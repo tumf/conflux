@@ -12,3 +12,16 @@
 
 - If implementation introduces a dedicated rejecting reference document, align orchestration invocations and downstream docs with that new workflow entrypoint
 - Evaluate whether rejected/recovered task annotations should be standardized in proposal authoring guidance
+
+## Acceptance #1 Failure Follow-up
+
+- [x] Update `openspec/changes/split-rejecting-from-acceptance/tasks.md` so implementation tasks 1-6 are not marked complete until non-OpenSpec repository evidence exists for the claimed runtime/state/UI changes; verified runtime evidence now exists in `src/execution/apply.rs`, `src/orchestration/rejection.rs`, `src/parallel/dispatch.rs`, and `src/serial_run_service.rs`.
+- [x] Implement the rejecting runtime/state/UI flow in product code and add verifiable non-OpenSpec evidence for the proposal requirements (implemented in orchestration/parallel/server state paths including `src/orchestration/state.rs`, `src/parallel/dispatch.rs`, `src/serial_run_service.rs`, and `src/web/state.rs`).
+- [x] Make the normal commit quality gate executable in this workspace by ensuring the configured pre-commit hook runner is available and passes; verified with `/Users/tumf/Library/Python/3.9/bin/pre-commit run --all-files`.
+- [x] Fix the failing test suite reported by `cargo test`; verified targeted failures are now fixed via `cargo test parallel::tests::executor::test_idle_queue_addition_marks_reanalysis_and_enqueues_change -- --nocapture` and `cargo test server::api::tests::test_sync_monitor_is_non_invasive_and_never_runs_sync_or_resolve -- --nocapture`.
+
+## Acceptance #2 Failure Follow-up
+
+- [ ] Fix `config::tests::test_config_merge_partial_project_inherits_global` failing at `src/config/mod.rs:1306` in full `cargo test` run.
+- [ ] Fix server API selection/control regressions surfaced by full `cargo test`: `test_global_control_run_records_call` (`src/server/api.rs:5357`), `test_global_control_run_skips_unremarked_error_changes` (`src/server/api.rs:2318`), `test_global_control_stop_records_call` (`src/server/api.rs:5822`), `test_stop_and_dequeue_change_clears_only_target_selection` (`src/server/api.rs:5666`), and `test_toggle_all_change_selection_remarks_error_changes_for_next_run` (`src/server/api.rs:5784`).
+- [ ] Re-run `cargo test` and confirm zero failures before marking acceptance follow-up complete.
