@@ -93,6 +93,22 @@ pub fn build_acceptance_prompt(
     )
 }
 
+/// Repository-standard archive-readiness checks that acceptance must evaluate
+/// before allowing archive to start.
+const ARCHIVE_READINESS_CONTEXT: &str = "<archive_readiness_context>\n\
+Before returning ACCEPTANCE: PASS, verify this workspace is ready for a real final archive commit under repository quality gates.\n\
+Run and evaluate these gates (or documented equivalents if this repo differs):\n\
+- pre-commit hook behavior for a normal commit (no --no-verify)\n\
+- cargo fmt --check\n\
+- cargo clippy -- -D warnings\n\
+- cargo test\n\
+If any gate fails, return a non-pass verdict and include actionable findings with:\n\
+1) blocking gate name (hook/fmt/clippy/test),\n\
+2) failing command,\n\
+3) relevant file/path context when available.\n\
+Do not defer these failures to archive.\n\
+</archive_readiness_context>";
+
 /// Build acceptance prompt context without the hardcoded system prompt.
 ///
 /// Use this when the fixed acceptance instructions live in the OpenCode command template
@@ -121,6 +137,8 @@ spec_deltas_path: openspec/changes/{}/specs/",
     if !diff_context.is_empty() {
         parts.push(diff_context.to_string());
     }
+
+    parts.push(ARCHIVE_READINESS_CONTEXT.to_string());
 
     if !last_output_context.is_empty() {
         parts.push(last_output_context.to_string());
@@ -318,6 +336,9 @@ mod tests {
         let diff_pos = result
             .find("DIFF_CONTEXT_MARKER")
             .expect("Diff context should be present");
+        let readiness_pos = result
+            .find("<archive_readiness_context>")
+            .expect("Archive readiness context should be present");
         let last_output_pos = result
             .find("LAST_OUTPUT_MARKER")
             .expect("Last output context should be present");
@@ -328,7 +349,7 @@ mod tests {
             .find("HISTORY_CONTEXT_MARKER")
             .expect("History context should be present");
 
-        // Verify order: prelude < metadata < diff < last_output < user < history
+        // Verify order: prelude < metadata < diff < readiness < last_output < user < history
         assert!(
             skill_pos < acceptance_id_pos,
             "Skill prelude should come before acceptance id"
@@ -342,8 +363,12 @@ mod tests {
             "Change metadata should come before diff context"
         );
         assert!(
-            diff_pos < last_output_pos,
-            "Diff context should come before last output context"
+            diff_pos < readiness_pos,
+            "Diff context should come before archive readiness context"
+        );
+        assert!(
+            readiness_pos < last_output_pos,
+            "Archive readiness context should come before last output context"
         );
         assert!(
             last_output_pos < user_pos,
