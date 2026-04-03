@@ -11,3 +11,9 @@
 ## Future Work
 
 - 必要であれば worktree クリーンアップや WIP rollback を別 proposal で扱う
+
+## Acceptance #1 Failure Follow-up
+
+- [x] server の stop-and-dequeue endpoint を実行中 change の実際のキャンセル経路へ接続し、対象 change のみを停止して `not queued` 状態へ遷移させる
+- [x] server API テストと dashboard テストを更新し、stop-and-dequeue 後にキャンセル済み状態と `not queued` 表示が継続することを検証する
+- [ ] 受け入れ前に作業ツリーを clean にし、実行済み検証結果を再確認する

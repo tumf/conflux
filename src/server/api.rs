@@ -2105,16 +2105,40 @@ pub async fn stop_and_dequeue_change(
     State(state): State<AppState>,
     Path((project_id, change_id)): Path<(String, String)>,
 ) -> Response {
-    {
+    let (entry, data_dir, was_running) = {
         let registry = state.registry.read().await;
-        if registry.get(&project_id).is_none() {
+        let Some(entry) = registry.get(&project_id).cloned() else {
             return error_response(StatusCode::NOT_FOUND, "Project not found");
+        };
+        (
+            entry.clone(),
+            registry.data_dir().to_path_buf(),
+            entry.status == ProjectStatus::Running,
+        )
+    };
+
+    if was_running {
+        info!(
+            project_id = %project_id,
+            change_id = %change_id,
+            "Stopping running project for stop-and-dequeue"
+        );
+        if CONTROL_CALLS.get().is_none() {
+            crate::server::runner::stop_project_run(&state.runners, project_id.clone()).await;
+        } else if let Some(calls) = CONTROL_CALLS.get() {
+            calls
+                .lock()
+                .unwrap()
+                .push((project_id.clone(), "stop-and-dequeue".to_string()));
         }
     }
 
     {
         let mut registry = state.registry.write().await;
         registry.set_change_state(&project_id, &change_id, false, None);
+        if was_running {
+            let _ = registry.set_status(&project_id, ProjectStatus::Stopped);
+        }
     }
 
     if let Some(db) = &state.db {
@@ -2127,9 +2151,70 @@ pub async fn stop_and_dequeue_change(
         }
     }
 
+    if was_running {
+        let worktree_path = data_dir
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch);
+        let project_selections = {
+            let registry = state.registry.read().await;
+            registry.change_selections_for_project(&project_id).cloned()
+        };
+        let remaining_changes =
+            list_selected_change_ids_in_worktree(&worktree_path, project_selections.as_ref()).await;
+
+        if remaining_changes.is_empty() {
+            let mut registry = state.registry.write().await;
+            let _ = registry.set_status(&project_id, ProjectStatus::Idle);
+            info!(
+                project_id = %project_id,
+                change_id = %change_id,
+                "No remaining selected changes after stop-and-dequeue"
+            );
+        } else {
+            info!(
+                project_id = %project_id,
+                change_id = %change_id,
+                remaining = remaining_changes.len(),
+                "Restarting project run for remaining selected changes"
+            );
+            if CONTROL_CALLS.get().is_none() {
+                let req = ProjectRunRequest {
+                    project_id: project_id.clone(),
+                    worktree_path,
+                    changes: Some(remaining_changes),
+                };
+                if let Err(e) = crate::server::runner::start_project_run(
+                    &state.runners,
+                    state.registry.clone(),
+                    state.db.clone(),
+                    req,
+                    state.log_tx.clone(),
+                )
+                .await
+                {
+                    error!(project_id = %project_id, change_id = %change_id, error = %e, "Failed to restart project after stop-and-dequeue");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to restart project run: {}", e),
+                    );
+                }
+            } else if let Some(calls) = CONTROL_CALLS.get() {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((project_id.clone(), "run".to_string()));
+            }
+
+            let mut registry = state.registry.write().await;
+            let _ = registry.set_status(&project_id, ProjectStatus::Running);
+        }
+    }
+
     info!(
         project_id = %project_id,
         change_id = %change_id,
+        running = was_running,
         "Change stop-and-dequeue requested"
     );
 
@@ -5565,6 +5650,9 @@ mod tests {
             .add("https://github.com/foo/bar".to_string(), "main".to_string())
             .unwrap();
 
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
         for change_id in ["fix-a", "fix-b"] {
             let change_dir = temp_dir
                 .path()
@@ -5574,6 +5662,13 @@ mod tests {
                 .join(format!("openspec/changes/{}", change_id));
             std::fs::create_dir_all(&change_dir).unwrap();
             std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+        }
+
+        {
+            let mut registry = state.registry.write().await;
+            let _ = registry.set_status(&entry.id, ProjectStatus::Running);
+            registry.set_change_state(&entry.id, "fix-a", true, None);
+            registry.set_change_state(&entry.id, "fix-b", true, None);
         }
 
         let router = build_router(state.clone());
@@ -5601,21 +5696,24 @@ mod tests {
             .uri("/api/v1/projects/state")
             .body(Body::empty())
             .unwrap();
-        let resp = router.oneshot(req).await.unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let changes = json["projects"][0]["changes"].as_array().unwrap();
+        let project = &json["projects"][0];
+        let changes = project["changes"].as_array().unwrap();
 
         let fix_a = changes.iter().find(|c| c["id"] == "fix-a").unwrap();
         let fix_b = changes.iter().find(|c| c["id"] == "fix-b").unwrap();
 
+        assert_eq!(project["status"], "running");
         assert_eq!(fix_a["selected"], false);
         assert_eq!(fix_a["status"], "not queued");
         assert_eq!(fix_b["selected"], true);
         assert_eq!(fix_b["status"], "not queued");
+
     }
 
     #[tokio::test]
