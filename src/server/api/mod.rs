@@ -4029,7 +4029,6 @@ mod tests {
         );
     }
 
-
     /// Verify the proposal-session WebSocket route is registered at the
     /// path the dashboard frontend connects to:
     /// `/api/v1/proposal-sessions/{session_id}/ws`

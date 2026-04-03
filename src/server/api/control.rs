@@ -433,13 +433,16 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: None,
             log_tx,
-            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
-            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
-                crate::config::ProposalSessionConfig::default(),
-                None,
-            ),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
         }
     }
 
