@@ -13,3 +13,8 @@
 ## Acceptance #1 Failure Follow-up
 
 - [x] Update `src/execution/state.rs` documentation/comments/examples so resumed `WorkspaceState::Applied` no longer imply direct archive-only routing and instead match the new apply-or-acceptance resume semantics.
+
+## Acceptance #5 Failure Follow-up
+
+- [x] Update the remaining `src/execution/state.rs` module docs/examples for `WorkspaceState::Archiving` so resumed non-terminal worktrees no longer imply a direct archive loop and instead match the acceptance-before-archive resume semantics implemented in `src/parallel/dispatch.rs`.
+- [x] Keep the Acceptance #1 follow-up marked complete only after both `Applied` and `Archiving` documentation/examples in `src/execution/state.rs` match the new resume semantics.
