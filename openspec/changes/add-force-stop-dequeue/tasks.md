@@ -17,3 +17,9 @@
 - [x] server の stop-and-dequeue endpoint を実行中 change の実際のキャンセル経路へ接続し、対象 change のみを停止して `not queued` 状態へ遷移させる
 - [x] server API テストと dashboard テストを更新し、stop-and-dequeue 後にキャンセル済み状態と `not queued` 表示が継続することを検証する
 - [x] 受け入れ前に作業ツリーを clean にし、実行済み検証結果を再確認する
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `cargo test` の全件実行で失敗する server API テスト5件を安定して通るように修正する
+- [x] `src/server/api.rs` の `CONTROL_CALLS` など共有グローバル状態が並列/全件テスト実行時に相互干渉していないか切り分け、必要ならテスト分離または状態初期化を追加する
+- [x] `cargo test` を再実行して full suite が green であることを確認する
