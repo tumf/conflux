@@ -7,7 +7,9 @@
 
 queued の change が空の場合、analysis を実行してはならない（MUST）。
 
-ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
+CLI の `run` サブコマンドでは、実行中の change が存在せず queued の change も空である場合、オーケストレーションは完了状態にならなければならない（MUST）。
+
+TUI/server の Running セッションでは、ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
@@ -22,8 +24,17 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **WHEN** 並列実行が analysis を開始しようとする
 - **THEN** analysis を実行しない
 
-#### Scenario: 実行中とqueuedが空でも待機を継続する
-- **GIVEN** ユーザが停止していない
+#### Scenario: CLI run は空キューで終了する
+- **GIVEN** CLI の `run` サブコマンドで並列実行している
+- **AND** 実行中の change が存在しない
+- **AND** queued の change も空である
+- **WHEN** 並列実行ループが次の analysis を開始しようとする
+- **THEN** analysis を実行しない
+- **AND** オーケストレーションは完了状態になる
+
+#### Scenario: TUI/server は空キューでも待機を継続する
+- **GIVEN** TUI または server の Running セッションである
+- **AND** ユーザが停止していない
 - **AND** 実行中の change が存在しない
 - **AND** queued の change も空である
 - **WHEN** 並列実行ループが次の analysis を開始しようとする
@@ -31,8 +42,9 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **AND** オーケストレーション実行ループは終了しない
 - **AND** 新しく queued になった change を待機する
 
-#### Scenario: idle待機中のqueued追加でanalysisが再開する
-- **GIVEN** ユーザが停止していない
+#### Scenario: TUI/server の idle待機中のqueued追加でanalysisが再開する
+- **GIVEN** TUI または server の Running セッションである
+- **AND** ユーザが停止していない
 - **AND** 並列実行ループが queued 0 件・実行中 0 件で待機中である
 - **WHEN** change が queued に追加される
 - **THEN** 実行ループは queue 通知を受け取る
