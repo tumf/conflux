@@ -665,14 +665,14 @@ where
         }
 
         // Apply-blocked handoff: if apply has produced REJECTED.md proposal,
-        // stop apply loop and hand off to acceptance even when tasks remain unchecked.
+        // stop apply loop and hand off to dedicated rejecting review even when tasks remain unchecked.
         if let Some(blocked_handoff) = detect_apply_blocked_handoff(workspace_path, change_id) {
             info!(
                 change_id = change_id,
                 rejected_path = %blocked_handoff.rejected_path.display(),
                 completed = progress.completed,
                 total = progress.total,
-                "Apply blocked handoff detected via REJECTED.md; exiting apply loop for acceptance"
+                "Apply blocked handoff detected via REJECTED.md; exiting apply loop for rejecting review"
             );
             break false;
         }

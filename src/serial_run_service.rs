@@ -21,8 +21,9 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, archive_change, execute_rejection_flow, AcceptanceResult,
-    ArchiveContext, ArchiveResult, OutputHandler,
+    acceptance_test_streaming, archive_change, execute_rejection_flow,
+    handle_resume_apply_from_rejecting, run_rejection_review, AcceptanceResult, ArchiveContext,
+    ArchiveResult, OutputHandler, RejectionReviewVerdict,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser::TaskProgress;
@@ -467,7 +468,7 @@ impl SerialRunService {
                     change_id = %change.id,
                     rejected_path = %handoff.rejected_path.display(),
                     iterations = apply_result.iterations,
-                    "Apply blocked handoff detected; proceeding to acceptance with incomplete tasks"
+                    "Apply blocked handoff detected; proceeding to rejecting review with incomplete tasks"
                 );
             }
 
@@ -479,61 +480,95 @@ impl SerialRunService {
 
             if is_complete || apply_blocked_handoff.is_some() {
                 let updated_change = updated_change.unwrap_or_else(|| change.clone());
-                if is_complete {
+
+                if let Some(ref handoff) = apply_blocked_handoff {
+                    warn!(
+                        change_id = %change.id,
+                        rejected_path = %handoff.rejected_path.display(),
+                        "Running rejecting review for apply-blocked handoff with unchecked tasks"
+                    );
+
+                    Self::update_operation_tracker(&operation_tracker, "rejecting");
+                    match run_rejection_review(&change.id, &self.repo_root, &self.config, ai_runner)
+                        .await?
+                    {
+                        RejectionReviewVerdict::Confirm => {
+                            let reason = format!(
+                                "Apply-blocked rejection confirmed by rejecting review (proposal: {})",
+                                handoff.rejected_path.display()
+                            );
+                            let base_branch =
+                                crate::vcs::git::commands::get_current_branch(&self.repo_root)
+                                    .await
+                                    .map_err(crate::error::OrchestratorError::from_vcs_error)?
+                                    .unwrap_or_else(|| "main".to_string());
+
+                            execute_rejection_flow(
+                                &change.id,
+                                &reason,
+                                &self.repo_root,
+                                &base_branch,
+                                &self.repo_root,
+                            )
+                            .await?;
+
+                            Ok(ChangeProcessResult::Rejected { reason })
+                        }
+                        RejectionReviewVerdict::Resume => {
+                            handle_resume_apply_from_rejecting(&change.id, &self.repo_root).await?;
+                            Ok(ChangeProcessResult::ApplySuccessIncomplete)
+                        }
+                    }
+                } else {
                     info!(
                         "Tasks complete for {}, running acceptance test...",
                         change.id
                     );
-                } else if let Some(ref handoff) = apply_blocked_handoff {
-                    warn!(
-                        change_id = %change.id,
-                        rejected_path = %handoff.rejected_path.display(),
-                        "Running acceptance for apply-blocked handoff with unchecked tasks"
-                    );
-                }
 
-                // Update operation to "acceptance" before running acceptance test
-                Self::update_operation_tracker(&operation_tracker, "acceptance");
+                    // Update operation to "acceptance" before running acceptance test
+                    Self::update_operation_tracker(&operation_tracker, "acceptance");
 
-                // Run acceptance test
-                match acceptance_test_streaming(
-                    &updated_change,
-                    agent,
-                    ai_runner,
-                    &self.config,
-                    output,
-                    cancel_check,
-                )
-                .await
-                {
-                    Ok((AcceptanceResult::Blocked, _attempt_number, _command)) => {
-                        let reason = "Implementation blocker detected".to_string();
-                        let base_branch =
-                            crate::vcs::git::commands::get_current_branch(&self.repo_root)
-                                .await
-                                .map_err(crate::error::OrchestratorError::from_vcs_error)?
-                                .unwrap_or_else(|| "main".to_string());
-
-                        execute_rejection_flow(
-                            &change.id,
-                            &reason,
-                            &self.repo_root,
-                            &base_branch,
-                            &self.repo_root,
-                        )
-                        .await?;
-
-                        Ok(ChangeProcessResult::Rejected { reason })
-                    }
-                    Ok((result, _attempt_number, _command)) => Ok(self.process_acceptance_result(
-                        &change.id,
+                    // Run acceptance test
+                    match acceptance_test_streaming(
+                        &updated_change,
                         agent,
-                        result,
-                        is_single_change_stopped,
-                    )),
-                    Err(e) => {
-                        error!("Acceptance error for {}: {}", change.id, e);
-                        Err(e)
+                        ai_runner,
+                        &self.config,
+                        output,
+                        cancel_check,
+                    )
+                    .await
+                    {
+                        Ok((AcceptanceResult::Blocked, _attempt_number, _command)) => {
+                            let reason = "Implementation blocker detected".to_string();
+                            let base_branch =
+                                crate::vcs::git::commands::get_current_branch(&self.repo_root)
+                                    .await
+                                    .map_err(crate::error::OrchestratorError::from_vcs_error)?
+                                    .unwrap_or_else(|| "main".to_string());
+
+                            execute_rejection_flow(
+                                &change.id,
+                                &reason,
+                                &self.repo_root,
+                                &base_branch,
+                                &self.repo_root,
+                            )
+                            .await?;
+
+                            Ok(ChangeProcessResult::Rejected { reason })
+                        }
+                        Ok((result, _attempt_number, _command)) => Ok(self
+                            .process_acceptance_result(
+                                &change.id,
+                                agent,
+                                result,
+                                is_single_change_stopped,
+                            )),
+                        Err(e) => {
+                            error!("Acceptance error for {}: {}", change.id, e);
+                            Err(e)
+                        }
                     }
                 }
             } else {

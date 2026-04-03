@@ -2083,8 +2083,8 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
     let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, None);
     executor.set_persistent_lifetime();
 
-    // Use an existing change ID in this repository so list_changes_native can resolve it.
-    let change_id = "fix-parallel-acceptance-fail-resume";
+    // Use an existing active change ID in this repository so list_changes_native can resolve it.
+    let change_id = "split-rejecting-from-acceptance";
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
