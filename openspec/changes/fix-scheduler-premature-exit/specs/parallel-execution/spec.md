@@ -9,7 +9,7 @@ queued の change が空の場合、analysis を実行してはならない（MU
 
 CLI の `run` サブコマンドでは、実行中の change が存在せず queued の change も空である場合、オーケストレーションは完了状態にならなければならない（MUST）。
 
-TUI/server の Running セッションでは、ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
+通常の cflx ループ型実行では、ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
@@ -32,8 +32,8 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **THEN** analysis を実行しない
 - **AND** オーケストレーションは完了状態になる
 
-#### Scenario: TUI/server は空キューでも待機を継続する
-- **GIVEN** TUI または server の Running セッションである
+#### Scenario: 通常の cflx 実行は空キューでも待機を継続する
+- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
 - **AND** ユーザが停止していない
 - **AND** 実行中の change が存在しない
 - **AND** queued の change も空である
@@ -42,8 +42,8 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **AND** オーケストレーション実行ループは終了しない
 - **AND** 新しく queued になった change を待機する
 
-#### Scenario: TUI/server の idle待機中のqueued追加でanalysisが再開する
-- **GIVEN** TUI または server の Running セッションである
+#### Scenario: 通常の cflx 実行の idle待機中のqueued追加でanalysisが再開する
+- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
 - **AND** ユーザが停止していない
 - **AND** 並列実行ループが queued 0 件・実行中 0 件で待機中である
 - **WHEN** change が queued に追加される
