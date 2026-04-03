@@ -374,3 +374,60 @@ fn latest_modified_rfc3339(paths: &[&std::path::Path]) -> Option<String> {
 
     latest.map(|ts| chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_repo_name;
+
+    #[test]
+    fn test_extract_repo_name_standard_https() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/my-repo.git"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_https_without_git_suffix() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/my-repo"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_ssh_url() {
+        assert_eq!(
+            extract_repo_name("git@github.com:owner/my-repo.git"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_trailing_slash() {
+        assert_eq!(
+            extract_repo_name("https://github.com/owner/my-repo/"),
+            "my-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_repo_name_bare_name() {
+        assert_eq!(extract_repo_name("my-repo"), "my-repo");
+    }
+
+    #[test]
+    fn test_extract_repo_name_empty_falls_back_to_url() {
+        let result = extract_repo_name("https://example.com/");
+        assert!(!result.is_empty(), "Should not produce an empty repo name");
+    }
+
+    #[test]
+    fn test_extract_repo_name_just_git_suffix() {
+        assert_eq!(
+            extract_repo_name("https://example.com/.git"),
+            "https://example.com/.git",
+            "A URL ending in .git with no basename should fall back to the full URL"
+        );
+    }
+}

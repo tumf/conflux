@@ -12,7 +12,7 @@
 - [x] 10. プロポーザルセッション管理を `api/proposals.rs` に抽出する（verification: `cargo test` 全通過）
 - [x] 11. WebSocket ハンドラを `api/ws.rs` に抽出する（verification: `cargo test` 全通過）
 - [x] 12. ダッシュボード静的アセット配信を `api/dashboard.rs` に抽出する（verification: `cargo test` 全通過）
-- [ ] 13. テストを各サブモジュール内 `#[cfg(test)]` に配置し直す（verification: `cargo test` 全通過）
+- [x] 13. テストを各サブモジュール内 `#[cfg(test)]` に配置し直す（verification: `cargo test --lib server::api` 全通過）
 - [x] 14. `cargo fmt --check && cargo clippy -- -D warnings && cargo test` をすべて実行して受け入れ条件を検証する
 
 ## Future Work

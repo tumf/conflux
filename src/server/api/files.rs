@@ -340,3 +340,96 @@ pub async fn get_file_content(
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_validate_relative_path_rejects_traversal() {
+        assert!(validate_relative_path("../etc/passwd").is_err());
+        assert!(validate_relative_path("foo/../bar").is_err());
+        assert!(validate_relative_path("..").is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_path_rejects_absolute() {
+        assert!(validate_relative_path("/etc/passwd").is_err());
+        assert!(validate_relative_path("\\windows\\system32").is_err());
+    }
+
+    #[test]
+    fn test_validate_relative_path_accepts_valid() {
+        assert!(validate_relative_path("src/main.rs").is_ok());
+        assert!(validate_relative_path("openspec/changes/add-feature/proposal.md").is_ok());
+        assert!(validate_relative_path("Cargo.toml").is_ok());
+    }
+
+    #[test]
+    fn test_build_file_tree_excludes_dirs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/foo")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+
+        let tree = build_file_tree(root, root).unwrap();
+        let names: Vec<&str> = tree.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(!names.contains(&".git"), "should exclude .git");
+        assert!(
+            !names.contains(&"node_modules"),
+            "should exclude node_modules"
+        );
+        assert!(!names.contains(&"target"), "should exclude target");
+        assert!(names.contains(&"src"), "should include src");
+        assert!(names.contains(&"Cargo.toml"), "should include Cargo.toml");
+    }
+
+    #[test]
+    fn test_build_file_tree_recursive() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/c.txt"), "hello").unwrap();
+        std::fs::write(root.join("a/d.txt"), "world").unwrap();
+
+        let tree = build_file_tree(root, root).unwrap();
+        assert_eq!(tree.len(), 1);
+        let a = &tree[0];
+        assert_eq!(a.name, "a");
+        assert_eq!(a.entry_type, "directory");
+
+        let children_a = a.children.as_ref().unwrap();
+        assert_eq!(children_a.len(), 2);
+
+        let b = children_a.iter().find(|e| e.name == "b").unwrap();
+        assert_eq!(b.entry_type, "directory");
+        let children_b = b.children.as_ref().unwrap();
+        assert_eq!(children_b.len(), 1);
+        assert_eq!(children_b[0].name, "c.txt");
+        assert_eq!(children_b[0].entry_type, "file");
+    }
+
+    #[test]
+    fn test_is_binary_file_text() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("text.txt");
+        std::fs::write(&path, "Hello, world!").unwrap();
+        assert!(!is_binary_file(&path).unwrap());
+    }
+
+    #[test]
+    fn test_is_binary_file_binary() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("binary.bin");
+        std::fs::write(&path, b"\x00\x01\x02\x03").unwrap();
+        assert!(is_binary_file(&path).unwrap());
+    }
+}
