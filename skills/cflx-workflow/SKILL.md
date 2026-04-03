@@ -11,18 +11,20 @@ Execute Conflux workflow operations autonomously. Called by orchestration system
 
 ## Operation Modes
 
-This skill supports three operations, determined by the orchestrator's invocation:
+This skill supports four operations, determined by the orchestrator's invocation:
 
 1. **apply** - Implement an approved change
-2. **accept** - Verify implementation against specs
-3. **archive** - Finalize a deployed change
+2. **rejecting** - Review apply-generated rejection proposals (`REJECTED.md`)
+3. **accept** - Verify implementation against specs
+4. **archive** - Finalize a deployed change
 
 ## Operation Selection
 
 The orchestrator specifies the operation. Parse the invocation to determine:
 
 - If change ID with "apply" or "implement" context → Execute Apply
-- If "accept" or "review" context → Execute Accept
+- If "rejecting" or "rejection review" context → Execute Rejecting review
+- If "accept" context → Execute Accept
 - If "archive" context → Execute Archive
 
 ## Operation 1: Apply (Implementation)
@@ -190,7 +192,28 @@ If apply determines the change is currently impossible to implement (for example
 
 **For detailed guidance**, read [references/cflx-apply.md](references/cflx-apply.md).
 
-## Operation 2: Accept (Acceptance Review)
+## Operation 2: Rejecting (Rejection Review)
+
+**Purpose**: Review apply-generated rejection proposals in `openspec/changes/<change-id>/REJECTED.md` before any terminal reject decision.
+
+### Rejecting Required Checks
+
+1. Confirm `openspec/changes/<change-id>/REJECTED.md` exists and contains a concrete reason.
+2. Confirm blocker evidence in `tasks.md` (`## Implementation Blocker #N`) is specific and actionable.
+3. Decide one outcome only:
+   - `CONFIRM`: reject proposal is valid and should be finalized.
+   - `RESUME`: reject proposal is dismissed and change must return to apply.
+4. Output exactly one final marker line:
+   - `REJECTION_REVIEW: CONFIRM`
+   - `REJECTION_REVIEW: RESUME`
+
+### Rejecting Outcome Rules
+
+- On `REJECTION_REVIEW: CONFIRM`, runtime finalizes rejection flow and base branch records only `openspec/changes/<change-id>/REJECTED.md`.
+- On `REJECTION_REVIEW: RESUME`, runtime removes worktree-local `REJECTED.md`, appends at least one unchecked non-rejection recovery task to `tasks.md`, and routes directly back to apply.
+- Rejecting review MUST NOT output `ACCEPTANCE: BLOCKED`; that marker is reserved for acceptance operation output.
+
+## Operation 3: Accept (Acceptance Review)
 
 **Purpose**: Verify implementation meets specifications with automated checks.
 
