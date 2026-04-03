@@ -7,6 +7,8 @@ references:
   - openspec/specs/orchestration-state/spec.md
   - src/execution/apply.rs
   - src/orchestration/rejection.rs
+  - skills/cflx-workflow/SKILL.md
+  - skills/cflx-workflow/references/cflx-accept.md
 ---
 
 # Change: Split rejection review from acceptance
@@ -29,6 +31,7 @@ references:
 - `confirm_rejection` の場合は既存の rejection flow を維持し、base branch には `openspec/changes/<change_id>/REJECTED.md` のみを commit する。
 - `resume_apply` の場合は worktree から `REJECTED.md` を除去し、`tasks.md` に reject 以外の解決タスクを追加した上で `applying` に戻す。
 - parallel / serial の resume・表示・API・イベントは `rejecting` を独立した実行段階として扱う。
+- rejecting 導入に伴うエージェント挙動の仕様変更は product code だけでなく `skills/cflx-workflow/` 配下の workflow skill source を canonical source として更新する。
 
 ## Acceptance Criteria
 
@@ -38,6 +41,7 @@ references:
 - `resume_apply` 時、worktree の `REJECTED.md` は削除され、`tasks.md` に reject 以外の解決タスクが追加され、change は `applying` に戻る。
 - TUI / Web API / shared state の表示で `rejecting` が独立した active status として観測できる。
 - resume 時に `REJECTED.md` が存在する非 terminal workspace は `accepting` ではなく `rejecting` に復元される。
+- workflow skill source (`skills/cflx-workflow/SKILL.md` と関連 reference) が rejecting 分離後の handoff / verdict / task-update semantics と整合する。
 
 ## Out of Scope
 

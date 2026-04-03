@@ -5,9 +5,10 @@
 - [ ] 3. Specify rejecting review outcomes `confirm_rejection` and `resume_apply`, including base-branch REJECTED-only commit semantics for confirmed rejection (verification: `openspec/specs/parallel-execution/spec.md` delta covers rejecting outcome contract and REJECTED-only merge rule)
 - [ ] 4. Specify reject-dismissal behavior so the runtime removes worktree `REJECTED.md`, appends non-rejection recovery tasks to `tasks.md`, and returns the change to apply (verification: spec delta includes explicit scenario for `tasks.md` mutation before resuming apply)
 - [ ] 5. Specify reducer/API/UI visibility updates so `rejecting` is surfaced as an active runtime stage in dashboard/TUI state consumers (verification: spec delta references shared orchestration state and observable display status requirements)
-- [ ] 6. Validate the proposal strictly and ensure all affected deltas are scenario-complete (verification: `python3 /Users/tumf/.agents/skills/cflx-proposal/scripts/cflx.py validate split-rejecting-from-acceptance --strict` passes)
+- [ ] 6. Update `skills/cflx-workflow/` canonical workflow instructions so apply/accept handoff semantics match the dedicated rejecting stage (verification: implementation updates target `skills/cflx-workflow/SKILL.md` and the relevant reference docs such as `skills/cflx-workflow/references/cflx-accept.md`)
+- [ ] 7. Validate the proposal strictly and ensure all affected deltas are scenario-complete (verification: `python3 /Users/tumf/.agents/skills/cflx-proposal/scripts/cflx.py validate split-rejecting-from-acceptance --strict` passes)
 
 ## Future Work
 
-- Update any downstream acceptance/review agent prompts after implementation if they need specialized rejecting-mode instructions
+- If implementation introduces a dedicated rejecting reference document, align orchestration invocations and downstream docs with that new workflow entrypoint
 - Evaluate whether rejected/recovered task annotations should be standardized in proposal authoring guidance
