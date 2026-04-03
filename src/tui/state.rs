@@ -1826,11 +1826,11 @@ mod guards {
                 ToggleActionResult::StateOnly(Some(log_msg))
             }
             "applying" | "accepting" | "archiving" | "resolving" => {
-                // Active (in-flight) changes: issue stop request
-                // State transition happens when ChangeStopped event is received
+                // Active (in-flight) changes: issue stop-and-dequeue request
+                // State transition happens when ChangeDequeued event is received
                 let id = change.id.clone();
-                let log_msg = format!("Stop requested: {}", id);
-                ToggleActionResult::Command(TuiCommand::StopChange(id), Some(log_msg))
+                let log_msg = format!("Stop-and-dequeue requested: {}", id);
+                ToggleActionResult::Command(TuiCommand::DequeueChange(id), Some(log_msg))
             }
             "error" => {
                 // Error rows in Running mode must mirror queue operations:
@@ -2265,7 +2265,7 @@ mod tests {
         // No StopChange command should appear
         assert!(!commands
             .iter()
-            .any(|c| matches!(c, TuiCommand::StopChange(_))));
+            .any(|c| matches!(c, TuiCommand::DequeueChange(_))));
     }
 
     #[test]

@@ -1,0 +1,25 @@
+## Implementation Tasks
+
+- [x] 1. reducer に実行中 change を terminal 化せず `not queued` へ戻す command/event を追加する（verification: `src/orchestration/state.rs` の reducer tests で `display_status()` が `not queued` になり、terminal が `None` のままであることを確認）
+- [x] 2. serial / parallel / TUI orchestrator の停止完了経路を新しい dequeue event に揃える（verification: `src/tui/orchestrator.rs`, `src/parallel/dispatch.rs`, `src/serial_run_service.rs` に対応イベント送信があり、既存 stop フローの unit/integration test が更新される）
+- [x] 3. TUI の active change 操作を「強制停止してキュー解除」の意味論に更新する（verification: `src/tui/state.rs` と `src/tui/command_handlers.rs` のテストで active change の停止後表示が `not queued` になる）
+- [x] 4. server API に change 単位の stop-and-dequeue endpoint を追加し、WebSocket/REST 状態更新を連動させる（verification: `src/server/api.rs` の API テストで endpoint 呼び出し後の change status が `not queued` / unselected-or-equivalent queue-off semantics と整合することを確認）
+- [x] 5. dashboard UI に実行中 change の stop-and-dequeue 操作を追加し、停止完了後の表示を `not queued` として反映する（verification: frontend tests または dashboard state tests で操作後表示が更新される）
+- [x] 6. stale event / refresh / resume に対する非回帰テストを追加する（verification: reducer / TUI / server tests で stop-and-dequeue 後に stale apply or refresh で active/stopped へ戻らないことを確認）
+- [x] 7. proposal 実装時に `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` を実行して受け入れ条件を検証する
+
+## Future Work
+
+- 必要であれば worktree クリーンアップや WIP rollback を別 proposal で扱う
+
+## Acceptance #1 Failure Follow-up
+
+- [x] server の stop-and-dequeue endpoint を実行中 change の実際のキャンセル経路へ接続し、対象 change のみを停止して `not queued` 状態へ遷移させる
+- [x] server API テストと dashboard テストを更新し、stop-and-dequeue 後にキャンセル済み状態と `not queued` 表示が継続することを検証する
+- [x] 受け入れ前に作業ツリーを clean にし、実行済み検証結果を再確認する
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `cargo test` の全件実行で失敗する server API テスト5件を安定して通るように修正する
+- [x] `src/server/api.rs` の `CONTROL_CALLS` など共有グローバル状態が並列/全件テスト実行時に相互干渉していないか切り分け、必要ならテスト分離または状態初期化を追加する
+- [x] `cargo test` を再実行して full suite が green であることを確認する

@@ -166,6 +166,9 @@ pub struct ChangeRuntimeState {
     pub terminal: TerminalState,
     /// Latest workspace observation (used for reconcile only).
     pub observation: WorkspaceObservation,
+    /// True when a change was explicitly force-stopped and dequeued.
+    /// While true, stale in-flight execution events must not re-activate this change.
+    pub dequeued: bool,
 }
 
 impl ChangeRuntimeState {
@@ -283,7 +286,10 @@ pub enum ReducerCommand {
     RemoveFromQueue(String),
     /// Request merge resolution for a change in MergeWait or ResolveWait.
     ResolveMerge(String),
-    /// Stop a running or queued change.
+    /// Force-stop a running or queued change and dequeue it back to not-queued.
+    DequeueChange(String),
+    /// Legacy stop command (terminal stopped). Prefer DequeueChange for stop-and-dequeue semantics.
+    #[allow(dead_code)]
     StopChange(String),
 }
 
@@ -716,7 +722,6 @@ impl OrchestratorState {
     pub fn apply_command(&mut self, cmd: ReducerCommand) -> ReduceOutcome {
         match cmd {
             ReducerCommand::AddToQueue(change_id) => {
-                // Permanently completed changes (Archived, Merged) cannot be re-queued.
                 {
                     let rt = self.runtime_entry(&change_id);
                     if matches!(
@@ -727,24 +732,21 @@ impl OrchestratorState {
                     ) {
                         return ReduceOutcome::NoOp;
                     }
-                    // Already queued and not in a retryable terminal state – no-op.
                     if !rt.is_terminal()
+                        && !rt.dequeued
                         && (rt.is_active() || rt.queue_intent == QueueIntent::Queued)
                     {
                         return ReduceOutcome::NoOp;
                     }
-                    // Clear retryable terminal states (Error, Stopped) so the change can
-                    // re-enter the queue.  This preserves the pending-set membership so the
-                    // orchestrator can schedule the retry.
                     if rt.is_terminal() {
                         rt.terminal = TerminalState::None;
                         rt.activity = ActivityState::Idle;
                         rt.wait_state = WaitState::None;
                     }
+                    rt.dequeued = false;
                     rt.queue_intent = QueueIntent::Queued;
                     rt.wait_state = WaitState::None;
                 }
-                // Ensure dynamic change is tracked in pending set.
                 self.add_dynamic_change(change_id.clone());
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
                     change_id,
@@ -764,11 +766,9 @@ impl OrchestratorState {
             }
             ReducerCommand::ResolveMerge(change_id) => {
                 let rt = self.runtime_entry(&change_id);
-                // Only meaningful when in MergeWait or ResolveWait.
                 if !matches!(rt.wait_state, WaitState::MergeWait | WaitState::ResolveWait) {
                     return ReduceOutcome::NoOp;
                 }
-                // Transition to ResolveWait (queued resolve intent).
                 rt.wait_state = WaitState::ResolveWait;
                 if !self.resolve_wait_queue.contains(&change_id) {
                     self.resolve_wait_queue.push(change_id.clone());
@@ -776,6 +776,24 @@ impl OrchestratorState {
                 ReduceOutcome::Changed(ReducerEffect::WaitStateSet {
                     change_id,
                     wait: WaitState::ResolveWait,
+                })
+            }
+            ReducerCommand::DequeueChange(change_id) => {
+                let rt = self.runtime_entry(&change_id);
+                if matches!(
+                    rt.terminal,
+                    TerminalState::Archived | TerminalState::Merged | TerminalState::Rejected(_)
+                ) {
+                    return ReduceOutcome::NoOp;
+                }
+                rt.terminal = TerminalState::None;
+                rt.activity = ActivityState::Idle;
+                rt.wait_state = WaitState::None;
+                rt.queue_intent = QueueIntent::NotQueued;
+                rt.dequeued = true;
+                ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
+                    change_id,
+                    intent: QueueIntent::NotQueued,
                 })
             }
             ReducerCommand::StopChange(change_id) => {
@@ -852,7 +870,7 @@ impl OrchestratorState {
             ExecutionEvent::ProcessingStarted(change_id) => {
                 self.set_current_change(Some(change_id.clone()));
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
+                if !rt.is_terminal() && !rt.dequeued {
                     rt.queue_intent = QueueIntent::Queued;
                 }
             }
@@ -863,7 +881,7 @@ impl OrchestratorState {
             ExecutionEvent::ProcessingError { id, error } => {
                 self.remove_from_pending(id);
                 let rt = self.runtime_entry(id);
-                if !rt.is_terminal() {
+                if !rt.is_terminal() && !rt.dequeued {
                     rt.terminal = TerminalState::Error(error.clone());
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::None;
@@ -875,11 +893,17 @@ impl OrchestratorState {
                 change_id,
                 command: _,
             } => {
-                self.set_current_change(Some(change_id.clone()));
-                let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
-                    rt.activity = ActivityState::Applying;
-                    rt.wait_state = WaitState::None;
+                let mut should_start = false;
+                {
+                    let rt = self.runtime_entry(change_id);
+                    if !rt.is_terminal() && !rt.dequeued {
+                        rt.activity = ActivityState::Applying;
+                        rt.wait_state = WaitState::None;
+                        should_start = true;
+                    }
+                }
+                if should_start {
+                    self.set_current_change(Some(change_id.clone()));
                 }
             }
             ExecutionEvent::ApplyCompleted { change_id, .. } => {
@@ -902,7 +926,7 @@ impl OrchestratorState {
             // Acceptance events
             ExecutionEvent::AcceptanceStarted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
+                if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Accepting;
                 }
             }
@@ -933,7 +957,7 @@ impl OrchestratorState {
             // Archive events
             ExecutionEvent::ArchiveStarted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
+                if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Archiving;
                 }
             }
@@ -999,7 +1023,7 @@ impl OrchestratorState {
             }
             ExecutionEvent::ResolveStarted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
+                if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Resolving;
                     rt.wait_state = WaitState::None;
                 }
@@ -1049,15 +1073,21 @@ impl OrchestratorState {
                 }
             }
 
-            // Stop events
-            ExecutionEvent::ChangeStopped { change_id } => {
+            // Stop/dequeue events
+            ExecutionEvent::ChangeDequeued { change_id }
+            | ExecutionEvent::ChangeStopped { change_id } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
-                    rt.terminal = TerminalState::Stopped;
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
-                    rt.queue_intent = QueueIntent::NotQueued;
+                if matches!(
+                    rt.terminal,
+                    TerminalState::Archived | TerminalState::Merged | TerminalState::Rejected(_)
+                ) {
+                    return;
                 }
+                rt.terminal = TerminalState::None;
+                rt.activity = ActivityState::Idle;
+                rt.wait_state = WaitState::None;
+                rt.queue_intent = QueueIntent::NotQueued;
+                rt.dequeued = true;
             }
 
             // Dynamic queue support
@@ -1459,15 +1489,16 @@ mod tests {
         let outcome4 = state.apply_command(ReducerCommand::RemoveFromQueue("c".to_string()));
         assert!(matches!(outcome4, ReduceOutcome::NoOp));
 
-        // StopChange.
+        // DequeueChange.
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
-        let outcome5 = state.apply_command(ReducerCommand::StopChange("c".to_string()));
+        let outcome5 = state.apply_command(ReducerCommand::DequeueChange("c".to_string()));
         assert!(matches!(outcome5, ReduceOutcome::Changed(_)));
-        assert_eq!(state.display_status("c"), "stopped");
+        assert_eq!(state.display_status("c"), "not queued");
 
-        // StopChange on already-terminal → NoOp.
-        let outcome6 = state.apply_command(ReducerCommand::StopChange("c".to_string()));
-        assert!(matches!(outcome6, ReduceOutcome::NoOp));
+        // DequeueChange on already not queued keeps queue-off state.
+        let outcome6 = state.apply_command(ReducerCommand::DequeueChange("c".to_string()));
+        assert!(matches!(outcome6, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "not queued");
 
         // Rejected is a permanent terminal state and cannot be re-queued.
         state.runtime_entry("c").terminal = TerminalState::Rejected("blocked".to_string());
@@ -1825,32 +1856,32 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // Stop the change.
-        state.apply_execution_event(&ExecutionEvent::ChangeStopped {
+        // Dequeue the change.
+        state.apply_execution_event(&ExecutionEvent::ChangeDequeued {
             change_id: "c".to_string(),
         });
-        assert_eq!(state.display_status("c"), "stopped");
+        assert_eq!(state.display_status("c"), "not queued");
 
-        // Late ApplyStarted must NOT overwrite Stopped.
+        // Late ApplyStarted must not regress from dequeued state.
         state.apply_execution_event(&ExecutionEvent::ApplyStarted {
             change_id: "c".to_string(),
             command: "cmd".to_string(),
         });
-        assert_eq!(state.display_status("c"), "stopped");
+        assert_eq!(state.display_status("c"), "not queued");
 
-        // Late AcceptanceStarted must NOT overwrite Stopped.
+        // Late AcceptanceStarted must not regress from dequeued state.
         state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
             change_id: "c".to_string(),
             command: "cmd".to_string(),
         });
-        assert_eq!(state.display_status("c"), "stopped");
+        assert_eq!(state.display_status("c"), "not queued");
 
-        // Late ProcessingError must NOT overwrite Stopped.
+        // Late ProcessingError must not regress from dequeued state.
         state.apply_execution_event(&ExecutionEvent::ProcessingError {
             id: "c".to_string(),
             error: "late error".to_string(),
         });
-        assert_eq!(state.display_status("c"), "stopped");
+        assert_eq!(state.display_status("c"), "not queued");
     }
 
     // -----------------------------------------------------------------------
@@ -1933,11 +1964,11 @@ mod tests {
         assert!(state.is_archived("a"));
         assert!(!state.is_pending("a"));
 
-        // ── Stop 'b' ───────────────────────────────────────────────────────
-        state.apply_command(ReducerCommand::StopChange("b".to_string()));
+        // ── Dequeue 'b' ────────────────────────────────────────────────────
+        state.apply_command(ReducerCommand::DequeueChange("b".to_string()));
 
-        // Reducer terminal = Stopped (shown as "stopped"); legacy pending unchanged by StopChange.
-        assert_eq!(state.display_status("b"), "stopped");
+        // Reducer returns b to not queued; legacy pending membership is unchanged.
+        assert_eq!(state.display_status("b"), "not queued");
         // 'c' (never explicitly queued in reducer) is still "not queued" in reducer.
         assert_eq!(state.display_status("c"), "not queued");
         assert!(state.is_pending("c")); // legacy: still in pending set
@@ -2345,25 +2376,22 @@ mod tests {
         );
     }
 
-    /// AddToQueue on a Stopped terminal change must clear the terminal and re-queue.
+    /// DequeueChange should clear runtime state to a non-terminal not-queued idle state.
     #[test]
-    fn test_add_to_queue_retries_stopped_terminal() {
+    fn test_dequeue_change_resets_to_not_queued_idle() {
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // Simulate a stop.
-        let outcome = state.apply_command(ReducerCommand::StopChange("c".to_string()));
-        // StopChange on a fresh (non-terminal) change produces a terminal.
+        // Start in queued/active-ish flow, then dequeue.
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        let outcome = state.apply_command(ReducerCommand::DequeueChange("c".to_string()));
         assert!(matches!(outcome, ReduceOutcome::Changed(_)));
-        assert_eq!(state.display_status("c"), "stopped");
-
-        // Retry via AddToQueue.
-        let outcome2 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
-        assert!(
-            matches!(outcome2, ReduceOutcome::Changed(_)),
-            "AddToQueue on stopped change must be Changed, not NoOp"
-        );
-        assert_eq!(state.display_status("c"), "queued");
+        assert_eq!(state.display_status("c"), "not queued");
         assert!(!state.is_terminal_change("c"));
+
+        // Explicit re-queue remains possible only by user action.
+        let outcome2 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(outcome2, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "queued");
     }
 
     /// AddToQueue on an Archived change must be a no-op (cannot re-queue a completed change).

@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { getProposalSessionWsUrl } from './restClient';
+import { getProposalSessionWsUrl, stopAndDequeueChange } from './restClient';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe('getProposalSessionWsUrl', () => {
   it('returns ws:// URL targeting /api/v1/proposal-sessions/{sessionId}/ws', () => {
@@ -18,5 +22,31 @@ describe('getProposalSessionWsUrl', () => {
     // The old (broken) path included /projects/{projectId}/ — ensure it's gone
     expect(url).not.toContain('/projects/');
     expect(url).not.toContain('proj-1');
+  });
+});
+
+describe('stopAndDequeueChange', () => {
+  it('calls stop-and-dequeue endpoint and returns parsed payload', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        change_id: 'change-a',
+        selected: false,
+        status: 'not queued',
+      }),
+    });
+
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    await expect(stopAndDequeueChange('project-1', 'change-a')).resolves.toEqual({
+      change_id: 'change-a',
+      selected: false,
+      status: 'not queued',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/projects/project-1/changes/change-a/stop-and-dequeue',
+      expect.objectContaining({ method: 'POST' }),
+    );
   });
 });

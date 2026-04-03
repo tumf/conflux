@@ -136,7 +136,7 @@ impl ParallelExecutor {
                 info!("Change '{}' stopped before dispatch", change_id);
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::ChangeStopped {
+                    ParallelEvent::ChangeDequeued {
                         change_id: change_id.clone(),
                     },
                 )
@@ -425,7 +425,7 @@ impl ParallelExecutor {
                         info!("Change '{}' stopped during execution", change_id);
                         if let Some(ref tx) = event_tx {
                             let _ = tx
-                                .send(ParallelEvent::ChangeStopped {
+                                .send(ParallelEvent::ChangeDequeued {
                                     change_id: change_id.clone(),
                                 })
                                 .await;
@@ -502,7 +502,7 @@ impl ParallelExecutor {
                                     info!("Change '{}' stopped during apply", change_id);
                                     if let Some(ref tx) = event_tx {
                                         let _ = tx
-                                            .send(ParallelEvent::ChangeStopped {
+                                            .send(ParallelEvent::ChangeDequeued {
                                                 change_id: change_id.clone(),
                                             })
                                             .await;
@@ -784,7 +784,7 @@ impl ParallelExecutor {
                                         ))
                                         .await;
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeStopped {
+                                        .send(ParallelEvent::ChangeDequeued {
                                             change_id: change_id.clone(),
                                         })
                                         .await;
@@ -823,7 +823,7 @@ impl ParallelExecutor {
                                 info!("Change '{}' stopped during acceptance", change_id);
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeStopped {
+                                        .send(ParallelEvent::ChangeDequeued {
                                             change_id: change_id.clone(),
                                         })
                                         .await;
@@ -865,7 +865,7 @@ impl ParallelExecutor {
                                     info!("Change '{}' stopped during acceptance", change_id);
                                     if let Some(ref tx) = event_tx {
                                         let _ = tx
-                                            .send(ParallelEvent::ChangeStopped {
+                                            .send(ParallelEvent::ChangeDequeued {
                                                 change_id: change_id.clone(),
                                             })
                                             .await;
@@ -956,7 +956,7 @@ impl ParallelExecutor {
                                 info!("Change '{}' stopped during archive", change_id);
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeStopped {
+                                        .send(ParallelEvent::ChangeDequeued {
                                             change_id: change_id.clone(),
                                         })
                                         .await;

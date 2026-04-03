@@ -6,6 +6,7 @@ export type ProjectStatus = 'idle' | 'running' | 'stopped';
 export type OrchestrationStatus = 'idle' | 'running' | 'stopped';
 export type ChangeStatus =
   | 'idle'
+  | 'not queued'
   | 'queued'
   | 'applying'
   | 'accepting'
