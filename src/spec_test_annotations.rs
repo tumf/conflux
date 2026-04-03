@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
@@ -15,6 +16,14 @@ pub enum SpecTestAnnotationError {
 }
 
 type Result<T> = std::result::Result<T, SpecTestAnnotationError>;
+
+static REQUIREMENT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^### Requirement:\s*(.+)\s*$").unwrap());
+static SCENARIO_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^#### Scenario:\s*(.+)\s*$").unwrap());
+static UI_ONLY_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)ui[-_ ]?only").unwrap());
+static ANNOTATION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"//\s*OPENSPEC:\s*(\S+)").unwrap());
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SpecScenarioRef {
@@ -139,7 +148,6 @@ fn finalize_scenario(
     current_requirement_slug: &Option<String>,
     spec_path_string: &str,
     spec_path: &Path,
-    ui_only_regex: &Regex,
     scenarios: &mut Vec<SpecScenario>,
 ) -> Result<()> {
     if let Some(scenario_title) = scenario_title {
@@ -154,7 +162,7 @@ fn finalize_scenario(
             .clone()
             .unwrap_or_else(|| slugify_heading(&requirement_title));
         let scenario_slug = slugify_heading(&scenario_title);
-        let ui_only = lines.iter().any(|line| ui_only_regex.is_match(line));
+        let ui_only = lines.iter().any(|line| UI_ONLY_REGEX.is_match(line));
 
         scenarios.push(SpecScenario {
             reference: SpecScenarioRef::new(
@@ -182,14 +190,8 @@ fn collect_spec_files(dir: &Path, specs: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn parse_spec_file(
-    spec_path: &Path,
-    repo_root: &Path,
-    ui_only_regex: &Regex,
-) -> Result<Vec<SpecScenario>> {
+fn parse_spec_file(spec_path: &Path, repo_root: &Path) -> Result<Vec<SpecScenario>> {
     let content = fs::read_to_string(spec_path)?;
-    let requirement_regex = Regex::new(r"^### Requirement:\s*(.+)\s*$").unwrap();
-    let scenario_regex = Regex::new(r"^#### Scenario:\s*(.+)\s*$").unwrap();
 
     let spec_path_relative = spec_path
         .strip_prefix(repo_root)
@@ -209,7 +211,7 @@ fn parse_spec_file(
     let mut current_lines: Vec<String> = Vec::new();
 
     for line in content.lines() {
-        if let Some(caps) = requirement_regex.captures(line) {
+        if let Some(caps) = REQUIREMENT_REGEX.captures(line) {
             finalize_scenario(
                 current_scenario.take(),
                 &current_lines,
@@ -217,7 +219,6 @@ fn parse_spec_file(
                 &current_requirement_slug,
                 &spec_path_string,
                 spec_path,
-                ui_only_regex,
                 &mut scenarios,
             )?;
             current_lines.clear();
@@ -227,7 +228,7 @@ fn parse_spec_file(
             continue;
         }
 
-        if let Some(caps) = scenario_regex.captures(line) {
+        if let Some(caps) = SCENARIO_REGEX.captures(line) {
             finalize_scenario(
                 current_scenario.take(),
                 &current_lines,
@@ -235,7 +236,6 @@ fn parse_spec_file(
                 &current_requirement_slug,
                 &spec_path_string,
                 spec_path,
-                ui_only_regex,
                 &mut scenarios,
             )?;
             current_lines.clear();
@@ -255,7 +255,6 @@ fn parse_spec_file(
         &current_requirement_slug,
         &spec_path_string,
         spec_path,
-        ui_only_regex,
         &mut scenarios,
     )?;
     Ok(scenarios)
@@ -266,10 +265,9 @@ fn collect_spec_scenarios(repo_root: &Path) -> Result<Vec<SpecScenario>> {
     let mut spec_files = Vec::new();
     collect_spec_files(&spec_root, &mut spec_files)?;
 
-    let ui_only_regex = Regex::new(r"(?i)ui[-_ ]?only").unwrap();
     let mut scenarios = Vec::new();
     for spec_file in spec_files {
-        scenarios.extend(parse_spec_file(&spec_file, repo_root, &ui_only_regex)?);
+        scenarios.extend(parse_spec_file(&spec_file, repo_root)?);
     }
     Ok(scenarios)
 }
@@ -318,13 +316,12 @@ fn collect_annotations(repo_root: &Path) -> Result<AnnotationScanResult> {
         }
     }
 
-    let annotation_regex = Regex::new(r"//\s*OPENSPEC:\s*(\S+)").unwrap();
     let mut result = AnnotationScanResult::default();
 
     for file_path in rs_files {
         let content = fs::read_to_string(&file_path)?;
         for (index, line) in content.lines().enumerate() {
-            if let Some(caps) = annotation_regex.captures(line) {
+            if let Some(caps) = ANNOTATION_REGEX.captures(line) {
                 let reference_text = caps.get(1).unwrap().as_str();
                 let location = format!("{}:{}", normalize_path(&file_path), index + 1);
                 match parse_reference(reference_text) {
