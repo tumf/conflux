@@ -98,15 +98,13 @@ pub(crate) fn create_local_git_repo_with_setup(
     std::fs::write(src.join("README.md"), "hello").unwrap();
     run_git(&["add", "."], &src);
     run_git(&["commit", "-m", "init"], &src);
+    run_git(&["init", "--bare", repo_path.to_str().unwrap()], parent);
     run_git(
-        &[
-            "clone",
-            "--bare",
-            src.to_str().unwrap(),
-            repo_path.to_str().unwrap(),
-        ],
-        parent,
+        &["remote", "add", "origin", repo_path.to_str().unwrap()],
+        &src,
     );
+    run_git(&["push", "origin", "main"], &src);
+    run_git(&["rev-parse", "--verify", "refs/heads/main"], &repo_path);
 
     repo_path
 }
