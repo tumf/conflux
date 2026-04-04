@@ -2200,7 +2200,7 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
     executor.set_persistent_lifetime();
 
     // Use an existing active change ID in this repository so list_changes_native can resolve it.
-    let change_id = "fix-parallel-acceptance-resume-archive-bypass";
+    let change_id = "refactor-tui-state-decompose";
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;

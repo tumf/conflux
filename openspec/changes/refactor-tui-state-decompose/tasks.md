@@ -10,3 +10,9 @@
 ## 3. 回帰確認
 - [x] 3.1 TUI state / runner 関連テストを実行し、主要フローに回帰がないことを確認する（確認: `cargo test --lib tui::state:: -- --nocapture` / `cargo test --lib tui::runner:: -- --nocapture` 成功）
 - [x] 3.2 画面操作・キュー操作・マージ操作の公開挙動に変更がないことを確認する（確認: 公開 API/CLI 変更なし、既存 TUI state テスト 99 件成功）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `cargo test` 全体実行で失敗している `parallel::tests::executor::test_idle_queue_addition_marks_reanalysis_and_enqueues_change` を修正し、動的キュー追加時に再解析フラグが立つことを回復する（確認: `src/parallel/tests/executor.rs` の change_id を現行有効 change に更新し、`cargo test test_idle_queue_addition_marks_reanalysis_and_enqueues_change -- --nocapture` 成功）
+- [x] 修正後に `cargo test` を再実行し、archive readiness の test ゲートを通す（確認: `cargo test` 成功）
+- [x] 通常コミット時に有効な pre-commit フック経路を確認し、必要なフック検証コマンド結果を記録する（確認: `git config --get core.hooksPath` は未設定（デフォルト `.git/hooks` 経路）、`prek run --all-files`（trim trailing whitespace / fix end of files / check yaml / check toml / check for added large files / rustfmt / clippy）成功）
