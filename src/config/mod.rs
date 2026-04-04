@@ -108,6 +108,27 @@ pub use crate::vcs::VcsBackend;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_test_lock() -> MutexGuard<'static, ()> {
+        static ENV_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_TEST_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    fn set_env_var<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(key: K, value: V) {
+        // SAFETY: All tests that mutate process-wide environment variables in this module
+        // take `env_test_lock()` first, ensuring serialized access.
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    fn remove_env_var<K: AsRef<std::ffi::OsStr>>(key: K) {
+        // SAFETY: All tests that mutate process-wide environment variables in this module
+        // take `env_test_lock()` first, ensuring serialized access.
+        unsafe { std::env::remove_var(key) }
+    }
 
     #[test]
     fn test_default_config() {
@@ -373,6 +394,8 @@ mod tests {
         use std::env;
         use tempfile::TempDir;
 
+        let _env_lock = env_test_lock();
+
         // Create a temporary directory with no config files
         let temp_dir = TempDir::new().unwrap();
 
@@ -382,8 +405,8 @@ mod tests {
         let original_home = env::var("HOME").ok();
 
         // Point XDG_CONFIG_HOME and HOME to temp directory (where no configs exist)
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
-        env::set_var("HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+        set_env_var("HOME", temp_dir.path());
         env::set_current_dir(temp_dir.path()).unwrap();
 
         // Load config - should fail validation due to missing required commands
@@ -392,12 +415,12 @@ mod tests {
         // Restore original directory and environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
         match original_home {
-            Some(val) => env::set_var("HOME", val),
-            None => env::remove_var("HOME"),
+            Some(val) => set_env_var("HOME", val),
+            None => remove_env_var("HOME"),
         }
 
         // Should return error when no config exists (no fallback to defaults)
@@ -411,6 +434,8 @@ mod tests {
         use std::env;
         use std::fs;
         use tempfile::TempDir;
+
+        let _env_lock = env_test_lock();
 
         // Create a temporary directory
         let temp_dir = TempDir::new().unwrap();
@@ -435,8 +460,8 @@ mod tests {
         let original_home = env::var("HOME").ok();
 
         // Point XDG_CONFIG_HOME and HOME to temp directory (where no global configs exist)
-        env::set_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
-        env::set_var("HOME", temp_dir.path());
+        set_env_var("XDG_CONFIG_HOME", temp_dir.path().join("config"));
+        set_env_var("HOME", temp_dir.path());
         env::set_current_dir(temp_dir.path()).unwrap();
 
         // Load config (should use project config)
@@ -445,12 +470,12 @@ mod tests {
         // Restore original directory and environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
         match original_home {
-            Some(val) => env::set_var("HOME", val),
-            None => env::remove_var("HOME"),
+            Some(val) => set_env_var("HOME", val),
+            None => remove_env_var("HOME"),
         }
 
         // Project config should be used
@@ -1035,21 +1060,21 @@ mod tests {
 
     #[test]
     fn test_get_xdg_env_config_path() {
-        use std::env;
+        let _env_lock = env_test_lock();
 
         // Test without XDG_CONFIG_HOME
-        env::remove_var("XDG_CONFIG_HOME");
+        remove_env_var("XDG_CONFIG_HOME");
         assert!(super::get_xdg_env_config_path().is_none());
 
         // Test with XDG_CONFIG_HOME set
-        env::set_var("XDG_CONFIG_HOME", "/custom/config");
+        set_env_var("XDG_CONFIG_HOME", "/custom/config");
         let result = super::get_xdg_env_config_path();
         assert!(result.is_some());
         let path = result.unwrap();
         assert_eq!(path.to_str().unwrap(), "/custom/config/cflx/config.jsonc");
 
         // Clean up
-        env::remove_var("XDG_CONFIG_HOME");
+        remove_env_var("XDG_CONFIG_HOME");
     }
 
     #[test]
@@ -1085,6 +1110,8 @@ mod tests {
         use std::env;
         use std::fs;
         use tempfile::TempDir;
+
+        let _env_lock = env_test_lock();
 
         // Create temporary directories for XDG and platform configs
         let xdg_dir = TempDir::new().unwrap();
@@ -1126,7 +1153,7 @@ mod tests {
         let original_dir = env::current_dir().unwrap();
 
         // Set XDG_CONFIG_HOME and change to work directory (no project config)
-        env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        set_env_var("XDG_CONFIG_HOME", xdg_dir.path());
         env::set_current_dir(work_dir.path()).unwrap();
 
         // Load config - should prefer XDG path
@@ -1135,8 +1162,8 @@ mod tests {
         // Restore environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
 
         // XDG config should be loaded
@@ -1153,6 +1180,8 @@ mod tests {
         use std::env;
         use tempfile::TempDir;
 
+        let _env_lock = env_test_lock();
+
         // Create temporary work directory with no config files
         let work_dir = TempDir::new().unwrap();
 
@@ -1162,7 +1191,7 @@ mod tests {
 
         // Set XDG_CONFIG_HOME to non-existent path
         let nonexistent = work_dir.path().join("nonexistent");
-        env::set_var("XDG_CONFIG_HOME", &nonexistent);
+        set_env_var("XDG_CONFIG_HOME", &nonexistent);
         env::set_current_dir(work_dir.path()).unwrap();
 
         // Load config - should fail due to missing required commands
@@ -1171,8 +1200,8 @@ mod tests {
         // Restore environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
 
         // Should return error since no config files exist with required commands
@@ -1187,6 +1216,8 @@ mod tests {
         use std::env;
         use std::fs;
         use tempfile::TempDir;
+
+        let _env_lock = env_test_lock();
 
         // Create temporary directories
         let xdg_dir = TempDir::new().unwrap();
@@ -1219,7 +1250,7 @@ mod tests {
         let original_dir = env::current_dir().unwrap();
 
         // Set XDG_CONFIG_HOME and change to work directory
-        env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        set_env_var("XDG_CONFIG_HOME", xdg_dir.path());
         env::set_current_dir(work_dir.path()).unwrap();
 
         // Load config - should prefer project config for apply_command
@@ -1228,8 +1259,8 @@ mod tests {
         // Restore environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
 
         // Project config should take priority for apply_command
@@ -1251,6 +1282,8 @@ mod tests {
         use std::env;
         use std::fs;
         use tempfile::TempDir;
+
+        let _env_lock = env_test_lock();
 
         // Create temporary directories
         let xdg_dir = TempDir::new().unwrap();
@@ -1282,7 +1315,7 @@ mod tests {
         let original_dir = env::current_dir().unwrap();
 
         // Set XDG_CONFIG_HOME and work directory
-        env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        set_env_var("XDG_CONFIG_HOME", xdg_dir.path());
         env::set_current_dir(work_dir.path()).unwrap();
 
         // Load config (should merge project and global)
@@ -1291,8 +1324,8 @@ mod tests {
         // Restore environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
 
         // Project config should override apply_command
@@ -1320,6 +1353,8 @@ mod tests {
         use std::env;
         use std::fs;
         use tempfile::TempDir;
+
+        let _env_lock = env_test_lock();
 
         // Create temporary directories
         let xdg_dir = TempDir::new().unwrap();
@@ -1358,7 +1393,7 @@ mod tests {
         let original_dir = env::current_dir().unwrap();
 
         // Set XDG_CONFIG_HOME and work directory
-        env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        set_env_var("XDG_CONFIG_HOME", xdg_dir.path());
         env::set_current_dir(work_dir.path()).unwrap();
 
         // Load config (should deep merge hooks)
@@ -1367,8 +1402,8 @@ mod tests {
         // Restore environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
 
         let hooks = config.get_hooks();
@@ -1493,6 +1528,8 @@ mod tests {
         use std::fs;
         use tempfile::TempDir;
 
+        let _env_lock = env_test_lock();
+
         // Create temporary directories for XDG env and default paths
         let xdg_env_dir = TempDir::new().unwrap();
         let xdg_default_dir = TempDir::new().unwrap();
@@ -1535,8 +1572,8 @@ mod tests {
         let original_dir = env::current_dir().unwrap();
 
         // Set XDG_CONFIG_HOME (env) and HOME (for default path)
-        env::set_var("XDG_CONFIG_HOME", xdg_env_dir.path());
-        env::set_var("HOME", xdg_default_dir.path());
+        set_env_var("XDG_CONFIG_HOME", xdg_env_dir.path());
+        set_env_var("HOME", xdg_default_dir.path());
         env::set_current_dir(work_dir.path()).unwrap();
 
         // Load config - XDG env should take priority over XDG default
@@ -1545,12 +1582,12 @@ mod tests {
         // Restore environment
         env::set_current_dir(original_dir).unwrap();
         match original_xdg {
-            Some(val) => env::set_var("XDG_CONFIG_HOME", val),
-            None => env::remove_var("XDG_CONFIG_HOME"),
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
         match original_home {
-            Some(val) => env::set_var("HOME", val),
-            None => env::remove_var("HOME"),
+            Some(val) => set_env_var("HOME", val),
+            None => remove_env_var("HOME"),
         }
 
         // XDG env config should be loaded (higher priority)
