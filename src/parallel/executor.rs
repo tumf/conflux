@@ -1031,11 +1031,6 @@ pub async fn execute_acceptance_in_workspace(
             change_id, revision_for_attempt
         );
 
-        mark_acceptance_passed(workspace_path, &revision_for_attempt)?;
-        info!(
-            "Durable acceptance state updated to passed for {} (revision={})",
-            change_id, revision_for_attempt
-        );
         // Reset acceptance tail injection flag so next apply can receive new output
         acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1082,6 +1077,11 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
+            mark_acceptance_passed(workspace_path, &revision_for_attempt)?;
+            info!(
+                "Durable acceptance state updated to passed for {} (revision={})",
+                change_id, revision_for_attempt
+            );
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 

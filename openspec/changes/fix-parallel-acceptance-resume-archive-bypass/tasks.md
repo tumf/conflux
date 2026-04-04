@@ -8,6 +8,11 @@
 - [x] 6. 再現ケースに対応する parallel resume 回帰テストを追加する (verification: acceptance 開始後に中断した workspace を再開すると archive ではなく acceptance に戻ることを `cargo test` で確認できる)
 - [x] 7. 実装後に品質ゲートを実行する (verification: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
 
+## Acceptance #1 Failure Follow-up
+
+- [x] acceptance command の非ゼロ終了時に durable acceptance state を `passed` へ上書きしないよう修正する
+- [x] acceptance command 失敗時に archive guard が archive を抑止する回帰テストを追加する
+
 ## Future Work
 
 - 実運用ログで同種の中断ケースが再発しないことの継続監視
