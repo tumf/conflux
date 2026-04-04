@@ -835,3 +835,51 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
 
     info!(session_id = %session_id, "Proposal session WebSocket disconnected");
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::server::api::test_support::make_router;
+
+    #[tokio::test]
+    async fn test_proposal_session_ws_route_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/proposal-sessions/test-session-id/ws")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Proposal session WS route must be registered at /api/v1/proposal-sessions/{{session_id}}/ws"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proposal_session_ws_old_route_does_not_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/some-project/proposal-sessions/test-session-id/ws")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "Old project-scoped WS route should NOT exist"
+        );
+    }
+}
