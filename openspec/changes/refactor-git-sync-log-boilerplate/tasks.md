@@ -10,3 +10,8 @@
 - [x] 3.1 git sync / resolve 関連テストを実行し、ログとレスポンスに回帰がないことを確認する（確認: 関連テスト成功）
 - [x] 3.2 サーバーAPIの公開仕様に変更がないことを確認する（確認: API/CLI変更なし）
 
+## Acceptance #4 Failure Follow-up
+- [x] `.cflx/` 配下の生成物（`acceptance-state.json`）を整理し、不要な未追跡ファイルを解消する
+- [x] `cargo fmt --all` を実行して `src/server/api/git_sync.rs` のテストコード整形差分を解消する
+- [x] `parallel::tests::executor::test_idle_queue_addition_marks_reanalysis_and_enqueues_change` の前提change_idを現行リポジトリ構成に合わせて修正し、`cargo test` を通す
+

@@ -816,9 +816,15 @@ mod tests {
             .filter(|entry| entry.project_id.as_deref() == Some("p1"))
             .collect();
 
-        assert_eq!(resolve_entries.len(), 4, "expected start/stdout/stderr/finished logs");
+        assert_eq!(
+            resolve_entries.len(),
+            4,
+            "expected start/stdout/stderr/finished logs"
+        );
         assert_eq!(resolve_entries[0].level, "info");
-        assert!(resolve_entries[0].message.starts_with("resolve_command started:"));
+        assert!(resolve_entries[0]
+            .message
+            .starts_with("resolve_command started:"));
         assert_eq!(resolve_entries[1].level, "info");
         assert_eq!(resolve_entries[1].message, "stdout-line");
         assert_eq!(resolve_entries[2].level, "warn");
@@ -828,11 +834,9 @@ mod tests {
             resolve_entries[3].message,
             "resolve_command finished: exit_code=Some(0)"
         );
-        assert!(
-            resolve_entries
-                .iter()
-                .all(|entry| entry.operation.as_deref() == Some("resolve"))
-        );
+        assert!(resolve_entries
+            .iter()
+            .all(|entry| entry.operation.as_deref() == Some("resolve")));
     }
 
     #[tokio::test]
@@ -841,9 +845,14 @@ mod tests {
         let state = make_state(&temp_dir, None);
         let mut log_rx = state.log_tx.subscribe();
 
-        let (ran, exit_code) =
-            run_resolve_command("printf 'ok\\n'; exit 7", temp_dir.path(), "prompt", Some(&state), Some("p2"))
-                .await;
+        let (ran, exit_code) = run_resolve_command(
+            "printf 'ok\\n'; exit 7",
+            temp_dir.path(),
+            "prompt",
+            Some(&state),
+            Some("p2"),
+        )
+        .await;
 
         assert!(ran);
         assert_eq!(exit_code, Some(7));
@@ -854,7 +863,11 @@ mod tests {
             .filter(|entry| entry.project_id.as_deref() == Some("p2"))
             .collect();
 
-        assert_eq!(resolve_entries.len(), 3, "expected start/stdout/finished logs");
+        assert_eq!(
+            resolve_entries.len(),
+            3,
+            "expected start/stdout/finished logs"
+        );
         assert_eq!(resolve_entries[2].level, "error");
         assert_eq!(
             resolve_entries[2].message,
