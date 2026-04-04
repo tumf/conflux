@@ -45,6 +45,35 @@ class OpenSpecManager:
         self.archive_dir = self.changes_dir / "archive"
         self.specs_dir = self.root_dir / "openspec" / "specs"
 
+    _OBSOLETE_ARTIFACTS = [
+        (
+            "openspec/AGENTS.md",
+            "openspec/AGENTS.md is obsolete; Conflux skills embed all required conventions",
+        ),
+        (
+            "openspec/project.md",
+            "openspec/project.md is obsolete; use .cflx.jsonc for project configuration",
+        ),
+    ]
+
+    def check_obsolete_artifacts(self) -> List[str]:
+        """Warn about obsolete OpenSpec artifacts that should be removed."""
+        warnings = []
+        for rel_path, message in self._OBSOLETE_ARTIFACTS:
+            if (self.root_dir / rel_path).exists():
+                warnings.append(f"OBSOLETE: {message}")
+
+        agents_md = self.root_dir / "AGENTS.md"
+        if agents_md.exists():
+            content = agents_md.read_text(encoding="utf-8")
+            if "<!-- OPENSPEC:START -->" in content:
+                warnings.append(
+                    "OBSOLETE: AGENTS.md contains <!-- OPENSPEC:START --> markers; "
+                    "these inline OpenSpec instructions are obsolete and should be removed"
+                )
+
+        return warnings
+
     def _is_valid_change_dir(self, change_dir: Path) -> bool:
         """Return True when directory is a valid change (has proposal.md)."""
         return (change_dir / "proposal.md").exists()
@@ -621,6 +650,10 @@ def main():
     manager = OpenSpecManager()
 
     try:
+        obsolete_warnings = manager.check_obsolete_artifacts()
+        for warning in obsolete_warnings:
+            print(f"{Colors.YELLOW}! {warning}{Colors.RESET}", file=sys.stderr)
+
         if args.command == "list":
             changes = manager.list_changes(
                 show_specs=args.specs, include_archived=args.archived

@@ -18,9 +18,7 @@ $ARGUMENTS
 **Guardrails**
 - Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
 - Keep changes tightly scoped to the requested outcome.
-- Do not run `openspec apply` (the command does not exist).
-- Do not run `/cflx-archive`, `openspec archive`, or any archive command during apply. Archiving is handled by the orchestrator.
-- Refer to `openspec/AGENTS.md` (located inside the `openspec/` directory—run `ls openspec` or `npx @fission-ai/openspec@latest update` if you don't see it) if you need additional OpenSpec conventions or clarifications.
+- Do not run any archive command during apply. Archiving is handled by the orchestrator.
 
 **Steps**
 Track these steps as TODOs and complete them one by one.
@@ -37,10 +35,10 @@ Track these steps as TODOs and complete them one by one.
 7. Never treat `openspec/` edits alone as sufficient evidence for an implementation task.
 8. If a task is broader than what can be truthfully completed, split/refine the task in `tasks.md` before marking anything complete.
 9. Update the checklist after all work is done so each task marked `- [x]` reflects repository reality, not intent.
-10. Reference `npx @fission-ai/openspec@latest list` or `npx @fission-ai/openspec@latest show <item>` when additional context is required.
+10. Reference `python3 "<SKILL_ROOT>/scripts/cflx.py" list` or `python3 "<SKILL_ROOT>/scripts/cflx.py" show <item>` when additional context is required.
 
 **Reference**
-- Use `npx @fission-ai/openspec@latest show <id> --json --deltas-only` if you need additional context from the proposal while implementing.
+- Use `python3 "<SKILL_ROOT>/scripts/cflx.py" show <id> --json --deltas-only` if you need additional context from the proposal while implementing.
 
 <system-reminder>
 Your operational mode has changed from plan to build.
