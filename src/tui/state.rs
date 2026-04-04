@@ -23,8 +23,13 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+mod log_logic;
+mod selection_logic;
+mod worktree_logic;
 
 fn apply_remote_status(change: &mut ChangeState, status: &str) {
     // Avoid regressing active/terminal states based on laggy remote snapshots.
@@ -498,7 +503,7 @@ impl AppState {
         }
 
         // Extract change_id from worktree branch name
-        let change_id_opt = if !worktree.branch.is_empty() && !worktree.is_detached {
+        let change_id_opt = if worktree_logic::can_extract_change_id_from_worktree(worktree) {
             GitWorkspaceManager::extract_change_id_from_worktree_name(&worktree.branch)
         } else {
             None
@@ -508,12 +513,7 @@ impl AppState {
         if let Some(change_id) = change_id_opt {
             if let Some(change) = self.changes.iter().find(|c| c.id == change_id) {
                 // Block deletion if change is in active processing states
-                let is_active = matches!(
-                    change.display_status_cache.as_str(),
-                    "queued" | "applying" | "archiving" | "resolving" | "accepting" | "merge wait"
-                );
-
-                if is_active {
+                if worktree_logic::is_change_in_active_state(change) {
                     self.warning_message = Some(format!(
                         "Cannot delete worktree: change '{}' is {}",
                         change_id,
@@ -743,17 +743,7 @@ impl AppState {
     }
 
     fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
-        if matches!(self.mode, AppMode::Running) && change.is_active_display_status() {
-            return false;
-        }
-
-        guards::validate_change_toggleable(
-            change.is_parallel_eligible,
-            self.parallel_mode,
-            &change.display_status_cache,
-            &change.id,
-        )
-        .is_allowed()
+        selection_logic::can_bulk_toggle_change(self.mode.clone(), self.parallel_mode, change)
     }
 
     /// Returns true when at least one change can be targeted by bulk toggle.
@@ -1344,26 +1334,16 @@ impl AppState {
         self.logs.push(entry);
 
         // Handle buffer trimming when exceeding max entries
-        if self.logs.len() > MAX_LOG_ENTRIES {
+        if log_logic::apply_log_buffer_limit(self.logs.len(), MAX_LOG_ENTRIES) {
             self.logs.remove(0);
         }
 
         // Auto-scroll to bottom if enabled, otherwise freeze view position
-        if self.log_auto_scroll {
-            self.log_scroll_offset = 0;
-        } else {
-            // When auto-scroll is disabled, freeze the displayed log range
-            // by incrementing offset for new log additions
-            self.log_scroll_offset += 1;
-
-            // When buffer is trimmed, we don't decrement offset because we want
-            // to keep showing the same log content (freeze position)
-            // However, if trimming pushed us out of range, clamp to oldest available
-            let max_offset = self.logs.len().saturating_sub(1);
-            if self.log_scroll_offset > max_offset {
-                self.log_scroll_offset = max_offset;
-            }
-        }
+        self.log_scroll_offset = log_logic::next_log_offset_on_append(
+            self.log_auto_scroll,
+            self.log_scroll_offset,
+            self.logs.len(),
+        );
     }
 
     /// Scroll logs up by a page (show older entries)
