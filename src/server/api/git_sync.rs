@@ -38,6 +38,22 @@ fn emit_log_entry(state: &AppState, entry: RemoteLogEntry) {
     let _ = state.log_tx.send(entry);
 }
 
+fn build_resolve_log_entry(project_id: &str, level: &str, message: String) -> RemoteLogEntry {
+    RemoteLogEntry {
+        message,
+        level: level.to_string(),
+        change_id: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        project_id: Some(project_id.to_string()),
+        operation: Some("resolve".to_string()),
+        iteration: None,
+    }
+}
+
+fn emit_resolve_log(state: &AppState, project_id: &str, level: &str, message: String) {
+    emit_log_entry(state, build_resolve_log_entry(project_id, level, message));
+}
+
 pub(super) async fn run_resolve_command(
     resolve_command_template: &str,
     work_dir: &std::path::Path,
@@ -57,17 +73,11 @@ pub(super) async fn run_resolve_command(
 
     // Send start event to project log
     if let (Some(state), Some(pid)) = (state, project_id) {
-        emit_log_entry(
+        emit_resolve_log(
             state,
-            RemoteLogEntry {
-                message: format!("resolve_command started: {}", command_str),
-                level: "info".to_string(),
-                change_id: None,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                project_id: Some(pid.to_string()),
-                operation: Some("resolve".to_string()),
-                iteration: None,
-            },
+            pid,
+            "info",
+            format!("resolve_command started: {}", command_str),
         );
     }
 
@@ -84,17 +94,11 @@ pub(super) async fn run_resolve_command(
                 resolve_command_template, e
             );
             if let (Some(state), Some(pid)) = (state, project_id) {
-                emit_log_entry(
+                emit_resolve_log(
                     state,
-                    RemoteLogEntry {
-                        message: format!("resolve_command failed to start: {}", e),
-                        level: "error".to_string(),
-                        change_id: None,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        project_id: Some(pid.to_string()),
-                        operation: Some("resolve".to_string()),
-                        iteration: None,
-                    },
+                    pid,
+                    "error",
+                    format!("resolve_command failed to start: {}", e),
                 );
             }
             return (true, Some(-1));
@@ -118,36 +122,14 @@ pub(super) async fn run_resolve_command(
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if !line.is_empty() {
-                emit_log_entry(
-                    state,
-                    RemoteLogEntry {
-                        message: line.to_string(),
-                        level: "info".to_string(),
-                        change_id: None,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        project_id: Some(pid.to_string()),
-                        operation: Some("resolve".to_string()),
-                        iteration: None,
-                    },
-                );
+                emit_resolve_log(state, pid, "info", line.to_string());
             }
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         for line in stderr.lines() {
             if !line.is_empty() {
-                emit_log_entry(
-                    state,
-                    RemoteLogEntry {
-                        message: line.to_string(),
-                        level: "warn".to_string(),
-                        change_id: None,
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        project_id: Some(pid.to_string()),
-                        operation: Some("resolve".to_string()),
-                        iteration: None,
-                    },
-                );
+                emit_resolve_log(state, pid, "warn", line.to_string());
             }
         }
 
@@ -157,17 +139,11 @@ pub(super) async fn run_resolve_command(
         } else {
             "error"
         };
-        emit_log_entry(
+        emit_resolve_log(
             state,
-            RemoteLogEntry {
-                message: format!("resolve_command finished: exit_code={:?}", exit_code),
-                level: level.to_string(),
-                change_id: None,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                project_id: Some(pid.to_string()),
-                operation: Some("resolve".to_string()),
-                iteration: None,
-            },
+            pid,
+            level,
+            format!("resolve_command finished: exit_code={:?}", exit_code),
         );
     }
 
@@ -643,13 +619,29 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tempfile::TempDir;
+    use tokio::sync::broadcast::{error::TryRecvError, Receiver};
     use tower::ServiceExt;
+
+    use crate::remote::types::RemoteLogEntry;
 
     use crate::server::api::test_support::{
         create_local_git_repo, init_bare_repo_with_commit, make_state,
     };
     use crate::server::api::{build_router, AppState, OrchestrationStatus, SERVER_LOG_BUFFER_SIZE};
     use crate::server::registry::create_shared_registry;
+
+    fn drain_log_entries(log_rx: &mut Receiver<RemoteLogEntry>) -> Vec<RemoteLogEntry> {
+        let mut entries = Vec::new();
+        loop {
+            match log_rx.try_recv() {
+                Ok(entry) => entries.push(entry),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Closed) => break,
+            }
+        }
+        entries
+    }
 
     #[test]
     fn test_build_resolve_command_argv_replaces_prompt_placeholder_as_single_arg() {
@@ -801,6 +793,85 @@ mod tests {
         assert_eq!(
             content, multiline_prompt,
             "Multi-line prompt should be passed intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_resolve_command_logs_start_stdout_stderr_finished_in_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut state = make_state(&temp_dir, None);
+        let mut log_rx = state.log_tx.subscribe();
+        state.resolve_command = Some("echo unused".to_string());
+
+        let command = "printf 'stdout-line\\n'; printf 'stderr-line\\n' >&2; exit 0";
+        let (ran, exit_code) =
+            run_resolve_command(command, temp_dir.path(), "prompt", Some(&state), Some("p1")).await;
+
+        assert!(ran, "resolve_command should have been attempted");
+        assert_eq!(exit_code, Some(0));
+
+        let entries = drain_log_entries(&mut log_rx);
+        let resolve_entries: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.project_id.as_deref() == Some("p1"))
+            .collect();
+
+        assert_eq!(
+            resolve_entries.len(),
+            4,
+            "expected start/stdout/stderr/finished logs"
+        );
+        assert_eq!(resolve_entries[0].level, "info");
+        assert!(resolve_entries[0]
+            .message
+            .starts_with("resolve_command started:"));
+        assert_eq!(resolve_entries[1].level, "info");
+        assert_eq!(resolve_entries[1].message, "stdout-line");
+        assert_eq!(resolve_entries[2].level, "warn");
+        assert_eq!(resolve_entries[2].message, "stderr-line");
+        assert_eq!(resolve_entries[3].level, "success");
+        assert_eq!(
+            resolve_entries[3].message,
+            "resolve_command finished: exit_code=Some(0)"
+        );
+        assert!(resolve_entries
+            .iter()
+            .all(|entry| entry.operation.as_deref() == Some("resolve")));
+    }
+
+    #[tokio::test]
+    async fn test_run_resolve_command_logs_error_level_on_non_zero_exit() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let mut log_rx = state.log_tx.subscribe();
+
+        let (ran, exit_code) = run_resolve_command(
+            "printf 'ok\\n'; exit 7",
+            temp_dir.path(),
+            "prompt",
+            Some(&state),
+            Some("p2"),
+        )
+        .await;
+
+        assert!(ran);
+        assert_eq!(exit_code, Some(7));
+
+        let entries = drain_log_entries(&mut log_rx);
+        let resolve_entries: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| entry.project_id.as_deref() == Some("p2"))
+            .collect();
+
+        assert_eq!(
+            resolve_entries.len(),
+            3,
+            "expected start/stdout/finished logs"
+        );
+        assert_eq!(resolve_entries[2].level, "error");
+        assert_eq!(
+            resolve_entries[2].message,
+            "resolve_command finished: exit_code=Some(7)"
         );
     }
 

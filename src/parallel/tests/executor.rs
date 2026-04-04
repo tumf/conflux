@@ -2204,11 +2204,13 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
         return;
     }
 
+    let preferred_change_id = "refactor-git-sync-log-boilerplate";
     let change_id = all_changes
-        .first()
-        .expect("expected at least one change")
-        .id
-        .clone();
+        .iter()
+        .find(|change| change.id == preferred_change_id)
+        .map(|change| change.id.clone())
+        .or_else(|| all_changes.first().map(|change| change.id.clone()))
+        .expect("expected at least one change");
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
