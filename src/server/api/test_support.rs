@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use tempfile::TempDir;
@@ -42,24 +44,36 @@ pub(super) fn create_local_git_repo_with_setup(
     parent: &Path,
     setup_script: Option<&str>,
 ) -> PathBuf {
-    let repo_path = parent.join("test-origin");
-    let src = parent.join("test-src");
+    fn run_git(args: &[&str], current_dir: &Path) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(current_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: git {}\nstdout: {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let unique = format!(
+        "{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let repo_path = parent.join(format!("test-origin-{unique}"));
+    let src = parent.join(format!("test-src-{unique}"));
     std::fs::create_dir_all(&src).unwrap();
-    std::process::Command::new("git")
-        .args(["init", "-b", "main"])
-        .current_dir(&src)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(&src)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(&src)
-        .output()
-        .unwrap();
+
+    run_git(&["init", "-b", "main"], &src);
+    run_git(&["config", "user.email", "test@example.com"], &src);
+    run_git(&["config", "user.name", "Test"], &src);
 
     if let Some(script) = setup_script {
         let wt_dir = src.join(".wt");
@@ -76,25 +90,18 @@ pub(super) fn create_local_git_repo_with_setup(
     }
 
     std::fs::write(src.join("README.md"), "hello").unwrap();
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(&src)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["commit", "-m", "init"])
-        .current_dir(&src)
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args([
+    run_git(&["add", "."], &src);
+    run_git(&["commit", "-m", "init"], &src);
+    run_git(
+        &[
             "clone",
             "--bare",
             src.to_str().unwrap(),
             repo_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
+        ],
+        parent,
+    );
+
     repo_path
 }
 

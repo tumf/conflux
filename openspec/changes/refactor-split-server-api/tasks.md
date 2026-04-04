@@ -185,7 +185,7 @@
 - [x] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも `test_add_project_without_repo_root_setup_succeeds_without_marker` / `test_add_project_setup_failure_returns_422_and_rolls_back_registry` / `test_global_control_run_records_call` / `test_projects_state_includes_sync_metadata_fields_after_monitor_refresh` / `test_toggle_all_change_selection_remarks_error_changes_for_next_run` / `test_app_state_resolve_command_comes_from_top_level_config`）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [x] `Acceptance #1 Failure Follow-up` と実装タスク 13 の完了状態を実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` のまま残さない
 - [x] `server::api::tests::test_list_worktrees_with_real_project` が再び通るよう修正し、`cargo test --lib server::api` を再実行して全体成功を確認する
-- [ ] archive 前品質ゲートとして `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test` / `prek run --all-files` を再実行し、すべて成功した証拠を確認する（`cargo test` は `server::api::tests::test_sync_monitor_is_non_invasive_and_never_runs_sync_or_resolve` が flaky に 422 を返して失敗するため未達）
+- [ ] archive 前品質ゲートとして `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test` / `prek run --all-files` を再実行し、すべて成功した証拠を確認する（`cargo fmt --check` / `cargo clippy -- -D warnings` / `prek run --all-files` は通過。`cargo test` は不安定で、今回の実行では `config::tests::test_config_merge_partial_project_inherits_global` が `left: opencode ... right: global-agent archive ...` で失敗し未達）
 
 ## Rejecting Recovery Tasks
 
