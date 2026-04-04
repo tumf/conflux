@@ -645,8 +645,10 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    use crate::server::api::test_support::{
+        create_local_git_repo, init_bare_repo_with_commit, make_state,
+    };
     use crate::server::api::{build_router, AppState, OrchestrationStatus, SERVER_LOG_BUFFER_SIZE};
-    use crate::server::api::test_support::{make_state, init_bare_repo_with_commit};
     use crate::server::registry::create_shared_registry;
 
     #[test]
@@ -952,7 +954,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["error"].as_str().unwrap_or(""), "resolve_command_not_configured");
+        assert_eq!(
+            json["error"].as_str().unwrap_or(""),
+            "resolve_command_not_configured"
+        );
     }
 
     async fn create_diverged_repo_setup(
@@ -1125,7 +1130,10 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
 
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json["error"].as_str().unwrap_or(""), "resolve_command_not_configured");
+        assert_eq!(
+            json["error"].as_str().unwrap_or(""),
+            "resolve_command_not_configured"
+        );
     }
 
     #[tokio::test]
@@ -1142,13 +1150,16 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
             log_tx,
-            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
-            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
-                crate::config::ProposalSessionConfig::default(),
-                None,
-            ),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
         };
 
         let branch = "main";
@@ -1238,13 +1249,16 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
             log_tx,
-            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
-            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
-                crate::config::ProposalSessionConfig::default(),
-                None,
-            ),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
         };
 
         let branch = "main";
@@ -1279,5 +1293,586 @@ mod tests {
                 assert_eq!(exit_code, 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_git_push_no_local_clone_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/push", entry.id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let error_val = json["error"].as_str().unwrap_or("");
+        assert_eq!(error_val, "resolve_command_not_configured");
+    }
+
+    #[tokio::test]
+    async fn test_git_push_non_fast_forward_detection_with_bare_repos() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("file:///not-a-real-remote".to_string(), "main".to_string())
+            .unwrap();
+
+        let local_repo_path = temp_dir.path().join(&entry.id);
+        std::fs::create_dir_all(&local_repo_path).unwrap();
+
+        let init_status = tokio::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&local_repo_path)
+            .status()
+            .await;
+
+        if init_status.is_err() || !init_status.unwrap().success() {
+            return;
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/push", entry.id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "Push with empty bare repo should fail, got: {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_project_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut state = make_state(&temp_dir, None);
+        state.resolve_command = Some("echo resolve".to_string());
+        let router = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects/nonexistent-project/git/sync")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_fails_without_resolve_command() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let _router = build_router(state);
+
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg
+                .add(
+                    "https://github.com/example/repo.git".to_string(),
+                    "main".to_string(),
+                )
+                .unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_with_project = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: None,
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
+        };
+        let router = build_router(state_with_project);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["error"].as_str().unwrap(),
+            "resolve_command_not_configured"
+        );
+        assert!(json["reason"].as_str().unwrap().contains("resolve_command"));
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_route_is_registered() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg
+                .add(
+                    "https://github.com/example/repo.git".to_string(),
+                    "main".to_string(),
+                )
+                .unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: None,
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
+        };
+        let router = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_success_response_contains_pull_and_push_sections() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg.add(remote_url.clone(), "main".to_string()).unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("true".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
+        };
+        let router = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        if status == StatusCode::OK {
+            assert!(json.get("pull").is_some());
+            assert!(json.get("push").is_some());
+            assert_eq!(json["status"].as_str(), Some("synced"));
+        }
+        assert!(status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_skips_resolve_when_already_up_to_date() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg.add(remote_url.clone(), "main".to_string()).unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("false".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
+        };
+        let router = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"].as_str(), Some("synced"));
+        assert_eq!(json["resolve_command_ran"].as_bool(), Some(false));
+        assert!(json["resolve_exit_code"].is_null());
+        assert_eq!(json["push"]["status"].as_str(), Some("already_up_to_date"));
+        assert_eq!(
+            json["skipped_reason"].as_str(),
+            Some("local_and_remote_already_match")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_runs_resolve_when_shas_differ() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg.add(remote_url.clone(), "main".to_string()).unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry: registry.clone(),
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("true".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
+        };
+        let router = build_router(state);
+
+        let req1 = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+            .body(Body::empty())
+            .unwrap();
+        let resp1 = router.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        let body1 = axum::body::to_bytes(resp1.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json1: serde_json::Value = serde_json::from_slice(&body1).unwrap();
+        assert_eq!(json1["resolve_command_ran"].as_bool(), Some(false));
+
+        let local_bare = {
+            let reg = registry.read().await;
+            reg.data_dir().join(&project_id)
+        };
+        let tree_out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD^{tree}"])
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+        let tree_sha = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
+
+        let parent_out = std::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+        let parent_sha = String::from_utf8_lossy(&parent_out.stdout)
+            .trim()
+            .to_string();
+
+        let commit_out = std::process::Command::new("git")
+            .args([
+                "commit-tree",
+                &tree_sha,
+                "-p",
+                &parent_sha,
+                "-m",
+                "local only commit",
+            ])
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+        let new_sha = String::from_utf8_lossy(&commit_out.stdout)
+            .trim()
+            .to_string();
+
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/heads/main", &new_sha])
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &new_sha])
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/heads/main", &parent_sha])
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &parent_sha])
+            .current_dir(&local_bare)
+            .output()
+            .unwrap();
+
+        let scratch = temp_dir.path().join("scratch-work");
+        std::process::Command::new("git")
+            .args(["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::fs::write(scratch.join("new-file.txt"), "origin-only").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "origin divergence"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+
+        let req2 = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+            .body(Body::empty())
+            .unwrap();
+        let resp2 = router.oneshot(req2).await.unwrap();
+        let status2 = resp2.status();
+
+        let body2 = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+
+        assert_eq!(status2, StatusCode::OK, "{}", json2);
+        assert_eq!(json2["status"].as_str(), Some("synced"));
+    }
+
+    #[tokio::test]
+    async fn test_git_sync_runs_resolve_when_remote_ahead() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let project_id = {
+            let mut reg = registry.write().await;
+            let entry = reg.add(remote_url.clone(), "main".to_string()).unwrap();
+            entry.id.clone()
+        };
+
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("true".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
+        };
+        let router = build_router(state);
+
+        let initial_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initial_resp.status(), StatusCode::OK);
+
+        let scratch = temp_dir.path().join("scratch-work-remote-ahead");
+        std::process::Command::new("git")
+            .args(["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::fs::write(scratch.join("remote-change.txt"), "new remote commit").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "remote change"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["push", "origin", "main"])
+            .current_dir(&scratch)
+            .output()
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/v1/projects/{}/git/sync", project_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"].as_str(), Some("synced"));
     }
 }

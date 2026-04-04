@@ -873,4 +873,81 @@ mod tests {
         };
         assert_eq!(auth.resolve_token(), Some("fallback-token".to_string()));
     }
+
+    #[tokio::test]
+    async fn test_add_project_creates_worktree_on_server_branch() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = json["id"].as_str().expect("Response must have id field");
+
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(project_id)
+            .join("main");
+
+        assert!(
+            worktree_path.exists(),
+            "Worktree directory must exist at {:?}",
+            worktree_path
+        );
+
+        let head_output = std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD"])
+            .current_dir(&worktree_path)
+            .output();
+
+        if let Ok(out) = head_output {
+            if out.status.success() {
+                let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                assert_ne!(
+                    head, "refs/heads/main",
+                    "Worktree HEAD must NOT reference refs/heads/main (base branch). It must use a server-specific branch. Got: {}",
+                    head
+                );
+                let expected_prefix = format!("refs/heads/server-wt/{}/", project_id);
+                assert!(
+                    head.starts_with(&expected_prefix),
+                    "Worktree HEAD must start with '{}'. Got: {}",
+                    expected_prefix,
+                    head
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_worktree_branch_function_produces_correct_format() {
+        use crate::server::registry::server_worktree_branch;
+        let project_id = "abc123def456789a";
+        let base_branch = "main";
+        let branch = server_worktree_branch(project_id, base_branch);
+        assert_eq!(
+            branch, "server-wt/abc123def456789a/main",
+            "server_worktree_branch must produce 'server-wt/<project_id>/<base_branch>'"
+        );
+    }
 }

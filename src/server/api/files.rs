@@ -349,8 +349,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::server::api::test_support::{create_local_git_repo, make_router, make_state};
     use crate::server::api::build_router;
+    use crate::server::api::test_support::{create_local_git_repo, make_router, make_state};
 
     #[test]
     fn test_validate_relative_path_rejects_traversal() {
