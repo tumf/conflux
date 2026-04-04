@@ -180,7 +180,7 @@
 
 ## Acceptance #22 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（`git status --porcelain` が空であることを確認済み）
 - [x] `src/server/api/control.rs` で `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、`cargo clippy -- -D warnings` と `prek run --all-files` の `clippy::items-after-test-module` failure を解消する
 - [x] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも `test_add_project_without_repo_root_setup_succeeds_without_marker` / `test_add_project_setup_failure_returns_422_and_rolls_back_registry` / `test_global_control_run_records_call` / `test_projects_state_includes_sync_metadata_fields_after_monitor_refresh` / `test_toggle_all_change_selection_remarks_error_changes_for_next_run` / `test_app_state_resolve_command_comes_from_top_level_config`）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [x] `Acceptance #1 Failure Follow-up` と実装タスク 13 の完了状態を実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` のまま残さない
