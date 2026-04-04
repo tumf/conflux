@@ -514,50 +514,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_global_control_run_records_call() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = make_state(&temp_dir, None);
-
-        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
-
-        let entry = state
-            .registry
-            .write()
-            .await
-            .add("https://github.com/foo/bar".to_string(), "main".to_string())
-            .unwrap();
-
-        let worktree_path = temp_dir
-            .path()
-            .join("worktrees")
-            .join(&entry.id)
-            .join(&entry.branch)
-            .join("openspec/changes/fix-a");
-        std::fs::create_dir_all(&worktree_path).unwrap();
-        std::fs::write(worktree_path.join("proposal.md"), "# proposal\n").unwrap();
-
-        let router = build_router(state.clone());
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/control/run")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let calls = CONTROL_CALLS.get().unwrap().lock().unwrap();
-        assert!(calls
-            .iter()
-            .any(|(id, action)| id == "_global_" && action == "run"));
-        assert!(calls
-            .iter()
-            .any(|(id, action)| id == &entry.id && action == "run"));
-    }
-
-    #[tokio::test]
     async fn test_toggle_all_change_selection_remarks_error_changes_for_next_run() {
         let temp_dir = TempDir::new().unwrap();
         let state = make_state(&temp_dir, None);

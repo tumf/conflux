@@ -476,13 +476,15 @@ pub async fn delete_project(
 mod tests {
     use super::*;
 
+    use std::env;
+
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
     use crate::server::api::test_support::{
-        create_local_git_repo, make_state, run_sync_monitor_once_for_tests,
+        create_local_git_repo, make_router, make_state, run_sync_monitor_once_for_tests,
     };
 
     #[cfg(feature = "heavy-tests")]
@@ -591,6 +593,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_global_control_run_records_call() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("proposal.md"), "# proposal\n").unwrap();
+
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let calls = CONTROL_CALLS.get().unwrap().lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|(id, action)| id == "_global_" && action == "run"));
+        assert!(calls
+            .iter()
+            .any(|(id, action)| id == &entry.id && action == "run"));
+    }
+
+    #[tokio::test]
     async fn test_projects_state_includes_sync_metadata_fields_after_monitor_refresh() {
         let temp_dir = TempDir::new().unwrap();
         let origin = create_local_git_repo(temp_dir.path());
@@ -648,5 +694,117 @@ mod tests {
             Some("echo top-level-resolve".to_string()),
             "AppState resolve_command should come from top-level config resolve_command"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_version_returns_200() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/version")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_version_no_auth_required() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, Some("secret-token"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/version")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /api/v1/version must succeed without authentication even when auth is configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_version_response_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/version")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let version = json["version"]
+            .as_str()
+            .expect("Response must contain 'version' field as a string");
+        assert!(
+            !version.is_empty(),
+            "version field must not be empty, got: {:?}",
+            version
+        );
+    }
+
+    #[test]
+    fn test_server_auth_config_resolve_token_from_token_field() {
+        use crate::config::ServerAuthConfig;
+        let auth = ServerAuthConfig {
+            mode: crate::config::ServerAuthMode::BearerToken,
+            token: Some("direct-token".to_string()),
+            token_env: None,
+        };
+        assert_eq!(auth.resolve_token(), Some("direct-token".to_string()));
+    }
+
+    #[test]
+    fn test_server_auth_config_resolve_token_from_env_var() {
+        use crate::config::ServerAuthConfig;
+
+        let env_var_name = "CFLX_TEST_SERVER_TOKEN_UNIQUE_12345";
+        unsafe {
+            env::set_var(env_var_name, "env-token-value");
+        }
+
+        let auth = ServerAuthConfig {
+            mode: crate::config::ServerAuthMode::BearerToken,
+            token: Some("fallback-token".to_string()),
+            token_env: Some(env_var_name.to_string()),
+        };
+        assert_eq!(auth.resolve_token(), Some("env-token-value".to_string()));
+
+        unsafe {
+            env::remove_var(env_var_name);
+        }
+    }
+
+    #[test]
+    fn test_server_auth_config_resolve_token_falls_back_when_env_unset() {
+        use crate::config::ServerAuthConfig;
+
+        let env_var_name = "CFLX_TEST_SERVER_TOKEN_UNSET_UNIQUE_99999";
+        unsafe {
+            env::remove_var(env_var_name);
+        }
+
+        let auth = ServerAuthConfig {
+            mode: crate::config::ServerAuthMode::BearerToken,
+            token: Some("fallback-token".to_string()),
+            token_env: Some(env_var_name.to_string()),
+        };
+        assert_eq!(auth.resolve_token(), Some("fallback-token".to_string()));
     }
 }

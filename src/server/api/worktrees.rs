@@ -429,7 +429,8 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    use crate::server::api::test_support::{create_local_git_repo, make_router};
+    use crate::server::api::build_router;
+    use crate::server::api::test_support::{create_local_git_repo, make_router, make_state};
 
     #[tokio::test]
     async fn test_list_worktrees_with_real_project() {
@@ -476,6 +477,135 @@ mod tests {
         assert!(
             !worktrees.is_empty(),
             "Should have at least one worktree after project add"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_worktrees_project_not_found_returns_404() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/nonexistent/worktrees")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_worktrees_empty_for_registered_project() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/projects/{}/worktrees", entry.id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_delete_worktree_project_not_found_returns_404() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/projects/nonexistent/worktrees/some-branch")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_merge_worktree_project_not_found_returns_404() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects/nonexistent/worktrees/some-branch/merge")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_worktrees_project_not_found_returns_404() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects/nonexistent/worktrees/refresh")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_worktree_project_not_found_returns_404() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "change_id": "test-change"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects/nonexistent/worktrees")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_worktree_auth_required() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, Some("secret-token"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/some-id/worktrees")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Worktree endpoints should require authentication"
         );
     }
 }
