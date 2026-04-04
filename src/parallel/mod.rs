@@ -11,6 +11,7 @@
 //! - `dispatch`: per-change dispatch logic
 //! - `orchestration`: order-based re-analysis scheduler loop
 
+mod acceptance_state;
 mod builder;
 mod cleanup;
 mod conflict;

@@ -8,6 +8,10 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::parallel::output_bridge::ParallelApplyEventHandler;
 
+use super::acceptance_state::{
+    has_durable_acceptance_pass, mark_acceptance_failed, mark_acceptance_passed,
+    mark_acceptance_started, mark_apply_completed,
+};
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
 use crate::stall::StallDetector;
@@ -220,6 +224,12 @@ pub async fn execute_apply_in_workspace(
         Err(e) => return Err(e),
     };
 
+    mark_apply_completed(workspace_path, &apply_result.revision)?;
+    info!(
+        "Durable acceptance state updated to pending after apply for {} (revision={})",
+        change_id, apply_result.revision
+    );
+
     // Return revision, iteration count, and apply-blocked handoff metadata
     Ok((
         apply_result.revision,
@@ -301,6 +311,37 @@ pub async fn execute_archive_in_workspace(
             )));
         }
     };
+
+    let current_revision = crate::vcs::git::commands::get_current_commit(workspace_path)
+        .await
+        .map_err(|e| {
+            OrchestratorError::AgentCommand(format!(
+                "Cannot archive '{}' in workspace '{}': failed to resolve current revision for acceptance guard: {}",
+                change_id,
+                workspace_path.display(),
+                e
+            ))
+        })?;
+
+    let has_passed_guard = has_durable_acceptance_pass(workspace_path, &current_revision)?;
+    if !has_passed_guard {
+        warn!(
+            "Archive guard blocked for {} in '{}': durable acceptance-pass state missing or stale (revision={})",
+            change_id,
+            workspace_path.display(),
+            current_revision
+        );
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cannot archive '{}' in workspace '{}': durable acceptance-pass state missing for revision {}",
+            change_id,
+            workspace_path.display(),
+            current_revision
+        )));
+    }
+    info!(
+        "Archive guard passed for {} with durable acceptance-pass state (revision={})",
+        change_id, current_revision
+    );
 
     let stall_detector = StallDetector::new(config.get_stall_detection());
 
@@ -866,6 +907,13 @@ pub async fn execute_acceptance_in_workspace(
         "Executing acceptance command via AiCommandRunner: {} (cwd: {:?})", command, workspace_path
     );
 
+    let revision_for_attempt = commit_hash.clone().unwrap_or_else(|| "unknown".to_string());
+    mark_acceptance_started(workspace_path, &revision_for_attempt)?;
+    info!(
+        "Durable acceptance state updated to running for {} (revision={})",
+        change_id, revision_for_attempt
+    );
+
     // Send AcceptanceStarted event with command
     if let Some(ref tx) = event_tx {
         let _ = tx
@@ -977,6 +1025,12 @@ pub async fn execute_acceptance_in_workspace(
         // Record to both agent history (local) and shared acceptance history
         agent.record_acceptance_attempt(change_id, attempt.clone());
         acceptance_history.lock().await.record(change_id, attempt);
+        mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+        info!(
+            "Durable acceptance state updated to failed for {} (revision={})",
+            change_id, revision_for_attempt
+        );
+
         // Reset acceptance tail injection flag so next apply can receive new output
         acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1023,6 +1077,11 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
+            mark_acceptance_passed(workspace_path, &revision_for_attempt)?;
+            info!(
+                "Durable acceptance state updated to passed for {} (revision={})",
+                change_id, revision_for_attempt
+            );
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1060,6 +1119,11 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
+            mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+            info!(
+                "Durable acceptance state updated to failed for {} (revision={})",
+                change_id, revision_for_attempt
+            );
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1100,6 +1164,11 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
+            mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+            info!(
+                "Durable acceptance state updated to failed for {} (revision={})",
+                change_id, revision_for_attempt
+            );
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 
@@ -1156,6 +1225,11 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
+            mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+            info!(
+                "Durable acceptance state updated to failed for {} (revision={})",
+                change_id, revision_for_attempt
+            );
             // Reset acceptance tail injection flag so next apply can receive new output
             acceptance_tail_injected.lock().await.remove(change_id);
 

@@ -5,7 +5,8 @@ use crate::agent::AgentRunner;
 use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
-use crate::parallel::executor::execute_acceptance_in_workspace;
+use crate::parallel::executor::{execute_acceptance_in_workspace, execute_archive_in_workspace};
+use crate::vcs::git::commands::get_current_commit;
 #[cfg(feature = "heavy-tests")]
 use crate::vcs::GitWorkspaceManager;
 use crate::vcs::{VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo};
@@ -1655,6 +1656,121 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
 }
 
 #[tokio::test]
+async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
+    use tempfile::TempDir;
+
+    let repo_root = TempDir::new().unwrap();
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").unwrap();
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .unwrap();
+
+    let change_id = "change-a";
+    let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::write(
+        tasks_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] 1. done\n",
+    )
+    .unwrap();
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS; exit 9'".to_string()),
+        archive_command: Some("sh -c 'echo archive-ran > archive-ran.txt'".to_string()),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        change_id,
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .unwrap();
+
+    match result {
+        crate::orchestration::AcceptanceResult::CommandFailed { .. } => {}
+        other => panic!("expected acceptance command failure, got {:?}", other),
+    }
+
+    let revision = get_current_commit(repo_root.path()).await.unwrap();
+    assert!(
+        !crate::parallel::acceptance_state::has_durable_acceptance_pass(
+            repo_root.path(),
+            &revision
+        )
+        .unwrap(),
+        "durable acceptance state must not be passed after non-zero acceptance exit"
+    );
+
+    let archive_result = execute_archive_in_workspace(
+        change_id,
+        repo_root.path(),
+        acceptance_config.get_archive_command().unwrap(),
+        &acceptance_config,
+        None,
+        VcsBackend::Git,
+        None,
+        None,
+        None,
+        &ai_runner,
+        &Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+        &Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+        &shared_stagger_state,
+    )
+    .await;
+
+    let err = archive_result.expect_err("archive must be blocked without durable acceptance pass");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("durable acceptance-pass state missing"),
+        "expected archive guard error, got: {}",
+        err_msg
+    );
+
+    assert!(
+        !repo_root.path().join("archive-ran.txt").exists(),
+        "archive command must not execute when archive guard blocks"
+    );
+}
+
+#[tokio::test]
 async fn test_dynamic_queue_injection() {
     use crate::tui::queue::DynamicQueue;
     use std::sync::Arc;
@@ -2084,7 +2200,7 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
     executor.set_persistent_lifetime();
 
     // Use an existing active change ID in this repository so list_changes_native can resolve it.
-    let change_id = "split-rejecting-from-acceptance";
+    let change_id = "fix-parallel-acceptance-resume-archive-bypass";
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
