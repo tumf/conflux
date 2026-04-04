@@ -22,9 +22,9 @@ use crate::orchestration::{
     execute_rejection_flow, handle_resume_apply_from_rejecting, run_rejection_review,
     RejectionReviewVerdict,
 };
-use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
+use super::acceptance_state::acceptance_resume_ready_for_archive;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
@@ -39,38 +39,57 @@ use super::ParallelExecutor;
 mod tests {
     use super::{decide_resume_action, should_run_apply, ResumeAction};
     use crate::execution::state::WorkspaceState;
-    use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
-    #[test]
-    fn decide_resume_action_routes_applied_with_incomplete_tasks_to_apply() {
-        let tmp = TempDir::new().unwrap();
-        let tasks_dir = tmp.path().join("openspec/changes/change-incomplete");
-        fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(
-            tasks_dir.join("tasks.md"),
-            "## Implementation Tasks\n- [x] done\n- [ ] pending\n",
-        )
-        .unwrap();
-
-        let action =
-            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
-        assert_eq!(action, ResumeAction::Apply);
+    fn init_git_workspace(path: &std::path::Path) {
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::fs::write(path.join("README.md"), "resume test").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
     }
 
     #[test]
-    fn decide_resume_action_routes_applied_with_complete_tasks_to_acceptance() {
+    fn decide_resume_action_routes_applied_to_acceptance_without_state_file() {
         let tmp = TempDir::new().unwrap();
-        let tasks_dir = tmp.path().join("openspec/changes/change-complete");
-        fs::create_dir_all(&tasks_dir).unwrap();
-        fs::write(
-            tasks_dir.join("tasks.md"),
-            "## Implementation Tasks\n- [x] done\n- [x] done2\n",
-        )
-        .unwrap();
+        init_git_workspace(tmp.path());
+
+        let action =
+            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Acceptance);
+    }
+
+    #[test]
+    fn decide_resume_action_routes_applied_to_archive_with_passed_state() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let revision = super::resolve_current_revision_sync(tmp.path()).unwrap();
+        crate::parallel::acceptance_state::mark_acceptance_passed(tmp.path(), &revision).unwrap();
 
         let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
-        assert_eq!(action, ResumeAction::Acceptance);
+        assert_eq!(action, ResumeAction::Archive);
     }
 
     #[test]
@@ -95,6 +114,7 @@ pub(super) enum ResumeAction {
     Terminal,
     Apply,
     Acceptance,
+    Archive,
     Rejecting,
 }
 
@@ -105,17 +125,70 @@ pub(super) fn decide_resume_action(
 ) -> ResumeAction {
     match state {
         WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
-        WorkspaceState::Archiving => ResumeAction::Acceptance,
-        WorkspaceState::Rejecting => ResumeAction::Rejecting,
-        WorkspaceState::Applied => {
-            match task_parser::parse_progress_with_fallback(change_id, Some(workspace_path)) {
-                Ok(progress) if progress.total > 0 && progress.completed >= progress.total => {
+        WorkspaceState::Archiving | WorkspaceState::Applied => {
+            let current_revision = resolve_current_revision_sync(workspace_path);
+            let has_passed = current_revision
+                .as_deref()
+                .and_then(|revision| {
+                    acceptance_resume_ready_for_archive(workspace_path, revision)
+                        .map_err(|e| {
+                            warn!(
+                                "Failed to evaluate durable acceptance state for '{}' in '{}': {}",
+                                change_id,
+                                workspace_path.display(),
+                                e
+                            );
+                            e
+                        })
+                        .ok()
+                })
+                .unwrap_or(false);
+
+            if let Some(revision) = current_revision.as_deref() {
+                if has_passed {
+                    info!(
+                        "Resume route for '{}' allows archive continuation (durable acceptance-pass found, revision={})",
+                        change_id,
+                        revision
+                    );
+                    ResumeAction::Archive
+                } else {
+                    info!(
+                        "Resume route forcing acceptance for '{}' because durable acceptance-pass state is missing or stale (revision={})",
+                        change_id,
+                        revision
+                    );
                     ResumeAction::Acceptance
                 }
-                Ok(_) | Err(_) => ResumeAction::Apply,
+            } else {
+                info!(
+                    "Resume route forcing acceptance for '{}' because current revision could not be resolved for durable acceptance guard",
+                    change_id
+                );
+                ResumeAction::Acceptance
             }
         }
+        WorkspaceState::Rejecting => ResumeAction::Rejecting,
         WorkspaceState::Created | WorkspaceState::Applying { .. } => ResumeAction::Apply,
+    }
+}
+
+fn resolve_current_revision_sync(workspace_path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let revision = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if revision.is_empty() {
+        None
+    } else {
+        Some(revision)
     }
 }
 
@@ -534,7 +607,8 @@ impl ParallelExecutor {
                     }
                 }
             }
-            let mut skip_apply_once = matches!(resume_action, ResumeAction::Acceptance);
+            let mut skip_apply_once = matches!(resume_action, ResumeAction::Acceptance | ResumeAction::Archive);
+            let mut skip_acceptance_once = matches!(resume_action, ResumeAction::Archive);
 
             let _apply_revision = loop {
                 // Skip apply only for the first cycle when resuming from an already-applied state.
@@ -800,38 +874,53 @@ impl ParallelExecutor {
                         .await;
                 }
 
-                // Step 2: Execute acceptance test after apply succeeds
-                // IMPORTANT: Acceptance results are NOT persisted to disk or git commits.
-                // This means acceptance will always run after apply completes, even on resume.
-                // This ensures quality gates are enforced regardless of interruptions.
+                // Step 2: Execute acceptance test after apply succeeds unless resume already proved
+                // durable acceptance-pass state for this exact revision.
+                if !skip_acceptance_once {
+                    // Update status to Accepting
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::WorkspaceStatusUpdated {
+                                workspace_name: workspace.name.clone(),
+                                status: WorkspaceStatus::Accepting,
+                            })
+                            .await;
+                    }
 
-                // Update status to Accepting
-                if let Some(ref tx) = event_tx {
-                    let _ = tx
-                        .send(ParallelEvent::WorkspaceStatusUpdated {
-                            workspace_name: workspace.name.clone(),
-                            status: WorkspaceStatus::Accepting,
-                        })
-                        .await;
+                    info!(
+                        "Running acceptance test for {} after apply completion (cycle {})",
+                        change_id, cycle_count
+                    );
                 }
-
-                info!(
-                    "Running acceptance test for {} after apply completion (cycle {})",
-                    change_id, cycle_count
-                );
-                let acceptance_result = execute_acceptance_in_workspace(
-                    &change_id,
-                    &workspace.path,
-                    &mut agent,
-                    event_tx.clone(),
-                    Some(&per_change_cancel),
-                    &ai_runner,
-                    &config,
-                    &acceptance_tail_injected,
-                    &acceptance_history,
-                    Some(base_branch.as_str()),
-                )
-                .await;
+                let acceptance_result = if skip_acceptance_once {
+                    skip_acceptance_once = false;
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(
+                                    "Skipping acceptance on resume because durable acceptance-pass state already exists for current revision",
+                                )
+                                .with_change_id(&change_id)
+                                .with_operation("acceptance"),
+                            ))
+                            .await;
+                    }
+                    Ok((crate::orchestration::AcceptanceResult::Pass, 0))
+                } else {
+                    execute_acceptance_in_workspace(
+                        &change_id,
+                        &workspace.path,
+                        &mut agent,
+                        event_tx.clone(),
+                        Some(&per_change_cancel),
+                        &ai_runner,
+                        &config,
+                        &acceptance_tail_injected,
+                        &acceptance_history,
+                        Some(base_branch.as_str()),
+                    )
+                    .await
+                };
 
                 match acceptance_result {
                     Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
