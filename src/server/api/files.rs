@@ -343,8 +343,14 @@ pub async fn get_file_content(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
     use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::server::api::test_support::{create_local_git_repo, make_router, make_state};
+    use crate::server::api::build_router;
 
     #[test]
     fn test_validate_relative_path_rejects_traversal() {
@@ -431,5 +437,233 @@ mod tests {
         let path = temp.path().join("binary.bin");
         std::fs::write(&path, b"\x00\x01\x02\x03").unwrap();
         assert!(is_binary_file(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_get_file_tree_project_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/nonexistent/files/tree")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_project_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, None);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/nonexistent/files/content?path=foo.txt")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_rejects_path_traversal() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/api/v1/projects/{}/files/content?path=../../../etc/passwd",
+                entry.id
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_file_tree_with_real_project() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = project_json["id"].as_str().unwrap();
+
+        let tree_req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/projects/{}/files/tree", project_id))
+            .body(Body::empty())
+            .unwrap();
+
+        let tree_resp = router.clone().oneshot(tree_req).await.unwrap();
+        assert_eq!(tree_resp.status(), StatusCode::OK);
+
+        let tree_body = axum::body::to_bytes(tree_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tree: Vec<serde_json::Value> = serde_json::from_slice(&tree_body).unwrap();
+        let names: Vec<&str> = tree.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(
+            names.contains(&"README.md"),
+            "File tree should contain README.md, got: {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_with_real_project() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = project_json["id"].as_str().unwrap();
+
+        let content_req = Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/api/v1/projects/{}/files/content?path=README.md",
+                project_id
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let content_resp = router.oneshot(content_req).await.unwrap();
+        assert_eq!(content_resp.status(), StatusCode::OK);
+
+        let content_body = axum::body::to_bytes(content_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let content: serde_json::Value = serde_json::from_slice(&content_body).unwrap();
+        assert_eq!(content["path"], "README.md");
+        assert_eq!(content["binary"], false);
+        assert_eq!(content["truncated"], false);
+        assert!(content["content"].is_string());
+        assert_eq!(content["content"].as_str().unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_get_file_content_nonexistent_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = project_json["id"].as_str().unwrap();
+
+        let content_req = Request::builder()
+            .method(Method::GET)
+            .uri(format!(
+                "/api/v1/projects/{}/files/content?path=nonexistent.txt",
+                project_id
+            ))
+            .body(Body::empty())
+            .unwrap();
+
+        let content_resp = router.oneshot(content_req).await.unwrap();
+        assert_eq!(content_resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_file_api_requires_auth() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, Some("secret-token"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/some-id/files/tree")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "File tree endpoint should require authentication"
+        );
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/some-id/files/content?path=foo.txt")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "File content endpoint should require authentication"
+        );
     }
 }

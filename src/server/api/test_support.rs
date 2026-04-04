@@ -11,7 +11,7 @@ use crate::server::api::{
 };
 use crate::server::registry::{create_shared_registry, OrchestrationStatus};
 
-pub(super) fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
+pub(crate) fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
     let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
     let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
     AppState {
@@ -32,15 +32,21 @@ pub(super) fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppSta
     }
 }
 
-pub(super) fn make_router(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
+pub(crate) fn make_router(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
     build_router(make_state(temp_dir, auth_token))
 }
 
-pub(super) async fn run_sync_monitor_once_for_tests(state: &AppState) {
+pub(crate) fn make_router_with_db(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
+    let mut state = make_state(temp_dir, auth_token);
+    state.db = Some(crate::server::db::ServerDb::new(temp_dir.path()).unwrap());
+    build_router(state)
+}
+
+pub(crate) async fn run_sync_monitor_once_for_tests(state: &AppState) {
     refresh_project_sync_states_once(&state.registry).await;
 }
 
-pub(super) fn create_local_git_repo_with_setup(
+pub(crate) fn create_local_git_repo_with_setup(
     parent: &Path,
     setup_script: Option<&str>,
 ) -> PathBuf {
@@ -105,6 +111,93 @@ pub(super) fn create_local_git_repo_with_setup(
     repo_path
 }
 
-pub(super) fn create_local_git_repo(parent: &Path) -> PathBuf {
+pub(crate) fn create_local_git_repo(parent: &Path) -> PathBuf {
     create_local_git_repo_with_setup(parent, None)
+}
+
+pub(crate) async fn init_bare_repo_with_commit(bare_path: &Path, branch: &str) -> Option<String> {
+    let init = tokio::process::Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(bare_path)
+        .status()
+        .await
+        .ok()?;
+    if !init.success() {
+        return None;
+    }
+
+    let work_dir = tempfile::TempDir::new().ok()?;
+    let work_path = work_dir.path();
+
+    let clone = tokio::process::Command::new("git")
+        .args(["clone", bare_path.to_str()?, work_path.to_str()?])
+        .status()
+        .await
+        .ok()?;
+    if !clone.success() {
+        return None;
+    }
+
+    tokio::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(work_path)
+        .status()
+        .await
+        .ok()?;
+    tokio::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(work_path)
+        .status()
+        .await
+        .ok()?;
+
+    let checkout = tokio::process::Command::new("git")
+        .args(["checkout", "-b", branch])
+        .current_dir(work_path)
+        .status()
+        .await
+        .ok()?;
+    if !checkout.success() {
+        return None;
+    }
+
+    std::fs::write(work_path.join("README.md"), "initial").ok()?;
+    tokio::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(work_path)
+        .status()
+        .await
+        .ok()?;
+    let commit = tokio::process::Command::new("git")
+        .args(["commit", "-m", "initial commit"])
+        .current_dir(work_path)
+        .status()
+        .await
+        .ok()?;
+    if !commit.success() {
+        return None;
+    }
+
+    let push = tokio::process::Command::new("git")
+        .args(["push", "origin", branch])
+        .current_dir(work_path)
+        .status()
+        .await
+        .ok()?;
+    if !push.success() {
+        return None;
+    }
+
+    let sha_out = tokio::process::Command::new("git")
+        .args(["rev-parse", &format!("refs/heads/{}", branch)])
+        .current_dir(bare_path)
+        .output()
+        .await
+        .ok()?;
+
+    if sha_out.status.success() {
+        Some(String::from_utf8_lossy(&sha_out.stdout).trim().to_string())
+    } else {
+        None
+    }
 }

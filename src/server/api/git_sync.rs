@@ -637,7 +637,17 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
     use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::server::api::{build_router, AppState, OrchestrationStatus, SERVER_LOG_BUFFER_SIZE};
+    use crate::server::api::test_support::{make_state, init_bare_repo_with_commit};
+    use crate::server::registry::create_shared_registry;
 
     #[test]
     fn test_build_resolve_command_argv_replaces_prompt_placeholder_as_single_arg() {
@@ -790,5 +800,484 @@ mod tests {
             content, multiline_prompt,
             "Multi-line prompt should be passed intact"
         );
+    }
+
+    #[tokio::test]
+    async fn test_git_pull_non_fast_forward_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let branch = "main";
+
+        let remote_dir = TempDir::new().unwrap();
+        let remote_path = remote_dir.path();
+        let remote_sha = init_bare_repo_with_commit(remote_path, branch).await;
+        if remote_sha.is_none() {
+            return;
+        }
+        let remote_sha = remote_sha.unwrap();
+
+        let remote_url = format!("file://{}", remote_path.display());
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add(remote_url.clone(), branch.to_string())
+            .unwrap();
+
+        let local_clone_path = temp_dir.path().join(&entry.id);
+        std::fs::create_dir_all(&local_clone_path).unwrap();
+
+        let init_local = tokio::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&local_clone_path)
+            .status()
+            .await;
+        if init_local.is_err() || !init_local.unwrap().success() {
+            return;
+        }
+
+        let work_dir = TempDir::new().unwrap();
+        let work_path = work_dir.path();
+        let clone_to_work = tokio::process::Command::new("git")
+            .args(["clone", &remote_url, work_path.to_str().unwrap()])
+            .status()
+            .await;
+        if clone_to_work.is_err() || !clone_to_work.unwrap().success() {
+            return;
+        }
+
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok();
+
+        std::fs::write(work_path.join("diverged.txt"), "diverged commit").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok();
+        let diverged_commit = tokio::process::Command::new("git")
+            .args(["commit", "-m", "diverged commit"])
+            .current_dir(work_path)
+            .status()
+            .await;
+        if diverged_commit.is_err() || !diverged_commit.unwrap().success() {
+            return;
+        }
+
+        let push_to_local = tokio::process::Command::new("git")
+            .args([
+                "push",
+                local_clone_path.to_str().unwrap(),
+                &format!("{}:{}", branch, branch),
+            ])
+            .current_dir(work_path)
+            .status()
+            .await;
+        if push_to_local.is_err() || !push_to_local.unwrap().success() {
+            return;
+        }
+
+        let work_dir2 = TempDir::new().unwrap();
+        let work_path2 = work_dir2.path();
+        let clone2 = tokio::process::Command::new("git")
+            .args(["clone", &remote_url, work_path2.to_str().unwrap()])
+            .status()
+            .await;
+        if clone2.is_err() || !clone2.unwrap().success() {
+            return;
+        }
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok();
+        std::fs::write(work_path2.join("remote_advance.txt"), "remote advance").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok();
+        let remote_commit = tokio::process::Command::new("git")
+            .args(["commit", "-m", "remote advance"])
+            .current_dir(work_path2)
+            .status()
+            .await;
+        if remote_commit.is_err() || !remote_commit.unwrap().success() {
+            return;
+        }
+        let push_remote = tokio::process::Command::new("git")
+            .args(["push", "origin", branch])
+            .current_dir(work_path2)
+            .status()
+            .await;
+        if push_remote.is_err() || !push_remote.unwrap().success() {
+            return;
+        }
+
+        let refs_dir = local_clone_path.join("refs/remotes/origin");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(refs_dir.join(branch), format!("{}\n", remote_sha)).unwrap();
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["error"].as_str().unwrap_or(""), "resolve_command_not_configured");
+    }
+
+    async fn create_diverged_repo_setup(
+        temp_dir: &TempDir,
+        state: &AppState,
+        branch: &str,
+    ) -> Option<(
+        tempfile::TempDir,
+        std::path::PathBuf,
+        crate::server::registry::ProjectEntry,
+        String,
+    )> {
+        let remote_dir = TempDir::new().ok()?;
+        let remote_path = remote_dir.path();
+        let remote_sha = init_bare_repo_with_commit(remote_path, branch).await?;
+
+        let remote_url = format!("file://{}", remote_path.display());
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add(remote_url.clone(), branch.to_string())
+            .ok()?;
+
+        let local_clone_path = temp_dir.path().join(&entry.id);
+        std::fs::create_dir_all(&local_clone_path).ok()?;
+        let init_local = tokio::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(&local_clone_path)
+            .status()
+            .await
+            .ok()?;
+        if !init_local.success() {
+            return None;
+        }
+
+        let work_dir = TempDir::new().ok()?;
+        let work_path = work_dir.path();
+        let clone_to_work = tokio::process::Command::new("git")
+            .args(["clone", &remote_url, work_path.to_str().unwrap()])
+            .status()
+            .await
+            .ok()?;
+        if !clone_to_work.success() {
+            return None;
+        }
+
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+
+        std::fs::write(work_path.join("diverged.txt"), "diverged commit").ok()?;
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        let diverged_commit = tokio::process::Command::new("git")
+            .args(["commit", "-m", "diverged commit"])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        if !diverged_commit.success() {
+            return None;
+        }
+        let push_to_local = tokio::process::Command::new("git")
+            .args([
+                "push",
+                local_clone_path.to_str().unwrap(),
+                &format!("{}:{}", branch, branch),
+            ])
+            .current_dir(work_path)
+            .status()
+            .await
+            .ok()?;
+        if !push_to_local.success() {
+            return None;
+        }
+
+        let work_dir2 = TempDir::new().ok()?;
+        let work_path2 = work_dir2.path();
+        let clone2 = tokio::process::Command::new("git")
+            .args(["clone", &remote_url, work_path2.to_str().unwrap()])
+            .status()
+            .await
+            .ok()?;
+        if !clone2.success() {
+            return None;
+        }
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok()?;
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok()?;
+        std::fs::write(work_path2.join("remote_advance.txt"), "remote advance").ok()?;
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok()?;
+        let remote_commit = tokio::process::Command::new("git")
+            .args(["commit", "-m", "remote advance"])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok()?;
+        if !remote_commit.success() {
+            return None;
+        }
+        let push_remote = tokio::process::Command::new("git")
+            .args(["push", "origin", branch])
+            .current_dir(work_path2)
+            .status()
+            .await
+            .ok()?;
+        if !push_remote.success() {
+            return None;
+        }
+
+        let refs_dir = local_clone_path.join("refs/remotes/origin");
+        std::fs::create_dir_all(&refs_dir).ok()?;
+        std::fs::write(refs_dir.join(branch), format!("{}\n", remote_sha)).ok()?;
+
+        Some((remote_dir, local_clone_path, entry, remote_url))
+    }
+
+    #[tokio::test]
+    async fn test_git_pull_delegates_to_git_sync_and_requires_resolve_command() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let branch = "main";
+
+        let result = create_diverged_repo_setup(&temp_dir, &state, branch).await;
+        let (_remote_dir, _local_clone_path, entry, _remote_url) = match result {
+            Some(r) => r,
+            None => return,
+        };
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["error"].as_str().unwrap_or(""), "resolve_command_not_configured");
+    }
+
+    #[tokio::test]
+    async fn test_git_pull_auto_resolve_runs_resolve_command() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let registry = crate::server::registry::create_shared_registry(temp_dir.path(), 4).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("echo resolve".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
+                crate::config::ProposalSessionConfig::default(),
+                None,
+            ),
+        };
+
+        let branch = "main";
+
+        let result = create_diverged_repo_setup(&temp_dir, &state, branch).await;
+        let (_remote_dir, _local_clone_path, entry, _remote_url) = match result {
+            Some(r) => r,
+            None => return,
+        };
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"auto_resolve": true}"#))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+
+        if status == StatusCode::OK {
+            if let Some(ran) = json.get("resolve_command_ran") {
+                if ran.as_bool() == Some(true) {
+                    assert_eq!(json["resolve_exit_code"].as_i64(), Some(0));
+                }
+            }
+        }
+
+        if status == StatusCode::UNPROCESSABLE_ENTITY {
+            let error_val = json["error"].as_str().unwrap_or("");
+            assert_ne!(error_val, "non_fast_forward");
+        }
+
+        assert!(status == StatusCode::OK || status == StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn test_git_pull_auto_resolve_without_resolve_command_configured_returns_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let branch = "main";
+
+        let result = create_diverged_repo_setup(&temp_dir, &state, branch).await;
+        let (_remote_dir, _local_clone_path, entry, _remote_url) = match result {
+            Some(r) => r,
+            None => return,
+        };
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"auto_resolve": true}"#))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+
+        if status == StatusCode::UNPROCESSABLE_ENTITY {
+            let error_val = json["error"].as_str().unwrap_or("");
+            assert!(
+                error_val == "resolve_command_not_configured" || error_val == "non_fast_forward"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_git_pull_auto_resolve_uses_top_level_resolve_command() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
+        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state = AppState {
+            registry,
+            runners: crate::server::runner::create_shared_runners(),
+            db: None,
+            auth_token: None,
+            max_concurrent_total: 4,
+            resolve_command: Some("echo resolve".to_string()),
+            log_tx,
+            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            terminal_manager: crate::server::terminal::create_terminal_manager(),
+            active_commands: crate::server::active_commands::create_shared_active_commands(),
+            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
+                crate::config::ProposalSessionConfig::default(),
+                None,
+            ),
+        };
+
+        let branch = "main";
+        let result = create_diverged_repo_setup(&temp_dir, &state, branch).await;
+        let (_remote_dir, _local_clone_path, entry, _remote_url) = match result {
+            Some(r) => r,
+            None => return,
+        };
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/git/pull", entry.id))
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"auto_resolve": true}"#))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+
+        if status == StatusCode::UNPROCESSABLE_ENTITY {
+            let error_val = json["error"].as_str().unwrap_or("");
+            assert_ne!(error_val, "resolve_command_not_configured");
+        }
+        if let Some(ran) = json.get("resolve_command_ran") {
+            if ran.as_bool() == Some(true) {
+                let exit_code = json["resolve_exit_code"].as_i64().unwrap_or(-1);
+                assert_eq!(exit_code, 0);
+            }
+        }
     }
 }

@@ -484,7 +484,8 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::server::api::test_support::{
-        create_local_git_repo, make_router, make_state, run_sync_monitor_once_for_tests,
+        create_local_git_repo, make_router, make_router_with_db, make_state,
+        run_sync_monitor_once_for_tests,
     };
 
     #[cfg(feature = "heavy-tests")]
@@ -694,6 +695,71 @@ mod tests {
             Some("echo top-level-resolve".to_string()),
             "AppState resolve_command should come from top-level config resolve_command"
         );
+    }
+
+    #[tokio::test]
+    async fn test_valid_auth_token_returns_200() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router(&temp_dir, Some("secret-token"));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects")
+            .header("Authorization", "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_ui_state_crud_endpoints() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = make_router_with_db(&temp_dir, None);
+
+        let put_req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/ui-state/selected_project_id")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"value":"proj-1"}"#))
+            .unwrap();
+        let put_resp = router.clone().oneshot(put_req).await.unwrap();
+        assert_eq!(put_resp.status(), StatusCode::NO_CONTENT);
+
+        let get_req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/ui-state")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = router.clone().oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected_project_id"], "proj-1");
+
+        let delete_req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/ui-state/selected_project_id")
+            .body(Body::empty())
+            .unwrap();
+        let delete_resp = router.clone().oneshot(delete_req).await.unwrap();
+        assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+        let get_req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/ui-state")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = router.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.get("selected_project_id").is_none());
     }
 
     #[tokio::test]
