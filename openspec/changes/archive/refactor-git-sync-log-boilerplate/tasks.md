@@ -18,4 +18,3 @@
 ## Acceptance #7 Failure Follow-up
 - [x] `.cflx/` 配下の acceptance 生成物を ignore または削除して、`git status --porcelain` を空にする
 - [x] `tasks.md` の `.cflx/` 整理完了チェックを、実際に working tree が clean である状態と一致するよう確認・更新する
-
