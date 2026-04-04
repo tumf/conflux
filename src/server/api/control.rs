@@ -410,6 +410,7 @@ pub(super) async fn get_logs(
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,3 +720,4 @@ pub(super) async fn start_single_project_run(
 
     Ok(())
 }
+
