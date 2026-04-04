@@ -79,10 +79,34 @@ fn get_platform_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|config_dir| config_dir.join(GLOBAL_CONFIG_DIR).join(GLOBAL_CONFIG_FILE))
 }
 
+/// Collect global config candidate paths in merge priority order (low → high).
+///
+/// Order:
+/// 1. Platform default: `dirs::config_dir()/cflx/config.jsonc`
+/// 2. XDG default: `~/.config/cflx/config.jsonc`
+/// 3. XDG env: `$XDG_CONFIG_HOME/cflx/config.jsonc`
+fn get_global_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Some(platform_path) = get_platform_config_path() {
+        paths.push(platform_path);
+    }
+
+    if let Some(xdg_default_path) = get_xdg_default_config_path() {
+        paths.push(xdg_default_path);
+    }
+
+    if let Some(xdg_env_path) = get_xdg_env_config_path() {
+        paths.push(xdg_env_path);
+    }
+
+    paths
+}
+
 /// Get the path to the global configuration file
 ///
 /// Deprecated: Use get_xdg_env_config_path() and get_xdg_default_config_path() for explicit priority.
-/// This function now returns the XDG path for backward compatibility.
+/// This function now delegates to get_xdg_env_config_path() for backwards compatibility.
 #[deprecated(
     since = "0.1.0",
     note = "Use get_xdg_env_config_path() and get_xdg_default_config_path() for explicit priority"
@@ -90,7 +114,7 @@ fn get_platform_config_path() -> Option<PathBuf> {
 #[allow(dead_code)]
 #[allow(deprecated)]
 pub fn get_global_config_path() -> Option<PathBuf> {
-    get_xdg_config_path()
+    get_xdg_env_config_path().or_else(get_xdg_default_config_path)
 }
 
 // Re-export commonly used items for convenience; also brings them into scope for path helpers.
@@ -1085,6 +1109,79 @@ mod tests {
             let path_str = path.to_string_lossy();
             assert!(path_str.contains(".config"));
             assert!(path_str.ends_with("cflx/config.jsonc"));
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_global_config_path_prefers_xdg_env_over_default() {
+        let _env_lock = env_test_lock();
+
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+
+        set_env_var("XDG_CONFIG_HOME", "/tmp/cflx-xdg-env");
+
+        let resolved =
+            super::get_global_config_path().expect("deprecated helper should resolve path");
+        assert_eq!(
+            resolved.to_string_lossy(),
+            "/tmp/cflx-xdg-env/cflx/config.jsonc",
+            "deprecated global helper must keep preferring XDG_CONFIG_HOME"
+        );
+
+        match original_xdg {
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_global_config_path_falls_back_to_xdg_default() {
+        let _env_lock = env_test_lock();
+
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        remove_env_var("XDG_CONFIG_HOME");
+
+        let from_deprecated = super::get_global_config_path();
+        let from_explicit = super::get_xdg_default_config_path();
+        assert_eq!(
+            from_deprecated, from_explicit,
+            "deprecated global helper must preserve XDG default fallback behavior"
+        );
+
+        match original_xdg {
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_get_global_config_paths_returns_low_to_high_priority_order() {
+        let _env_lock = env_test_lock();
+
+        let original_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        set_env_var("XDG_CONFIG_HOME", "/tmp/cflx-priority");
+
+        let paths = super::get_global_config_paths();
+        assert!(
+            paths.len() >= 2,
+            "expected at least XDG default and XDG env paths"
+        );
+
+        let last = paths
+            .last()
+            .expect("global path list should not be empty")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            last, "/tmp/cflx-priority/cflx/config.jsonc",
+            "XDG env path must be highest priority and appear last"
+        );
+
+        match original_xdg {
+            Some(val) => set_env_var("XDG_CONFIG_HOME", val),
+            None => remove_env_var("XDG_CONFIG_HOME"),
         }
     }
 
