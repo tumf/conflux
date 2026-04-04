@@ -12,7 +12,7 @@
 - [x] 10. プロポーザルセッション管理を `api/proposals.rs` に抽出する（verification: `cargo test` 全通過）
 - [x] 11. WebSocket ハンドラを `api/ws.rs` に抽出する（verification: `cargo test` 全通過）
 - [x] 12. ダッシュボード静的アセット配信を `api/dashboard.rs` に抽出する（verification: `cargo test` 全通過）
-- [ ] 13. テストを各サブモジュール内 `#[cfg(test)]` に配置し直す（現状 `src/server/api/mod.rs` に多数の API 別テストが残存しているため未完了。verification: `mod.rs` の API 別テスト移管後に `cargo test --lib server::api` 全通過）
+- [x] 13. テストを各サブモジュール内 `#[cfg(test)]` に配置し直す（`mod.rs` には共有ロジックのテストのみを残し、`cargo test --lib server::api` 全通過を確認済み）
 - [x] 14. `cargo fmt --check && cargo clippy -- -D warnings && cargo test` をすべて実行して受け入れ条件を検証する
 
 ## Future Work
@@ -22,7 +22,7 @@
 ## Acceptance #1 Failure Follow-up
 
 - [x] `test_stats_and_logs_endpoints_return_data` が `POST /api/v1/projects` で 201 を再び返すように修正し、`cargo test test_stats_and_logs_endpoints_return_data -- --nocapture` を再実行して通過を確認する
-- [ ] `src/server/api/mod.rs` に残っている API テストを責務別サブモジュールへ移し、`src/server/api/mod.rs` にはルーター構築と共有ロジックのテストだけを残す
+- [x] `src/server/api/mod.rs` に残っている API テストを責務別サブモジュールへ移し、`src/server/api/mod.rs` にはルーター構築と共有ロジックのテストだけを残す（`mod.rs` は共有ロジックの `test_classify_sync_state_variants` のみを保持）
 
 ## Acceptance #2 Failure Follow-up
 
@@ -183,7 +183,7 @@
 - [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（`git status --porcelain` が空であることを確認済み）
 - [x] `src/server/api/control.rs` で `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、`cargo clippy -- -D warnings` と `prek run --all-files` の `clippy::items-after-test-module` failure を解消する
 - [x] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも `test_add_project_without_repo_root_setup_succeeds_without_marker` / `test_add_project_setup_failure_returns_422_and_rolls_back_registry` / `test_global_control_run_records_call` / `test_projects_state_includes_sync_metadata_fields_after_monitor_refresh` / `test_toggle_all_change_selection_remarks_error_changes_for_next_run` / `test_app_state_resolve_command_comes_from_top_level_config`）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
-- [ ] `Acceptance #1 Failure Follow-up` と実装タスク 13 の完了状態を実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` のまま残さない（Task 13 を未完了へ戻したため再調整が必要）
+- [x] `Acceptance #1 Failure Follow-up` と実装タスク 13 の完了状態を実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` のまま残さない（Task 13 を再完了化し整合済み）
 - [x] `server::api::tests::test_list_worktrees_with_real_project` が再び通るよう修正し、`cargo test --lib server::api` を再実行して全体成功を確認する
 - [x] archive 前品質ゲートとして `cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test` / `prek run --all-files` を再実行し、すべて成功した証拠を確認する（再検証で 4 コマンドすべて通過）
 
