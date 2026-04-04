@@ -489,3 +489,121 @@ The system SHALL execute a rejection flow when acceptance returns a `Blocked` ve
 - **WHEN** the flow completes
 - **THEN** the rejected worktree is cleaned up
 - **AND** the rejected change remains represented by the base-side `REJECTED.md` marker
+
+## Requirements
+
+### Requirement: Force stop and dequeue returns a running change to not queued
+
+The system SHALL support a force-stop-and-dequeue operation for a running change.
+
+This operation MUST cancel the in-flight execution for the target change and, once cancellation is confirmed, clear the reducer-owned runtime state back to a non-terminal idle queue-off state.
+
+After the operation completes, the target change MUST satisfy all of the following:
+
+- `queue_intent` is `NotQueued`
+- `activity` is `Idle`
+- `wait_state` is `None`
+- `terminal` is `None`
+- the derived display status is `not queued`
+
+The force-stop-and-dequeue operation MUST be distinct from terminal stop semantics such as `Stopped`, and MUST NOT leave the change in a terminal stopped state.
+
+#### Scenario: Running apply is force-stopped and dequeued
+
+- **GIVEN** a change is currently in an active execution stage such as `Applying`
+- **WHEN** the user invokes force-stop-and-dequeue for that change
+- **THEN** the in-flight execution is cancelled
+- **AND** after cancellation confirmation the reducer clears the change to `NotQueued` + `Idle` + `None wait` + `None terminal`
+- **AND** the derived display status is `not queued`
+
+#### Scenario: Stale stop completion does not create terminal stopped state
+
+- **GIVEN** a running change has already completed force-stop-and-dequeue
+- **WHEN** a late stop-related event from the cancelled worker arrives
+- **THEN** the reducer ignores any regression to terminal `Stopped`
+- **AND** the derived display status remains `not queued`
+
+### Requirement: Force-stop-and-dequeue does not auto-resume work
+
+After a change has been force-stopped and dequeued, the system SHALL NOT automatically re-queue or restart that change unless the user explicitly requests queueing again.
+
+#### Scenario: Refresh does not re-queue dequeued change
+
+- **GIVEN** a change has completed force-stop-and-dequeue and currently displays `not queued`
+- **WHEN** the system processes a later refresh or reconciliation pass
+- **THEN** the reducer preserves `NotQueued`
+- **AND** the change does not transition back to an active or queued state without a new explicit queue command
+
+### Requirement: Force-stop-and-dequeue only applies to retryable active work
+
+The system SHALL apply force-stop-and-dequeue only to changes that are currently retryable and in-flight or queued for in-flight cancellation handling.
+
+The operation MUST NOT convert permanent terminal changes such as `Archived`, `Merged`, or `Rejected` into `not queued`.
+
+#### Scenario: Archived change ignores force-stop-and-dequeue
+
+- **GIVEN** a change is already in terminal `Archived`
+- **WHEN** force-stop-and-dequeue is requested for that change
+- **THEN** the reducer treats the request as a no-op
+- **AND** the derived display status remains `archived`
+
+
+### Requirement: Reducer-Owned Change Runtime State
+
+The system SHALL maintain reducer-owned runtime state for each change in `OrchestratorState`.
+
+The runtime state MUST distinguish at least the following concerns:
+
+- queue intent
+- active execution stage
+- wait reason
+- terminal result
+- workspace observation summary
+- execution mode (Serial or Parallel)
+
+The active execution stage SHALL include a dedicated `Rejecting` stage distinct from `Applying`, `Accepting`, `Archiving`, and `Resolving`. Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
+
+#### Scenario: Runtime state preserves queued intent while blocked
+
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the runtime state records queued intent
+- **AND** the wait reason becomes blocked with dependency details
+- **AND** the derived display status is `blocked`
+
+#### Scenario: Runtime state exposes rejecting as active stage
+
+- **GIVEN** apply execution generated `openspec/changes/fix-auth/REJECTED.md`
+- **WHEN** the reducer applies the rejection-review start event
+- **THEN** the active execution stage becomes `Rejecting`
+- **AND** the derived display status is `rejecting`
+- **AND** the change is not shown as `accepting`
+
+### Requirement: Rejected terminal state remains distinct from errors
+
+The terminal result MUST include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejecting review has confirmed the specification is unimplementable or otherwise out of scope for completion, requiring a rollback to the base branch with a documented reason.
+
+#### Scenario: rejecting-confirmed change becomes rejected terminal state
+
+- **GIVEN** a change is in `Rejecting`
+- **AND** the rejection flow completes (`REJECTED.md` committed and worktree removed)
+- **WHEN** the reducer applies the terminal rejection event
+- **THEN** the terminal result becomes `Rejected`
+- **AND** the derived display status is `rejected`
+
+### Requirement: Rejection proposal dismissal returns to apply with recovery tasks
+
+When rejecting review dismisses a worktree-local `openspec/changes/<change_id>/REJECTED.md` proposal, the runtime SHALL return the change to active apply rather than terminal rejection.
+
+Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED.md` file and ensure `openspec/changes/<change_id>/tasks.md` contains at least one unchecked task describing a non-rejection recovery step. The runtime SHALL route this dismiss path directly back to `Applying` rather than through the normal acceptance stage.
+
+#### Scenario: dismissing rejection proposal resumes apply
+
+- **GIVEN** a change is currently in `Rejecting`
+- **AND** the worktree contains `openspec/changes/fix-auth/REJECTED.md`
+- **WHEN** rejecting review dismisses the reject proposal
+- **THEN** the worktree-local `REJECTED.md` is removed
+- **AND** `openspec/changes/fix-auth/tasks.md` is updated with at least one unchecked recovery task that is not a reject action
+- **AND** the active execution stage becomes `Applying`
+- **AND** the derived display status is `applying`

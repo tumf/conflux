@@ -191,6 +191,18 @@ export async function toggleChangeSelection(
 }
 
 /**
+ * Force-stop and dequeue a single running change
+ */
+export async function stopAndDequeueChange(
+  projectId: string,
+  changeId: string,
+): Promise<{ change_id: string; selected: boolean; status: string }> {
+  return fetchAPI(`/projects/${projectId}/changes/${changeId}/stop-and-dequeue`, {
+    method: 'POST',
+  });
+}
+
+/**
  * Toggle all changes for a project (select all / deselect all)
  */
 export async function toggleAllChangeSelection(

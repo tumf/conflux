@@ -336,6 +336,7 @@ pub(super) async fn list_remote_changes_in_worktree(
                 Ok(WorkspaceState::Archiving) => ("archiving".to_string(), None),
                 Ok(WorkspaceState::Archived) => ("archived".to_string(), None),
                 Ok(WorkspaceState::Merged) => ("merged".to_string(), None),
+                Ok(WorkspaceState::Rejecting) => ("rejecting".to_string(), None),
                 Err(_) => ("idle".to_string(), None),
             }
         } else {

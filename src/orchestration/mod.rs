@@ -36,6 +36,9 @@ pub use output::{
     ChannelOutputHandler, ContextualOutputHandler, LogOutputHandler, OutputHandler, OutputMessage,
 };
 #[allow(unused_imports)]
-pub use rejection::{execute_rejection_flow, has_rejection_proposal};
+pub use rejection::{
+    execute_rejection_flow, handle_resume_apply_from_rejecting, has_rejection_proposal,
+    run_rejection_review, RejectionReviewVerdict,
+};
 #[allow(unused_imports)]
 pub use state::OrchestratorState;

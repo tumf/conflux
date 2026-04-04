@@ -1583,3 +1583,226 @@ ParallelRunService SHALL treat a confirmed blocked verdict as a terminal rejecti
 - **WHEN** the rejection flow completes
 - **THEN** the base branch receives only `openspec/changes/fix-auth/REJECTED.md`
 - **AND** the remaining worktree-only files are discarded with worktree cleanup
+
+
+### Requirement: Parallel execution acceptance loop
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
+The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
+When resuming a workspace that has not completed archive, the orchestrator SHALL determine the next non-terminal step from the worktree state and MUST NOT start archive directly.
+
+**Acceptance state persistence**: Acceptance results are NOT persisted to disk or git commits. Therefore, on resume:
+- If the resumed worktree is terminal (`Archived`, `Merged`, or rejected): apply/acceptance are not required.
+- If the resumed worktree is non-terminal and its worktree-local `tasks.md` progress is 100%: acceptance MUST be re-run before archive.
+- If the resumed worktree is non-terminal and its worktree-local `tasks.md` progress is below 100% or unavailable: the orchestrator MUST resume with apply instead of archive.
+
+This ensures quality gates are always enforced, even after interruptions.
+
+- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
+- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
+- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
+- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
+- Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
+- Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
+- Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
+- If acceptance output is BLOCKED, the orchestrator MUST stop apply retries for the change and preserve the workspace for manual follow-up.
+- If acceptance output is BLOCKED, the change MUST be recorded as a terminal failure for dependency skipping in the current run.
+- Before allowing archive to start, acceptance MUST verify that the workspace is ready for a real final archive commit under the repository's final-commit quality gates (SHALL). If those readiness checks fail, acceptance MUST return a non-pass verdict and record the blocking gate or command context instead of allowing archive to surface the failure later (MUST).
+
+#### Scenario: Parallel acceptance retry narrows to updated files and prior findings
+- **GIVEN** a change completes an apply iteration successfully in parallel mode
+- **AND** acceptance output indicates CONTINUE
+- **WHEN** the orchestrator runs a subsequent acceptance attempt for the same change
+- **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
+- **AND** the acceptance prompt includes the prior acceptance findings for verification
+- **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
+
+#### Scenario: Parallel acceptance failure logging uses tail lines
+- **GIVEN** acceptance output tail includes `ACCEPTANCE: FAIL` and `FINDINGS:` lines
+- **WHEN** the orchestrator records the acceptance failure
+- **THEN** the recorded findings exclude the acceptance markers and `FINDINGS:` header
+- **AND** logs do not report "N findings" based on tail line count
+
+#### Scenario: Acceptance blocked preserves workspace and stops apply
+- **GIVEN** acceptance output indicates `ACCEPTANCE: BLOCKED`
+- **WHEN** the orchestrator processes the acceptance result
+- **THEN** the workspace is preserved for manual follow-up
+- **AND** apply retries for the change are stopped in the current run
+
+#### Scenario: Acceptance catches archive-readiness blocker before archive
+- **GIVEN** apply has produced a workspace that appears functionally complete
+- **AND** the final archive commit would be rejected by a repository quality gate such as a pre-commit hook, formatting check, lint check, or test gate
+- **WHEN** acceptance evaluates archive-readiness
+- **THEN** acceptance returns a non-pass verdict before archive starts
+- **AND** acceptance findings identify the blocking gate or command context so the failure is actionable
+
+#### Scenario: Acceptance passes archive-ready workspace to archive
+- **GIVEN** apply has produced a workspace with no unresolved acceptance findings
+- **AND** the workspace satisfies the repository's final-commit quality gates for archive
+- **WHEN** acceptance completes
+- **THEN** the change may proceed to archive
+- **AND** archive remains responsible for executing and verifying the final archive commit
+
+#### Scenario: Resumed worktree with incomplete tasks returns to apply
+- **GIVEN** a parallel-mode worktree is resumed and has not completed archive
+- **AND** the worktree-local `openspec/changes/{change_id}/tasks.md` progress is below 100%
+- **WHEN** the orchestrator chooses the next step for the resumed change
+- **THEN** it resumes with apply
+- **AND** it does not start archive directly
+
+#### Scenario: Resumed worktree with complete tasks returns to acceptance
+- **GIVEN** a parallel-mode worktree is resumed and has not completed archive
+- **AND** the worktree-local task progress for the change is 100%
+- **WHEN** the orchestrator chooses the next step for the resumed change
+- **THEN** it resumes with acceptance
+- **AND** archive starts only after that acceptance pass succeeds
+
+### Requirement: Workspace State Detection
+Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
+
+Archive-complete terminal detection MAY still use committed file state, but non-terminal resumed worktrees MUST NOT be classified into a direct-archive execution path.
+
+When a reused worktree is not archive-complete:
+- the orchestrator MUST inspect worktree-local task progress for the change
+- it MUST choose `apply` when progress is below 100% or unavailable
+- it MUST choose `acceptance` when progress is 100%
+- it MUST NOT choose archive directly
+
+#### Scenario: Non-terminal resumed worktree never routes directly to archive
+- **GIVEN** a reused worktree is neither archive-complete nor merged
+- **WHEN** resume classification is performed
+- **THEN** the next execution step is either apply or acceptance
+- **AND** archive is not selected as the first resumed non-terminal step
+
+### Requirement: Queue ingestion and analysis targeting
+並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
+
+キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
+
+queued の change が空の場合、analysis を実行してはならない（MUST）。
+
+CLI の `run` サブコマンドでは、実行中の change が存在せず queued の change も空である場合、オーケストレーションは完了状態にならなければならない（MUST）。
+
+通常の cflx ループ型実行では、ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
+
+queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
+
+#### Scenario: queuedのみがanalysis対象になる
+- **GIVEN** queued に change が存在する
+- **AND** queued 以外に実行中の change が存在する
+- **WHEN** 並列実行が analysis を開始する
+- **THEN** analysis 対象は queued の change のみになる
+
+#### Scenario: queuedが空ならanalysisを実行しない
+- **GIVEN** queued の change が存在しない
+- **WHEN** 並列実行が analysis を開始しようとする
+- **THEN** analysis を実行しない
+
+#### Scenario: CLI run は空キューで終了する
+- **GIVEN** CLI の `run` サブコマンドで並列実行している
+- **AND** 実行中の change が存在しない
+- **AND** queued の change も空である
+- **WHEN** 並列実行ループが次の analysis を開始しようとする
+- **THEN** analysis を実行しない
+- **AND** オーケストレーションは完了状態になる
+
+#### Scenario: 通常の cflx 実行は空キューでも待機を継続する
+- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
+- **AND** ユーザが停止していない
+- **AND** 実行中の change が存在しない
+- **AND** queued の change も空である
+- **WHEN** 並列実行ループが次の analysis を開始しようとする
+- **THEN** analysis を実行しない
+- **AND** オーケストレーション実行ループは終了しない
+- **AND** 新しく queued になった change を待機する
+
+#### Scenario: 通常の cflx 実行の idle待機中のqueued追加でanalysisが再開する
+- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
+- **AND** ユーザが停止していない
+- **AND** 並列実行ループが queued 0 件・実行中 0 件で待機中である
+- **WHEN** change が queued に追加される
+- **THEN** 実行ループは queue 通知を受け取る
+- **AND** analysis を再評価する
+
+#### Scenario: queued外のchangeはanalysis対象から除外される
+- **GIVEN** queued に含まれない change が存在する
+- **AND** queued には別の change が存在する
+- **WHEN** 並列実行が analysis を開始する
+- **THEN** queued 外の change は analysis 対象から除外される
+
+
+### Requirement: Acceptance failure returns to apply loop
+
+When acceptance returns FAIL, the parallel dispatch loop MUST re-enter the apply step on the next cycle, regardless of how the workspace was initially routed (fresh start or resume).
+
+#### Scenario: Resumed workspace acceptance failure triggers apply retry
+
+- **GIVEN** a parallel workspace resumed with state `Applied` (routed to acceptance-only on first cycle)
+- **WHEN** the acceptance step returns `ACCEPTANCE: FAIL`
+- **THEN** the next cycle of the apply+acceptance loop MUST execute the apply step before running acceptance again
+
+
+### Requirement: ParallelRunService rejection flow on blocked execution
+
+ParallelRunService SHALL support blocked handoff from both acceptance and apply execution phases. When apply execution records a blocker by generating `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT enter the normal acceptance flow. Instead, the runtime SHALL run rejection review and require one of two outcomes: `confirm_rejection` or `resume_apply`.
+
+The rejecting review operation SHALL end with exactly one dedicated marker line: `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME`. Runtime routing SHALL parse that marker instead of relying on `ACCEPTANCE: BLOCKED` for apply-generated rejection proposals.
+
+`confirm_rejection` / `REJECTION_REVIEW: CONFIRM` SHALL execute the rejection flow and finalize the change as rejected after the base branch records `openspec/changes/<change_id>/REJECTED.md`. `resume_apply` / `REJECTION_REVIEW: RESUME` SHALL delete the worktree-local `REJECTED.md`, append at least one non-rejection recovery task to the worktree-local `tasks.md`, and return the change to apply so that the blocker is addressed as normal implementation work.
+
+Parallel rejection handling SHALL NOT rely on `openspec resolve <change_id>` and SHALL NOT merge additional worktree files into the base branch. When rejection is confirmed, the base branch SHALL receive only `openspec/changes/<change_id>/REJECTED.md`.
+
+#### Scenario: apply rejection proposal enters rejecting stage
+
+- **GIVEN** apply execution generates `openspec/changes/fix-auth/REJECTED.md` with a blocker reason
+- **AND** `openspec/changes/fix-auth/tasks.md` still contains unchecked implementation tasks
+- **WHEN** the runtime evaluates the apply result
+- **THEN** the workspace enters `rejecting`
+- **AND** the change does not enter the normal acceptance flow
+- **AND** apply does not immediately retry the same change
+
+#### Scenario: rejecting review uses dedicated verdict marker
+
+- **GIVEN** a workspace is in `rejecting`
+- **WHEN** the rejecting review operation completes successfully
+- **THEN** its final marker is exactly one of `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME`
+- **AND** runtime routing does not require `ACCEPTANCE: BLOCKED` to choose the next step
+
+#### Scenario: rejecting confirms rejection
+
+- **GIVEN** parallel execution is reviewing a change in `rejecting`
+- **AND** `openspec/changes/fix-auth/REJECTED.md` exists in the worktree
+- **WHEN** rejecting returns `confirm_rejection`
+- **THEN** the rejection flow commits `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **AND** the workspace result is returned as rejected
+- **AND** no further resolve step is required to finalize the rejection
+
+#### Scenario: rejecting resumes apply after dismissing reject proposal
+
+- **GIVEN** parallel execution is reviewing a change in `rejecting`
+- **AND** `openspec/changes/fix-auth/REJECTED.md` exists in the worktree
+- **WHEN** rejecting returns `resume_apply`
+- **THEN** the worktree-local `openspec/changes/fix-auth/REJECTED.md` is removed
+- **AND** `openspec/changes/fix-auth/tasks.md` gains at least one unchecked task describing a non-rejection recovery action
+- **AND** the change returns to `applying`
+
+#### Scenario: rejected worktree changes are not merged to base
+
+- **GIVEN** a rejected worktree contains code, tasks, and spec changes in addition to `REJECTED.md`
+- **WHEN** rejecting confirms rejection and the rejection flow completes
+- **THEN** the base branch receives only `openspec/changes/fix-auth/REJECTED.md`
+- **AND** the remaining worktree-only files are discarded with worktree cleanup
+
+## Requirements
+
+### Requirement: Parallel rejecting resume semantics
+
+Parallel execution SHALL restore a non-terminal workspace containing `openspec/changes/<change_id>/REJECTED.md` into `rejecting` on resume instead of `accepting` or `applying`.
+
+#### Scenario: resumed rejection proposal re-enters rejecting
+
+- **GIVEN** parallel execution resumes a workspace that has not completed archive
+- **AND** the workspace contains `openspec/changes/fix-auth/REJECTED.md`
+- **WHEN** the orchestrator determines the next non-terminal step
+- **THEN** the next step is `rejecting`
+- **AND** the workspace does not run the normal acceptance loop before rejection review

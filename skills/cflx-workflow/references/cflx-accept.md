@@ -37,20 +37,16 @@ Permission Error Acceptance:
 - Permission errors are NOT treated as Implementation Blockers (do NOT output "ACCEPTANCE: BLOCKED")
 - Permission errors are expected workflow outcomes when file access is restricted
 
-Implementation Blocker review:
+Implementation Blocker review (acceptance stage scope):
 1. Check if tasks.md contains any "## Implementation Blocker #N" sections
 2. Check whether `openspec/changes/<change_id>/REJECTED.md` exists (apply-generated rejection proposal artifact)
-3. If Implementation Blocker(s) exist:
-   a. Review each blocker's Category, Root Cause, Evidence, Impact, and Resolution Required
-   b. Verify the blocker is legitimate (spec contradiction or truly non-mockable external constraint)
-   c. Verify `REJECTED.md` proposal content aligns with blocker summary when present
-   d. If blocker is valid:
-      - Output "ACCEPTANCE: BLOCKED"
-      - Do NOT output FINDINGS or update tasks.md
-      - The orchestrator will confirm rejection proposal and execute rejection flow
-   e. If blocker is NOT valid (issue is mockable or solvable autonomously):
-      - Treat as acceptance FAIL
-      - Add finding: "Implementation Blocker #N is not valid: [reason]. Agent must [specific action]."
+3. If both blocker section and `REJECTED.md` exist:
+   - Treat this as a rejecting-stage handoff signal that should be reviewed by rejecting flow, not acceptance.
+   - Output `ACCEPTANCE: FAIL` with finding that routing is incorrect if acceptance is invoked directly for this state.
+4. If blocker section exists without `REJECTED.md`:
+   - Treat as acceptance FAIL
+   - Add finding requiring apply/rejecting flow to produce or clear blocker evidence consistently.
+5. If blocker section does not exist, run normal acceptance checks below.
 
 Spec-only change detection:
 - Read `openspec/changes/<change_id>/proposal.md` and look for a `Change Type` field.

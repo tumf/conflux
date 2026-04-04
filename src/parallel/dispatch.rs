@@ -18,7 +18,11 @@ use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
-use crate::orchestration::execute_rejection_flow;
+use crate::orchestration::{
+    execute_rejection_flow, handle_resume_apply_from_rejecting, run_rejection_review,
+    RejectionReviewVerdict,
+};
+use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::cleanup::WorkspaceCleanupGuard;
@@ -30,6 +34,99 @@ use super::types::WorkspaceResult;
 use super::workspace;
 use super::ParallelEvent;
 use super::ParallelExecutor;
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_resume_action, should_run_apply, ResumeAction};
+    use crate::execution::state::WorkspaceState;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn decide_resume_action_routes_applied_with_incomplete_tasks_to_apply() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("openspec/changes/change-incomplete");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n- [ ] pending\n",
+        )
+        .unwrap();
+
+        let action =
+            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Apply);
+    }
+
+    #[test]
+    fn decide_resume_action_routes_applied_with_complete_tasks_to_acceptance() {
+        let tmp = TempDir::new().unwrap();
+        let tasks_dir = tmp.path().join("openspec/changes/change-complete");
+        fs::create_dir_all(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n- [x] done2\n",
+        )
+        .unwrap();
+
+        let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Acceptance);
+    }
+
+    #[test]
+    fn decide_resume_action_keeps_archived_as_terminal() {
+        let tmp = TempDir::new().unwrap();
+        let action = decide_resume_action("change-archived", tmp.path(), &WorkspaceState::Archived);
+        assert_eq!(action, ResumeAction::Terminal);
+    }
+
+    #[test]
+    fn should_run_apply_consumes_skip_flag_after_first_cycle() {
+        let mut skip_apply_once = true;
+
+        assert!(!should_run_apply(&mut skip_apply_once));
+        assert!(!skip_apply_once);
+        assert!(should_run_apply(&mut skip_apply_once));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResumeAction {
+    Terminal,
+    Apply,
+    Acceptance,
+    Rejecting,
+}
+
+pub(super) fn decide_resume_action(
+    change_id: &str,
+    workspace_path: &std::path::Path,
+    state: &WorkspaceState,
+) -> ResumeAction {
+    match state {
+        WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
+        WorkspaceState::Archiving => ResumeAction::Acceptance,
+        WorkspaceState::Rejecting => ResumeAction::Rejecting,
+        WorkspaceState::Applied => {
+            match task_parser::parse_progress_with_fallback(change_id, Some(workspace_path)) {
+                Ok(progress) if progress.total > 0 && progress.completed >= progress.total => {
+                    ResumeAction::Acceptance
+                }
+                Ok(_) | Err(_) => ResumeAction::Apply,
+            }
+        }
+        WorkspaceState::Created | WorkspaceState::Applying { .. } => ResumeAction::Apply,
+    }
+}
+
+fn should_run_apply(skip_apply_once: &mut bool) -> bool {
+    if *skip_apply_once {
+        *skip_apply_once = false;
+        false
+    } else {
+        true
+    }
+}
 
 impl ParallelExecutor {
     /// Dispatch a single change to a workspace for apply + acceptance + archive.
@@ -62,7 +159,7 @@ impl ParallelExecutor {
                 info!("Change '{}' stopped before dispatch", change_id);
                 send_event(
                     &self.event_tx,
-                    ParallelEvent::ChangeStopped {
+                    ParallelEvent::ChangeDequeued {
                         change_id: change_id.clone(),
                     },
                 )
@@ -138,13 +235,7 @@ impl ParallelExecutor {
             // A resumed workspace may be in any state; we must not blindly run the full
             // pipeline for terminal states (Archived, Merged) or already-applied states.
             let effective_state = if was_resumed {
-                match detect_workspace_state(
-                    &change_id,
-                    &workspace.path,
-                    &base_branch,
-                )
-                .await
-                {
+                match detect_workspace_state(&change_id, &workspace.path, &base_branch).await {
                     Ok(state) => {
                         let state_label = format!("{:?}", state);
                         if let Some(ref tx) = event_tx {
@@ -172,11 +263,32 @@ impl ParallelExecutor {
                 WorkspaceState::Created
             };
 
+            let resume_action = if was_resumed {
+                decide_resume_action(&change_id, &workspace.path, &effective_state)
+            } else {
+                ResumeAction::Apply
+            };
+
+            if was_resumed {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            LogEntry::info(format!(
+                                "Resume routing for {}: state={:?} -> {:?}",
+                                change_id, effective_state, resume_action
+                            ))
+                            .with_change_id(&change_id),
+                        ))
+                        .await;
+                }
+            }
+
             // Early return for terminal states: Archived and Merged workspaces must not
             // re-enter the apply/acceptance/archive pipeline.  Doing so silently creates
             // duplicate apply commits or masks already-complete work as a fresh start.
-            match &effective_state {
-                WorkspaceState::Merged => {
+            if matches!(resume_action, ResumeAction::Terminal) {
+                match &effective_state {
+                    WorkspaceState::Merged => {
                     info!(
                         "Change '{}' workspace already merged to base, skipping all processing",
                         change_id
@@ -265,7 +377,8 @@ impl ParallelExecutor {
                         }
                     }
                 }
-                _ => {}
+                    _ => {}
+                }
             }
 
             // Create agent for acceptance testing
@@ -308,18 +421,124 @@ impl ParallelExecutor {
             });
 
             // Apply+Acceptance loop: retry apply when acceptance fails.
-            // For workspaces in Applied or Archiving state the apply step already
-            // ran in a previous execution; skip the apply loop body and proceed
-            // directly to the acceptance + archive stages so we avoid creating a
-            // spurious duplicate "Apply: <change_id>" commit.
-            let skip_apply = matches!(
-                effective_state,
-                WorkspaceState::Applied | WorkspaceState::Archiving
-            );
+            // Resume routing determines whether we start from apply or acceptance.
+            // The acceptance-only shortcut is consumed after one cycle so that any
+            // acceptance FAIL/command error path re-enters apply on the next cycle.
+            // Rejecting resumes are handled as an immediate rejection review branch.
+            if matches!(resume_action, ResumeAction::Rejecting) {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                            workspace_name: workspace.name.clone(),
+                            status: WorkspaceStatus::Rejecting,
+                        })
+                        .await;
+                }
+
+                match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
+                    Ok(RejectionReviewVerdict::Confirm) => {
+                        let rejected_path = workspace
+                            .path
+                            .join("openspec")
+                            .join("changes")
+                            .join(&change_id)
+                            .join("REJECTED.md");
+                        let reason = format!(
+                            "Rejecting review confirmed rejection (proposal: {})",
+                            rejected_path.display()
+                        );
+                        let resolved_base = base_branch.clone();
+                        match execute_rejection_flow(
+                            &change_id,
+                            &reason,
+                            &workspace.path,
+                            &resolved_base,
+                            &repo_root,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeRejected {
+                                            change_id: change_id.clone(),
+                                            reason: reason.clone(),
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeDequeued {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                }
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None,
+                                    rejected: Some(reason),
+                                };
+                            }
+                            Err(e) => {
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(format!(
+                                        "Rejected flow failed after rejecting CONFIRM verdict: {}",
+                                        e
+                                    )),
+                                    rejected: None,
+                                };
+                            }
+                        }
+                    }
+                    Ok(RejectionReviewVerdict::Resume) => {
+                        if let Err(e) = handle_resume_apply_from_rejecting(&change_id, &workspace.path).await {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Failed to resume apply from rejecting verdict: {}",
+                                    e
+                                )),
+                                rejected: None,
+                            };
+                        }
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::warn("Rejecting review returned RESUME; returning to apply loop")
+                                        .with_change_id(&change_id)
+                                        .with_operation("rejecting"),
+                                ))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!(
+                                "Rejecting review failed while resuming rejecting stage: {}",
+                                e
+                            )),
+                            rejected: None,
+                        };
+                    }
+                }
+            }
+            let mut skip_apply_once = matches!(resume_action, ResumeAction::Acceptance);
 
             let _apply_revision = loop {
-                // Skip apply for workspaces that were already applied in a previous run.
-                if skip_apply {
+                // Skip apply only for the first cycle when resuming from an already-applied state.
+                if !should_run_apply(&mut skip_apply_once) {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::Log(
@@ -341,7 +560,7 @@ impl ParallelExecutor {
                         info!("Change '{}' stopped during execution", change_id);
                         if let Some(ref tx) = event_tx {
                             let _ = tx
-                                .send(ParallelEvent::ChangeStopped {
+                                .send(ParallelEvent::ChangeDequeued {
                                     change_id: change_id.clone(),
                                 })
                                 .await;
@@ -418,7 +637,7 @@ impl ParallelExecutor {
                                     info!("Change '{}' stopped during apply", change_id);
                                     if let Some(ref tx) = event_tx {
                                         let _ = tx
-                                            .send(ParallelEvent::ChangeStopped {
+                                            .send(ParallelEvent::ChangeDequeued {
                                                 change_id: change_id.clone(),
                                             })
                                             .await;
@@ -459,19 +678,115 @@ impl ParallelExecutor {
                     info!(
                         change_id = %change_id,
                         rejected_path = %handoff.rejected_path.display(),
-                        "Apply emitted blocked handoff proposal; forwarding to acceptance"
+                        "Apply emitted blocked handoff proposal; routing to rejecting stage"
                     );
                     if let Some(ref tx) = event_tx {
                         let _ = tx
+                            .send(ParallelEvent::WorkspaceStatusUpdated {
+                                workspace_name: workspace.name.clone(),
+                                status: WorkspaceStatus::Rejecting,
+                            })
+                            .await;
+                        let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::warn(format!(
-                                    "Apply blocked handoff detected via {}",
+                                    "Apply blocked handoff detected via {}; entering rejecting stage",
                                     handoff.rejected_path.display()
                                 ))
                                 .with_change_id(&change_id)
-                                .with_operation("apply"),
+                                .with_operation("rejecting"),
                             ))
                             .await;
+                    }
+
+                    match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
+                        Ok(RejectionReviewVerdict::Confirm) => {
+                            let reason = format!(
+                                "Apply-blocked rejection confirmed by rejecting review (proposal: {})",
+                                handoff.rejected_path.display()
+                            );
+                            let resolved_base = base_branch.clone();
+                            match execute_rejection_flow(
+                                &change_id,
+                                &reason,
+                                &workspace.path,
+                                &resolved_base,
+                                &repo_root,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::ChangeRejected {
+                                                change_id: change_id.clone(),
+                                                reason: reason.clone(),
+                                            })
+                                            .await;
+                                        let _ = tx
+                                            .send(ParallelEvent::ChangeDequeued {
+                                                change_id: change_id.clone(),
+                                            })
+                                            .await;
+                                    }
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name: workspace.name,
+                                        final_revision: None,
+                                        error: None,
+                                        rejected: Some(reason),
+                                    };
+                                }
+                                Err(e) => {
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name: workspace.name,
+                                        final_revision: None,
+                                        error: Some(format!(
+                                            "Rejected flow failed after rejecting CONFIRM verdict: {}",
+                                            e
+                                        )),
+                                        rejected: None,
+                                    };
+                                }
+                            }
+                        }
+                        Ok(RejectionReviewVerdict::Resume) => {
+                            if let Err(e) = handle_resume_apply_from_rejecting(&change_id, &workspace.path).await {
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(format!(
+                                        "Failed to resume apply from rejecting verdict: {}",
+                                        e
+                                    )),
+                                    rejected: None,
+                                };
+                            }
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::warn("Rejecting review returned RESUME; returning to apply loop")
+                                            .with_change_id(&change_id)
+                                            .with_operation("rejecting"),
+                                    ))
+                                    .await;
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Rejecting review failed after apply blocked handoff: {}",
+                                    e
+                                )),
+                                rejected: None,
+                            };
+                        }
                     }
                 }
 
@@ -591,19 +906,25 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::Fail { findings },
                         acceptance_iteration,
                     )) => {
+                        let blocking_gate_context = findings
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "no acceptance findings captured".to_string());
                         warn!(
-                            "Acceptance failed for {} ({} tail lines) (cycle {}), returning to apply loop",
+                            "Acceptance failed for {} ({} findings) (cycle {}), blocking gate context: {}; returning to apply loop",
                             change_id,
                             findings.len(),
-                            cycle_count
+                            cycle_count,
+                            blocking_gate_context
                         );
                         // Note: tasks.md is now updated by the acceptance agent itself
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
                                     LogEntry::warn(format!(
-                                        "Acceptance failed ({} tail lines), returning to apply loop (cycle {})",
+                                        "Acceptance failed ({} findings), blocking gate context: {}; returning to apply loop (cycle {})",
                                         findings.len(),
+                                        blocking_gate_context,
                                         cycle_count
                                     ))
                                     .with_change_id(&change_id)
@@ -694,7 +1015,7 @@ impl ParallelExecutor {
                                         ))
                                         .await;
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeStopped {
+                                        .send(ParallelEvent::ChangeDequeued {
                                             change_id: change_id.clone(),
                                         })
                                         .await;
@@ -733,7 +1054,7 @@ impl ParallelExecutor {
                                 info!("Change '{}' stopped during acceptance", change_id);
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeStopped {
+                                        .send(ParallelEvent::ChangeDequeued {
                                             change_id: change_id.clone(),
                                         })
                                         .await;
@@ -775,7 +1096,7 @@ impl ParallelExecutor {
                                     info!("Change '{}' stopped during acceptance", change_id);
                                     if let Some(ref tx) = event_tx {
                                         let _ = tx
-                                            .send(ParallelEvent::ChangeStopped {
+                                            .send(ParallelEvent::ChangeDequeued {
                                                 change_id: change_id.clone(),
                                             })
                                             .await;
@@ -866,7 +1187,7 @@ impl ParallelExecutor {
                                 info!("Change '{}' stopped during archive", change_id);
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
-                                        .send(ParallelEvent::ChangeStopped {
+                                        .send(ParallelEvent::ChangeDequeued {
                                             change_id: change_id.clone(),
                                         })
                                         .await;

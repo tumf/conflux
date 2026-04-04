@@ -279,7 +279,7 @@ pub async fn run_orchestrator(
         if dynamic_queue.is_stopped(&change_id).await {
             dynamic_queue.clear_stopped(&change_id).await;
             shared_state.write().await.drop_pending_change(&change_id);
-            let change_stopped_event = OrchestratorEvent::ChangeStopped {
+            let change_stopped_event = OrchestratorEvent::ChangeDequeued {
                 change_id: change_id.clone(),
             };
             dispatch_event(
@@ -508,7 +508,7 @@ pub async fn run_orchestrator(
                 // Clear the stopped flag to allow re-queueing
                 dynamic_queue.clear_stopped(&change_id).await;
                 // Send ChangeStopped event to move the change to not queued
-                let change_stopped_event = OrchestratorEvent::ChangeStopped {
+                let change_stopped_event = OrchestratorEvent::ChangeDequeued {
                     change_id: change_id.clone(),
                 };
                 dispatch_event(
@@ -860,7 +860,7 @@ pub async fn run_orchestrator(
                     // Clear the stop flag and send ChangeStopped event
                     dynamic_queue.clear_stopped(&change_id).await;
                     shared_state.write().await.drop_pending_change(&change_id);
-                    let change_stopped_event2 = OrchestratorEvent::ChangeStopped {
+                    let change_stopped_event2 = OrchestratorEvent::ChangeDequeued {
                         change_id: change_id.clone(),
                     };
                     dispatch_event(

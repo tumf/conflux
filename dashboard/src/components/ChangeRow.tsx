@@ -1,6 +1,6 @@
 import React, { useCallback } from 'react';
 import { RemoteChange } from '../api/types';
-import { toggleChangeSelection } from '../api/restClient';
+import { stopAndDequeueChange, toggleChangeSelection } from '../api/restClient';
 
 interface ChangeRowProps {
   change: RemoteChange;
@@ -10,6 +10,7 @@ interface ChangeRowProps {
 
 const statusConfig: Record<string, { color: string; bg: string }> = {
   idle: { color: 'text-[#71717a]', bg: 'bg-[#27272a]' },
+  'not queued': { color: 'text-[#71717a]', bg: 'bg-[#27272a]' },
   queued: { color: 'text-[#3b82f6]', bg: 'bg-[#1e3a5f]/50' },
   applying: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
   accepting: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
@@ -23,6 +24,7 @@ const statusConfig: Record<string, { color: string; bg: string }> = {
 
 const progressBarColor: Record<string, string> = {
   idle: 'bg-[#3f3f46]',
+  'not queued': 'bg-[#3f3f46]',
   queued: 'bg-[#3b82f6]',
   applying: 'bg-[#f59e0b]',
   accepting: 'bg-[#f59e0b]',
@@ -52,6 +54,16 @@ export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps)
     (e: React.MouseEvent) => {
       e.stopPropagation();
       toggleChangeSelection(change.project, change.id).catch(console.error);
+    },
+    [change.project, change.id],
+  );
+
+  const isActive = ['applying', 'accepting', 'archiving', 'resolving'].includes(change.status);
+
+  const handleStopAndDequeue = useCallback(
+    (e: React.MouseEvent) => {
+      e.stopPropagation();
+      stopAndDequeueChange(change.project, change.id).catch(console.error);
     },
     [change.project, change.id],
   );
@@ -99,9 +111,21 @@ export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps)
           </button>
           <span className="truncate font-mono text-xs text-[#a1a1aa]">{change.id}</span>
         </div>
-        <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-medium ${cfg.color} ${cfg.bg}`}>
-          {statusDisplay}
-        </span>
+        <div className="flex items-center gap-2 shrink-0">
+          {isActive && (
+            <button
+              type="button"
+              onClick={handleStopAndDequeue}
+              className="rounded border border-[#dc2626] px-2 py-0.5 text-xs font-medium text-[#fca5a5] transition-colors hover:bg-[#7f1d1d]/40"
+              aria-label={`Stop and dequeue ${change.id}`}
+            >
+              Stop & dequeue
+            </button>
+          )}
+          <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${cfg.color} ${cfg.bg}`}>
+            {statusDisplay}
+          </span>
+        </div>
       </div>
 
       <div className="space-y-1">
