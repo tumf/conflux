@@ -13,7 +13,7 @@ use super::defaults::PROJECT_CONFIG_FILE;
 use super::jsonc;
 use super::types::{OrchestratorConfig, ProposalSessionConfig, ServerConfig};
 // Path helpers are defined in the parent (mod.rs) and accessed via super::
-use super::{get_platform_config_path, get_xdg_default_config_path, get_xdg_env_config_path};
+use super::get_global_config_paths;
 
 // ── OrchestratorConfig: file loading ──────────────────────────────────────
 
@@ -64,28 +64,10 @@ impl OrchestratorConfig {
     ) -> (ServerConfig, Option<String>, ProposalSessionConfig) {
         let mut merged = OrchestratorConfig::default();
 
-        // 1. Platform default config
-        if let Some(platform_path) = get_platform_config_path() {
-            if platform_path.exists() {
-                if let Ok(c) = Self::load_from_file(&platform_path) {
-                    merged.merge(c);
-                }
-            }
-        }
-
-        // 2. XDG default config (~/.config)
-        if let Some(xdg_default_path) = get_xdg_default_config_path() {
-            if xdg_default_path.exists() {
-                if let Ok(c) = Self::load_from_file(&xdg_default_path) {
-                    merged.merge(c);
-                }
-            }
-        }
-
-        // 3. XDG env config ($XDG_CONFIG_HOME)
-        if let Some(xdg_env_path) = get_xdg_env_config_path() {
-            if xdg_env_path.exists() {
-                if let Ok(c) = Self::load_from_file(&xdg_env_path) {
+        // 1-3. Global config candidates in merge priority order.
+        for path in get_global_config_paths() {
+            if path.exists() {
+                if let Ok(c) = Self::load_from_file(&path) {
                     merged.merge(c);
                 }
             }
@@ -114,30 +96,12 @@ impl OrchestratorConfig {
     pub fn load(custom_path: Option<&Path>) -> Result<Self> {
         let mut config = Self::default();
 
-        // 1. Platform default config (lowest priority)
-        if let Some(platform_path) = get_platform_config_path() {
-            if platform_path.exists() {
-                debug!("Loading platform config from: {:?}", platform_path);
-                let platform_config = Self::load_from_file(&platform_path)?;
-                config.merge(platform_config);
-            }
-        }
-
-        // 2. XDG config (default path: ~/.config)
-        if let Some(xdg_default_path) = get_xdg_default_config_path() {
-            if xdg_default_path.exists() {
-                debug!("Loading XDG default config from: {:?}", xdg_default_path);
-                let xdg_default_config = Self::load_from_file(&xdg_default_path)?;
-                config.merge(xdg_default_config);
-            }
-        }
-
-        // 3. XDG config (environment variable: $XDG_CONFIG_HOME)
-        if let Some(xdg_env_path) = get_xdg_env_config_path() {
-            if xdg_env_path.exists() {
-                debug!("Loading XDG env config from: {:?}", xdg_env_path);
-                let xdg_env_config = Self::load_from_file(&xdg_env_path)?;
-                config.merge(xdg_env_config);
+        // 1-3. Global config candidates (low → high priority)
+        for path in get_global_config_paths() {
+            if path.exists() {
+                debug!("Loading global config from: {:?}", path);
+                let loaded_config = Self::load_from_file(&path)?;
+                config.merge(loaded_config);
             }
         }
 
