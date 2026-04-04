@@ -11,6 +11,6 @@
 - [x] 3.2 CLI公開挙動と設定ファイル互換性に差分がないことを確認する（確認: API/CLI変更なし）
 
 ## Acceptance #2 Failure Follow-up
-- [x] `.cflx/acceptance-state.json` を整理し、`git status --porcelain` が空になる状態にする
-- [x] `pre-commit` をこのワークスペースで実行可能にし、`pre-commit run --all-files` を成功させる
+- [x] `.cflx/acceptance-state.json` を整理し、`git status --porcelain` で `.cflx/acceptance-state.json` が表示されない状態にする
+- [x] `pre-commit` をこのワークスペースで実行可能にし、`python3 -m pre_commit run --all-files` を修正なしで成功させる
 - [x] `parallel::tests::executor::test_idle_queue_addition_marks_reanalysis_and_enqueues_change` の失敗を解消し、`cargo test` をグリーンにする
