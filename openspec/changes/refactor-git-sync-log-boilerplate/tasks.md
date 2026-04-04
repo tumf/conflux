@@ -15,3 +15,7 @@
 - [x] `cargo fmt --all` を実行して `src/server/api/git_sync.rs` のテストコード整形差分を解消する
 - [x] `parallel::tests::executor::test_idle_queue_addition_marks_reanalysis_and_enqueues_change` の前提change_idを現行リポジトリ構成に合わせて修正し、`cargo test` を通す
 
+## Acceptance #7 Failure Follow-up
+- [x] `.cflx/` 配下の acceptance 生成物を ignore または削除して、`git status --porcelain` を空にする
+- [x] `tasks.md` の `.cflx/` 整理完了チェックを、実際に working tree が clean である状態と一致するよう確認・更新する
+

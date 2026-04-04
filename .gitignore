@@ -6,3 +6,4 @@ error.log
 .agents/.skill-lock.json
 .playwright-cli/
 .tldrignore
+.cflx/
