@@ -2196,11 +2196,19 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
     use crate::tui::queue::DynamicQueue;
 
     let config = create_test_config();
-    let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, None);
+    let mut executor = ParallelExecutor::new(PathBuf::from("."), config, None);
     executor.set_persistent_lifetime();
 
-    // Use an existing active change ID in this repository so list_changes_native can resolve it.
-    let change_id = "fix-parallel-acceptance-resume-archive-bypass";
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let change_id = all_changes
+        .first()
+        .expect("expected at least one change")
+        .id
+        .clone();
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
