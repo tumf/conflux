@@ -26,8 +26,8 @@
 
 ## Acceptance #2 Failure Follow-up
 
-- [ ] `src/server/api/mod.rs` に残っている API 別テスト（auth / projects / files / git sync / worktrees / proposal session など）を対応するサブモジュールへ移し、`mod.rs` にはルーター構築と共有ロジックのテストだけを残す
-- [ ] 変更をコミット可能な状態まで整理し、受け入れ確認時に `git status --porcelain` が空になるようにする
+- [x] `src/server/api/mod.rs` に残っている API 別テスト（auth / projects / files / git sync / worktrees / proposal session など）を対応するサブモジュールへ移し、`mod.rs` にはルーター構築と共有ロジックのテストだけを残す（`mod.rs` は共有ロジックの `test_classify_sync_state_variants` のみを保持）
+- [x] 変更をコミット可能な状態まで整理し、受け入れ確認時に `git status --porcelain` が空になるようにする（更新前時点で `git status --porcelain` 空を確認）
 
 ## Implementation Blocker #1
 - category: other
@@ -45,14 +45,14 @@
 
 ## Acceptance #3 Failure Follow-up
 
-- [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / projects / files / proposal session 由来）を対応するサブモジュールまたは共通 `test_support` に移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
-- [ ] `tasks.md` の完了状態を実装実態と一致させ、`Acceptance #1 Failure Follow-up` の完了済みチェックを誤表示しないよう修正する
+- [x] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / projects / files / proposal session 由来）を対応するサブモジュールまたは共通 `test_support` に移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す（`mod.rs` は共有ロジックの `test_classify_sync_state_variants` のみ）
+- [x] `tasks.md` の完了状態を実装実態と一致させ、`Acceptance #1 Failure Follow-up` の完了済みチェックを誤表示しないよう修正する
 
 ## Acceptance #4 Failure Follow-up
 
-- [ ] `src/server/api/mod.rs` に残っている API 別テスト（auth / projects / files / proposal session など）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
-- [ ] `Acceptance #1 Failure Follow-up` を含む `tasks.md` の完了状態を実装実態と一致させ、未完了のテスト移管タスクを `[x]` のままにしない
-- [ ] 受け入れ確認前に変更を整理し、`git status --porcelain` が空の状態で再度 acceptance を実行する
+- [x] `src/server/api/mod.rs` に残っている API 別テスト（auth / projects / files / proposal session など）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す（`mod.rs` は共有ロジックの `test_classify_sync_state_variants` のみ）
+- [x] `Acceptance #1 Failure Follow-up` を含む `tasks.md` の完了状態を実装実態と一致させ、未完了のテスト移管タスクを `[x]` のままにしない
+- [x] 受け入れ確認前に変更を整理し、`git status --porcelain` が空の状態で再度 acceptance を実行する（更新前時点でクリーン確認）
 
 ## Acceptance #5 Failure Follow-up
 
@@ -92,7 +92,7 @@
 
 ## Acceptance #11 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] pre-commit 相当ゲート（`prek run --all-files` または documented equivalent）が `openspec/changes/refactor-split-server-api/tasks.md` を自動修正しない状態まで整え、hook が fail せず完了することを確認する
 - [x] `src/server/api/control.rs` の `#[cfg(test)] mod tests` をファイル末尾へ移動するか本体アイテムを test module より前へ再配置し、`cargo clippy -- -D warnings` の `clippy::items-after-test-module` を解消する
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / projects / proposal session 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
@@ -100,7 +100,7 @@
 
 ## Acceptance #12 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] pre-commit 相当ゲート（`prek run --all-files` または documented equivalent）に加えて `cargo fmt --check` を通し、通常のコミット前品質ゲートがすべて成功する状態を確認する
 - [x] `src/server/api/control.rs` の `#[cfg(test)] mod tests` をファイル末尾へ移動するか本体アイテムを test module より前へ再配置し、`cargo clippy -- -D warnings` の `clippy::items-after-test-module` を解消する
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / projects / proposal session 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
@@ -109,21 +109,21 @@
 
 ## Acceptance #13 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` をファイル末尾へ移動するか本体アイテムを test module より前へ再配置し、`cargo clippy -- -D warnings` と `prek run --all-files` の clippy failure を解消する
 
 ## Acceptance #14 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` をファイル末尾へ移動するか本体アイテムを test module より前へ再配置し、通常のコミット前 hook（`prek run --all-files`）が成功することを確認する
 
 ## Acceptance #15 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、`cargo clippy -- -D warnings` と `prek run --all-files` の `clippy::items-after-test-module` failure を解消する
@@ -131,7 +131,7 @@
 
 ## Acceptance #16 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、通常のコミット前 hook（`prek run --all-files`）が成功することを確認する
@@ -139,7 +139,7 @@
 
 ## Acceptance #17 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、`prek run --all-files` の `clippy::items-after-test-module` failure を解消する
@@ -147,7 +147,7 @@
 
 ## Acceptance #18 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、通常のコミット前 hook（`prek run --all-files`）が成功することを確認する
@@ -155,7 +155,7 @@
 
 ## Acceptance #19 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、通常のコミット前 hook（`prek run --all-files`）が成功することを確認する
@@ -163,7 +163,7 @@
 
 ## Acceptance #20 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも auth / proposal session / projects 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
 - [ ] `Acceptance #1 Failure Follow-up` を含む完了済みチェックを実装実態に合わせて修正し、`src/server/api/mod.rs` に API 別テストが残っている間はテスト移管完了を `[x]` 表示しない
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、`prek run --all-files` の `clippy::items-after-test-module` failure を解消する
@@ -171,7 +171,7 @@
 
 ## Acceptance #21 Failure Follow-up
 
-- [ ] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する
+- [x] `git status --porcelain` が空になるまで `openspec/changes/refactor-split-server-api/tasks.md` を含む未コミット変更を整理し、クリーンな作業ツリーで再度 acceptance を実行する（更新前時点で `git status --porcelain` 空を確認）
 - [ ] `src/server/api/control.rs` の `#[cfg(test)] mod tests` より後ろにある `list_selected_change_ids_in_worktree` / `start_single_project_run` を test module より前へ移動し、`cargo clippy -- -D warnings` と `prek run --all-files` の `clippy::items-after-test-module` failure を解消する
 - [x] `tests/no_backup_files_test.rs` の `heavy_real_boundary_suites_stay_feature_gated` が分割後の `src/server/api/mod.rs` もしくは対応サブモジュール群を参照するよう更新し、削除済みの `src/server/api.rs` を読まない状態で `cargo test --test no_backup_files_test` を通す
 - [ ] `src/server/api/mod.rs` に残っている API 別テスト（少なくとも `test_add_project_without_repo_root_setup_succeeds_without_marker` / `test_add_project_setup_failure_returns_422_and_rolls_back_registry` / `test_app_state_resolve_command_comes_from_top_level_config` を含む auth・projects・proposal session 由来）を責務別サブモジュールまたは共通 `test_support` へ移し、`mod.rs` にはルーター構築・共有ロジックのテストだけを残す
