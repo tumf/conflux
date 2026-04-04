@@ -77,7 +77,7 @@ First, gather available context proactively before asking questions.
 **Context to gather first**:
 
 - Prior user messages, goals, and constraints from the current session
-- Repository-specific instructions such as `AGENTS.md` or `openspec/AGENTS.md` when present
+- Repository-specific instructions such as `AGENTS.md` when present
 - Existing related specs, archived changes, and relevant source/test modules
 - Existing architecture or workflow boundaries already mentioned in the conversation
 
