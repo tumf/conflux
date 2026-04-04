@@ -390,6 +390,92 @@ pub async fn server_refresh_worktrees(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
 ) -> Response {
-    // Delegate to the list endpoint (always fresh from git)
-    server_list_worktrees(State(state), Path(project_id)).await
+    let (worktree_path, _entry) = match resolve_project_worktree_path(&state, &project_id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    if !worktree_path.exists() {
+        return error_response(StatusCode::NOT_FOUND, "Project worktree not found");
+    }
+
+    match crate::worktree_ops::get_worktrees(&worktree_path).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(WorktreeOpResponse {
+                success: true,
+                message: "Worktree snapshot refreshed".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            error!(
+                project_id = %project_id,
+                error = %e,
+                "Failed to refresh worktree snapshot"
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to refresh worktree snapshot: {}", e),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::server::api::test_support::{create_local_git_repo, make_router};
+
+    #[tokio::test]
+    async fn test_list_worktrees_with_real_project() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = project_json["id"].as_str().unwrap();
+
+        let list_req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/projects/{}/worktrees", project_id))
+            .body(Body::empty())
+            .unwrap();
+
+        let list_resp = router.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let worktrees: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !worktrees.is_empty(),
+            "Should have at least one worktree after project add"
+        );
+    }
 }

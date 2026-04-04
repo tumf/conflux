@@ -410,6 +410,68 @@ pub(super) async fn get_logs(
     }
 }
 
+/// List change IDs in a project worktree that should be included in the next run.
+/// Error changes are excluded unless they have been explicitly re-marked.
+pub(super) async fn list_selected_change_ids_in_worktree(
+    worktree_path: &std::path::Path,
+    change_selections: Option<&std::collections::HashMap<String, bool>>,
+) -> Vec<String> {
+    let changes = list_remote_changes_in_worktree(worktree_path, "", "").await;
+    changes
+        .into_iter()
+        .filter(|change| {
+            let explicit_selection = change_selections.and_then(|m| m.get(&change.id)).copied();
+            let selected = explicit_selection.unwrap_or(true);
+            if change.status == "error" {
+                explicit_selection.unwrap_or(false)
+            } else {
+                selected
+            }
+        })
+        .map(|change| change.id)
+        .collect()
+}
+
+// ─────────────────────────── Deprecated per-project control (removed) ─────────
+
+// Per-project control endpoints (/projects/{id}/control/run|stop|retry) have been
+// removed. Use the global /api/v1/control/run and /api/v1/control/stop endpoints
+// instead. The global endpoints manage all projects as a single orchestration unit.
+
+// ─────────────────────────── Internal: per-project run (used by global control) ─
+
+/// Start a single project run (used internally by global_control_run and add_project auto-enqueue).
+pub(super) async fn start_single_project_run(
+    state: &AppState,
+    project_id: &str,
+    worktree_path: std::path::PathBuf,
+    changes: Vec<String>,
+) -> std::result::Result<(), String> {
+    let req = ProjectRunRequest {
+        project_id: project_id.to_string(),
+        worktree_path,
+        changes: if changes.is_empty() {
+            None
+        } else {
+            Some(changes)
+        },
+    };
+
+    crate::server::runner::start_project_run(
+        &state.runners,
+        state.registry.clone(),
+        state.db.clone(),
+        req,
+        state.log_tx.clone(),
+    )
+    .await
+    .map_err(|e| format!("Failed to start run: {}", e))?;
+
+    let mut registry = state.registry.write().await;
+    let _ = registry.set_status(project_id, ProjectStatus::Running);
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -420,73 +482,13 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    use crate::server::api::{build_router, AppState, SERVER_LOG_BUFFER_SIZE};
-    use crate::server::registry::{create_shared_registry, OrchestrationStatus};
+    use crate::server::api::test_support::{create_local_git_repo, make_state as make_base_state};
+    use crate::server::api::{build_router, AppState};
 
     fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
-        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
-        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
-        AppState {
-            registry,
-            runners: crate::server::runner::create_shared_runners(),
-            db: Some(crate::server::db::ServerDb::new(temp_dir.path()).unwrap()),
-            auth_token: auth_token.map(std::string::ToString::to_string),
-            max_concurrent_total: 4,
-            resolve_command: None,
-            log_tx,
-            orchestration_status: Arc::new(
-                tokio::sync::RwLock::new(OrchestrationStatus::default()),
-            ),
-            terminal_manager: crate::server::terminal::create_terminal_manager(),
-            active_commands: crate::server::active_commands::create_shared_active_commands(),
-            proposal_session_manager:
-                crate::server::proposal_session::create_proposal_session_manager(
-                    crate::config::ProposalSessionConfig::default(),
-                    None,
-                ),
-        }
-    }
-
-    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
-        let repo_path = parent.join("test-origin");
-        let src = parent.join("test-src");
-        std::fs::create_dir_all(&src).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::fs::write(src.join("README.md"), "hello").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                src.to_str().unwrap(),
-                repo_path.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        repo_path
+        let mut state = make_base_state(temp_dir, auth_token);
+        state.db = Some(crate::server::db::ServerDb::new(temp_dir.path()).unwrap());
+        state
     }
 
     #[tokio::test]
@@ -509,6 +511,135 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_global_control_run_records_call() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&worktree_path).unwrap();
+        std::fs::write(worktree_path.join("proposal.md"), "# proposal\n").unwrap();
+
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let calls = CONTROL_CALLS.get().unwrap().lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|(id, action)| id == "_global_" && action == "run"));
+        assert!(calls
+            .iter()
+            .any(|(id, action)| id == &entry.id && action == "run"));
+    }
+
+    #[tokio::test]
+    async fn test_toggle_all_change_selection_remarks_error_changes_for_next_run() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
+        }
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/projects/{}/changes/toggle-all", entry.id))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["selected"], true);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 1);
+        assert_eq!(json["skipped"], 0);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
+        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
     }
 
     #[tokio::test]
@@ -657,67 +788,3 @@ mod tests {
         assert!(!logs_json.as_array().unwrap().is_empty());
     }
 }
-
-/// List change IDs in a project worktree that should be included in the next run.
-/// Error changes are excluded unless they have been explicitly re-marked.
-pub(super) async fn list_selected_change_ids_in_worktree(
-    worktree_path: &std::path::Path,
-    change_selections: Option<&std::collections::HashMap<String, bool>>,
-) -> Vec<String> {
-    let changes = list_remote_changes_in_worktree(worktree_path, "", "").await;
-    changes
-        .into_iter()
-        .filter(|change| {
-            let explicit_selection = change_selections.and_then(|m| m.get(&change.id)).copied();
-            let selected = explicit_selection.unwrap_or(true);
-            if change.status == "error" {
-                explicit_selection.unwrap_or(false)
-            } else {
-                selected
-            }
-        })
-        .map(|change| change.id)
-        .collect()
-}
-
-// ─────────────────────────── Deprecated per-project control (removed) ─────────
-
-// Per-project control endpoints (/projects/{id}/control/run|stop|retry) have been
-// removed. Use the global /api/v1/control/run and /api/v1/control/stop endpoints
-// instead. The global endpoints manage all projects as a single orchestration unit.
-
-// ─────────────────────────── Internal: per-project run (used by global control) ─
-
-/// Start a single project run (used internally by global_control_run and add_project auto-enqueue).
-pub(super) async fn start_single_project_run(
-    state: &AppState,
-    project_id: &str,
-    worktree_path: std::path::PathBuf,
-    changes: Vec<String>,
-) -> std::result::Result<(), String> {
-    let req = ProjectRunRequest {
-        project_id: project_id.to_string(),
-        worktree_path,
-        changes: if changes.is_empty() {
-            None
-        } else {
-            Some(changes)
-        },
-    };
-
-    crate::server::runner::start_project_run(
-        &state.runners,
-        state.registry.clone(),
-        state.db.clone(),
-        req,
-        state.log_tx.clone(),
-    )
-    .await
-    .map_err(|e| format!("Failed to start run: {}", e))?;
-
-    let mut registry = state.registry.write().await;
-    let _ = registry.set_status(project_id, ProjectStatus::Running);
-
-    Ok(())
-}
-

@@ -52,7 +52,7 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
             ],
         ),
         (
-            "src/server/api/mod.rs",
+            "src/server/api/projects.rs",
             &[
                 "test_add_project_setup_failure_returns_422_and_rolls_back_registry",
                 "test_add_project_without_repo_root_setup_succeeds_without_marker",

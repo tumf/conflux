@@ -471,3 +471,182 @@ pub async fn delete_project(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use tempfile::TempDir;
+    use tower::ServiceExt;
+
+    use crate::server::api::test_support::{
+        create_local_git_repo, make_state, run_sync_monitor_once_for_tests,
+    };
+
+    #[cfg(feature = "heavy-tests")]
+    use crate::server::api::test_support::{create_local_git_repo_with_setup, make_router};
+
+    #[cfg(feature = "heavy-tests")]
+    #[tokio::test]
+    async fn test_add_project_without_repo_root_setup_succeeds_without_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+
+        let router = make_router(&temp_dir, None);
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let project_id = json["id"].as_str().expect("Response must contain id");
+
+        let marker_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(project_id)
+            .join("main")
+            .join(".setup-root-path");
+        assert!(
+            !marker_path.exists(),
+            "No setup marker should exist when repo-root .wt/setup is absent"
+        );
+    }
+
+    #[cfg(feature = "heavy-tests")]
+    #[tokio::test]
+    async fn test_add_project_setup_failure_returns_422_and_rolls_back_registry() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin =
+            create_local_git_repo_with_setup(temp_dir.path(), Some("#!/bin/sh\nexit 42\n"));
+        let remote_url = format!("file://{}", origin.to_str().unwrap());
+        let expected_project_id = crate::server::registry::generate_project_id(&remote_url, "main");
+
+        let state = make_state(&temp_dir, None);
+        let router = build_router(state.clone());
+
+        let body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let error_message = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error_message.contains("worktree setup failed"),
+            "error should mention setup failure, got: {}",
+            json
+        );
+
+        let registry = state.registry.read().await;
+        assert!(
+            registry.list().is_empty(),
+            "Registry should be empty after setup failure rollback"
+        );
+
+        let local_repo_path = temp_dir.path().join(&expected_project_id);
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&expected_project_id)
+            .join("main");
+        assert!(
+            !local_repo_path.exists(),
+            "Bare clone should be cleaned up after setup failure"
+        );
+        assert!(
+            !worktree_path.exists(),
+            "Worktree should be cleaned up after setup failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_projects_state_includes_sync_metadata_fields_after_monitor_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let origin = create_local_git_repo(temp_dir.path());
+        let remote_url = format!("file://{}", origin.to_string_lossy());
+
+        let state = make_state(&temp_dir, None);
+        let router = build_router(state.clone());
+
+        let add_body = serde_json::json!({
+            "remote_url": remote_url,
+            "branch": "main"
+        });
+        let add_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/projects")
+            .header("Content-Type", "application/json")
+            .body(Body::from(add_body.to_string()))
+            .unwrap();
+        let add_resp = router.clone().oneshot(add_req).await.unwrap();
+        assert_eq!(add_resp.status(), StatusCode::CREATED);
+
+        run_sync_monitor_once_for_tests(&state).await;
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/projects/state")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let project = &json["projects"][0];
+        assert_eq!(project["sync_state"], "up_to_date");
+        assert_eq!(project["ahead_count"], 0);
+        assert_eq!(project["behind_count"], 0);
+        assert_eq!(project["sync_required"], false);
+        assert!(project["local_sha"].as_str().is_some());
+        assert!(project["remote_sha"].as_str().is_some());
+        assert!(project["last_remote_check_at"].as_str().is_some());
+        assert!(project["remote_check_error"].is_null());
+    }
+
+    #[cfg(feature = "heavy-tests")]
+    #[test]
+    fn test_app_state_resolve_command_comes_from_top_level_config() {
+        let top_level_resolve_cmd = Some("echo top-level-resolve".to_string());
+        let app_state_resolve_command = top_level_resolve_cmd.clone();
+
+        assert_eq!(
+            app_state_resolve_command,
+            Some("echo top-level-resolve".to_string()),
+            "AppState resolve_command should come from top-level config resolve_command"
+        );
+    }
+}

@@ -83,6 +83,9 @@ mod terminals;
 mod worktrees;
 mod ws;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use helpers::{
     error_response, now_rfc3339, ProjectsStateResponse, StatsOverviewResponse,
     StatsOverviewSummaryResponse, StatsProjectResponse, StatsRecentEventResponse,
@@ -676,44 +679,16 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    use crate::server::api::test_support::{
+        create_local_git_repo, create_local_git_repo_with_setup, make_router, make_state,
+        run_sync_monitor_once_for_tests,
+    };
     use crate::server::registry::create_shared_registry;
-
-    fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
-        let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
-        let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
-        AppState {
-            registry,
-            runners: crate::server::runner::create_shared_runners(),
-            db: None,
-            auth_token: auth_token.map(|s| s.to_string()),
-            max_concurrent_total: 4,
-            resolve_command: None,
-            log_tx,
-            orchestration_status: Arc::new(
-                tokio::sync::RwLock::new(OrchestrationStatus::default()),
-            ),
-            terminal_manager: crate::server::terminal::create_terminal_manager(),
-            active_commands: crate::server::active_commands::create_shared_active_commands(),
-            proposal_session_manager:
-                crate::server::proposal_session::create_proposal_session_manager(
-                    crate::config::ProposalSessionConfig::default(),
-                    None,
-                ),
-        }
-    }
-
-    fn make_router(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
-        build_router(make_state(temp_dir, auth_token))
-    }
 
     fn make_router_with_db(temp_dir: &TempDir, auth_token: Option<&str>) -> Router {
         let mut state = make_state(temp_dir, auth_token);
         state.db = Some(crate::server::db::ServerDb::new(temp_dir.path()).unwrap());
         build_router(state)
-    }
-
-    async fn run_sync_monitor_once_for_tests(state: &AppState) {
-        refresh_project_sync_states_once(&state.registry).await;
     }
 
     async fn rev_parse(repo: &std::path::Path, rev: &str) -> Option<String> {
@@ -952,67 +927,6 @@ mod tests {
         assert_eq!(json, serde_json::json!([]));
     }
 
-    /// Creates a local bare git repository with a `main` branch and one commit.
-    /// Optional `setup_script` is committed at `.wt/setup` in the source repo.
-    /// Returns the path to the bare repo (usable as a `file://` URL).
-    fn create_local_git_repo_with_setup(
-        parent: &std::path::Path,
-        setup_script: Option<&str>,
-    ) -> std::path::PathBuf {
-        let repo_path = parent.join("test-origin");
-        // Create a normal repo, add a commit, then convert to bare-compatible source.
-        let src = parent.join("test-src");
-        std::fs::create_dir_all(&src).unwrap();
-        std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::fs::write(src.join("README.md"), "hello").unwrap();
-
-        if let Some(script) = setup_script {
-            let wt_dir = src.join(".wt");
-            std::fs::create_dir_all(&wt_dir).unwrap();
-            std::fs::write(wt_dir.join("setup"), script).unwrap();
-        }
-
-        std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&src)
-            .output()
-            .unwrap();
-        // Clone as bare so it can be used as a remote.
-        std::process::Command::new("git")
-            .args([
-                "clone",
-                "--bare",
-                src.to_str().unwrap(),
-                repo_path.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        repo_path
-    }
-
-    fn create_local_git_repo(parent: &std::path::Path) -> std::path::PathBuf {
-        create_local_git_repo_with_setup(parent, None)
-    }
-
     #[tokio::test]
     async fn test_add_project_returns_201() {
         let temp_dir = TempDir::new().unwrap();
@@ -1087,108 +1001,6 @@ mod tests {
             recorded_root,
             worktree_path.to_string_lossy(),
             "ROOT_WORKTREE_PATH should point to worktree repo root"
-        );
-    }
-
-    #[cfg(feature = "heavy-tests")]
-    #[tokio::test]
-    async fn test_add_project_without_repo_root_setup_succeeds_without_marker() {
-        let temp_dir = TempDir::new().unwrap();
-        let origin = create_local_git_repo(temp_dir.path());
-        let remote_url = format!("file://{}", origin.to_str().unwrap());
-
-        let router = make_router(&temp_dir, None);
-
-        let body = serde_json::json!({
-            "remote_url": remote_url,
-            "branch": "main"
-        });
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/projects")
-            .header("Content-Type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let project_id = json["id"].as_str().expect("Response must contain id");
-
-        let marker_path = temp_dir
-            .path()
-            .join("worktrees")
-            .join(project_id)
-            .join("main")
-            .join(".setup-root-path");
-        assert!(
-            !marker_path.exists(),
-            "No setup marker should exist when repo-root .wt/setup is absent"
-        );
-    }
-
-    #[cfg(feature = "heavy-tests")]
-    #[tokio::test]
-    async fn test_add_project_setup_failure_returns_422_and_rolls_back_registry() {
-        let temp_dir = TempDir::new().unwrap();
-        let origin =
-            create_local_git_repo_with_setup(temp_dir.path(), Some("#!/bin/sh\nexit 42\n"));
-        let remote_url = format!("file://{}", origin.to_str().unwrap());
-        let expected_project_id = crate::server::registry::generate_project_id(&remote_url, "main");
-
-        let state = make_state(&temp_dir, None);
-        let router = build_router(state.clone());
-
-        let body = serde_json::json!({
-            "remote_url": remote_url,
-            "branch": "main"
-        });
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/projects")
-            .header("Content-Type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let error_message = json["error"].as_str().unwrap_or_default();
-        assert!(
-            error_message.contains("worktree setup failed"),
-            "error should mention setup failure, got: {}",
-            json
-        );
-
-        let registry = state.registry.read().await;
-        assert!(
-            registry.list().is_empty(),
-            "Registry should be empty after setup failure rollback"
-        );
-
-        let local_repo_path = temp_dir.path().join(&expected_project_id);
-        let worktree_path = temp_dir
-            .path()
-            .join("worktrees")
-            .join(&expected_project_id)
-            .join("main");
-        assert!(
-            !local_repo_path.exists(),
-            "Bare clone should be cleaned up after setup failure"
-        );
-        assert!(
-            !worktree_path.exists(),
-            "Worktree should be cleaned up after setup failure"
         );
     }
 
@@ -1329,52 +1141,6 @@ mod tests {
     // ── Global Control tests ──
 
     #[tokio::test]
-    async fn test_global_control_run_records_call() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = make_state(&temp_dir, None);
-
-        // Initialize call recorder
-        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
-
-        let entry = state
-            .registry
-            .write()
-            .await
-            .add("https://github.com/foo/bar".to_string(), "main".to_string())
-            .unwrap();
-
-        let worktree_path = temp_dir
-            .path()
-            .join("worktrees")
-            .join(&entry.id)
-            .join(&entry.branch)
-            .join("openspec/changes/fix-a");
-        std::fs::create_dir_all(&worktree_path).unwrap();
-        std::fs::write(worktree_path.join("proposal.md"), "# proposal\n").unwrap();
-
-        let router = build_router(state.clone());
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/control/run")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let calls = CONTROL_CALLS.get().unwrap().lock().unwrap();
-        // Global run records a "_global_" + "run" call
-        assert!(calls
-            .iter()
-            .any(|(id, action)| id == "_global_" && action == "run"));
-        assert!(calls
-            .iter()
-            .any(|(id, action)| id == &entry.id && action == "run"));
-    }
-
-    #[tokio::test]
     async fn test_global_control_run_skips_unremarked_error_changes() {
         let temp_dir = TempDir::new().unwrap();
         let state = make_state(&temp_dir, None);
@@ -1419,53 +1185,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["started"], 0);
         assert_eq!(json["skipped"], 1);
-    }
-
-    #[tokio::test]
-    async fn test_projects_state_includes_sync_metadata_fields_after_monitor_refresh() {
-        let temp_dir = TempDir::new().unwrap();
-        let origin = create_local_git_repo(temp_dir.path());
-        let remote_url = format!("file://{}", origin.to_string_lossy());
-
-        let state = make_state(&temp_dir, None);
-        let router = build_router(state.clone());
-
-        let add_body = serde_json::json!({
-            "remote_url": remote_url,
-            "branch": "main"
-        });
-        let add_req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/projects")
-            .header("Content-Type", "application/json")
-            .body(Body::from(add_body.to_string()))
-            .unwrap();
-        let add_resp = router.clone().oneshot(add_req).await.unwrap();
-        assert_eq!(add_resp.status(), StatusCode::CREATED);
-
-        run_sync_monitor_once_for_tests(&state).await;
-
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/api/v1/projects/state")
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let project = &json["projects"][0];
-        assert_eq!(project["sync_state"], "up_to_date");
-        assert_eq!(project["ahead_count"], 0);
-        assert_eq!(project["behind_count"], 0);
-        assert_eq!(project["sync_required"], false);
-        assert!(project["local_sha"].as_str().is_some());
-        assert!(project["remote_sha"].as_str().is_some());
-        assert!(project["last_remote_check_at"].as_str().is_some());
-        assert!(project["remote_check_error"].is_null());
     }
 
     #[tokio::test]
@@ -1661,91 +1380,6 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
-    }
-
-    #[tokio::test]
-    async fn test_toggle_all_change_selection_remarks_error_changes_for_next_run() {
-        let temp_dir = TempDir::new().unwrap();
-        let state = make_state(&temp_dir, None);
-        let entry = state
-            .registry
-            .write()
-            .await
-            .add("https://github.com/foo/bar".to_string(), "main".to_string())
-            .unwrap();
-
-        let change_dir = temp_dir
-            .path()
-            .join("worktrees")
-            .join(&entry.id)
-            .join(&entry.branch)
-            .join("openspec/changes/fix-a");
-        std::fs::create_dir_all(&change_dir).unwrap();
-        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
-
-        {
-            let mut registry = state.registry.write().await;
-            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
-        }
-
-        let router = build_router(state.clone());
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(format!("/api/v1/projects/{}/changes/toggle-all", entry.id))
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["selected"], true);
-
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/api/v1/projects/state")
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
-        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
-
-        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/control/run")
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["started"], 1);
-        assert_eq!(json["skipped"], 0);
-
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri("/api/v1/projects/state")
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
-        assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
     }
 
     #[tokio::test]
@@ -2680,24 +2314,6 @@ mod tests {
 
     /// Test that AppState receives resolve_command from the top-level config
     /// (not from server.resolve_command which is now deprecated).
-    #[cfg(feature = "heavy-tests")]
-    #[test]
-    fn test_app_state_resolve_command_comes_from_top_level_config() {
-        // Simulate what run_server now does: takes resolve_command as a separate parameter
-        // from the top-level config, not from ServerConfig.resolve_command.
-        let top_level_resolve_cmd = Some("echo top-level-resolve".to_string());
-
-        // Build AppState as run_server does (using the top-level resolve_command parameter)
-        // The ServerConfig.resolve_command field is deprecated and should be None.
-        let app_state_resolve_command = top_level_resolve_cmd.clone();
-
-        assert_eq!(
-            app_state_resolve_command,
-            Some("echo top-level-resolve".to_string()),
-            "AppState resolve_command should come from top-level config resolve_command"
-        );
-    }
-
     /// Test that auto_resolve uses the top-level resolve_command in AppState.
     /// This verifies the routing: top-level config -> run_server() -> AppState -> git_pull/git_push.
     #[tokio::test]
@@ -3558,57 +3174,6 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!([]));
-    }
-
-    #[tokio::test]
-    async fn test_list_worktrees_with_real_project() {
-        let temp_dir = TempDir::new().unwrap();
-        let origin = create_local_git_repo(temp_dir.path());
-        let remote_url = format!("file://{}", origin.to_str().unwrap());
-
-        let router = make_router(&temp_dir, None);
-
-        // First add the project (this clones and creates worktree)
-        let add_body = serde_json::json!({
-            "remote_url": remote_url,
-            "branch": "main"
-        });
-
-        let add_req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/projects")
-            .header("Content-Type", "application/json")
-            .body(Body::from(add_body.to_string()))
-            .unwrap();
-
-        let add_resp = router.clone().oneshot(add_req).await.unwrap();
-        assert_eq!(add_resp.status(), StatusCode::CREATED);
-
-        let body_bytes = axum::body::to_bytes(add_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let project_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let project_id = project_json["id"].as_str().unwrap();
-
-        // Now list worktrees
-        let list_req = Request::builder()
-            .method(Method::GET)
-            .uri(format!("/api/v1/projects/{}/worktrees", project_id))
-            .body(Body::empty())
-            .unwrap();
-
-        let list_resp = router.oneshot(list_req).await.unwrap();
-        assert_eq!(list_resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let worktrees: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        // Should have at least the main worktree
-        assert!(
-            !worktrees.is_empty(),
-            "Should have at least one worktree after project add"
-        );
     }
 
     #[tokio::test]
