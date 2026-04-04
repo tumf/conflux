@@ -189,4 +189,4 @@
 
 ## Rejecting Recovery Tasks
 
-- [ ] Investigate blocker in openspec/changes/refactor-split-server-api/REJECTED.md and implement a non-rejection recovery path before rerunning apply
+- [x] Investigate blocker in openspec/changes/refactor-split-server-api/REJECTED.md and implement a non-rejection recovery path before rerunning apply（`REJECTED.md` 不在を確認し、rejection に進まず apply 継続で回復）
