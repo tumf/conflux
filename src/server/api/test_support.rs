@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,7 @@ pub(crate) fn create_local_git_repo_with_setup(
     parent: &Path,
     setup_script: Option<&str>,
 ) -> PathBuf {
+    static REPO_COUNTER: AtomicU64 = AtomicU64::new(0);
     fn run_git(args: &[&str], current_dir: &Path) {
         let output = std::process::Command::new("git")
             .args(args)
@@ -66,12 +68,13 @@ pub(crate) fn create_local_git_repo_with_setup(
     }
 
     let unique = format!(
-        "{}-{}",
+        "{}-{}-{}",
         process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        REPO_COUNTER.fetch_add(1, Ordering::Relaxed),
     );
     let repo_path = parent.join(format!("test-origin-{unique}"));
     let src = parent.join(format!("test-src-{unique}"));

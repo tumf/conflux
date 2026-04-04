@@ -164,17 +164,18 @@ pub async fn add_project(
     // This is required so that git pull/push on the bare clone can update refs/heads/<branch>
     // without being blocked by an active checkout of that branch.
     let server_branch = server_worktree_branch(&project_id, &branch);
-    let (local_repo_path, worktree_path) = {
+    let (data_dir, local_repo_path, worktree_path) = {
         let registry = state.registry.read().await;
         let data_dir = registry.data_dir().to_path_buf();
         let repo = data_dir.join(&project_id);
         let wt = data_dir.join("worktrees").join(&project_id).join(&branch);
-        (repo, wt)
+        (data_dir, repo, wt)
     };
 
     // Step 3: Verify the branch exists on the remote.
     let ls_remote = tokio::process::Command::new("git")
         .args(["ls-remote", "--heads", &remote_url, &branch])
+        .current_dir(&data_dir)
         .output()
         .await;
 
@@ -489,7 +490,7 @@ mod tests {
     };
 
     #[cfg(feature = "heavy-tests")]
-    use crate::server::api::test_support::{create_local_git_repo_with_setup, make_router};
+    use crate::server::api::test_support::create_local_git_repo_with_setup;
 
     #[cfg(feature = "heavy-tests")]
     #[tokio::test]
