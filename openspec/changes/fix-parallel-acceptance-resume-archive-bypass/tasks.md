@@ -13,6 +13,10 @@
 - [x] acceptance command の非ゼロ終了時に durable acceptance state を `passed` へ上書きしないよう修正する
 - [x] acceptance command 失敗時に archive guard が archive を抑止する回帰テストを追加する
 
+## Acceptance #2 Failure Follow-up
+
+- [x] `cargo test` 失敗を解消し、`server::api::projects::tests::test_add_project_creates_worktree_on_server_branch` が `201 Created` を返す期待と整合するよう修正する
+
 ## Future Work
 
 - 実運用ログで同種の中断ケースが再発しないことの継続監視
