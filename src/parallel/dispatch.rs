@@ -86,7 +86,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
         let revision = super::resolve_current_revision_sync(tmp.path()).unwrap();
-        crate::parallel::acceptance_state::mark_acceptance_passed(tmp.path(), &revision).unwrap();
+        crate::parallel::acceptance_state::mark_acceptance_passed(tmp.path(), &revision, None)
+            .unwrap();
 
         let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
         assert_eq!(action, ResumeAction::Archive);

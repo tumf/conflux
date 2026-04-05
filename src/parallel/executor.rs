@@ -9,8 +9,8 @@ use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::parallel::output_bridge::ParallelApplyEventHandler;
 
 use super::acceptance_state::{
-    has_durable_acceptance_pass, mark_acceptance_failed, mark_acceptance_passed,
-    mark_acceptance_started, mark_apply_completed,
+    delete_acceptance_state, has_durable_acceptance_pass, mark_acceptance_failed,
+    mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
 };
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
@@ -224,7 +224,7 @@ pub async fn execute_apply_in_workspace(
         Err(e) => return Err(e),
     };
 
-    mark_apply_completed(workspace_path, &apply_result.revision)?;
+    mark_apply_completed(workspace_path, &apply_result.revision, change_id)?;
     info!(
         "Durable acceptance state updated to pending after apply for {} (revision={})",
         change_id, apply_result.revision
@@ -753,6 +753,13 @@ pub async fn execute_archive_in_workspace(
         }
     }
 
+    if let Err(err) = delete_acceptance_state(workspace_path) {
+        warn!(
+            "Failed to delete acceptance state for {} after archive completion: {}",
+            change_id, err
+        );
+    }
+
     // Clear history after successful archive
     {
         let mut apply_hist = apply_history.lock().await;
@@ -908,7 +915,7 @@ pub async fn execute_acceptance_in_workspace(
     );
 
     let revision_for_attempt = commit_hash.clone().unwrap_or_else(|| "unknown".to_string());
-    mark_acceptance_started(workspace_path, &revision_for_attempt)?;
+    mark_acceptance_started(workspace_path, &revision_for_attempt, change_id)?;
     info!(
         "Durable acceptance state updated to running for {} (revision={})",
         change_id, revision_for_attempt
@@ -1025,7 +1032,7 @@ pub async fn execute_acceptance_in_workspace(
         // Record to both agent history (local) and shared acceptance history
         agent.record_acceptance_attempt(change_id, attempt.clone());
         acceptance_history.lock().await.record(change_id, attempt);
-        mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+        mark_acceptance_failed(workspace_path, &revision_for_attempt, Some(change_id))?;
         info!(
             "Durable acceptance state updated to failed for {} (revision={})",
             change_id, revision_for_attempt
@@ -1077,7 +1084,7 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_passed(workspace_path, &revision_for_attempt)?;
+            mark_acceptance_passed(workspace_path, &revision_for_attempt, Some(change_id))?;
             info!(
                 "Durable acceptance state updated to passed for {} (revision={})",
                 change_id, revision_for_attempt
@@ -1119,7 +1126,7 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+            mark_acceptance_failed(workspace_path, &revision_for_attempt, Some(change_id))?;
             info!(
                 "Durable acceptance state updated to failed for {} (revision={})",
                 change_id, revision_for_attempt
@@ -1164,7 +1171,7 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+            mark_acceptance_failed(workspace_path, &revision_for_attempt, Some(change_id))?;
             info!(
                 "Durable acceptance state updated to failed for {} (revision={})",
                 change_id, revision_for_attempt
@@ -1225,7 +1232,7 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_failed(workspace_path, &revision_for_attempt)?;
+            mark_acceptance_failed(workspace_path, &revision_for_attempt, Some(change_id))?;
             info!(
                 "Durable acceptance state updated to failed for {} (revision={})",
                 change_id, revision_for_attempt
