@@ -960,30 +960,29 @@ impl OrchestratorState {
 
             // Workspace status synchronization events (parallel mode)
             ExecutionEvent::WorkspaceStatusUpdated {
+                change_id,
                 workspace_name: _,
                 status,
             } => {
-                if let Some(change_id) = self.current_change_id.clone() {
-                    let rt = self.runtime_entry(&change_id);
-                    if !rt.is_terminal() && !rt.dequeued {
-                        match status {
-                            crate::vcs::WorkspaceStatus::Applying => {
-                                rt.activity = ActivityState::Applying;
-                            }
-                            crate::vcs::WorkspaceStatus::Accepting => {
-                                rt.activity = ActivityState::Accepting;
-                            }
-                            crate::vcs::WorkspaceStatus::Rejecting => {
-                                rt.activity = ActivityState::Rejecting;
-                            }
-                            crate::vcs::WorkspaceStatus::Archiving => {
-                                rt.activity = ActivityState::Archiving;
-                            }
-                            crate::vcs::WorkspaceStatus::Resolving => {
-                                rt.activity = ActivityState::Resolving;
-                            }
-                            _ => {}
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    match status {
+                        crate::vcs::WorkspaceStatus::Applying => {
+                            rt.activity = ActivityState::Applying;
                         }
+                        crate::vcs::WorkspaceStatus::Accepting => {
+                            rt.activity = ActivityState::Accepting;
+                        }
+                        crate::vcs::WorkspaceStatus::Rejecting => {
+                            rt.activity = ActivityState::Rejecting;
+                        }
+                        crate::vcs::WorkspaceStatus::Archiving => {
+                            rt.activity = ActivityState::Archiving;
+                        }
+                        crate::vcs::WorkspaceStatus::Resolving => {
+                            rt.activity = ActivityState::Resolving;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1883,6 +1882,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 4.4: late events after stop do not regress state
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_workspace_status_update_targets_explicit_change_id() {
+        use crate::events::ExecutionEvent;
+        use crate::vcs::WorkspaceStatus;
+
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
+
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "a".to_string(),
+            command: "apply-a".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "b".to_string(),
+            command: "apply-b".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "b".to_string(),
+            workspace_name: "ws-b".to_string(),
+            status: WorkspaceStatus::Rejecting,
+        });
+
+        assert_eq!(state.display_status("a"), "applying");
+        assert_eq!(state.display_status("b"), "rejecting");
+    }
 
     #[test]
     fn test_late_events_after_stop_do_not_regress_state() {
