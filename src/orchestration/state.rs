@@ -203,12 +203,6 @@ impl ChangeRuntimeState {
         {
             return false;
         }
-        // Rejecting state must not remain without terminal outcome after review completion.
-        if matches!(self.activity, ActivityState::Rejecting)
-            && matches!(self.terminal, TerminalState::None)
-        {
-            return false;
-        }
         true
     }
 
@@ -1428,13 +1422,13 @@ mod tests {
         };
         assert!(ok.invariants_hold());
 
-        // Invalid: Rejecting + no terminal outcome must not remain.
-        let invalid3 = ChangeRuntimeState {
+        // Rejecting + no terminal outcome is a valid in-flight state while review runs.
+        let in_flight_rejecting = ChangeRuntimeState {
             activity: ActivityState::Rejecting,
             terminal: TerminalState::None,
             ..Default::default()
         };
-        assert!(!invalid3.invariants_hold());
+        assert!(in_flight_rejecting.invariants_hold());
     }
 
     // -----------------------------------------------------------------------
@@ -1633,12 +1627,26 @@ mod tests {
             outcome: RejectionOutcome::Resume,
         });
         assert_eq!(state.display_status("c"), "applying");
+        assert_ne!(
+            state
+                .change_runtime("c")
+                .expect("runtime for c after rejecting resume")
+                .activity,
+            ActivityState::Rejecting
+        );
 
         state.apply_execution_event(&ExecutionEvent::RejectionReviewFailed {
             change_id: "c".to_string(),
             error: "rejecting failed".to_string(),
         });
         assert_eq!(state.display_status("c"), "error");
+        assert_ne!(
+            state
+                .change_runtime("c")
+                .expect("runtime for c after rejecting failure")
+                .activity,
+            ActivityState::Rejecting
+        );
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
         state.apply_execution_event(&ExecutionEvent::ProcessingStarted("c".to_string()));
@@ -1653,6 +1661,13 @@ mod tests {
             outcome: RejectionOutcome::Confirm,
         });
         assert_eq!(state.display_status("c"), "rejected");
+        assert_ne!(
+            state
+                .change_runtime("c")
+                .expect("runtime for c after rejecting confirm")
+                .activity,
+            ActivityState::Rejecting
+        );
     }
 
     // -----------------------------------------------------------------------

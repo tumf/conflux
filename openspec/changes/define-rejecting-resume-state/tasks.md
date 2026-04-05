@@ -11,3 +11,9 @@
 ## Future Work
 
 - Serial モードでの Rejecting サポート定義
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `invariants_hold()` が `Rejecting + terminal=None` の中間状態を禁止しないよう修正し、rejection review 完了後の不正残留だけを reducer/transition レベルで検証する（verification: `cargo test --lib orchestration::state`）
+- [x] `test_change_runtime_invariants()` の checklist claim を仕様に合わせて修正し、`RejectionReviewCompleted` / `RejectionReviewFailed` 適用後に `Rejecting` が残らないことを reducer テストで検証する（verification: `cargo test --lib orchestration::state`）
+- [x] 通常コミット相当の hook ゲートを実行可能にする（`pre-commit` CLI を利用可能にするか、リポジトリの documented equivalent を明示して再検証する）（verification: `prek run --all-files`, `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`）
