@@ -247,6 +247,7 @@ impl ParallelExecutor {
                     send_event(
                         &self.event_tx,
                         ParallelEvent::WorkspaceStatusUpdated {
+                            change_id: workspace_result.change_id.clone(),
                             workspace_name: workspace_result.workspace_name.clone(),
                             status: crate::vcs::WorkspaceStatus::MergeWait,
                         },
