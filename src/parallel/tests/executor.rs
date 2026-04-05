@@ -323,7 +323,6 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -612,7 +611,6 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shared_stagger_state,
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -789,7 +787,6 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shared_stagger_state,
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -938,7 +935,6 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shared_stagger_state,
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1116,7 +1112,6 @@ async fn test_merge_retries_when_merge_commit_missing() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shared_stagger_state,
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1308,7 +1303,6 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shared_stagger_state,
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1506,7 +1500,6 @@ async fn test_merge_retries_after_pre_commit_changes() {
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
         shared_stagger_state,
-        needs_reanalysis: false,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1849,6 +1842,31 @@ fn ready_analysis_result<'a>(
     })
 }
 
+fn blocked_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    let dependencies = changes
+        .iter()
+        .map(|change| {
+            (
+                change.id.clone(),
+                vec!["unresolved-dependency".to_string()],
+            )
+        })
+        .collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies,
+            groups: None,
+        }
+    })
+}
+
 #[tokio::test]
 async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() {
     use crate::parallel::dynamic_queue::ReanalysisReason;
@@ -2017,6 +2035,78 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
 }
 
 #[tokio::test]
+async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("queued-after-zero-dispatch")];
+    let mut in_flight = HashSet::new();
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            1,
+            ReanalysisReason::QueueNotification,
+            &blocked_analysis_result,
+            semaphore.clone(),
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break);
+    assert_eq!(iteration, 1, "dispatch 0件では iteration は進まない");
+    assert_eq!(queued.len(), 1, "dispatchできない change はキューに残る");
+    assert!(in_flight.is_empty());
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            iteration,
+            ReanalysisReason::ResolveCompletion,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break);
+    assert_eq!(iteration, 2, "次ループ再評価で dispatch され iteration が進む");
+    assert!(queued.is_empty(), "再評価後にキューが消化される");
+    assert_eq!(in_flight.len(), 1, "再評価後に change が in-flight になる");
+
+    while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
 async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_work() {
     use crate::parallel::dynamic_queue::ReanalysisReason;
     use crate::parallel::WorkspaceResult;
@@ -2087,7 +2177,7 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
 }
 
 #[tokio::test]
-async fn test_handle_merge_result_triggers_reanalysis() {
+async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
     use crate::parallel::MergeResult;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -2098,8 +2188,8 @@ async fn test_handle_merge_result_triggers_reanalysis() {
     let config = create_test_config();
     let (tx, _rx) = mpsc::channel(32);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
-    executor.needs_reanalysis = false;
 
+    executor.pending_merge_count.store(2, Ordering::Relaxed);
     executor
         .handle_merge_result(MergeResult {
             change_id: "change-ok".to_string(),
@@ -2107,13 +2197,8 @@ async fn test_handle_merge_result_triggers_reanalysis() {
             outcome: Ok(()),
         })
         .await;
+    assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 1);
 
-    assert!(
-        executor.needs_reanalysis,
-        "successful background merge should trigger scheduler re-analysis"
-    );
-
-    executor.needs_reanalysis = false;
     executor
         .handle_merge_result(MergeResult {
             change_id: "change-err".to_string(),
@@ -2121,11 +2206,7 @@ async fn test_handle_merge_result_triggers_reanalysis() {
             outcome: Err("merge failed".to_string()),
         })
         .await;
-
-    assert!(
-        executor.needs_reanalysis,
-        "failed background merge should also trigger scheduler re-analysis"
-    );
+    assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -2155,10 +2236,6 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
         executor.pending_merge_count.load(Ordering::Relaxed),
         0,
         "scheduler must clear pending merge counter after merge result is handled"
-    );
-    assert!(
-        executor.needs_reanalysis,
-        "merge completion should trigger scheduler re-analysis"
     );
 }
 
@@ -2229,7 +2306,6 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
         "dynamic queue additions should trigger reanalysis"
     );
     assert_eq!(reason.to_string(), "queue");
-    assert!(executor.needs_reanalysis);
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].id, change_id);
 }
@@ -2592,7 +2668,6 @@ async fn test_concurrent_reanalysis_queue_dispatch() {
 
     // Verify executor is set up correctly
     assert!(executor.dynamic_queue.is_some());
-    assert!(!executor.needs_reanalysis); // Initially false until execution starts
 
     // Test debounce logic
     {

@@ -129,8 +129,6 @@ pub struct ParallelExecutor {
     acceptance_history: Arc<Mutex<crate::history::AcceptanceHistory>>,
     /// Tracks which changes have had acceptance tail injected (to prevent re-injection)
     acceptance_tail_injected: Arc<Mutex<std::collections::HashMap<String, bool>>>,
-    /// Flag to trigger re-analysis on next loop iteration
-    needs_reanalysis: bool,
     /// Counter for active manual resolve operations (TUI mode)
     manual_resolve_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Counter for active automatic resolve operations
