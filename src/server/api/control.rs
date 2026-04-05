@@ -71,7 +71,13 @@ pub async fn toggle_all_change_selection(
         .join("worktrees")
         .join(&entry.id)
         .join(&entry.branch);
-    let changes = list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
+    let changes = list_remote_changes_in_worktree(
+        &worktree_path,
+        &entry.id,
+        &entry.branch,
+        &state.shared_orchestrator_state,
+    )
+    .await;
     let change_ids: Vec<String> = changes.iter().map(|c| c.id.clone()).collect();
 
     let new_selected = registry.toggle_all_changes(&project_id, &change_ids);
@@ -177,8 +183,12 @@ pub async fn global_control_run(State(state): State<AppState>) -> Response {
 
         // Collect only the change IDs that are selected for the next run.
         let project_selections = all_selections.get(&entry.id);
-        let changes =
-            list_selected_change_ids_in_worktree(&worktree_path, project_selections).await;
+        let changes = list_selected_change_ids_in_worktree(
+            &worktree_path,
+            project_selections,
+            &state.shared_orchestrator_state,
+        )
+        .await;
         if changes.is_empty() {
             skipped_count += 1;
             continue;
@@ -415,8 +425,12 @@ pub(super) async fn get_logs(
 pub(super) async fn list_selected_change_ids_in_worktree(
     worktree_path: &std::path::Path,
     change_selections: Option<&std::collections::HashMap<String, bool>>,
+    shared_orchestrator_state: &Arc<
+        tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+    >,
 ) -> Vec<String> {
-    let changes = list_remote_changes_in_worktree(worktree_path, "", "").await;
+    let changes =
+        list_remote_changes_in_worktree(worktree_path, "", "", shared_orchestrator_state).await;
     changes
         .into_iter()
         .filter(|change| {
