@@ -957,6 +957,42 @@ impl OrchestratorState {
                     rt.queue_intent = QueueIntent::NotQueued;
                 }
             }
+            ExecutionEvent::RejectionReviewCompleted { change_id, outcome } => {
+                let should_mark_pending_removed =
+                    matches!(outcome, crate::events::RejectionOutcome::Confirm);
+                if should_mark_pending_removed {
+                    self.remove_from_pending(change_id);
+                }
+
+                let rt = self.runtime_entry(change_id);
+                if rt.is_terminal() || rt.dequeued {
+                    return;
+                }
+                match outcome {
+                    crate::events::RejectionOutcome::Confirm => {
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::None;
+                        rt.queue_intent = QueueIntent::NotQueued;
+                        rt.terminal = TerminalState::Rejected(
+                            "rejecting review confirmed rejection".to_string(),
+                        );
+                    }
+                    crate::events::RejectionOutcome::Resume => {
+                        rt.activity = ActivityState::Applying;
+                        rt.wait_state = WaitState::None;
+                        rt.terminal = TerminalState::None;
+                    }
+                }
+            }
+            ExecutionEvent::RejectionReviewFailed { change_id, error } => {
+                self.remove_from_pending(change_id);
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::None;
+                    rt.terminal = TerminalState::Error(error.clone());
+                }
+            }
 
             // Workspace status synchronization events (parallel mode)
             ExecutionEvent::WorkspaceStatusUpdated {
@@ -1384,6 +1420,14 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.invariants_hold());
+
+        // Rejecting + no terminal outcome is a valid in-flight state while review runs.
+        let in_flight_rejecting = ChangeRuntimeState {
+            activity: ActivityState::Rejecting,
+            terminal: TerminalState::None,
+            ..Default::default()
+        };
+        assert!(in_flight_rejecting.invariants_hold());
     }
 
     // -----------------------------------------------------------------------
@@ -1545,7 +1589,7 @@ mod tests {
 
     #[test]
     fn test_apply_execution_event_transitions() {
-        use crate::events::ExecutionEvent;
+        use crate::events::{ExecutionEvent, RejectionOutcome};
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
@@ -1571,14 +1615,60 @@ mod tests {
             change_id: "c".to_string(),
         });
 
-        state.apply_execution_event(&ExecutionEvent::ArchiveStarted {
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "c".to_string(),
-            command: "cmd".to_string(),
+            workspace_name: "ws-c".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
         });
-        assert_eq!(state.display_status("c"), "archiving");
+        assert_eq!(state.display_status("c"), "rejecting");
 
-        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
-        assert_eq!(state.display_status("c"), "archived");
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "c".to_string(),
+            outcome: RejectionOutcome::Resume,
+        });
+        assert_eq!(state.display_status("c"), "applying");
+        assert_ne!(
+            state
+                .change_runtime("c")
+                .expect("runtime for c after rejecting resume")
+                .activity,
+            ActivityState::Rejecting
+        );
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewFailed {
+            change_id: "c".to_string(),
+            error: "rejecting failed".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "error");
+        assert_ne!(
+            state
+                .change_runtime("c")
+                .expect("runtime for c after rejecting failure")
+                .activity,
+            ActivityState::Rejecting
+        );
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ProcessingStarted("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "c".to_string(),
+            workspace_name: "ws-c".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+        assert_eq!(state.display_status("c"), "rejecting");
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "c".to_string(),
+            outcome: RejectionOutcome::Confirm,
+        });
+        assert_eq!(state.display_status("c"), "rejected");
+        assert_ne!(
+            state
+                .change_runtime("c")
+                .expect("runtime for c after rejecting confirm")
+                .activity,
+            ActivityState::Rejecting
+        );
     }
 
     // -----------------------------------------------------------------------
