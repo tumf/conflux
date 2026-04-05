@@ -9,34 +9,32 @@ use super::*;
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     let registry = state.registry.clone();
     let log_rx = state.log_tx.subscribe();
-    let sync_available = state.resolve_command.is_some();
-    let orchestration_status = state.orchestration_status.clone();
-    let shared_orchestrator_state = state.shared_orchestrator_state.clone();
-    let active_commands = state.active_commands.clone();
-    let db = state.db.clone();
-    ws.on_upgrade(move |socket| {
-        handle_ws(
-            socket,
-            registry,
-            log_rx,
-            sync_available,
-            orchestration_status,
-            shared_orchestrator_state,
-            active_commands,
-            db,
-        )
-    })
+    let context = WsSnapshotContext {
+        sync_available: state.resolve_command.is_some(),
+        orchestration_status: state.orchestration_status.clone(),
+        shared_orchestrator_state: state.shared_orchestrator_state.clone(),
+        active_commands: state.active_commands.clone(),
+        db: state.db.clone(),
+    };
+
+    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx, context))
+}
+
+#[derive(Clone)]
+struct WsSnapshotContext {
+    sync_available: bool,
+    orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
+    shared_orchestrator_state:
+        Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    active_commands: SharedActiveCommands,
+    db: Option<Arc<ServerDb>>,
 }
 
 async fn handle_ws(
     mut socket: WebSocket,
     registry: SharedRegistry,
     mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
-    sync_available: bool,
-    orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
-    shared_orchestrator_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
-    active_commands: SharedActiveCommands,
-    db: Option<Arc<ServerDb>>,
+    context: WsSnapshotContext,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
 
@@ -75,7 +73,7 @@ async fn handle_ws(
                             entry,
                             selections,
                             errors,
-                            &shared_orchestrator_state,
+                            &context.shared_orchestrator_state,
                         )
                         .await,
                     );
@@ -104,7 +102,7 @@ async fn handle_ws(
                     Some(worktrees_map)
                 };
 
-                let ui_state = if let Some(db) = &db {
+                let ui_state = if let Some(db) = &context.db {
                     match db.get_all_ui_state() {
                         Ok(state) => state,
                         Err(e) => {
@@ -116,16 +114,16 @@ async fn handle_ws(
                     std::collections::HashMap::new()
                 };
 
-                let orch_status = orchestration_status.read().await.as_str().to_string();
+                let orch_status = context.orchestration_status.read().await.as_str().to_string();
                 let active_cmds = {
-                    let ac = active_commands.read().await;
+                    let ac = context.active_commands.read().await;
                     ac.snapshot()
                 };
                 if let Ok(payload) = serde_json::to_string(&RemoteStateUpdate::FullState {
                     projects: snapshot,
                     worktrees,
                     ui_state,
-                    sync_available,
+                    sync_available: context.sync_available,
                     orchestration_status: orch_status,
                     active_commands: active_cmds,
                 }) {
@@ -178,7 +176,9 @@ pub(super) async fn build_remote_project_snapshot_async(
     entry: &ProjectEntry,
     change_selections: Option<&std::collections::HashMap<String, bool>>,
     error_changes: Option<&std::collections::HashMap<String, String>>,
-    shared_orchestrator_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    shared_orchestrator_state: &Arc<
+        tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+    >,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
     let repo = extract_repo_name(&entry.remote_url);
@@ -187,14 +187,13 @@ pub(super) async fn build_remote_project_snapshot_async(
         .join(&entry.id)
         .join(&entry.branch);
 
-    let mut changes =
-        list_remote_changes_in_worktree(
-            &worktree_path,
-            &entry.id,
-            &entry.branch,
-            shared_orchestrator_state,
-        )
-        .await;
+    let mut changes = list_remote_changes_in_worktree(
+        &worktree_path,
+        &entry.id,
+        &entry.branch,
+        shared_orchestrator_state,
+    )
+    .await;
 
     // Apply selected/error state from registry.
     for change in &mut changes {
@@ -302,7 +301,9 @@ pub(super) async fn list_remote_changes_in_worktree(
     worktree_path: &std::path::Path,
     project_id: &str,
     base_branch: &str,
-    shared_orchestrator_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    shared_orchestrator_state: &Arc<
+        tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+    >,
 ) -> Vec<RemoteChange> {
     let changes_dir = worktree_path.join("openspec/changes");
     if !changes_dir.exists() {
@@ -465,8 +466,13 @@ mod tests {
             ("merge wait".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-resolve-pending", &worktree_by_change, &status_map, "main")
-                .await,
+            derive_change_status(
+                "c-resolve-pending",
+                &worktree_by_change,
+                &status_map,
+                "main"
+            )
+            .await,
             ("resolve pending".to_string(), None)
         );
         assert_eq!(
@@ -503,7 +509,10 @@ mod tests {
         assert_eq!(orchestrator_state.display_status("change-a"), "merge wait");
 
         orchestrator_state.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
-        assert_eq!(orchestrator_state.display_status("change-a"), "resolve pending");
+        assert_eq!(
+            orchestrator_state.display_status("change-a"),
+            "resolve pending"
+        );
 
         orchestrator_state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
             change_id: "change-a".to_string(),
