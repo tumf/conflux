@@ -7,6 +7,7 @@
 //! - Per-change cancellation monitoring
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
@@ -39,6 +40,7 @@ use super::ParallelExecutor;
 mod tests {
     use super::{decide_resume_action, should_run_apply, ResumeAction};
     use crate::execution::state::WorkspaceState;
+    use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -75,6 +77,18 @@ mod tests {
     fn decide_resume_action_routes_applied_to_acceptance_without_state_file() {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-incomplete");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
 
         let action =
             decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
@@ -85,11 +99,46 @@ mod tests {
     fn decide_resume_action_routes_applied_to_archive_with_passed_state() {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-complete");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+
         let revision = super::resolve_current_revision_sync(tmp.path()).unwrap();
         crate::parallel::acceptance_state::mark_acceptance_passed(tmp.path(), &revision).unwrap();
 
         let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
         assert_eq!(action, ResumeAction::Archive);
+    }
+
+    #[test]
+    fn decide_resume_action_routes_applied_to_apply_when_implementation_tasks_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-incomplete");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n- [ ] todo\n\n## Future Work\n- [ ] not counted\n",
+        )
+        .unwrap();
+
+        let action =
+            decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Apply);
     }
 
     #[test]
@@ -120,12 +169,21 @@ pub(super) enum ResumeAction {
 
 pub(super) fn decide_resume_action(
     change_id: &str,
-    workspace_path: &std::path::Path,
+    workspace_path: &Path,
     state: &WorkspaceState,
 ) -> ResumeAction {
     match state {
         WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
         WorkspaceState::Archiving | WorkspaceState::Applied => {
+            if should_route_to_apply_for_incomplete_implementation_tasks(change_id, workspace_path)
+            {
+                info!(
+                    "Resume route for '{}' forcing apply because implementation tasks are incomplete",
+                    change_id
+                );
+                return ResumeAction::Apply;
+            }
+
             let current_revision = resolve_current_revision_sync(workspace_path);
             let has_passed = current_revision
                 .as_deref()
@@ -170,6 +228,129 @@ pub(super) fn decide_resume_action(
         }
         WorkspaceState::Rejecting => ResumeAction::Rejecting,
         WorkspaceState::Created | WorkspaceState::Applying { .. } => ResumeAction::Apply,
+    }
+}
+
+fn should_route_to_apply_for_incomplete_implementation_tasks(
+    change_id: &str,
+    workspace_path: &Path,
+) -> bool {
+    if !is_implementation_change(change_id, workspace_path) {
+        return false;
+    }
+
+    match read_implementation_task_progress(change_id, workspace_path) {
+        Ok(Some((completed, total))) => {
+            let has_incomplete = completed < total;
+            if has_incomplete {
+                info!(
+                    "Resume routing check for '{}' detected incomplete implementation tasks ({}/{})",
+                    change_id, completed, total
+                );
+            }
+            has_incomplete
+        }
+        Ok(None) => false,
+        Err(err) => {
+            warn!(
+                "Failed to read implementation task progress for '{}' in '{}': {}",
+                change_id,
+                workspace_path.display(),
+                err
+            );
+            false
+        }
+    }
+}
+
+fn is_implementation_change(change_id: &str, workspace_path: &Path) -> bool {
+    let proposal_path = workspace_path
+        .join("openspec/changes")
+        .join(change_id)
+        .join("proposal.md");
+
+    if !proposal_path.exists() {
+        return false;
+    }
+
+    let metadata = crate::openspec::parse_proposal_metadata_from_file(&proposal_path);
+    metadata
+        .change_type
+        .as_deref()
+        .is_some_and(|change_type| change_type.eq_ignore_ascii_case("implementation"))
+}
+
+fn read_implementation_task_progress(
+    change_id: &str,
+    workspace_path: &Path,
+) -> Result<Option<(u32, u32)>> {
+    let tasks_path = workspace_path
+        .join("openspec/changes")
+        .join(change_id)
+        .join("tasks.md");
+
+    if !tasks_path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&tasks_path).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!(
+            "Failed to read tasks file '{}' for resume routing: {}",
+            tasks_path.display(),
+            e
+        ))
+    })?;
+
+    let mut in_implementation_section = false;
+    let mut total = 0u32;
+    let mut completed = 0u32;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("## ") {
+            in_implementation_section = trimmed == "## Implementation Tasks";
+            continue;
+        }
+
+        if !in_implementation_section {
+            continue;
+        }
+
+        if let Some(status) = parse_task_checkbox_status(trimmed) {
+            total += 1;
+            if status {
+                completed += 1;
+            }
+        }
+    }
+
+    if total == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((completed, total)))
+    }
+}
+
+fn parse_task_checkbox_status(line: &str) -> Option<bool> {
+    let candidate = line
+        .strip_prefix("- [")
+        .or_else(|| line.strip_prefix("* ["))
+        .or_else(|| {
+            let mut parts = line.splitn(2, ". [");
+            let numbered = parts.next()?;
+            if numbered.chars().all(|c| c.is_ascii_digit()) {
+                parts.next()
+            } else {
+                None
+            }
+        })?;
+
+    let marker = candidate.chars().next()?;
+    match marker {
+        'x' | 'X' => Some(true),
+        ' ' => Some(false),
+        _ => None,
     }
 }
 
