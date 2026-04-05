@@ -9,3 +9,9 @@
 ## Future Work
 
 - spec-only changes や Future Work checkbox の resume policy を必要に応じて別 change で整理する
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `cargo test` failing の原因を修正し、`server::api::projects::tests::test_add_project_creates_worktree_on_server_branch` が再度成功することを確認する
+- [x] quality gate 実行結果に合わせて task 5 の完了状態を見直し、必要なら再実行後にのみ `[x]` に戻す
+- [x] acceptance 実行前に `.cflx/acceptance-state.json` の未コミット変更が残らないようにワークツリーをクリーンな状態へ戻す
