@@ -108,12 +108,13 @@ Changes have a **selection/queue** state.
 | `[resolving]` | Resolving (spinner, iteration when available) |
 | `[archived]` | Archived successfully |
 | `[merged]` | Merged to base branch (parallel mode only) |
+| `[rejected]` | Rejected as a terminal state and removed from the runnable queue |
 | `[error]` | Processing failed |
 
 **Workflow:**
 1. **Select mode (header shows `[Ready]`)**: Use `Space` to toggle the execution mark (`selected`)
 2. Press `F5` to start processing - all execution-marked changes become `queued`
-3. **Running mode (header shows `[Running N]`)**: `queued` → `applying` → (optional `accepting`) → `archiving` → `archived` (parallel mode may also show `merge wait`/`resolving`/`merged`)
+3. **Running mode (header shows `[Running N]`)**: `queued` → `applying` → (optional `accepting`) → `archiving` → `archived`; changes can also terminate early as `rejected` when blocked/rejected by the workflow (parallel mode may also show `merge wait`/`resolving`/`merged`)
 
 #### Header Status
 
