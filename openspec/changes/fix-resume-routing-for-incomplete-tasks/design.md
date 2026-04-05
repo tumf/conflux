@@ -2,7 +2,9 @@
 
 ## Overview
 
-implementation change では unchecked implementation task が残る段階はまだ apply フェーズの継続が必要であり、acceptance は tasks 完了後の品質ゲートである。resume routing が task completeness を見ずに Acceptance を選ぶと、通常フローの Acceptance > Archive を経て archive guard で遅延失敗する。
+implementation change では unchecked task が残る段階はまだ apply フェーズの継続が必要であり、acceptance は tasks 完了後の品質ゲートである。
+
+v0.5.114 で確認された根本原因は、resume routing (`src/parallel/dispatch.rs` の `read_implementation_task_progress`) が `## Implementation Tasks` セクション限定で checkbox を数えるのに対し、archive guard (`src/task_parser.rs` の `parse_content`) がファイル全体の checkbox を数える、というスコープ不一致にある。`## Acceptance #N Failure Follow-up` 等の追加セクションに未完了 checkbox が残ると、resume routing は「完了」と判断し Acceptance に送るが、archive guard は「未完了」で拒否する。
 
 ## Goals
 
@@ -28,7 +30,9 @@ resumed implementation workspace では次の順で routing する:
 
 ### Task completeness scope
 
-判定対象は `## Implementation Tasks` 配下の checkbox とし、`## Future Work` は routing blocker にしない。
+resume routing の tasks 判定は archive guard と同じスコープを使う。具体的には `task_parser::parse_content` 相当のファイル全体 checkbox カウントを使い、`## Future Work` セクションのみを除外する（archive guard が `## Future Work` を除外している場合はそれに合わせる）。
+
+`## Implementation Tasks` セクション限定の独自パーサー (`read_implementation_task_progress`) は廃止し、archive guard と同一の判定関数を呼ぶ。これにより routing と guard のスコープ不一致を構造的に防ぐ。
 
 ### Observability
 
@@ -36,6 +40,7 @@ Apply に戻したケースでは `tasks incomplete; rerouting resumed workspace
 
 ## Test Strategy
 
-1. incomplete tasks の resumed workspace が Apply へ戻る回帰テスト
-2. completed tasks の resumed workspace が Acceptance または Archive へ進む既存挙動維持テスト
-3. Future Work 項目が blocker にならないテスト
+1. `## Implementation Tasks` 完了だが `## Acceptance #N Failure Follow-up` に未完了 checkbox がある場合に Apply へ戻る回帰テスト（v0.5.114 再現ケース）
+2. ファイル全体で tasks 完了の resumed workspace が Acceptance または Archive へ進む既存挙動維持テスト
+3. `## Future Work` 項目が blocker にならないテスト
+4. resume routing と archive guard の判定結果が一致することを確認するテスト

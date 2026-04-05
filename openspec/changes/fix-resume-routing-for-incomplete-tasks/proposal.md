@@ -22,26 +22,27 @@ references:
 
 ## Problem / Context
 
-implementation change の resumed workspace で `tasks.md` に未完了 implementation task が残っていても、resume routing が Apply ではなく Acceptance を選ぶと、通常の Acceptance > Archive フローを通って archive 側で tasks incomplete error になる。
+implementation change の resumed workspace で `tasks.md` に未完了 task が残っていても、resume routing が Apply ではなく Acceptance を選ぶと、通常の Acceptance > Archive フローを通って archive 側で tasks incomplete error になる。
 
-この挙動では、まだ実装を続けるべき change が品質ゲート・archive フェーズへ誤進入し、ユーザーは「resume したのに作業再開ではなく後段エラーに落ちる」状態になる。
+根本原因は resume routing の tasks 判定スコープと archive guard の tasks 判定スコープの不一致にある。resume routing (`src/parallel/dispatch.rs` の `read_implementation_task_progress`) は `## Implementation Tasks` セクション配下の checkbox のみを数えるが、archive guard (`src/task_parser.rs` の `parse_content`) はファイル全体の checkbox を数える。このため `## Acceptance #N Failure Follow-up` 等の追加セクションに未完了 checkbox が残っていても resume routing は「tasks 完了」と判断して Acceptance に送り、archive guard が「tasks 未完了」で拒否する。
 
 ## Proposed Solution
 
-Conflux は resumed implementation workspace の routing で task completeness を最優先 gate として扱い、unchecked implementation task が残る限り Apply に戻す。
+Conflux は resume routing の tasks 判定スコープを archive guard と一致させ、ファイル全体の未完了 checkbox がある限り Apply に戻す。
 
 具体的には:
 
-1. resume routing 時に `tasks.md` の implementation task 完了状況を確認する。
-2. unchecked implementation task が残っている implementation change は Acceptance や Archive へ進めず Apply にルーティングする。
+1. resume routing の task completeness 判定を `## Implementation Tasks` セクション限定から、archive guard と同じファイル全体スコープ（`task_parser::parse_content` 相当）に変更する。
+2. ファイル全体で unchecked task が残っている implementation change は Acceptance や Archive へ進めず Apply にルーティングする。
 3. tasks 完了後のみ、既存の durable acceptance state と workspace state を使って Acceptance / Archive routing を評価する。
 4. routing 理由として `tasks incomplete; rerouting resumed workspace to apply` 相当の観測可能なログを出す。
 
 ## Acceptance Criteria
 
-- resumed implementation workspace は、`tasks.md` に未完了 implementation task が残る限り Acceptance にルーティングされない。
+- resumed implementation workspace は、`tasks.md` にファイル全体で未完了 task が残る限り Acceptance にルーティングされない。
 - その場合 workspace は Apply に戻される。
 - tasks 完了後は既存どおり durable acceptance state と workspace state に基づいて Acceptance > Archive routing が行われる。
+- resume routing の tasks 判定スコープと archive guard の tasks 判定スコープが一致しており、routing は通すが archive で落ちる不整合が起きない。
 - tasks 未完了 change を resume しても、Archive 側の tasks incomplete error に到達する前に Apply へ戻る。
 - 回帰テストで incomplete tasks の resume が Apply を選び、completed tasks の resume が既存 routing を維持することを確認できる。
 
