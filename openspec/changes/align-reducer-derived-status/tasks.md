@@ -13,6 +13,6 @@
 
 ## Acceptance #1 Failure Follow-up
 
-- [ ] `src/server/api/control.rs` と `src/server/api/ws.rs` の未コミット差分を整理し、`git status --porcelain` が空になる状態にする
+- [x] `src/server/api/control.rs` と `src/server/api/ws.rs` の未コミット差分を整理し、`git status --porcelain` が空になる状態にする
 - [x] `src/server/api/ws.rs` の `handle_ws` の引数数を 7 以下へリファクタリングし、`cargo clippy -- -D warnings` を通す
 - [x] pre-commit hook（rustfmt/clippy）を通常コミット相当で再実行し、hook が自動修正や失敗なしで完了することを確認する
