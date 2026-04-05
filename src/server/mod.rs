@@ -118,6 +118,9 @@ pub async fn run_server(
         orchestration_status: std::sync::Arc::new(tokio::sync::RwLock::new(
             registry::OrchestrationStatus::default(),
         )),
+        shared_orchestrator_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+        )),
         terminal_manager: terminal::create_terminal_manager(),
         active_commands: active_commands::create_shared_active_commands(),
         proposal_session_manager,

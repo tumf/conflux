@@ -66,8 +66,16 @@ pub async fn projects_state(State(state): State<AppState>) -> Response {
     for entry in &entries {
         let selections = all_selections.get(&entry.id);
         let errors = all_errors.get(&entry.id);
-        projects
-            .push(build_remote_project_snapshot_async(&data_dir, entry, selections, errors).await);
+        projects.push(
+            build_remote_project_snapshot_async(
+                &data_dir,
+                entry,
+                selections,
+                errors,
+                &state.shared_orchestrator_state,
+            )
+            .await,
+        );
     }
 
     let sync_available = state.resolve_command.is_some();
@@ -422,7 +430,12 @@ pub async fn add_project(
     {
         let orch_status = state.orchestration_status.read().await;
         if *orch_status == OrchestrationStatus::Running {
-            let changes = list_selected_change_ids_in_worktree(&worktree_path, None).await;
+            let changes = list_selected_change_ids_in_worktree(
+                &worktree_path,
+                None,
+                &state.shared_orchestrator_state,
+            )
+            .await;
             if !changes.is_empty() {
                 info!(
                     "Auto-enqueuing new project during Running state: project_id={} changes={:?}",

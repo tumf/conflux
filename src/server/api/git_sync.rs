@@ -1224,6 +1224,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1323,6 +1326,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1490,6 +1496,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1547,6 +1556,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1594,6 +1606,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1652,6 +1667,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1712,6 +1730,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:
@@ -1873,6 +1894,9 @@ mod tests {
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
+            shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
             proposal_session_manager:

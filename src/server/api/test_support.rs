@@ -24,6 +24,9 @@ pub(crate) fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppSta
         resolve_command: None,
         log_tx,
         orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+        shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+        )),
         terminal_manager: crate::server::terminal::create_terminal_manager(),
         active_commands: crate::server::active_commands::create_shared_active_commands(),
         proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(

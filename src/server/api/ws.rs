@@ -11,6 +11,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
     let log_rx = state.log_tx.subscribe();
     let sync_available = state.resolve_command.is_some();
     let orchestration_status = state.orchestration_status.clone();
+    let shared_orchestrator_state = state.shared_orchestrator_state.clone();
     let active_commands = state.active_commands.clone();
     let db = state.db.clone();
     ws.on_upgrade(move |socket| {
@@ -20,6 +21,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
             log_rx,
             sync_available,
             orchestration_status,
+            shared_orchestrator_state,
             active_commands,
             db,
         )
@@ -32,6 +34,7 @@ async fn handle_ws(
     mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
     sync_available: bool,
     orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
+    shared_orchestrator_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     active_commands: SharedActiveCommands,
     db: Option<Arc<ServerDb>>,
 ) {
@@ -66,7 +69,16 @@ async fn handle_ws(
                 for entry in &entries {
                     let selections = all_selections.get(&entry.id);
                     let errors = all_errors.get(&entry.id);
-                    snapshot.push(build_remote_project_snapshot_async(&data_dir, entry, selections, errors).await);
+                    snapshot.push(
+                        build_remote_project_snapshot_async(
+                            &data_dir,
+                            entry,
+                            selections,
+                            errors,
+                            &shared_orchestrator_state,
+                        )
+                        .await,
+                    );
                 }
 
                 // Collect worktree information for each project
@@ -166,6 +178,7 @@ pub(super) async fn build_remote_project_snapshot_async(
     entry: &ProjectEntry,
     change_selections: Option<&std::collections::HashMap<String, bool>>,
     error_changes: Option<&std::collections::HashMap<String, String>>,
+    shared_orchestrator_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
 ) -> RemoteProject {
     let name = project_display_name(&entry.remote_url, &entry.branch);
     let repo = extract_repo_name(&entry.remote_url);
@@ -175,7 +188,13 @@ pub(super) async fn build_remote_project_snapshot_async(
         .join(&entry.branch);
 
     let mut changes =
-        list_remote_changes_in_worktree(&worktree_path, &entry.id, &entry.branch).await;
+        list_remote_changes_in_worktree(
+            &worktree_path,
+            &entry.id,
+            &entry.branch,
+            shared_orchestrator_state,
+        )
+        .await;
 
     // Apply selected/error state from registry.
     for change in &mut changes {
@@ -247,10 +266,43 @@ pub(super) fn project_display_name(remote_url: &str, branch: &str) -> String {
     format!("{}@{}", repo, branch)
 }
 
+fn map_workspace_state_fallback(state: WorkspaceState) -> (String, Option<u32>) {
+    match state {
+        WorkspaceState::Created => ("created".to_string(), None),
+        WorkspaceState::Applying { iteration } => ("applying".to_string(), Some(iteration)),
+        WorkspaceState::Applied => ("applied".to_string(), None),
+        WorkspaceState::Archiving => ("archiving".to_string(), None),
+        WorkspaceState::Archived => ("archived".to_string(), None),
+        WorkspaceState::Merged => ("merged".to_string(), None),
+        WorkspaceState::Rejecting => ("rejecting".to_string(), None),
+    }
+}
+
+async fn derive_change_status(
+    change_id: &str,
+    worktree_by_change: &std::collections::HashMap<String, std::path::PathBuf>,
+    status_map: &std::collections::HashMap<String, &'static str>,
+    base_branch: &str,
+) -> (String, Option<u32>) {
+    if let Some(status) = status_map.get(change_id) {
+        return (status.to_string(), None);
+    }
+
+    if let Some(wt_path) = worktree_by_change.get(change_id) {
+        return match detect_workspace_state(change_id, wt_path, base_branch).await {
+            Ok(state) => map_workspace_state_fallback(state),
+            Err(_) => ("idle".to_string(), None),
+        };
+    }
+
+    ("idle".to_string(), None)
+}
+
 pub(super) async fn list_remote_changes_in_worktree(
     worktree_path: &std::path::Path,
     project_id: &str,
     base_branch: &str,
+    shared_orchestrator_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
 ) -> Vec<RemoteChange> {
     let changes_dir = worktree_path.join("openspec/changes");
     if !changes_dir.exists() {
@@ -280,6 +332,11 @@ pub(super) async fn list_remote_changes_in_worktree(
             debug!("Failed to read changes dir {:?}: {}", changes_dir, e);
             return Vec::new();
         }
+    };
+
+    let status_map: std::collections::HashMap<String, &'static str> = {
+        let guard = shared_orchestrator_state.read().await;
+        guard.all_display_statuses()
     };
 
     let mut changes = Vec::new();
@@ -324,24 +381,8 @@ pub(super) async fn list_remote_changes_in_worktree(
         let last_modified = latest_modified_rfc3339(&[&proposal_path, &tasks_path])
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-        let (status, iteration_number) = if path.join("REJECTED.md").exists() {
-            ("rejected".to_string(), None)
-        } else if let Some(wt_path) = worktree_by_change.get(dir_name) {
-            match detect_workspace_state(dir_name, wt_path, base_branch).await {
-                Ok(WorkspaceState::Created) => ("queued".to_string(), None),
-                Ok(WorkspaceState::Applying { iteration }) => {
-                    ("applying".to_string(), Some(iteration))
-                }
-                Ok(WorkspaceState::Applied) => ("archiving".to_string(), None),
-                Ok(WorkspaceState::Archiving) => ("archiving".to_string(), None),
-                Ok(WorkspaceState::Archived) => ("archived".to_string(), None),
-                Ok(WorkspaceState::Merged) => ("merged".to_string(), None),
-                Ok(WorkspaceState::Rejecting) => ("rejecting".to_string(), None),
-                Err(_) => ("idle".to_string(), None),
-            }
-        } else {
-            ("idle".to_string(), None)
-        };
+        let (status, iteration_number) =
+            derive_change_status(dir_name, &worktree_by_change, &status_map, base_branch).await;
 
         changes.push(RemoteChange {
             id: dir_name.to_string(),
@@ -378,7 +419,109 @@ fn latest_modified_rfc3339(paths: &[&std::path::Path]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_repo_name;
+    use super::*;
+
+    #[test]
+    fn test_map_workspace_state_fallback_created_and_applied_are_aligned() {
+        assert_eq!(
+            map_workspace_state_fallback(WorkspaceState::Created),
+            ("created".to_string(), None)
+        );
+        assert_eq!(
+            map_workspace_state_fallback(WorkspaceState::Applied),
+            ("applied".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_map_workspace_state_fallback_preserves_iteration_for_applying() {
+        assert_eq!(
+            map_workspace_state_fallback(WorkspaceState::Applying { iteration: 7 }),
+            ("applying".to_string(), Some(7))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_derive_change_status_prefers_reducer_statuses() {
+        let mut status_map = std::collections::HashMap::new();
+        status_map.insert("c-accepting".to_string(), "accepting");
+        status_map.insert("c-resolving".to_string(), "resolving");
+        status_map.insert("c-merge-wait".to_string(), "merge wait");
+        status_map.insert("c-resolve-pending".to_string(), "resolve pending");
+        status_map.insert("c-blocked".to_string(), "blocked");
+
+        let worktree_by_change = std::collections::HashMap::new();
+
+        assert_eq!(
+            derive_change_status("c-accepting", &worktree_by_change, &status_map, "main").await,
+            ("accepting".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-resolving", &worktree_by_change, &status_map, "main").await,
+            ("resolving".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-merge-wait", &worktree_by_change, &status_map, "main").await,
+            ("merge wait".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-resolve-pending", &worktree_by_change, &status_map, "main")
+                .await,
+            ("resolve pending".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-blocked", &worktree_by_change, &status_map, "main").await,
+            ("blocked".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_ws_display_status_matches_tui_reducer_display_status() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+
+        let mut orchestrator_state =
+            OrchestratorState::with_mode(vec!["change-a".to_string()], 1, ExecutionMode::Parallel);
+
+        orchestrator_state.apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
+        assert_eq!(orchestrator_state.display_status("change-a"), "queued");
+
+        orchestrator_state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "change-a".to_string(),
+            command: "accept --change change-a".to_string(),
+        });
+        assert_eq!(orchestrator_state.display_status("change-a"), "accepting");
+
+        orchestrator_state.apply_execution_event(&ExecutionEvent::AcceptanceCompleted {
+            change_id: "change-a".to_string(),
+        });
+        orchestrator_state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "manual resolve required".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(orchestrator_state.display_status("change-a"), "merge wait");
+
+        orchestrator_state.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+        assert_eq!(orchestrator_state.display_status("change-a"), "resolve pending");
+
+        orchestrator_state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "change-a".to_string(),
+            dependency_ids: vec!["change-b".to_string()],
+        });
+        assert_eq!(orchestrator_state.display_status("change-a"), "blocked");
+    }
+
+    #[tokio::test]
+    async fn test_derive_change_status_returns_idle_without_reducer_or_worktree() {
+        let status_map = std::collections::HashMap::new();
+        let worktree_by_change = std::collections::HashMap::new();
+
+        assert_eq!(
+            derive_change_status("unknown-change", &worktree_by_change, &status_map, "main").await,
+            ("idle".to_string(), None)
+        );
+    }
 
     #[test]
     fn test_extract_repo_name_standard_https() {

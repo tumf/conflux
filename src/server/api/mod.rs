@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
+use crate::orchestration::state::OrchestratorState;
 use crate::remote::types::{RemoteChange, RemoteLogEntry, RemoteProject, RemoteStateUpdate};
 use crate::server::active_commands::{
     ActiveCommandGuard, RootKind, SharedActiveCommands, WorktreeRootKey,
@@ -64,6 +65,8 @@ pub struct AppState {
     pub log_tx: tokio::sync::broadcast::Sender<RemoteLogEntry>,
     /// Global orchestration status (Idle/Running/Stopped)
     pub orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
+    /// Reducer-owned per-change runtime state used as canonical display status source.
+    pub shared_orchestrator_state: Arc<tokio::sync::RwLock<OrchestratorState>>,
     /// Terminal session manager for dashboard interactive shells
     pub terminal_manager: SharedTerminalManager,
     /// Active command registry for worktree root-level singleton execution
