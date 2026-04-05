@@ -280,8 +280,9 @@ pub enum ExecutionEvent {
         change_id: String,
         workspace: String,
     },
-    /// Workspace status updated
+    /// Workspace status synchronization for a specific change (parallel mode)
     WorkspaceStatusUpdated {
+        change_id: String,
         #[allow(dead_code)]
         workspace_name: String,
         #[allow(dead_code)]

@@ -660,6 +660,7 @@ impl ParallelExecutor {
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(ParallelEvent::WorkspaceStatusUpdated {
+                            change_id: change_id.clone(),
                             workspace_name: workspace.name.clone(),
                             status: WorkspaceStatus::Rejecting,
                         })
@@ -947,6 +948,7 @@ impl ParallelExecutor {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::WorkspaceStatusUpdated {
+                                change_id: change_id.clone(),
                                 workspace_name: workspace.name.clone(),
                                 status: WorkspaceStatus::Rejecting,
                             })
@@ -1103,6 +1105,7 @@ impl ParallelExecutor {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::WorkspaceStatusUpdated {
+                                change_id: change_id.clone(),
                                 workspace_name: workspace.name.clone(),
                                 status: WorkspaceStatus::Accepting,
                             })
@@ -1447,6 +1450,7 @@ impl ParallelExecutor {
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(ParallelEvent::WorkspaceStatusUpdated {
+                        change_id: change_id.clone(),
                         workspace_name: workspace.name.clone(),
                         status: WorkspaceStatus::Archiving,
                     })
