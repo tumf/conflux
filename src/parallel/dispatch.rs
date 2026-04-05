@@ -23,6 +23,7 @@ use crate::orchestration::{
     execute_rejection_flow, handle_resume_apply_from_rejecting, run_rejection_review,
     RejectionReviewVerdict,
 };
+use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::acceptance_resume_ready_for_archive;
@@ -133,12 +134,33 @@ mod tests {
         .unwrap();
         fs::write(
             change_dir.join("tasks.md"),
-            "## Implementation Tasks\n- [x] done\n- [ ] todo\n\n## Future Work\n- [ ] not counted\n",
+            "## Implementation Tasks\n- [x] done\n- [ ] todo\n\n## Future Work\n- 補足メモのみ\n",
         )
         .unwrap();
 
         let action =
             decide_resume_action("change-incomplete", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Apply);
+    }
+
+    #[test]
+    fn decide_resume_action_routes_applied_to_apply_when_follow_up_tasks_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-follow-up");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [ ] fix regression\n",
+        )
+        .unwrap();
+
+        let action = decide_resume_action("change-follow-up", tmp.path(), &WorkspaceState::Applied);
         assert_eq!(action, ResumeAction::Apply);
     }
 
@@ -294,64 +316,18 @@ fn read_implementation_task_progress(
         return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&tasks_path).map_err(|e| {
+    let progress = task_parser::parse_file(&tasks_path, Some(change_id)).map_err(|e| {
         OrchestratorError::ConfigLoad(format!(
-            "Failed to read tasks file '{}' for resume routing: {}",
+            "Failed to parse tasks file '{}' for resume routing: {}",
             tasks_path.display(),
             e
         ))
     })?;
 
-    let mut in_implementation_section = false;
-    let mut total = 0u32;
-    let mut completed = 0u32;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("## ") {
-            in_implementation_section = trimmed == "## Implementation Tasks";
-            continue;
-        }
-
-        if !in_implementation_section {
-            continue;
-        }
-
-        if let Some(status) = parse_task_checkbox_status(trimmed) {
-            total += 1;
-            if status {
-                completed += 1;
-            }
-        }
-    }
-
-    if total == 0 {
+    if progress.total == 0 {
         Ok(None)
     } else {
-        Ok(Some((completed, total)))
-    }
-}
-
-fn parse_task_checkbox_status(line: &str) -> Option<bool> {
-    let candidate = line
-        .strip_prefix("- [")
-        .or_else(|| line.strip_prefix("* ["))
-        .or_else(|| {
-            let mut parts = line.splitn(2, ". [");
-            let numbered = parts.next()?;
-            if numbered.chars().all(|c| c.is_ascii_digit()) {
-                parts.next()
-            } else {
-                None
-            }
-        })?;
-
-    let marker = candidate.chars().next()?;
-    match marker {
-        'x' | 'X' => Some(true),
-        ' ' => Some(false),
-        _ => None,
+        Ok(Some((progress.completed, progress.total)))
     }
 }
 
