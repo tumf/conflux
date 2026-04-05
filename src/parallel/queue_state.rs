@@ -378,7 +378,6 @@ impl ParallelExecutor {
                     merge_result.change_id
                 );
                 self.retry_deferred_merges().await;
-                self.needs_reanalysis = true;
             }
             Err(error) => {
                 error!(
@@ -395,7 +394,6 @@ impl ParallelExecutor {
                     },
                 )
                 .await;
-                self.needs_reanalysis = true;
             }
         }
     }
@@ -620,9 +618,8 @@ impl ParallelExecutor {
             if queue_changed {
                 let mut last_change = self.last_queue_change_at.lock().await;
                 *last_change = Some(std::time::Instant::now());
-                self.needs_reanalysis = true;
                 *reanalysis_reason = ReanalysisReason::QueueNotification;
-                info!("Queue changed, re-analysis triggered");
+                info!("Queue changed, scheduler state now requires re-analysis");
             }
             queue_changed
         } else {
@@ -692,7 +689,7 @@ impl ParallelExecutor {
                 in_flight.len(),
                 queued.len()
             );
-            // Keep needs_reanalysis=true so re-analysis will run when slots free up
+            // Re-analysis stays state-driven and will resume once slots free up.
             return Ok((false, iteration));
         }
 
@@ -741,7 +738,6 @@ impl ParallelExecutor {
                 return Ok((true, iteration)); // Should break
             } else {
                 // Wait for in-flight to complete
-                self.needs_reanalysis = false;
                 return Ok((false, iteration)); // Continue, don't break
             }
         }
@@ -771,7 +767,6 @@ impl ParallelExecutor {
             if in_flight.is_empty() {
                 return Ok((true, iteration)); // Should break
             } else {
-                self.needs_reanalysis = false;
                 return Ok((false, iteration)); // Continue
             }
         }
@@ -851,7 +846,6 @@ impl ParallelExecutor {
             iteration
         };
 
-        self.needs_reanalysis = false;
         Ok((false, new_iteration))
     }
 }

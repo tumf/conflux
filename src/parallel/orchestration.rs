@@ -115,8 +115,7 @@ impl ParallelExecutor {
             self.repo_root.clone(),
         );
 
-        // Set needs_reanalysis to trigger first analysis
-        self.needs_reanalysis = true;
+        // Reanalysis reason is derived from scheduler events/state each iteration.
         let mut reanalysis_reason = ReanalysisReason::Initial;
         let mut cancelled = false;
 
@@ -149,44 +148,47 @@ impl ParallelExecutor {
             )
             .await;
 
-            // Step 2: Re-analysis if needed and debounce elapsed
+            // Step 2: Re-analysis decision is derived from scheduler state.
             let work_drained = queued.is_empty()
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
                 && self.manual_resolve_active() == 0
                 && self.pending_merge_count.load(Ordering::Relaxed) == 0;
-            if self.needs_reanalysis && work_drained {
-                if self.scheduler_lifetime == SchedulerLifetime::Finite {
-                    info!(
-                        "All changes completed (queued/in-flight/resolve_wait/manual_resolve empty), stopping"
-                    );
-                    break;
-                }
+            if work_drained && self.scheduler_lifetime == SchedulerLifetime::Finite {
+                info!(
+                    "All changes completed (queued/in-flight/resolve_wait/manual_resolve empty), stopping"
+                );
+                break;
+            }
+            if work_drained && self.scheduler_lifetime == SchedulerLifetime::Persistent {
                 info!(
                     "Scheduler idle with no work; waiting for dynamic queue notifications (persistent lifetime)"
                 );
-                self.needs_reanalysis = false;
             }
 
-            if self.needs_reanalysis && !queued.is_empty() {
-                let (should_break, new_iteration) = self
-                    .perform_reanalysis_and_dispatch(
-                        &mut queued,
-                        &mut in_flight,
-                        max_parallelism,
-                        iteration,
-                        reanalysis_reason,
-                        &analyzer,
-                        semaphore.clone(),
-                        &mut join_set,
-                        &mut cleanup_guard,
-                    )
-                    .await?;
+            if !queued.is_empty() {
+                let available_slots = self.calculate_available_slots(max_parallelism, &in_flight);
+                let should_attempt_reanalysis = available_slots > 0;
+                if should_attempt_reanalysis {
+                    let (should_break, new_iteration) = self
+                        .perform_reanalysis_and_dispatch(
+                            &mut queued,
+                            &mut in_flight,
+                            max_parallelism,
+                            iteration,
+                            reanalysis_reason,
+                            &analyzer,
+                            semaphore.clone(),
+                            &mut join_set,
+                            &mut cleanup_guard,
+                        )
+                        .await?;
 
-                iteration = new_iteration;
+                    iteration = new_iteration;
 
-                if should_break {
-                    break;
+                    if should_break {
+                        break;
+                    }
                 }
             }
 
@@ -211,10 +213,9 @@ impl ParallelExecutor {
                         Ok(workspace_result) => {
                             self.handle_workspace_completion(workspace_result, max_parallelism, &mut in_flight, &merge_result_tx).await;
 
-                            // Trigger re-analysis on next iteration.
+                            // Re-analysis is state-derived each loop.
                             // If a manual resolve is still active, keep the generic completion reason;
                             // otherwise treat the slot release as resolve-aware capacity recovery.
-                            self.needs_reanalysis = true;
                             let manual_resolves_active = self
                                 .manual_resolve_count
                                 .as_ref()
@@ -253,7 +254,7 @@ impl ParallelExecutor {
 
                 // Debounce timer: wait before allowing re-analysis
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                    // Timer expired, loop will re-check needs_reanalysis and debounce
+                    // Timer expired; next loop derives re-analysis from current scheduler state.
                 }
             }
         }
