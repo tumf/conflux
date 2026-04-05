@@ -22,6 +22,6 @@
 
 ## Acceptance #3 Failure Follow-up
 
-- [ ] resume routing の tasks 判定を `## Implementation Tasks` セクション限定の独自パーサーから、archive guard と同一の `task_parser::parse_content` 相当に変更し、スコープ不一致を解消する (verification: `## Acceptance #N Failure Follow-up` に未完了 checkbox がある場合に resume が Apply を選ぶ回帰テストが追加される)
-- [ ] `read_implementation_task_progress` を archive guard と同一スコープの判定に置き換え、独自セクション限定パーサーを廃止する (verification: `src/parallel/dispatch.rs` の回帰テストで routing と archive guard の判定結果が一致することを確認できる)
-- [ ] quality gate を実行する (verification: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
+- [x] resume routing の tasks 判定を `## Implementation Tasks` セクション限定の独自パーサーから、archive guard と同一の `task_parser::parse_content` 相当に変更し、スコープ不一致を解消する (verification: `## Acceptance #N Failure Follow-up` に未完了 checkbox がある場合に resume が Apply を選ぶ回帰テストが追加される)
+- [x] `read_implementation_task_progress` を archive guard と同一スコープの判定に置き換え、独自セクション限定パーサーを廃止する (verification: `src/parallel/dispatch.rs` の回帰テストで routing と archive guard の判定結果が一致することを確認できる)
+- [x] quality gate を実行する (verification: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`)
