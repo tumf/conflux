@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 
+use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
@@ -286,6 +287,13 @@ impl ParallelExecutor {
             .await;
             // Rejected flow is terminal after base-side REJECTED marker commit
             // and should not proceed to merge. Ensure preserved workspace is cleaned up.
+            let workspace_path = self
+                .workspace_manager
+                .find_existing_workspace(&workspace_result.change_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|info| info.path);
             if let Err(e) = self
                 .workspace_manager
                 .cleanup_workspace(&workspace_result.workspace_name)
@@ -295,6 +303,13 @@ impl ParallelExecutor {
                     "Failed to cleanup rejected workspace '{}' for change '{}': {}",
                     workspace_result.workspace_name, workspace_result.change_id, e
                 );
+            } else if let Some(workspace_path) = workspace_path {
+                if let Err(err) = delete_acceptance_state(&workspace_path) {
+                    warn!(
+                        "Failed to delete acceptance state for rejected change '{}': {}",
+                        workspace_result.change_id, err
+                    );
+                }
             }
         } else {
             info!(
