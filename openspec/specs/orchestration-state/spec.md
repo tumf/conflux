@@ -609,6 +609,34 @@ Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED
 - **AND** the derived display status is `applying`
 
 
+### Requirement: Reducer-Owned Change Runtime State
+
+The active execution stage SHALL include lifecycle events for entering and leaving the `Rejecting` stage. The reducer SHALL support two outcomes from rejection review: confirmation (transition to `Rejected` terminal) and dismissal/resume (transition back to `Applying`).
+
+#### Scenario: Rejection review confirm transitions to rejected terminal
+
+- **GIVEN** a change is in `Rejecting` activity stage
+- **WHEN** the reducer applies a rejection-review-completed event with `Confirm` outcome
+- **THEN** the activity becomes `Idle`
+- **AND** the terminal state becomes `Rejected`
+- **AND** the derived display status is `rejected`
+
+#### Scenario: Rejection review resume transitions back to applying
+
+- **GIVEN** a change is in `Rejecting` activity stage
+- **WHEN** the reducer applies a rejection-review-completed event with `Resume` outcome
+- **THEN** the activity becomes `Applying`
+- **AND** the terminal state remains `None`
+- **AND** the derived display status is `applying`
+
+#### Scenario: Rejection review failure transitions to error terminal
+
+- **GIVEN** a change is in `Rejecting` activity stage
+- **WHEN** the reducer applies a rejection-review-failed event
+- **THEN** the activity becomes `Idle`
+- **AND** the terminal state becomes `Error`
+- **AND** the derived display status is `error`
+
 ### Requirement: Reducer Input Precedence and Idempotency
 
 Execution events SHALL own active-stage and terminal transitions. Workspace observations SHALL reconcile durable wait/recovery state and MUST NOT override an active execution stage.
@@ -629,7 +657,6 @@ When a workspace-status synchronization event is used, it SHALL target the speci
 - **WHEN** a workspace-status synchronization event arrives
 - **THEN** the reducer identifies the target change from the event payload itself
 - **AND** `current_change_id` is not used to decide which runtime entry to mutate
-
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -662,3 +689,16 @@ Server-mode WebSocket API SHALL produce the same set of display status strings a
 - **GIVEN** the reducer can produce any of: `not queued`, `queued`, `blocked`, `applying`, `accepting`, `rejecting`, `archiving`, `resolving`, `merge wait`, `resolve pending`, `archived`, `merged`, `rejected`, `error`, `stopped`
 - **WHEN** a WebSocket client receives a change list
 - **THEN** the status field for each change is one of the above values
+
+### Requirement: Scheduler dispatch derives queued candidates from reducer state
+
+The parallel scheduler's decision to dispatch queued changes SHALL be derived from reducer-observable state (queue intent, active execution stage, available slots) rather than transient event flags. This ensures that changes with `QueueIntent::Queued` in the reducer are always considered for dispatch when execution capacity exists.
+
+#### Scenario: Reducer queued change is visible to scheduler dispatch
+
+- **GIVEN** a change has `QueueIntent::Queued` in the reducer
+- **AND** no activity stage is active for that change
+- **AND** available execution slots are greater than zero
+- **WHEN** the scheduler evaluates dispatch candidates
+- **THEN** the change is included in the re-analysis candidate set
+- **AND** the scheduler does not require a separate event flag to consider this change
