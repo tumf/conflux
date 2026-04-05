@@ -23,16 +23,27 @@ parallel acceptance resume safety のため durable acceptance state は必要�
 
 acceptance state は worktree path を入力にする API を維持してもよいが、実際の保存先は worktree 外の Conflux 管理領域へ移す。
 
+推奨保存先は `~/.local/state/cflx/acceptance-state/` 配下とする。既存の cflx runtime logs が `~/.local/state/cflx/` 配下に置かれている運用と整合し、Git worktree の dirty 判定から完全に分離できるためである。
+
 最低限必要な保持情報:
 
 - state
 - revision
 - updated_at
-- 対象 workspace/worktree を一意に引ける key
+- workspace absolute path
+- change_id
 
 ### Storage key
 
-resume/archive guard で同じ workspace を再識別できる必要があるため、保存 key には少なくとも worktree path あるいは change_id + workspace identity を含める。
+resume/archive guard で同じ workspace を再識別できる必要があるため、保存 key は workspace absolute path を主キーに固定する。change_id は補助情報として保持し、同一 change_id の再作成や branch 再利用時も path 単位で区別する。
+
+revision は payload に保持し、`passed` でも current revision と不一致なら archive を解放しない。
+
+### Cleanup / invalidation
+
+- archive 完了後は対応する acceptance state を削除する
+- workspace cleanup 完了後も state を削除または無効化する
+- resume 時に state は存在しても revision mismatch なら stale として扱い、`passed` と見なさない
 
 ### Behavioral compatibility
 

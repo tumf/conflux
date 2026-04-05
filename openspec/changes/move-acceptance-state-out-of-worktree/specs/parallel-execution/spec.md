@@ -26,3 +26,12 @@ The durable acceptance state artifact MUST NOT be written inside the Git worktre
 - **WHEN** the workspace is resumed
 - **THEN** the orchestrator reruns acceptance before archive
 - **AND** it does so without relying on a worktree-local acceptance-state file
+
+#### Scenario: Stale durable pass for another revision does not unlock archive
+
+- **GIVEN** external acceptance state exists for a workspace
+- **AND** that state is `passed`
+- **AND** the stored revision does not match the workspace's current revision
+- **WHEN** resume routing or archive preconditions are evaluated
+- **THEN** the orchestrator MUST NOT treat that state as a valid pass for archive
+- **AND** it reruns acceptance before archive

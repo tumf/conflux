@@ -32,20 +32,26 @@ references:
 
 Conflux は durable acceptance state を維持しつつ、その保存先を worktree 外の Conflux 管理領域へ移し、worktree 配下には `.cflx/acceptance-state.json` を生成しない。
 
+推奨保存先は `~/.local/state/cflx/acceptance-state/` 配下とし、workspace absolute path を主キーにした外部 state ファイルまたは同等の外部 persistence を使う。
+
 具体的には:
 
-1. acceptance state persistence API を worktree path 基準のファイル保存から、worktree を一意に識別できる外部ストア基準へ置き換える。
-2. apply 完了 / acceptance 開始 / PASS / FAIL 時の state 更新は従来どおり維持するが、保存先は Git 管理外の Conflux state 領域とする。
-3. resume routing と archive guard は新しい外部 persistence から acceptance state を読み、現行の durable semantics を保つ。
-4. worktree 配下には `.cflx/acceptance-state.json` を作成しないことを保証する。
-5. merge readiness と dirty worktree 判定の回帰テストで、Conflux 生成 acceptance state artifact が merge の妨げにならないことを確認する。
+1. acceptance state persistence API を worktree path 基準のファイル保存から、`~/.local/state/cflx/acceptance-state/` 配下の外部ストア基準へ置き換える。
+2. state key は workspace absolute path を主キーとし、change_id・revision・updated_at を payload に含める。
+3. apply 完了 / acceptance 開始 / PASS / FAIL 時の state 更新は従来どおり維持するが、保存先は Git 管理外の Conflux state 領域とする。
+4. resume routing と archive guard は新しい外部 persistence から acceptance state を読み、現行の durable semantics を保つ。revision mismatch や stale state は archive 解放条件として扱わない。
+5. archive 完了または workspace cleanup 完了後は対応する外部 acceptance state を削除または無効化し、長期残留 state が次回実行に干渉しないようにする。
+6. worktree 配下には `.cflx/acceptance-state.json` を作成しないことを保証する。
+7. merge readiness と dirty worktree 判定の回帰テストで、Conflux 生成 acceptance state artifact が merge の妨げにならないことを確認する。
 
 ## Acceptance Criteria
 
 - Conflux は parallel workspace/worktree 配下に `.cflx/acceptance-state.json` を生成しない。
-- durable acceptance state は worktree 外に保持され、resume routing と archive guard は現行同等の `pending` / `running` / `passed` / `failed` semantics を維持する。
+- durable acceptance state は `~/.local/state/cflx/acceptance-state/` 相当の worktree 外管理領域に保持され、resume routing と archive guard は現行同等の `pending` / `running` / `passed` / `failed` semantics を維持する。
+- state key は workspace absolute path ベースで安定して再解決でき、revision mismatch または stale pass では archive が解放されない。
 - acceptance 実行後も Conflux 自身が生成した acceptance state artifact によって merge が dirty worktree 扱いで defer されない。
 - 再起動後も interrupted acceptance は archive に進まず、外部 persistence に基づいて acceptance 再実行へ戻る。
+- archive 完了または workspace cleanup 完了後は外部 acceptance state が削除または無効化される。
 - 回帰テストで worktree 配下に acceptance state ファイルが存在しないことと、merge readiness が internal artifact で壊れないことを確認できる。
 
 ## Out of Scope
