@@ -668,6 +668,14 @@ impl ParallelExecutor {
 
                 match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
                     Ok(RejectionReviewVerdict::Confirm) => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::RejectionReviewCompleted {
+                                    change_id: change_id.clone(),
+                                    outcome: crate::events::RejectionOutcome::Confirm,
+                                })
+                                .await;
+                        }
                         let rejected_path = workspace
                             .path
                             .join("openspec")
@@ -727,7 +735,23 @@ impl ParallelExecutor {
                         }
                     }
                     Ok(RejectionReviewVerdict::Resume) => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::RejectionReviewCompleted {
+                                    change_id: change_id.clone(),
+                                    outcome: crate::events::RejectionOutcome::Resume,
+                                })
+                                .await;
+                        }
                         if let Err(e) = handle_resume_apply_from_rejecting(&change_id, &workspace.path).await {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::RejectionReviewFailed {
+                                        change_id: change_id.clone(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
                             cancel_monitor.abort();
                             return WorkspaceResult {
                                 change_id,
@@ -751,6 +775,14 @@ impl ParallelExecutor {
                         }
                     }
                     Err(e) => {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::RejectionReviewFailed {
+                                    change_id: change_id.clone(),
+                                    error: e.to_string(),
+                                })
+                                .await;
+                        }
                         cancel_monitor.abort();
                         return WorkspaceResult {
                             change_id,
@@ -933,6 +965,14 @@ impl ParallelExecutor {
 
                     match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
                         Ok(RejectionReviewVerdict::Confirm) => {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::RejectionReviewCompleted {
+                                        change_id: change_id.clone(),
+                                        outcome: crate::events::RejectionOutcome::Confirm,
+                                    })
+                                    .await;
+                            }
                             let reason = format!(
                                 "Apply-blocked rejection confirmed by rejecting review (proposal: {})",
                                 handoff.rejected_path.display()
@@ -984,7 +1024,23 @@ impl ParallelExecutor {
                             }
                         }
                         Ok(RejectionReviewVerdict::Resume) => {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::RejectionReviewCompleted {
+                                        change_id: change_id.clone(),
+                                        outcome: crate::events::RejectionOutcome::Resume,
+                                    })
+                                    .await;
+                            }
                             if let Err(e) = handle_resume_apply_from_rejecting(&change_id, &workspace.path).await {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::RejectionReviewFailed {
+                                            change_id: change_id.clone(),
+                                            error: e.to_string(),
+                                        })
+                                        .await;
+                                }
                                 return WorkspaceResult {
                                     change_id,
                                     workspace_name: workspace.name,
@@ -1008,6 +1064,14 @@ impl ParallelExecutor {
                             continue;
                         }
                         Err(e) => {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::RejectionReviewFailed {
+                                        change_id: change_id.clone(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
                             return WorkspaceResult {
                                 change_id,
                                 workspace_name: workspace.name,

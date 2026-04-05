@@ -187,6 +187,12 @@ impl LogEntry {
 ///
 /// This enum combines events from both serial and parallel execution modes,
 /// providing a single interface for event handling across the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionOutcome {
+    Confirm,
+    Resume,
+}
+
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     // Lifecycle events
@@ -244,6 +250,13 @@ pub enum ExecutionEvent {
     AcceptanceFailed { change_id: String, error: String },
     /// Change rejected after acceptance blocker detection
     ChangeRejected { change_id: String, reason: String },
+    /// Rejection review completed for a change
+    RejectionReviewCompleted {
+        change_id: String,
+        outcome: RejectionOutcome,
+    },
+    /// Rejection review failed for a change
+    RejectionReviewFailed { change_id: String, error: String },
     /// Acceptance output (streaming)
     #[allow(dead_code)]
     AcceptanceOutput {
