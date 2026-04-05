@@ -14,7 +14,7 @@ Automates the OpenSpec change workflow (list → dependency analysis → apply �
 - 🔌 **Multi-Agent Support**: Works with Claude Code, OpenCode, and Codex
 - 🪝 **Lifecycle Hooks**: Configurable hooks for custom actions at each workflow stage
 - ⚡ **Parallel Execution**: Process multiple independent changes simultaneously using Git worktrees
-- 🌐 **Web Monitoring**: Optional HTTP server with REST API and WebSocket for remote monitoring
+- 🌐 **Web UI**: Optional browser dashboard with REST API and WebSocket for remote monitoring
 
 ## Architecture
 
@@ -29,7 +29,35 @@ Automates the OpenSpec change workflow (list → dependency analysis → apply �
 └─────────────────────────────────────────────┘
 ```
 
+## Modes and Frontends
+
+Conflux has two operating modes and three main frontends. Keeping them separate makes the rest of this README easier to follow.
+
+### Operating Modes
+
+| Mode | Command | Purpose |
+|------|---------|---------|
+| **Normal mode** | `cflx` / `cflx run` | Run orchestration in the current repository |
+| **Server mode** | `cflx server` | Run a long-lived multi-project daemon with HTTP/WebSocket APIs |
+
+### Frontends
+
+| Frontend | Command / Access | Available In | Purpose |
+|----------|------------------|--------------|---------|
+| **TUI** | `cflx` or `cflx tui` | Normal mode, remote server client mode | Interactive change review and control |
+| **Headless run** | `cflx run` | Normal mode | Non-interactive orchestration |
+| **Web UI** | Browser dashboard | `--web` in normal mode, or `cflx server` | Remote monitoring via HTTP/WebSocket |
+
+### How They Fit Together
+
+- **Most users start in normal mode**: run `cflx`, inspect changes in the TUI, then execute locally.
+- **Use `cflx run`** when you want the same orchestration flow without an interactive UI.
+- **Use `cflx server`** when you want a persistent daemon for multiple projects, remote access, or server-managed proposal sessions.
+- **Web UI is not a separate execution engine**: it is a dashboard frontend on top of the orchestrator state exposed over HTTP/WebSocket.
+
 ## Quick Start
+
+### Local TUI (recommended)
 
 ```bash
 # 1. Install
@@ -38,14 +66,18 @@ cargo install --path .
 # 2. Initialize configuration (Claude Code agent by default)
 cflx init
 
-# 3. Launch the interactive TUI (default entry point)
+# 3. Launch the interactive TUI in the current repository
 cflx
+```
 
-# Or run headless (non-interactive)
+### Local headless run
+
+```bash
+cflx init
 cflx run
 ```
 
-For other templates:
+### Other templates
 
 ```bash
 cflx init --template opencode
@@ -54,25 +86,11 @@ cflx init --template codex
 
 ## Usage
 
-### Golden Path: Quick Start
+### Local Orchestration
 
-```bash
-# Step 1: Generate configuration for your AI agent (Claude Code by default)
-cflx init
+#### TUI (`cflx`)
 
-# Step 2: Edit the generated .cflx.jsonc to configure your agent
-vim .cflx.jsonc
-
-# Step 3a: Launch the interactive TUI to review and process changes
-cflx
-
-# Step 3b: Or run in headless (non-interactive) mode
-cflx run
-```
-
-### Interactive TUI (Primary Interface)
-
-The primary way to use the orchestrator is through the interactive TUI dashboard:
+The primary local interface is the interactive TUI dashboard:
 
 ```bash
 cflx
@@ -155,9 +173,9 @@ Changes have a **selection/queue** state.
 | `Enter` | Open shell | Runs only when `worktree_command` is configured |
 | `Ctrl+C` | Quit | Exit application |
 
-*QR code is only available when web monitoring is enabled (`--web` flag). Press any key to close the QR popup.
+*QR code is only available when the Web UI is enabled (`--web` flag). Press any key to close the QR popup.
 
-### TUI Worktree View
+#### TUI Worktree View
 
 The TUI includes a dedicated Worktree View for managing git worktrees directly from the interface.
 
@@ -215,29 +233,9 @@ The TUI includes a dedicated Worktree View for managing git worktrees directly f
 - Non-blocking: Conflict checks run asynchronously, TUI remains responsive
 - Fallback: On check failure, assumes no conflict info (safe default)
 
-### Initialize Configuration
+#### Headless Run (`cflx run`)
 
-Generate a configuration file for your preferred AI agent:
-
-```bash
-# Default: Claude Code template
-cflx init
-
-# OpenCode template
-cflx init --template opencode
-
-# Codex template
-cflx init --template codex
-
-# Overwrite existing config
-cflx init --force
-```
-
-Available templates: `claude` (default), `opencode`, `codex`
-
-### Run Orchestration (Non-Interactive)
-
-Process all pending changes in headless mode:
+Process all pending changes in non-interactive mode:
 
 ```bash
 cflx run
@@ -258,6 +256,55 @@ Custom configuration file:
 ```bash
 cflx run --config /path/to/config.jsonc
 ```
+
+### Server Mode
+
+Use server mode when you want a persistent daemon, multi-project management, remote APIs, or server-managed proposal sessions.
+
+```bash
+cflx server
+```
+
+Server mode exposes the Web UI and APIs for connected clients. A TUI can connect to a remote server with `--server`.
+
+For background service management and server-only configuration, see [Server Mode Details](#server-mode-details).
+
+### Web UI and Remote Monitoring
+
+- In **normal mode**, enable the dashboard with `--web` on `cflx` or `cflx run`
+- In **server mode**, the dashboard is part of the daemon setup
+- Full dashboard/API details are documented in [Web UI and Dashboard](#web-ui-and-dashboard)
+
+```bash
+# Local TUI + Web UI
+cflx --web
+
+# Local headless run + Web UI
+cflx run --web
+
+# Remote TUI connected to a server
+cflx tui --server http://host:39876
+```
+
+### Initialize Configuration
+
+Generate a configuration file for your preferred AI agent:
+
+```bash
+# Default: Claude Code template
+cflx init
+
+# OpenCode template
+cflx init --template opencode
+
+# Codex template
+cflx init --template codex
+
+# Overwrite existing config
+cflx init --force
+```
+
+Available templates: `claude` (default), `opencode`, `codex`
 
 ## How It Works
 
@@ -391,9 +438,12 @@ This allows you to use different AI tools (Claude Code, OpenCode, Codex, etc.) w
 | `acceptance_prompt` | Prompt injected into acceptance_command's `{prompt}` | (empty) |
 | `archive_prompt` | Prompt injected into archive_command's `{prompt}` | (empty) |
 
-### Proposal Session OPENCODE_CONFIG Customization
+### Server-Only Configuration
 
-Proposal sessions do **not** auto-generate or inject `OPENCODE_CONFIG`.
+#### Proposal Session OPENCODE_CONFIG
+
+This setting applies to proposal sessions created by `cflx server`.
+Server-side proposal sessions do **not** auto-generate or inject `OPENCODE_CONFIG`.
 If `proposal_session.transport_env.OPENCODE_CONFIG` is not set, opencode uses its built-in default config.
 
 To override the config, set `OPENCODE_CONFIG` explicitly:
@@ -547,9 +597,9 @@ Commands:
 
 Options:
   -c, --config <PATH>          Path to custom configuration file (JSONC format)
-  --web                        Enable web monitoring server for remote status viewing
-  --web-port <PORT>            Port for web monitoring server (default: 0 = auto-assign by OS)
-  --web-bind <ADDR>            Bind address for web monitoring server (default: 127.0.0.1)
+  --web                        Enable Web UI server for remote dashboard access
+  --web-port <PORT>            Port for Web UI server (default: 0 = auto-assign by OS)
+  --web-bind <ADDR>            Bind address for Web UI server (default: 127.0.0.1)
   --server <URL>               Connect TUI to a remote Conflux server (e.g., http://host:39876)
   --server-token <TOKEN>       Bearer token for remote server authentication
   --server-token-env <VAR>     Environment variable holding the bearer token
@@ -568,17 +618,17 @@ Options:
   --no-resume               Disable workspace resume (always create new workspaces)
   --dry-run                 Preview parallelization groups without executing
   --max-iterations <N>      Maximum number of orchestration loop iterations (0 = no limit)
-  --web                     Enable web monitoring server
+  --web                     Enable Web UI server
   --web-port <PORT>         Web server port (default: 0 = auto-assign by OS)
   --web-bind <ADDR>         Web server bind address (default: 127.0.0.1)
 ```
 
 **TUI options:**
 
-The TUI (default mode, `cflx` or `cflx tui`) also supports web monitoring options:
+The TUI (default mode, `cflx` or `cflx tui`) also supports Web UI options:
 
 ```bash
-# TUI with web monitoring
+# TUI with Web UI
 cflx --web
 
 # Custom port and bind address
@@ -759,34 +809,36 @@ The orchestrator includes a command execution queue that prevents resource confl
 # → Usually succeeds on retry
 ```
 
-### Web Monitoring
+## Web UI and Dashboard
 
-The orchestrator supports an optional HTTP server for remote monitoring of orchestration progress via web browser.
+The Web UI is a monitoring dashboard backed by HTTP/WebSocket state. It works in both normal mode (`--web`) and server mode.
 
-**Usage:**
+### Enabling the Web UI
 
 ```bash
-# Enable web monitoring with TUI (OS auto-assigns an available port)
+# Normal mode: TUI + Web UI
 cflx --web
+
+# Normal mode: headless run + Web UI
+cflx run --web
 
 # Custom port and bind address
 cflx --web --web-port 9000 --web-bind 0.0.0.0
-
-# With headless run mode
-cflx run --web
 ```
 
 When using the default port (0), the OS automatically assigns an available port.
 The actual bound address is logged when the server starts.
 
-**Features:**
+In server mode (`cflx server`), the Web UI is always available on the configured port.
 
-- **Dashboard UI**: View progress at `http://localhost:8080/`
+### Dashboard Features
+
+- **Dashboard UI**: View progress at `http://localhost:<port>/`
 - **Real-time updates**: WebSocket connection for live progress updates
 - **REST API**: Query state programmatically
-- **QR Code Popup**: Press `w` in the TUI to display a QR code for quick mobile access to the dashboard
+- **QR Code Popup**: Press `w` in the TUI to display a QR code for quick mobile access
 
-**REST API Endpoints:**
+### REST API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -797,9 +849,9 @@ The actual bound address is logged when the server starts.
 
 For complete API specifications, see the [OpenAPI documentation](docs/openapi.yaml).
 
-**WebSocket:**
+### WebSocket
 
-Connect to `ws://localhost:8080/ws` for real-time state updates. Messages are JSON with the following format:
+Connect to `ws://localhost:<port>/ws` for real-time state updates. Messages are JSON with the following format:
 
 ```json
 {
@@ -817,9 +869,7 @@ Connect to `ws://localhost:8080/ws` for real-time state updates. Messages are JS
 }
 ```
 
-**Dashboard Overview:**
-
-The web dashboard provides a visual overview of orchestration progress:
+### Dashboard Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -854,15 +904,13 @@ The web dashboard provides a visual overview of orchestration progress:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Dashboard Features:**
-
 - **Stats Bar**: Shows total, completed, in-progress, and pending change counts
 - **Change Cards**: Each change displays ID, progress status, and progress bar
 - **Real-time Updates**: Progress updates automatically via WebSocket connection
 - **Connection Status**: Shows current WebSocket connection state (Connected/Disconnected)
 - **Responsive Design**: Works on desktop and mobile browsers
 
-**Web Monitoring Troubleshooting:**
+### Web UI Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
@@ -873,7 +921,9 @@ The web dashboard provides a visual overview of orchestration progress:
 | Cannot access from another device | Use `--web-bind 0.0.0.0` to allow external connections (local network only) |
 | CORS errors in browser console | This is normal for cross-origin requests; the server handles CORS headers |
 
-### Background Service
+## Server Mode Details
+
+### Background Service (`cflx service`)
 
 Use `cflx service` to install and manage `cflx server` as a user-level background service.
 
@@ -909,6 +959,8 @@ Notes:
 - macOS writes a plist under `~/Library/LaunchAgents/com.conflux.cflx-server.plist`.
 - Linux writes a unit file under `~/.config/systemd/user/cflx-server.service`.
 - Configure persistent server settings in your global config file before installing, for example `~/.config/cflx/config.jsonc`.
+
+## Command-line Reference
 
 **Init subcommand options:**
 ```
@@ -993,7 +1045,7 @@ This will build and install the orchestrator to your Cargo bin directory (typica
 | [Contributing Guide](CONTRIBUTING.md) | Local development setup and contributor workflow |
 | [Development Guide](docs/guides/DEVELOPMENT.md) | Build instructions and project structure |
 | [Release Guide](docs/guides/RELEASE.md) | How to create releases |
-| [API Specification](docs/openapi.yaml) | OpenAPI spec for web monitoring |
+| [API Specification](docs/openapi.yaml) | OpenAPI spec for the Web UI and API |
 
 Internal documentation (parallel execution audit) is available in `docs/audit/`.
 
