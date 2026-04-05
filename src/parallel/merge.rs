@@ -427,6 +427,13 @@ impl ParallelExecutor {
                         err
                     );
                 } else {
+                    if let Err(err) = delete_acceptance_state(&workspace.path) {
+                        tracing::warn!(
+                            "Failed to delete acceptance state for '{}' after resolve merge cleanup: {}",
+                            change_id,
+                            err
+                        );
+                    }
                     send_event(
                         &self.event_tx,
                         ParallelEvent::CleanupCompleted {

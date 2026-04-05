@@ -517,6 +517,13 @@ impl ParallelExecutor {
                             workspace_info.workspace_name, e
                         );
                     } else {
+                        if let Err(err) = delete_acceptance_state(&workspace_info.path) {
+                            warn!(
+                                "Failed to delete acceptance state for '{}' after deferred merge cleanup: {}",
+                                change_id,
+                                err
+                            );
+                        }
                         send_event(
                             &self.event_tx,
                             ParallelEvent::CleanupCompleted {
