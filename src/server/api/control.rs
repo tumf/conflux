@@ -425,7 +425,9 @@ pub(super) async fn get_logs(
 pub(super) async fn list_selected_change_ids_in_worktree(
     worktree_path: &std::path::Path,
     change_selections: Option<&std::collections::HashMap<String, bool>>,
-    shared_orchestrator_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    shared_orchestrator_state: &Arc<
+        tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+    >,
 ) -> Vec<String> {
     let changes =
         list_remote_changes_in_worktree(worktree_path, "", "", shared_orchestrator_state).await;

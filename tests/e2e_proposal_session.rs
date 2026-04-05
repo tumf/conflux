@@ -139,6 +139,9 @@ fn make_state_with_transport_env(
         resolve_command: None,
         log_tx,
         orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+        shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
+            conflux::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+        )),
         terminal_manager: create_terminal_manager(),
         active_commands: create_shared_active_commands(),
         proposal_session_manager: create_proposal_session_manager(proposal_config, None),
