@@ -11,3 +11,8 @@
 ## Future Work
 
 - ReanalysisReason をログ専用に整理し、制御フローから分離する
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `src/parallel/tests/executor.rs` の未コミット変更を整理し、acceptance 実行時に `git status --porcelain` が空になる状態にする
+- [x] pre-commit フックを通常 commit 経路で実行できるようにセットアップし、`pre-commit run --all-files` 相当で rustfmt / clippy が通ることを確認する

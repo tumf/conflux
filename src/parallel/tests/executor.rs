@@ -1851,12 +1851,7 @@ fn blocked_analysis_result<'a>(
     let order = changes.iter().map(|change| change.id.clone()).collect();
     let dependencies = changes
         .iter()
-        .map(|change| {
-            (
-                change.id.clone(),
-                vec!["unresolved-dependency".to_string()],
-            )
-        })
+        .map(|change| (change.id.clone(), vec!["unresolved-dependency".to_string()]))
         .collect();
     Box::pin(async move {
         crate::analyzer::AnalysisResult {
@@ -2099,7 +2094,10 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
         .unwrap();
 
     assert!(!should_break);
-    assert_eq!(iteration, 2, "次ループ再評価で dispatch され iteration が進む");
+    assert_eq!(
+        iteration, 2,
+        "次ループ再評価で dispatch され iteration が進む"
+    );
     assert!(queued.is_empty(), "再評価後にキューが消化される");
     assert_eq!(in_flight.len(), 1, "再評価後に change が in-flight になる");
 
