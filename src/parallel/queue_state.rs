@@ -162,10 +162,6 @@ impl ParallelExecutor {
         let mut selected_changes: Vec<String> = Vec::new();
 
         for change_id in &analysis_result.order {
-            if selected_changes.len() >= available_slots {
-                break;
-            }
-
             // Check if change has unresolved dependencies
             if let Some(deps) = analysis_result.dependencies.get(change_id) {
                 let mut unresolved_deps = Vec::new();
@@ -227,7 +223,9 @@ impl ParallelExecutor {
                 .await;
             }
 
-            selected_changes.push(change_id.clone());
+            if selected_changes.len() < available_slots {
+                selected_changes.push(change_id.clone());
+            }
         }
 
         selected_changes
