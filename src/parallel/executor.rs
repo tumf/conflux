@@ -135,12 +135,13 @@ async fn run_post_apply_cleanup_review(
         )));
     }
 
-    let (still_dirty, dirty_status) = has_uncommitted_changes(workspace_path).await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!(
-            "Failed to verify post-cleanup dirty state for change '{}': {}",
-            change_id, e
-        ))
-    })?;
+    let (still_dirty, dirty_status) =
+        has_uncommitted_changes(workspace_path).await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!(
+                "Failed to verify post-cleanup dirty state for change '{}': {}",
+                change_id, e
+            ))
+        })?;
 
     if still_dirty {
         return Err(OrchestratorError::AgentCommand(format!(
@@ -312,12 +313,13 @@ pub async fn execute_apply_in_workspace(
     };
 
     if apply_result.blocked_handoff.is_none() {
-        let (is_dirty, dirty_status) = has_uncommitted_changes(workspace_path).await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!(
-                "Failed to inspect worktree dirty state after apply completion for '{}': {}",
-                change_id, e
-            ))
-        })?;
+        let (is_dirty, dirty_status) =
+            has_uncommitted_changes(workspace_path).await.map_err(|e| {
+                OrchestratorError::AgentCommand(format!(
+                    "Failed to inspect worktree dirty state after apply completion for '{}': {}",
+                    change_id, e
+                ))
+            })?;
 
         if is_dirty {
             warn!(
@@ -1377,11 +1379,11 @@ pub async fn execute_acceptance_in_workspace(
 #[cfg(test)]
 mod tests {
     use super::{format_acceptance_failure_log_message, run_post_apply_cleanup_review};
+    use crate::ai_command_runner::AiCommandRunner;
     use crate::command_queue::CommandQueueConfig;
     use crate::config::defaults::default_retry_patterns;
     use crate::config::OrchestratorConfig;
     use crate::task_parser::TaskProgress;
-    use crate::ai_command_runner::AiCommandRunner;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::process::Command;
@@ -1574,7 +1576,10 @@ mod tests {
         std::fs::write(temp_dir.path().join("dirty.txt"), "dirty\n").unwrap();
 
         let config = OrchestratorConfig {
-            acceptance_command: Some("sh -c 'git add dirty.txt && git commit -m cleanup && echo CLEANUP_REVIEW: CLEAN'".to_string()),
+            acceptance_command: Some(
+                "sh -c 'git add dirty.txt && git commit -m cleanup && echo CLEANUP_REVIEW: CLEAN'"
+                    .to_string(),
+            ),
             ..Default::default()
         };
         let ai_runner = test_ai_runner();
@@ -1583,10 +1588,14 @@ mod tests {
             .await
             .expect("cleanup review should succeed");
 
-        let (is_dirty, status) = crate::vcs::git::commands::has_uncommitted_changes(temp_dir.path())
-            .await
-            .unwrap();
-        assert!(!is_dirty, "worktree must be clean after successful cleanup review: {status}");
+        let (is_dirty, status) =
+            crate::vcs::git::commands::has_uncommitted_changes(temp_dir.path())
+                .await
+                .unwrap();
+        assert!(
+            !is_dirty,
+            "worktree must be clean after successful cleanup review: {status}"
+        );
     }
 
     #[tokio::test]
@@ -1596,7 +1605,9 @@ mod tests {
         std::fs::write(temp_dir.path().join("dirty.txt"), "dirty\n").unwrap();
 
         let config = OrchestratorConfig {
-            acceptance_command: Some("sh -c 'git add dirty.txt && git commit -m cleanup && echo done'".to_string()),
+            acceptance_command: Some(
+                "sh -c 'git add dirty.txt && git commit -m cleanup && echo done'".to_string(),
+            ),
             ..Default::default()
         };
         let ai_runner = test_ai_runner();
