@@ -27,7 +27,10 @@ Create structured change proposals for Conflux (OpenSpec-based) projects through
 - Do not ask the user to choose or confirm the `change-id`; generate a concise unique verb-led slug yourself.
 - If the request is sufficiently clear after context gathering, draft the proposal directly instead of forcing an extra clarification round.
 - For implementation-oriented proposals, make tasks evidence-bearing: each behavior-changing task should name repository-verifiable code, tests, or commands.
+- For behavior-changing proposals, require verification coverage planning per requirement/task so verification ownership is explicit at proposal time.
 - Before choosing `spec-only`, explicitly classify the user's desired artifact as one of: `spec/documentation`, `implementation`, or `both`.
+- Use the standard verification vocabulary for ownership planning: `unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`.
+- Treat `manual` and `benchmark` as intentional coverage (not missing unit tests) when they fit the requirement better.
 - If the user's request is phrased as a concrete product, UI, API, route, form, workflow, or behavior change, default to `implementation` or `hybrid`, not `spec-only`, unless the user explicitly asks for spec-only or documentation-only work.
 - If canonical specs already describe the requested behavior but the codebase still lacks implementation, do NOT create another `spec-only` proposal unless the user explicitly asks to update spec artifacts only.
 - When selecting `spec-only`, explicitly state in the user-facing response that the proposal will NOT implement the feature and will only update tracked specification artifacts.
@@ -243,9 +246,12 @@ Create `openspec/changes/<id>/tasks.md`:
 
 - Break into small, verifiable steps
 - Include verification methods
+- For each behavior-changing requirement/task, record planned verification ownership using one of: `unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`
+- When `manual` or `benchmark` is selected, state why it is intentional coverage and how reviewers will evaluate completion
 - Specify integration/wiring tasks
 - Mark non-AI-executable tasks for Future Work
 - Prefer concrete repository evidence in verification notes (source paths, test files, or runnable commands), not vague statements like "verify implementation works"
+- Make task verification notes traceable as ownership pairs: implementation task + verification path (for example `verification: integration - tests/api/test_auth_flow.rs`)
 
 **External dependency policy (mock-first / verification-first)**:
 
@@ -452,8 +458,11 @@ python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict --evidence error
 - Keep scope focused and minimal
 - Break large changes into multiple proposals
 - Include clear acceptance criteria
+- For behavior-changing proposals, plan verification ownership per requirement/task using `unit` / `integration` / `e2e` / `manual` / `benchmark` / `not-testable`
+- Treat `manual` and `benchmark` as valid intentional coverage when justified by requirement characteristics
 - Specify verification for each task
 - Make implementation-facing tasks hard to mark complete without source/test evidence
+- Ensure tasks guidance keeps ownership traceable by pairing each implementation task with its verification path
 
 ### User Experience
 
