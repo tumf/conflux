@@ -1033,6 +1033,11 @@ impl OrchestratorState {
             ExecutionEvent::ChangeArchived(change_id) => {
                 self.mark_archived(change_id);
                 let mode = self.execution_mode;
+                let has_other_resolving = self.change_runtime.iter().any(|(id, runtime)| {
+                    id != change_id
+                        && matches!(runtime.activity, ActivityState::Resolving)
+                        && !runtime.is_terminal()
+                });
                 let rt = self.runtime_entry(change_id);
                 rt.activity = ActivityState::Idle;
 
@@ -1044,8 +1049,14 @@ impl OrchestratorState {
                         rt.queue_intent = QueueIntent::NotQueued;
                     }
                     ExecutionMode::Parallel => {
-                        // Parallel: archive triggers merge wait, not terminal yet.
-                        rt.wait_state = WaitState::MergeWait;
+                        // Parallel: archived changes defer to active resolve in the same reducer scope.
+                        // If another change is resolving, keep this row in ResolveWait so it can
+                        // continue automatically after the active resolve completes.
+                        rt.wait_state = if has_other_resolving {
+                            WaitState::ResolveWait
+                        } else {
+                            WaitState::MergeWait
+                        };
                     }
                 }
             }
@@ -2178,7 +2189,7 @@ mod tests {
         assert_eq!(
             state.display_status("c"),
             "merge wait",
-            "Parallel: ChangeArchived must transition to merge wait, not terminal archived"
+            "Parallel: ChangeArchived must transition to merge wait when no resolving change exists"
         );
         assert!(
             !state.is_terminal_change("c"),
@@ -2196,6 +2207,31 @@ mod tests {
             "Parallel: MergeCompleted must transition to merged terminal"
         );
         assert!(state.is_terminal_change("c"));
+    }
+
+    #[test]
+    fn test_parallel_mode_change_archived_uses_resolve_pending_when_other_change_is_resolving() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["resolving".to_string(), "archived".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "resolving".to_string(),
+            command: "resolve resolving".to_string(),
+        });
+        assert_eq!(state.display_status("resolving"), "resolving");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
+        assert_eq!(
+            state.display_status("archived"),
+            "resolve pending",
+            "Parallel: ChangeArchived must transition to resolve pending while another change is resolving"
+        );
+        assert!(!state.is_terminal_change("archived"));
     }
 
     #[test]
