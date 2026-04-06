@@ -39,7 +39,7 @@ use super::ParallelExecutor;
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_resume_action, should_run_apply, ResumeAction};
+    use super::{decide_resume_action, resume_cycle_flags, should_run_apply, ResumeAction};
     use crate::execution::state::WorkspaceState;
     use std::fs;
     use std::process::Command;
@@ -122,6 +122,31 @@ mod tests {
     }
 
     #[test]
+    fn decide_resume_action_routes_applied_to_acceptance_with_failed_durable_state() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_dir = tmp.path().join("openspec/changes/change-failed");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+
+        let revision = super::resolve_current_revision_sync(tmp.path()).unwrap();
+        crate::parallel::acceptance_state::mark_acceptance_failed(tmp.path(), &revision, None)
+            .unwrap();
+
+        let action = decide_resume_action("change-failed", tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Acceptance);
+    }
+
+    #[test]
     fn decide_resume_action_routes_applied_to_apply_when_implementation_tasks_incomplete() {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
@@ -178,6 +203,22 @@ mod tests {
         assert!(!should_run_apply(&mut skip_apply_once));
         assert!(!skip_apply_once);
         assert!(should_run_apply(&mut skip_apply_once));
+    }
+
+    #[test]
+    fn resume_cycle_flags_for_acceptance_resume_skip_only_apply_once() {
+        let (skip_apply_once, skip_acceptance_once) = resume_cycle_flags(ResumeAction::Acceptance);
+
+        assert!(skip_apply_once);
+        assert!(!skip_acceptance_once);
+    }
+
+    #[test]
+    fn resume_cycle_flags_for_archive_resume_skip_apply_and_acceptance_once() {
+        let (skip_apply_once, skip_acceptance_once) = resume_cycle_flags(ResumeAction::Archive);
+
+        assert!(skip_apply_once);
+        assert!(skip_acceptance_once);
     }
 }
 
@@ -357,6 +398,16 @@ fn should_run_apply(skip_apply_once: &mut bool) -> bool {
     } else {
         true
     }
+}
+
+fn resume_cycle_flags(resume_action: ResumeAction) -> (bool, bool) {
+    (
+        matches!(
+            resume_action,
+            ResumeAction::Acceptance | ResumeAction::Archive
+        ),
+        matches!(resume_action, ResumeAction::Archive),
+    )
 }
 
 impl ParallelExecutor {
@@ -798,25 +849,43 @@ impl ParallelExecutor {
                     }
                 }
             }
-            let mut skip_apply_once = matches!(resume_action, ResumeAction::Acceptance | ResumeAction::Archive);
-            let mut skip_acceptance_once = matches!(resume_action, ResumeAction::Archive);
+            let (mut skip_apply_once, mut skip_acceptance_once) =
+                resume_cycle_flags(resume_action);
 
             let _apply_revision = loop {
                 // Skip apply only for the first cycle when resuming from an already-applied state.
-                if !should_run_apply(&mut skip_apply_once) {
+                // Even when apply is skipped, this cycle must still execute acceptance unless
+                // resume_action explicitly allows archive continuation.
+                let (revision, final_iteration, blocked_handoff) = if !should_run_apply(&mut skip_apply_once) {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::info(format!(
-                                    "Skipping apply for {} (workspace already in {:?} state)",
+                                    "Skipping apply for {} (workspace already in {:?} state); continuing with acceptance/archive routing",
                                     change_id, effective_state
                                 ))
                                 .with_change_id(&change_id),
                             ))
                             .await;
                     }
-                    break String::new();
-                }
+
+                    match crate::vcs::git::commands::get_current_commit(&workspace.path).await {
+                        Ok(revision) => (revision, cumulative_iteration, None),
+                        Err(e) => {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Failed to resolve current revision while resuming without apply: {}",
+                                    e
+                                )),
+                                rejected: None,
+                            };
+                        }
+                    }
+                } else {
 
                 // Check if this change has been stopped (single-change stop)
                 if let Some(ref queue) = dynamic_queue {
@@ -890,7 +959,7 @@ impl ParallelExecutor {
                 )
                 .await;
 
-                let (revision, final_iteration, blocked_handoff) = match apply_result {
+                match apply_result {
                     Ok((rev, iter, blocked_handoff)) => (rev, iter, blocked_handoff),
                     Err(e) => {
                         // Check if this was a single-change stop
@@ -934,6 +1003,7 @@ impl ParallelExecutor {
                             rejected: None,
                         };
                     }
+                }
                 };
 
                 // Update cumulative iteration count

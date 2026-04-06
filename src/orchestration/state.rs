@@ -2702,6 +2702,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_dependency_blocked_and_resolved_preserve_queue_intent_until_user_dequeue() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+
+        state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "c".to_string(),
+            dependency_ids: vec!["dep-a".to_string()],
+        });
+        assert_eq!(state.display_status("c"), "blocked");
+
+        state.apply_execution_event(&ExecutionEvent::DependencyResolved {
+            change_id: "c".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "queued");
+
+        state.apply_command(ReducerCommand::RemoveFromQueue("c".to_string()));
+        assert_eq!(
+            state.display_status("c"),
+            "not queued",
+            "queue intent should only clear on explicit dequeue command"
+        );
+    }
+
     /// ChangesRefreshed must not overwrite queue_intent = Queued with "not queued".
     #[test]
     fn test_changes_refreshed_preserves_queue_intent() {

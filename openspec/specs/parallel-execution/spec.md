@@ -1985,3 +1985,70 @@ parallel mode で Conflux-managed isolated worktree 上の apply がタスク完
 - **THEN** change は acceptance や archive に進まない
 - **AND** current run では apply 側の失敗として停止する
 - **AND** workspace は follow-up 用に保持される
+
+
+### Requirement: キュー変更デバウンスとスロット駆動の再分析
+
+並列実行中、システムはキュー変更（追加・削除）を実行中でも監視し、変更から10秒経過した後に再分析を行い、実行スロットが空いたタイミングで依存関係を考慮して次の変更を選定しなければならない（SHALL）。
+
+加えて、システムは再分析時に実行スロットの空き数を算出し、依存関係分析の `order`（依存関係を満たした上での推奨実行順序）に従って空き数分の change を同時に起動しなければならない（SHALL）。
+
+依存関係は実行制約として扱い、`order` の上位にあっても依存先が base に Git マージされた状態（依存先の成果物を使って実行できる状態）になるまで開始してはならない（MUST）。
+
+依存制約が解決した change は、依存解決後の実行開始時点で worktree を新規作成し、既存の worktree がある場合も作り直さなければならない（MUST）。この挙動は依存 change に固有であり、resume が常に成立することを保証しない前提の例外とする。
+
+#### Scenario: 空きスロット数に応じて同時起動する
+- **GIVEN** `max_concurrent_workspaces` が 3 に設定されている
+- **AND** 依存関係が解決済みの change が 3 件以上ある
+- **WHEN** 再分析が実行される
+- **THEN** システムは空きスロット数に応じて最大 3 件まで同時に起動する
+- **AND** 依存関係が未解決の change は起動しない
+
+#### Scenario: 後続 change でも dependency block が反映される
+- **GIVEN** analyzer が `change-b` は `change-a` に依存すると返している
+- **AND** `change-a` は base branch に未 merge である
+- **AND** 現在の再分析で他の ready change が先に空きスロットを消費する
+- **WHEN** scheduler が dispatch 対象と blocked state を更新する
+- **THEN** `change-b` は起動されない
+- **AND** `change-b` は dependency blocked として扱われる
+- **AND** blocked 判定は available slot が残っているかどうかに依存しない
+
+
+### Requirement: Parallel execution acceptance loop
+
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+
+When resuming a workspace that has not completed archive, the orchestrator SHALL route `Applied` or `Archiving` workspaces without a durable acceptance `passed` state for the current revision back to acceptance before archive. A resume cycle that selects `ResumeAction::Acceptance` MUST NOT hand off to archive unless acceptance for the current revision has returned `Pass` or an equivalent durable acceptance-pass record has been confirmed during that cycle.
+
+A durable acceptance state of `failed`, `running`, `pending`, or missing for the current revision MUST be treated as not archive-ready. Archive guardrails MAY reject such a workspace as a final defense, but dispatch control flow MUST prevent archive entry before that guard is reached.
+
+#### Scenario: Applied workspace with failed durable state reruns acceptance before archive
+
+- **GIVEN** a resumed parallel workspace is detected as `Applied`
+- **AND** the current revision has a durable acceptance state of `failed`
+- **WHEN** resume routing is evaluated
+- **THEN** the workspace is routed to acceptance
+- **AND** archive is not started for that cycle
+
+#### Scenario: Applied workspace with missing durable pass does not hand off to archive
+
+- **GIVEN** a resumed parallel workspace is detected as `Applied`
+- **AND** no durable acceptance `passed` state exists for the current revision
+- **WHEN** the orchestrator resumes execution
+- **THEN** acceptance is executed for that revision
+- **AND** archive is not entered until acceptance returns `Pass`
+
+#### Scenario: Applied workspace with durable pass can continue archive
+
+- **GIVEN** a resumed parallel workspace is detected as `Applied`
+- **AND** a durable acceptance `passed` state exists for the current revision
+- **WHEN** resume routing is evaluated
+- **THEN** the workspace may continue to archive
+- **AND** acceptance may be skipped for that cycle
+
+#### Scenario: Resume log and executed phase stay consistent
+
+- **GIVEN** the orchestrator logs `state=Applied -> Acceptance` for a resumed workspace
+- **WHEN** that resume cycle begins execution
+- **THEN** acceptance execution is started in the same cycle
+- **AND** archive is not attempted before acceptance completion

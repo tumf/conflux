@@ -49,4 +49,10 @@ describe('ChangeRow', () => {
 
     expect(screen.queryByRole('button', { name: 'Stop and dequeue change-a' })).toBeNull();
   });
+
+  it('does not show stop-and-dequeue button for rejected change', () => {
+    render(<ChangeRow change={makeChange('rejected')} />);
+
+    expect(screen.queryByRole('button', { name: 'Stop and dequeue change-a' })).toBeNull();
+  });
 });

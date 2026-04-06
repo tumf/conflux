@@ -1862,6 +1862,103 @@ fn blocked_analysis_result<'a>(
     })
 }
 
+fn selective_dependency_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    let dependencies = changes
+        .iter()
+        .map(|change| {
+            if change.id == "change-b" {
+                (change.id.clone(), vec!["unresolved-dependency".to_string()])
+            } else {
+                (change.id.clone(), Vec::new())
+            }
+        })
+        .collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies,
+            groups: None,
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
+    use crate::events::ExecutionEvent;
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().unwrap();
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("change-a"), make_test_change("change-b")];
+    let mut in_flight = HashSet::new();
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            1,
+            ReanalysisReason::QueueNotification,
+            &selective_dependency_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .unwrap();
+
+    assert!(!should_break);
+    assert_eq!(iteration, 2);
+    assert_eq!(in_flight.len(), 1, "ready change should consume the slot");
+
+    let mut saw_blocked_event = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::DependencyBlocked {
+            change_id,
+            dependency_ids,
+        } = event
+        {
+            if change_id == "change-b" {
+                assert_eq!(dependency_ids, vec!["unresolved-dependency".to_string()]);
+                saw_blocked_event = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_blocked_event,
+        "dependency-blocked event must be emitted even if available slots are already consumed"
+    );
+
+    while join_set.join_next().await.is_some() {}
+}
+
 #[tokio::test]
 async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() {
     use crate::parallel::dynamic_queue::ReanalysisReason;
