@@ -8,4 +8,3 @@
 ## Future Work
 
 - Revisit whether cleanup-review outcomes should later get a dedicated user-visible status if operators need finer-grained observability.
-
