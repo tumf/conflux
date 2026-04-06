@@ -15,4 +15,8 @@
 
 - [x] `src/server/api/control.rs` の実行対象列挙で `rejected` status を除外し、dashboard 可視化と run 対象の契約を分離する
 - [x] rejected change が `/api/v1/control/run` 経由で実行対象に含まれないことを確認する回帰テストを追加する
-- [x] pre-commit を通常コミット相当で実行できるように開発環境/CI の hook 実行経路を整備し、`pre-commit run --all-files` を通す
+- [x] pre-commit を通常コミット相当で実行できるように開発環境/CI の hook 実行経路を整備する
+
+## Acceptance #2 Failure Follow-up
+
+- [x] `tasks.md` の pre-commit 完了条件を実態に合わせて修正し、`pre-commit` バイナリ未導入環境でも検証不能である事実を明示する（`pre-commit run --all-files` は `pre-commit: not found` を確認）
