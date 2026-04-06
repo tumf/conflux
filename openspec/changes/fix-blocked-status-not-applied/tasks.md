@@ -10,3 +10,8 @@
 
 - 回帰原因となった commit / refactor の事後分析とポストモーテム
 - dependency block event の observability 強化（ログや debug counters の追加）
+
+## Acceptance #1 Failure Follow-up
+
+- [x] pre-commit 実行環境を整備し、通常 commit と同等の hook 実行 (`pre-commit run --all-files`) が成功することを確認する（`pre-commit` 未導入を確認し、`prek run --all-files` で hook 一式が pass）
+- [x] archive 前チェック手順に pre-commit 未導入時のセットアップ手順または代替検証方法を明記する（`docs/guides/DEVELOPMENT.md` の Pre-commit checks セクションへ追記）

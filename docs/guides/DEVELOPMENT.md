@@ -208,6 +208,9 @@ cargo clippy
 cargo fmt --check && cargo clippy -- -D warnings && cargo test
 ```
 
+Archive 前チェックでは、通常 commit 時の hook と同等の検証として `prek run --all-files` を実行する。
+`pre-commit` コマンドが未導入の場合は `prek` を標準手段とし、以下のセットアップ後に同じコマンドを実行する。
+
 Install the Git hook using prek:
 
 **Migration from pre-commit:**
