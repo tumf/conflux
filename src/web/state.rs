@@ -1787,4 +1787,62 @@ mod tests {
         assert_eq!(notqueued.queue_status, None);
         assert_eq!(archived.queue_status, Some("archived".to_string()));
     }
+
+    #[tokio::test]
+    async fn test_dependency_blocked_and_resolved_converges_to_reducer_queue_status() {
+        use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let changes = vec![create_test_change("change-b", 0, 3)];
+        let web_state = WebState::new(&changes);
+
+        let mut shared = OrchestratorState::new(vec!["change-b".to_string()], 0);
+        shared.apply_command(ReducerCommand::AddToQueue("change-b".to_string()));
+
+        let shared = Arc::new(RwLock::new(shared));
+        web_state.set_shared_state(shared.clone()).await;
+
+        {
+            let mut guard = shared.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::DependencyBlocked {
+                change_id: "change-b".to_string(),
+                dependency_ids: vec!["change-a".to_string()],
+            });
+        }
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::DependencyBlocked {
+                change_id: "change-b".to_string(),
+                dependency_ids: vec!["change-a".to_string()],
+            })
+            .await;
+
+        let blocked_state = web_state.get_state().await;
+        assert_eq!(
+            blocked_state.changes[0].queue_status,
+            Some("blocked".to_string()),
+            "web state should converge to reducer-derived blocked status"
+        );
+
+        {
+            let mut guard = shared.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::DependencyResolved {
+                change_id: "change-b".to_string(),
+            });
+        }
+
+        web_state
+            .apply_execution_event(&ExecutionEvent::DependencyResolved {
+                change_id: "change-b".to_string(),
+            })
+            .await;
+
+        let resolved_state = web_state.get_state().await;
+        assert_eq!(
+            resolved_state.changes[0].queue_status,
+            Some("queued".to_string()),
+            "web state should converge back to queued after dependency resolved"
+        );
+    }
 }
