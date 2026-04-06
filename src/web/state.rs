@@ -1787,4 +1787,58 @@ mod tests {
         assert_eq!(notqueued.queue_status, None);
         assert_eq!(archived.queue_status, Some("archived".to_string()));
     }
+
+    #[tokio::test]
+    async fn test_changes_refreshed_reactivated_change_clears_rejected_queue_status() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::OrchestratorState;
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let web_state = WebState::new(&changes);
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        {
+            let mut guard = shared.write().await;
+            guard.apply_execution_event(&ExecutionEvent::ChangeRejected {
+                change_id: "change-a".to_string(),
+                reason: "blocked".to_string(),
+            });
+            assert_eq!(guard.display_status("change-a"), "rejected");
+
+            // Reactivation by refresh with the change present in active list.
+            guard.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![create_test_change("change-a", 0, 1)],
+                committed_change_ids: std::collections::HashSet::new(),
+                uncommitted_file_change_ids: std::collections::HashSet::new(),
+                worktree_change_ids: std::collections::HashSet::new(),
+                worktree_paths: std::collections::HashMap::new(),
+                worktree_not_ahead_ids: std::collections::HashSet::new(),
+                merge_wait_ids: std::collections::HashSet::new(),
+            });
+            assert_eq!(guard.display_status("change-a"), "not queued");
+        }
+
+        web_state.set_shared_state(shared.clone()).await;
+        web_state
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![create_test_change("change-a", 0, 1)],
+                committed_change_ids: std::collections::HashSet::new(),
+                uncommitted_file_change_ids: std::collections::HashSet::new(),
+                worktree_change_ids: std::collections::HashSet::new(),
+                worktree_paths: std::collections::HashMap::new(),
+                worktree_not_ahead_ids: std::collections::HashSet::new(),
+                merge_wait_ids: std::collections::HashSet::new(),
+            })
+            .await;
+
+        let state = web_state.get_state().await;
+        assert_eq!(
+            state.changes[0].queue_status, None,
+            "reactivated change should not keep rejected queue_status"
+        );
+    }
 }

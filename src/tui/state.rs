@@ -3067,6 +3067,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_display_statuses_rejected_to_not_queued_reactivation() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        // Start from rejected in TUI cache.
+        app.changes[0].display_status_cache = "rejected".to_string();
+
+        // After reactivation reducer returns not queued.
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("change-a".to_string(), "not queued");
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(
+            app.changes[0].display_status_cache, "not queued",
+            "reactivated change must transition from rejected to not queued"
+        );
+    }
+
     /// Regression: reducer-driven display must not affect a Merged change via merge_wait.
     #[test]
     fn test_auto_clear_merge_wait_does_not_affect_merged() {

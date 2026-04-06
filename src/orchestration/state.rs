@@ -1189,6 +1189,19 @@ impl OrchestratorState {
                 for id in new_ids {
                     self.add_dynamic_change(id);
                 }
+
+                // If a previously rejected change reappears in the active listing,
+                // treat it as reactivated and reset runtime state to defaults.
+                for change in changes {
+                    let rt = self.runtime_entry(&change.id);
+                    if matches!(rt.terminal, TerminalState::Rejected(_)) {
+                        rt.terminal = TerminalState::None;
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::None;
+                        rt.queue_intent = QueueIntent::NotQueued;
+                    }
+                }
+
                 // Apply workspace observations via the reconcile path.
                 let mw: Vec<String> = merge_wait_ids.iter().cloned().collect();
                 let nah: Vec<String> = worktree_not_ahead_ids.iter().cloned().collect();
@@ -1588,10 +1601,38 @@ mod tests {
         assert!(matches!(outcome6, ReduceOutcome::Changed(_)));
         assert_eq!(state.display_status("c"), "not queued");
 
-        // Rejected is a permanent terminal state and cannot be re-queued.
+        // Rejected cannot be re-queued until a refresh reactivates the change.
         state.runtime_entry("c").terminal = TerminalState::Rejected("blocked".to_string());
         let outcome7 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(matches!(outcome7, ReduceOutcome::NoOp));
+
+        // Reactivation path: when the change reappears in active listing after
+        // REJECTED.md removal, ChangesRefreshed clears rejected terminal state.
+        use crate::events::ExecutionEvent;
+        use crate::openspec::{Change, ProposalMetadata};
+        use std::collections::{HashMap, HashSet};
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![Change {
+                id: "c".to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
+            }],
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+        assert_eq!(state.display_status("c"), "not queued");
+
+        // AddToQueue must be accepted again after reactivation.
+        let outcome8 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(outcome8, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "queued");
     }
 
     // -----------------------------------------------------------------------
@@ -1735,6 +1776,46 @@ mod tests {
 
         // The reducer should have set MergeWait via apply_observation.
         assert_eq!(state.display_status("c"), "merge wait");
+    }
+
+    #[test]
+    fn test_changes_refreshed_reactivates_rejected_change() {
+        use crate::events::ExecutionEvent;
+        use crate::openspec::{Change, ProposalMetadata};
+        use std::collections::{HashMap, HashSet};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Previously rejected and with stale non-default runtime fields.
+        let rt = state.runtime_entry("c");
+        rt.terminal = TerminalState::Rejected("blocked".to_string());
+        rt.activity = ActivityState::Rejecting;
+        rt.wait_state = WaitState::MergeWait;
+        rt.queue_intent = QueueIntent::Queued;
+
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![Change {
+                id: "c".to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+                metadata: ProposalMetadata::default(),
+            }],
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+
+        let rt = state.change_runtime("c").expect("runtime for c");
+        assert!(matches!(rt.terminal, TerminalState::None));
+        assert!(matches!(rt.activity, ActivityState::Idle));
+        assert!(matches!(rt.wait_state, WaitState::None));
+        assert!(matches!(rt.queue_intent, QueueIntent::NotQueued));
+        assert_eq!(state.display_status("c"), "not queued");
     }
 
     // -----------------------------------------------------------------------
