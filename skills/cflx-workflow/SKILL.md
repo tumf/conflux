@@ -87,6 +87,37 @@ Before changing any task to `[x]`, verify all applicable conditions below are tr
 5. Tasks claiming unit-test coverage are complete only when tests are genuinely unit-scoped and do not rely on real stateful external boundaries.
 6. If added tests require real stateful external boundaries, classify them as integration/e2e evidence; do not use them as unit-test completion evidence.
 7. Unit-test completion is invalid when the only evidence is integration-style tests that exercise real git/process/filesystem/network/database/timer flows.
+8. The planned verification path from proposal/tasks (for example: `unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`) is identified before completion is claimed.
+9. The evidence type is consistent with the planned verification type; mismatches MUST be recorded as follow-up work instead of being marked complete.
+
+### Planned Verification Alignment (Apply)
+
+Apply MUST connect proposal planning and implementation truthfulness:
+
+- Read planned verification ownership from proposal/task context before closing each implementation task.
+- Treat `manual`, `benchmark`, and `not-testable` as intentional verification paths when explicitly planned.
+- Do not block completion only because unit/integration tests are absent if the planned path is intentionally non-test automation.
+- If verification ownership is missing or ambiguous for behavior-changing work, do not silently assume unit tests; add follow-up tasks to clarify planning/enforcement alignment.
+- If planned type and evidence type diverge (for example, planned `unit` but only integration-style evidence exists), keep the task open or add explicit mismatch follow-up before completion.
+- Record the mismatch with concrete evidence so acceptance can enforce the same verification model.
+
+Evidence type guide used by apply:
+- Unit evidence: isolated logic tests with mocks/fakes/in-memory doubles only.
+- Integration evidence: tests touching real filesystem/process/VCS/network/database/timer or other stateful boundaries.
+- Manual evidence: explicit operator/tester procedure and result ownership.
+- Benchmark evidence: reproducible performance measurement artifact (command, metric, threshold, result).
+- Not-testable evidence: explicit rationale for why automated verification is not feasible plus ownership of ongoing manual/runtime checks.
+
+If verification mismatch is discovered during apply, append unchecked follow-up tasks similar to:
+
+```markdown
+## Verification Mismatch Follow-up
+- [ ] Extract unit-testable decision logic and add unit-scoped tests for <component>
+- [ ] Reclassify coverage as integration/e2e/manual/benchmark when unit ownership is not valid
+- [ ] Update proposal/task verification ownership to match actual enforceable evidence
+```
+
+Do not mark the parent implementation task complete until mismatch follow-up is represented truthfully in `tasks.md`.
 
 Never mark a task complete based only on any of the following:
 
@@ -333,6 +364,32 @@ Recommended:
   - <specific follow-up action 2>
 ```
 
+### Verification Planning & Ownership (Accept)
+
+Acceptance MUST enforce the verification ownership planned by proposal/task guidance:
+
+- Determine planned verification type per requirement/task (`unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`).
+- Distinguish missing coverage from intentional coverage:
+  - `manual` is intentional when explicit ownership/procedure is documented.
+  - `benchmark` is intentional when expected performance evidence ownership is documented.
+  - `not-testable` is intentional only when rationale and operational ownership are explicit.
+- Do not fail solely because unit/integration tests are absent when planned verification is `manual`, `benchmark`, or `not-testable` and ownership is explicit.
+- Fail when planned verification is missing or ambiguous for behavior-changing work; findings must call out planning/enforcement misalignment.
+- For planned `unit`, integration-style evidence is a mismatch, not valid unit completion.
+
+### Unit vs Integration Mismatch Handling (Accept)
+
+When a task claims unit verification ownership but evidence is integration-style:
+
+1. Report a checklist truthfulness finding with concrete boundary evidence.
+2. Require follow-up to either:
+   - extract pure decision logic and add true unit tests, or
+   - reclassify ownership/evidence as integration/e2e/manual/benchmark and update checklist claims.
+3. Do not count integration-style evidence as unit-test completion.
+
+Example finding style:
+- `[path:line] Planned verification=unit, evidence=integration (touches real filesystem/process). Add unit-scoped tests or reclassify ownership.`
+
 ### Accept Rules
 
 - Each finding must include concrete evidence (file path, function, line)
@@ -342,6 +399,7 @@ Recommended:
 - `ACCEPTANCE: BLOCKED` is allowed only when a valid `Implementation Blocker #<n>` exists with concrete evidence and unblock actions
 - For apply-blocked handoff, `openspec/changes/<change-id>/REJECTED.md` is a **proposal artifact**; acceptance must explicitly confirm before runtime executes rejection flow
 - If blocker data is weak, speculative, or fixable within repo scope, return FAIL instead of BLOCKED
+- For behavior-changing work, missing/ambiguous verification planning is FAIL (not CONTINUE) because proposal planning and workflow enforcement must align
 
 **For detailed guidance**, read [references/cflx-accept.md](references/cflx-accept.md).
 
