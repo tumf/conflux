@@ -26,7 +26,7 @@ parallel mode では apply が分離された git worktree で実行されるた
 
 parallel mode の apply ループがタスク完了で終了したあと、`Apply:` 最終コミット作成前に post-apply cleanup review を追加する。
 
-cleanup review は通常の apply 再実行ではなく、`cflx-workflow` skill に追加される専用 operation として agent command を起動する。cleanup review は dirty worktree を確認し、acceptance handoff のために安全に整理できる差分のみを扱う。無差別 `git add -A` は行わず、判断不能・危険・スコープ外の差分が残る場合は acceptance に進めない。
+cleanup review は通常の apply 再実行ではなく、`cflx-workflow` skill に追加される専用 operation として agent command を起動する。cleanup review は dirty worktree を確認し、worktree を clean な状態にする責務を持つ。無差別 `git add -A` は行わず、差分の安全性を確認したうえで整理する。cleanup review は自律完遂が前提であり、orchestrator に判断を返す逃げ道は用意しない。
 
 外部の coarse-grained 状態遷移は増やさず、cleanup review は apply の内部サブステップとして扱う。成功時のみ clean handoff-ready な `Apply:` 完了状態を確定し、失敗時は apply 側の失敗として現在の run で先に進めない。
 
@@ -36,7 +36,7 @@ cleanup review は通常の apply 再実行ではなく、`cflx-workflow` skill 
 - cleanup review は `cflx-workflow` の専用 operation としてプロンプト構築・起動・verdict 解析ができる。
 - cleanup review は無差別 `git add -A` を前提にせず、安全に handoff 可能な差分だけを整理対象とする。
 - cleanup review が成功した場合のみ `Apply:` 完了状態が確定し、その後 acceptance に進む。
-- cleanup review が blocked/fail の場合、change は acceptance や archive に進まず apply 側の失敗として停止する。
+- cleanup review が `CLEANUP_REVIEW: CLEAN` を出さずに終了した場合（command failure）、change は acceptance や archive に進まず apply 側の失敗として停止する。
 - acceptance は dirty worktree を検出したときの安全網を維持するが、managed worktree apply が残した dirty を主に後段で拾う構造を減らす。
 
 ## Out of Scope

@@ -50,20 +50,18 @@ cleanup review agent は以下のみを行う:
 - dirty file set を確認する
 - acceptance handoff に含めてよい差分と、除外/巻き戻しすべき差分を区別する
 - blind `git add -A` を行わない
-- 判断不能・危険・秘密情報・一時生成物・スコープ外差分が残る場合は blocked を返す
-- 成功時のみ clean handoff-ready 状態を作る
+- worktree を clean handoff-ready 状態にするまで整理する
+- clean 化できたときだけ成功を返す
 
 ### 4. verdict contract
 
 cleanup review は machine-readable final marker を 1 つだけ返す。
 
-候補:
-- `CLEANUP_REVIEW: CLEAN`
-- `CLEANUP_REVIEW: BLOCKED`
+verdict は `CLEANUP_REVIEW: CLEAN` の一択。
 
-意味:
 - `CLEAN`: worktree は acceptance handoff 可能
-- `BLOCKED`: safe cleanup を完了できず、acceptance に進めない
+
+cleanup review は自律完遂が前提であり、orchestrator に判断を返す逃げ道（BLOCKED 等）は用意しない。clean にできなかった場合は verdict を出さず、command failure として orchestrator に処理される。
 
 ### 5. apply completion gating
 
@@ -77,7 +75,7 @@ managed worktree apply では、durable apply-complete / acceptance-pending 相�
 
 ### 6. failure behavior
 
-cleanup review が blocked の場合:
+cleanup review が `CLEANUP_REVIEW: CLEAN` を出さずに終了した場合（command failure）:
 - acceptance は開始しない
 - archive にも進まない
 - current run では apply 側失敗として扱う

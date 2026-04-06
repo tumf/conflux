@@ -22,11 +22,11 @@ parallel mode で Conflux-managed isolated worktree 上の apply がタスク完
 - **THEN** cleanup review は不要である
 - **AND** orchestrator は従来どおり apply 完了を確定して acceptance に進む
 
-#### Scenario: Blocked cleanup review prevents acceptance handoff
+#### Scenario: Cleanup review command failure prevents acceptance handoff
 
 - **GIVEN** parallel mode の managed worktree apply が task-complete だが dirty である
-- **AND** cleanup review operation が safe handoff を成立させられない
-- **WHEN** orchestrator が cleanup review verdict を処理する
+- **AND** cleanup review operation が worktree を clean にできず `CLEANUP_REVIEW: CLEAN` を出さずに終了する
+- **WHEN** orchestrator が cleanup review command result を処理する
 - **THEN** change は acceptance や archive に進まない
 - **AND** current run では apply 側の失敗として停止する
 - **AND** workspace は follow-up 用に保持される
