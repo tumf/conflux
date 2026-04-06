@@ -20,3 +20,7 @@
 ## Acceptance #2 Failure Follow-up
 
 - [x] `tasks.md` の pre-commit 完了条件を実態に合わせて修正し、`pre-commit` バイナリ未導入環境でも検証不能である事実を明示する（`pre-commit run --all-files` は `pre-commit: not found` を確認）
+
+## Acceptance #3 Failure Follow-up
+
+- [x] archive readiness の hook gate を満たすため、開発環境/CI で `pre-commit run --all-files` が直接成功するように `pre-commit` バイナリの実行経路を整備する
