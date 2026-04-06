@@ -16,6 +16,7 @@ use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
 use crate::stall::StallDetector;
 use crate::vcs::git::commands as git_commands;
+use crate::vcs::git::commands::has_uncommitted_changes;
 use crate::vcs::git::GitWorkspaceManager;
 use crate::vcs::VcsBackend;
 use std::path::Path;
@@ -69,6 +70,92 @@ fn build_parallel_hook_context(
     }
 
     ctx
+}
+
+async fn run_post_apply_cleanup_review(
+    change_id: &str,
+    workspace_path: &Path,
+    config: &OrchestratorConfig,
+    ai_runner: &AiCommandRunner,
+) -> Result<()> {
+    let user_template = config.get_acceptance_command()?;
+    let prompt = crate::agent::build_cleanup_review_prompt(change_id);
+    let command = OrchestratorConfig::expand_prompt(
+        &OrchestratorConfig::expand_change_id(user_template, change_id),
+        &prompt,
+    );
+
+    info!(
+        change_id = %change_id,
+        workspace = %workspace_path.display(),
+        "Starting post-apply cleanup review for dirty managed worktree"
+    );
+
+    let (mut child, mut output_rx) = ai_runner
+        .execute_streaming_with_retry(
+            &command,
+            Some(workspace_path),
+            Some("cleanup-review"),
+            Some(change_id),
+        )
+        .await?;
+
+    let mut stdout = String::new();
+    while let Some(line) = output_rx.recv().await {
+        match line {
+            crate::ai_command_runner::OutputLine::Stdout(s) => {
+                stdout.push_str(&s);
+                stdout.push('\n');
+            }
+            crate::ai_command_runner::OutputLine::Stderr(_) => {}
+        }
+    }
+
+    let status = child.wait().await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to wait for cleanup-review command for change '{}' in workspace '{}': {}",
+            change_id,
+            workspace_path.display(),
+            e
+        ))
+    })?;
+
+    if !status.success() {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cleanup-review command failed with exit code {:?} for change '{}'",
+            status.code(),
+            change_id
+        )));
+    }
+
+    if !crate::agent::parse_cleanup_review_output(&stdout) {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cleanup-review output missing required single marker CLEANUP_REVIEW: CLEAN for change '{}'",
+            change_id
+        )));
+    }
+
+    let (still_dirty, dirty_status) = has_uncommitted_changes(workspace_path).await.map_err(|e| {
+        OrchestratorError::AgentCommand(format!(
+            "Failed to verify post-cleanup dirty state for change '{}': {}",
+            change_id, e
+        ))
+    })?;
+
+    if still_dirty {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cleanup-review reported clean marker but worktree remains dirty for change '{}': {}",
+            change_id, dirty_status
+        )));
+    }
+
+    info!(
+        change_id = %change_id,
+        workspace = %workspace_path.display(),
+        "Post-apply cleanup review succeeded and worktree is clean"
+    );
+
+    Ok(())
 }
 
 /// Execute apply command in a single workspace, repeating until tasks are 100% complete.
@@ -223,6 +310,25 @@ pub async fn execute_apply_in_workspace(
         }
         Err(e) => return Err(e),
     };
+
+    if apply_result.blocked_handoff.is_none() {
+        let (is_dirty, dirty_status) = has_uncommitted_changes(workspace_path).await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!(
+                "Failed to inspect worktree dirty state after apply completion for '{}': {}",
+                change_id, e
+            ))
+        })?;
+
+        if is_dirty {
+            warn!(
+                change_id = %change_id,
+                workspace = %workspace_path.display(),
+                dirty_status = %dirty_status,
+                "Managed worktree is dirty after apply completion; running post-apply cleanup review before acceptance handoff"
+            );
+            run_post_apply_cleanup_review(change_id, workspace_path, config, ai_runner).await?;
+        }
+    }
 
     mark_apply_completed(workspace_path, &apply_result.revision, change_id)?;
     info!(
@@ -1270,8 +1376,16 @@ pub async fn execute_acceptance_in_workspace(
 
 #[cfg(test)]
 mod tests {
-    use super::format_acceptance_failure_log_message;
+    use super::{format_acceptance_failure_log_message, run_post_apply_cleanup_review};
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::default_retry_patterns;
+    use crate::config::OrchestratorConfig;
     use crate::task_parser::TaskProgress;
+    use crate::ai_command_runner::AiCommandRunner;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::process::Command;
+    use tokio::sync::Mutex;
 
     #[test]
     fn test_progress_commit_message_format() {
@@ -1400,5 +1514,99 @@ mod tests {
 
         // Should NOT create commit when progress decreased (edge case)
         assert!(new_progress_decreased.completed <= old_progress.completed);
+    }
+
+    async fn init_test_git_repo(repo_root: &std::path::Path) {
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+
+        std::fs::write(repo_root.join("README.md"), "base\n").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .unwrap();
+    }
+
+    fn test_ai_runner() -> AiCommandRunner {
+        let queue_config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            retry_error_patterns: default_retry_patterns(),
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 1,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let shared_stagger_state = Arc::new(Mutex::new(None));
+        AiCommandRunner::new(queue_config, shared_stagger_state)
+    }
+
+    #[tokio::test]
+    async fn test_post_apply_cleanup_review_succeeds_with_single_clean_marker() {
+        let temp_dir = TempDir::new().unwrap();
+        init_test_git_repo(temp_dir.path()).await;
+        std::fs::write(temp_dir.path().join("dirty.txt"), "dirty\n").unwrap();
+
+        let config = OrchestratorConfig {
+            acceptance_command: Some("sh -c 'git add dirty.txt && git commit -m cleanup && echo CLEANUP_REVIEW: CLEAN'".to_string()),
+            ..Default::default()
+        };
+        let ai_runner = test_ai_runner();
+
+        run_post_apply_cleanup_review("change-a", temp_dir.path(), &config, &ai_runner)
+            .await
+            .expect("cleanup review should succeed");
+
+        let (is_dirty, status) = crate::vcs::git::commands::has_uncommitted_changes(temp_dir.path())
+            .await
+            .unwrap();
+        assert!(!is_dirty, "worktree must be clean after successful cleanup review: {status}");
+    }
+
+    #[tokio::test]
+    async fn test_post_apply_cleanup_review_fails_when_marker_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        init_test_git_repo(temp_dir.path()).await;
+        std::fs::write(temp_dir.path().join("dirty.txt"), "dirty\n").unwrap();
+
+        let config = OrchestratorConfig {
+            acceptance_command: Some("sh -c 'git add dirty.txt && git commit -m cleanup && echo done'".to_string()),
+            ..Default::default()
+        };
+        let ai_runner = test_ai_runner();
+
+        let err = run_post_apply_cleanup_review("change-a", temp_dir.path(), &config, &ai_runner)
+            .await
+            .expect_err("cleanup review must fail without marker");
+        assert!(
+            err.to_string().contains("CLEANUP_REVIEW: CLEAN"),
+            "error should mention missing marker: {err}"
+        );
     }
 }

@@ -13,7 +13,8 @@ mod runner;
 pub use output::OutputLine;
 pub use prompt::{
     build_acceptance_diff_context, build_acceptance_prompt, build_acceptance_prompt_context_only,
-    build_apply_prompt, build_archive_prompt, build_last_acceptance_output_context,
+    build_apply_prompt, build_archive_prompt, build_cleanup_review_prompt,
+    build_last_acceptance_output_context, parse_cleanup_review_output,
 };
 pub use runner::AgentRunner;
 
