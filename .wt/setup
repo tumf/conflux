@@ -50,4 +50,20 @@ if [ -n "$hooks_dir" ]; then
   fi
 fi
 
+if ! command -v pre-commit >/dev/null 2>&1; then
+  if command -v uvx >/dev/null 2>&1; then
+    pre_commit_shim_dir="${HOME}/.local/bin"
+    pre_commit_shim="${pre_commit_shim_dir}/pre-commit"
+    mkdir -p "${pre_commit_shim_dir}"
+    cat >"${pre_commit_shim}" <<'EOF'
+#!/bin/sh
+exec uvx pre-commit "$@"
+EOF
+    chmod +x "${pre_commit_shim}"
+    echo "Installed pre-commit shim at ${pre_commit_shim}"
+  else
+    echo "uvx not found; cannot create pre-commit shim" 1>&2
+  fi
+fi
+
 echo "Setup completed successfully!"

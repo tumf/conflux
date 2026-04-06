@@ -282,7 +282,12 @@ async fn derive_change_status(
     worktree_by_change: &std::collections::HashMap<String, std::path::PathBuf>,
     status_map: &std::collections::HashMap<String, &'static str>,
     base_branch: &str,
+    rejected_marker_exists: bool,
 ) -> (String, Option<u32>) {
+    if rejected_marker_exists {
+        return ("rejected".to_string(), None);
+    }
+
     if let Some(status) = status_map.get(change_id) {
         return (status.to_string(), None);
     }
@@ -357,8 +362,11 @@ pub(super) async fn list_remote_changes_in_worktree(
             continue;
         }
 
-        // Only include directories that look like an active change (proposal.md exists).
+        // Include changes that have proposal.md. Also keep REJECTED.md-bearing
+        // directories visible in dashboard snapshots as terminal rows.
         let proposal_path = path.join("proposal.md");
+        let rejected_marker_path = path.join("REJECTED.md");
+        let rejected_marker_exists = rejected_marker_path.exists();
         if !proposal_path.exists() {
             continue;
         }
@@ -382,8 +390,14 @@ pub(super) async fn list_remote_changes_in_worktree(
         let last_modified = latest_modified_rfc3339(&[&proposal_path, &tasks_path])
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
-        let (status, iteration_number) =
-            derive_change_status(dir_name, &worktree_by_change, &status_map, base_branch).await;
+        let (status, iteration_number) = derive_change_status(
+            dir_name,
+            &worktree_by_change,
+            &status_map,
+            base_branch,
+            rejected_marker_exists,
+        )
+        .await;
 
         changes.push(RemoteChange {
             id: dir_name.to_string(),
@@ -454,15 +468,36 @@ mod tests {
         let worktree_by_change = std::collections::HashMap::new();
 
         assert_eq!(
-            derive_change_status("c-accepting", &worktree_by_change, &status_map, "main").await,
+            derive_change_status(
+                "c-accepting",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("accepting".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-resolving", &worktree_by_change, &status_map, "main").await,
+            derive_change_status(
+                "c-resolving",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("resolving".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-merge-wait", &worktree_by_change, &status_map, "main").await,
+            derive_change_status(
+                "c-merge-wait",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("merge wait".to_string(), None)
         );
         assert_eq!(
@@ -470,13 +505,15 @@ mod tests {
                 "c-resolve-pending",
                 &worktree_by_change,
                 &status_map,
-                "main"
+                "main",
+                false,
             )
             .await,
             ("resolve pending".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-blocked", &worktree_by_change, &status_map, "main").await,
+            derive_change_status("c-blocked", &worktree_by_change, &status_map, "main", false)
+                .await,
             ("blocked".to_string(), None)
         );
     }
@@ -527,9 +564,66 @@ mod tests {
         let worktree_by_change = std::collections::HashMap::new();
 
         assert_eq!(
-            derive_change_status("unknown-change", &worktree_by_change, &status_map, "main").await,
+            derive_change_status(
+                "unknown-change",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("idle".to_string(), None)
         );
+    }
+
+    #[tokio::test]
+    async fn test_derive_change_status_prefers_rejected_marker_over_reducer() {
+        let mut status_map = std::collections::HashMap::new();
+        status_map.insert("change-a".to_string(), "accepting");
+        let worktree_by_change = std::collections::HashMap::new();
+
+        assert_eq!(
+            derive_change_status("change-a", &worktree_by_change, &status_map, "main", true).await,
+            ("rejected".to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_remote_changes_includes_rejected_marker_change() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec").join("changes");
+
+        let rejected_change_dir = changes_dir.join("change-rejected");
+        std::fs::create_dir_all(&rejected_change_dir).unwrap();
+        std::fs::write(rejected_change_dir.join("proposal.md"), "# proposal\n").unwrap();
+        std::fs::write(rejected_change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
+        std::fs::write(rejected_change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let active_change_dir = changes_dir.join("change-active");
+        std::fs::create_dir_all(&active_change_dir).unwrap();
+        std::fs::write(active_change_dir.join("proposal.md"), "# proposal\n").unwrap();
+        std::fs::write(active_change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::default(),
+        ));
+
+        let changes =
+            list_remote_changes_in_worktree(temp_dir.path(), "project-1", "main", &shared_state)
+                .await;
+
+        let rejected_change = changes.iter().find(|change| change.id == "change-rejected");
+        assert!(
+            rejected_change.is_some(),
+            "change with REJECTED.md marker must be included in dashboard snapshot"
+        );
+        assert_eq!(
+            rejected_change.unwrap().status,
+            "rejected",
+            "REJECTED.md marker must force rejected status in dashboard snapshot"
+        );
+
+        assert!(changes.iter().any(|change| change.id == "change-active"));
     }
 
     #[test]
