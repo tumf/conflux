@@ -1,4 +1,4 @@
-.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
+.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -93,8 +93,13 @@ test-heavy:
 	@echo "Running heavy test tier (feature=heavy-tests)..."
 	cargo test --features heavy-tests
 
+# Run pre-commit hooks (uses uvx when pre-commit is not globally installed)
+pre-commit:
+	@echo "Running pre-commit hooks..."
+	@bash -lc 'if command -v pre-commit >/dev/null 2>&1; then pre-commit run --all-files; elif command -v uvx >/dev/null 2>&1; then uvx pre-commit run --all-files; else echo "pre-commit is not installed and uvx is unavailable"; exit 127; fi'
+
 # Run all default-path checks (format, lint, fast tests)
-check: fmt lint test
+check: fmt lint test pre-commit
 	@echo "All checks passed!"
 
 # Bump patch version (0.0.x -> 0.0.x+1) using cargo-release

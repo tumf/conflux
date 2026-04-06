@@ -468,18 +468,36 @@ mod tests {
         let worktree_by_change = std::collections::HashMap::new();
 
         assert_eq!(
-            derive_change_status("c-accepting", &worktree_by_change, &status_map, "main", false)
-                .await,
+            derive_change_status(
+                "c-accepting",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("accepting".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-resolving", &worktree_by_change, &status_map, "main", false)
-                .await,
+            derive_change_status(
+                "c-resolving",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("resolving".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-merge-wait", &worktree_by_change, &status_map, "main", false)
-                .await,
+            derive_change_status(
+                "c-merge-wait",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("merge wait".to_string(), None)
         );
         assert_eq!(
@@ -546,8 +564,14 @@ mod tests {
         let worktree_by_change = std::collections::HashMap::new();
 
         assert_eq!(
-            derive_change_status("unknown-change", &worktree_by_change, &status_map, "main", false)
-                .await,
+            derive_change_status(
+                "unknown-change",
+                &worktree_by_change,
+                &status_map,
+                "main",
+                false
+            )
+            .await,
             ("idle".to_string(), None)
         );
     }
@@ -559,8 +583,7 @@ mod tests {
         let worktree_by_change = std::collections::HashMap::new();
 
         assert_eq!(
-            derive_change_status("change-a", &worktree_by_change, &status_map, "main", true)
-                .await,
+            derive_change_status("change-a", &worktree_by_change, &status_map, "main", true).await,
             ("rejected".to_string(), None)
         );
     }
@@ -585,13 +608,9 @@ mod tests {
             crate::orchestration::state::OrchestratorState::default(),
         ));
 
-        let changes = list_remote_changes_in_worktree(
-            temp_dir.path(),
-            "project-1",
-            "main",
-            &shared_state,
-        )
-        .await;
+        let changes =
+            list_remote_changes_in_worktree(temp_dir.path(), "project-1", "main", &shared_state)
+                .await;
 
         let rejected_change = changes.iter().find(|change| change.id == "change-rejected");
         assert!(

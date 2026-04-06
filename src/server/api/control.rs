@@ -436,6 +436,11 @@ pub(super) async fn list_selected_change_ids_in_worktree(
         .filter(|change| {
             let explicit_selection = change_selections.and_then(|m| m.get(&change.id)).copied();
             let selected = explicit_selection.unwrap_or(true);
+
+            if change.status == "rejected" {
+                return false;
+            }
+
             if change.status == "error" {
                 explicit_selection.unwrap_or(false)
             } else {
@@ -756,5 +761,84 @@ mod tests {
             .unwrap();
         let logs_json: serde_json::Value = serde_json::from_slice(&logs_body).unwrap();
         assert!(!logs_json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_selected_change_ids_excludes_rejected_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes");
+        std::fs::create_dir_all(&changes_dir).unwrap();
+
+        let active_change_dir = changes_dir.join("change-active");
+        std::fs::create_dir_all(&active_change_dir).unwrap();
+        std::fs::write(active_change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        let rejected_change_dir = changes_dir.join("change-rejected");
+        std::fs::create_dir_all(&rejected_change_dir).unwrap();
+        std::fs::write(rejected_change_dir.join("proposal.md"), "# proposal\n").unwrap();
+        std::fs::write(rejected_change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let selected = list_selected_change_ids_in_worktree(
+            temp_dir.path(),
+            None,
+            &Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::default(),
+            )),
+        )
+        .await;
+
+        assert_eq!(selected, vec!["change-active".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_global_control_run_skips_rejected_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let rejected_change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/rejected-only");
+        std::fs::create_dir_all(&rejected_change_dir).unwrap();
+        std::fs::write(rejected_change_dir.join("proposal.md"), "# proposal\n").unwrap();
+        std::fs::write(rejected_change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let calls = CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        calls.lock().unwrap().clear();
+
+        let router = build_router(state.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/control/run")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 0);
+        assert_eq!(json["skipped"], 1);
+
+        let recorded_calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded_calls,
+            vec![("_global_".to_string(), "run".to_string())],
+            "project-level run must not start when only rejected changes are present"
+        );
     }
 }

@@ -10,3 +10,9 @@
 
 - rejected reason を WebUI detail panel や tooltip に表示する改善
 - rejected / archived / merged を切り替える filter UI の追加
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `src/server/api/control.rs` の実行対象列挙で `rejected` status を除外し、dashboard 可視化と run 対象の契約を分離する
+- [x] rejected change が `/api/v1/control/run` 経由で実行対象に含まれないことを確認する回帰テストを追加する
+- [x] pre-commit を通常コミット相当で実行できるように開発環境/CI の hook 実行経路を整備し、`pre-commit run --all-files` を通す
