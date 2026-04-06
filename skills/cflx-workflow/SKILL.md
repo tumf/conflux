@@ -1,6 +1,6 @@
 ---
 name: cflx-workflow
-description: Execute Conflux workflow operations autonomously without user interaction. Provides three operations - apply (implement approved changes), accept (verify implementation), and archive (finalize deployed changes). Called by Conflux orchestration system. CRITICAL - This skill CANNOT ask questions or request user input.
+description: Execute Conflux workflow operations autonomously without user interaction. Provides apply/rejecting/cleanup-review/accept/archive operations for Conflux orchestration. CRITICAL - This skill CANNOT ask questions or request user input.
 ---
 
 # Conflux Workflow Executor
@@ -244,7 +244,28 @@ If apply determines the change is currently impossible to implement (for example
 - On `REJECTION_REVIEW: RESUME`, runtime removes worktree-local `REJECTED.md`, appends at least one unchecked non-rejection recovery task to `tasks.md`, and routes directly back to apply.
 - Rejecting review MUST NOT output `ACCEPTANCE: BLOCKED`; that marker is reserved for acceptance operation output.
 
-## Operation 3: Accept (Acceptance Review)
+## Operation 3: Cleanup-review (Post-apply cleanup handoff)
+
+**Purpose**: Ensure a task-complete but dirty managed worktree is made handoff-ready before acceptance starts.
+
+### Cleanup-review Required Behavior
+
+1. Run inside the managed worktree for the given change.
+2. Review dirty files and clean only post-apply handoff artifacts.
+3. **NEVER** use blind staging such as `git add -A` or `git add .`.
+4. Stage/commit only intentional cleanup changes required for clean handoff.
+5. Verify worktree cleanliness before finishing.
+6. Output exactly one success marker line on success:
+   - `CLEANUP_REVIEW: CLEAN`
+
+### Cleanup-review Output Rules
+
+- Success output MUST contain exactly one standalone marker line: `CLEANUP_REVIEW: CLEAN`
+- Do not emit alternate verdict markers.
+- Do not wrap the marker in code fences.
+- If cleanup cannot be completed, fail loudly (non-zero/command failure) instead of inventing a different marker.
+
+## Operation 4: Accept (Acceptance Review)
 
 **Purpose**: Verify implementation meets specifications with automated checks.
 

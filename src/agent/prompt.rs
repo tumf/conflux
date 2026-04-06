@@ -65,6 +65,54 @@ pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context:
     parts.join("\n\n")
 }
 
+/// Build cleanup-review prompt for post-apply dirty worktree handoff.
+///
+/// The cleanup-review operation is a strict, handoff-only operation:
+/// - It must clean only the apply-generated dirty state.
+/// - It must not perform blind staging (e.g. `git add -A`).
+/// - On success it must emit exactly one marker: `CLEANUP_REVIEW: CLEAN`.
+pub fn build_cleanup_review_prompt(change_id: &str) -> String {
+    let mut parts = Vec::new();
+
+    parts.push("load skills: cflx-workflow".to_string());
+    parts.push(format!("Cleanup-review change id: {}", change_id));
+    parts.push(format!(
+        "change_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nworkspace_path: .",
+        change_id, change_id, change_id
+    ));
+    parts.push(
+        "Rules:\n- Perform only post-apply handoff cleanup for this managed worktree\n- NEVER use blind staging such as `git add -A` or `git add .`\n- Stage and commit only intentional cleanup files needed for clean handoff\n- Do not ask for human input; finish autonomously\n- On success, output exactly one final marker line: CLEANUP_REVIEW: CLEAN"
+            .to_string(),
+    );
+
+    parts.join("\n\n")
+}
+
+/// Parse cleanup-review output and validate the final verdict marker.
+///
+/// Returns true only when output contains exactly one standalone
+/// `CLEANUP_REVIEW: CLEAN` line outside markdown code fences.
+pub fn parse_cleanup_review_output(output: &str) -> bool {
+    let mut in_code_block = false;
+    let mut marker_count = 0_u32;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        if trimmed == "CLEANUP_REVIEW: CLEAN" {
+            marker_count += 1;
+        }
+    }
+
+    marker_count == 1
+}
+
 /// Build acceptance prompt from user prompt and history context
 ///
 /// Now unified with context_only mode - no embedded system prompt.
@@ -407,5 +455,37 @@ mod tests {
         // Should NOT contain diff context section with actual content
         assert!(!result.contains("Files changed since last acceptance check:"));
         assert!(!result.contains("Previous acceptance findings:"));
+    }
+
+    #[test]
+    fn test_build_cleanup_review_prompt_contains_required_context() {
+        let prompt = build_cleanup_review_prompt("change-123");
+
+        assert!(prompt.contains("load skills: cflx-workflow"));
+        assert!(prompt.contains("Cleanup-review change id: change-123"));
+        assert!(prompt.contains("change_id: change-123"));
+        assert!(prompt.contains("proposal_path: openspec/changes/change-123/proposal.md"));
+        assert!(prompt.contains("tasks_path: openspec/changes/change-123/tasks.md"));
+        assert!(prompt.contains("workspace_path: ."));
+        assert!(prompt.contains("NEVER use blind staging"));
+        assert!(prompt.contains("CLEANUP_REVIEW: CLEAN"));
+    }
+
+    #[test]
+    fn test_parse_cleanup_review_output_accepts_single_marker() {
+        let output = "log line\nCLEANUP_REVIEW: CLEAN\nmore logs";
+        assert!(parse_cleanup_review_output(output));
+    }
+
+    #[test]
+    fn test_parse_cleanup_review_output_rejects_multiple_markers() {
+        let output = "CLEANUP_REVIEW: CLEAN\nCLEANUP_REVIEW: CLEAN\n";
+        assert!(!parse_cleanup_review_output(output));
+    }
+
+    #[test]
+    fn test_parse_cleanup_review_output_ignores_code_fence_markers() {
+        let output = "```\nCLEANUP_REVIEW: CLEAN\n```\n";
+        assert!(!parse_cleanup_review_output(output));
     }
 }
