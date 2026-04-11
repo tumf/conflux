@@ -827,15 +827,31 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
         }
     });
 
-    tokio::select! {
-        _ = &mut notif_task => {},
-        _ = &mut send_task => {},
-        _ = &mut recv_task => {},
+    let shutdown_reason = tokio::select! {
+        _ = &mut notif_task => "notification_task_finished",
+        _ = &mut send_task => "send_task_finished",
+        _ = &mut recv_task => "recv_task_finished",
+    };
+
+    debug!(
+        session_id = %session_id,
+        shutdown_reason,
+        "Proposal session WebSocket is shutting down tasks"
+    );
+
+    if !notif_task.is_finished() {
+        notif_task.abort();
+    }
+    if !send_task.is_finished() {
+        send_task.abort();
+    }
+    if !recv_task.is_finished() {
+        recv_task.abort();
     }
 
-    notif_task.abort();
-    send_task.abort();
-    recv_task.abort();
+    let _ = notif_task.await;
+    let _ = send_task.await;
+    let _ = recv_task.await;
 
     info!(session_id = %session_id, "Proposal session WebSocket disconnected");
 }
