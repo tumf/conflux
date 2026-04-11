@@ -57,31 +57,17 @@ Conflux has two operating modes and three main frontends. Keeping them separate 
 
 ## Quick Start
 
-### Local TUI (recommended)
+For the full first-run guide, see [QUICKSTART.md](QUICKSTART.md).
+
+- English: [QUICKSTART.md](QUICKSTART.md)
+- Japanese: [QUICKSTART.ja.md](QUICKSTART.ja.md)
+
+If you only want the shortest possible path:
 
 ```bash
-# 1. Install
-cargo install --path .
-
-# 2. Initialize configuration (Claude Code agent by default)
+cargo install cflx
 cflx init
-
-# 3. Launch the interactive TUI in the current repository
 cflx
-```
-
-### Local headless run
-
-```bash
-cflx init
-cflx run
-```
-
-### Other templates
-
-```bash
-cflx init --template opencode
-cflx init --template codex
 ```
 
 ## Usage
