@@ -775,6 +775,83 @@ async fn proposal_session_reconnect_does_not_duplicate_acknowledged_prompt() {
 }
 
 #[tokio::test]
+async fn proposal_session_reconnect_new_socket_continues_streaming_after_old_disconnect() {
+    let temp_dir = TempDir::new().unwrap();
+    let origin = create_local_git_repo(temp_dir.path());
+    let remote_url = format!("file://{}", origin.to_string_lossy());
+    let state = make_state(&temp_dir);
+    let router = build_router(state.clone());
+
+    let (_router, project_id) = create_project(router.clone(), remote_url).await;
+
+    let create_req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/projects/{project_id}/proposal-sessions"))
+        .body(Body::empty())
+        .unwrap();
+    let create_resp = router.clone().oneshot(create_req).await.unwrap();
+    let create_body = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: Value = serde_json::from_slice(&create_body).unwrap();
+    let session_id = created["id"].as_str().unwrap().to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_router = router.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, serve_router).await.unwrap();
+    });
+
+    use futures_util::SinkExt;
+
+    let ws_url = format!("ws://{addr}/api/v1/proposal-sessions/{session_id}/ws");
+    let (mut first_socket, _) = connect_async(ws_url.clone()).await.unwrap();
+
+    first_socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "prompt", "content": "first"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let _ = next_non_heartbeat_json(&mut first_socket).await;
+    let _ = next_non_heartbeat_json(&mut first_socket).await;
+    let _ = next_non_heartbeat_json(&mut first_socket).await;
+
+    drop(first_socket);
+
+    let (mut reconnect_socket, _) = connect_async(ws_url).await.unwrap();
+
+    loop {
+        let replay_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+        if replay_json["type"] == "recovery_state" {
+            break;
+        }
+    }
+
+    reconnect_socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"type": "prompt", "content": "after-reconnect"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    let user_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+    assert_eq!(user_json["type"], "user_message");
+    assert_eq!(user_json["content"], "after-reconnect");
+
+    let thought_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+    assert_eq!(thought_json["type"], "agent_thought_chunk");
+    assert_eq!(thought_json["text"], "echo:after-reconnect");
+
+    let turn_complete_json = next_non_heartbeat_json(&mut reconnect_socket).await;
+    assert_eq!(turn_complete_json["type"], "turn_complete");
+
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn proposal_session_multi_session_websockets_stay_independent() {
     let temp_dir = TempDir::new().unwrap();
     let origin = create_local_git_repo(temp_dir.path());

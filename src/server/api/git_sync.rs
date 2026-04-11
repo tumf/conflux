@@ -173,6 +173,20 @@ fn build_auto_resolve_prompt(
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct SyncPlan {
+    should_skip_resolve_and_push: bool,
+}
+
+fn plan_sync(local_sha_for_push: &str, remote_sha_for_push: &str) -> SyncPlan {
+    let should_skip_resolve_and_push =
+        !remote_sha_for_push.is_empty() && local_sha_for_push == remote_sha_for_push;
+
+    SyncPlan {
+        should_skip_resolve_and_push,
+    }
+}
+
 /// POST /api/v1/projects/:id/git/pull - pull from remote
 ///
 /// NOTE: This endpoint is kept for backward compatibility.
@@ -477,7 +491,8 @@ pub async fn git_sync(State(state): State<AppState>, Path(project_id): Path<Stri
     // ── Up-to-date check ──────────────────────────────────────────────────────
     // If local and remote SHAs match after the pull phase, the branch is already
     // synchronized — skip the expensive resolve_command and push entirely.
-    if !remote_sha_for_push.is_empty() && local_sha_for_push == remote_sha_for_push {
+    let sync_plan = plan_sync(&local_sha_for_push, &remote_sha_for_push);
+    if sync_plan.should_skip_resolve_and_push {
         info!(
             "git sync: already up-to-date, skipping resolve and push: project_id={} sha={}",
             project_id, local_sha_for_push
@@ -673,6 +688,24 @@ mod tests {
                 "a b c-suffix".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_plan_sync_skips_when_remote_sha_matches_local_sha() {
+        let plan = plan_sync("abc123", "abc123");
+        assert!(plan.should_skip_resolve_and_push);
+    }
+
+    #[test]
+    fn test_plan_sync_does_not_skip_when_remote_sha_differs() {
+        let plan = plan_sync("abc123", "def456");
+        assert!(!plan.should_skip_resolve_and_push);
+    }
+
+    #[test]
+    fn test_plan_sync_does_not_skip_when_remote_sha_is_empty() {
+        let plan = plan_sync("abc123", "");
+        assert!(!plan.should_skip_resolve_and_push);
     }
 
     #[tokio::test]

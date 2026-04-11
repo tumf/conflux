@@ -3,6 +3,7 @@
 //! Wraps a single ACP subprocess, providing typed methods for the initialize
 //! handshake, session lifecycle, and message relay.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// Resolve a relative command name to an absolute path via the user's login shell.
@@ -301,6 +302,47 @@ impl AcpPromptBlock {
     }
 }
 
+async fn dispatch_jsonrpc_response(
+    pending_requests: &Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+    value: Value,
+) -> bool {
+    let response = match serde_json::from_value::<JsonRpcResponse>(value.clone()) {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(error = %e, payload = %value, "Failed to parse JSON-RPC response");
+            return true;
+        }
+    };
+
+    let Some(raw_id) = response.id.clone() else {
+        warn!(payload = %value, "JSON-RPC response missing id field");
+        return true;
+    };
+
+    let Some(request_id) = raw_id.as_u64() else {
+        warn!(response_id = %raw_id, "JSON-RPC response id is not u64");
+        return true;
+    };
+
+    let waiter = {
+        let mut pending = pending_requests.lock().await;
+        pending.remove(&request_id)
+    };
+
+    match waiter {
+        Some(tx) => {
+            if tx.send(response).is_err() {
+                debug!(request_id, "Response waiter dropped before delivery");
+            }
+        }
+        None => {
+            warn!(request_id, "Received response for unknown request id");
+        }
+    }
+
+    true
+}
+
 /// ACP client wrapping a subprocess communicating via JSON-RPC over stdio.
 pub struct AcpClient {
     /// Sender half for writing JSON-RPC messages to the subprocess stdin.
@@ -311,8 +353,8 @@ pub struct AcpClient {
     notification_rx: Mutex<mpsc::Receiver<AcpMessage>>,
     /// Monotonically incrementing request ID counter.
     next_id: AtomicU64,
-    /// Channel for receiving responses keyed by request ID.
-    response_rx: Mutex<mpsc::Receiver<JsonRpcResponse>>,
+    /// Pending JSON-RPC response waiters keyed by request ID.
+    pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
     /// Handle to the child process.
     child: Mutex<Option<Child>>,
     /// Whether the ACP session has been initialized.
@@ -326,13 +368,12 @@ impl AcpClient {
     pub fn new_for_test() -> Self {
         let (stdin_tx, _stdin_rx) = mpsc::channel::<String>(1);
         let (notification_tx, notification_rx) = mpsc::channel::<AcpMessage>(1);
-        let (_response_tx, response_rx) = mpsc::channel::<JsonRpcResponse>(1);
         Self {
             stdin_tx,
             notification_tx,
             notification_rx: Mutex::new(notification_rx),
             next_id: AtomicU64::new(1),
-            response_rx: Mutex::new(response_rx),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
             child: Mutex::new(None),
             initialized: Mutex::new(false),
             working_dir: PathBuf::new(),
@@ -384,9 +425,6 @@ impl AcpClient {
         // Channel for notifications going to the WebSocket relay
         let (notif_tx, notif_rx) = mpsc::channel::<AcpMessage>(256);
 
-        // Channel for request/response correlation
-        let (response_tx, response_rx) = mpsc::channel::<JsonRpcResponse>(64);
-
         // Spawn stdin writer task
         let mut writer = child_stdin;
         tokio::spawn(async move {
@@ -407,9 +445,12 @@ impl AcpClient {
             debug!("ACP stdin writer task ended");
         });
 
+        let pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
         // Spawn stdout reader task
-        let response_tx_clone = response_tx.clone();
         let notif_tx_clone = notif_tx.clone();
+        let pending_requests_for_stdout = pending_requests.clone();
         tokio::spawn(async move {
             let reader = BufReader::new(child_stdout);
             let mut lines = reader.lines();
@@ -419,42 +460,40 @@ impl AcpClient {
                 }
                 debug!(line = %line, "ACP stdout");
 
-                match serde_json::from_str::<Value>(&line) {
-                    Ok(val) => {
-                        // Check if it's a response (has "id" and either "result" or "error")
-                        if val.get("id").is_some()
-                            && (val.get("result").is_some() || val.get("error").is_some())
-                        {
-                            match serde_json::from_value::<JsonRpcResponse>(val) {
-                                Ok(resp) => {
-                                    if response_tx_clone.send(resp).await.is_err() {
-                                        debug!("Response channel closed");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to parse JSON-RPC response");
-                                }
-                            }
-                        } else {
-                            // Treat as notification
-                            match serde_json::from_value::<JsonRpcNotification>(val) {
-                                Ok(notif) => {
-                                    let msg = AcpMessage::Notification(notif);
-                                    if notif_tx_clone.send(msg).await.is_err() {
-                                        debug!("Notification channel closed");
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Failed to parse JSON-RPC notification");
-                                }
+                let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    debug!(line = %line, "Non-JSON line from ACP stdout");
+                    continue;
+                };
+
+                let has_method = val.get("method").is_some();
+                let has_id = val.get("id").is_some();
+
+                if has_method {
+                    if has_id {
+                        warn!(
+                            payload = %val,
+                            "Received unsupported JSON-RPC server request on ACP stdout"
+                        );
+                        continue;
+                    }
+
+                    match serde_json::from_value::<JsonRpcNotification>(val) {
+                        Ok(notif) => {
+                            let msg = AcpMessage::Notification(notif);
+                            if notif_tx_clone.send(msg).await.is_err() {
+                                debug!("Notification channel closed");
+                                break;
                             }
                         }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse JSON-RPC notification");
+                        }
                     }
-                    Err(e) => {
-                        debug!(error = %e, line = %line, "Non-JSON line from ACP stdout");
-                    }
+                    continue;
+                }
+
+                if !dispatch_jsonrpc_response(&pending_requests_for_stdout, val).await {
+                    break;
                 }
             }
             debug!("ACP stdout reader task ended");
@@ -476,7 +515,7 @@ impl AcpClient {
             notification_tx: notif_tx.clone(),
             notification_rx: Mutex::new(notif_rx),
             next_id: AtomicU64::new(1),
-            response_rx: Mutex::new(response_rx),
+            pending_requests: pending_requests.clone(),
             child: Mutex::new(Some(child)),
             initialized: Mutex::new(false),
             working_dir: working_dir.to_path_buf(),
@@ -645,12 +684,21 @@ impl AcpClient {
             }
         }
         *child = None;
+
+        let mut pending = self.pending_requests.lock().await;
+        pending.clear();
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
 
     async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value, AcpError> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (response_tx, response_rx) = oneshot::channel::<JsonRpcResponse>();
+
+        {
+            let mut pending = self.pending_requests.lock().await;
+            pending.insert(id, response_tx);
+        }
 
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -664,43 +712,35 @@ impl AcpClient {
 
         debug!(method = %method, id = %id, "Sending ACP request");
 
-        self.stdin_tx
-            .send(line)
-            .await
-            .map_err(|_| AcpError::ProcessExited)?;
+        if self.stdin_tx.send(line).await.is_err() {
+            let mut pending = self.pending_requests.lock().await;
+            pending.remove(&id);
+            return Err(AcpError::ProcessExited);
+        }
 
-        // Wait for the response with matching ID
-        let mut rx = self.response_rx.lock().await;
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
-                Ok(Some(resp)) => {
-                    if resp.id == Some(Value::Number(id.into())) {
-                        if let Some(err) = resp.error {
-                            return Err(AcpError::RpcError {
-                                code: err.code,
-                                message: err.message,
-                            });
-                        }
-                        return Ok(resp.result.unwrap_or(Value::Null));
-                    }
-                    // Not our response; this shouldn't happen in practice with
-                    // a single-consumer pattern, but we handle it gracefully.
-                    debug!(
-                        expected_id = %id,
-                        got_id = ?resp.id,
-                        "Received response with unexpected ID, dropping"
-                    );
-                }
-                Ok(None) => {
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), response_rx).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => {
                     return Err(AcpError::ProcessExited);
                 }
                 Err(_) => {
+                    let mut pending = self.pending_requests.lock().await;
+                    pending.remove(&id);
                     return Err(AcpError::Timeout {
                         method: method.to_string(),
                     });
                 }
-            }
+            };
+
+        if let Some(err) = response.error {
+            return Err(AcpError::RpcError {
+                code: err.code,
+                message: err.message,
+            });
         }
+
+        Ok(response.result.unwrap_or(Value::Null))
     }
 
     async fn send_notification(&self, method: &str, params: Option<Value>) -> Result<(), AcpError> {
@@ -878,5 +918,70 @@ mod tests {
             }
             _ => panic!("Expected Elicitation"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_jsonrpc_response_routes_by_request_id() {
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_1, rx_1) = oneshot::channel::<JsonRpcResponse>();
+        let (tx_2, rx_2) = oneshot::channel::<JsonRpcResponse>();
+        {
+            let mut guard = pending.lock().await;
+            guard.insert(1, tx_1);
+            guard.insert(2, tx_2);
+        }
+
+        let handled = dispatch_jsonrpc_response(
+            &pending,
+            serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}),
+        )
+        .await;
+        assert!(handled);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx_1)
+                .await
+                .is_err()
+        );
+
+        let response = tokio::time::timeout(std::time::Duration::from_millis(200), rx_2)
+            .await
+            .expect("response should be delivered")
+            .expect("waiter should stay alive");
+        assert_eq!(response.id, Some(Value::Number(2_u64.into())));
+
+        let guard = pending.lock().await;
+        assert!(guard.contains_key(&1));
+        assert!(!guard.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn dispatch_jsonrpc_response_ignores_non_u64_id_without_consuming_waiters() {
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_1, rx_1) = oneshot::channel::<JsonRpcResponse>();
+        {
+            let mut guard = pending.lock().await;
+            guard.insert(1, tx_1);
+        }
+
+        let handled = dispatch_jsonrpc_response(
+            &pending,
+            serde_json::json!({"jsonrpc": "2.0", "id": "string-id", "result": {"ok": true}}),
+        )
+        .await;
+        assert!(handled);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx_1)
+                .await
+                .is_err()
+        );
+
+        let guard = pending.lock().await;
+        assert!(guard.contains_key(&1));
     }
 }
