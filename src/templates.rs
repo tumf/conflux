@@ -11,33 +11,32 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
-  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:apply {change_id} {prompt}'",
+  "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
-  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/openspec:archive {change_id} {prompt}'",
+  "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '/cflx-accept {change_id} {prompt}'",
+  "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
-  "apply_prompt": "",
+  //"apply_prompt": "",
 
   // System prompt for archive command (injected into {prompt} placeholder)
-  "archive_prompt": "",
+  //"archive_prompt": "",
 
   // System prompt for acceptance command (injected into {prompt} placeholder)
   // Note: A hardcoded acceptance prompt is always prepended before this value
-  "acceptance_prompt": "",
+  //"acceptance_prompt": "",
 
-  // Controls how the acceptance `{prompt}` is constructed.
-  // - full: include hardcoded acceptance system prompt + diff/history context
-  // - context_only: only include change metadata + diff/history context
-  // Use context_only when the fixed acceptance instructions live in a separate command template.
-  "acceptance_prompt_mode": "context_only",
+   // Worktree command for TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  "worktree_command": "tmux new-window -n wt ",
+  // "worktree_command": "codex '/openspec:proposal --worktree {workspace_dir}'",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
@@ -47,10 +46,6 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   //   "suppress_repetitive_debug": true,
   //   "summary_interval_secs": 60
   // },
-
-  // Command to create a worktree for proposals from TUI (+ key)
-  // Supports {workspace_dir} and {repo_root} placeholders
-  // "worktree_command": "codex '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
@@ -90,33 +85,32 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   "analyze_command": "opencode run --format json {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
-  "apply_command": "opencode run '/openspec-apply {change_id} {prompt}'",
+  "apply_command": "opencode run '{prompt}'",
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
-  "archive_command": "opencode run '/conflux:archive {change_id} {prompt}'",
+  "archive_command": "opencode run '{prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "opencode run '/cflx-accept {change_id} {prompt}'",
+  "acceptance_command": "opencode run '{prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run {prompt}",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
-  "apply_prompt": "",
+  //"apply_prompt": "",
 
   // System prompt for archive command (injected into {prompt} placeholder)
-  "archive_prompt": "",
+  //"archive_prompt": "",
 
   // System prompt for acceptance command (injected into {prompt} placeholder)
   // Note: A hardcoded acceptance prompt is always prepended before this value
-  "acceptance_prompt": "",
+  //"acceptance_prompt": "",
 
-  // Controls how the acceptance `{prompt}` is constructed.
-  // - full: include hardcoded acceptance system prompt + diff/history context
-  // - context_only: only include change metadata + diff/history context
-  // Use context_only when the fixed acceptance instructions live in the OpenCode command template.
-  "acceptance_prompt_mode": "context_only",
+  // Worktree command for TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  "worktree_command": "tmux new-window -n wt ",
+  // "worktree_command": "claude run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
@@ -126,10 +120,6 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   //   "suppress_repetitive_debug": true,
   //   "summary_interval_secs": 60
   // },
-
-  // Command to create a worktree for proposals from TUI (+ key)
-  // Supports {workspace_dir} and {repo_root} placeholders
-  // "worktree_command": "claude run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
@@ -169,33 +159,32 @@ pub const CODEX_TEMPLATE: &str = r#"{
   "analyze_command": "codex --json {prompt}",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
-  "apply_command": "codex '/openspec:apply {change_id} {prompt}'",
+  "apply_command": "codex '{prompt}'",
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
-  "archive_command": "codex '/openspec:archive {change_id} {prompt}'",
+  "archive_command": "codex '{prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "codex '/cflx-accept {change_id} {prompt}'",
+  "acceptance_command": "codex '{prompt}'",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "codex {prompt}",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
-  "apply_prompt": "",
+  //"apply_prompt": "",
 
   // System prompt for archive command (injected into {prompt} placeholder)
-  "archive_prompt": "",
+  //"archive_prompt": "",
 
   // System prompt for acceptance command (injected into {prompt} placeholder)
   // Note: A hardcoded acceptance prompt is always prepended before this value
-  "acceptance_prompt": "",
+  //"acceptance_prompt": "",
 
-  // Controls how the acceptance `{prompt}` is constructed.
-  // - full: include hardcoded acceptance system prompt + diff/history context
-  // - context_only: only include change metadata + diff/history context
-  // Use context_only when the fixed acceptance instructions live in a separate command template.
-  "acceptance_prompt_mode": "context_only",
+  // Worktree command for TUI (+ key)
+  // Supports {workspace_dir} and {repo_root} placeholders
+  "worktree_command": "tmux new-window -n wt ",
+  // "worktree_command": "opencode run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Maximum iterations for the orchestration loop (default: 50, 0 = no limit)
   // "max_iterations": 50,
@@ -205,10 +194,6 @@ pub const CODEX_TEMPLATE: &str = r#"{
   //   "suppress_repetitive_debug": true,
   //   "summary_interval_secs": 60
   // },
-
-  // Command to create a worktree for proposals from TUI (+ key)
-  // Supports {workspace_dir} and {repo_root} placeholders
-  // "worktree_command": "opencode run '/openspec:proposal --worktree {workspace_dir}'",
 
   // Lifecycle hooks (optional)
   // Available hooks:
@@ -294,11 +279,30 @@ mod tests {
     }
 
     #[test]
-    fn test_templates_contain_change_id_placeholder() {
-        // All templates should contain {change_id} placeholder
-        assert!(CLAUDE_TEMPLATE.contains("{change_id}"));
-        assert!(OPENCODE_TEMPLATE.contains("{change_id}"));
-        assert!(CODEX_TEMPLATE.contains("{change_id}"));
+    fn test_claude_template_matches_sample_style() {
+        assert!(CLAUDE_TEMPLATE.contains("\"apply_command\": \"claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'\""));
+        assert!(CLAUDE_TEMPLATE.contains("\"archive_command\": \"claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'\""));
+        assert!(CLAUDE_TEMPLATE.contains("\"acceptance_command\": \"claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'\""));
+        assert!(CLAUDE_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
+        assert!(!CLAUDE_TEMPLATE.contains("\"acceptance_prompt_mode\""));
+    }
+
+    #[test]
+    fn test_opencode_template_matches_sample_style() {
+        assert!(OPENCODE_TEMPLATE.contains("\"apply_command\": \"opencode run '{prompt}'\""));
+        assert!(OPENCODE_TEMPLATE.contains("\"archive_command\": \"opencode run '{prompt}'\""));
+        assert!(OPENCODE_TEMPLATE.contains("\"acceptance_command\": \"opencode run '{prompt}'\""));
+        assert!(OPENCODE_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
+        assert!(!OPENCODE_TEMPLATE.contains("\"acceptance_prompt_mode\""));
+    }
+
+    #[test]
+    fn test_codex_template_matches_sample_style() {
+        assert!(CODEX_TEMPLATE.contains("\"apply_command\": \"codex '{prompt}'\""));
+        assert!(CODEX_TEMPLATE.contains("\"archive_command\": \"codex '{prompt}'\""));
+        assert!(CODEX_TEMPLATE.contains("\"acceptance_command\": \"codex '{prompt}'\""));
+        assert!(CODEX_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
+        assert!(!CODEX_TEMPLATE.contains("\"acceptance_prompt_mode\""));
     }
 
     #[test]
