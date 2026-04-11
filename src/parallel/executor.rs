@@ -897,6 +897,14 @@ fn resolve_acceptance_state_revision(start_revision: &str, end_revision: Option<
     end_revision.unwrap_or_else(|| start_revision.to_string())
 }
 
+fn revision_to_history_commit_hash(revision: &str) -> Option<String> {
+    if revision == "unknown" {
+        None
+    } else {
+        Some(revision.to_string())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
@@ -1156,7 +1164,7 @@ pub async fn execute_acceptance_in_workspace(
             exit_code: status.code(),
             stdout_tail: stdout_tail.clone(),
             stderr_tail: stderr_tail.clone(),
-            commit_hash: commit_hash.clone(),
+            commit_hash: revision_to_history_commit_hash(&end_revision),
         };
         // Record to both agent history (local) and shared acceptance history
         agent.record_acceptance_attempt(change_id, attempt.clone());
@@ -1208,7 +1216,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
-                commit_hash: commit_hash.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
             };
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
@@ -1250,7 +1258,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
-                commit_hash: commit_hash.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
             };
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
@@ -1295,7 +1303,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
-                commit_hash: commit_hash.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
             };
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
@@ -1356,7 +1364,7 @@ pub async fn execute_acceptance_in_workspace(
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
-                commit_hash: commit_hash.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
             };
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());

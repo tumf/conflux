@@ -15,3 +15,8 @@
 
 - [x] `openspec/changes/fix-acceptance-revision-drift/tasks.md` の verification ownership を実態に合わせて見直し、`src/parallel/tests/executor.rs` の実 Git / filesystem / process 依存テストは integration として再分類する
 - [x] durable acceptance revision 判定を純粋ロジックとして切り出し、実 Git / filesystem / process に依存しない unit test を追加して checklist の `verification: unit` を真実にする
+
+## Acceptance #2 Failure Follow-up
+
+- [x] acceptance attempt history に保存する `commit_hash` を開始時 revision ではなく終了時 revision に更新し、次回 acceptance diff context が revision drift しないようにする
+- [x] `src/parallel/executor.rs` の acceptance diff context が直前 acceptance 後の revision を基準に changed files を計算することを、HEAD 変化ありケースで回帰テスト化する
