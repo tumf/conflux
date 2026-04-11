@@ -718,19 +718,20 @@ impl AcpClient {
             return Err(AcpError::ProcessExited);
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), response_rx).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => {
-                return Err(AcpError::ProcessExited);
-            }
-            Err(_) => {
-                let mut pending = self.pending_requests.lock().await;
-                pending.remove(&id);
-                return Err(AcpError::Timeout {
-                    method: method.to_string(),
-                });
-            }
-        };
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), response_rx).await {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => {
+                    return Err(AcpError::ProcessExited);
+                }
+                Err(_) => {
+                    let mut pending = self.pending_requests.lock().await;
+                    pending.remove(&id);
+                    return Err(AcpError::Timeout {
+                        method: method.to_string(),
+                    });
+                }
+            };
 
         if let Some(err) = response.error {
             return Err(AcpError::RpcError {
@@ -939,9 +940,11 @@ mod tests {
         .await;
         assert!(handled);
 
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), rx_1)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx_1)
+                .await
+                .is_err()
+        );
 
         let response = tokio::time::timeout(std::time::Duration::from_millis(200), rx_2)
             .await
@@ -972,9 +975,11 @@ mod tests {
         .await;
         assert!(handled);
 
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), rx_1)
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx_1)
+                .await
+                .is_err()
+        );
 
         let guard = pending.lock().await;
         assert!(guard.contains_key(&1));
