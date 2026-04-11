@@ -2,7 +2,8 @@
 //!
 //! Contains helper functions used across TUI modules.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crossterm::{
@@ -14,18 +15,41 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::error::{OrchestratorError, Result};
 
+fn find_change_dir(change_id: &str, base_path: Option<&Path>) -> Option<PathBuf> {
+    let changes_root = match base_path {
+        Some(base) => base.join("openspec/changes"),
+        None => Path::new("openspec/changes").to_path_buf(),
+    };
+
+    let active_dir = changes_root.join(change_id);
+    if active_dir.exists() {
+        return Some(active_dir);
+    }
+
+    let archive_dir = changes_root.join("archive");
+    fs::read_dir(archive_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            (name_str == change_id || name_str.ends_with(&format!("-{}", change_id)))
+                .then(|| entry.path())
+        })
+}
+
 /// Launch editor for the specified change
 ///
 /// Opens the user's configured editor ($EDITOR) with the change's proposal.md file.
+/// Archived changes are resolved from `openspec/changes/archive/` as well.
 /// If proposal.md does not exist, falls back to opening the change directory.
 /// Falls back to "vi" if $EDITOR is not set.
 pub fn launch_editor_for_change(change_id: &str) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
-    let proposal_path = Path::new("openspec/changes")
-        .join(change_id)
-        .join("proposal.md");
-    let change_dir = Path::new("openspec/changes").join(change_id);
+    let change_dir = find_change_dir(change_id, None)
+        .ok_or_else(|| OrchestratorError::ChangeNotFound(change_id.to_string()))?;
+    let proposal_path = change_dir.join("proposal.md");
 
     // Try to open proposal.md directly if it exists
     if proposal_path.exists() {
@@ -147,6 +171,47 @@ pub fn get_version_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cflx-{}-{}", prefix, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_find_change_dir_prefers_active_change() {
+        let temp_dir = make_temp_dir("active-change");
+
+        let change_id = "active-change";
+        let active_dir = temp_dir.join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&active_dir).unwrap();
+
+        let found = find_change_dir(change_id, Some(&temp_dir));
+        assert_eq!(found, Some(active_dir));
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_find_change_dir_falls_back_to_archived_change() {
+        let temp_dir = make_temp_dir("archived-change");
+
+        let change_id = "archived-change";
+        let archive_dir = temp_dir
+            .join("openspec/changes/archive")
+            .join(format!("2026-04-11-{}", change_id));
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let found = find_change_dir(change_id, Some(&temp_dir));
+        assert_eq!(found, Some(archive_dir));
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
 
     #[test]
     fn test_truncate_to_display_width_with_suffix_short_string() {

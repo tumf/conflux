@@ -461,7 +461,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     let session_id_for_notifs = session_id.clone();
     let ws_send_tx_for_notifs = ws_send_tx.clone();
 
-    let notif_task = tokio::spawn(async move {
+    let mut notif_task = tokio::spawn(async move {
         while let Some(notification) = acp_client_for_notifs.recv_notification().await {
             if let Some(update) = notification.as_update() {
                 if let Some(event_session_id) = update.session_id.as_deref() {
@@ -671,7 +671,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
         }
     });
 
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
@@ -705,7 +705,7 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     let state_for_recv = state.clone();
     let ws_send_tx_for_recv = ws_send_tx.clone();
 
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Text(text) => {
@@ -828,10 +828,14 @@ async fn proposal_session_ws(socket: WebSocket, state: AppState, session_id: Str
     });
 
     tokio::select! {
-        _ = notif_task => {},
-        _ = send_task => {},
-        _ = recv_task => {},
+        _ = &mut notif_task => {},
+        _ = &mut send_task => {},
+        _ = &mut recv_task => {},
     }
+
+    notif_task.abort();
+    send_task.abort();
+    recv_task.abort();
 
     info!(session_id = %session_id, "Proposal session WebSocket disconnected");
 }
