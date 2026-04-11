@@ -54,6 +54,7 @@ export function ProposalChat({
     messages,
     status,
     sendMessage,
+    retryMessage,
     stop,
     error,
     activeElicitation,
@@ -69,17 +70,6 @@ export function ProposalChat({
     [sendMessage],
   );
 
-  const handleRetryMessage = useCallback(
-    (messageId: string) => {
-      const target = messages.find((message) => message.id === messageId && message.role === 'user');
-      if (!target) {
-        console.warn('Retry requested for missing user message', { sessionId, messageId });
-        return;
-      }
-      sendMessage(target.content);
-    },
-    [messages, sendMessage, sessionId],
-  );
 
   const activeSession: ProposalSession = useMemo(
     () => ({
@@ -144,7 +134,7 @@ export function ProposalChat({
             messages={messages}
             isAgentResponding={status === 'submitted' || status === 'streaming' || status === 'recovering'}
             onExamplePromptSelect={handleExamplePromptSelect}
-            onRetryMessage={handleRetryMessage}
+            onRetryMessage={retryMessage}
           />
           <ChatInput
             onSend={sendMessage}

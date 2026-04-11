@@ -7,7 +7,7 @@ import {
   ToolCallInfo,
   ToolCallStatus,
 } from '../api/types';
-import { getProposalSessionWsUrl, listProposalSessionMessages } from '../api/restClient';
+import { getProposalSessionWsUrl } from '../api/restClient';
 
 export type ProposalChatStatus = 'ready' | 'submitted' | 'streaming' | 'recovering' | 'error';
 
@@ -19,6 +19,18 @@ interface SubmissionLock {
 interface PendingPrompt {
   content: string;
   clientMessageId: string;
+}
+
+function markPendingMessagesFailed(messages: ProposalChatMessage[]): ProposalChatMessage[] {
+  return messages.map((message) => {
+    if (message.role !== 'user' || message.sendStatus !== 'pending') {
+      return message;
+    }
+    return {
+      ...message,
+      sendStatus: 'failed',
+    };
+  });
 }
 
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
@@ -53,7 +65,6 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
   const unmountedRef = useRef(false);
   const activeAssistantMessageIdRef = useRef<string | null>(null);
   const statusRef = useRef<ProposalChatStatus>('ready');
-  const historyLoadedRef = useRef(false);
   const sessionGenerationRef = useRef(0);
   const acceptedPromptIdsRef = useRef<Set<string>>(new Set());
   const recoveryTurnIdRef = useRef<string | null>(null);
@@ -174,6 +185,8 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         transitionStatus('error', reason);
         setError(reason);
       }
+      setMessages((prev) => markPendingMessagesFailed(prev));
+      pendingPromptsRef.current = [];
       clearSubmissionLock();
     },
     [clearSubmissionLock, transitionStatus],
@@ -362,7 +375,6 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         }
         console.info('proposal-chat websocket connected', {
           sessionId,
-          historyLoaded: historyLoadedRef.current,
           generation,
         });
         setWsConnected(true);
@@ -451,7 +463,6 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     pendingPromptsRef.current = [];
     acceptedPromptIdsRef.current = new Set();
     recoveryTurnIdRef.current = null;
-    historyLoadedRef.current = false;
 
     if (!projectId || !sessionId) {
       setWsConnected(false);
@@ -467,39 +478,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       at: nowIso(),
     });
 
-    void (async () => {
-      try {
-        const history = await listProposalSessionMessages(projectId, sessionId);
-        if (unmountedRef.current || sessionGenerationRef.current !== generation) {
-          console.debug('proposal-chat discard stale history response', {
-            projectId,
-            sessionId,
-            generation,
-            currentGeneration: sessionGenerationRef.current,
-            at: nowIso(),
-          });
-          return;
-        }
-        setMessages(history.messages);
-      } catch (e) {
-        if (sessionGenerationRef.current !== generation) {
-          return;
-        }
-        console.warn('proposal-chat history load failed', {
-          sessionId,
-          generation,
-          error: e instanceof Error ? e.message : String(e),
-        });
-      } finally {
-        if (sessionGenerationRef.current !== generation) {
-          return;
-        }
-        historyLoadedRef.current = true;
-        if (!unmountedRef.current) {
-          connect(generation);
-        }
-      }
-    })();
+    connect(generation);
 
     return () => {
       unmountedRef.current = true;
@@ -515,6 +494,29 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
     };
   }, [clearReconnectTimer, connect, projectId, sessionId, transitionStatus]);
 
+  const submitPrompt = useCallback(
+    (content: string, clientMessageId: string, reason: 'send_message' | 'retry_message') => {
+      setError(null);
+      updateSubmissionLock(true, reason);
+      transitionStatus('submitted', reason);
+
+      const payload = JSON.stringify({
+        type: 'prompt',
+        content,
+        client_message_id: clientMessageId,
+      });
+
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        pendingPromptsRef.current.push({ content, clientMessageId });
+        return;
+      }
+
+      ws.send(payload);
+    },
+    [transitionStatus, updateSubmissionLock],
+  );
+
   const sendMessage = useCallback(
     (content: string) => {
       if (!sessionId) return;
@@ -528,28 +530,31 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
         role: 'user',
         content: trimmed,
         timestamp: nowIso(),
-        sendStatus: wsConnected ? 'sent' : 'pending',
+        sendStatus: 'pending',
       });
 
-      setError(null);
-      updateSubmissionLock(true, 'send_message');
-      transitionStatus('submitted', 'send_message');
+      submitPrompt(trimmed, clientMessageId, 'send_message');
+    },
+    [appendOrUpdateMessage, sessionId, submitPrompt, submissionLock.isLocked],
+  );
 
-      const payload = JSON.stringify({
-        type: 'prompt',
-        content: trimmed,
-        client_message_id: clientMessageId,
-      });
-
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        pendingPromptsRef.current.push({ content: trimmed, clientMessageId });
+  const retryMessage = useCallback(
+    (messageId: string) => {
+      if (submissionLock.isLocked) {
+        return;
+      }
+      const target = messages.find((message) => message.id === messageId && message.role === 'user');
+      if (!target || target.sendStatus !== 'failed') {
         return;
       }
 
-      ws.send(payload);
+      appendOrUpdateMessage({
+        ...target,
+        sendStatus: 'pending',
+      });
+      submitPrompt(target.content, target.id, 'retry_message');
     },
-    [appendOrUpdateMessage, sessionId, transitionStatus, submissionLock.isLocked, updateSubmissionLock, wsConnected],
+    [appendOrUpdateMessage, messages, submissionLock.isLocked, submitPrompt],
   );
 
   const stop = useCallback(() => {
@@ -584,6 +589,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       messages,
       status,
       sendMessage,
+      retryMessage,
       stop,
       error,
       activeElicitation,
@@ -597,6 +603,7 @@ export function useProposalChat(projectId: string | null, sessionId: string | nu
       messages,
       sendElicitationResponse,
       sendMessage,
+      retryMessage,
       status,
       stop,
       wsConnected,
