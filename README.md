@@ -1,43 +1,45 @@
 # Conflux
 
+[![日本語](https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-blue?style=flat-square)](./README.ja.md) [![English](https://img.shields.io/badge/English-blue?style=flat-square)](./README.md) [![简体中文](https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-blue?style=flat-square)](./README.zh-CN.md) [![Español](https://img.shields.io/badge/Espa%C3%B1ol-blue?style=flat-square)](./README.es.md) [![Português%20(BR)](https://img.shields.io/badge/Portugu%C3%AAs%20(BR)-blue?style=flat-square)](./README.pt-BR.md) [![한국어](https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-blue?style=flat-square)](./README.ko.md) [![Français](https://img.shields.io/badge/Fran%C3%A7ais-blue?style=flat-square)](./README.fr.md) [![Deutsch](https://img.shields.io/badge/Deutsch-blue?style=flat-square)](./README.de.md) [![Русский](https://img.shields.io/badge/%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-blue?style=flat-square)](./README.ru.md) [![Tiếng%20Việt](https://img.shields.io/badge/Ti%E1%BA%BFng%20Vi%E1%BB%87t-blue?style=flat-square)](./README.vi.md)
+
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ![Conflux TUI](docs/images/conflux-tui.jpg)
 
-Conflux is a tool that orchestrates self-driving AI coding agents around specification-driven development. Without a human constantly supervising it, Conflux keeps changes moving through implementation, acceptance, archival, and the final merge as one continuous flow.
+Conflux is a tool that orchestrates autonomous development by AI coding agents based on specification-driven development. Without requiring continuous human supervision, it keeps changes moving through a full workflow: application, acceptance judgment, archiving, and final merge.
 
-The goal is not one-off code generation. The goal is to define the spec first, then keep building against that spec so a production-minded, non-trivial product can keep moving forward over time.
+The goal is not one-off code generation. It is to define the specification first, then continuously grow a production-minded, substantial finished product by stacking changes that follow that specification.
 
-Conflux is also vendor-agnostic. It is designed so you can swap in agents such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/openai-codex/), and [OpenCode](https://opencode.ai/).
+Conflux is also not tied to any specific AI vendor. It is designed so you can swap tools such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/openai-codex/), and [OpenCode](https://opencode.ai/).
 
-## Core Concepts
+## Core Concepts of Conflux
 
-- **Self-driving development that keeps moving while you sleep**: AI agents process changes one by one and keep the project advancing without constant human attention.
-- **Specification-driven development**: Using [OpenSpec](https://github.com/openspec/openspec), Conflux defines the spec first, then drives implementation, acceptance, and iteration against that spec.
-- **Growing a non-trivial finished product continuously**: Instead of stopping at a single generation step, Conflux accumulates changes and keeps pushing the product toward a finished state.
+- **Autonomous development that keeps moving while you sleep**: Even without constant human attention, AI agents process changes one by one and keep development moving forward.
+- **Specification-driven development**: Using [OpenSpec](https://github.com/openspec/openspec), you define the specification first, then proceed with implementation, acceptance, and improvement based on it.
+- **Continuously growing a substantial finished product**: Instead of stopping at one-off generation, Conflux accumulates changes over time and steadily moves closer to a finished product.
 
-## How Conflux makes that possible
+## Mechanisms That Make It Work
 
-- **Multi-Ralph loops**: Conflux improves through repeated iterations while keeping the carried context minimal in each pass, which makes LLM usage more efficient.
-- **Parallel development with git worktrees**: Conflux assigns an isolated worktree to each change so multiple changes can progress safely in parallel.
-- **Vendor-agnostic agent selection**: Conflux is not tied to a single vendor. Agents like [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/openai-codex/), and [OpenCode](https://opencode.ai/) can be swapped depending on the role.
-- **Separation of implementation and acceptance**: Conflux separates the agent that pushes implementation forward from the agent that inspects and accepts the result. This lets you pair a fast coder with a stronger reviewer, improving both LLM efficiency and overall development speed.
+- **Multi-layer Ralph loops**: Conflux improves through repeated iteration while keeping the context handed off in each iteration as small as possible, making LLM usage more efficient.
+- **Parallel development with git worktree**: By assigning an independent worktree to each change, Conflux enables multiple changes to proceed safely in parallel.
+- **Vendor-independent agent choice**: Conflux is not locked to any specific vendor such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/openai-codex/), or [OpenCode](https://opencode.ai/). You can swap implementation and evaluation agents depending on the task.
+- **Separation of implementation and acceptance roles**: By separating the role that drives implementation from the role that evaluates the result, you can combine a fast coder with a smarter reviewer. This improves overall development speed while using LLMs more efficiently.
 
-In short, Conflux is an orchestrator for self-driving, specification-driven development: a practical development flow with parallel execution and role separation that keeps a non-trivial product moving forward continuously.
+In short, Conflux is an **orchestrator for running autonomous, specification-driven development as a practical development workflow with parallel execution and clear role separation, continuously pushing a substantial finished product forward**.
 
 ## Main Usage
 
-| Use | Command |
+| Usage | Command |
 |------|---------|
 | TUI | `cflx` |
-| Headless run | `cflx run` |
+| Headless execution | `cflx run` |
 
-For server mode, remote TUI, REST API, Web UI, and `cflx service`, see the [Server Mode Guide](docs/guides/SERVER.md).
+For server mode, remote TUI, REST API, and `cflx service`, see the [Server Mode Guide (English)](docs/guides/SERVER.md).
 
 ## Quick Start
 
-For first-time setup, see [QUICKSTART.md](QUICKSTART.md).
+For initial setup, see [QUICKSTART.md](QUICKSTART.md).
 
 ## Basic Commands
 
@@ -45,13 +47,13 @@ For first-time setup, see [QUICKSTART.md](QUICKSTART.md).
 # TUI
 cflx
 
-# Headless run
+# Headless execution
 cflx run
 
-# Run a specific change
+# Run only a specific change
 cflx run --change add-feature-x
 
-# Initialize configuration
+# Initialize the configuration file
 cflx init
 
 # Install bundled skills
@@ -60,13 +62,13 @@ cflx install-skills
 
 ## Configuration
 
-Configuration files use JSONC.
+The configuration file format is JSONC.
 
 - `.cflx.jsonc`
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
-Generate a template:
+Generate templates:
 
 ```bash
 cflx init
@@ -75,7 +77,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-For detailed configuration examples, hooks, workspace execution, and command queue behavior, see the additional guides below.
+For detailed configuration examples, hooks, workspace execution, and command queue explanations, see the English README.
 
 ## Installation
 
@@ -87,11 +89,11 @@ cargo install cflx
 
 | Document | Description |
 |----------|-------------|
-| [QUICKSTART.md](QUICKSTART.md) | First-time setup |
-| [Server Mode Guide](docs/guides/SERVER.md) | Server mode, remote TUI, Web UI, REST API, background service |
-| [README.ja.md](README.ja.md) | Japanese translation |
+| [QUICKSTART.md](QUICKSTART.md) | Initial setup |
+| [Server Mode Guide (English)](docs/guides/SERVER.md) | Server mode, remote TUI, Web UI, REST API, background service |
+| [README.md](README.md) | Full documentation (English) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Usage examples |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Contributing guide |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Development guide |
 | [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Release guide |
 | [docs/openapi.yaml](docs/openapi.yaml) | API specification |

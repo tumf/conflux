@@ -1,0 +1,103 @@
+# Conflux
+
+[![日本語](https://img.shields.io/badge/%E6%97%A5%E6%9C%AC%E8%AA%9E-blue?style=flat-square)](./README.ja.md) [![English](https://img.shields.io/badge/English-blue?style=flat-square)](./README.md) [![简体中文](https://img.shields.io/badge/%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-blue?style=flat-square)](./README.zh-CN.md) [![Español](https://img.shields.io/badge/Espa%C3%B1ol-blue?style=flat-square)](./README.es.md) [![Português%20(BR)](https://img.shields.io/badge/Portugu%C3%AAs%20(BR)-blue?style=flat-square)](./README.pt-BR.md) [![한국어](https://img.shields.io/badge/%ED%95%9C%EA%B5%AD%EC%96%B4-blue?style=flat-square)](./README.ko.md) [![Français](https://img.shields.io/badge/Fran%C3%A7ais-blue?style=flat-square)](./README.fr.md) [![Deutsch](https://img.shields.io/badge/Deutsch-blue?style=flat-square)](./README.de.md) [![Русский](https://img.shields.io/badge/%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-blue?style=flat-square)](./README.ru.md) [![Tiếng%20Việt](https://img.shields.io/badge/Ti%E1%BA%BFng%20Vi%E1%BB%87t-blue?style=flat-square)](./README.vi.md)
+
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+![Conflux TUI](docs/images/conflux-tui.jpg)
+
+Conflux es una herramienta que orquesta el desarrollo autónomo de agentes de codificación de IA basado en desarrollo guiado por especificaciones. Sin necesidad de supervisión humana constante, mantiene los cambios avanzando a través de todo el flujo: aplicación, validación de aceptación, archivado y fusión final.
+
+El objetivo no es la generación puntual de código. La idea es definir primero la especificación y, a partir de ella, seguir acumulando cambios para hacer crecer de forma continua un producto terminado de cierta escala y pensado para uso real.
+
+Además, Conflux no depende de un proveedor específico de IA. Está diseñado para poder intercambiar herramientas como [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/openai-codex/) y [OpenCode](https://opencode.ai/).
+
+## Conceptos básicos de Conflux
+
+- **Desarrollo autónomo que avanza mientras duermes**: Aunque no haya una persona pendiente todo el tiempo, los agentes de IA procesan los cambios uno por uno y hacen avanzar el desarrollo.
+- **Desarrollo guiado por especificaciones**: Con [OpenSpec](https://github.com/openspec/openspec), primero se define la especificación y después se avanza en implementación, validación y mejora conforme a ella.
+- **Hacer crecer continuamente un producto terminado de cierta escala**: No se queda en una generación puntual; Conflux acumula cambios y acerca progresivamente el proyecto a un producto completo.
+
+## Mecanismos que lo hacen posible
+
+- **Bucles Ralph múltiples**: Mejora mediante iteraciones repetidas, manteniendo al mínimo el contexto que se transfiere en cada iteración para usar los LLM de forma más eficiente.
+- **Desarrollo en paralelo con git worktree**: Al asignar un worktree independiente a cada change, Conflux permite avanzar con seguridad en varios cambios en paralelo.
+- **Elección de agentes independiente del proveedor**: No queda atado a un proveedor concreto como [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://openai.com/index/openai-codex/) u [OpenCode](https://opencode.ai/). Puedes sustituir los agentes de implementación o evaluación según el objetivo.
+- **Separación entre implementación y aceptación**: Al separar el rol que impulsa la implementación del rol que valida el resultado, puedes combinar un codificador rápido con un revisor más inteligente. Así se aprovechan mejor los LLM y también se acelera el desarrollo en conjunto.
+
+En resumen, Conflux es un **orquestador para operar el desarrollo autónomo basado en especificaciones como un flujo de desarrollo práctico, con ejecución en paralelo y separación de roles, y para seguir impulsando de forma continua un producto terminado de cierta escala**.
+
+## Uso principal
+
+| Uso | Comando |
+|------|---------|
+| TUI | `cflx` |
+| Ejecución headless | `cflx run` |
+
+Para el modo servidor, la TUI remota, la API REST y `cflx service`, consulta la [guía del modo servidor (en inglés)](docs/guides/SERVER.md).
+
+## Inicio rápido
+
+Para la configuración inicial, consulta [QUICKSTART.es.md](QUICKSTART.es.md).
+
+## Comandos básicos
+
+```bash
+# TUI
+cflx
+
+# Ejecución headless
+cflx run
+
+# Ejecutar solo un cambio específico
+cflx run --change add-feature-x
+
+# Inicializar el archivo de configuración
+cflx init
+
+# Instalar bundled skills
+cflx install-skills
+```
+
+## Configuración
+
+El archivo de configuración usa formato JSONC.
+
+- `.cflx.jsonc`
+- `~/.config/cflx/config.jsonc`
+- `--config <PATH>`
+
+Generación de plantillas:
+
+```bash
+cflx init
+cflx init --template opencode
+cflx init --template codex
+cflx init --force
+```
+
+Para ejemplos detallados de configuración, hooks, ejecución en workspaces y la cola de comandos, consulta el README en inglés.
+
+## Instalación
+
+```bash
+cargo install cflx
+```
+
+## Documentación
+
+| Documento | Descripción |
+|----------|-------------|
+| [QUICKSTART.es.md](QUICKSTART.es.md) | Configuración inicial |
+| [Guía del modo servidor (en inglés)](docs/guides/SERVER.md) | Modo servidor, TUI remota, Web UI, API REST, servicio en segundo plano |
+| [README.md](README.md) | Documentación completa (inglés) |
+| [docs/guides/USAGE.md](docs/guides/USAGE.md) | Ejemplos de uso |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Guía de contribución |
+| [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Guía de desarrollo |
+| [docs/guides/RELEASE.md](docs/guides/RELEASE.md) | Guía de lanzamiento |
+| [docs/openapi.yaml](docs/openapi.yaml) | Especificación de API |
+
+## Licencia
+
+MIT
