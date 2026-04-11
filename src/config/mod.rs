@@ -413,6 +413,22 @@ mod tests {
     }
 
     #[test]
+    fn test_load_from_custom_path_returns_parse_error_with_path_context() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        writeln!(temp_file, r#"{{"apply_command": invalid-json}}"#).unwrap();
+
+        let result = OrchestratorConfig::load_from_file(temp_file.path());
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to parse config file"));
+        assert!(err_msg.contains(&temp_file.path().display().to_string()));
+    }
+
+    #[test]
     #[ignore] // Requires isolated environment (may load global config)
     fn test_load_returns_error_when_no_config_exists() {
         use std::env;

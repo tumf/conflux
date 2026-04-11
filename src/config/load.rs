@@ -5,7 +5,7 @@
 //! that perform actual file I/O.
 
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::{OrchestratorError, Result};
 
@@ -24,7 +24,13 @@ impl OrchestratorConfig {
             OrchestratorError::ConfigLoad(format!("Failed to read config file {:?}: {}", path, e))
         })?;
 
-        Self::parse_jsonc(&content)
+        Self::parse_jsonc(&content).map_err(|err| match err {
+            OrchestratorError::ConfigParse(msg) => OrchestratorError::ConfigParse(format!(
+                "Failed to parse config file {:?}: {}",
+                path, msg
+            )),
+            other => other,
+        })
     }
 
     /// Parse JSONC content (JSON with Comments)
@@ -67,8 +73,15 @@ impl OrchestratorConfig {
         // 1-3. Global config candidates in merge priority order.
         for path in get_global_config_paths() {
             if path.exists() {
-                if let Ok(c) = Self::load_from_file(&path) {
-                    merged.merge(c);
+                match Self::load_from_file(&path) {
+                    Ok(c) => merged.merge(c),
+                    Err(err) => {
+                        warn!(
+                            path = ?path,
+                            error = %err,
+                            "Failed to load global server config candidate; skipping"
+                        );
+                    }
                 }
             }
         }
