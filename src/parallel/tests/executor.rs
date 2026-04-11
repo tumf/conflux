@@ -392,7 +392,10 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
 
     std::fs::write(repo_root.join("dirty.txt"), "dirty").or_fail("unexpected error");
@@ -429,8 +432,14 @@ async fn test_resolve_merge_executes_selected_change_only() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
-    let workspace_b = manager.create_workspace("change-b", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
     commit_workspace_change(&workspace_b, "change-b.txt", "B", "Apply: change-b").await;
 
@@ -548,8 +557,14 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
-    let workspace_b = manager.create_workspace("change-b", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
     std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
@@ -721,8 +736,14 @@ async fn test_merge_allows_non_merge_head_after_merges() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
-    let workspace_b = manager.create_workspace("change-b", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
     std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
@@ -897,7 +918,10 @@ async fn test_merge_retries_when_merge_left_in_progress() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
 
     std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
@@ -1045,8 +1069,14 @@ async fn test_merge_retries_when_merge_commit_missing() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
-    let workspace_b = manager.create_workspace("change-b", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
     std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
@@ -1232,8 +1262,14 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
-    let workspace_b = manager.create_workspace("change-b", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
     std::fs::write(workspace_a.path.join("conflict.txt"), "A").or_fail("unexpected error");
     Command::new("git")
@@ -1361,7 +1397,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         .await
         .or_fail("unexpected error");
 
-    let merged_contents = std::fs::read_to_string(repo_root.join("conflict.txt")).or_fail("unexpected error");
+    let merged_contents =
+        std::fs::read_to_string(repo_root.join("conflict.txt")).or_fail("unexpected error");
     assert!(merged_contents.contains('B'));
 }
 
@@ -1417,7 +1454,10 @@ async fn test_merge_retries_after_pre_commit_changes() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.or_fail("unexpected error");
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
 
     std::fs::write(repo_root.join("main.txt"), "main").or_fail("unexpected error");
     Command::new("git")
@@ -1464,7 +1504,9 @@ async fn test_merge_retries_after_pre_commit_changes() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path).or_fail("unexpected error").permissions();
+        let mut perms = std::fs::metadata(&hook_path)
+            .or_fail("unexpected error")
+            .permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&hook_path, perms).or_fail("unexpected error");
     }
@@ -1558,7 +1600,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         .await
         .or_fail("unexpected error");
 
-    let hook_contents = std::fs::read_to_string(repo_root.join("hooked.txt")).or_fail("unexpected error");
+    let hook_contents =
+        std::fs::read_to_string(repo_root.join("hooked.txt")).or_fail("unexpected error");
     assert!(hook_contents.contains("hooked"));
 }
 
@@ -1572,7 +1615,8 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     init_git_repo(repo_root.path()).await;
 
     // Create a workspace commit so acceptance diff context has a real delta target.
-    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").or_fail("unexpected error");
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["add", "feature.rs"])
         .current_dir(repo_root.path())
@@ -1695,7 +1739,8 @@ async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
-    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").or_fail("unexpected error");
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["add", "feature.rs"])
         .current_dir(repo_root.path())
@@ -1762,7 +1807,9 @@ async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
         other => panic!("expected acceptance command failure, got {:?}", other),
     }
 
-    let revision = get_current_commit(repo_root.path()).await.or_fail("unexpected error");
+    let revision = get_current_commit(repo_root.path())
+        .await
+        .or_fail("unexpected error");
     assert!(
         !crate::parallel::acceptance_state::has_durable_acceptance_pass(
             repo_root.path(),
@@ -1775,7 +1822,9 @@ async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
     let archive_result = execute_archive_in_workspace(
         change_id,
         repo_root.path(),
-        acceptance_config.get_archive_command().or_fail("unexpected error"),
+        acceptance_config
+            .get_archive_command()
+            .or_fail("unexpected error"),
         &acceptance_config,
         None,
         VcsBackend::Git,
