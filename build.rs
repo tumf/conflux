@@ -17,7 +17,7 @@ fn main() {
         if build_script.exists() {
             println!("Building dashboard...");
             let output = Command::new("bash")
-                .arg(build_script.to_str().unwrap())
+                .arg("build.sh")
                 .current_dir(dashboard_dir)
                 .output();
 

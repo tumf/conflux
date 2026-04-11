@@ -35,6 +35,19 @@ exclude = [
   "CLAUDE.md",
   "README.ja.md",
 ]
+include = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "build.rs",
+  "README.md",
+  "src/**",
+  "tests/**",
+  "web/**",
+  "skills/cflx-proposal/**",
+  "skills/cflx-workflow/**",
+  "skills/cflx-run/**",
+  "dashboard/dist/**",
+]
 
 [lib]
 name = "conflux"
