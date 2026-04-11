@@ -20,3 +20,8 @@
 
 - [x] acceptance attempt history に保存する `commit_hash` を開始時 revision ではなく終了時 revision に更新し、次回 acceptance diff context が revision drift しないようにする
 - [x] `src/parallel/executor.rs` の acceptance diff context が直前 acceptance 後の revision を基準に changed files を計算することを、HEAD 変化ありケースで回帰テスト化する
+
+## Acceptance #3 Failure Follow-up
+
+- [x] `src/parallel/tests/executor.rs` を rustfmt で整形し、通常の pre-commit hook 実行で作業ツリーが変更されない状態に戻す
+- [x] archive readiness の品質ゲート（少なくとも `pre-commit run --all-files` と `cargo fmt --check`）を再実行して、hook/fmt failure が解消したことを確認する

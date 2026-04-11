@@ -2167,8 +2167,11 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
         other => panic!("expected acceptance pass, got {:?}", other),
     }
 
-    std::fs::write(repo_root.path().join("post_acceptance_only.rs"), "pub fn only_after() {}\n")
-        .or_fail("unexpected error");
+    std::fs::write(
+        repo_root.path().join("post_acceptance_only.rs"),
+        "pub fn only_after() {}\n",
+    )
+    .or_fail("unexpected error");
     Command::new("git")
         .args(["add", "post_acceptance_only.rs"])
         .current_dir(repo_root.path())
