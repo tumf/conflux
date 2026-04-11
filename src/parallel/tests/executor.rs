@@ -13,11 +13,37 @@ use crate::vcs::{VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, Workspa
 use crate::vcs::{WorkspaceManager, WorkspaceStatus};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+
+trait TestAssertionExt<T> {
+    fn or_fail(self, context: &str) -> T;
+}
+
+impl<T, E> TestAssertionExt<T> for Result<T, E>
+where
+    E: Display,
+{
+    fn or_fail(self, context: &str) -> T {
+        match self {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+}
+
+impl<T> TestAssertionExt<T> for Option<T> {
+    fn or_fail(self, context: &str) -> T {
+        match self {
+            Some(value) => value,
+            None => panic!("{context}: value was None"),
+        }
+    }
+}
 
 const DEFAULT_STAGGER_DELAY_MS: u64 = 2000;
 const DEFAULT_MAX_RETRIES: u32 = 2;
@@ -41,6 +67,20 @@ fn create_test_config_with(overrides: OrchestratorConfig) -> OrchestratorConfig 
     let mut base = create_test_config();
     base.merge(overrides);
     base
+}
+
+#[test]
+#[should_panic(expected = "option missing: value was None")]
+fn test_or_fail_option_reports_context() {
+    let value: Option<u32> = None;
+    let _ = value.or_fail("option missing");
+}
+
+#[test]
+#[should_panic(expected = "io failed: boom")]
+fn test_or_fail_result_reports_context_and_error() {
+    let result: Result<(), &str> = Err("boom");
+    result.or_fail("io failed");
 }
 
 #[test]
@@ -223,33 +263,33 @@ async fn init_git_repo(repo_root: &Path) {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("README.md"), "base").unwrap();
+    std::fs::write(repo_root.join("README.md"), "base").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 }
 
 async fn commit_workspace_change(
@@ -258,19 +298,19 @@ async fn commit_workspace_change(
     contents: &str,
     message: &str,
 ) {
-    std::fs::write(workspace.path.join(filename), contents).unwrap();
+    std::fs::write(workspace.path.join(filename), contents).or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", message])
         .current_dir(&workspace.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 }
 #[test]
 fn test_skip_reason_for_merge_deferred_dependency() {
@@ -339,7 +379,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_resolve_merge_aborts_when_base_dirty() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -352,10 +392,13 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
 
-    std::fs::write(repo_root.join("dirty.txt"), "dirty").unwrap();
+    std::fs::write(repo_root.join("dirty.txt"), "dirty").or_fail("unexpected error");
 
     let result = resolve_deferred_merge(repo_root.to_path_buf(), config, "change-a").await;
     assert!(result.is_err());
@@ -365,7 +408,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     let merge_messages = String::from_utf8_lossy(&merge_log.stdout);
     assert!(!merge_messages.contains("Merge change: change-a"));
 }
@@ -373,11 +416,11 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_resolve_merge_executes_selected_change_only() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
-    let worktree_dir = tempfile::TempDir::new().unwrap();
+    let worktree_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let base_dir = worktree_dir.path().join("worktrees");
-    let resolver_dir = tempfile::TempDir::new().unwrap();
+    let resolver_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let resolver_script = resolver_dir.path().join("merge-resolver.sh");
 
     init_git_repo(repo_root).await;
@@ -389,8 +432,14 @@ async fn test_resolve_merge_executes_selected_change_only() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
-    let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
     commit_workspace_change(&workspace_b, "change-b.txt", "B", "Apply: change-b").await;
 
@@ -401,31 +450,31 @@ async fn test_resolve_merge_executes_selected_change_only() {
             .path
             .join(format!("openspec/changes/{}", change_id));
         if changes_dir.exists() {
-            std::fs::remove_dir_all(&changes_dir).unwrap();
+            std::fs::remove_dir_all(&changes_dir).or_fail("unexpected error");
         }
 
         // Create archive entry as a directory (archive_entry_exists checks directory names)
         let archive_dir = workspace.path.join("openspec/changes/archive");
         let archive_entry = archive_dir.join(change_id);
-        std::fs::create_dir_all(&archive_entry).unwrap();
+        std::fs::create_dir_all(&archive_entry).or_fail("unexpected error");
         std::fs::write(
             archive_entry.join("proposal.md"),
             format!("# Archive entry for {}", change_id),
         )
-        .unwrap();
+        .or_fail("unexpected error");
 
         Command::new("git")
             .args(["add", "-A"])
             .current_dir(&workspace.path)
             .output()
             .await
-            .unwrap();
+            .or_fail("unexpected error");
         Command::new("git")
             .args(["commit", "-m", &format!("Archive: {}", change_id)])
             .current_dir(&workspace.path)
             .output()
             .await
-            .unwrap();
+            .or_fail("unexpected error");
     }
 
     let script_contents = format!(
@@ -440,18 +489,18 @@ async fn test_resolve_merge_executes_selected_change_only() {
         workspace_a.name,
         workspace_a.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     resolve_deferred_merge(repo_root.to_path_buf(), config, "change-a")
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let merge_log = Command::new("git")
         .args(["log", "--merges", "--format=%s"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     let merge_messages = String::from_utf8_lossy(&merge_log.stdout);
     assert!(merge_messages.contains("Merge change: change-a"));
     assert!(!merge_messages.contains("Merge change: change-b"));
@@ -460,7 +509,7 @@ async fn test_resolve_merge_executes_selected_change_only() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_uses_resolve_command_with_change_ids() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -469,37 +518,37 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("README.md"), "base").unwrap();
+    std::fs::write(repo_root.join("README.md"), "base").or_fail("unexpected error");
 
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
@@ -508,36 +557,42 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
-    let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+    std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_b.path.join("change-b.txt"), "B").unwrap();
+    std::fs::write(workspace_b.path.join("change-b.txt"), "B").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-b"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let resolver_script = repo_root.join("merge-resolver.sh");
     let script_contents = format!(
@@ -561,7 +616,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         workspace_b.name,
         workspace_b.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     // Create test AI runner
 
@@ -627,13 +682,13 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
             |_revs, _details| async move { Ok(()) },
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 }
 
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_allows_non_merge_head_after_merges() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -642,37 +697,37 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("README.md"), "base").unwrap();
+    std::fs::write(repo_root.join("README.md"), "base").or_fail("unexpected error");
 
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
@@ -681,36 +736,42 @@ async fn test_merge_allows_non_merge_head_after_merges() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
-    let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+    std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_b.path.join("change-b.txt"), "B").unwrap();
+    std::fs::write(workspace_b.path.join("change-b.txt"), "B").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-b"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let resolver_script = repo_root.join("merge-resolver.sh");
     let script_contents = format!(
@@ -737,7 +798,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         workspace_b.name,
         workspace_b.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     // Create test AI runner
 
@@ -803,13 +864,13 @@ async fn test_merge_allows_non_merge_head_after_merges() {
             |_revs, _details| async move { Ok(()) },
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 }
 
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_retries_when_merge_left_in_progress() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -818,37 +879,37 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("README.md"), "base").unwrap();
+    std::fs::write(repo_root.join("README.md"), "base").or_fail("unexpected error");
 
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
@@ -857,21 +918,24 @@ async fn test_merge_retries_when_merge_left_in_progress() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+    std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let resolver_script = repo_root.join("merge-resolver.sh");
     let script_contents = format!(
@@ -885,7 +949,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
             touch .git/merge-in-progress-marker\n",
         workspace_a.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     // Create test AI runner
 
@@ -951,13 +1015,13 @@ async fn test_merge_retries_when_merge_left_in_progress() {
             |_revs, _details| async move { Ok(()) },
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 }
 
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_retries_when_merge_commit_missing() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -966,37 +1030,37 @@ async fn test_merge_retries_when_merge_commit_missing() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("README.md"), "base").unwrap();
+    std::fs::write(repo_root.join("README.md"), "base").or_fail("unexpected error");
 
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
@@ -1005,36 +1069,42 @@ async fn test_merge_retries_when_merge_commit_missing() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
-    let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+    std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_b.path.join("change-b.txt"), "B").unwrap();
+    std::fs::write(workspace_b.path.join("change-b.txt"), "B").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-b"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let resolver_script = repo_root.join("merge-resolver.sh");
     let script_contents = format!(
@@ -1062,7 +1132,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         workspace_a.name,
         workspace_a.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     // Create test AI runner
 
@@ -1128,14 +1198,14 @@ async fn test_merge_retries_when_merge_commit_missing() {
             |_revs, _details| async move { Ok(()) },
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let merge_log = Command::new("git")
         .args(["log", "--merges", "--format=%s"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     let merge_messages = String::from_utf8_lossy(&merge_log.stdout);
     assert!(merge_messages.contains("Merge change: change-a"));
     assert!(merge_messages.contains("Merge change: change-b"));
@@ -1144,7 +1214,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_resolves_conflict_with_resolve_command() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -1153,37 +1223,37 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("conflict.txt"), "base").unwrap();
+    std::fs::write(repo_root.join("conflict.txt"), "base").or_fail("unexpected error");
 
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
@@ -1192,36 +1262,42 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 2, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
-    let workspace_b = manager.create_workspace("change-b", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
+    let workspace_b = manager
+        .create_workspace("change-b", None)
+        .await
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_a.path.join("conflict.txt"), "A").unwrap();
+    std::fs::write(workspace_a.path.join("conflict.txt"), "A").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_b.path.join("conflict.txt"), "B").unwrap();
+    std::fs::write(workspace_b.path.join("conflict.txt"), "B").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-b"])
         .current_dir(&workspace_b.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let resolver_script = repo_root.join("merge-resolver.sh");
     let script_contents = format!(
@@ -1253,7 +1329,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         workspace_b.name,
         workspace_b.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     // Create test AI runner
 
@@ -1319,9 +1395,10 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
             |_revs, _details| async move { Ok(()) },
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    let merged_contents = std::fs::read_to_string(repo_root.join("conflict.txt")).unwrap();
+    let merged_contents =
+        std::fs::read_to_string(repo_root.join("conflict.txt")).or_fail("unexpected error");
     assert!(merged_contents.contains('B'));
 }
 
@@ -1329,7 +1406,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_merge_retries_after_pre_commit_changes() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
+    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
     let base_dir = repo_root.join("worktrees");
 
@@ -1338,37 +1415,37 @@ async fn test_merge_retries_after_pre_commit_changes() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("hooked.txt"), "base").unwrap();
+    std::fs::write(repo_root.join("hooked.txt"), "base").or_fail("unexpected error");
 
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     Command::new("git")
         .args(["commit", "-m", "Base"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config_with(OrchestratorConfig {
         resolve_command: Some("sh merge-resolver.sh".to_string()),
@@ -1377,35 +1454,38 @@ async fn test_merge_retries_after_pre_commit_changes() {
     let mut manager =
         GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
 
-    let workspace_a = manager.create_workspace("change-a", None).await.unwrap();
+    let workspace_a = manager
+        .create_workspace("change-a", None)
+        .await
+        .or_fail("unexpected error");
 
-    std::fs::write(repo_root.join("main.txt"), "main").unwrap();
+    std::fs::write(repo_root.join("main.txt"), "main").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Main update"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    std::fs::write(workspace_a.path.join("change-a.txt"), "A").unwrap();
+    std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(&workspace_a.path)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let hooks_dir = repo_root.join(".git/hooks");
     let hook_path = hooks_dir.join("pre-commit");
@@ -1420,13 +1500,15 @@ async fn test_merge_retries_after_pre_commit_changes() {
           exit 1\n\
         fi\n\
         exit 0\n";
-    std::fs::write(&hook_path, hook_contents).unwrap();
+    std::fs::write(&hook_path, hook_contents).or_fail("unexpected error");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path).unwrap().permissions();
+        let mut perms = std::fs::metadata(&hook_path)
+            .or_fail("unexpected error")
+            .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms).unwrap();
+        std::fs::set_permissions(&hook_path, perms).or_fail("unexpected error");
     }
 
     let resolver_script = repo_root.join("merge-resolver.sh");
@@ -1450,7 +1532,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         workspace_a.name,
         workspace_a.name
     );
-    std::fs::write(&resolver_script, script_contents).unwrap();
+    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     // Create test AI runner
 
@@ -1516,9 +1598,10 @@ async fn test_merge_retries_after_pre_commit_changes() {
             |_revs, _details| async move { Ok(()) },
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
-    let hook_contents = std::fs::read_to_string(repo_root.join("hooked.txt")).unwrap();
+    let hook_contents =
+        std::fs::read_to_string(repo_root.join("hooked.txt")).or_fail("unexpected error");
     assert!(hook_contents.contains("hooked"));
 }
 
@@ -1528,23 +1611,24 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
-    let repo_root = TempDir::new().unwrap();
+    let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
     // Create a workspace commit so acceptance diff context has a real delta target.
-    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").unwrap();
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["add", "feature.rs"])
         .current_dir(repo_root.path())
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(repo_root.path())
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let acceptance_output = "ACCEPTANCE: FAIL\n\nFINDINGS:\n- archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)\n- secondary finding\n";
     let config = create_test_config_with(OrchestratorConfig {
@@ -1588,7 +1672,7 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
         Some("main"),
     )
     .await
-    .unwrap();
+    .or_fail("unexpected error");
 
     match result {
         crate::orchestration::AcceptanceResult::Fail { findings } => {
@@ -1652,31 +1736,32 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
 async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
     use tempfile::TempDir;
 
-    let repo_root = TempDir::new().unwrap();
+    let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
-    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n").unwrap();
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["add", "feature.rs"])
         .current_dir(repo_root.path())
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Apply: change-a"])
         .current_dir(repo_root.path())
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let change_id = "change-a";
     let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
-    std::fs::create_dir_all(&tasks_dir).unwrap();
+    std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
     std::fs::write(
         tasks_dir.join("tasks.md"),
         "## Implementation Tasks\n\n- [x] 1. done\n",
     )
-    .unwrap();
+    .or_fail("unexpected error");
 
     let acceptance_config = create_test_config_with(OrchestratorConfig {
         acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS; exit 9'".to_string()),
@@ -1715,27 +1800,31 @@ async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
         Some("main"),
     )
     .await
-    .unwrap();
+    .or_fail("unexpected error");
 
     match result {
         crate::orchestration::AcceptanceResult::CommandFailed { .. } => {}
         other => panic!("expected acceptance command failure, got {:?}", other),
     }
 
-    let revision = get_current_commit(repo_root.path()).await.unwrap();
+    let revision = get_current_commit(repo_root.path())
+        .await
+        .or_fail("unexpected error");
     assert!(
         !crate::parallel::acceptance_state::has_durable_acceptance_pass(
             repo_root.path(),
             &revision
         )
-        .unwrap(),
+        .or_fail("unexpected error"),
         "durable acceptance state must not be passed after non-zero acceptance exit"
     );
 
     let archive_result = execute_archive_in_workspace(
         change_id,
         repo_root.path(),
-        acceptance_config.get_archive_command().unwrap(),
+        acceptance_config
+            .get_archive_command()
+            .or_fail("unexpected error"),
         &acceptance_config,
         None,
         VcsBackend::Git,
@@ -1898,8 +1987,8 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     use tokio::sync::{mpsc, Semaphore};
     use tokio::task::JoinSet;
 
-    let repo_dir = TempDir::new().unwrap();
-    let workspace_base = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config_with(OrchestratorConfig {
@@ -1931,7 +2020,7 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(!should_break);
     assert_eq!(iteration, 2);
@@ -1968,8 +2057,8 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
     use tokio::sync::{mpsc, Semaphore};
     use tokio::task::JoinSet;
 
-    let repo_dir = TempDir::new().unwrap();
-    let workspace_base = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config_with(OrchestratorConfig {
@@ -2011,7 +2100,7 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(
         !should_break,
@@ -2046,7 +2135,7 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(
         !should_break,
@@ -2079,8 +2168,8 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
     use tokio::sync::{mpsc, Semaphore};
     use tokio::task::JoinSet;
 
-    let repo_dir = TempDir::new().unwrap();
-    let workspace_base = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config_with(OrchestratorConfig {
@@ -2116,7 +2205,7 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(!should_break);
     assert_eq!(iteration, 2);
@@ -2135,8 +2224,8 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
     use tokio::sync::{mpsc, Semaphore};
     use tokio::task::JoinSet;
 
-    let repo_dir = TempDir::new().unwrap();
-    let workspace_base = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config_with(OrchestratorConfig {
@@ -2168,7 +2257,7 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(!should_break);
     assert_eq!(iteration, 1, "dispatch 0件では iteration は進まない");
@@ -2188,7 +2277,7 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(!should_break);
     assert_eq!(
@@ -2210,8 +2299,8 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
     use tokio::sync::{mpsc, Semaphore};
     use tokio::task::JoinSet;
 
-    let repo_dir = TempDir::new().unwrap();
-    let workspace_base = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config_with(OrchestratorConfig {
@@ -2248,7 +2337,7 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
             &mut cleanup_guard,
         )
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     assert!(
         !should_break,
@@ -2277,7 +2366,7 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
-    let repo_dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config();
@@ -2310,7 +2399,7 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
-    let repo_dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config();
@@ -2338,7 +2427,7 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
 async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
     use tempfile::TempDir;
 
-    let repo_dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
 
     let config = create_test_config();
@@ -2382,7 +2471,7 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
         .find(|change| change.id == preferred_change_id)
         .map(|change| change.id.clone())
         .or_else(|| all_changes.first().map(|change| change.id.clone()))
-        .expect("expected at least one change");
+        .or_fail("expected at least one change");
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
@@ -2471,7 +2560,7 @@ async fn test_queue_notification_triggers_reanalysis() {
     queue.push("test-change".to_string()).await;
 
     // Verify the notification was received
-    let result = handle.await.unwrap();
+    let result = handle.await.or_fail("unexpected error");
     assert!(
         result.is_ok(),
         "Queue notification should have been received"
@@ -2486,7 +2575,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -2495,39 +2584,39 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create openspec/changes/test-change directory (simulating incomplete archive)
     let change_dir = repo_root.join("openspec/changes/test-change");
-    fs::create_dir_all(&change_dir).unwrap();
-    fs::write(change_dir.join("spec.md"), "# Test").unwrap();
+    fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    fs::write(change_dir.join("spec.md"), "# Test").or_fail("unexpected error");
 
     // Commit the change directory to ensure working tree is clean
     Command::new("git")
@@ -2535,13 +2624,13 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Add test change (not archived)"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create executor
     let config = create_test_config();
@@ -2587,7 +2676,7 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -2596,54 +2685,54 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create archive directory but NOT openspec/changes/test-change (proper archive)
     let archive_dir = repo_root.join("openspec/changes/archive/test-change");
-    fs::create_dir_all(&archive_dir).unwrap();
-    fs::write(archive_dir.join("spec.md"), "# Archived").unwrap();
+    fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    fs::write(archive_dir.join("spec.md"), "# Archived").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Archive: test-change"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create worktree for the change (outside the main repo to avoid dirty working tree)
-    let workspace_base = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     let workspace_path = workspace_base.path().join("ws-test-change");
 
     Command::new("git")
@@ -2652,13 +2741,13 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
             "add",
             "-b",
             "ws-test-change",
-            workspace_path.to_str().unwrap(),
+            workspace_path.to_str().or_fail("unexpected error"),
             "HEAD",
         ])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create executor
     let config = create_test_config_with(OrchestratorConfig {
@@ -2792,7 +2881,7 @@ async fn test_on_merged_hook_execution() {
     use crate::hooks::{HookConfig, HookRunner, HooksConfig};
     use tempfile::TempDir;
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path().to_path_buf();
 
     // Create a marker file path to verify hook execution
@@ -2853,7 +2942,7 @@ async fn test_attempt_merge_deferred_when_resolve_active() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -2862,34 +2951,34 @@ async fn test_attempt_merge_deferred_when_resolve_active() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     let config = create_test_config();
     let (tx, _rx) = mpsc::channel(10);
@@ -2934,7 +3023,7 @@ async fn test_merge_deferred_when_worktree_dirty() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -2943,39 +3032,39 @@ async fn test_merge_deferred_when_worktree_dirty() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create archive directory to simulate that archive was successful (change moved to archive)
     let archive_dir = repo_root.join("openspec/changes/archive/2024-01-01-test-change");
-    fs::create_dir_all(&archive_dir).unwrap();
-    fs::write(archive_dir.join("spec.md"), "# Archived Test").unwrap();
+    fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    fs::write(archive_dir.join("spec.md"), "# Archived Test").or_fail("unexpected error");
 
     // Commit the archive
     Command::new("git")
@@ -2983,16 +3072,16 @@ async fn test_merge_deferred_when_worktree_dirty() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Archive: test-change"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create a dirty file (uncommitted change)
-    fs::write(repo_root.join("dirty.txt"), "dirty content").unwrap();
+    fs::write(repo_root.join("dirty.txt"), "dirty content").or_fail("unexpected error");
 
     // Create executor
     let config = create_test_config();
@@ -3034,7 +3123,7 @@ async fn test_merge_deferred_when_archive_entry_missing() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -3043,34 +3132,34 @@ async fn test_merge_deferred_when_archive_entry_missing() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Note: No archive directory created - this simulates archive entry missing
     // And no openspec/changes/test-change directory (simulating change was removed but not archived)
@@ -3117,7 +3206,7 @@ async fn test_merge_proceeds_when_archive_complete() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -3126,54 +3215,54 @@ async fn test_merge_proceeds_when_archive_complete() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create archive directory but NOT openspec/changes/test-change (proper archive)
     let archive_dir = repo_root.join("openspec/changes/archive/test-change");
-    fs::create_dir_all(&archive_dir).unwrap();
-    fs::write(archive_dir.join("spec.md"), "# Archived").unwrap();
+    fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    fs::write(archive_dir.join("spec.md"), "# Archived").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Archive: test-change"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create worktree for the change (outside the main repo to avoid dirty working tree)
-    let workspace_base = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     let workspace_path = workspace_base.path().join("ws-test-change");
 
     Command::new("git")
@@ -3182,13 +3271,13 @@ async fn test_merge_proceeds_when_archive_complete() {
             "add",
             "-b",
             "ws-test-change",
-            workspace_path.to_str().unwrap(),
+            workspace_path.to_str().or_fail("unexpected error"),
             "HEAD",
         ])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create executor
     let config = create_test_config_with(OrchestratorConfig {
@@ -3234,7 +3323,7 @@ async fn test_attempt_merge_errors_on_detached_head() {
     use tokio::sync::mpsc;
 
     // Create temporary repository
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
 
     // Initialize git repo
@@ -3243,51 +3332,51 @@ async fn test_attempt_merge_errors_on_detached_head() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["config", "user.name", "Test User"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create initial commit
-    fs::write(repo_root.join("README.md"), "initial").unwrap();
+    fs::write(repo_root.join("README.md"), "initial").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Initial"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create archive directory but NOT openspec/changes/test-change (proper archive)
     let archive_dir = repo_root.join("openspec/changes/archive/test-change");
-    fs::create_dir_all(&archive_dir).unwrap();
-    fs::write(archive_dir.join("spec.md"), "# Archived").unwrap();
+    fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    fs::write(archive_dir.join("spec.md"), "# Archived").or_fail("unexpected error");
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     Command::new("git")
         .args(["commit", "-m", "Archive: test-change"])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Detach HEAD explicitly
     let detached_rev = Command::new("git")
@@ -3295,7 +3384,7 @@ async fn test_attempt_merge_errors_on_detached_head() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
     let detached_rev = String::from_utf8_lossy(&detached_rev.stdout)
         .trim()
         .to_string();
@@ -3304,10 +3393,10 @@ async fn test_attempt_merge_errors_on_detached_head() {
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create worktree for the change (outside the main repo to avoid dirty working tree)
-    let workspace_base = TempDir::new().unwrap();
+    let workspace_base = TempDir::new().or_fail("unexpected error");
     let workspace_path = workspace_base.path().join("ws-test-change");
 
     Command::new("git")
@@ -3316,13 +3405,13 @@ async fn test_attempt_merge_errors_on_detached_head() {
             "add",
             "-b",
             "ws-test-change",
-            workspace_path.to_str().unwrap(),
+            workspace_path.to_str().or_fail("unexpected error"),
             "HEAD",
         ])
         .current_dir(repo_root)
         .output()
         .await
-        .unwrap();
+        .or_fail("unexpected error");
 
     // Create executor
     let config = create_test_config_with(OrchestratorConfig {
