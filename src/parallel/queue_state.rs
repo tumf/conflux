@@ -529,14 +529,12 @@ impl ParallelExecutor {
                         .await;
                     }
                 }
-                Ok(super::merge::MergeAttempt::Deferred(reason)) => {
-                    // Re-classify deferred reason: only resolve-in-progress is auto-resumable.
-                    let auto_resumable = reason.contains("Resolve in progress");
+                Ok(super::merge::MergeAttempt::Deferred(deferred)) => {
                     info!(
                         "Deferred merge still blocked for '{}': {} (auto_resumable={})",
-                        change_id, reason, auto_resumable
+                        change_id, deferred.reason, deferred.auto_resumable
                     );
-                    if auto_resumable {
+                    if deferred.auto_resumable {
                         self.merge_wait_changes.remove(&change_id);
                     } else {
                         self.resolve_wait_changes.remove(&change_id);
@@ -546,8 +544,8 @@ impl ParallelExecutor {
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: change_id.clone(),
-                            reason,
-                            auto_resumable,
+                            reason: deferred.reason,
+                            auto_resumable: deferred.auto_resumable,
                         },
                     )
                     .await;
