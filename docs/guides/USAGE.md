@@ -74,26 +74,26 @@ cflx run --change add-feature-x,fix-bug-y,refactor-z
 cflx run --config /path/to/config.jsonc
 ```
 
-## Parallel Execution
+## Workspace Execution
 
-Run independent changes in parallel using Git worktrees:
+Conflux uses Git worktrees in the default execution mode:
 
 ```bash
-# Preview parallelization groups without executing
-cflx run --parallel --dry-run
+# Preview workspace grouping without executing
+cflx run --dry-run
 
-# Execute in parallel
-cflx run --parallel
+# Execute with the default workspace mode
+cflx run
 ```
 
 Resume behavior:
 
 ```bash
-# Parallel mode automatically reuses existing workspaces
-cflx run --parallel
+# Existing workspaces are reused automatically
+cflx run
 
 # Force a fresh start (discard existing workspaces)
-cflx run --parallel --no-resume
+cflx run --no-resume
 ```
 
 ## Web Monitoring
@@ -165,11 +165,11 @@ cflx run
 cflx run
 ```
 
-### Example 5: Parallel Execution with Web Monitoring
+### Example 5: Workspace Execution with Web Monitoring
 
 ```bash
-# Run with parallel mode and web dashboard
-cflx run --parallel --web
+# Run with the default workspace mode and web dashboard
+cflx run --web
 
 # Or use TUI with web monitoring
 cflx --web
