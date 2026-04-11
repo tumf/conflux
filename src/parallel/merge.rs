@@ -52,13 +52,38 @@ pub async fn base_dirty_reason(repo_root: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Deferred merge metadata.
+#[derive(Debug)]
+pub struct DeferredMerge {
+    /// Human-readable reason for defer.
+    pub reason: String,
+    /// Whether deferral is auto-resumable (`ResolveWait`) or requires manual action (`MergeWait`).
+    pub auto_resumable: bool,
+}
+
 /// Result of a merge attempt
 #[derive(Debug)]
 pub enum MergeAttempt {
     /// Merge succeeded, includes the merge revision
     Merged { revision: String },
-    /// Merge deferred with reason (e.g., base dirty, archive not complete)
-    Deferred(String),
+    /// Merge deferred with explicit classification.
+    Deferred(DeferredMerge),
+}
+
+impl DeferredMerge {
+    fn auto(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            auto_resumable: true,
+        }
+    }
+
+    fn manual(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            auto_resumable: false,
+        }
+    }
 }
 
 impl ParallelExecutor {
@@ -214,10 +239,8 @@ impl ParallelExecutor {
                         .await;
                     }
                 }
-                Ok(MergeAttempt::Deferred(reason)) => {
-                    // Merge deferred: only resolve-in-progress reasons are auto-resumable.
-                    let auto_resumable = reason.contains("Resolve in progress");
-                    if auto_resumable {
+                Ok(MergeAttempt::Deferred(deferred)) => {
+                    if deferred.auto_resumable {
                         self.resolve_wait_changes
                             .insert(workspace_result.change_id.clone());
                         self.merge_wait_changes.remove(&workspace_result.change_id);
@@ -238,8 +261,8 @@ impl ParallelExecutor {
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: workspace_result.change_id.clone(),
-                            reason,
-                            auto_resumable,
+                            reason: deferred.reason,
+                            auto_resumable: deferred.auto_resumable,
                         },
                     )
                     .await;
@@ -292,13 +315,13 @@ impl ParallelExecutor {
             .map(|counter| counter.load(std::sync::atomic::Ordering::SeqCst))
             .unwrap_or(0);
         if auto_resolve_count.saturating_add(manual_resolve_count) > 0 {
-            return Ok(MergeAttempt::Deferred(
-                "Resolve in progress for another change".to_string(),
-            ));
+            return Ok(MergeAttempt::Deferred(DeferredMerge::auto(
+                "Resolve in progress for another change",
+            )));
         }
 
         if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
-            return Ok(MergeAttempt::Deferred(reason));
+            return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
         }
 
         if change_ids.len() != archive_paths.len() {
@@ -322,7 +345,7 @@ impl ParallelExecutor {
                         change_id, change_id
                     );
                     tracing::warn!("{}", reason);
-                    return Ok(MergeAttempt::Deferred(reason));
+                    return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
                 }
                 Err(e) => {
                     let reason = format!(
@@ -330,7 +353,7 @@ impl ParallelExecutor {
                         change_id, e
                     );
                     tracing::warn!("{}", reason);
-                    return Ok(MergeAttempt::Deferred(reason));
+                    return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
                 }
             }
         }
@@ -460,9 +483,8 @@ impl ParallelExecutor {
 
                 Ok(())
             }
-            MergeAttempt::Deferred(reason) => {
-                let auto_resumable = reason.contains("Resolve in progress");
-                if auto_resumable {
+            MergeAttempt::Deferred(deferred) => {
+                if deferred.auto_resumable {
                     // Auto-resumable: another merge/resolve is in progress.
                     // Track as deferred so retry_deferred_merges picks it up.
                     self.resolve_wait_changes.insert(change_id.to_string());
@@ -471,7 +493,7 @@ impl ParallelExecutor {
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: change_id.to_string(),
-                            reason: reason.clone(),
+                            reason: deferred.reason.clone(),
                             auto_resumable: true,
                         },
                     )
@@ -482,12 +504,12 @@ impl ParallelExecutor {
                         &self.event_tx,
                         ParallelEvent::ResolveFailed {
                             change_id: change_id.to_string(),
-                            error: reason.clone(),
+                            error: deferred.reason.clone(),
                         },
                     )
                     .await;
                 }
-                Err(OrchestratorError::GitCommand(reason))
+                Err(OrchestratorError::GitCommand(deferred.reason))
             }
         }
     }
@@ -735,30 +757,19 @@ pub async fn resolve_deferred_merge(
 
 #[cfg(test)]
 mod tests {
+    use super::DeferredMerge;
+
     #[test]
-    fn test_resolve_in_progress_reason_is_auto_resumable() {
-        let auto_resumable =
-            "Resolve in progress for another change".contains("Resolve in progress");
-        assert!(auto_resumable);
+    fn test_auto_deferred_sets_auto_resumable_true() {
+        let deferred = DeferredMerge::auto("Resolve in progress for another change");
+        assert!(deferred.auto_resumable);
+        assert_eq!(deferred.reason, "Resolve in progress for another change");
     }
 
     #[test]
-    fn test_merge_in_progress_reason_is_not_auto_resumable() {
-        let auto_resumable =
-            "Merge in progress (MERGE_HEAD exists)".contains("Resolve in progress");
-        assert!(!auto_resumable);
-    }
-
-    #[test]
-    fn test_uncommitted_changes_reason_is_not_auto_resumable() {
-        let auto_resumable = "Working tree has uncommitted changes".contains("Resolve in progress");
-        assert!(!auto_resumable);
-    }
-
-    #[test]
-    fn test_archive_incomplete_reason_is_not_auto_resumable() {
-        let auto_resumable = "Archive incomplete for 'change-a': worktree may be dirty"
-            .contains("Resolve in progress");
-        assert!(!auto_resumable);
+    fn test_manual_deferred_sets_auto_resumable_false() {
+        let deferred = DeferredMerge::manual("Working tree has uncommitted changes");
+        assert!(!deferred.auto_resumable);
+        assert_eq!(deferred.reason, "Working tree has uncommitted changes");
     }
 }

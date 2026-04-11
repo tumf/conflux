@@ -3108,16 +3108,17 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Deferred(reason)) => {
+        Ok(MergeAttempt::Deferred(deferred)) => {
+            assert!(!deferred.auto_resumable);
             assert!(
-                reason.contains("Archive incomplete"),
+                deferred.reason.contains("Archive incomplete"),
                 "Expected deferred reason to mention archive incomplete, got: {}",
-                reason
+                deferred.reason
             );
             assert!(
-                reason.contains("test-change"),
+                deferred.reason.contains("test-change"),
                 "Expected reason to include change ID, got: {}",
-                reason
+                deferred.reason
             );
         }
         Ok(MergeAttempt::Merged { .. }) => {
@@ -3231,10 +3232,10 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
         Ok(MergeAttempt::Merged { .. }) => {
             // Success - merge was allowed
         }
-        Ok(MergeAttempt::Deferred(reason)) => {
+        Ok(MergeAttempt::Deferred(deferred)) => {
             panic!(
                 "Merge should have succeeded when change is archived, got deferred: {}",
-                reason
+                deferred.reason
             );
         }
         Err(e) => {
@@ -3458,11 +3459,12 @@ async fn test_attempt_merge_deferred_when_resolve_active() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Deferred(reason)) => {
+        Ok(MergeAttempt::Deferred(deferred)) => {
+            assert!(deferred.auto_resumable);
             assert!(
-                reason.contains("Resolve in progress"),
+                deferred.reason.contains("Resolve in progress"),
                 "Expected deferred reason to mention resolve in progress, got: {}",
-                reason
+                deferred.reason
             );
         }
         Ok(MergeAttempt::Merged { .. }) => {
@@ -3559,11 +3561,12 @@ async fn test_merge_deferred_when_worktree_dirty() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Deferred(reason)) => {
+        Ok(MergeAttempt::Deferred(deferred)) => {
+            assert!(!deferred.auto_resumable);
             assert!(
-                reason.contains("incomplete") || reason.contains("dirty"),
+                deferred.reason.contains("incomplete") || deferred.reason.contains("dirty"),
                 "Expected deferred reason to mention incomplete archive or dirty worktree, got: {}",
-                reason
+                deferred.reason
             );
         }
         Ok(MergeAttempt::Merged { .. }) => {
@@ -3640,13 +3643,14 @@ async fn test_merge_deferred_when_archive_entry_missing() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Deferred(reason)) => {
+        Ok(MergeAttempt::Deferred(deferred)) => {
+            assert!(!deferred.auto_resumable);
             assert!(
-                reason.contains("incomplete")
-                    || reason.contains("archive")
-                    || reason.contains("missing"),
+                deferred.reason.contains("incomplete")
+                    || deferred.reason.contains("archive")
+                    || deferred.reason.contains("missing"),
                 "Expected deferred reason to mention incomplete archive or missing entry, got: {}",
-                reason
+                deferred.reason
             );
         }
         Ok(MergeAttempt::Merged { .. }) => {
@@ -3761,10 +3765,10 @@ async fn test_merge_proceeds_when_archive_complete() {
         Ok(MergeAttempt::Merged { .. }) => {
             // Success - merge was allowed
         }
-        Ok(MergeAttempt::Deferred(reason)) => {
+        Ok(MergeAttempt::Deferred(deferred)) => {
             panic!(
                 "Merge should have succeeded when change is archived, got deferred: {}",
-                reason
+                deferred.reason
             );
         }
         Err(e) => {
@@ -3891,8 +3895,11 @@ async fn test_attempt_merge_errors_on_detached_head() {
         .await;
 
     match result {
-        Ok(MergeAttempt::Deferred(reason)) => {
-            panic!("Detached HEAD must not become MergeDeferred: {}", reason);
+        Ok(MergeAttempt::Deferred(deferred)) => {
+            panic!(
+                "Detached HEAD must not become MergeDeferred: {}",
+                deferred.reason
+            );
         }
         Ok(MergeAttempt::Merged { revision }) => {
             panic!("Detached HEAD must not merge successfully: {}", revision);
