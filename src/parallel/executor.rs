@@ -893,6 +893,10 @@ fn format_acceptance_failure_log_message(findings: &[String]) -> String {
     )
 }
 
+fn resolve_acceptance_state_revision(start_revision: &str, end_revision: Option<String>) -> String {
+    end_revision.unwrap_or_else(|| start_revision.to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
@@ -1112,9 +1116,12 @@ pub async fn execute_acceptance_in_workspace(
         ))
     })?;
 
-    let end_revision = crate::vcs::git::commands::get_current_commit(workspace_path)
-        .await
-        .unwrap_or_else(|_| start_revision.clone());
+    let end_revision = resolve_acceptance_state_revision(
+        &start_revision,
+        crate::vcs::git::commands::get_current_commit(workspace_path)
+            .await
+            .ok(),
+    );
     if end_revision != start_revision {
         warn!(
             module = module_path!(),
@@ -1392,7 +1399,10 @@ pub async fn execute_acceptance_in_workspace(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_acceptance_failure_log_message, run_post_apply_cleanup_review};
+    use super::{
+        format_acceptance_failure_log_message, resolve_acceptance_state_revision,
+        run_post_apply_cleanup_review,
+    };
     use crate::ai_command_runner::AiCommandRunner;
     use crate::command_queue::CommandQueueConfig;
     use crate::config::defaults::default_retry_patterns;
@@ -1499,6 +1509,18 @@ mod tests {
             message,
             "Acceptance failed (0 findings), blocking gate context: no acceptance findings captured"
         );
+    }
+
+    #[test]
+    fn test_resolve_acceptance_state_revision_prefers_end_revision() {
+        let resolved = resolve_acceptance_state_revision("start-rev", Some("end-rev".to_string()));
+        assert_eq!(resolved, "end-rev");
+    }
+
+    #[test]
+    fn test_resolve_acceptance_state_revision_falls_back_to_start_revision() {
+        let resolved = resolve_acceptance_state_revision("start-rev", None);
+        assert_eq!(resolved, "start-rev");
     }
 
     #[test]
