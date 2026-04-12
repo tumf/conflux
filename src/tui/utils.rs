@@ -38,6 +38,25 @@ fn find_change_dir(change_id: &str, base_path: Option<&Path>) -> Option<PathBuf>
         })
 }
 
+enum EditorTarget {
+    Proposal(PathBuf),
+    Directory(PathBuf),
+}
+
+fn resolve_editor_target(change_id: &str, base_path: Option<&Path>) -> Result<EditorTarget> {
+    let change_dir = find_change_dir(change_id, base_path)
+        .ok_or_else(|| OrchestratorError::ChangeNotFound(change_id.to_string()))?;
+    let proposal_path = change_dir.join("proposal.md");
+
+    if proposal_path.exists() {
+        Ok(EditorTarget::Proposal(proposal_path))
+    } else if change_dir.exists() {
+        Ok(EditorTarget::Directory(change_dir))
+    } else {
+        Err(OrchestratorError::ChangeNotFound(change_id.to_string()))
+    }
+}
+
 /// Launch editor for the specified change
 ///
 /// Opens the user's configured editor ($EDITOR) with the change's proposal.md file.
@@ -47,33 +66,28 @@ fn find_change_dir(change_id: &str, base_path: Option<&Path>) -> Option<PathBuf>
 pub fn launch_editor_for_change(change_id: &str) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
-    let change_dir = find_change_dir(change_id, None)
-        .ok_or_else(|| OrchestratorError::ChangeNotFound(change_id.to_string()))?;
-    let proposal_path = change_dir.join("proposal.md");
-
-    // Try to open proposal.md directly if it exists
-    if proposal_path.exists() {
-        info!(
-            module = module_path!(),
-            "Launching editor: {} (file: {:?})", editor, proposal_path
-        );
-        Command::new(&editor)
-            .arg(&proposal_path)
-            .status()
-            .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
-    } else if change_dir.exists() {
-        // Fallback: open directory if proposal.md doesn't exist
-        info!(
-            module = module_path!(),
-            "Launching editor: {} (cwd: {:?})", editor, change_dir
-        );
-        Command::new(&editor)
-            .arg(".")
-            .current_dir(&change_dir)
-            .status()
-            .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
-    } else {
-        return Err(OrchestratorError::ChangeNotFound(change_id.to_string()));
+    match resolve_editor_target(change_id, None)? {
+        EditorTarget::Proposal(proposal_path) => {
+            info!(
+                module = module_path!(),
+                "Launching editor: {} (file: {:?})", editor, proposal_path
+            );
+            Command::new(&editor)
+                .arg(&proposal_path)
+                .status()
+                .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
+        }
+        EditorTarget::Directory(change_dir) => {
+            info!(
+                module = module_path!(),
+                "Launching editor: {} (cwd: {:?})", editor, change_dir
+            );
+            Command::new(&editor)
+                .arg(".")
+                .current_dir(&change_dir)
+                .status()
+                .map_err(|e| OrchestratorError::EditorLaunchFailed(e.to_string()))?;
+        }
     }
 
     Ok(())
@@ -209,6 +223,46 @@ mod tests {
 
         let found = find_change_dir(change_id, Some(&temp_dir));
         assert_eq!(found, Some(archive_dir));
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_editor_target_prefers_proposal_file() {
+        let temp_dir = make_temp_dir("proposal-target");
+        let change_id = "proposal-target";
+        let change_dir = temp_dir.join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let proposal_path = change_dir.join("proposal.md");
+        std::fs::write(&proposal_path, "# proposal\n").unwrap();
+
+        let target = resolve_editor_target(change_id, Some(&temp_dir)).unwrap();
+        match target {
+            EditorTarget::Proposal(path) => assert_eq!(path, proposal_path),
+            EditorTarget::Directory(path) => {
+                panic!("expected proposal target, got directory target: {:?}", path)
+            }
+        }
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_editor_target_falls_back_to_directory_when_missing_proposal() {
+        let temp_dir = make_temp_dir("directory-target");
+        let change_id = "directory-target";
+        let archive_dir = temp_dir
+            .join("openspec/changes/archive")
+            .join(format!("2026-04-11-{}", change_id));
+        std::fs::create_dir_all(&archive_dir).unwrap();
+
+        let target = resolve_editor_target(change_id, Some(&temp_dir)).unwrap();
+        match target {
+            EditorTarget::Directory(path) => assert_eq!(path, archive_dir),
+            EditorTarget::Proposal(path) => {
+                panic!("expected directory target, got proposal target: {:?}", path)
+            }
+        }
 
         std::fs::remove_dir_all(temp_dir).unwrap();
     }

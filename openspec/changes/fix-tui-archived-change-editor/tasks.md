@@ -9,3 +9,8 @@
 
 - 手元の TUI セッションで archived change を実際に選択して `e` を押す手動確認
 - 必要なら act/exp 表示差分の別原因を追う追加 proposal を切り出す
+
+## Acceptance #1 Failure Follow-up
+
+- [x] `cargo test` を修正し、`server::api::projects::tests::test_projects_state_includes_sync_metadata_fields_after_monitor_refresh` が `POST /api/v1/projects` に対して `201 Created` を期待どおり返すようにする
+- [x] archived change editor launch の完了条件に対する検証エビデンスを整合させる（`resolve_editor_target` の unit test を追加し、`proposal.md` 優先と directory fallback の両方を自動検証）
