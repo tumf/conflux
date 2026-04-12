@@ -65,15 +65,15 @@ cd ~/myproject
 git init
 ```
 
-## 3. Bundled Skills installieren
+## 3. Bundled Skills für Claude Code installieren
 
-Fügen Sie die bundled skills von Conflux dem Projekt hinzu.
+Fügen Sie die bundled skills von Conflux für Claude Code dem Projekt hinzu.
 
 ```bash
-cflx install-skills
+cflx install-skills --claude
 ```
 
-Dadurch werden `cflx-*`-Skills unter `./.agents/skills` abgelegt.
+Dadurch werden `cflx-*`-Skills unter `./.claude/skills` abgelegt.
 
 Ob sie zusammen mit `.cflx.jsonc` in Git aufgenommen werden sollen, entscheiden Sie anschließend.
 
@@ -111,7 +111,7 @@ Beim ersten Mal reicht der von `cflx init` erzeugte Inhalt völlig aus.
 
 Beim initialen Setup entscheiden Sie, ob die folgenden zwei Elemente in Git aufgenommen werden sollen:
 
-- `./.agents/skills/cflx-*`
+- `./.claude/skills/cflx-*`
 - `./.cflx.jsonc`
 
 Empfehlung:
@@ -124,7 +124,7 @@ Wenn Sie unsicher sind, können Sie zunächst beide committen. Praktisch ist es,
 Wenn beide zu `.gitignore` hinzugefügt werden sollen:
 
 ```bash
-printf ".agents/skills/cflx-*\n.cflx.jsonc\n" >> .gitignore
+printf ".claude/skills/cflx-*\n.cflx.jsonc\n" >> .gitignore
 git add .gitignore
 git commit -m 'Ignore Conflux local setup files'
 ```
@@ -132,7 +132,7 @@ git commit -m 'Ignore Conflux local setup files'
 Wenn beide ins Repository aufgenommen werden sollen:
 
 ```bash
-git add .agents/skills/cflx-* .cflx.jsonc
+git add .claude/skills/cflx-* .cflx.jsonc
 git commit -m 'Add Conflux setup files'
 ```
 

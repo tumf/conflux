@@ -58,13 +58,13 @@ git init
 
 ## 3. 安装 bundled skills
 
-将 Conflux 自带的 bundled skill 安装到项目中。
+将 Conflux 自带的 bundled skill 作为 Claude Code 用配置安装到项目中。
 
 ```bash
-cflx install-skills
+cflx install-skills --claude
 ```
 
-这样会在 `./.agents/skills` 下安装 `cflx-*` skill。
+这样会在 `./.claude/skills` 下安装 `cflx-*` skill。
 
 是否提交到 Git，可以稍后与 `.cflx.jsonc` 一起统一决定。
 
@@ -102,7 +102,7 @@ Claude Code 模板示例：
 
 在首次设置时，需要决定是否将以下两个内容加入 Git。
 
-- `./.agents/skills/cflx-*`
+- `./.claude/skills/cflx-*`
 - `./.cflx.jsonc`
 
 推荐做法：
@@ -115,7 +115,7 @@ Claude Code 模板示例：
 如果把两者都加入 `.gitignore`：
 
 ```bash
-printf ".agents/skills/cflx-*\n.cflx.jsonc\n" >> .gitignore
+printf ".claude/skills/cflx-*\n.cflx.jsonc\n" >> .gitignore
 git add .gitignore
 git commit -m 'Ignore Conflux local setup files'
 ```
@@ -123,7 +123,7 @@ git commit -m 'Ignore Conflux local setup files'
 如果把两者都加入仓库：
 
 ```bash
-git add .agents/skills/cflx-* .cflx.jsonc
+git add .claude/skills/cflx-* .cflx.jsonc
 git commit -m 'Add Conflux setup files'
 ```
 
