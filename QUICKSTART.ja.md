@@ -65,15 +65,15 @@ cd ~/myproject
 git init
 ```
 
-## 3. bundled skills をインストール
+## 3. Claude Code 向け bundled skills をインストール
 
-Conflux の bundled skill をプロジェクトに入れます。
+Conflux の bundled skill を Claude Code 向けにプロジェクトへ入れます。
 
 ```bash
-cflx install-skills
+cflx install-skills --claude
 ```
 
-これで `./.agents/skills` 以下に `cflx-*` スキルが入ります。
+これで `./.claude/skills` 以下に `cflx-*` スキルが入ります。
 
 Git に入れるかどうかは `.cflx.jsonc` とあわせてあとでまとめて決めます。
 
@@ -111,7 +111,7 @@ Claude Code テンプレート例:
 
 初回セットアップでは、次の 2 つを Git に入れるかどうかを決めます。
 
-- `./.agents/skills/cflx-*`
+- `./.claude/skills/cflx-*`
 - `./.cflx.jsonc`
 
 おすすめ:
@@ -124,7 +124,7 @@ Claude Code テンプレート例:
 両方 `.gitignore` に追加する場合:
 
 ```bash
-printf ".agents/skills/cflx-*\n.cflx.jsonc\n" >> .gitignore
+printf ".claude/skills/cflx-*\n.cflx.jsonc\n" >> .gitignore
 git add .gitignore
 git commit -m 'Ignore Conflux local setup files'
 ```
@@ -132,7 +132,7 @@ git commit -m 'Ignore Conflux local setup files'
 両方リポジトリに追加する場合:
 
 ```bash
-git add .agents/skills/cflx-* .cflx.jsonc
+git add .claude/skills/cflx-* .cflx.jsonc
 git commit -m 'Add Conflux setup files'
 ```
 
