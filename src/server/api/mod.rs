@@ -361,6 +361,7 @@ async fn compute_project_sync_metadata(
 
     let ls_remote = tokio::process::Command::new("git")
         .args(["ls-remote", "--heads", remote_url, branch])
+        .current_dir(local_repo_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
