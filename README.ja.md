@@ -65,8 +65,14 @@ cflx run --change add-feature-x
 # 設定ファイルを初期化
 cflx init
 
-# bundled skills をインストール
+# bundled skills を .agents/skills にインストール
 cflx install-skills
+
+# bundled skills を .claude/skills にインストール
+cflx install-skills --claude
+
+# bundled skills を ~/.claude/skills にインストール
+cflx install-skills --claude --global
 ```
 
 ## 設定
