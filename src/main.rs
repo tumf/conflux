@@ -47,7 +47,9 @@ mod worktree_ops;
 mod test_support;
 
 use clap::Parser;
-use cli::{install_skills_legacy_error, Cli, Commands, ProjectCommands, TuiArgs};
+use cli::{
+    install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, ProjectCommands, TuiArgs,
+};
 use config::OrchestratorConfig;
 use error::Result;
 use install_skills::{run_install_skills, InstallSkillsOptions};
@@ -904,8 +906,13 @@ async fn main() -> Result<()> {
                 eprintln!("{}", install_skills_legacy_error(src));
                 std::process::exit(1);
             }
+            let target = match args.target() {
+                InstallSkillsTarget::Agents => install_skills::InstallTarget::Agents,
+                InstallSkillsTarget::Claude => install_skills::InstallTarget::Claude,
+            };
             let opts = InstallSkillsOptions {
                 global: args.global,
+                target,
                 project_root: None, // use CWD at runtime
             };
             if let Err(e) = run_install_skills(opts) {

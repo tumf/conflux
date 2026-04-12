@@ -135,13 +135,15 @@ pub enum Commands {
     ///   cflx service uninstall  # Remove the service
     Service(ServiceArgs),
 
-    /// Install agent skills into .agents/skills
+    /// Install agent skills into .agents/skills or .claude/skills
     ///
-    /// Installs bundled agent skills into the standard .agents/skills location.
+    /// Installs bundled agent skills into the standard target location.
     ///
     /// EXAMPLES:
-    ///   cflx install-skills           # Install bundled skills (project scope)
-    ///   cflx install-skills --global  # Install bundled skills (global scope)
+    ///   cflx install-skills                    # Install bundled skills to .agents (project scope)
+    ///   cflx install-skills --global           # Install bundled skills to .agents (global scope)
+    ///   cflx install-skills --claude           # Install bundled skills to .claude (project scope)
+    ///   cflx install-skills --claude --global  # Install bundled skills to .claude (global scope)
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 }
@@ -477,34 +479,67 @@ pub struct ServiceArgs {
     pub command: ServiceSubcommand,
 }
 
+/// Install target family for `install-skills`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallSkillsTarget {
+    Agents,
+    Claude,
+}
+
 /// Arguments for the `install-skills` subcommand
 #[derive(Parser, Debug)]
 #[command(
-    long_about = "Install bundled agent skills into the standard .agents/skills location.
+    long_about = "Install bundled agent skills into the standard skills location.
 
 Skills are embedded into the cflx binary at compile time and installed directly
 without requiring a skills/ directory to be present. When no embedded skills are
 available (uncommon), the command falls back to discovering skills from a local
 skills/ directory at the project root.
 
-SCOPE:
+TARGETS:
+  Default target: .agents (existing behavior)
+  --claude:       .claude
+
+SCOPE (.agents target):
   Project scope (default): installs to ./.agents/skills
                             lock file:  ./.agents/.skill-lock.json
   Global scope (--global):  installs to ~/.agents/skills
                             lock file:  ~/.agents/.skill-lock.json
 
+SCOPE (.claude target):
+  Project scope (default): installs to ./.claude/skills
+                            lock file:  ./.claude/.skill-lock.json
+  Global scope (--global):  installs to ~/.claude/skills
+                            lock file:  ~/.claude/.skill-lock.json
+
 EXAMPLES:
   cflx install-skills
-  cflx install-skills --global"
+  cflx install-skills --global
+  cflx install-skills --claude
+  cflx install-skills --claude --global"
 )]
 pub struct InstallSkillsArgs {
-    /// Install into global scope (~/.agents/skills) instead of project scope (./.agents/skills)
+    /// Install into global scope (~/.agents/skills or ~/.claude/skills) instead of project scope
     #[arg(long)]
     pub global: bool,
+
+    /// Install bundled skills into .claude/skills instead of .agents/skills
+    #[arg(long, default_value = "false")]
+    pub claude: bool,
 
     /// Hidden positional argument to detect and reject legacy source forms (e.g. "self", "local:...").
     #[arg(hide = true)]
     pub legacy_source: Option<String>,
+}
+
+impl InstallSkillsArgs {
+    pub fn target(&self) -> InstallSkillsTarget {
+        if self.claude {
+            InstallSkillsTarget::Claude
+        } else {
+            InstallSkillsTarget::Agents
+        }
+    }
 }
 
 /// Return a migration guidance error message when a legacy source argument is detected.
@@ -1232,6 +1267,8 @@ mod tests {
         match cli.command {
             Some(Commands::InstallSkills(args)) => {
                 assert!(!args.global);
+                assert!(!args.claude);
+                assert_eq!(args.target(), InstallSkillsTarget::Agents);
             }
             _ => panic!("Expected InstallSkills subcommand"),
         }
@@ -1243,6 +1280,34 @@ mod tests {
         match cli.command {
             Some(Commands::InstallSkills(args)) => {
                 assert!(args.global);
+                assert!(!args.claude);
+                assert_eq!(args.target(), InstallSkillsTarget::Agents);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_claude_flag() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "--claude"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert!(!args.global);
+                assert!(args.claude);
+                assert_eq!(args.target(), InstallSkillsTarget::Claude);
+            }
+            _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_install_skills_claude_and_global_flags() {
+        let cli = Cli::parse_from(["cflx", "install-skills", "--claude", "--global"]);
+        match cli.command {
+            Some(Commands::InstallSkills(args)) => {
+                assert!(args.global);
+                assert!(args.claude);
+                assert_eq!(args.target(), InstallSkillsTarget::Claude);
             }
             _ => panic!("Expected InstallSkills subcommand"),
         }

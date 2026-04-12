@@ -1681,7 +1681,7 @@ URL にブランチ表記が含まれる場合、CLI は `remote_url` をリポ�
 
 ### Requirement: install-skills Subcommand
 
-The CLI SHALL provide an `install-skills` subcommand for installing bundled Conflux agent skills into the standard `.agents/skills` locations without requiring a source argument.
+The CLI SHALL provide an `install-skills` subcommand for installing bundled Conflux agent skills into standard `.agents/skills` or `.claude/skills` locations without requiring a source argument.
 
 #### Scenario: Install bundled skills in project scope by default
 
@@ -1696,6 +1696,20 @@ The CLI SHALL provide an `install-skills` subcommand for installing bundled Conf
 - **THEN** the CLI starts an install flow using bundled skills sourced from the repository's top-level `skills/` layout
 - **AND** installed skills are written under `~/.agents/skills`
 - **AND** the lock file is written to `~/.agents/.skill-lock.json`
+
+#### Scenario: Install bundled skills in Claude project scope
+
+- **WHEN** the user runs `cflx install-skills --claude`
+- **THEN** the CLI starts an install flow using bundled skills sourced from the repository's top-level `skills/` layout
+- **AND** installed skills are written under `./.claude/skills`
+- **AND** the lock file is written to `./.claude/.skill-lock.json`
+
+#### Scenario: Install bundled skills in Claude global scope
+
+- **WHEN** the user runs `cflx install-skills --claude --global`
+- **THEN** the CLI starts an install flow using bundled skills sourced from the repository's top-level `skills/` layout
+- **AND** installed skills are written under `~/.claude/skills`
+- **AND** the lock file is written to `~/.claude/.skill-lock.json`
 
 #### Scenario: Reject legacy explicit self source syntax
 

@@ -1,5 +1,5 @@
 use agent_skills_rs::LockManager;
-use conflux::install_skills::{run_install_skills, InstallSkillsOptions};
+use conflux::install_skills::{run_install_skills, InstallSkillsOptions, InstallTarget};
 /// Integration / filesystem tests for `cflx install-skills`.
 ///
 /// These tests verify that `run_install_skills` correctly writes skills to
@@ -37,6 +37,7 @@ fn test_project_scope_install_creates_agents_skills_dir_and_updates_lock_file() 
 
     let opts = InstallSkillsOptions {
         global: false,
+        target: InstallTarget::Agents,
         project_root: Some(workdir.path().to_path_buf()),
     };
     run_install_skills(opts).unwrap();
@@ -79,6 +80,7 @@ fn test_global_scope_install_uses_home_agents_dir_and_updates_lock_file() {
 
     let opts = InstallSkillsOptions {
         global: true,
+        target: InstallTarget::Agents,
         project_root: Some(workdir.path().to_path_buf()),
     };
     let result = run_install_skills(opts);
@@ -131,6 +133,7 @@ fn test_embedded_install_without_skills_dir() {
 
     let opts = InstallSkillsOptions {
         global: false,
+        target: InstallTarget::Agents,
         project_root: Some(workdir.path().to_path_buf()),
     };
     run_install_skills(opts).unwrap();
@@ -214,6 +217,7 @@ fn test_embedded_wins_when_local_skills_dir_exists() {
 
     let opts = InstallSkillsOptions {
         global: false,
+        target: InstallTarget::Agents,
         project_root: Some(workdir.path().to_path_buf()),
     };
     run_install_skills(opts).unwrap();
@@ -242,5 +246,83 @@ fn test_embedded_wins_when_local_skills_dir_exists() {
     assert!(
         !test_skill_dir.exists(),
         "Local test-skill must NOT be installed when embedded skills are available"
+    );
+}
+
+#[test]
+fn test_project_scope_install_creates_claude_skills_dir_and_updates_lock_file() {
+    let workdir = TempDir::new().unwrap();
+
+    let opts = InstallSkillsOptions {
+        global: false,
+        target: InstallTarget::Claude,
+        project_root: Some(workdir.path().to_path_buf()),
+    };
+    run_install_skills(opts).unwrap();
+
+    let skill_path = workdir.path().join(".claude/skills/cflx-proposal");
+    assert!(
+        skill_path.exists(),
+        "Expected embedded skill directory at {skill_path:?}"
+    );
+
+    let lock_path = workdir.path().join(".claude/.skill-lock.json");
+    assert!(lock_path.exists(), "Expected lock file at {lock_path:?}");
+
+    let lock_manager = LockManager::new(lock_path);
+    let entry = lock_manager.get_entry("cflx-proposal").unwrap();
+    assert!(
+        entry.is_some(),
+        "Lock entry for 'cflx-proposal' should exist"
+    );
+    assert_eq!(entry.unwrap().source_type, "self");
+}
+
+#[test]
+fn test_global_scope_install_uses_home_claude_dir_and_updates_lock_file() {
+    let workdir = TempDir::new().unwrap();
+    let fake_home = TempDir::new().unwrap();
+
+    let _guard = shared_test_support::env_lock();
+
+    let orig_home = std::env::var("HOME").ok();
+    unsafe {
+        std::env::set_var("HOME", fake_home.path());
+    }
+
+    let opts = InstallSkillsOptions {
+        global: true,
+        target: InstallTarget::Claude,
+        project_root: Some(workdir.path().to_path_buf()),
+    };
+    let result = run_install_skills(opts);
+
+    unsafe {
+        match orig_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    drop(_guard);
+
+    result.unwrap();
+
+    let skill_path = fake_home.path().join(".claude/skills/cflx-proposal");
+    assert!(
+        skill_path.exists(),
+        "Expected global embedded skill at {skill_path:?}"
+    );
+
+    let lock_path = fake_home.path().join(".claude/.skill-lock.json");
+    assert!(
+        lock_path.exists(),
+        "Expected global lock file at {lock_path:?}"
+    );
+
+    let lock_manager = LockManager::new(lock_path);
+    let entry = lock_manager.get_entry("cflx-proposal").unwrap();
+    assert!(
+        entry.is_some(),
+        "Global lock entry for 'cflx-proposal' should exist"
     );
 }
