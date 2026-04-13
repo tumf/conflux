@@ -1,24 +1,28 @@
 {
-  // Conflux Configuration - Project-specific overrides
+    // Conflux Configuration - Project-specific overrides
+    "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
+    "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+    "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+    "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
+    "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
-  // Web monitoring server configuration
-  "web": {
-    "port": 51823,
-    "bind": "127.0.0.1",
-    "refresh_interval_secs": 5
-  },
+    // Web monitoring server configuration
+    "web": {
+        "port": 51823,
+        "bind": "127.0.0.1",
+        "refresh_interval_secs": 5,
+    },
 
-  // Lifecycle hooks
-  "hooks": {
-    // Rebuild indexes after merge completion
-    //"on_merged": "make bump-patch && make index"
-    "on_merged": {
-      "command": "make bump-patch",
-      "timeout": 120,
-      "continue_on_failure": false,
-      "max_retries": 2,
-      "retry_delay_secs": 5
-    }
-
-  }
+    // Lifecycle hooks
+    "hooks": {
+        // Rebuild indexes after merge completion
+        //"on_merged": "make bump-patch && make index"
+        "on_merged": {
+            "command": "make bump-patch",
+            "timeout": 120,
+            "continue_on_failure": false,
+            "max_retries": 2,
+            "retry_delay_secs": 5,
+        },
+    },
 }
