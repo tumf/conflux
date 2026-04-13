@@ -10,6 +10,8 @@ TUI は `MergeDeferred(auto_resumable=true)` イベントを受信し、かつ�
 
 `is_resolving` は Project スコープの resolve 直列化フラグであり、同一 Project 内で resolve 操作が同時に 1 つしか実行されないことを保証する。このフラグは resolve 操作同士の直列化のみに使用し、apply/accept/archive パイプラインの開始・再開・リトライをブロックしてはならない（MUST NOT）。
 
+本 Requirement は旧 spec 内で 3 回重複していた同名 Requirement を 1 つに統合したものである（削除対象: apply/accept/archive 非ブロック条項と Project スコープが明示されていない旧 2 版）。
+
 #### Scenario: auto-resumable deferred with no active resolve
 
 **Given**: 同一 Project 内で resolve が実行中でない（`is_resolving` が `false`）
@@ -33,6 +35,8 @@ TUI は `MergeDeferred(auto_resumable=true)` イベントを受信し、かつ�
 `resolve_merge()` が即時開始パスを取る際、システムは Project スコープの `is_resolving` フラグを即座に `true` に設定しなければならず（MUST）、同一 Project 内の後続の M キー操作がキュー追加パスに入ることを保証しなければならない（MUST）。
 
 このフラグの影響範囲は **resolve 操作同士の直列化のみ** である。`start_processing`、`resume_processing`、`retry_error_changes` 等の apply/accept/archive パイプライン操作はこのフラグによってブロックされてはならない（MUST NOT）。
+
+本 Requirement は旧 spec 内で 2 回重複していた同名 Requirement を 1 つに統合したものである。
 
 #### Scenario: consecutive-m-key-press-during-resolve
 
