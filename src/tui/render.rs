@@ -332,6 +332,7 @@ fn render_header(frame: &mut Frame, app: &AppState, area: Rect) {
         }
         AppMode::ConfirmWorktreeDelete => ("Confirm Delete".to_string(), Color::Yellow, true),
         AppMode::QrPopup => ("QR Code".to_string(), Color::Green, true),
+        AppMode::ConfirmForceKill { .. } => ("Confirm Kill".to_string(), Color::Red, true),
     };
 
     // Build header spans
@@ -599,14 +600,19 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        // Show "Space: stop" for active changes, otherwise describe the mark action.
+        // Show "K: kill" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if matches!(
             item.display_status_cache.as_str(),
             "applying" | "accepting" | "archiving" | "resolving"
         ) {
-            keys.push("Space: stop");
+            if let AppMode::ConfirmForceKill { .. } = app.mode {
+                keys.push("Y: confirm kill");
+                keys.push("N: cancel");
+            } else {
+                keys.push("K: kill");
+            }
         } else if !is_parallel_blocked {
             keys.push(match (item.display_status_cache.as_str(), item.selected) {
                 ("error", true) => "Space: clear retry",
@@ -953,14 +959,19 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
 
     let mut keys = vec!["↑↓/jk: move"];
     if let Some(item) = current_item {
-        // Show "Space: stop" for active changes, otherwise describe the mark action.
+        // Show "K: kill" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
         let is_parallel_blocked = app.parallel_mode && !item.is_parallel_eligible;
         if matches!(
             item.display_status_cache.as_str(),
             "applying" | "accepting" | "archiving" | "resolving"
         ) {
-            keys.push("Space: stop");
+            if let AppMode::ConfirmForceKill { .. } = app.mode {
+                keys.push("Y: confirm kill");
+                keys.push("N: cancel");
+            } else {
+                keys.push("K: kill");
+            }
         } else if !is_parallel_blocked {
             keys.push(match (item.display_status_cache.as_str(), item.selected) {
                 ("error", true) => "Space: clear retry",

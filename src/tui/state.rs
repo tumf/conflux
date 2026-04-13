@@ -738,7 +738,8 @@ impl AppState {
             AppMode::Stopping
             | AppMode::Error
             | AppMode::ConfirmWorktreeDelete
-            | AppMode::QrPopup => None,
+            | AppMode::QrPopup
+            | AppMode::ConfirmForceKill { .. } => None,
         }
     }
 
@@ -1806,11 +1807,9 @@ mod guards {
                 ToggleActionResult::StateOnly(Some(log_msg))
             }
             "applying" | "accepting" | "archiving" | "resolving" => {
-                // Active (in-flight) changes: issue stop-and-dequeue request
-                // State transition happens when ChangeDequeued event is received
-                let id = change.id.clone();
-                let log_msg = format!("Stop-and-dequeue requested: {}", id);
-                ToggleActionResult::Command(TuiCommand::DequeueChange(id), Some(log_msg))
+                // Active changes: Space does NOT trigger force-kill.
+                // Use K key to enter force-kill confirmation mode instead.
+                ToggleActionResult::None
             }
             "error" => {
                 // Error rows in Running mode must mirror queue operations:
@@ -3248,6 +3247,40 @@ mod tests {
         assert_eq!(
             app.changes[1].display_status_cache, "queued",
             "display_status_cache must NOT be mutated locally; reducer drives it"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Force-kill: Space on active change must NOT trigger stop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_running_mode_space_on_active_change_does_not_stop() {
+        let changes = vec![create_test_change("c1", 0, 3)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "applying".to_string();
+
+        let cmd = app.toggle_selection();
+        assert!(
+            cmd.is_none(),
+            "Space on active change must NOT issue any command, got {:?}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_running_mode_space_on_accepting_does_not_stop() {
+        let changes = vec![create_test_change("c1", 0, 3)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "accepting".to_string();
+
+        let cmd = app.toggle_selection();
+        assert!(
+            cmd.is_none(),
+            "Space on accepting change must NOT issue any command, got {:?}",
+            cmd
         );
     }
 

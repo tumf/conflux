@@ -48,6 +48,11 @@ pub enum AppMode {
     ConfirmWorktreeDelete,
     /// QR popup mode - showing Web UI QR code
     QrPopup,
+    /// Force-kill confirmation for a single active change
+    ConfirmForceKill {
+        /// The change ID being confirmed for force-kill
+        change_id: String,
+    },
 }
 
 /// Information about a git worktree

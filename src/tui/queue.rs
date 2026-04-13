@@ -3,9 +3,10 @@
 //! This module provides a thread-safe queue for dynamically adding changes
 //! during orchestrator execution.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
+use tokio_util::sync::CancellationToken;
 
 /// Dynamic queue for runtime change additions
 ///
@@ -22,6 +23,8 @@ pub struct DynamicQueue {
     removed: Arc<Mutex<HashSet<String>>>,
     /// Set of change IDs that have been stopped
     stopped: Arc<Mutex<HashSet<String>>>,
+    /// Per-change cancellation tokens for immediate force-kill
+    kill_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
     /// Notification for queue changes (used to wake up re-analysis loop)
     notify: Arc<Notify>,
 }
@@ -33,6 +36,7 @@ impl DynamicQueue {
             inner: Arc::new(Mutex::new(VecDeque::new())),
             removed: Arc::new(Mutex::new(HashSet::new())),
             stopped: Arc::new(Mutex::new(HashSet::new())),
+            kill_tokens: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
         }
     }
@@ -148,6 +152,32 @@ impl DynamicQueue {
     pub fn try_is_stopped(&self, id: &str) -> bool {
         if let Ok(stopped) = self.stopped.try_lock() {
             stopped.contains(id)
+        } else {
+            false
+        }
+    }
+
+    /// Register a per-change cancellation token for immediate force-kill.
+    /// Called by the parallel executor when spawning a workspace task.
+    pub async fn register_kill_token(&self, id: String, token: CancellationToken) {
+        let mut tokens = self.kill_tokens.lock().await;
+        tokens.insert(id, token);
+    }
+
+    /// Unregister a per-change cancellation token (cleanup on task completion).
+    pub async fn unregister_kill_token(&self, id: &str) {
+        let mut tokens = self.kill_tokens.lock().await;
+        tokens.remove(id);
+    }
+
+    /// Force-kill a change: mark stopped AND immediately cancel its execution token.
+    /// Returns true if a kill token was found and cancelled.
+    pub async fn force_kill(&self, id: &str) -> bool {
+        self.mark_stopped(id.to_string()).await;
+        let tokens = self.kill_tokens.lock().await;
+        if let Some(token) = tokens.get(id) {
+            token.cancel();
+            true
         } else {
             false
         }
@@ -295,5 +325,43 @@ mod tests {
 
         let removed = queue.drain_removed().await;
         assert!(removed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_force_kill_marks_stopped_and_cancels_token() {
+        let queue = DynamicQueue::new();
+        let token = CancellationToken::new();
+        queue
+            .register_kill_token("a".to_string(), token.clone())
+            .await;
+
+        assert!(!token.is_cancelled());
+        let had_token = queue.force_kill("a").await;
+        assert!(had_token);
+        assert!(token.is_cancelled());
+        assert!(queue.is_stopped("a").await);
+    }
+
+    #[tokio::test]
+    async fn test_force_kill_without_token_still_marks_stopped() {
+        let queue = DynamicQueue::new();
+
+        let had_token = queue.force_kill("b").await;
+        assert!(!had_token);
+        assert!(queue.is_stopped("b").await);
+    }
+
+    #[tokio::test]
+    async fn test_unregister_kill_token() {
+        let queue = DynamicQueue::new();
+        let token = CancellationToken::new();
+        queue
+            .register_kill_token("a".to_string(), token.clone())
+            .await;
+        queue.unregister_kill_token("a").await;
+
+        let had_token = queue.force_kill("a").await;
+        assert!(!had_token);
+        assert!(!token.is_cancelled());
     }
 }

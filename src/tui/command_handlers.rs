@@ -543,15 +543,21 @@ pub async fn handle_tui_command(
                 .write()
                 .await
                 .apply_command(ReducerCommand::DequeueChange(id.clone()));
-            // Stop a single active change (serial/parallel modes)
-            // For serial mode: set a flag that orchestrator checks before each operation
-            // For parallel mode: cancel the workspace task for this change
-            ctx.app.add_log(LogEntry::info(format!(
-                "Stop-and-dequeue request received for: {}",
-                id
-            )));
-            // The actual cancellation is handled by the orchestrator via dynamic_queue.mark_stopped()
-            ctx.dynamic_queue.mark_stopped(id.clone()).await;
+            // Force-kill the in-flight execution for this change.
+            // force_kill() marks stopped AND immediately cancels the per-change token,
+            // bypassing the 100ms polling delay for truly immediate process termination.
+            let had_token = ctx.dynamic_queue.force_kill(&id).await;
+            if had_token {
+                ctx.app.add_log(LogEntry::info(format!(
+                    "Force-kill issued for active change: {}",
+                    id
+                )));
+            } else {
+                ctx.app.add_log(LogEntry::info(format!(
+                    "Stop-and-dequeue request received for: {}",
+                    id
+                )));
+            }
         }
         TuiCommand::ResolveMerge(id) => {
             // Apply reducer command first so shared state reflects resolve intent.
