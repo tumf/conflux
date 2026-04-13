@@ -1,19 +1,6 @@
-## Requirements
+## Purpose
 
-### Requirement: EventSink トレイトによるフロントエンド抽象化
-Core（Reducer + オーケストレーションループ）とフロントエンド（TUI/Web）の間に `EventSink` トレイトを定義しなければならない（MUST）。
-
-オーケストレーションループはフロントエンド固有の型（`mpsc::Sender<OrchestratorEvent>`, `WebState`）に直接依存してはならない（SHALL NOT）。代わりに `EventSink` トレイトを通じてイベントを配信する。
-
-#### Scenario: TUI がイベントを EventSink 経由で受信する
-- **WHEN** オーケストレーションループがイベントを発行する
-- **THEN** `TuiEventSink` の `on_event()` が呼ばれる
-- **AND** 内部で TUI channel にイベントが転送される
-
-#### Scenario: テスト時にフロントエンドをモックできる
-- **WHEN** オーケストレーションのテストでフロントエンドが不要な場合
-- **THEN** `MockEventSink` を注入してイベントを収集できる
-- **AND** TUI/Web の実体に依存しない
+Core（Reducer + オーケストレーションループ）とフロントエンド（TUI/Web）の間の抽象化レイヤーを定義し、疎結合なアーキテクチャを維持する。
 
 ## Requirements
 
@@ -67,7 +54,6 @@ Frontend は Core の状態を **読み取り** と **コマンド発行** で�
 - **THEN** Core の `is_resolving_active()` を参照する
 - **AND** Frontend 独自の resolve serialization フラグでは判断しない
 - **AND** この判断は resolve 操作のみに影響し、apply/accept/archive はブロックしない
-
 
 ### Requirement: EventSink トレイトによるフロントエンド抽象化
 
