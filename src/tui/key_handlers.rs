@@ -439,9 +439,7 @@ pub async fn handle_key_event(
                     .add_log(LogEntry::info(format!("Force-kill confirmed: {}", cid)));
                 let _ = ctx.cmd_tx.send(TuiCommand::DequeueChange(cid)).await;
             }
-            (KeyCode::Char('n'), _)
-            | (KeyCode::Char('N'), _)
-            | (KeyCode::Esc, _) => {
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
                 ctx.app.mode = AppMode::Running;
                 ctx.app
                     .add_log(LogEntry::info("Force-kill canceled".to_string()));
