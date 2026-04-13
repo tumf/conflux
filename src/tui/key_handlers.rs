@@ -429,6 +429,26 @@ pub async fn handle_key_event(
         return Ok(None);
     }
 
+    // Handle force-kill confirmation mode
+    if let AppMode::ConfirmForceKill { ref change_id } = ctx.app.mode {
+        let cid = change_id.clone();
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => {
+                ctx.app.mode = AppMode::Running;
+                ctx.app
+                    .add_log(LogEntry::info(format!("Force-kill confirmed: {}", cid)));
+                let _ = ctx.cmd_tx.send(TuiCommand::DequeueChange(cid)).await;
+            }
+            (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
+                ctx.app.mode = AppMode::Running;
+                ctx.app
+                    .add_log(LogEntry::info("Force-kill canceled".to_string()));
+            }
+            _ => {}
+        }
+        return Ok(None);
+    }
+
     // Handle worktree delete confirmation
     if ctx.app.mode == AppMode::ConfirmWorktreeDelete {
         match (key.code, key.modifiers) {
@@ -536,6 +556,30 @@ pub async fn handle_key_event(
             use crate::tui::types::ViewMode;
             if ctx.app.view_mode == ViewMode::Changes {
                 ctx.app.toggle_logs_panel();
+            }
+        }
+        (KeyCode::Char('K'), _) => {
+            // Enter force-kill confirmation for active changes in Running mode
+            use crate::tui::types::ViewMode;
+            if ctx.app.view_mode == ViewMode::Changes
+                && ctx.app.mode == AppMode::Running
+                && !ctx.app.changes.is_empty()
+                && ctx.app.cursor_index < ctx.app.changes.len()
+            {
+                let change = &ctx.app.changes[ctx.app.cursor_index];
+                if matches!(
+                    change.display_status_cache.as_str(),
+                    "applying" | "accepting" | "archiving" | "resolving"
+                ) {
+                    let cid = change.id.clone();
+                    ctx.app.mode = AppMode::ConfirmForceKill {
+                        change_id: cid.clone(),
+                    };
+                    ctx.app.add_log(LogEntry::warn(format!(
+                        "Confirm force-kill for '{}': press Y to confirm, N/Esc to cancel",
+                        cid
+                    )));
+                }
             }
         }
         _ => {}

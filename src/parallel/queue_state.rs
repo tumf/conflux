@@ -250,6 +250,13 @@ impl ParallelExecutor {
         // Remove from in-flight
         in_flight.remove(&workspace_result.change_id);
 
+        // Clean up kill token registry
+        if let Some(ref queue) = self.dynamic_queue {
+            queue
+                .unregister_kill_token(&workspace_result.change_id)
+                .await;
+        }
+
         info!(
             "Task completed: change='{}', in_flight={}, available_slots={}, error={:?}",
             workspace_result.change_id,

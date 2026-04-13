@@ -96,7 +96,8 @@ use helpers::{
 
 use control::{
     get_logs, get_project_history, get_stats_overview, global_control_run, global_control_status,
-    global_control_stop, toggle_all_change_selection, toggle_change_selection,
+    global_control_stop, stop_and_dequeue_change, toggle_all_change_selection,
+    toggle_change_selection,
 };
 use dashboard::{dashboard_assets, dashboard_favicon, dashboard_icons, dashboard_index};
 use files::{get_file_content, get_file_tree};
@@ -580,6 +581,10 @@ pub fn build_router(app_state: AppState) -> Router {
         .route(
             "/projects/{id}/changes/{change_id}/toggle",
             post(toggle_change_selection),
+        )
+        .route(
+            "/projects/{id}/changes/{change_id}/stop-and-dequeue",
+            post(stop_and_dequeue_change),
         )
         .route(
             "/projects/{id}/changes/toggle-all",

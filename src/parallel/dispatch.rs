@@ -674,6 +674,14 @@ impl ParallelExecutor {
 
             // Create a per-change cancel token that monitors both global cancel and single-change stop
             let per_change_cancel = CancellationToken::new();
+
+            // Register the kill token for immediate force-kill from TUI/WebUI
+            if let Some(ref queue) = dynamic_queue {
+                queue
+                    .register_kill_token(change_id.clone(), per_change_cancel.clone())
+                    .await;
+            }
+
             let monitor_cancel = per_change_cancel.clone();
             let monitor_global = cancel_token.clone();
             let monitor_queue = dynamic_queue.clone();

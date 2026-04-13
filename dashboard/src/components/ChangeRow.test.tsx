@@ -35,13 +35,37 @@ afterEach(() => {
 });
 
 describe('ChangeRow', () => {
-  it('shows stop-and-dequeue button for active changes and calls API', () => {
+  it('shows stop button for active changes, opens confirmation dialog, calls API on confirm', () => {
     render(<ChangeRow change={makeChange('applying')} />);
 
     const button = screen.getByRole('button', { name: 'Stop and dequeue change-a' });
     fireEvent.click(button);
 
+    // API should NOT be called immediately
+    expect(stopAndDequeueChangeMock).not.toHaveBeenCalled();
+
+    // Confirmation dialog should be shown
+    expect(screen.getByText('Force Kill Change')).toBeTruthy();
+
+    // Click the confirm button
+    const confirmButton = screen.getByRole('button', { name: 'Force Kill' });
+    fireEvent.click(confirmButton);
+
     expect(stopAndDequeueChangeMock).toHaveBeenCalledWith('project-1', 'change-a');
+  });
+
+  it('closes confirmation dialog on cancel without calling API', () => {
+    render(<ChangeRow change={makeChange('applying')} />);
+
+    const button = screen.getByRole('button', { name: 'Stop and dequeue change-a' });
+    fireEvent.click(button);
+
+    // Click cancel
+    const cancelButton = screen.getByRole('button', { name: 'Cancel' });
+    fireEvent.click(cancelButton);
+
+    expect(stopAndDequeueChangeMock).not.toHaveBeenCalled();
+    expect(screen.queryByText('Force Kill Change')).toBeNull();
   });
 
   it('does not show stop-and-dequeue button for not queued change', () => {
