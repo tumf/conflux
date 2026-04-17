@@ -124,20 +124,9 @@ fn build_analysis_prompt(changes: &[Change]) -> String {
         .join("\n");
 
     format!(
-        r#"load skills: cflx-analyze
-
-以下のOpenSpec変更から、次に実行すべきものを1つ選んでください。
-
-変更一覧:
-{}
-
-選択基準:
-1. 依存関係がない、または依存先が完了しているもの
-2. 進捗が進んでいるもの（継続性）
-3. 名前から推測される依存関係を考慮
-
-回答は変更IDのみを1行で出力してください。
-"#,
+        "load skills: cflx-analyze\n\n\
+         Queued changes:\n\
+         {}\n",
         change_list
     )
 }
@@ -211,19 +200,19 @@ mod tests {
 
         let prompt = build_analysis_prompt(&changes);
 
-        // Verify prompt contains change IDs
+        // Verify skill prelude
+        assert!(prompt.contains("load skills: cflx-analyze"));
+
+        // Verify prompt contains variable context (change IDs and progress)
         assert!(prompt.contains("add-feature"));
         assert!(prompt.contains("fix-bug"));
-
-        // Verify prompt contains progress info
         assert!(prompt.contains("2/5 tasks"));
         assert!(prompt.contains("40.0%"));
         assert!(prompt.contains("4/4 tasks"));
         assert!(prompt.contains("100.0%"));
 
-        // Verify prompt contains instruction header
-        assert!(prompt.contains("変更一覧"));
-        assert!(prompt.contains("選択基準"));
+        // Verify prompt contains queued changes header
+        assert!(prompt.contains("Queued changes:"));
     }
 
     #[test]
@@ -231,8 +220,28 @@ mod tests {
         let changes: Vec<Change> = vec![];
         let prompt = build_analysis_prompt(&changes);
 
-        // Prompt should still have structure
-        assert!(prompt.contains("変更一覧"));
-        assert!(prompt.contains("選択基準"));
+        // Prompt should still have skill prelude and structure
+        assert!(prompt.contains("load skills: cflx-analyze"));
+        assert!(prompt.contains("Queued changes:"));
+    }
+
+    #[test]
+    fn test_build_analysis_prompt_no_fixed_guidance() {
+        let changes = vec![test_change("some-change", 3, 5)];
+        let prompt = build_analysis_prompt(&changes);
+
+        // Fixed guidance must NOT appear in Rust-side prompt (owned by cflx-analyze skill)
+        assert!(
+            !prompt.contains("選択基準"),
+            "Selection criteria must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("回答は変更IDのみ"),
+            "Output contract must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("依存関係がない"),
+            "Dependency rules must not be in Rust prompt"
+        );
     }
 }

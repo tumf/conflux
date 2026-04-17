@@ -131,25 +131,13 @@ pub async fn resolve_conflicts_with_retry(
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
-    let initial_resolve_prompt = format!(
-        "load skills: cflx-resolve\n\n\
-         {}\n\n\
-         A merge conflict occurred while trying to merge the following revisions:\n\
-         {}\n\n\
-         VCS error output:\n\
-         {}\n\n\
-         Current VCS status:\n\
-         {}\n\n\
-         VCS log for conflicting changes:\n\
-         {}\n\n\
-         Conflicting files: {}\n\n\
-         Please resolve the merge conflicts in the listed files.",
+    let initial_resolve_prompt = build_conflict_resolve_prompt(
         vcs_prompt_prefix,
-        revisions.join(", "),
+        &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         vcs_error,
-        vcs_status,
-        vcs_log,
-        conflict_files_str
+        &vcs_status,
+        &vcs_log,
+        &conflict_files_str,
     );
     let template = config.get_resolve_command()?;
     let initial_command =
@@ -178,25 +166,13 @@ pub async fn resolve_conflicts_with_retry(
         );
 
         // Build the resolve prompt with VCS-specific context
-        let mut resolve_prompt = format!(
-            "load skills: cflx-resolve\n\n\
-             {}\n\n\
-             A merge conflict occurred while trying to merge the following revisions:\n\
-             {}\n\n\
-             VCS error output:\n\
-             {}\n\n\
-             Current VCS status:\n\
-             {}\n\n\
-             VCS log for conflicting changes:\n\
-             {}\n\n\
-             Conflicting files: {}\n\n\
-             Please resolve the merge conflicts in the listed files.",
+        let mut resolve_prompt = build_conflict_resolve_prompt(
             vcs_prompt_prefix,
-            revisions.join(", "),
+            &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             vcs_error,
-            vcs_status,
-            vcs_log,
-            conflict_files_str
+            &vcs_status,
+            &vcs_log,
+            &conflict_files_str,
         );
 
         // Add context from previous attempts if any
@@ -449,47 +425,15 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
-    let initial_resolve_prompt = format!(
-        "load skills: cflx-resolve\n\n\
-         {}\n\n\
-         You must complete sequential Git merges into the target branch.\n\n\
-         Target branch: {}\n\
-         Base revision before merges: {}\n\
-         Merge plan (branch => change_id):\n{}\n\n\
-         Worktree directories (branch => path):\n{}\n\n\
-         Requirements:\n\
-         - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
-         - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
-         - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\n\
-         Instructions (repeat for each branch in order):\n\
-         1) Pre-sync in the worktree directory:\n\
-            - cd <worktree_path>\n\
-            - git checkout <branch>\n\
-            - git merge --no-ff -m \"Pre-sync base into <change_id>\" <target_branch>\n\
-            - If a conflict occurs, resolve it, git add, then git commit -m \"Pre-sync base into <change_id>\" to complete the merge.\n\
-            - If the merge commit message is wrong, fix it with: git commit --amend -m \"Pre-sync base into <change_id>\".\n\
-             2) Final merge into the target branch (in the repo root):\n\
-                 - cd <repo_root>\n\
-                 - git checkout <target_branch>\n\
-                 - git merge --no-ff --no-commit <branch>\n\
-                 - If a conflict occurs, resolve it and git add the resolved files.\n\
-                 - BEFORE creating the merge commit:\n\
-                   * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).\n\
-                   * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.\n\
-                 - Finally, run `git commit -m \"Merge change: <change_id>\"` to complete the merge.\n\
-         3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\n\
-         Current VCS status:\n{}\n\n\
-         VCS log for branches:\n{}\n\n\
-         Conflicting files (repo root, if any): {}\n\n\
-         Complete the merges so that the target branch has merge commits for every change_id.",
+    let initial_resolve_prompt = build_sequential_merge_resolve_prompt(
         vcs_prompt_prefix,
         target_branch,
         base_revision,
-        merge_plan,
-        worktree_locations,
-        vcs_status,
-        vcs_log,
-        conflict_files_str
+        &merge_plan,
+        &worktree_locations,
+        &vcs_status,
+        &vcs_log,
+        &conflict_files_str,
     );
     let template = config.get_resolve_command()?;
     let initial_command =
@@ -519,47 +463,15 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             revisions.join(", ")
         );
 
-        let mut resolve_prompt = format!(
-            "load skills: cflx-resolve\n\n\
-             {}\n\n\
-             You must complete sequential Git merges into the target branch.\n\n\
-             Target branch: {}\n\
-             Base revision before merges: {}\n\
-             Merge plan (branch => change_id):\n{}\n\n\
-             Worktree directories (branch => path):\n{}\n\n\
-             Requirements:\n\
-             - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
-             - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
-             - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\n\
-             Instructions (repeat for each branch in order):\n\
-             1) Pre-sync in the worktree directory:\n\
-                - cd <worktree_path>\n\
-                - git checkout <branch>\n\
-                - git merge --no-ff -m \"Pre-sync base into <change_id>\" <target_branch>\n\
-                - If a conflict occurs, resolve it, git add, then git commit -m \"Pre-sync base into <change_id>\" to complete the merge.\n\
-                - If the merge commit message is wrong, fix it with: git commit --amend -m \"Pre-sync base into <change_id>\".\n\
-             2) Final merge into the target branch (in the repo root):\n\
-                 - cd <repo_root>\n\
-                 - git checkout <target_branch>\n\
-                 - git merge --no-ff --no-commit <branch>\n\
-                 - If a conflict occurs, resolve it and git add the resolved files.\n\
-                 - BEFORE creating the merge commit:\n\
-                   * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).\n\
-                   * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.\n\
-                 - Finally, run `git commit -m \"Merge change: <change_id>\"` to complete the merge.\n\
-             3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\n\
-             Current VCS status:\n{}\n\n\
-             VCS log for branches:\n{}\n\n\
-             Conflicting files (repo root, if any): {}\n\n\
-             Complete the merges so that the target branch has merge commits for every change_id.",
+        let mut resolve_prompt = build_sequential_merge_resolve_prompt(
             vcs_prompt_prefix,
             target_branch,
             base_revision,
-            merge_plan,
-            worktree_locations,
-            vcs_status,
-            vcs_log,
-            conflict_files_str
+            &merge_plan,
+            &worktree_locations,
+            &vcs_status,
+            &vcs_log,
+            &conflict_files_str,
         );
 
         // Add context from previous attempts if any
@@ -981,5 +893,175 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     match workspace_manager.backend_type() {
         VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
+    }
+}
+
+/// Build prompt for conflict resolution (variable context only; fixed guidance lives in cflx-resolve).
+fn build_conflict_resolve_prompt(
+    vcs_prompt_prefix: &str,
+    revisions: &[&str],
+    vcs_error: &str,
+    vcs_status: &str,
+    vcs_log: &str,
+    conflict_files_str: &str,
+) -> String {
+    format!(
+        "load skills: cflx-resolve\n\n\
+         {}\n\n\
+         Conflicting revisions: {}\n\n\
+         VCS error output:\n\
+         {}\n\n\
+         Current VCS status:\n\
+         {}\n\n\
+         VCS log for conflicting changes:\n\
+         {}\n\n\
+         Conflicting files: {}",
+        vcs_prompt_prefix,
+        revisions.join(", "),
+        vcs_error,
+        vcs_status,
+        vcs_log,
+        conflict_files_str
+    )
+}
+
+/// Build prompt for sequential merge resolution (variable context only; fixed guidance lives in cflx-resolve).
+#[allow(clippy::too_many_arguments)]
+fn build_sequential_merge_resolve_prompt(
+    vcs_prompt_prefix: &str,
+    target_branch: &str,
+    base_revision: &str,
+    merge_plan: &str,
+    worktree_locations: &str,
+    vcs_status: &str,
+    vcs_log: &str,
+    conflict_files_str: &str,
+) -> String {
+    format!(
+        "load skills: cflx-resolve\n\n\
+         {}\n\n\
+         Operation: sequential merge\n\n\
+         Target branch: {}\n\
+         Base revision before merges: {}\n\
+         Merge plan (branch => change_id):\n{}\n\n\
+         Worktree directories (branch => path):\n{}\n\n\
+         Current VCS status:\n{}\n\n\
+         VCS log for branches:\n{}\n\n\
+         Conflicting files (repo root, if any): {}",
+        vcs_prompt_prefix,
+        target_branch,
+        base_revision,
+        merge_plan,
+        worktree_locations,
+        vcs_status,
+        vcs_log,
+        conflict_files_str
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conflict_resolve_prompt_has_skill_prelude() {
+        let prompt = build_conflict_resolve_prompt(
+            "Git conflict resolution:",
+            &["branch-a", "branch-b"],
+            "merge failed",
+            "UU file.rs",
+            "commit log here",
+            "file.rs",
+        );
+        assert!(prompt.contains("load skills: cflx-resolve"));
+        // Variable context present
+        assert!(prompt.contains("branch-a, branch-b"));
+        assert!(prompt.contains("file.rs"));
+    }
+
+    #[test]
+    fn test_conflict_resolve_prompt_no_fixed_guidance() {
+        let prompt =
+            build_conflict_resolve_prompt("prefix", &["rev1"], "err", "status", "log", "files");
+        // Fixed guidance must NOT appear (owned by cflx-resolve skill)
+        assert!(
+            !prompt.contains("Please resolve the merge conflicts"),
+            "Resolution instruction must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("Safety Constraints"),
+            "Safety constraints must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("--no-verify"),
+            "Safety rules must not be in Rust prompt"
+        );
+    }
+
+    #[test]
+    fn test_sequential_merge_prompt_has_skill_prelude() {
+        let prompt = build_sequential_merge_resolve_prompt(
+            "Git conflict resolution:",
+            "main",
+            "abc123",
+            "- branch-a => change-1",
+            "- branch-a => /path (change_id: change-1)",
+            "clean",
+            "log entries",
+            "(none)",
+        );
+        assert!(prompt.contains("load skills: cflx-resolve"));
+        assert!(prompt.contains("Operation: sequential merge"));
+        // Variable context present
+        assert!(prompt.contains("Target branch: main"));
+        assert!(prompt.contains("abc123"));
+        assert!(prompt.contains("change-1"));
+    }
+
+    #[test]
+    fn test_sequential_merge_prompt_no_fixed_guidance() {
+        let prompt = build_sequential_merge_resolve_prompt(
+            "prefix",
+            "main",
+            "base",
+            "plan",
+            "locations",
+            "status",
+            "log",
+            "files",
+        );
+        // Fixed guidance must NOT appear (owned by cflx-resolve skill)
+        assert!(
+            !prompt.contains("Requirements:"),
+            "Requirements section must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("Instructions (repeat"),
+            "Step-by-step instructions must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("Pre-sync base into"),
+            "Commit convention must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("Merge change:"),
+            "Merge commit convention must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("git merge --no-ff"),
+            "Git commands must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("git rm -rf"),
+            "Git cleanup commands must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("--no-verify"),
+            "Safety rules must not be in Rust prompt"
+        );
+        assert!(
+            !prompt.contains("Complete the merges"),
+            "Completion instruction must not be in Rust prompt"
+        );
     }
 }
