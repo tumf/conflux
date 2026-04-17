@@ -124,7 +124,9 @@ fn build_analysis_prompt(changes: &[Change]) -> String {
         .join("\n");
 
     format!(
-        r#"以下のOpenSpec変更から、次に実行すべきものを1つ選んでください。
+        r#"load skills: cflx-analyze
+
+以下のOpenSpec変更から、次に実行すべきものを1つ選んでください。
 
 変更一覧:
 {}

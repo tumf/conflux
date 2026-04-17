@@ -26,7 +26,7 @@ pub fn build_apply_prompt(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-workflow".to_string());
+    parts.push("load skills: cflx-apply".to_string());
     parts.push(format!("Apply change id: {}", change_id));
 
     if !user_prompt.is_empty() {
@@ -51,7 +51,7 @@ pub fn build_apply_prompt(
 pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context: &str) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-workflow".to_string());
+    parts.push("load skills: cflx-archive".to_string());
     parts.push(format!("Archive change id: {}", change_id));
 
     if !user_prompt.is_empty() {
@@ -74,7 +74,7 @@ pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context:
 pub fn build_cleanup_review_prompt(change_id: &str) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-workflow".to_string());
+    parts.push("load skills: cflx-cleanup-review".to_string());
     parts.push(format!("Cleanup-review change id: {}", change_id));
     parts.push(format!(
         "change_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nworkspace_path: .",
@@ -170,7 +170,7 @@ pub fn build_acceptance_prompt_context_only(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-workflow".to_string());
+    parts.push("load skills: cflx-accept".to_string());
     parts.push(format!("Acceptance id:{}", change_id));
 
     // Change metadata first so downstream templates can reference it.
@@ -373,7 +373,7 @@ mod tests {
 
         // Find positions of each marker
         let skill_pos = result
-            .find("load skills: cflx-workflow")
+            .find("load skills: cflx-accept")
             .expect("Skill prelude should be present");
         let acceptance_id_pos = result
             .find("Acceptance id:test-change")
@@ -446,7 +446,7 @@ mod tests {
         );
 
         // Should contain prelude, change metadata and user prompt
-        assert!(result.contains("load skills: cflx-workflow"));
+        assert!(result.contains("load skills: cflx-accept"));
         assert!(result.contains("Acceptance id:test-change"));
         assert!(result.contains("change_id: test-change"));
         assert!(result.contains("proposal_path: openspec/changes/test-change/proposal.md"));
@@ -461,7 +461,7 @@ mod tests {
     fn test_build_cleanup_review_prompt_contains_required_context() {
         let prompt = build_cleanup_review_prompt("change-123");
 
-        assert!(prompt.contains("load skills: cflx-workflow"));
+        assert!(prompt.contains("load skills: cflx-cleanup-review"));
         assert!(prompt.contains("Cleanup-review change id: change-123"));
         assert!(prompt.contains("change_id: change-123"));
         assert!(prompt.contains("proposal_path: openspec/changes/change-123/proposal.md"));

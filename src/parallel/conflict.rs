@@ -132,7 +132,8 @@ pub async fn resolve_conflicts_with_retry(
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = format!(
-        "{}\n\n\
+        "load skills: cflx-resolve\n\n\
+         {}\n\n\
          A merge conflict occurred while trying to merge the following revisions:\n\
          {}\n\n\
          VCS error output:\n\
@@ -142,13 +143,7 @@ pub async fn resolve_conflicts_with_retry(
          VCS log for conflicting changes:\n\
          {}\n\n\
          Conflicting files: {}\n\n\
-         Please resolve the merge conflicts in the listed files.\n\n\
-         IMPORTANT:\n\
-         - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\
-         - Do NOT break existing functionality unrelated to the conflicting changes.\n\
-         - When resolving conflicts, preserve both sides' intent where possible.\n\
-         - If shared code is modified, ensure all existing callers still work correctly.\n\
-         - Do NOT remove or alter existing functionality that is not part of the conflicting changes.",
+         Please resolve the merge conflicts in the listed files.",
         vcs_prompt_prefix,
         revisions.join(", "),
         vcs_error,
@@ -184,7 +179,8 @@ pub async fn resolve_conflicts_with_retry(
 
         // Build the resolve prompt with VCS-specific context
         let mut resolve_prompt = format!(
-            "{}\n\n\
+            "load skills: cflx-resolve\n\n\
+             {}\n\n\
              A merge conflict occurred while trying to merge the following revisions:\n\
              {}\n\n\
              VCS error output:\n\
@@ -194,13 +190,7 @@ pub async fn resolve_conflicts_with_retry(
              VCS log for conflicting changes:\n\
              {}\n\n\
              Conflicting files: {}\n\n\
-             Please resolve the merge conflicts in the listed files.\n\n\
-             IMPORTANT:\n\
-             - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\
-             - Do NOT break existing functionality unrelated to the conflicting changes.\n\
-             - When resolving conflicts, preserve both sides' intent where possible.\n\
-             - If shared code is modified, ensure all existing callers still work correctly.\n\
-             - Do NOT remove or alter existing functionality that is not part of the conflicting changes.",
+             Please resolve the merge conflicts in the listed files.",
             vcs_prompt_prefix,
             revisions.join(", "),
             vcs_error,
@@ -460,7 +450,8 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = format!(
-        "{}\n\n\
+        "load skills: cflx-resolve\n\n\
+         {}\n\n\
          You must complete sequential Git merges into the target branch.\n\n\
          Target branch: {}\n\
          Base revision before merges: {}\n\
@@ -469,12 +460,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
          Requirements:\n\
          - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
          - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
-         - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\
-         - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\
-         - Do NOT break existing functionality unrelated to the changes being merged.\n\
-         - When resolving conflicts, preserve both sides' intent where possible.\n\
-         - If shared code is modified, ensure all existing callers still work correctly.\n\
-         - Do NOT remove or alter existing functionality that is not part of the changes being merged.\n\n\
+         - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\n\
          Instructions (repeat for each branch in order):\n\
          1) Pre-sync in the worktree directory:\n\
             - cd <worktree_path>\n\
@@ -491,8 +477,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                    * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).\n\
                    * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.\n\
                  - Finally, run `git commit -m \"Merge change: <change_id>\"` to complete the merge.\n\
-         3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
-         4) Do not use destructive commands like reset --hard.\n\n\
+         3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\n\
          Current VCS status:\n{}\n\n\
          VCS log for branches:\n{}\n\n\
          Conflicting files (repo root, if any): {}\n\n\
@@ -535,7 +520,8 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         );
 
         let mut resolve_prompt = format!(
-            "{}\n\n\
+            "load skills: cflx-resolve\n\n\
+             {}\n\n\
              You must complete sequential Git merges into the target branch.\n\n\
              Target branch: {}\n\
              Base revision before merges: {}\n\
@@ -544,12 +530,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
              Requirements:\n\
              - Before merging each branch into the target branch, you MUST pre-sync base into that worktree branch (base -> worktree) from inside the worktree directory.\n\
              - If a pre-sync merge commit is created, its subject MUST be exactly: \"Pre-sync base into <change_id>\".\n\
-             - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\
-             - Do NOT use --no-verify flag when committing. Always run pre-commit hooks.\n\
-             - Do NOT break existing functionality unrelated to the changes being merged.\n\
-             - When resolving conflicts, preserve both sides' intent where possible.\n\
-             - If shared code is modified, ensure all existing callers still work correctly.\n\
-             - Do NOT remove or alter existing functionality that is not part of the changes being merged.\n\n\
+             - The final merge into the target branch MUST create a merge commit with subject exactly: \"Merge change: <change_id>\".\n\n\
              Instructions (repeat for each branch in order):\n\
              1) Pre-sync in the worktree directory:\n\
                 - cd <worktree_path>\n\
@@ -566,8 +547,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                    * If `openspec/changes/<change_id>/proposal.md` exists AND `openspec/changes/archive/` contains the same <change_id>, remove `openspec/changes/<change_id>` (the directory was resurrected by the merge and must be deleted).\n\
                    * Use `git rm -rf openspec/changes/<change_id>` to remove the resurrected directory.\n\
                  - Finally, run `git commit -m \"Merge change: <change_id>\"` to complete the merge.\n\
-             3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\
-             4) Do not use destructive commands like reset --hard.\n\n\
+             3) If a pre-commit hook modifies files and stops the commit, re-stage and re-run git commit with the same message.\n\n\
              Current VCS status:\n{}\n\n\
              VCS log for branches:\n{}\n\n\
              Conflicting files (repo root, if any): {}\n\n\
@@ -578,7 +558,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             merge_plan,
             worktree_locations,
             vcs_status,
-             vcs_log,
+            vcs_log,
             conflict_files_str
         );
 

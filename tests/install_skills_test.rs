@@ -145,8 +145,20 @@ fn test_embedded_install_without_skills_dir() {
 
     let lock_manager = LockManager::new(lock_path);
 
-    // All three bundled skills must be installed
-    for name in &["cflx-proposal", "cflx-workflow", "cflx-run"] {
+    // All bundled skills must be installed
+    let expected_skills = [
+        "cflx-proposal",
+        "cflx-workflow",
+        "cflx-run",
+        "cflx-analyze",
+        "cflx-apply",
+        "cflx-rejecting",
+        "cflx-cleanup-review",
+        "cflx-accept",
+        "cflx-archive",
+        "cflx-resolve",
+    ];
+    for name in &expected_skills {
         let skill_dir = skills_base.join(name);
         assert!(
             skill_dir.exists(),
@@ -166,16 +178,17 @@ fn test_embedded_install_without_skills_dir() {
         );
     }
 
-    // Verify scripts/cflx.py is NOT distributed (replaced by native CLI)
-    assert!(
-        !skills_base.join("cflx-proposal/scripts/cflx.py").exists(),
-        "cflx-proposal must NOT have scripts/cflx.py (replaced by native CLI)"
-    );
-    assert!(
-        !skills_base.join("cflx-workflow/scripts/cflx.py").exists(),
-        "cflx-workflow must NOT have scripts/cflx.py (replaced by native CLI)"
-    );
-    // Verify reference auxiliary files are still present
+    // Verify scripts/cflx.py is NOT distributed in any skill (replaced by native CLI)
+    for name in &expected_skills {
+        assert!(
+            !skills_base
+                .join(format!("{}/scripts/cflx.py", name))
+                .exists(),
+            "{name} must NOT have scripts/cflx.py (replaced by native CLI)"
+        );
+    }
+
+    // Verify reference auxiliary files are present for skills that have them
     assert!(
         skills_base
             .join("cflx-workflow/references/cflx-accept.md")
@@ -197,6 +210,18 @@ fn test_embedded_install_without_skills_dir() {
     assert!(
         skills_base.join("cflx-run/references/cflx-run.md").exists(),
         "cflx-run must have references/cflx-run.md"
+    );
+    assert!(
+        skills_base
+            .join("cflx-apply/references/cflx-apply.md")
+            .exists(),
+        "cflx-apply must have references/cflx-apply.md"
+    );
+    assert!(
+        skills_base
+            .join("cflx-archive/references/cflx-archive.md")
+            .exists(),
+        "cflx-archive must have references/cflx-archive.md"
     );
 }
 
