@@ -4,11 +4,9 @@ use anyhow::Result;
 
 // cflx-proposal skill files
 const CFLX_PROPOSAL_SKILL_MD: &str = include_str!("../skills/cflx-proposal/SKILL.md");
-const CFLX_PROPOSAL_SCRIPT: &str = include_str!("../skills/cflx-proposal/scripts/cflx.py");
 
 // cflx-workflow skill files
 const CFLX_WORKFLOW_SKILL_MD: &str = include_str!("../skills/cflx-workflow/SKILL.md");
-const CFLX_WORKFLOW_SCRIPT: &str = include_str!("../skills/cflx-workflow/scripts/cflx.py");
 const CFLX_WORKFLOW_REF_ACCEPT: &str =
     include_str!("../skills/cflx-workflow/references/cflx-accept.md");
 const CFLX_WORKFLOW_REF_APPLY: &str =
@@ -22,15 +20,11 @@ const CFLX_RUN_REF: &str = include_str!("../skills/cflx-run/references/cflx-run.
 
 /// Return all cflx bundled skills with their auxiliary files embedded at compile time.
 pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
-    let proposal = register_embedded_skill(
-        CFLX_PROPOSAL_SKILL_MD,
-        &[("scripts/cflx.py", CFLX_PROPOSAL_SCRIPT)],
-    )?;
+    let proposal = register_embedded_skill(CFLX_PROPOSAL_SKILL_MD, &[])?;
 
     let workflow = register_embedded_skill(
         CFLX_WORKFLOW_SKILL_MD,
         &[
-            ("scripts/cflx.py", CFLX_WORKFLOW_SCRIPT),
             ("references/cflx-accept.md", CFLX_WORKFLOW_REF_ACCEPT),
             ("references/cflx-apply.md", CFLX_WORKFLOW_REF_APPLY),
             ("references/cflx-archive.md", CFLX_WORKFLOW_REF_ARCHIVE),
@@ -76,14 +70,14 @@ mod tests {
 
         let proposal = skills.iter().find(|s| s.name == "cflx-proposal").unwrap();
         assert!(
-            proposal.auxiliary_files.contains_key("scripts/cflx.py"),
-            "cflx-proposal must have scripts/cflx.py"
+            !proposal.auxiliary_files.contains_key("scripts/cflx.py"),
+            "cflx-proposal must NOT have scripts/cflx.py (replaced by native CLI)"
         );
 
         let workflow = skills.iter().find(|s| s.name == "cflx-workflow").unwrap();
         assert!(
-            workflow.auxiliary_files.contains_key("scripts/cflx.py"),
-            "cflx-workflow must have scripts/cflx.py"
+            !workflow.auxiliary_files.contains_key("scripts/cflx.py"),
+            "cflx-workflow must NOT have scripts/cflx.py (replaced by native CLI)"
         );
         assert!(
             workflow

@@ -6,7 +6,7 @@
 - [ ] 4. Update embedded skill registration and install-skills packaging in `src/embedded_skills.rs` so bundled skill installation includes the new operation-specific skills and each skill's own auxiliary files while keeping `cflx-workflow` installable as a self-contained compatibility router (verification: `cargo test embedded_skills -- --nocapture` and `cargo test --test install_skills_test -- --nocapture`).
 - [ ] 5. Refresh skill-facing docs and distribution metadata such as `skills/README.md` to describe the router + per-operation skill architecture instead of a single multi-operation workflow skill (verification: docs mention `cflx-workflow` as compatibility router and list all operation-specific skills).
 - [ ] 6. Update OpenSpec coverage for agent prompt / install-skill behavior so canonical specs describe direct per-operation skill loading plus retained `cflx-workflow` compatibility routing (verification: strict validation passes with spec deltas under `openspec/changes/split-workflow-skills-by-operation/specs/`).
-- [ ] 7. Run focused validation for the new proposal and repository checks before handoff (verification: `python3 skills/cflx-proposal/scripts/cflx.py validate split-workflow-skills-by-operation --strict`, plus the targeted Rust tests/commands used above, all pass).
+- [ ] 7. Run focused validation for the new proposal and repository checks before handoff (verification: `cflx openspec validate split-workflow-skills-by-operation --strict`, plus the targeted Rust tests/commands used above, all pass).
 
 ## Future Work
 

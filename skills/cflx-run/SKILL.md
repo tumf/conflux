@@ -134,7 +134,7 @@ If multiple changes were archived in a single run, use the archived change direc
 ls openspec/changes/archive/
 
 # For each archived change, identify its spec deltas
-python3 openspec/scripts/cflx.py show <change-id> --json --deltas-only 2>/dev/null || \
+cflx openspec show <change-id> --json --deltas-only 2>/dev/null || \
   cat openspec/changes/archive/<change-id>/proposal.md
 ```
 
