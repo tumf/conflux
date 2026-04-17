@@ -33,7 +33,7 @@ fn resolve_rejection_review_command(template: &str, prompt: &str, change_id: &st
 
 fn rejection_review_prompt(change_id: &str) -> String {
     format!(
-        "load skills: cflx-workflow\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
+        "load skills: cflx-rejecting\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
         change_id, change_id, change_id, change_id, change_id
     )
 }

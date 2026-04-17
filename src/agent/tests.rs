@@ -246,7 +246,7 @@ fn test_build_apply_prompt_with_only_system_prompt() {
     let acceptance_tail = "";
     let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
 
-    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("load skills: cflx-apply"));
     assert!(result.contains("Apply change id: my-change"));
     assert!(result.contains(APPLY_SYSTEM_PROMPT));
 }
@@ -312,7 +312,7 @@ fn test_build_archive_prompt_with_all_parts() {
     let history_context = "<last_archive attempt=\"1\">\nstatus: failed\n</last_archive>";
     let result = build_archive_prompt("my-change", user_prompt, history_context);
 
-    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("load skills: cflx-archive"));
     assert!(result.contains("Archive change id: my-change"));
     assert!(result.contains("Please archive this change"));
     assert!(result.contains("<last_archive attempt=\"1\">"));
@@ -336,7 +336,7 @@ fn test_build_archive_prompt_with_empty_history() {
     let history_context = "";
     let result = build_archive_prompt("my-change", user_prompt, history_context);
 
-    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("load skills: cflx-archive"));
     assert!(result.contains("Archive change id: my-change"));
     assert!(result.contains("Please archive this change"));
 }
@@ -347,6 +347,6 @@ fn test_build_archive_prompt_both_empty() {
     let history_context = "";
     let result = build_archive_prompt("my-change", user_prompt, history_context);
 
-    assert!(result.contains("load skills: cflx-workflow"));
+    assert!(result.contains("load skills: cflx-archive"));
     assert!(result.contains("Archive change id: my-change"));
 }

@@ -4,7 +4,7 @@ Conflux workflow management skills for AI coding assistants.
 
 ## Overview
 
-This repository contains three complementary skills for managing the Conflux (OpenSpec-based) change lifecycle:
+Conflux uses a **router + per-operation skill** architecture. New orchestrator prompts load dedicated operation-specific skills directly, while `cflx-workflow` remains as a backward-compatible router for legacy prompts.
 
 ```
 [Human] → cflx-proposal → Proposal Creation (interactive)
@@ -13,11 +13,17 @@ This repository contains three complementary skills for managing the Conflux (Op
                 ↓
            cflx-run → `cflx run` orchestration
                 ↓
-        cflx-workflow (apply) → Implementation (autonomous)
-                ↓
-        cflx-workflow (accept) → Verification (autonomous)
-                ↓
-        cflx-workflow (archive) → Finalization (autonomous)
+        ┌─────────────────────────────────────┐
+        │  Orchestrator loads dedicated skills │
+        ├─────────────────────────────────────┤
+        │  cflx-analyze  → Dependency analysis│
+        │  cflx-apply    → Implementation     │
+        │  cflx-rejecting→ Rejection review   │
+        │  cflx-cleanup-review → Cleanup      │
+        │  cflx-accept   → Acceptance review  │
+        │  cflx-archive  → Finalization       │
+        │  cflx-resolve  → Conflict resolution│
+        └─────────────────────────────────────┘
 ```
 
 ## Skills
@@ -30,30 +36,6 @@ This repository contains three complementary skills for managing the Conflux (Op
 - Human-interactive mode
 - Asks clarifying questions
 - Guides users through proposal structure
-- Iterates based on feedback
-
-**Triggers**:
-- "Create a proposal for..."
-- "Draft a change proposal"
-- "Propose a new feature"
-
-### cflx-workflow
-
-**Purpose**: Execute Conflux workflow operations autonomously without user interaction.
-
-**Characteristics**:
-- Called by orchestration system
-- Cannot ask questions
-- Makes autonomous decisions
-- Three operations: apply, accept, archive
-
-**Operations**:
-
-| Operation | Purpose | Output |
-|-----------|---------|--------|
-| Apply | Implement approved changes | Completed tasks + code |
-| Accept | Verify implementation | PASS / FAIL / CONTINUE / BLOCKED |
-| Archive | Finalize deployed changes | Archived change + updated specs |
 
 ### cflx-run
 
@@ -62,19 +44,50 @@ This repository contains three complementary skills for managing the Conflux (Op
 **Characteristics**:
 - Human-invoked operational mode
 - Verifies clean working tree and base branch
-- Checks whether upstream sync is needed
 - Runs Conflux orchestration and reviews the merge result
+
+### Operation-Specific Skills (Dedicated)
+
+These skills are loaded directly by the orchestrator for each operation:
+
+| Skill | Operation | Purpose |
+|-------|-----------|---------|
+| `cflx-analyze` | analyze | Dependency analysis and change selection |
+| `cflx-apply` | apply | Implement approved changes |
+| `cflx-rejecting` | rejecting | Review rejection proposals |
+| `cflx-cleanup-review` | cleanup-review | Post-apply worktree cleanup |
+| `cflx-accept` | accept | Acceptance review (operation identity) |
+| `cflx-archive` | archive | Finalize deployed changes |
+| `cflx-resolve` | resolve | Merge conflict resolution |
+
+All operation-specific skills are autonomous (cannot ask questions) and are called by the orchestration system, not for direct human use.
+
+### cflx-workflow (Compatibility Router)
+
+**Purpose**: Backward-compatible router for legacy prompts that use `load skills: cflx-workflow`.
+
+**Characteristics**:
+- Self-contained: provides legacy-equivalent guidance for apply / rejecting / cleanup-review / accept / archive without requiring additional skill loads
+- Does not require cross-skill auxiliary file access
+- New orchestrator prompts should use dedicated operation-specific skills instead
 
 ## Installation
 
 ```bash
-npx skills add tumf/cflx-skills
+cflx install-skills
 ```
 
-This will install all three skills:
+This installs all bundled skills:
 - `cflx-proposal` - For interactive proposal creation
 - `cflx-run` - For executing `cflx run` from a clean base branch
-- `cflx-workflow` - For autonomous workflow execution
+- `cflx-workflow` - Compatibility router for legacy prompts
+- `cflx-analyze` - Dependency analysis
+- `cflx-apply` - Change implementation
+- `cflx-rejecting` - Rejection review
+- `cflx-cleanup-review` - Post-apply cleanup
+- `cflx-accept` - Acceptance review identity
+- `cflx-archive` - Change archival
+- `cflx-resolve` - Conflict resolution
 
 ## Requirements
 
@@ -86,38 +99,11 @@ This will install all three skills:
 OpenSpec operations are provided natively by the `cflx` binary:
 
 ```bash
-# List changes
-cflx openspec list
-
-# List specs
-cflx openspec list --specs
-
-# Show change details
-cflx openspec show <id>
-
-# Validate change
-cflx openspec validate <id> --strict
-
-# Archive change
-cflx openspec archive <id> --yes
-```
-
-## Directory Structure
-
-```
-openspec/
-├── changes/
-│   ├── <change-id>/
-│   │   ├── proposal.md
-│   │   ├── tasks.md
-│   │   ├── design.md (optional)
-│   │   └── specs/
-│   │       └── <capability>/
-│   │           └── spec.md
-│   └── archive/
-└── specs/
-    └── <capability>/
-        └── spec.md
+cflx openspec list                # List changes
+cflx openspec list --specs        # List specs
+cflx openspec show <id>           # Show change details
+cflx openspec validate <id> --strict  # Validate change
+cflx openspec archive <id> --yes  # Archive change
 ```
 
 ## Key Principles
@@ -139,7 +125,7 @@ openspec/
 - Apply can escalate `IMPLEMENTATION_BLOCKER` when implementation is truly impossible in current loop
 - Accept can return `ACCEPTANCE: BLOCKED` only with concrete blocker evidence
 
-### Autonomous Execution (cflx-workflow only)
+### Autonomous Execution (all operation-specific skills)
 
 - No questions allowed during execution
 - Make decisions based on available context
