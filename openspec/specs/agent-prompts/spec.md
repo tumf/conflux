@@ -4,6 +4,7 @@
 
 This specification defines the behavior and constraints for AI agent system prompts, particularly the apply prompt (`APPLY_SYSTEM_PROMPT`), to ensure reliable and autonomous task execution.
 ## Requirements
+
 ### Requirement: Apply system prompt MUST include task format guidance
 apply プロンプトは tasks.md のフォーマット修正と進捗更新の指示を含めなければならない（MUST）。Future Work / Out of Scope / Notes セクションへタスクを移動する際は、チェックボックス（`- [ ]` または `- [x]`）を削除し、プレーンテキストまたはチェックボックスなしのリスト項目として記載しなければならない（MUST）。WIP スナップショット作成を妨げないため、apply プロンプトは `--no-verify` を一律禁止してはならない（MUST NOT）。
 
@@ -210,7 +211,6 @@ acceptance は以下を満たさなければならない（MUST）。
 
 #
 
-
 ### Requirement: Prompts MUST apply a mock-first external dependency policy
 
 AI が単独で解決・検証できない要件は外部依存として扱われなければならない（MUST）。
@@ -251,7 +251,6 @@ unit test の主張と実際の test scope が一致しない場合、acceptance
 - **WHEN** acceptance が確認すると実際には integration-style test しか存在しない
 - **THEN** acceptance は FAIL を出力する
 - **AND** finding で unsupported な checklist claim を明示する
-
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
@@ -302,7 +301,6 @@ Conflux の orchestrator は、managed worktree apply の post-apply handoff cle
 - **THEN** output には final marker が 1 回だけ含まれる
 - **AND** marker は `CLEANUP_REVIEW: CLEAN` のみであり、成功以外の verdict は存在しない
 
-
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
 acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイル一覧と前回 findings を含める（MUST）。
@@ -334,7 +332,6 @@ Conflux core の acceptance prompt builder は、特定アーキテクチャ・�
 - **WHEN** acceptance が archive-readiness を判定する
 - **THEN** acceptance はその commit-path blocker を relevant な readiness finding として扱う
 - **AND** hook 内部の test/lint/format を独立 gate として追加列挙しない
-
 
 ### Requirement: Operation-specific prompts MUST load dedicated skills
 
@@ -424,15 +421,30 @@ The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary s
 
 ### Requirement: cflx-accept MUST preserve acceptance command-template single source
 
-The dedicated `cflx-accept` skill MAY provide operation identity and scoped acceptance guidance, but it MUST NOT become the primary source of fixed acceptance procedure. The fixed acceptance procedure MUST remain defined by `.opencode/commands/cflx-accept.md`.
+The dedicated `cflx-accept` skill MAY provide operation identity and scoped acceptance guidance, but it MUST NOT become the primary source of fixed acceptance procedure. The fixed acceptance procedure MUST remain defined by `.opencode/commands/cflx-accept.md`, and the acceptance output contract MUST be stated in a machine-readable form that is consistent with runtime verdict parsing and regression tests.
 
-#### Scenario: cflx-accept preserves command-template single source
+The canonical acceptance verdict is an unwrapped standalone line containing exactly one of `ACCEPTANCE: PASS`, `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, or `ACCEPTANCE: BLOCKED`. Markdown wrappers are explicitly categorized as follows:
+
+- **Forbidden in agent output**: markdown headings (`#`, `##`, etc.), blockquotes (`>`), bullets (`-`, `*`), fenced code blocks (`` ``` ``). The command template and skill guidance MUST instruct agents not to wrap the verdict marker in these forms.
+- **Tolerated by parser (defensive)**: bold (`**`), italic (`*`), underline (`_`), heading prefixes (`#`+), blockquote prefixes (`>`), bullet prefixes (`-`). The runtime parser strips these before matching as a defense against common LLM formatting drift, but this tolerance does not make them canonical.
+- **Rejected by parser**: verdict markers inside fenced code blocks are ignored (they may be examples, not actual verdicts).
+
+#### Scenario: Acceptance command template defines a standalone machine-readable verdict
 
 - **GIVEN** the orchestrator emits `load skills: cflx-accept`
-- **WHEN** acceptance runs through the standard command template flow
-- **THEN** fixed acceptance procedure still comes from `.opencode/commands/cflx-accept.md`
-- **AND** `cflx-accept` does not replace that command template as the primary fixed-instruction source
+- **AND** acceptance runs through the standard command template flow
+- **WHEN** the final verdict is produced
+- **THEN** the canonical output contract is an unwrapped standalone line containing exactly one of `ACCEPTANCE: PASS`, `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, or `ACCEPTANCE: BLOCKED`
+- **AND** the contract explicitly states that markdown headings, quotes, bullets, and fenced code blocks are forbidden around the verdict marker
+- **AND** the runtime parser defensively tolerates common drift prefixes (heading `#`, quote `>`, bullet `-`, bold/italic) but this tolerance does not alter the canonical contract
+- **AND** runtime parsing and regression tests enforce the documented contract instead of relying on implicit formatter behavior
 
+#### Scenario: Acceptance ownership boundary stays explicit after workflow split
+
+- **GIVEN** acceptance prompt construction, command-template instructions, dedicated skill guidance, and runtime parser enforcement are reviewed together
+- **WHEN** a future refactor changes one of these surfaces
+- **THEN** tests fail if fixed acceptance procedure or final verdict contract drifts out of sync across those surfaces
+- **AND** Rust-side prompt builders continue to inject runtime context without replacing the command template as the authoritative acceptance procedure source
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
