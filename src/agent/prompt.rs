@@ -282,8 +282,13 @@ pub fn build_last_acceptance_output_context(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Expose ARCHIVE_READINESS_CONTEXT for cross-module drift tests.
+    pub(crate) fn get_archive_readiness_context() -> &'static str {
+        ARCHIVE_READINESS_CONTEXT
+    }
 
     #[test]
     fn test_build_acceptance_diff_context_with_files_and_findings() {

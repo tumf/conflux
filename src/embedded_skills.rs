@@ -202,4 +202,106 @@ mod tests {
             );
         }
     }
+
+    // --- Prompt ownership drift-detection tests ---
+    // These tests verify that the workflow-split ownership boundaries are maintained:
+    // - cflx-accept skill must not duplicate the fixed acceptance procedure
+    // - Rust prompt builders must not contain fixed guidance phrases
+    // - Embedded skills must maintain their documented role boundaries
+
+    /// Phrases that belong exclusively to the command template (.opencode/commands/cflx-accept.md).
+    /// If cflx-accept SKILL.md contains these, it means fixed procedure has drifted into the skill.
+    const ACCEPTANCE_FIXED_PROCEDURE_PHRASES: &[&str] = &[
+        "CRITICAL formatting rule:",
+        "Forbidden wrappings",
+        "NO markdown headings",
+        "CRITICAL - When outputting FAIL:",
+        "## Acceptance #",
+    ];
+
+    #[test]
+    fn test_cflx_accept_skill_does_not_duplicate_fixed_procedure() {
+        // The cflx-accept skill provides operation identity and scoped guidance only.
+        // The fixed acceptance procedure (checklist, verdict formatting rules, FAIL workflow)
+        // must remain in .opencode/commands/cflx-accept.md.
+        for phrase in ACCEPTANCE_FIXED_PROCEDURE_PHRASES {
+            assert!(
+                !CFLX_ACCEPT_SKILL_MD.contains(phrase),
+                "cflx-accept SKILL.md must NOT contain fixed procedure phrase '{}' — \
+                 this belongs in .opencode/commands/cflx-accept.md",
+                phrase
+            );
+        }
+    }
+
+    #[test]
+    fn test_cflx_accept_skill_references_command_template() {
+        // The cflx-accept skill must reference the command template as the single source
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
+            "cflx-accept SKILL.md must reference the command template as single source"
+        );
+    }
+
+    #[test]
+    fn test_rust_prompt_builder_does_not_contain_acceptance_checklist() {
+        // The ARCHIVE_READINESS_CONTEXT is the only fixed content the Rust prompt builder
+        // injects. Verify it doesn't contain acceptance checklist items that belong
+        // to the command template.
+        let archive_ctx = crate::agent::prompt::tests::get_archive_readiness_context();
+        let checklist_phrases = [
+            "Output format (output exactly ONCE",
+            "CRITICAL formatting rule:",
+            "Required checks:",
+            "Implementation Blocker review:",
+        ];
+        for phrase in &checklist_phrases {
+            assert!(
+                !archive_ctx.contains(phrase),
+                "ARCHIVE_READINESS_CONTEXT must NOT contain acceptance checklist phrase '{}' — \
+                 this belongs in .opencode/commands/cflx-accept.md",
+                phrase
+            );
+        }
+    }
+
+    #[test]
+    fn test_acceptance_verdict_contract_consistency() {
+        // Verify the four canonical verdict markers are documented consistently
+        // across the parser, the command template reference, and the cflx-workflow skill.
+        let canonical_markers = [
+            "ACCEPTANCE: PASS",
+            "ACCEPTANCE: FAIL",
+            "ACCEPTANCE: CONTINUE",
+            "ACCEPTANCE: BLOCKED",
+        ];
+
+        // cflx-workflow SKILL.md must mention all four markers
+        for marker in &canonical_markers {
+            assert!(
+                CFLX_WORKFLOW_SKILL_MD.contains(marker),
+                "cflx-workflow SKILL.md must document verdict marker '{}'",
+                marker
+            );
+        }
+
+        // cflx-workflow references/cflx-accept.md must mention all four markers
+        for marker in &canonical_markers {
+            assert!(
+                CFLX_WORKFLOW_REF_ACCEPT.contains(marker),
+                "cflx-workflow references/cflx-accept.md must document verdict marker '{}'",
+                marker
+            );
+        }
+    }
+
+    #[test]
+    fn test_cflx_workflow_verdict_format_prohibitions() {
+        // Verify the cflx-workflow skill includes formatting prohibitions
+        // to prevent drift in legacy-path output.
+        assert!(
+            CFLX_WORKFLOW_SKILL_MD.contains("Do NOT wrap the verdict"),
+            "cflx-workflow SKILL.md must include verdict formatting prohibition"
+        );
+    }
 }

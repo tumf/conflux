@@ -6,7 +6,7 @@
 
 mod history_ops;
 mod output;
-mod prompt;
+pub(crate) mod prompt;
 mod runner;
 
 // Re-export public types for backward compatibility

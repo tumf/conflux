@@ -163,12 +163,14 @@ Read `proposal.md` and detect `Change Type`:
 
 ### Output Format
 
-Output exactly ONE verdict marker on its own line:
+Output exactly ONE verdict marker on its own line with NO markdown formatting:
 
 - `ACCEPTANCE: PASS` - All checks pass
 - `ACCEPTANCE: FAIL` - Checks fail (followed by FINDINGS and tasks.md update)
 - `ACCEPTANCE: CONTINUE` - Verification incomplete
 - `ACCEPTANCE: BLOCKED` - Valid Implementation Blocker exists
+
+Do NOT wrap the verdict in headings (`##`), blockquotes (`>`), bullets (`-`), bold (`**`), or code fences.
 
 ### Accept Rules
 
