@@ -3,6 +3,7 @@
 ## Purpose
 Defines the release process, versioning, and changelog generation.
 ## Requirements
+
 ### Requirement: REQ-REL-001 Version Bump Automation
 
 The system SHALL provide a release script that automates version bumping.
@@ -26,22 +27,24 @@ The system SHALL provide a release script that automates version bumping.
 
 ### Requirement: REQ-REL-002 Pre-release Validation
 
-The release script SHALL validate code quality before allowing a release.
+The release and CI validation flow SHALL include dependency vulnerability auditing in addition to formatting, linting, and test checks.
 
 **Priority**: High
 
-#### Scenario: All checks pass
-- Given the code is properly formatted
-- And there are no clippy warnings
-- And all tests pass
-- When the user runs the release script
-- Then the release process SHALL proceed
+#### Scenario: CI audit passes
+- Given the GitHub Actions checks job is running
+- And project dependencies have no known RustSec advisories
+- When the validation steps execute
+- Then `cargo audit` SHALL run as part of CI validation
+- And the checks job SHALL continue to subsequent validation steps
 
-#### Scenario: Checks fail
-- Given cargo fmt reports formatting issues
-- When the user runs the release script
-- Then the script SHALL exit with an error
-- And display a message about the failed check
+#### Scenario: CI audit fails on known vulnerability
+- Given the GitHub Actions checks job is running
+- And Cargo.lock includes a dependency with a known RustSec advisory
+- When `cargo audit` executes
+- Then the audit step SHALL fail
+- And the checks job SHALL fail
+- And the workflow logs SHALL include the advisory details
 
 ### Requirement: REQ-REL-009 Branch-based Pre-release Suffix
 
@@ -165,3 +168,21 @@ The project SHALL include a cargo-dist configuration file.
 #### Scenario: Platform targets
 - When cargo-dist runs
 - Then it SHALL build for the targets specified in dist-workspace.toml
+
+### Requirement: Local Validation Command Includes Audit
+
+The project SHALL provide a standard local command for dependency vulnerability auditing and include it in the comprehensive local validation target.
+
+**Priority**: Medium
+
+#### Scenario: Run audit explicitly
+- Given a developer is at the repository root
+- When the developer runs `make audit`
+- Then `cargo audit` SHALL run
+- And the command SHALL succeed only when no known advisories are present
+
+#### Scenario: Run comprehensive local validation
+- Given a developer wants to run the full local validation suite
+- When the developer runs `make check`
+- Then the command SHALL run formatting, linting, tests, pre-commit checks, and dependency auditing
+- And `make check` SHALL fail if `cargo audit` reports a known advisory

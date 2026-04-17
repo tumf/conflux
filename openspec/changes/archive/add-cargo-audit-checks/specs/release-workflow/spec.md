@@ -21,6 +21,8 @@ The release and CI validation flow SHALL include dependency vulnerability auditi
 - And the checks job SHALL fail
 - And the workflow logs SHALL include the advisory details
 
+## ADDED Requirements
+
 ### Requirement: Local Validation Command Includes Audit
 
 The project SHALL provide a standard local command for dependency vulnerability auditing and include it in the comprehensive local validation target.
