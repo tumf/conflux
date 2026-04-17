@@ -108,13 +108,28 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
 }
 
 /// Strip markdown decorations from a string.
-/// Removes bold (**), italic (*), underline (_), and other common markdown formatting.
+/// Removes bold (**), italic (*), underline (_), heading prefixes (#),
+/// blockquote prefixes (>), and bullet prefixes (-) that LLMs commonly
+/// add around verdict markers.
+///
+/// This is a defensive measure — the canonical contract forbids these
+/// wrappers, but the parser tolerates them to prevent silent CONTINUE
+/// fallback when an agent drifts.
 pub(crate) fn strip_markdown_decorations(text: &str) -> String {
-    // Simple approach: remove all common markdown decoration characters
-    text.replace("**", "")
-        .replace(['*', '_'], "")
-        .trim()
-        .to_string()
+    let mut s = text.to_string();
+    // Remove bold pairs first to avoid leaving stray * characters
+    s = s.replace("**", "");
+    // Remove remaining italic/underline characters
+    s = s.replace(['*', '_'], "");
+    // Trim whitespace, then strip leading markdown block-level prefixes
+    let trimmed = s.trim();
+    // Strip leading heading markers (e.g., "## ", "### ")
+    let trimmed = trimmed.trim_start_matches('#');
+    // Strip leading blockquote markers (e.g., "> ")
+    let trimmed = trimmed.trim_start_matches('>');
+    // Strip leading bullet markers (e.g., "- ")
+    let trimmed = trimmed.trim_start_matches('-');
+    trimmed.trim().to_string()
 }
 
 /// Parse findings from acceptance output.
@@ -483,6 +498,109 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         }
     }
 
+    // --- Markdown drift tolerance tests ---
+    // These tests verify that the parser defensively handles common LLM
+    // formatting drift (headings, blockquotes, bullets) even though the
+    // canonical contract forbids these wrappers.
+
+    #[test]
+    fn test_parse_pass_with_heading_prefix() {
+        let output = "## ACCEPTANCE: PASS\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_pass_with_heading_h3_prefix() {
+        let output = "### ACCEPTANCE: PASS\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_fail_with_heading_prefix() {
+        let output = "## ACCEPTANCE: FAIL\nFINDINGS:\n- Issue 1\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0], "Issue 1");
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pass_with_blockquote_prefix() {
+        let output = "> ACCEPTANCE: PASS\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_fail_with_blockquote_prefix() {
+        let output = "> ACCEPTANCE: FAIL\nFINDINGS:\n- Issue 1\n";
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings.len(), 1);
+            }
+            _ => panic!("Expected Fail"),
+        }
+    }
+
+    #[test]
+    fn test_parse_pass_with_bullet_prefix() {
+        let output = "- ACCEPTANCE: PASS\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_continue_with_heading_prefix() {
+        let output = "## ACCEPTANCE: CONTINUE\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_blocked_with_heading_prefix() {
+        let output = "## ACCEPTANCE: BLOCKED\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+    }
+
+    #[test]
+    fn test_parse_pass_with_heading_and_bold() {
+        // Combined drift: heading + bold
+        let output = "## **ACCEPTANCE: PASS**\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_strip_markdown_decorations_heading() {
+        assert_eq!(
+            strip_markdown_decorations("## ACCEPTANCE: PASS"),
+            "ACCEPTANCE: PASS"
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_decorations_blockquote() {
+        assert_eq!(
+            strip_markdown_decorations("> ACCEPTANCE: PASS"),
+            "ACCEPTANCE: PASS"
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_decorations_bullet() {
+        assert_eq!(
+            strip_markdown_decorations("- ACCEPTANCE: PASS"),
+            "ACCEPTANCE: PASS"
+        );
+    }
+
+    #[test]
+    fn test_strip_markdown_decorations_heading_and_bold() {
+        assert_eq!(
+            strip_markdown_decorations("## **ACCEPTANCE: PASS**"),
+            "ACCEPTANCE: PASS"
+        );
+    }
+
     #[test]
     fn test_parse_fail_empty_findings_when_no_section() {
         // When ACCEPTANCE: FAIL appears without a FINDINGS section,
@@ -494,5 +612,73 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             }
             _ => panic!("Expected Fail"),
         }
+    }
+
+    // --- Marker contract consistency tests ---
+    // These tests verify that the marker detection used in orchestration/acceptance.rs
+    // streaming code is consistent with the parser contract. The streaming code uses
+    // strip_markdown_decorations + starts_with to detect markers for the grace period,
+    // and the parser uses the same function. Both must agree.
+
+    #[test]
+    fn test_marker_detection_consistency_with_parser() {
+        // The orchestration streaming code (src/orchestration/acceptance.rs) detects
+        // markers using strip_markdown_decorations + starts_with for the grace period.
+        // The parser (parse_acceptance_output) uses the same approach.
+        // This test ensures both detect markers in all documented drift cases.
+        let drift_cases: &[(&str, &str)] = &[
+            ("ACCEPTANCE: PASS", "pass"),
+            ("**ACCEPTANCE: PASS**", "pass"),
+            ("## ACCEPTANCE: PASS", "pass"),
+            ("> ACCEPTANCE: PASS", "pass"),
+            ("- ACCEPTANCE: PASS", "pass"),
+            ("### **ACCEPTANCE: FAIL**", "fail"),
+            ("ACCEPTANCE: CONTINUE", "continue"),
+            ("ACCEPTANCE: BLOCKED", "blocked"),
+            ("## ACCEPTANCE: BLOCKED", "blocked"),
+            ("> ACCEPTANCE: FAIL", "fail"),
+        ];
+
+        for (case, expected_kind) in drift_cases {
+            // 1. Verify strip_markdown_decorations + starts_with detects the marker
+            let normalized = strip_markdown_decorations(case.trim());
+            let is_marker = normalized.starts_with("ACCEPTANCE: PASS")
+                || normalized.starts_with("ACCEPTANCE: FAIL")
+                || normalized.starts_with("ACCEPTANCE: CONTINUE")
+                || normalized.starts_with("ACCEPTANCE: BLOCKED");
+            assert!(
+                is_marker,
+                "strip_markdown_decorations + starts_with must detect marker in '{}' (normalized: '{}')",
+                case, normalized
+            );
+
+            // 2. Verify the full parser returns the expected result kind (not a spurious fallback)
+            let full_output = format!("{}\n", case);
+            let result = parse_acceptance_output(&full_output);
+            let result_kind = match &result {
+                AcceptanceResult::Pass => "pass",
+                AcceptanceResult::Fail { .. } => "fail",
+                AcceptanceResult::Continue => "continue",
+                AcceptanceResult::Blocked => "blocked",
+            };
+            assert_eq!(
+                result_kind, *expected_kind,
+                "parse_acceptance_output returned '{}' but expected '{}' for input '{}'",
+                result_kind, expected_kind, case
+            );
+        }
+    }
+
+    #[test]
+    fn test_code_fence_markers_rejected_by_both_parser_and_detection() {
+        // Markers inside code fences must NOT be detected by either the parser
+        // or the streaming marker detection (which operates line-by-line and
+        // does not track code fence state, but the parser does).
+        let output = "```\nACCEPTANCE: PASS\n```\n";
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::Continue,
+            "Parser must not match markers inside code fences"
+        );
     }
 }

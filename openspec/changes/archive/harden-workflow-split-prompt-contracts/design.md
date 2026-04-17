@@ -12,6 +12,23 @@
 
 ## Ownership Model
 
+### Per-operation ownership inventory
+
+| Operation | Fixed Guidance Source | Rust Prompt Builder | Runtime Parser | Compatibility Note |
+|-----------|---------------------|--------------------|--------------|--------------------|
+| acceptance | `.opencode/commands/cflx-accept.md` (command template) | `build_acceptance_prompt_context_only` — injects change metadata, diff context, archive-readiness context, last output context, user prompt, history | `parse_acceptance_output` in `src/acceptance.rs` — enforces `ACCEPTANCE: PASS\|FAIL\|CONTINUE\|BLOCKED` standalone marker contract | `cflx-accept` skill provides operation identity + scoped guidance only; `cflx-workflow` Accept section provides legacy-equivalent guidance |
+| apply | `cflx-apply` skill (dedicated skill) | `build_apply_prompt` — injects change_id, user prompt, history context, acceptance tail | N/A (no machine-readable output contract parsed by runtime) | `cflx-workflow` Apply section provides legacy-equivalent guidance |
+| analyze | `cflx-analyze` skill (dedicated skill) | Rust injects candidate changes, progress context | N/A | `cflx-workflow` does not route analyze |
+| archive | `cflx-archive` skill (dedicated skill) | `build_archive_prompt` — injects change_id, user prompt, history | N/A | `cflx-workflow` Archive section provides legacy-equivalent guidance |
+| cleanup-review | `cflx-cleanup-review` skill (dedicated skill) | `build_cleanup_review_prompt` — injects change_id, paths, rules | `parse_cleanup_review_output` in `src/agent/prompt.rs` — enforces single `CLEANUP_REVIEW: CLEAN` standalone marker | `cflx-workflow` Cleanup Review section provides legacy-equivalent guidance |
+| rejecting | `cflx-rejecting` skill (dedicated skill) | Rust injects change_id, REJECTED.md path | Runtime checks for `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME` | `cflx-workflow` Rejecting Review section provides legacy-equivalent guidance |
+| resolve | `cflx-resolve` skill (dedicated skill) | Rust injects conflict files, VCS state, merge plan, retry history | N/A | `cflx-workflow` does not route resolve |
+
+### Intentional compatibility exceptions
+
+- `cflx-workflow` remains a self-contained backward-compatible router: its operation sections intentionally duplicate a subset of fixed guidance from dedicated skills so that legacy prompts (`load skills: cflx-workflow`) can function without additional skill loads. This duplication is intentional and constrained — `cflx-workflow` MUST NOT become the authoritative source for new orchestrator prompts.
+- `cflx-accept` skill supplements `.opencode/commands/cflx-accept.md` with verification-ownership checks and spec-only detection, but the fixed acceptance checklist and output contract remain command-template-owned.
+
 ### Command-template-owned fixed guidance
 
 - acceptance の fixed checklist / verdict workflow / output contract は `.opencode/commands/cflx-accept.md`
@@ -24,7 +41,7 @@
 ### Rust-owned runtime context and enforcement
 
 - Rust prompt builders は skill/template prelude と runtime-only context を注入する
-- runtime parser / orchestration layer は documented marker contract を enforcement するが、undocumented formatting assumptionsに依存してはならない
+- runtime parser / orchestration layer は documented marker contract を enforcement するが、undocumented formatting assumptions に依存してはならない
 
 ## Contract Hardening Strategy
 

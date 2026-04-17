@@ -76,9 +76,17 @@ Output format (output exactly ONCE at the end):
 - If verification cannot complete in this session: Output "ACCEPTANCE: CONTINUE"
 
 CRITICAL formatting rule: The verdict marker (e.g. "ACCEPTANCE: PASS") MUST be on its own line
-with NOTHING else on that line. Do NOT append any text after the marker on the same line.
-Bad:  "ACCEPTANCE: PASSAll criteria verified"
-Good: "ACCEPTANCE: PASS" (followed by a newline, then any explanation on subsequent lines)
+with NOTHING else on that line. Do NOT wrap the marker in any markdown formatting.
+
+Forbidden wrappings (will cause parser failures or unintended fallback):
+- NO markdown headings: "## ACCEPTANCE: PASS" is WRONG
+- NO blockquotes: "> ACCEPTANCE: PASS" is WRONG
+- NO bullets: "- ACCEPTANCE: PASS" is WRONG
+- NO bold/italic: "**ACCEPTANCE: PASS**" is WRONG
+- NO code fences: wrapping in ``` blocks is WRONG
+- NO trailing text: "ACCEPTANCE: PASSAll criteria verified" is WRONG
+
+Correct output: "ACCEPTANCE: PASS" alone on its own line, followed by a newline.
 
 CRITICAL - When outputting FAIL:
 1. List ALL issues discovered in the FINDINGS section
