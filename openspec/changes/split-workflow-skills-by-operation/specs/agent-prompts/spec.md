@@ -1,10 +1,16 @@
 ## MODIFIED Requirements
 
-### Requirement: Operation-specific workflow prompts MUST load dedicated skills
+### Requirement: Operation-specific prompts MUST load dedicated skills
 
-Conflux orchestrator prompt builders MUST load operation-specific workflow skills directly when the operation is already known. `apply` MUST load `cflx-apply`, `accept` MUST load `cflx-accept`, `archive` MUST load `cflx-archive`, `cleanup-review` MUST load `cflx-cleanup-review`, and rejecting review MUST load `cflx-rejecting`.
+Conflux orchestrator prompt builders MUST load operation-specific skills directly when the operation is already known. `analyze` MUST load `cflx-analyze`, `apply` MUST load `cflx-apply`, `accept` MUST load `cflx-accept`, `archive` MUST load `cflx-archive`, `cleanup-review` MUST load `cflx-cleanup-review`, rejecting review MUST load `cflx-rejecting`, and `resolve` MUST load `cflx-resolve`.
 
-`cflx-workflow` MUST remain available as a backward-compatible router for legacy prompts, but new orchestrator-generated prompts MUST NOT depend on it as the primary source of detailed operation instructions.
+`cflx-workflow` MUST remain available as a backward-compatible router for legacy workflow prompts, but new orchestrator-generated prompts MUST NOT depend on it as the primary source of detailed operation instructions.
+
+#### Scenario: Analyze prompt loads cflx-analyze directly
+
+- **GIVEN** the orchestrator constructs a dependency analysis prompt for queued changes
+- **WHEN** the analyze prompt builder emits the skill prelude
+- **THEN** the prelude contains `load skills: cflx-analyze`
 
 #### Scenario: Apply prompt loads cflx-apply directly
 
@@ -38,9 +44,15 @@ Conflux orchestrator prompt builders MUST load operation-specific workflow skill
 - **THEN** the prelude contains `load skills: cflx-rejecting`
 - **AND** the review still returns only `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME`
 
+#### Scenario: Resolve prompt loads cflx-resolve directly
+
+- **GIVEN** the orchestrator constructs a resolve prompt for merge conflicts or merge-finalization recovery
+- **WHEN** the resolve prompt builder emits the skill prelude
+- **THEN** the prelude contains `load skills: cflx-resolve`
+
 ### Requirement: cflx-workflow MUST remain as a compatibility router
 
-The bundled workflow skill `cflx-workflow` MUST remain installable for backward compatibility, but its primary role SHALL be to route legacy prompts to the correct operation guidance rather than to duplicate the full detailed instructions for every operation. Legacy prompts that load only `cflx-workflow` MUST still be able to execute apply / rejecting / cleanup-review / accept / archive with legacy-equivalent guidance, without requiring additional skill loads or cross-skill auxiliary file access.
+The bundled workflow skill `cflx-workflow` MUST remain installable for backward compatibility, but its primary role SHALL be to route legacy prompts to the correct operation guidance rather than to duplicate the full detailed instructions for every operation. Legacy prompts that load only `cflx-workflow` MUST still be able to execute apply / rejecting / cleanup-review / accept / archive with legacy-equivalent guidance, without requiring additional skill loads or cross-skill auxiliary file access. `cflx-workflow` MAY remain the only bundled workflow-related skill that ships `scripts/cflx.py` for this compatibility surface.
 
 #### Scenario: Legacy workflow prompt still has a supported router
 
@@ -55,6 +67,24 @@ The bundled workflow skill `cflx-workflow` MUST remain installable for backward 
 - **WHEN** the router handles apply / rejecting / cleanup-review / accept / archive
 - **THEN** it remains functional without loading additional dedicated skill names in the prompt
 - **AND** it does not require cross-skill auxiliary file access to provide legacy-equivalent operation guidance
+
+### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
+
+The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary source of fixed operation guidance for dependency analysis and conflict resolution respectively. Rust-side prompt builders MAY inject variable runtime context, but they MUST NOT remain the primary home of fixed analyze / resolve rules.
+
+#### Scenario: Analyze fixed guidance moves out of inline Rust prompt text
+
+- **GIVEN** dependency analysis is executed through the standard orchestrator path
+- **WHEN** the analyze prompt is assembled
+- **THEN** fixed dependency-selection guidance comes from `cflx-analyze`
+- **AND** Rust primarily contributes variable context such as candidate changes and progress
+
+#### Scenario: Resolve fixed guidance moves out of inline Rust prompt text
+
+- **GIVEN** conflict resolution or merge-finalization recovery is executed through the standard orchestrator path
+- **WHEN** the resolve prompt is assembled
+- **THEN** fixed conflict-resolution guidance comes from `cflx-resolve`
+- **AND** Rust primarily contributes variable context such as conflict files, VCS state, and retry history
 
 ### Requirement: cflx-accept MUST preserve acceptance command-template single source
 
