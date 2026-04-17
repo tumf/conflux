@@ -1507,7 +1507,12 @@ mod tests {
     #[test]
     fn test_openspec_show_json_deltas_only() {
         let cli = Cli::parse_from([
-            "cflx", "openspec", "show", "my-change", "--json", "--deltas-only",
+            "cflx",
+            "openspec",
+            "show",
+            "my-change",
+            "--json",
+            "--deltas-only",
         ]);
         match cli.command {
             Some(Commands::Openspec(args)) => match args.command {
@@ -1540,9 +1545,7 @@ mod tests {
 
     #[test]
     fn test_openspec_validate_strict_with_change() {
-        let cli = Cli::parse_from([
-            "cflx", "openspec", "validate", "my-change", "--strict",
-        ]);
+        let cli = Cli::parse_from(["cflx", "openspec", "validate", "my-change", "--strict"]);
         match cli.command {
             Some(Commands::Openspec(args)) => match args.command {
                 super::OpenspecCommands::Validate(val_args) => {
@@ -1557,19 +1560,17 @@ mod tests {
 
     #[test]
     fn test_openspec_validate_evidence_modes() {
-        for (flag, expected) in [
-            ("off", "Off"),
-            ("warn", "Warn"),
-            ("error", "Error"),
-        ] {
-            let cli = Cli::parse_from([
-                "cflx", "openspec", "validate", "--evidence", flag,
-            ]);
+        for (flag, expected) in [("off", "Off"), ("warn", "Warn"), ("error", "Error")] {
+            let cli = Cli::parse_from(["cflx", "openspec", "validate", "--evidence", flag]);
             match cli.command {
                 Some(Commands::Openspec(args)) => match args.command {
                     super::OpenspecCommands::Validate(val_args) => {
                         let actual = format!("{:?}", val_args.evidence);
-                        assert_eq!(actual, expected, "Evidence mode mismatch for flag '{}'", flag);
+                        assert_eq!(
+                            actual, expected,
+                            "Evidence mode mismatch for flag '{}'",
+                            flag
+                        );
                     }
                     _ => panic!("Expected Validate subcommand"),
                 },
@@ -1597,7 +1598,12 @@ mod tests {
     #[test]
     fn test_openspec_archive_skip_specs() {
         let cli = Cli::parse_from([
-            "cflx", "openspec", "archive", "my-change", "--yes", "--skip-specs",
+            "cflx",
+            "openspec",
+            "archive",
+            "my-change",
+            "--yes",
+            "--skip-specs",
         ]);
         match cli.command {
             Some(Commands::Openspec(args)) => match args.command {

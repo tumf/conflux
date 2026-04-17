@@ -38,7 +38,11 @@ fn split_spec(content: &str) -> (String, Vec<(String, String)>) {
     let preamble = parts[0].to_string();
 
     for (i, _start) in starts.iter().enumerate() {
-        let block_body = if i < parts.len() - 1 { parts[i + 1] } else { "" };
+        let block_body = if i < parts.len() - 1 {
+            parts[i + 1]
+        } else {
+            ""
+        };
         let full_block = format!("### Requirement:{}", block_body);
 
         // Extract the key from the heading line
@@ -60,9 +64,8 @@ fn split_spec(content: &str) -> (String, Vec<(String, String)>) {
 /// Parse delta content into sections (ADDED, MODIFIED, REMOVED).
 fn parse_delta_sections(delta: &str) -> DeltaSections {
     static SECTION_RE: OnceLock<Regex> = OnceLock::new();
-    let section_re = SECTION_RE.get_or_init(|| {
-        Regex::new(r"(?m)^## (ADDED|MODIFIED|REMOVED) Requirements\s*$").unwrap()
-    });
+    let section_re = SECTION_RE
+        .get_or_init(|| Regex::new(r"(?m)^## (ADDED|MODIFIED|REMOVED) Requirements\s*$").unwrap());
 
     let matches: Vec<_> = section_re.find_iter(delta).collect();
     let caps: Vec<_> = section_re.captures_iter(delta).collect();
@@ -182,9 +185,8 @@ pub fn merge_spec_delta(canonical: &str, delta: &str) -> (String, Vec<String>) {
 
     // Reject no-op promotions
     if blocks_equal(&original_blocks, &result_blocks) {
-        errors.push(
-            "Archive promotion would produce no canonical diff (no-op archive)".to_string(),
-        );
+        errors
+            .push("Archive promotion would produce no canonical diff (no-op archive)".to_string());
         return (canonical.to_string(), errors);
     }
 
@@ -321,7 +323,11 @@ impl OpenSpecManager {
                 }
                 let spec_file = path.join("spec.md");
                 if spec_file.exists() {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let name = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     let rel_path = format!("openspec/specs/{}/spec.md", name);
                     specs.push(SpecInfo {
                         name,
@@ -336,10 +342,7 @@ impl OpenSpecManager {
     }
 
     fn get_change_info(&self, change_dir: &Path, archived: bool) -> Option<ChangeInfo> {
-        let id = change_dir
-            .file_name()?
-            .to_string_lossy()
-            .to_string();
+        let id = change_dir.file_name()?.to_string_lossy().to_string();
         let rel_path = if archived {
             format!("openspec/changes/archive/{}", id)
         } else {
@@ -374,11 +377,7 @@ impl OpenSpecManager {
         Some(info)
     }
 
-    fn show_change(
-        &self,
-        change_id: &str,
-        deltas_only: bool,
-    ) -> Option<ShowInfo> {
+    fn show_change(&self, change_id: &str, deltas_only: bool) -> Option<ShowInfo> {
         let change_dir = self.find_change_dir(change_id)?;
         let archived = change_dir.to_string_lossy().contains("/archive/");
         let rel_path = change_dir
@@ -427,8 +426,11 @@ impl OpenSpecManager {
                         let spec_file = path.join("spec.md");
                         if spec_file.exists() {
                             if let Ok(content) = fs::read_to_string(&spec_file) {
-                                let name =
-                                    path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                let name = path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
                                 info.specs.insert(name, content);
                             }
                         }
@@ -483,8 +485,11 @@ impl OpenSpecManager {
                     for entry in entries.filter_map(|e| e.ok()) {
                         let path = entry.path();
                         if path.is_dir() {
-                            let name =
-                                path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            let name = path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
                             if name == "archive" || name.starts_with('.') {
                                 continue;
                             }
@@ -545,9 +550,7 @@ impl OpenSpecManager {
                             ));
                         }
                         Some(ref ct)
-                            if ct != "spec-only"
-                                && ct != "implementation"
-                                && ct != "hybrid" =>
+                            if ct != "spec-only" && ct != "implementation" && ct != "hybrid" =>
                         {
                             errors.push(format!(
                                 "{}: proposal.md has invalid Change Type '{}' (must be one of: hybrid, implementation, spec-only)",
@@ -563,8 +566,7 @@ impl OpenSpecManager {
         // Validate tasks format
         if tasks_file.exists() {
             if let Ok(content) = fs::read_to_string(&tasks_file) {
-                let (te, tw) =
-                    validate_tasks_content(&content, &change_id, strict, evidence_mode);
+                let (te, tw) = validate_tasks_content(&content, &change_id, strict, evidence_mode);
                 errors.extend(te);
                 warnings.extend(tw);
             }
@@ -634,8 +636,7 @@ impl OpenSpecManager {
         static REQ_RE: OnceLock<Regex> = OnceLock::new();
         static SCENARIO_RE: OnceLock<Regex> = OnceLock::new();
         let req_re = REQ_RE.get_or_init(|| Regex::new(r"(?m)^### Requirement:").unwrap());
-        let scenario_re =
-            SCENARIO_RE.get_or_init(|| Regex::new(r"(?m)^#### Scenario:").unwrap());
+        let scenario_re = SCENARIO_RE.get_or_init(|| Regex::new(r"(?m)^#### Scenario:").unwrap());
 
         if let Ok(entries) = fs::read_dir(specs_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
@@ -652,10 +653,7 @@ impl OpenSpecManager {
                 let spec_file = path.join("spec.md");
 
                 if !spec_file.exists() {
-                    errors.push(format!(
-                        "{}: Missing spec.md in {}",
-                        change_id, spec_name
-                    ));
+                    errors.push(format!("{}: Missing spec.md in {}", change_id, spec_name));
                     continue;
                 }
 
@@ -703,8 +701,7 @@ impl OpenSpecManager {
         }
 
         // Validate before archiving
-        let (is_valid, errors, warnings) =
-            self.validate_change(Some(change_id), true, "error");
+        let (is_valid, errors, warnings) = self.validate_change(Some(change_id), true, "error");
         if !is_valid {
             return Err(format!("Validation failed:\n{}", errors.join("\n")));
         }
@@ -750,7 +747,10 @@ impl OpenSpecManager {
                 change_id, specs_updated
             ))
         } else {
-            Ok(format!("Archived to openspec/changes/archive/{}", change_id))
+            Ok(format!(
+                "Archived to openspec/changes/archive/{}",
+                change_id
+            ))
         }
     }
 
@@ -840,8 +840,7 @@ impl OpenSpecManager {
                 };
 
                 if canonical_spec.exists() {
-                    let canonical_content =
-                        fs::read_to_string(&canonical_spec).unwrap_or_default();
+                    let canonical_content = fs::read_to_string(&canonical_spec).unwrap_or_default();
                     let (merged, _) = merge_spec_delta(&canonical_content, &delta_content);
                     let _ = fs::write(&canonical_spec, merged);
                 } else {
@@ -889,10 +888,8 @@ struct ShowInfo {
 fn count_tasks(content: &str) -> (u32, u32) {
     static CHECKBOX_RE: OnceLock<Regex> = OnceLock::new();
     static CHECKED_RE: OnceLock<Regex> = OnceLock::new();
-    let checkbox_re =
-        CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
-    let checked_re =
-        CHECKED_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[x\]").unwrap());
+    let checkbox_re = CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
+    let checked_re = CHECKED_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[x\]").unwrap());
 
     let excluded_sections = ["future work", "out of scope", "notes"];
     let mut in_excluded = false;
@@ -902,9 +899,7 @@ fn count_tasks(content: &str) -> (u32, u32) {
     for line in content.lines() {
         if line.starts_with("##") {
             let section_name = line.trim_start_matches('#').trim().to_lowercase();
-            in_excluded = excluded_sections
-                .iter()
-                .any(|&s| section_name.contains(s));
+            in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
             continue;
         }
         if in_excluded {
@@ -942,15 +937,46 @@ fn extract_change_type(proposal_content: &str) -> Option<String> {
 
 /// Behavior-bearing task keywords
 const BEHAVIOR_TASK_KEYWORDS: &[&str] = &[
-    "add ", "implement ", "create ", "update ", "modify ", "introduce ", "wire ",
-    "integrate ", "expose ", "persist ", "support ", "build ",
+    "add ",
+    "implement ",
+    "create ",
+    "update ",
+    "modify ",
+    "introduce ",
+    "wire ",
+    "integrate ",
+    "expose ",
+    "persist ",
+    "support ",
+    "build ",
 ];
 
 /// Evidence hint patterns
 const EVIDENCE_HINTS: &[&str] = &[
-    "src/", "tests/", "test/", "uv run ", "pytest", "make ", "python ", "python3 ",
-    "cflx validate", ".py", ".ts", ".js", ".rs", ".go", ".spec", ".test", " --once",
-    "npm test", "npm run ", "npx ", "yarn ", "pnpm ", "cargo test", "cargo build",
+    "src/",
+    "tests/",
+    "test/",
+    "uv run ",
+    "pytest",
+    "make ",
+    "python ",
+    "python3 ",
+    "cflx validate",
+    ".py",
+    ".ts",
+    ".js",
+    ".rs",
+    ".go",
+    ".spec",
+    ".test",
+    " --once",
+    "npm test",
+    "npm run ",
+    "npx ",
+    "yarn ",
+    "pnpm ",
+    "cargo test",
+    "cargo build",
     "go test",
 ];
 
@@ -980,12 +1006,10 @@ fn validate_tasks_content(
     static BARE_TASK_RE: OnceLock<Regex> = OnceLock::new();
     static VERIFICATION_RE: OnceLock<Regex> = OnceLock::new();
 
-    let checkbox_re =
-        CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
-    let checkbox_detail_re = CHECKBOX_DETAIL_RE
-        .get_or_init(|| Regex::new(r"^\s*[-*]\s*\[([ x])\]\s+(.*)$").unwrap());
-    let bare_task_re =
-        BARE_TASK_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+[^\[]").unwrap());
+    let checkbox_re = CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
+    let checkbox_detail_re =
+        CHECKBOX_DETAIL_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[([ x])\]\s+(.*)$").unwrap());
+    let bare_task_re = BARE_TASK_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+[^\[]").unwrap());
     let verification_re = VERIFICATION_RE
         .get_or_init(|| Regex::new(r"(?i)\(verification:\s*(.+?)\)\s*[.。]?$").unwrap());
 
@@ -997,9 +1021,7 @@ fn validate_tasks_content(
 
         if line.starts_with("##") {
             let section_name = line.trim_start_matches('#').trim().to_lowercase();
-            in_excluded = excluded_sections
-                .iter()
-                .any(|&s| section_name.contains(s));
+            in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
             continue;
         }
 
@@ -1197,10 +1219,7 @@ pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result
                 .iter()
                 .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                 .collect();
-            map.insert(
-                "specs".to_string(),
-                serde_json::Value::Object(specs_map),
-            );
+            map.insert("specs".to_string(), serde_json::Value::Object(specs_map));
         }
 
         let json_value = serde_json::Value::Object(map);
@@ -1250,11 +1269,7 @@ pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result
 /// `cflx openspec validate` — validate changes.
 ///
 /// Returns (is_valid, exit_code).
-pub fn cmd_validate(
-    change_id: Option<&str>,
-    strict: bool,
-    evidence: &str,
-) -> (bool, i32) {
+pub fn cmd_validate(change_id: Option<&str>, strict: bool, evidence: &str) -> (bool, i32) {
     let mgr = OpenSpecManager::new();
 
     // Check obsolete artifacts
@@ -1459,7 +1474,8 @@ mod validation_tests {
 
     #[test]
     fn test_count_tasks_excludes_future_work() {
-        let content = "## Implementation\n- [x] Task 1\n- [ ] Task 2\n## Future Work\n- [ ] Future task\n";
+        let content =
+            "## Implementation\n- [x] Task 1\n- [ ] Task 2\n## Future Work\n- [ ] Future task\n";
         let (completed, total) = count_tasks(content);
         assert_eq!(completed, 1);
         assert_eq!(total, 2);
@@ -1494,7 +1510,9 @@ mod validation_tests {
     fn test_validate_tasks_bare_task() {
         let content = "## Implementation\n- Some task without checkbox\n";
         let (errors, _) = validate_tasks_content(content, "test", false, "off");
-        assert!(errors.iter().any(|e| e.contains("Possible task without checkbox")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("Possible task without checkbox")));
     }
 
     #[test]
@@ -1516,7 +1534,8 @@ mod validation_tests {
 
     #[test]
     fn test_validate_tasks_with_verification_hint() {
-        let content = "- [ ] Add a new feature (verification: unit - cargo test covers the feature)\n";
+        let content =
+            "- [ ] Add a new feature (verification: unit - cargo test covers the feature)\n";
         let (errors, warnings) = validate_tasks_content(content, "test", true, "warn");
         assert!(errors.is_empty());
         assert!(warnings.is_empty());

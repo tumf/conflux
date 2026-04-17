@@ -924,7 +924,7 @@ async fn main() -> Result<()> {
 
         // Openspec subcommand: native OpenSpec utility operations
         Some(Commands::Openspec(args)) => {
-            use cli::{OpenspecCommands, EvidenceMode};
+            use cli::{EvidenceMode, OpenspecCommands};
 
             match args.command {
                 OpenspecCommands::List(list_args) => {
@@ -963,10 +963,9 @@ async fn main() -> Result<()> {
                         eprintln!("Error: --yes flag is required (non-interactive only)");
                         std::process::exit(1);
                     }
-                    if let Err(e) = crate::openspec_cmd::cmd_archive(
-                        &arc_args.change_id,
-                        arc_args.skip_specs,
-                    ) {
+                    if let Err(e) =
+                        crate::openspec_cmd::cmd_archive(&arc_args.change_id, arc_args.skip_specs)
+                    {
                         eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
