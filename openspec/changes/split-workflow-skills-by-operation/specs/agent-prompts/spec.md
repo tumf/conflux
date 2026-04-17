@@ -52,7 +52,7 @@ Conflux orchestrator prompt builders MUST load operation-specific skills directl
 
 ### Requirement: cflx-workflow MUST remain as a compatibility router
 
-The bundled workflow skill `cflx-workflow` MUST remain installable for backward compatibility, but its primary role SHALL be to route legacy prompts to the correct operation guidance rather than to duplicate the full detailed instructions for every operation. Legacy prompts that load only `cflx-workflow` MUST still be able to execute apply / rejecting / cleanup-review / accept / archive with legacy-equivalent guidance, without requiring additional skill loads or cross-skill auxiliary file access. `cflx-workflow` MAY remain the only bundled workflow-related skill that ships `scripts/cflx.py` for this compatibility surface.
+The bundled workflow skill `cflx-workflow` MUST remain installable for backward compatibility, but its primary role SHALL be to route legacy prompts to the correct operation guidance rather than to duplicate the full detailed instructions for every operation. Legacy prompts that load only `cflx-workflow` MUST still be able to execute apply / rejecting / cleanup-review / accept / archive with legacy-equivalent guidance, without requiring additional skill loads or cross-skill auxiliary file access.
 
 #### Scenario: Legacy workflow prompt still has a supported router
 

@@ -4,14 +4,14 @@
 
 `split-workflow-skills-by-operation` は、従来 `cflx-workflow` に集約されていた workflow 系 operation だけでなく、Rust 実装へ inline で埋め込まれている analyze / resolve prompt も含めて、Conflux の operation prompt surface 全体を dedicated skills へ寄せる変更である。
 
-同時に、`replace-cflx-py-with-native-cli` proposal の native CLI 方針を前提としつつ、legacy compatibility のため `cflx-workflow` にだけ `scripts/cflx.py` を残す例外を認める。
+同時に、完了済みの `replace-cflx-py-with-native-cli` が導入した native CLI 方針を前提とし、bundled skill 配布物へ `scripts/cflx.py` を再導入しない。
 
 ## Goals
 
 - analyze / apply / rejecting / cleanup-review / accept / archive / resolve それぞれに dedicated skill を持たせる
 - Rust 側の prompt source を operation ごとの固定 guidance と可変コンテキストに分離する
 - `cflx-workflow` を legacy compatibility router として維持する
-- `scripts/cflx.py` は `cflx-workflow` のみへ残し、他の dedicated skills には配布しない
+- bundled skill 配布物は native CLI 前提を維持し、`scripts/cflx.py` を再導入しない
 
 ## Non-Goals
 
@@ -39,7 +39,7 @@
 
 `cflx-workflow` は apply / rejecting / cleanup-review / accept / archive について、legacy prompt が `load skills: cflx-workflow` しか読まない場合でも従来同等の guidance を提供する self-contained router として残す。
 
-`cflx-workflow` に限っては、既存運用互換のため `scripts/cflx.py` を維持する。
+
 
 ## Prompt Ownership Model
 
@@ -77,9 +77,9 @@ Rust 側は実行時にしか分からない可変コンテキストを prompt �
 Bundled skill packaging / install-skills の契約は以下とする。
 
 - dedicated skills は自分の `SKILL.md` と必要な auxiliary references を持つ
-- `scripts/cflx.py` を含む bundled skill は `cflx-workflow` のみ
+- bundled skill 配布物へ `scripts/cflx.py` は含めない
 - legacy prompts that load only `cflx-workflow` remain supported
-- new orchestrator-generated prompts depend on dedicated skills, not on `cflx-workflow` helper surface
+- new orchestrator-generated prompts depend on dedicated skills, not on a helper-script surface
 
 ## Migration Plan
 
@@ -97,7 +97,7 @@ Bundled skill packaging / install-skills の契約は以下とする。
 
 Mitigation:
 - apply / rejecting / cleanup-review / accept / archive の legacy-equivalent guidance を router に残す
-- `cflx.py` も `cflx-workflow` に限って保持する
+- native CLI 前提の command guidance を router 内へ明示し、helper script なしでも互換 surface を維持する
 
 ### Risk: analyze / resolve migration scope expands too much
 
