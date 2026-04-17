@@ -54,11 +54,33 @@ Conflux separates tests into two explicit tiers:
 
 For heavy suites, keep `#![cfg(feature = "heavy-tests")]` at file top so they remain opt-in by design.
 
+### Dependency vulnerability audit
+
+Check for known vulnerabilities in dependencies using `cargo audit`:
+
+```bash
+# Run audit standalone
+make audit
+
+# Or directly
+cargo audit
+```
+
+`cargo audit` is included in `make check` and runs in CI, but is **not** part of pre-commit or prek hooks. This keeps commit-time hooks fast while ensuring audits run during CI and explicit local validation.
+
+Install `cargo-audit` if not already present:
+
+```bash
+cargo install cargo-audit
+```
+
 ### Validation by phase
 
 - **Pre-commit hook**: `cargo fmt --all` + `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - **Local developer loop**: `cargo test`
 - **Acceptance baseline**: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`
+- **Full local validation**: `make check` (includes `cargo audit`)
+- **CI**: All of the above plus `cargo audit`
 - **Broader readiness / explicit E2E**: `cargo test --features heavy-tests`
 
 ### Run tests
