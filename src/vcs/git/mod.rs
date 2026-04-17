@@ -600,7 +600,7 @@ impl GitWorkspaceManager {
         }
 
         // Sort by last_modified, newest first
-        candidates.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.last_modified));
 
         Ok(candidates)
     }

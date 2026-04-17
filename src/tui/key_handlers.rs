@@ -545,11 +545,9 @@ pub async fn handle_key_event(
         (KeyCode::Char('+'), _) => {
             handle_plus_key(ctx).await?;
         }
-        (KeyCode::Char('w'), _) => {
+        (KeyCode::Char('w'), _) if ctx.app.web_url.is_some() => {
             // Show QR code popup (only if web_url is set)
-            if ctx.app.web_url.is_some() {
-                ctx.app.show_qr_popup();
-            }
+            ctx.app.show_qr_popup();
         }
         (KeyCode::Char('l'), _) => {
             // Toggle log panel visibility (only in Changes view)

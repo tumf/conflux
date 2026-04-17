@@ -171,11 +171,10 @@ impl ProgressInfo {
     ///
     /// Returns 0 if total is 0 to avoid division by zero.
     pub fn percentage(&self) -> u32 {
-        if self.total == 0 {
-            0
-        } else {
-            (self.completed * 100) / self.total
-        }
+        self.total
+            .checked_div(self.total)
+            .map(|_| (self.completed * 100) / self.total)
+            .unwrap_or(0)
     }
 
     /// Check if all tasks are completed.

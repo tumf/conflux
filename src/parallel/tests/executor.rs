@@ -1702,21 +1702,20 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     let mut saw_acceptance_completed = false;
     while let Ok(event) = event_rx.try_recv() {
         match event {
-            crate::events::ExecutionEvent::Log(entry) => {
+            crate::events::ExecutionEvent::Log(entry)
                 if entry.level == crate::events::LogLevel::Warn
                     && entry.operation.as_deref() == Some("acceptance")
                     && entry.message.contains("blocking gate context")
                     && entry
                         .message
-                        .contains("archive-readiness gate failed: cargo clippy -- -D warnings")
-                {
-                    saw_gate_specific_warn_log = true;
-                }
+                        .contains("archive-readiness gate failed: cargo clippy -- -D warnings") =>
+            {
+                saw_gate_specific_warn_log = true;
             }
-            crate::events::ExecutionEvent::AcceptanceCompleted { change_id } => {
-                if change_id == "change-a" {
-                    saw_acceptance_completed = true;
-                }
+            crate::events::ExecutionEvent::AcceptanceCompleted { change_id }
+                if change_id == "change-a" =>
+            {
+                saw_acceptance_completed = true;
             }
             _ => {}
         }

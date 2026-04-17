@@ -1283,10 +1283,8 @@ impl Orchestrator {
                         change_id,
                         completed,
                         total,
-                    } => {
-                        if total > 0 {
-                            info!("Progress {}: {}/{}", change_id, completed, total);
-                        }
+                    } if total > 0 => {
+                        info!("Progress {}: {}/{}", change_id, completed, total);
                     }
                     ParallelEvent::ApplyCompleted { change_id, .. } => {
                         info!("Apply completed for {}", change_id);
