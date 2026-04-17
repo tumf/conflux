@@ -132,7 +132,7 @@ pub async fn resolve_conflicts_with_retry(
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = build_conflict_resolve_prompt(
-        &vcs_prompt_prefix,
+        vcs_prompt_prefix,
         &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         vcs_error,
         &vcs_status,
@@ -167,7 +167,7 @@ pub async fn resolve_conflicts_with_retry(
 
         // Build the resolve prompt with VCS-specific context
         let mut resolve_prompt = build_conflict_resolve_prompt(
-            &vcs_prompt_prefix,
+            vcs_prompt_prefix,
             &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             vcs_error,
             &vcs_status,
@@ -426,7 +426,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = build_sequential_merge_resolve_prompt(
-        &vcs_prompt_prefix,
+        vcs_prompt_prefix,
         target_branch,
         base_revision,
         &merge_plan,
@@ -464,7 +464,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         );
 
         let mut resolve_prompt = build_sequential_merge_resolve_prompt(
-            &vcs_prompt_prefix,
+            vcs_prompt_prefix,
             target_branch,
             base_revision,
             &merge_plan,
@@ -926,6 +926,7 @@ fn build_conflict_resolve_prompt(
 }
 
 /// Build prompt for sequential merge resolution (variable context only; fixed guidance lives in cflx-resolve).
+#[allow(clippy::too_many_arguments)]
 fn build_sequential_merge_resolve_prompt(
     vcs_prompt_prefix: &str,
     target_branch: &str,
@@ -1020,7 +1021,14 @@ mod tests {
     #[test]
     fn test_sequential_merge_prompt_no_fixed_guidance() {
         let prompt = build_sequential_merge_resolve_prompt(
-            "prefix", "main", "base", "plan", "locations", "status", "log", "files",
+            "prefix",
+            "main",
+            "base",
+            "plan",
+            "locations",
+            "status",
+            "log",
+            "files",
         );
         // Fixed guidance must NOT appear (owned by cflx-resolve skill)
         assert!(
