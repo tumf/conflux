@@ -32,6 +32,7 @@ mod execution;
 mod history;
 mod hooks;
 mod openspec;
+pub mod openspec_cmd;
 pub mod orchestration;
 mod orchestrator;
 mod parallel;

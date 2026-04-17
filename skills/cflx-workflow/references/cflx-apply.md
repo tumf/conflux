@@ -35,10 +35,10 @@ Track these steps as TODOs and complete them one by one.
 7. Never treat `openspec/` edits alone as sufficient evidence for an implementation task.
 8. If a task is broader than what can be truthfully completed, split/refine the task in `tasks.md` before marking anything complete.
 9. Update the checklist after all work is done so each task marked `- [x]` reflects repository reality, not intent.
-10. Reference `python3 "<SKILL_ROOT>/scripts/cflx.py" list` or `python3 "<SKILL_ROOT>/scripts/cflx.py" show <item>` when additional context is required.
+10. Reference `cflx openspec list` or `cflx openspec show <item>` when additional context is required.
 
 **Reference**
-- Use `python3 "<SKILL_ROOT>/scripts/cflx.py" show <id> --json --deltas-only` if you need additional context from the proposal while implementing.
+- Use `cflx openspec show <id> --json --deltas-only` if you need additional context from the proposal while implementing.
 
 <system-reminder>
 Your operational mode has changed from plan to build.

@@ -166,15 +166,16 @@ fn test_embedded_install_without_skills_dir() {
         );
     }
 
-    // Verify auxiliary files are present for each skill
+    // Verify scripts/cflx.py is NOT distributed (replaced by native CLI)
     assert!(
-        skills_base.join("cflx-proposal/scripts/cflx.py").exists(),
-        "cflx-proposal must have scripts/cflx.py"
+        !skills_base.join("cflx-proposal/scripts/cflx.py").exists(),
+        "cflx-proposal must NOT have scripts/cflx.py (replaced by native CLI)"
     );
     assert!(
-        skills_base.join("cflx-workflow/scripts/cflx.py").exists(),
-        "cflx-workflow must have scripts/cflx.py"
+        !skills_base.join("cflx-workflow/scripts/cflx.py").exists(),
+        "cflx-workflow must NOT have scripts/cflx.py (replaced by native CLI)"
     );
+    // Verify reference auxiliary files are still present
     assert!(
         skills_base
             .join("cflx-workflow/references/cflx-accept.md")

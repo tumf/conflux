@@ -1,0 +1,12 @@
+## Implementation Tasks
+
+- [x] 1. Add an `openspec` CLI namespace in `src/cli.rs` and `src/main.rs` with native `list`, `show`, `validate`, and `archive` subcommands that preserve the current helper flags (`--specs`, `--json`, `--deltas-only`, `--strict`, `--evidence`, `--yes`, `--skip-specs`) (verification: unit - CLI parse/help tests cover each new subcommand and flag combination).
+- [x] 2. Implement native list/show/validate handlers by extending `src/openspec.rs` or adjacent Rust modules so active/archived change discovery, JSON output, deltas-only output, and strict/evidence validation semantics cover the current `cflx.py` workflow expectations (verification: unit - focused Rust tests cover native command output and strict validation behavior for representative change fixtures).
+- [x] 3. Port spec promotion and archive merge logic from `skills/shared/cflx_spec_promotion.py` into Rust and wire `cflx openspec archive` to execute archive-ready promotion without Python runtime (verification: integration - archive-focused Rust tests cover ADDED/MODIFIED/REMOVED promotion, missing target failures, and no-op archive rejection).
+- [x] 4. Update active skill sources and references in `skills/cflx-proposal/`, `skills/cflx-workflow/`, `skills/cflx-run/`, and active in-flight proposal/task guidance to call `cflx openspec ...` instead of `scripts/cflx.py` wherever those instructions must remain executable for current workflows (verification: manual - repo search over active skill/docs/proposal sources finds no remaining executable references to `scripts/cflx.py`).
+- [x] 5. Remove `scripts/cflx.py` auxiliary files and Python-only packaging assumptions from `src/embedded_skills.rs`, `tests/install_skills_test.rs`, `skills/README.md`, and related bundled-skill distribution metadata while preserving skill installation itself (verification: integration - `cargo test embedded_skills -- --nocapture` and `cargo test --test install_skills_test -- --nocapture` pass without expecting `scripts/cflx.py`).
+- [x] 6. Validate the migration with native proposal tooling and focused repository checks, including this proposal's own strict validation path after the new CLI lands (verification: unit/integration - focused Rust tests for touched modules pass; manual - `cflx openspec validate replace-cflx-py-with-native-cli --strict` succeeds).
+
+## Future Work
+
+- Update archived historical proposal/task text that still mentions `cflx.py` if the repository later decides to normalize legacy documentation as a separate cleanup pass.

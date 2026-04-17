@@ -22,7 +22,7 @@ Language rules
 
 Repository compatibility check
 1. If `openspec/` does not exist, STOP and tell the user this repo is not Conflux/OpenSpec-initialized.
-2. If `python3 "<SKILL_ROOT>/scripts/cflx.py" list --specs` fails because `"<SKILL_ROOT>/scripts/cflx.py"` does not exist, still draft the proposals (files under `openspec/changes/`), but skip validation and mention the missing validator.
+2. If `cflx openspec list --specs` fails because `cflx` is not available, still draft the proposals (files under `openspec/changes/`), but skip validation and mention the missing validator.
 
 Discovery (find refactor candidates)
 Collect evidence first. Use fast, low-risk heuristics; prioritize areas with clear payoff and low functional risk.
@@ -58,7 +58,7 @@ Proposal requirements
 - In `spec.md`, include at least one minimal, testable requirement/scenario so strict validation can pass even for "no intended behaviour change" refactors.
 
 Validation
-- If `"<SKILL_ROOT>/scripts/cflx.py"` is present, run `python3 "<SKILL_ROOT>/scripts/cflx.py" validate <id> --strict` for EACH proposal and fix any issues.
+- Run `cflx openspec validate <id> --strict` for EACH proposal and fix any issues.
 
 Output to the user
 - Show the list of proposals created with their change IDs and paths.

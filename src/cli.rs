@@ -146,6 +146,20 @@ pub enum Commands {
     ///   cflx install-skills --claude --global  # Install bundled skills to .claude (global scope)
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
+
+    /// OpenSpec utility commands for repository-scoped operations
+    ///
+    /// Provides native subcommands for listing, inspecting, validating, and
+    /// archiving OpenSpec changes and specs — replacing the former Python helper.
+    ///
+    /// EXAMPLES:
+    ///   cflx openspec list                          # List active changes
+    ///   cflx openspec list --specs                  # List canonical specs
+    ///   cflx openspec show my-change                # Show change details
+    ///   cflx openspec show my-change --json         # JSON output
+    ///   cflx openspec validate --strict             # Validate all changes
+    ///   cflx openspec archive my-change --yes       # Archive a change
+    Openspec(OpenspecArgs),
 }
 
 /// Arguments for the run subcommand
@@ -551,6 +565,95 @@ pub fn install_skills_legacy_error(src: &str) -> String {
          cflx install-skills           # project scope\n  \
          cflx install-skills --global  # global scope"
     )
+}
+
+/// Arguments for the `openspec` subcommand group
+#[derive(Parser, Debug)]
+#[command(about = "OpenSpec utility commands")]
+pub struct OpenspecArgs {
+    #[command(subcommand)]
+    pub command: OpenspecCommands,
+}
+
+/// Subcommands for `cflx openspec`
+#[derive(Subcommand, Debug)]
+pub enum OpenspecCommands {
+    /// List active changes or canonical specs
+    List(OpenspecListArgs),
+
+    /// Show detailed information about a change
+    Show(OpenspecShowArgs),
+
+    /// Validate change structure and spec deltas
+    Validate(OpenspecValidateArgs),
+
+    /// Archive a deployed change and promote spec deltas
+    Archive(OpenspecArchiveArgs),
+}
+
+/// Arguments for `cflx openspec list`
+#[derive(Parser, Debug)]
+pub struct OpenspecListArgs {
+    /// List canonical specs instead of changes
+    #[arg(long)]
+    pub specs: bool,
+}
+
+/// Arguments for `cflx openspec show`
+#[derive(Parser, Debug)]
+pub struct OpenspecShowArgs {
+    /// Change ID to show
+    pub change_id: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Show only spec deltas
+    #[arg(long)]
+    pub deltas_only: bool,
+}
+
+/// Evidence checking mode for validation
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+pub enum EvidenceMode {
+    /// Do not check for evidence hints
+    #[default]
+    Off,
+    /// Warn on missing evidence hints
+    Warn,
+    /// Error on missing evidence hints
+    Error,
+}
+
+/// Arguments for `cflx openspec validate`
+#[derive(Parser, Debug)]
+pub struct OpenspecValidateArgs {
+    /// Change ID to validate (omit to validate all)
+    pub change_id: Option<String>,
+
+    /// Enable strict validation mode
+    #[arg(long)]
+    pub strict: bool,
+
+    /// How to treat missing implementation evidence in tasks.md
+    #[arg(long, value_enum, default_value_t = EvidenceMode::Off)]
+    pub evidence: EvidenceMode,
+}
+
+/// Arguments for `cflx openspec archive`
+#[derive(Parser, Debug)]
+pub struct OpenspecArchiveArgs {
+    /// Change ID to archive
+    pub change_id: String,
+
+    /// Skip confirmation prompt
+    #[arg(long)]
+    pub yes: bool,
+
+    /// Skip spec updates during archive
+    #[arg(long)]
+    pub skip_specs: bool,
 }
 
 /// Check if git directory exists
@@ -1352,6 +1455,166 @@ mod tests {
                 );
             }
             _ => panic!("Expected InstallSkills subcommand"),
+        }
+    }
+
+    // ── openspec subcommand tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_openspec_list_default() {
+        let cli = Cli::parse_from(["cflx", "openspec", "list"]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::List(list_args) => {
+                    assert!(!list_args.specs);
+                }
+                _ => panic!("Expected List subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_list_specs_flag() {
+        let cli = Cli::parse_from(["cflx", "openspec", "list", "--specs"]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::List(list_args) => {
+                    assert!(list_args.specs);
+                }
+                _ => panic!("Expected List subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_show_basic() {
+        let cli = Cli::parse_from(["cflx", "openspec", "show", "my-change"]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Show(show_args) => {
+                    assert_eq!(show_args.change_id, "my-change");
+                    assert!(!show_args.json);
+                    assert!(!show_args.deltas_only);
+                }
+                _ => panic!("Expected Show subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_show_json_deltas_only() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "openspec",
+            "show",
+            "my-change",
+            "--json",
+            "--deltas-only",
+        ]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Show(show_args) => {
+                    assert_eq!(show_args.change_id, "my-change");
+                    assert!(show_args.json);
+                    assert!(show_args.deltas_only);
+                }
+                _ => panic!("Expected Show subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_validate_all_default() {
+        let cli = Cli::parse_from(["cflx", "openspec", "validate"]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Validate(val_args) => {
+                    assert!(val_args.change_id.is_none());
+                    assert!(!val_args.strict);
+                    assert!(matches!(val_args.evidence, super::EvidenceMode::Off));
+                }
+                _ => panic!("Expected Validate subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_validate_strict_with_change() {
+        let cli = Cli::parse_from(["cflx", "openspec", "validate", "my-change", "--strict"]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Validate(val_args) => {
+                    assert_eq!(val_args.change_id, Some("my-change".to_string()));
+                    assert!(val_args.strict);
+                }
+                _ => panic!("Expected Validate subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_validate_evidence_modes() {
+        for (flag, expected) in [("off", "Off"), ("warn", "Warn"), ("error", "Error")] {
+            let cli = Cli::parse_from(["cflx", "openspec", "validate", "--evidence", flag]);
+            match cli.command {
+                Some(Commands::Openspec(args)) => match args.command {
+                    super::OpenspecCommands::Validate(val_args) => {
+                        let actual = format!("{:?}", val_args.evidence);
+                        assert_eq!(
+                            actual, expected,
+                            "Evidence mode mismatch for flag '{}'",
+                            flag
+                        );
+                    }
+                    _ => panic!("Expected Validate subcommand"),
+                },
+                _ => panic!("Expected Openspec subcommand"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_openspec_archive_basic() {
+        let cli = Cli::parse_from(["cflx", "openspec", "archive", "my-change", "--yes"]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Archive(arc_args) => {
+                    assert_eq!(arc_args.change_id, "my-change");
+                    assert!(arc_args.yes);
+                    assert!(!arc_args.skip_specs);
+                }
+                _ => panic!("Expected Archive subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_openspec_archive_skip_specs() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "openspec",
+            "archive",
+            "my-change",
+            "--yes",
+            "--skip-specs",
+        ]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Archive(arc_args) => {
+                    assert_eq!(arc_args.change_id, "my-change");
+                    assert!(arc_args.yes);
+                    assert!(arc_args.skip_specs);
+                }
+                _ => panic!("Expected Archive subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
         }
     }
 

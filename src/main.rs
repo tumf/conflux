@@ -17,6 +17,7 @@ mod execution;
 mod history;
 mod hooks;
 mod openspec;
+mod openspec_cmd;
 mod orchestration;
 mod orchestrator;
 mod parallel;
@@ -918,6 +919,57 @@ async fn main() -> Result<()> {
             if let Err(e) = run_install_skills(opts) {
                 eprintln!("Error: {e}");
                 std::process::exit(1);
+            }
+        }
+
+        // Openspec subcommand: native OpenSpec utility operations
+        Some(Commands::Openspec(args)) => {
+            use cli::{EvidenceMode, OpenspecCommands};
+
+            match args.command {
+                OpenspecCommands::List(list_args) => {
+                    if let Err(e) = crate::openspec_cmd::cmd_list(list_args.specs) {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                OpenspecCommands::Show(show_args) => {
+                    if let Err(e) = crate::openspec_cmd::cmd_show(
+                        &show_args.change_id,
+                        show_args.json,
+                        show_args.deltas_only,
+                    ) {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                OpenspecCommands::Validate(val_args) => {
+                    let evidence = match val_args.evidence {
+                        EvidenceMode::Off => "off",
+                        EvidenceMode::Warn => "warn",
+                        EvidenceMode::Error => "error",
+                    };
+                    let (is_valid, exit_code) = crate::openspec_cmd::cmd_validate(
+                        val_args.change_id.as_deref(),
+                        val_args.strict,
+                        evidence,
+                    );
+                    if !is_valid {
+                        std::process::exit(exit_code);
+                    }
+                }
+                OpenspecCommands::Archive(arc_args) => {
+                    if !arc_args.yes {
+                        eprintln!("Error: --yes flag is required (non-interactive only)");
+                        std::process::exit(1);
+                    }
+                    if let Err(e) =
+                        crate::openspec_cmd::cmd_archive(&arc_args.change_id, arc_args.skip_specs)
+                    {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
             }
         }
 
