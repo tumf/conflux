@@ -64,6 +64,12 @@ jobs:
           npm ci
           npm run build
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
       - name: Run pre-commit/prek hooks (all files)
         run: |
           python -m pip install --upgrade pip
