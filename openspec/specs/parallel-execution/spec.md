@@ -1290,26 +1290,15 @@ Changes in MergeWait state (requiring user intervention) SHALL NOT prevent sched
 
 ### Requirement: Merge Deferred State Separation
 
-The parallel executor SHALL treat a resolve attempt as complete when the target change has been integrated into the base branch, even if the integration happened via fast-forward and did not create a merge commit.
+When parallel merge verification runs after archive completion, a change that is already integrated into the base branch via fast-forward SHALL be treated as merged rather than as a merge verification failure.
 
-`Missing merge commits for change_ids` SHALL NOT be used for changes that are already integrated into the base branch via fast-forward.
+#### Scenario: archive-complete change fast-forwarded during parallel merge does not fail verification
 
-#### Scenario: Fast-forward resolve is accepted as merged
-
-**Given** a change has completed archive successfully in parallel mode
-**And** the resolve command merges the change into the base branch via fast-forward
-**When** post-resolve verification runs
-**Then** the change is treated as successfully merged
-**And** the system does not enqueue another resolve retry for that change
-
-#### Scenario: Missing merge commits only applies to truly incomplete merge state
-
-**Given** a change has completed archive successfully in parallel mode
-**And** post-resolve verification finds no required merge commit evidence
-**And** the change is not integrated into the base branch
-**When** the system prepares the next resolve attempt
-**Then** the resolve context may include `Missing merge commits for change_ids`
-**And** the listed change_ids exclude fast-forward-integrated changes
+**Given** a change completed archive successfully in parallel mode
+**And** the subsequent merge path integrates the change into the base branch via fast-forward
+**When** post-merge verification checks for merge completion
+**Then** the change is treated as merged
+**And** the system does not emit a merge verification error based only on missing merge commit subject
 
 ### Requirement: Parallel execution acceptance loop
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
