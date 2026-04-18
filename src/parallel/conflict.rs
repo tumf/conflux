@@ -678,14 +678,45 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         .await
                         .map_err(OrchestratorError::from)?;
 
-                if !missing_commits.is_empty() {
+                // Filter out changes that were integrated via fast-forward.
+                // A fast-forward merge does not create a merge commit, so
+                // missing_merge_commits_since will report it as missing.
+                // Check if the worktree branch tip is an ancestor of HEAD
+                // (i.e. the branch content is already in the target branch).
+                let mut truly_missing: Vec<String> = Vec::new();
+                for missing_id in &missing_commits {
+                    // Find the revision (branch name) for this change_id
+                    let revision = revisions
+                        .iter()
+                        .zip(change_ids.iter())
+                        .find(|(_, cid)| *cid == missing_id)
+                        .map(|(rev, _)| rev.as_str());
+
+                    if let Some(rev) = revision {
+                        let is_integrated = git_commands::is_ancestor(repo_root, rev, "HEAD")
+                            .await
+                            .unwrap_or(false);
+                        if is_integrated {
+                            info!(
+                                "Change '{}' (branch '{}') integrated via fast-forward; skipping merge commit check",
+                                missing_id, rev
+                            );
+                        } else {
+                            truly_missing.push(missing_id.clone());
+                        }
+                    } else {
+                        truly_missing.push(missing_id.clone());
+                    }
+                }
+
+                if !truly_missing.is_empty() {
                     let reason = format!(
                         "Missing merge commits for change_ids ({}); retrying resolve",
-                        missing_commits.join(", ")
+                        truly_missing.join(", ")
                     );
                     warn!(
                         "Missing merge commits after resolve attempt {}/{}: {:?}",
-                        attempt, max_retries, missing_commits
+                        attempt, max_retries, truly_missing
                     );
                     send_event(
                         event_tx,

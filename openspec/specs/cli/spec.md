@@ -3,6 +3,7 @@
 ## Purpose
 Defines CLI commands, subcommands, flags, and their behaviors for the cflx binary.
 ## Requirements
+
 ### Requirement: Subcommand Structure
 
 CLI SHALL have a subcommand structure that supports future command extensions.
@@ -1372,20 +1373,15 @@ resolve コマンドの再試行時、システムは前回の試行結果と継
 
 ### Requirement: Resolve Context Format
 
-resolve コンテキストは、人間とAIが読みやすい形式で構造化されなければならない（SHALL）。
+When resolve verification continues because merge completion is still incomplete, the continuation reason SHALL distinguish between true missing merge evidence and successful fast-forward integration.
 
-コンテキストブロックには以下が含まれる：
-- 現在の試行番号と最大試行回数
-- 前回の試行の詳細（コマンド終了ステータス、検証結果、所要時間）
-- 検証失敗の具体的な理由（継続理由）
-- ループ継続の説明
+#### Scenario: Fast-forward merge does not emit missing-merge-commits context
 
-#### Scenario: コンテキストの可読性
-
-- **WHEN** resolve コンテキストがフォーマットされる
-- **THEN** 「This is attempt X of Y」という形式で試行回数が示される
-- **AND** 「Previous attempt (N):」というラベルで前回の結果が示される
-- **AND** 「Continue resolving...」などの指示が含まれる
+- **GIVEN** the resolve command exits successfully
+- **AND** the change has been integrated into the base branch via fast-forward
+- **WHEN** the system evaluates whether another resolve attempt is needed
+- **THEN** `<resolve_context>` does not include `Missing merge commits for change_ids`
+- **AND** the change is not scheduled for another resolve attempt based on merge-commit absence alone
 
 ### Requirement: Enhanced Help Output
 
@@ -1751,7 +1747,6 @@ The `run` subcommand SHALL display hook execution details in the same user-visib
 
 #
 
-
 ### Requirement: install-skills Subcommand
 
 The CLI SHALL provide an `install-skills` subcommand for installing bundled Conflux agent skills into standard skill locations without requiring a source argument.
@@ -1856,7 +1851,6 @@ The CLI SHALL provide a native `cflx openspec` command namespace for repository-
 - **GIVEN** a change is ready to archive
 - **WHEN** the user runs `cflx openspec archive <change-id> --yes`
 - **THEN** the CLI archives the change and promotes spec deltas without invoking a bundled Python helper
-
 
 ### Requirement: install-skills Subcommand
 

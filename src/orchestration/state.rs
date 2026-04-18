@@ -2755,4 +2755,54 @@ mod tests {
             "ChangesRefreshed must not overwrite queue_intent = Queued"
         );
     }
+
+    /// Fast-forward resolve: terminal Merged set via ResolveCompleted must survive
+    /// a subsequent ChangesRefreshed that still reports the workspace as archived
+    /// (the workspace scan may lag behind the actual merge).
+    #[test]
+    fn test_fast_forward_merged_survives_archived_observation() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["ff".to_string()], 0);
+
+        // Change is archived and deferred to merge wait (manual, not auto-resumable).
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "ff".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(state.display_status("ff"), "merge wait");
+
+        // Resolve starts.
+        state.apply_command(ReducerCommand::ResolveMerge("ff".to_string()));
+        assert_eq!(state.display_status("ff"), "resolve pending");
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "ff".to_string(),
+            command: "resolve-cmd".to_string(),
+        });
+        assert_eq!(state.display_status("ff"), "resolving");
+
+        // Resolve succeeds (fast-forward merge detected by the caller).
+        state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "ff".to_string(),
+            worktree_change_ids: None,
+        });
+        assert_eq!(state.display_status("ff"), "merged");
+
+        // Refresh still sees the worktree as archived (workspace scan lag).
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![],
+            committed_change_ids: Default::default(),
+            uncommitted_file_change_ids: Default::default(),
+            worktree_change_ids: Default::default(),
+            worktree_paths: Default::default(),
+            worktree_not_ahead_ids: Default::default(),
+            merge_wait_ids: ["ff".to_string()].into_iter().collect(),
+        });
+        assert_eq!(
+            state.display_status("ff"),
+            "merged",
+            "Terminal Merged from fast-forward resolve must not regress to merge wait"
+        );
+    }
 }
