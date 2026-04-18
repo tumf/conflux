@@ -3,6 +3,7 @@
 ## Purpose
 Defines parallel change execution using jj workspaces or Git worktrees.
 ## Requirements
+
 ### Requirement: Shared Parallel Orchestration Service
 システムはCLIとTUIの並列実行を扱う統一的な`ParallelRunService`を提供しなければならない（SHALL）。
 
@@ -1183,7 +1184,6 @@ apply実行中にエージェント出力から権限要求のauto-rejectが検�
 - **WHEN** applyループが出力を評価する
 - **THEN** 通常の失敗処理が適用される
 
-
 ### Requirement: Resumed Archived Workspaces Preserve Merge Handoff
 
 When parallel execution resumes a workspace already detected as `WorkspaceState::Archived`, the executor SHALL treat that workspace as archive-complete for downstream lifecycle handling.
@@ -1221,7 +1221,6 @@ The resumed workspace MUST NOT silently complete in a way that bypasses merge ha
 
 #
 
-
 ### Requirement: Parallel Execution Event Reporting
 
 order-based再分析ループでもarchive完了後のmerge結果に応じてイベントを送信し、merge成功時にはcleanupイベントを送信しなければならない（SHALL）。
@@ -1250,7 +1249,6 @@ MergeDeferred が発生した場合は `MergeDeferred` イベントを送信し�
 - **WHEN** 待機状態が更新される
 - **THEN** change B は `MergeWait` に留まる
 - **AND** TUI は手動 resolve 対象として表示する
-
 
 ### Requirement: Scheduler Loop Termination
 
@@ -1292,29 +1290,26 @@ Changes in MergeWait state (requiring user intervention) SHALL NOT prevent sched
 
 ### Requirement: Merge Deferred State Separation
 
-The parallel executor SHALL maintain two separate sets for tracking deferred merge changes:
+The parallel executor SHALL treat a resolve attempt as complete when the target change has been integrated into the base branch, even if the integration happened via fast-forward and did not create a merge commit.
 
-- `resolve_wait_changes`: Changes with auto-resumable deferral reasons (e.g., another merge in progress). These are considered "in progress" and keep the scheduler alive.
-- `merge_wait_changes`: Changes requiring user intervention (e.g., uncommitted changes on base). These are considered "suspended" and do not keep the scheduler alive.
+`Missing merge commits for change_ids` SHALL NOT be used for changes that are already integrated into the base branch via fast-forward.
 
-When a `MergeAttempt::Deferred` result is received, the change SHALL be added to `resolve_wait_changes` if `auto_resumable` is true, or `merge_wait_changes` if `auto_resumable` is false.
+#### Scenario: Fast-forward resolve is accepted as merged
 
-The `retry_deferred_merges` method SHALL only retry changes in `resolve_wait_changes`. If a retry results in a non-auto-resumable deferral, the change SHALL be moved from `resolve_wait_changes` to `merge_wait_changes`.
+**Given** a change has completed archive successfully in parallel mode
+**And** the resolve command merges the change into the base branch via fast-forward
+**When** post-resolve verification runs
+**Then** the change is treated as successfully merged
+**And** the system does not enqueue another resolve retry for that change
 
-#### Scenario: Auto-resumable deferral tracked as resolve_wait
+#### Scenario: Missing merge commits only applies to truly incomplete merge state
 
-**Given**: A change completes apply and archive successfully
-**When**: The merge attempt returns `Deferred` with `auto_resumable=true`
-**Then**: The change is added to `resolve_wait_changes`
-**And**: The scheduler loop does not terminate
-
-#### Scenario: Manual-intervention deferral tracked as merge_wait
-
-**Given**: A change completes apply and archive successfully
-**When**: The merge attempt returns `Deferred` with `auto_resumable=false`
-**Then**: The change is added to `merge_wait_changes`
-**And**: The scheduler loop may terminate if no other active work remains
-
+**Given** a change has completed archive successfully in parallel mode
+**And** post-resolve verification finds no required merge commit evidence
+**And** the change is not integrated into the base branch
+**When** the system prepares the next resolve attempt
+**Then** the resolve context may include `Missing merge commits for change_ids`
+**And** the listed change_ids exclude fast-forward-integrated changes
 
 ### Requirement: Parallel execution acceptance loop
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
@@ -1380,7 +1375,6 @@ This ensures quality gates are always enforced, even after interruptions.
 - **AND** the system falls back to the AI resolve command
 - **AND** the AI resolve command attempts to finalize the archive commit
 
-
 ### Requirement: Shared Parallel Orchestration Service
 
 システムはCLIとTUIの並列実行を扱う統一的な`ParallelRunService`を提供しなければならない（SHALL）。
@@ -1420,7 +1414,6 @@ Acceptance が `Blocked` を返した場合、ParallelRunService は rejection �
 - **AND** `WorkspaceResult.rejected` SHALL contain the rejection reason
 - **AND** `WorkspaceResult.error` SHALL be `None`
 
-
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
 パラレルスケジューラの `tokio::select!` イベントループは、workspace 完了後の merge + コンフリクト解決処理によってブロックされてはならない（MUST NOT）。merge + resolve 処理はバックグラウンドタスクとして非同期に実行し、スケジューラループは queued change の dispatch を継続しなければならない（SHALL）。
@@ -1447,7 +1440,6 @@ merge/resolve の結果（成功・Deferred・失敗）はスケジューラル�
 - **WHEN** merge が Deferred（resolve 進行中 or base dirty）となる
 - **THEN** Deferred イベントがスケジューラループに通知される
 - **AND** Change A は resolve_wait_changes または merge_wait_changes に追加される
-
 
 ### Requirement: Parallel Execution Event Reporting
 
@@ -1476,7 +1468,6 @@ Git backend では archive-complete 後の merge/dependency 判定に先立っ�
 - **WHEN** merge handling starts
 - **THEN** the system reports an execution error rather than classifying the change as manual-intervention `MergeWait`
 - **AND** the failure is distinguishable from deferred merge conflicts or base-dirty waits
-
 
 ### Requirement: Parallel execution completion status must accurately reflect actual processing outcome
 
@@ -1538,7 +1529,6 @@ The parallel execution subsystem SHALL NOT run a merge stall monitor based on hi
 **Then** it does not start a merge stall monitor based on historical base-branch merge commits
 **And** queue execution proceeds based only on actual execution state, user stop requests, and real processing failures
 
-
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
 ParallelRunService SHALL support blocked handoff from both acceptance and apply execution phases. When apply execution records a blocker by generating `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal, the runtime SHALL treat the workspace as `apply blocked` even if `tasks.md` still contains unchecked items. An `apply blocked` workspace SHALL proceed to acceptance instead of being retried indefinitely as fresh apply work. Acceptance SHALL decide whether to confirm the rejection proposal, and only a confirmed blocked verdict SHALL execute the rejection flow.
@@ -1565,7 +1555,6 @@ ParallelRunService SHALL support blocked handoff from both acceptance and apply 
 - **THEN** the rejection flow does not execute
 - **AND** the runtime returns the change to a non-terminal state for further action
 
-
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
 ParallelRunService SHALL treat a confirmed blocked verdict as a terminal rejection after the base branch has recorded `openspec/changes/<change_id>/REJECTED.md`. Parallel rejection handling SHALL NOT rely on `openspec resolve <change_id>` and SHALL NOT merge additional worktree files into the base branch. After the reject marker commit succeeds, the runtime SHALL emit a rejected result, preserve the rejection reason, and clean up the rejected worktree.
@@ -1583,7 +1572,6 @@ ParallelRunService SHALL treat a confirmed blocked verdict as a terminal rejecti
 - **WHEN** the rejection flow completes
 - **THEN** the base branch receives only `openspec/changes/fix-auth/REJECTED.md`
 - **AND** the remaining worktree-only files are discarded with worktree cleanup
-
 
 ### Requirement: Parallel execution acceptance loop
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
@@ -1730,7 +1718,6 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **WHEN** 並列実行が analysis を開始する
 - **THEN** queued 外の change は analysis 対象から除外される
 
-
 ### Requirement: Acceptance failure returns to apply loop
 
 When acceptance returns FAIL, the parallel dispatch loop MUST re-enter the apply step on the next cycle, regardless of how the workspace was initially routed (fresh start or resume).
@@ -1740,7 +1727,6 @@ When acceptance returns FAIL, the parallel dispatch loop MUST re-enter the apply
 - **GIVEN** a parallel workspace resumed with state `Applied` (routed to acceptance-only on first cycle)
 - **WHEN** the acceptance step returns `ACCEPTANCE: FAIL`
 - **THEN** the next cycle of the apply+acceptance loop MUST execute the apply step before running acceptance again
-
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1807,7 +1793,6 @@ Parallel execution SHALL restore a non-terminal workspace containing `openspec/c
 - **THEN** the next step is `rejecting`
 - **AND** the workspace does not run the normal acceptance loop before rejection review
 
-
 ### Requirement: Parallel execution acceptance loop
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
@@ -1855,7 +1840,6 @@ If the orchestrator restarts after acceptance started but before a final verdict
 - **THEN** the archive command is not executed
 - **AND** the orchestrator logs that acceptance must be rerun before archive
 
-
 ### Requirement: Parallel execution acceptance loop
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
@@ -1893,7 +1877,6 @@ For implementation changes, resumed workspaces with unchecked task items in `tas
 - **WHEN** resume routing is evaluated
 - **THEN** the workspace is routed to acceptance
 - **AND** archive is not started
-
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1986,7 +1969,6 @@ parallel mode で Conflux-managed isolated worktree 上の apply がタスク完
 - **AND** current run では apply 側の失敗として停止する
 - **AND** workspace は follow-up 用に保持される
 
-
 ### Requirement: キュー変更デバウンスとスロット駆動の再分析
 
 並列実行中、システムはキュー変更（追加・削除）を実行中でも監視し、変更から10秒経過した後に再分析を行い、実行スロットが空いたタイミングで依存関係を考慮して次の変更を選定しなければならない（SHALL）。
@@ -2012,7 +1994,6 @@ parallel mode で Conflux-managed isolated worktree 上の apply がタスク完
 - **THEN** `change-b` は起動されない
 - **AND** `change-b` は dependency blocked として扱われる
 - **AND** blocked 判定は available slot が残っているかどうかに依存しない
-
 
 ### Requirement: Parallel execution acceptance loop
 
@@ -2053,7 +2034,6 @@ A durable acceptance state of `failed`, `running`, `pending`, or missing for the
 - **THEN** acceptance execution is started in the same cycle
 - **AND** archive is not attempted before acceptance completion
 
-
 ### Requirement: Durable acceptance state gates archive on the current revision
 
 Parallel execution MUST persist enough workspace-local acceptance state to distinguish `pending`, `running`, `passed`, and non-pass terminal outcomes for the latest apply revision.
@@ -2092,7 +2072,6 @@ If the orchestrator restarts after acceptance started but before a final verdict
 - **THEN** the durable acceptance state revision remains `rev-same`
 - **AND** existing archive gating semantics are preserved
 
-
 ### Requirement: post-archive-merge-dispatch
 
 When a change is archived in parallel mode, the orchestrator must attempt to merge or defer the change according to the canonical merge-deferred contract rather than leaving auto-resumable and manual-wait cases ambiguous.
@@ -2116,7 +2095,6 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 **When**: The deferred merge result is processed
 **Then**: The change remains in manual merge wait handling (`MergeWait`)
 **And**: it is not classified as auto-resumable
-
 
 ### Requirement: Parallel execution acceptance loop
 

@@ -38,32 +38,15 @@ Display status exposed to consumers MAY be derived from this runtime state, but 
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
-The reducer SHALL accept mutations only through structured inputs: user commands, execution events, and workspace observations.
+Workspace observations SHALL NOT regress a change from terminal `Merged` back to `MergeWait` when the change has already been integrated into the base branch, including fast-forward integration.
 
-The reducer MUST be idempotent for duplicate inputs and MUST ignore stale inputs that would regress terminal state.
+#### Scenario: Archived workspace observation does not regress fast-forward merged change
 
-Execution events SHALL own active-stage and terminal transitions. Workspace observations SHALL reconcile durable wait/recovery state and MUST NOT override an active execution stage.
-
-#### Scenario: Duplicate event is a no-op
-
-- **GIVEN** a change is already in an applying activity state
-- **WHEN** the same `ApplyStarted` event is processed again
-- **THEN** the reducer leaves the runtime state unchanged
-- **AND** no invalid regression occurs
-
-#### Scenario: Late failure does not regress merged state
-
-- **GIVEN** a change is already in terminal merged state
-- **WHEN** a stale `ResolveFailed` or `ApplyFailed` event arrives
-- **THEN** the reducer ignores the stale event
-- **AND** the runtime state remains merged
-
-#### Scenario: Observation does not override active resolve
-
-- **GIVEN** a change is currently resolving
-- **WHEN** auto-refresh observes that the worktree is archived and ahead of base
-- **THEN** the reducer stores the observation
-- **AND** the displayed status remains `resolving`
+- **GIVEN** a change has already reached terminal `Merged`
+- **AND** the integration happened via fast-forward rather than a merge commit
+- **WHEN** a later `ChangesRefreshed` event observes the workspace as archived
+- **THEN** the reducer keeps the terminal state as `Merged`
+- **AND** the derived display status does not regress to `merge wait`
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -128,7 +111,6 @@ In Parallel mode, `ChangeArchived` SHALL set the wait state to `MergeWait` (a no
 - **THEN** the terminal state becomes `Merged`
 - **AND** the derived display status is `merged`
 
-
 ### Requirement: Parallel Resume Applies Archive-Complete Wait Semantics
 
 In Parallel execution mode, when a resumed workspace is already archive-complete, the shared lifecycle state SHALL apply the same wait semantics as a `ChangeArchived` transition.
@@ -146,7 +128,6 @@ This resume-time archive-complete transition MUST preserve the user-visible merg
 
 
 #
-
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -188,7 +169,6 @@ TUI runner の `apply_to_reducer` 条件に `MergeDeferred` イベントを含�
 **When**: 次の `ChangesRefreshed` イベントが処理される
 **Then**: reducer の `display_status()` が "merge wait" を返し、TUI の M キーヒントが表示され続ける
 
-
 ### Requirement: post-archive-merge-dispatch
 
 When a change is archived in parallel mode, the orchestrator must attempt to merge or queue the change for resolve, rather than leaving it in MergeWait indefinitely.
@@ -204,7 +184,6 @@ When a change is archived in parallel mode, the orchestrator must attempt to mer
 **Given**: No resolve is currently active and change B has just been archived in parallel mode
 **When**: The ChangeArchived event for B is processed by the TUI orchestrator
 **Then**: An immediate merge attempt is initiated for B (via ResolveMerge command)
-
 
 ### Requirement: OrchestratorState が唯一のループ状態ソースである
 `OrchestratorState` はオーケストレーションループの状態（apply 回数、pending/archived/completed 変更セット、イテレーション番号、current change ID）の唯一の正規ソースでなければならない（MUST）。
@@ -228,7 +207,6 @@ When a change is archived in parallel mode, the orchestrator must attempt to mer
 - **THEN** `OrchestratorState` の `pending_changes` が減少する
 - **AND** `changes_processed` が増加する
 - **AND** 他に同じ情報を保持する変数が更新される必要がない
-
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -309,7 +287,6 @@ Frontend MAY cache the resolve queue state for rendering purposes, but the cache
 - **WHEN** the resolve queue is accessed for rendering
 - **THEN** the displayed queue is derived from `OrchestratorState.resolve_wait_queue`
 - **AND** Frontend does not maintain a separate FIFO queue that diverges from Core state
-
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -441,7 +418,6 @@ This ensures rejected changes are not picked up by `cflx run` or presented as ca
 - **THEN** `fix-auth` is NOT in the active change list
 - **AND** the runtime does NOT clear `TerminalState::Rejected`
 
-
 ### Requirement: Parallel mode treats archive as merge-wait
 
 - **GIVEN** the orchestrator is running in Parallel execution mode
@@ -468,7 +444,6 @@ A parallel archived change MUST leave `MergeWait` as soon as merge handling can 
 - **THEN** the change is treated as an execution error
 - **AND** the reducer does not classify the failure as `merge wait`
 
-
 ### Requirement: Rejection Flow Execution
 
 The system SHALL execute a rejection flow when acceptance returns a `Blocked` verdict, including blocked verdicts that originated from apply execution through a rejection proposal file. Apply execution MAY generate `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal when it encounters an implementation blocker that prevents completion. This proposal file SHALL NOT become a terminal rejection by itself. Acceptance SHALL review the blocker and decide whether to confirm the rejection. Only after acceptance confirms the blocked verdict SHALL the runtime treat the change as rejected, commit only `REJECTED.md` on the base branch, and delete the worktree.
@@ -488,7 +463,6 @@ The system SHALL execute a rejection flow when acceptance returns a `Blocked` ve
 - **THEN** the terminal state becomes `Rejected` with the rejection reason
 - **AND** the derived display status is `rejected`
 - **AND** the change cannot be re-queued via `AddToQueue`
-
 
 ### Requirement: Rejection Flow Execution
 
@@ -572,7 +546,6 @@ The operation MUST NOT convert permanent terminal changes such as `Archived`, `M
 - **THEN** the reducer treats the request as a no-op
 - **AND** the derived display status remains `archived`
 
-
 ### Requirement: Reducer-Owned Change Runtime State
 
 The system SHALL maintain reducer-owned runtime state for each change in `OrchestratorState`.
@@ -633,7 +606,6 @@ Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED
 - **AND** the active execution stage becomes `Applying`
 - **AND** the derived display status is `applying`
 
-
 ### Requirement: Reducer-Owned Change Runtime State
 
 The active execution stage SHALL include lifecycle events for entering and leaving the `Rejecting` stage. The reducer SHALL support two outcomes from rejection review: confirmation (transition to `Rejected` terminal) and dismissal/resume (transition back to `Applying`).
@@ -664,24 +636,15 @@ The active execution stage SHALL include lifecycle events for entering and leavi
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
-Execution events SHALL own active-stage and terminal transitions. Workspace observations SHALL reconcile durable wait/recovery state and MUST NOT override an active execution stage.
+Workspace observations SHALL NOT regress a change from terminal `Merged` back to `MergeWait` when the change has already been integrated into the base branch, including fast-forward integration.
 
-When a workspace-status synchronization event is used, it SHALL target the specific change being updated. The reducer MUST NOT infer the target change from `current_change_id` when multiple changes may be active concurrently.
+#### Scenario: Archived workspace observation does not regress fast-forward merged change
 
-#### Scenario: Workspace status sync targets the correct change
-
-- **GIVEN** change `a` is `Applying`
-- **AND** change `b` is `Rejecting`
-- **WHEN** a workspace-status synchronization event for `b` is applied
-- **THEN** only change `b` is updated
-- **AND** change `a` remains `Applying`
-
-#### Scenario: Parallel workspace status sync does not rely on current change id
-
-- **GIVEN** multiple changes are active in parallel mode
-- **WHEN** a workspace-status synchronization event arrives
-- **THEN** the reducer identifies the target change from the event payload itself
-- **AND** `current_change_id` is not used to decide which runtime entry to mutate
+- **GIVEN** a change has already reached terminal `Merged`
+- **AND** the integration happened via fast-forward rather than a merge commit
+- **WHEN** a later `ChangesRefreshed` event observes the workspace as archived
+- **THEN** the reducer keeps the terminal state as `Merged`
+- **AND** the derived display status does not regress to `merge wait`
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -703,7 +666,6 @@ Server-mode WebSocket API (`/api/v1/ws`) SHALL derive per-change display status 
 - **WHEN** a WebSocket client requests the change list
 - **THEN** the change status is NOT reported as `archiving`
 - **AND** the change status reflects the intermediate state accurately
-
 
 ### Requirement: WebSocket change status consistency with TUI
 
@@ -728,7 +690,6 @@ The parallel scheduler's decision to dispatch queued changes SHALL be derived fr
 - **THEN** the change is included in the re-analysis candidate set
 - **AND** the scheduler does not require a separate event flag to consider this change
 
-
 ### Requirement: post-archive-merge-dispatch
 
 When a change is archived in parallel mode, the project-scoped reducer and orchestrator MUST classify the archived change according to whether another change in the same Project is already resolving.
@@ -750,7 +711,6 @@ If another change in the same Project has `ActivityState::Resolving`, the archiv
 - **When** the reducer processes `ChangeArchived` for Change B
 - **Then** Change B enters `MergeWait`
 - **And** the derived display status is `merge wait`
-
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 
@@ -804,7 +764,6 @@ When a previously rejected change reappears in the active listing because its `R
 - **WHEN** `ChangesRefreshed` fires
 - **THEN** `fix-auth` is NOT in the active change list
 - **AND** the runtime does NOT clear `TerminalState::Rejected`
-
 
 ### Requirement: Resolve Wait Queue Ownership
 
