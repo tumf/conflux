@@ -3913,3 +3913,190 @@ async fn test_attempt_merge_errors_on_detached_head() {
         }
     }
 }
+
+/// Regression: when an acceptance command emits a canonical standalone verdict
+/// but the child process keeps stdout open (e.g. opencode + MCP children),
+/// the executor MUST finalize the verdict via the grace period and terminate
+/// the child instead of waiting for the inactivity-timeout retry.
+///
+/// The test shortens the grace period to 1 second using a task-local override
+/// (so concurrent tests are not affected) and uses an acceptance command that
+/// sleeps for 30 seconds after emitting `ACCEPTANCE: PASS`. The execution
+/// must complete in well under the sleep duration and must return PASS.
+#[tokio::test]
+async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retry() {
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        // Emit canonical standalone PASS, then keep the process alive long
+        // enough that the executor MUST cut it off via the grace period.
+        acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS; sleep 30'".to_string()),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        // 5s inactivity timeout would otherwise also rescue this test, so
+        // disable it to ensure we are exercising the verdict-grace path only.
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let started = Instant::now();
+    let (result, _iteration) = crate::parallel::executor::scoped_verdict_grace_secs_for_test(
+        1,
+        execute_acceptance_in_workspace(
+            "change-a",
+            repo_root.path(),
+            &mut agent,
+            None,
+            None,
+            &ai_runner,
+            &acceptance_config,
+            &acceptance_tail_injected,
+            &acceptance_history,
+            Some("main"),
+        ),
+    )
+    .await
+    .or_fail("unexpected error");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, crate::orchestration::AcceptanceResult::Pass),
+        "expected acceptance PASS via verdict grace, got {:?}",
+        result
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "verdict-grace finalization should complete well under the 30s sleep, took {:?}",
+        elapsed
+    );
+
+    // Durable acceptance state must reflect PASS for the current revision.
+    let revision = get_current_commit(repo_root.path())
+        .await
+        .or_fail("unexpected error");
+    assert!(
+        crate::parallel::acceptance_state::has_durable_acceptance_pass(repo_root.path(), &revision)
+            .or_fail("unexpected error"),
+        "verdict-finalized PASS must be persisted as durable acceptance state"
+    );
+}
+
+/// Regression: malformed trailing-text verdicts (e.g. `ACCEPTANCE: PASSAll ...`)
+/// MUST NOT be treated as canonical PASS by the parallel executor. The legacy
+/// `starts_with` check accepted these and could lock in a bogus pass; the
+/// strict canonical contract falls through to CONTINUE so the loop can retry.
+#[tokio::test]
+async fn test_acceptance_trailing_text_pass_is_not_canonical() {
+    use tempfile::TempDir;
+
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(
+            "sh -c 'echo ACCEPTANCE: PASSAll acceptance criteria verified'".to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("unexpected error");
+
+    assert!(
+        matches!(result, crate::orchestration::AcceptanceResult::Continue),
+        "trailing-text PASS must NOT satisfy canonical verdict; expected CONTINUE fallback, got {:?}",
+        result
+    );
+
+    // Durable acceptance state must NOT mark a malformed verdict as passed.
+    let revision = get_current_commit(repo_root.path())
+        .await
+        .or_fail("unexpected error");
+    assert!(
+        !crate::parallel::acceptance_state::has_durable_acceptance_pass(
+            repo_root.path(),
+            &revision
+        )
+        .or_fail("unexpected error"),
+        "malformed trailing-text verdict must not produce durable acceptance-pass state"
+    );
+}

@@ -16,13 +16,42 @@ pub enum AcceptanceResult {
     Blocked,
 }
 
+/// Canonical verdict variants. The runtime requires an unwrapped standalone
+/// line that exactly equals one of these markers (after stripping tolerated
+/// markdown decorations). Trailing text concatenation such as
+/// `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` does NOT satisfy the
+/// canonical contract and falls through to the CONTINUE fallback.
+pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
+    ("ACCEPTANCE: PASS", "pass"),
+    ("ACCEPTANCE: FAIL", "fail"),
+    ("ACCEPTANCE: CONTINUE", "continue"),
+    ("ACCEPTANCE: BLOCKED", "blocked"),
+];
+
+/// Returns the canonical verdict kind for a single output line, or `None` when
+/// the line is not a standalone canonical verdict.
+///
+/// Matching is strict: the line must equal one of [`CANONICAL_VERDICTS`] markers
+/// exactly after trimming whitespace and stripping defensively-tolerated markdown
+/// decorations (bold/italic/underline + leading heading/blockquote/bullet
+/// prefixes). Trailing-text concatenation onto the marker is rejected.
+pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
+    let normalized = strip_markdown_decorations(line.trim());
+    CANONICAL_VERDICTS
+        .iter()
+        .find(|(marker, _)| normalized == *marker)
+        .map(|(_, kind)| *kind)
+}
+
 /// Parse acceptance output text and determine pass/fail/continue/blocked status.
 ///
-/// Expected format:
-/// - PASS: `ACCEPTANCE: PASS` (with optional markdown decorations like `**ACCEPTANCE: PASS**`)
-/// - FAIL: `ACCEPTANCE: FAIL` followed by `FINDINGS:` and items prefixed with `- `
-/// - CONTINUE: `ACCEPTANCE: CONTINUE`
-/// - BLOCKED: `ACCEPTANCE: BLOCKED`
+/// Canonical contract: the verdict MUST be an unwrapped standalone line equal to
+/// one of `ACCEPTANCE: PASS`, `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`,
+/// `ACCEPTANCE: BLOCKED`. Bold/italic/underline wrappers and leading
+/// heading/blockquote/bullet prefixes are tolerated defensively but trailing
+/// text concatenated onto the marker (for example `ACCEPTANCE: PASSAll ...` or
+/// `ACCEPTANCE: PASS## ...`) is NOT a canonical verdict and produces the
+/// CONTINUE fallback.
 ///
 /// # Examples
 ///
@@ -49,43 +78,23 @@ pub enum AcceptanceResult {
 /// assert_eq!(parse_acceptance_output(blocked_output), AcceptanceResult::Blocked);
 /// ```
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
-    let lines: Vec<&str> = output.lines().collect();
-
-    // Look for ACCEPTANCE: PASS, ACCEPTANCE: FAIL, ACCEPTANCE: CONTINUE, or ACCEPTANCE: BLOCKED
-    // Skip code blocks (delimited by ```) to avoid matching examples in prompts
-    let mut acceptance_status = None;
+    let mut acceptance_status: Option<&'static str> = None;
     let mut in_code_block = false;
 
-    for line in &lines {
+    for line in output.lines() {
         let trimmed = line.trim();
 
-        // Toggle code block state on triple backticks
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
             continue;
         }
 
-        // Skip lines inside code blocks
         if in_code_block {
             continue;
         }
 
-        // Strip markdown decorations (**, *, _, etc.) before matching
-        let normalized = strip_markdown_decorations(trimmed);
-        // Use starts_with instead of exact match to handle cases where
-        // the AI agent output concatenates text after the status keyword
-        // without a newline (e.g., "ACCEPTANCE: PASSAll criteria verified").
-        if normalized.starts_with("ACCEPTANCE: PASS") {
-            acceptance_status = Some("pass");
-            break;
-        } else if normalized.starts_with("ACCEPTANCE: FAIL") {
-            acceptance_status = Some("fail");
-            break;
-        } else if normalized.starts_with("ACCEPTANCE: CONTINUE") {
-            acceptance_status = Some("continue");
-            break;
-        } else if normalized.starts_with("ACCEPTANCE: BLOCKED") {
-            acceptance_status = Some("blocked");
+        if let Some(kind) = canonical_verdict_kind(trimmed) {
+            acceptance_status = Some(kind);
             break;
         }
     }
@@ -95,13 +104,13 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
         Some("continue") => AcceptanceResult::Continue,
         Some("blocked") => AcceptanceResult::Blocked,
         Some("fail") => {
-            // Parse findings
             let findings = parse_findings(output);
             AcceptanceResult::Fail { findings }
         }
         _ => {
-            // Default to continue if no explicit status found
-            // This allows the acceptance loop to retry and investigate further
+            // Default to continue if no canonical standalone verdict was found.
+            // Malformed verdicts (trailing text, code-block-only verdicts,
+            // unparseable output) fall here so the loop can retry.
             AcceptanceResult::Continue
         }
     }
@@ -402,47 +411,85 @@ ACCEPTANCE: PASS
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 
+    // Trailing-text concatenation is NOT canonical. The runtime parser
+    // rejects malformed verdicts and falls through to CONTINUE so the
+    // acceptance loop can retry instead of locking in a bogus PASS.
+
     #[test]
-    fn test_parse_pass_with_trailing_text() {
-        // Regression: AI agent output may concatenate text after the status
-        // keyword without a newline, e.g. "ACCEPTANCE: PASSAll acceptance criteria verified:"
+    fn test_parse_pass_with_trailing_text_is_not_canonical() {
+        // Regression: real log produced "ACCEPTANCE: PASSAll acceptance criteria verified:"
+        // which previously satisfied PASS via starts_with. Strict canonical
+        // matching rejects it.
         let output = "ACCEPTANCE: PASSAll acceptance criteria verified:\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 
     #[test]
-    fn test_parse_pass_with_trailing_text_in_context() {
-        // Full context from real log output
+    fn test_parse_pass_with_trailing_heading_is_not_canonical() {
+        // Real log: "ACCEPTANCE: PASS## Acceptance Review Summary"
+        let output = "ACCEPTANCE: PASS## Acceptance Review Summary\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_pass_with_trailing_text_in_context_is_not_canonical() {
         let output = r#"Some prior output
 ACCEPTANCE: PASSAll acceptance criteria verified:
 
 1. Git working tree is clean
 "#;
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
-    }
-
-    #[test]
-    fn test_parse_fail_with_trailing_text() {
-        let output = "ACCEPTANCE: FAILSome additional context\nFINDINGS:\n- Issue 1\n";
-        match parse_acceptance_output(output) {
-            AcceptanceResult::Fail { findings } => {
-                assert_eq!(findings.len(), 1);
-                assert_eq!(findings[0], "Issue 1");
-            }
-            _ => panic!("Expected Fail"),
-        }
-    }
-
-    #[test]
-    fn test_parse_continue_with_trailing_text() {
-        let output = "ACCEPTANCE: CONTINUENeeds further investigation\n";
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
     }
 
     #[test]
-    fn test_parse_blocked_with_trailing_text() {
+    fn test_parse_pass_with_trailing_text_falls_through_to_canonical_pass() {
+        // If a malformed verdict appears first but a canonical standalone
+        // verdict follows on a later line, the canonical line wins.
+        let output = "ACCEPTANCE: PASSAll bad form\nACCEPTANCE: PASS\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_fail_with_trailing_text_is_not_canonical() {
+        let output = "ACCEPTANCE: FAILSome additional context\nFINDINGS:\n- Issue 1\n";
+        // Trailing-text FAIL is malformed; falls through to CONTINUE.
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_continue_with_trailing_text_is_not_canonical() {
+        let output = "ACCEPTANCE: CONTINUENeeds further investigation\n";
+        // Malformed verdict — falls through to CONTINUE default (same kind by
+        // coincidence, but still via fallback rather than canonical match).
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_blocked_with_trailing_text_is_not_canonical() {
         let output = "ACCEPTANCE: BLOCKEDWaiting for dependency\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_parse_passed_word_boundary_is_not_canonical() {
+        // "ACCEPTANCE: PASSED" must not match canonical PASS.
+        let output = "ACCEPTANCE: PASSED\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn test_canonical_verdict_kind_strict_match() {
+        assert_eq!(canonical_verdict_kind("ACCEPTANCE: PASS"), Some("pass"));
+        assert_eq!(
+            canonical_verdict_kind("**ACCEPTANCE: PASS**"),
+            Some("pass")
+        );
+        assert_eq!(canonical_verdict_kind("## ACCEPTANCE: PASS"), Some("pass"));
+        assert_eq!(canonical_verdict_kind("> ACCEPTANCE: FAIL"), Some("fail"));
+        assert_eq!(canonical_verdict_kind("ACCEPTANCE: PASSAll bad"), None);
+        assert_eq!(canonical_verdict_kind("ACCEPTANCE: PASS## heading"), None);
+        assert_eq!(canonical_verdict_kind("ACCEPTANCE: PASSED"), None);
+        assert_eq!(canonical_verdict_kind("not a verdict"), None);
     }
 
     #[test]
@@ -622,10 +669,10 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
 
     #[test]
     fn test_marker_detection_consistency_with_parser() {
-        // The orchestration streaming code (src/orchestration/acceptance.rs) detects
-        // markers using strip_markdown_decorations + starts_with for the grace period.
-        // The parser (parse_acceptance_output) uses the same approach.
-        // This test ensures both detect markers in all documented drift cases.
+        // Streaming verdict detection (src/orchestration/acceptance.rs and
+        // src/parallel/executor.rs) and the parser MUST agree on the canonical
+        // contract: standalone exact match after stripping tolerated markdown
+        // decorations. This test pins both surfaces to canonical_verdict_kind.
         let drift_cases: &[(&str, &str)] = &[
             ("ACCEPTANCE: PASS", "pass"),
             ("**ACCEPTANCE: PASS**", "pass"),
@@ -640,19 +687,14 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         ];
 
         for (case, expected_kind) in drift_cases {
-            // 1. Verify strip_markdown_decorations + starts_with detects the marker
-            let normalized = strip_markdown_decorations(case.trim());
-            let is_marker = normalized.starts_with("ACCEPTANCE: PASS")
-                || normalized.starts_with("ACCEPTANCE: FAIL")
-                || normalized.starts_with("ACCEPTANCE: CONTINUE")
-                || normalized.starts_with("ACCEPTANCE: BLOCKED");
-            assert!(
-                is_marker,
-                "strip_markdown_decorations + starts_with must detect marker in '{}' (normalized: '{}')",
-                case, normalized
+            assert_eq!(
+                canonical_verdict_kind(case),
+                Some(*expected_kind),
+                "canonical_verdict_kind must detect '{}' as kind '{}'",
+                case,
+                expected_kind
             );
 
-            // 2. Verify the full parser returns the expected result kind (not a spurious fallback)
             let full_output = format!("{}\n", case);
             let result = parse_acceptance_output(&full_output);
             let result_kind = match &result {
@@ -665,6 +707,28 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 result_kind, *expected_kind,
                 "parse_acceptance_output returned '{}' but expected '{}' for input '{}'",
                 result_kind, expected_kind, case
+            );
+        }
+    }
+
+    #[test]
+    fn test_marker_detection_rejects_trailing_text_uniformly() {
+        // Both surfaces (parser + streaming detection) must reject trailing-text
+        // verdicts so they cannot accidentally finalize an acceptance run early.
+        let malformed: &[&str] = &[
+            "ACCEPTANCE: PASSAll checks completed",
+            "ACCEPTANCE: PASS## Acceptance Review Summary",
+            "ACCEPTANCE: PASSED",
+            "ACCEPTANCE: FAILSome explanation",
+            "ACCEPTANCE: CONTINUEMore work",
+            "ACCEPTANCE: BLOCKEDWaiting",
+        ];
+
+        for case in malformed {
+            assert!(
+                canonical_verdict_kind(case).is_none(),
+                "canonical_verdict_kind must NOT detect malformed verdict '{}'",
+                case
             );
         }
     }
