@@ -425,26 +425,23 @@ The dedicated `cflx-accept` skill MAY provide operation identity and scoped acce
 
 The canonical acceptance verdict is an unwrapped standalone line containing exactly one of `ACCEPTANCE: PASS`, `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, or `ACCEPTANCE: BLOCKED`. Markdown wrappers are explicitly categorized as follows:
 
-- **Forbidden in agent output**: markdown headings (`#`, `##`, etc.), blockquotes (`>`), bullets (`-`, `*`), fenced code blocks (`` ``` ``). The command template and skill guidance MUST instruct agents not to wrap the verdict marker in these forms.
-- **Tolerated by parser (defensive)**: bold (`**`), italic (`*`), underline (`_`), heading prefixes (`#`+), blockquote prefixes (`>`), bullet prefixes (`-`). The runtime parser strips these before matching as a defense against common LLM formatting drift, but this tolerance does not make them canonical.
-- **Rejected by parser**: verdict markers inside fenced code blocks are ignored (they may be examples, not actual verdicts).
+- **Forbidden in agent output**: markdown headings (`#`, `##`, etc.), blockquotes (`>`), bullets (`-`, `*`), fenced code blocks (`` ``` ``).
+- **Tolerated by parser (defensive)**: bold (`**`), italic (`*`), underline (`_`), heading prefixes (`#`+), blockquote prefixes (`>`), bullet prefixes (`-`) when the verdict line still remains standalone after stripping those wrappers.
+- **Rejected by canonical parser**: verdict lines with trailing text concatenated onto the marker itself, including `ACCEPTANCE: PASSAll ...` and `ACCEPTANCE: PASS## ...`.
 
-#### Scenario: Acceptance command template defines a standalone machine-readable verdict
+#### Scenario: canonical verdict is a standalone line only
 
-- **GIVEN** the orchestrator emits `load skills: cflx-accept`
-- **AND** acceptance runs through the standard command template flow
+- **GIVEN** acceptance runs through the standard command template flow
 - **WHEN** the final verdict is produced
 - **THEN** the canonical output contract is an unwrapped standalone line containing exactly one of `ACCEPTANCE: PASS`, `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, or `ACCEPTANCE: BLOCKED`
-- **AND** the contract explicitly states that markdown headings, quotes, bullets, and fenced code blocks are forbidden around the verdict marker
-- **AND** the runtime parser defensively tolerates common drift prefixes (heading `#`, quote `>`, bullet `-`, bold/italic) but this tolerance does not alter the canonical contract
-- **AND** runtime parsing and regression tests enforce the documented contract instead of relying on implicit formatter behavior
+- **AND** trailing prose or headings concatenated onto that line are not valid canonical verdicts
 
-#### Scenario: Acceptance ownership boundary stays explicit after workflow split
+#### Scenario: command template remains the source of verdict formatting guidance
 
-- **GIVEN** acceptance prompt construction, command-template instructions, dedicated skill guidance, and runtime parser enforcement are reviewed together
-- **WHEN** a future refactor changes one of these surfaces
-- **THEN** tests fail if fixed acceptance procedure or final verdict contract drifts out of sync across those surfaces
-- **AND** Rust-side prompt builders continue to inject runtime context without replacing the command template as the authoritative acceptance procedure source
+- **GIVEN** the acceptance prompt loads `cflx-accept`
+- **WHEN** the agent is instructed how to emit the final verdict
+- **THEN** the formatting rule is defined by `.opencode/commands/cflx-accept.md`
+- **AND** the skill may reinforce operation identity but does not replace the template as the source of canonical verdict formatting
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
