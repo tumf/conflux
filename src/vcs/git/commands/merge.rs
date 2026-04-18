@@ -548,4 +548,160 @@ mod tests {
             "Expected mismatch to include wrong pre-sync subject"
         );
     }
+
+    /// Helper: initialize a git repo with config and an initial commit.
+    async fn init_test_repo(dir: &Path) {
+        let _ = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("README.md"), "initial\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(dir)
+            .output()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_missing_merge_commits_reports_missing_for_fast_forward() {
+        // Verifies that missing_merge_commits_since reports a change as missing
+        // when it was integrated via fast-forward (no merge commit exists).
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        init_test_repo(dir).await;
+
+        let base_rev = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
+
+        // Create a feature branch and add a commit
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "ws-change-a"])
+            .current_dir(dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("feature.txt"), "feature\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Feature commit"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        // Fast-forward merge back to main
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["merge", "ws-change-a"]) // default: fast-forward
+            .current_dir(dir)
+            .output()
+            .await;
+
+        // missing_merge_commits_since looks for "Merge change: change-a"
+        // Since fast-forward created no merge commit, the change is reported as missing.
+        let missing = missing_merge_commits_since(
+            dir,
+            base_rev.trim(),
+            &["change-a".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(missing, vec!["change-a".to_string()],
+            "Fast-forward merged change should appear as missing (no merge commit)");
+    }
+
+    #[tokio::test]
+    async fn test_is_ancestor_detects_fast_forward_integration() {
+        // Verifies that is_ancestor can detect that a fast-forward-merged branch
+        // is an ancestor of HEAD, which is the mechanism to identify fast-forward
+        // integration in the resolve verification path.
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        init_test_repo(dir).await;
+
+        // Create a feature branch and add a commit
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "ws-change-a"])
+            .current_dir(dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("feature.txt"), "feature\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Feature commit"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        // Fast-forward merge back to main
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["merge", "ws-change-a"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        // ws-change-a should be an ancestor of HEAD after fast-forward
+        let integrated = is_ancestor(dir, "ws-change-a", "HEAD").await.unwrap();
+        assert!(integrated, "Fast-forward branch should be ancestor of HEAD");
+
+        // A non-existent or unmerged branch should NOT be an ancestor
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "ws-unmerged"])
+            .current_dir(dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("unmerged.txt"), "unmerged\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Unmerged commit"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        let not_integrated = is_ancestor(dir, "ws-unmerged", "HEAD").await.unwrap();
+        assert!(!not_integrated, "Unmerged branch should NOT be ancestor of HEAD");
+    }
 }
