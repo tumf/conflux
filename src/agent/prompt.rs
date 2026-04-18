@@ -141,20 +141,18 @@ pub fn build_acceptance_prompt(
     )
 }
 
-/// Repository-standard archive-readiness checks that acceptance must evaluate
-/// before allowing archive to start.
+/// Repository-agnostic archive-commitability checks that acceptance must
+/// evaluate before allowing archive to start.
 const ARCHIVE_READINESS_CONTEXT: &str = "<archive_readiness_context>\n\
-Before returning ACCEPTANCE: PASS, verify this workspace is ready for a real final archive commit under repository quality gates.\n\
-Run and evaluate these gates (or documented equivalents if this repo differs):\n\
-- pre-commit hook behavior for a normal commit (no --no-verify)\n\
-- cargo fmt --check\n\
-- cargo clippy -- -D warnings\n\
-- cargo test\n\
-If any gate fails, return a non-pass verdict and include actionable findings with:\n\
-1) blocking gate name (hook/fmt/clippy/test),\n\
-2) failing command,\n\
+Before returning ACCEPTANCE: PASS, verify this workspace is ready for the real final archive commit on this repository's actual commit path.\n\
+Focus only on blockers that would actually prevent the archive commit from succeeding.\n\
+Do not assume that tests, linters, formatters, or pre-commit hooks exist unless they are part of the real commit path for this repository.\n\
+If a normal commit in this repository runs hooks or other verification that would block the archive commit, treat that commit-path failure as relevant.\n\
+If archive commitability is blocked, return a non-pass verdict and include actionable findings with:\n\
+1) the blocking commit-path step or hook,\n\
+2) the failing command or commit attempt when available,\n\
 3) relevant file/path context when available.\n\
-Do not defer these failures to archive.\n\
+Do not defer commit-path blockers to archive.\n\
 </archive_readiness_context>";
 
 /// Build acceptance prompt context without the hardcoded system prompt.
