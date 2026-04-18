@@ -69,7 +69,7 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 	fi
 
 	git add -A
-	git commit --no-verify -m "chore(release): release v${NEW_VERSION}"
+	git commit -m "chore(release): release v${NEW_VERSION}"
 	git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
 	git push origin "$CURRENT_BRANCH" --follow-tags
 	exit 0
