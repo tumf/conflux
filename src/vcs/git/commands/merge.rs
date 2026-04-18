@@ -706,4 +706,156 @@ mod tests {
             "Unmerged branch should NOT be ancestor of HEAD"
         );
     }
+
+    /// Regression test: parallel merge fast-forward verification.
+    ///
+    /// After archive, a fast-forward merge produces no merge commit.
+    /// `missing_merge_commits_since` reports it as missing, but `is_ancestor`
+    /// confirms the branch content is on HEAD. The combination should treat
+    /// the change as successfully integrated (no error).
+    #[tokio::test]
+    async fn test_fast_forward_merge_passes_verification_with_ancestor_check() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        init_test_repo(dir).await;
+
+        let base_rev = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
+
+        // Create workspace branch with a commit (simulates archived change)
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "ws-change-ff"])
+            .current_dir(dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("feature-ff.txt"), "fast-forward content\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Archive: change-ff"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        // Fast-forward merge back to main (no merge commit created)
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["merge", "ws-change-ff"]) // default: fast-forward
+            .current_dir(dir)
+            .output()
+            .await;
+
+        let change_ids = vec!["change-ff".to_string()];
+        let revisions = vec!["ws-change-ff".to_string()];
+
+        // missing_merge_commits_since reports the change as missing
+        let missing = missing_merge_commits_since(dir, base_rev.trim(), &change_ids)
+            .await
+            .unwrap();
+        assert_eq!(
+            missing,
+            vec!["change-ff".to_string()],
+            "Fast-forward merge should be reported as missing by merge commit check"
+        );
+
+        // Apply the same filtering logic used in verify_merge_commits:
+        // filter out changes whose branch is an ancestor of HEAD
+        let mut truly_missing: Vec<String> = Vec::new();
+        for missing_id in &missing {
+            let revision = revisions
+                .iter()
+                .zip(change_ids.iter())
+                .find(|(_, cid)| *cid == missing_id)
+                .map(|(rev, _)| rev.as_str());
+
+            if let Some(rev) = revision {
+                let is_integrated = is_ancestor(dir, rev, "HEAD").await.unwrap_or(false);
+                if !is_integrated {
+                    truly_missing.push(missing_id.clone());
+                }
+            } else {
+                truly_missing.push(missing_id.clone());
+            }
+        }
+
+        assert!(
+            truly_missing.is_empty(),
+            "Fast-forward integrated change should NOT appear as truly missing, \
+             but got: {:?}",
+            truly_missing
+        );
+    }
+
+    /// Verify that a genuinely unintegrated change is still reported as missing
+    /// even when fast-forward filtering is applied.
+    #[tokio::test]
+    async fn test_unintegrated_change_still_reported_missing_after_ff_filter() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        init_test_repo(dir).await;
+
+        let base_rev = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
+
+        // Create a branch but do NOT merge it
+        let _ = Command::new("git")
+            .args(["checkout", "-b", "ws-change-unmerged"])
+            .current_dir(dir)
+            .output()
+            .await;
+        std::fs::write(dir.join("unmerged.txt"), "unmerged\n").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir)
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Unmerged change"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        let _ = Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir)
+            .output()
+            .await;
+
+        let change_ids = vec!["change-unmerged".to_string()];
+        let revisions = vec!["ws-change-unmerged".to_string()];
+
+        let missing = missing_merge_commits_since(dir, base_rev.trim(), &change_ids)
+            .await
+            .unwrap();
+
+        // Apply fast-forward filter
+        let mut truly_missing: Vec<String> = Vec::new();
+        for missing_id in &missing {
+            let revision = revisions
+                .iter()
+                .zip(change_ids.iter())
+                .find(|(_, cid)| *cid == missing_id)
+                .map(|(rev, _)| rev.as_str());
+
+            if let Some(rev) = revision {
+                let is_integrated = is_ancestor(dir, rev, "HEAD").await.unwrap_or(false);
+                if !is_integrated {
+                    truly_missing.push(missing_id.clone());
+                }
+            } else {
+                truly_missing.push(missing_id.clone());
+            }
+        }
+
+        assert_eq!(
+            truly_missing,
+            vec!["change-unmerged".to_string()],
+            "Unintegrated change must still be reported as truly missing"
+        );
+    }
 }

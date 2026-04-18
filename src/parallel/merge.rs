@@ -598,7 +598,7 @@ impl ParallelExecutor {
             })
             .await?;
 
-            self.verify_merge_commits(&base_revision, &target_branch, change_ids)
+            self.verify_merge_commits(&base_revision, &target_branch, change_ids, revisions)
                 .await?;
 
             let merge_revision = self.workspace_manager.get_current_revision().await?;
@@ -724,6 +724,7 @@ impl ParallelExecutor {
         base_revision: &str,
         _target_branch: &str,
         change_ids: &[String],
+        revisions: &[String],
     ) -> Result<()> {
         if matches!(
             self.workspace_manager.backend_type(),
@@ -734,11 +735,47 @@ impl ParallelExecutor {
                 git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
                     .await
                     .map_err(OrchestratorError::from_vcs_error)?;
+
             if !missing.is_empty() {
-                return Err(OrchestratorError::GitCommand(format!(
-                    "Missing merge commit message containing change_id(s): {}",
-                    missing.join(", ")
-                )));
+                // Filter out changes integrated via fast-forward.
+                // A fast-forward merge does not create a merge commit, so
+                // missing_merge_commits_since reports it as missing. Check if the
+                // worktree branch tip is an ancestor of HEAD (i.e. content is
+                // already on the target branch).
+                let mut truly_missing: Vec<String> = Vec::new();
+                for missing_id in &missing {
+                    let revision = revisions
+                        .iter()
+                        .zip(change_ids.iter())
+                        .find(|(_, cid)| *cid == missing_id)
+                        .map(|(rev, _)| rev.as_str());
+
+                    if let Some(rev) = revision {
+                        let is_integrated =
+                            git_commands::is_ancestor(repo_root, rev, "HEAD")
+                                .await
+                                .unwrap_or(false);
+                        if is_integrated {
+                            tracing::info!(
+                                "Change '{}' (branch '{}') integrated via fast-forward; \
+                                 skipping merge commit check",
+                                missing_id,
+                                rev
+                            );
+                        } else {
+                            truly_missing.push(missing_id.clone());
+                        }
+                    } else {
+                        truly_missing.push(missing_id.clone());
+                    }
+                }
+
+                if !truly_missing.is_empty() {
+                    return Err(OrchestratorError::GitCommand(format!(
+                        "Missing merge commit message containing change_id(s): {}",
+                        truly_missing.join(", ")
+                    )));
+                }
             }
         }
 
