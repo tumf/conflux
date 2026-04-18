@@ -693,10 +693,9 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                         .map(|(rev, _)| rev.as_str());
 
                     if let Some(rev) = revision {
-                        let is_integrated =
-                            git_commands::is_ancestor(repo_root, rev, "HEAD")
-                                .await
-                                .unwrap_or(false);
+                        let is_integrated = git_commands::is_ancestor(repo_root, rev, "HEAD")
+                            .await
+                            .unwrap_or(false);
                         if is_integrated {
                             info!(
                                 "Change '{}' (branch '{}') integrated via fast-forward; skipping merge commit check",

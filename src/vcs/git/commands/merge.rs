@@ -622,16 +622,15 @@ mod tests {
 
         // missing_merge_commits_since looks for "Merge change: change-a"
         // Since fast-forward created no merge commit, the change is reported as missing.
-        let missing = missing_merge_commits_since(
-            dir,
-            base_rev.trim(),
-            &["change-a".to_string()],
-        )
-        .await
-        .unwrap();
+        let missing = missing_merge_commits_since(dir, base_rev.trim(), &["change-a".to_string()])
+            .await
+            .unwrap();
 
-        assert_eq!(missing, vec!["change-a".to_string()],
-            "Fast-forward merged change should appear as missing (no merge commit)");
+        assert_eq!(
+            missing,
+            vec!["change-a".to_string()],
+            "Fast-forward merged change should appear as missing (no merge commit)"
+        );
     }
 
     #[tokio::test]
@@ -702,6 +701,9 @@ mod tests {
             .await;
 
         let not_integrated = is_ancestor(dir, "ws-unmerged", "HEAD").await.unwrap();
-        assert!(!not_integrated, "Unmerged branch should NOT be ancestor of HEAD");
+        assert!(
+            !not_integrated,
+            "Unmerged branch should NOT be ancestor of HEAD"
+        );
     }
 }
