@@ -752,7 +752,7 @@ mod tests {
             .await;
 
         let change_ids = vec!["change-ff".to_string()];
-        let revisions = vec!["ws-change-ff".to_string()];
+        let revisions = ["ws-change-ff".to_string()];
 
         // missing_merge_commits_since reports the change as missing
         let missing = missing_merge_commits_since(dir, base_rev.trim(), &change_ids)
@@ -827,7 +827,7 @@ mod tests {
             .await;
 
         let change_ids = vec!["change-unmerged".to_string()];
-        let revisions = vec!["ws-change-unmerged".to_string()];
+        let revisions = ["ws-change-unmerged".to_string()];
 
         let missing = missing_merge_commits_since(dir, base_rev.trim(), &change_ids)
             .await
