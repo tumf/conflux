@@ -480,10 +480,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     #[test]
     fn test_canonical_verdict_kind_strict_match() {
         assert_eq!(canonical_verdict_kind("ACCEPTANCE: PASS"), Some("pass"));
-        assert_eq!(
-            canonical_verdict_kind("**ACCEPTANCE: PASS**"),
-            Some("pass")
-        );
+        assert_eq!(canonical_verdict_kind("**ACCEPTANCE: PASS**"), Some("pass"));
         assert_eq!(canonical_verdict_kind("## ACCEPTANCE: PASS"), Some("pass"));
         assert_eq!(canonical_verdict_kind("> ACCEPTANCE: FAIL"), Some("fail"));
         assert_eq!(canonical_verdict_kind("ACCEPTANCE: PASSAll bad"), None);

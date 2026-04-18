@@ -930,7 +930,7 @@ pub(crate) fn acceptance_verdict_grace_period() -> std::time::Duration {
 /// Run `fut` with the verdict grace period overridden to `secs`. The override
 /// is scoped to the current task only; concurrent tasks (including parallel
 /// tests) keep seeing the default. Test-only helper.
-#[cfg(any(test, feature = "heavy-tests"))]
+#[cfg(test)]
 pub(crate) async fn scoped_verdict_grace_secs_for_test<F, R>(secs: u64, fut: F) -> R
 where
     F: std::future::Future<Output = R>,
@@ -1166,8 +1166,7 @@ pub async fn execute_acceptance_in_workspace(
                 // Strict matching: trailing-text concatenation does NOT count.
                 if !verdict_detected && crate::acceptance::canonical_verdict_kind(&s).is_some() {
                     verdict_detected = true;
-                    verdict_deadline =
-                        Some(tokio::time::Instant::now() + verdict_grace_period);
+                    verdict_deadline = Some(tokio::time::Instant::now() + verdict_grace_period);
                     info!(
                         "Acceptance canonical verdict detected for {}, starting {}s grace period",
                         change_id,
