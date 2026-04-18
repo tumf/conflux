@@ -905,6 +905,39 @@ fn revision_to_history_commit_hash(revision: &str) -> Option<String> {
     }
 }
 
+const ACCEPTANCE_VERDICT_GRACE_DEFAULT_SECS: u64 = 30;
+
+tokio::task_local! {
+    /// Test-only task-local override for the verdict grace period. Scoped to
+    /// the calling task via [`scoped_verdict_grace_secs_for_test`] so it does
+    /// not leak across concurrent tests the way an env var or static atomic
+    /// would.
+    pub(crate) static VERDICT_GRACE_OVERRIDE_SECS: u64;
+}
+
+/// Returns the grace period applied after detecting a canonical standalone
+/// acceptance verdict. Defaults to 30 seconds. Tests may override the value
+/// for the current task via [`scoped_verdict_grace_secs_for_test`].
+pub(crate) fn acceptance_verdict_grace_period() -> std::time::Duration {
+    let secs = VERDICT_GRACE_OVERRIDE_SECS
+        .try_with(|secs| *secs)
+        .ok()
+        .filter(|secs| *secs > 0)
+        .unwrap_or(ACCEPTANCE_VERDICT_GRACE_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Run `fut` with the verdict grace period overridden to `secs`. The override
+/// is scoped to the current task only; concurrent tasks (including parallel
+/// tests) keep seeing the default. Test-only helper.
+#[cfg(test)]
+pub(crate) async fn scoped_verdict_grace_secs_for_test<F, R>(secs: u64, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    VERDICT_GRACE_OVERRIDE_SECS.scope(secs, fut).await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_acceptance_in_workspace(
     change_id: &str,
@@ -1068,9 +1101,43 @@ pub async fn execute_acceptance_in_workspace(
     let mut output_collector = crate::history::OutputCollector::new();
     let mut full_stdout = String::new();
 
-    // Stream output until channel closes
+    // Grace period after detecting a canonical standalone verdict before
+    // terminating the acceptance child process. This handles the case where
+    // the agent process (e.g. opencode + MCP child processes) does not exit
+    // promptly after emitting the verdict but keeps stdout/stderr pipes open,
+    // which previously left acceptance to wait for inactivity timeout retry.
+    let verdict_grace_period = acceptance_verdict_grace_period();
+
+    let mut verdict_detected = false;
+    let mut verdict_deadline: Option<tokio::time::Instant> = None;
+    let mut early_terminated = false;
+
+    // Stream output until channel closes or verdict grace period expires.
     use crate::ai_command_runner::OutputLine as AiOutputLine;
-    while let Some(line) = output_rx.recv().await {
+    loop {
+        let recv_future = output_rx.recv();
+        let line = if let Some(deadline) = verdict_deadline {
+            match tokio::time::timeout_at(deadline, recv_future).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(_) => {
+                    info!(
+                        "Acceptance verdict grace period ({}s) expired for {}, terminating child process",
+                        verdict_grace_period.as_secs(),
+                        change_id
+                    );
+                    let _ = child.terminate();
+                    early_terminated = true;
+                    break;
+                }
+            }
+        } else {
+            match recv_future.await {
+                Some(line) => line,
+                None => break,
+            }
+        };
+
         // Check for cancellation
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
             warn!("Acceptance test cancelled for: {}", change_id);
@@ -1084,7 +1151,6 @@ pub async fn execute_acceptance_in_workspace(
                 full_stdout.push_str(&s);
                 full_stdout.push('\n');
 
-                // Forward to event channel
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(ParallelEvent::Log(
@@ -1095,11 +1161,22 @@ pub async fn execute_acceptance_in_workspace(
                         ))
                         .await;
                 }
+
+                // Detect canonical standalone verdict and start grace period.
+                // Strict matching: trailing-text concatenation does NOT count.
+                if !verdict_detected && crate::acceptance::canonical_verdict_kind(&s).is_some() {
+                    verdict_detected = true;
+                    verdict_deadline = Some(tokio::time::Instant::now() + verdict_grace_period);
+                    info!(
+                        "Acceptance canonical verdict detected for {}, starting {}s grace period",
+                        change_id,
+                        verdict_grace_period.as_secs()
+                    );
+                }
             }
             AiOutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
 
-                // Forward to event channel (agent stderr is info-level, not warn)
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(ParallelEvent::Log(
@@ -1114,7 +1191,9 @@ pub async fn execute_acceptance_in_workspace(
         }
     }
 
-    // Wait for child process to complete
+    // Wait for child process to complete. After early verdict-driven
+    // termination this returns the terminated exit status, which we treat as
+    // success-equivalent for verdict-based result classification below.
     let status = child.wait().await.map_err(|e| {
         OrchestratorError::AgentCommand(format!(
             "Failed to wait for acceptance command for change '{}' in workspace '{}': {}",
@@ -1123,6 +1202,12 @@ pub async fn execute_acceptance_in_workspace(
             e
         ))
     })?;
+
+    // When the runtime terminated the child after a canonical verdict, the
+    // terminated exit code is not a real failure — the acceptance result is
+    // already determined by the verdict. Skip the command-failure branch in
+    // that case so the verdict drives the final result.
+    let verdict_finalized_run = early_terminated && verdict_detected;
 
     let end_revision = resolve_acceptance_state_revision(
         &start_revision,
@@ -1149,8 +1234,10 @@ pub async fn execute_acceptance_in_workspace(
     let parse_result = parse_acceptance_output(&full_stdout);
     let tail_findings = build_acceptance_tail_findings(stdout_tail.clone(), stderr_tail.clone());
 
-    // Check if command failed
-    if !status.success() {
+    // Check if command failed. A verdict-finalized run was terminated by us
+    // after the canonical verdict, so the non-zero exit is expected and the
+    // verdict drives the final result.
+    if !status.success() && !verdict_finalized_run {
         let error_msg = format!(
             "Acceptance command failed with exit code: {:?}",
             status.code()

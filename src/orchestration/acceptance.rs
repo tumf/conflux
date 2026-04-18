@@ -136,6 +136,7 @@ where
     // Stream output until channel closes or acceptance marker detected + grace period
     let mut marker_detected = false;
     let mut marker_deadline: Option<tokio::time::Instant> = None;
+    let mut early_terminated = false;
 
     loop {
         let recv_future = output_rx.recv();
@@ -152,6 +153,7 @@ where
                         change.id
                     );
                     let _ = child.terminate();
+                    early_terminated = true;
                     break;
                 }
             }
@@ -178,24 +180,19 @@ where
                 full_stdout.push('\n');
                 output.on_stdout(&s);
 
-                // Detect acceptance marker in stdout to start grace period.
-                // This prevents indefinite blocking when the agent process
-                // does not exit after emitting the acceptance verdict.
-                if !marker_detected {
-                    let normalized = crate::acceptance::strip_markdown_decorations(s.trim());
-                    if normalized.starts_with("ACCEPTANCE: PASS")
-                        || normalized.starts_with("ACCEPTANCE: FAIL")
-                        || normalized.starts_with("ACCEPTANCE: CONTINUE")
-                        || normalized.starts_with("ACCEPTANCE: BLOCKED")
-                    {
-                        marker_detected = true;
-                        marker_deadline = Some(tokio::time::Instant::now() + MARKER_GRACE_PERIOD);
-                        info!(
-                            "Acceptance marker detected for {}, starting {}s grace period",
-                            change.id,
-                            MARKER_GRACE_PERIOD.as_secs()
-                        );
-                    }
+                // Detect a canonical standalone verdict in stdout to start the
+                // grace period. This prevents indefinite blocking when the
+                // agent process does not exit after emitting the verdict.
+                // Strict canonical matching ensures malformed verdicts (e.g.
+                // "ACCEPTANCE: PASSAll ...") do not trigger early completion.
+                if !marker_detected && crate::acceptance::canonical_verdict_kind(&s).is_some() {
+                    marker_detected = true;
+                    marker_deadline = Some(tokio::time::Instant::now() + MARKER_GRACE_PERIOD);
+                    info!(
+                        "Acceptance canonical verdict detected for {}, starting {}s grace period",
+                        change.id,
+                        MARKER_GRACE_PERIOD.as_secs()
+                    );
                 }
             }
             OutputLine::Stderr(s) => {
@@ -220,8 +217,13 @@ where
     // Build tail findings for history recording (last N lines, used in AcceptanceAttempt).
     let tail_findings = build_acceptance_tail_findings(stdout_tail.clone(), stderr_tail.clone());
 
-    // Check if command failed
-    if !status.success() {
+    // A verdict-finalized run is one we terminated after observing the
+    // canonical standalone verdict. The non-zero exit from termination is
+    // expected — the verdict drives the final result.
+    let verdict_finalized_run = early_terminated && marker_detected;
+
+    // Check if command failed (skip when verdict already finalized).
+    if !status.success() && !verdict_finalized_run {
         let error_msg = format!(
             "Acceptance command failed with exit code: {:?}",
             status.code()

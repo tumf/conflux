@@ -78,6 +78,16 @@ Output format (output exactly ONCE at the end):
 CRITICAL formatting rule: The verdict marker (e.g. "ACCEPTANCE: PASS") MUST be on its own line
 with NOTHING else on that line. Do NOT wrap the marker in any markdown formatting.
 
+This canonical standalone-line contract is owned by THIS command template.
+The runtime parser enforces the contract strictly: any verdict line that does
+not equal one of `ACCEPTANCE: PASS|FAIL|CONTINUE|BLOCKED` exactly (after
+stripping defensively-tolerated bold/italic/heading/blockquote/bullet
+prefixes) is rejected and treated as if no verdict was emitted, which forces
+acceptance to retry. The runtime also finalizes acceptance the moment a
+canonical standalone verdict line is observed in stdout, so emitting the
+verdict immediately ends acceptance even if the agent process keeps stdout
+open afterwards.
+
 Forbidden wrappings (will cause parser failures or unintended fallback):
 - NO markdown headings: "## ACCEPTANCE: PASS" is WRONG
 - NO blockquotes: "> ACCEPTANCE: PASS" is WRONG
@@ -85,6 +95,7 @@ Forbidden wrappings (will cause parser failures or unintended fallback):
 - NO bold/italic: "**ACCEPTANCE: PASS**" is WRONG
 - NO code fences: wrapping in ``` blocks is WRONG
 - NO trailing text: "ACCEPTANCE: PASSAll criteria verified" is WRONG
+- NO heading concatenation: "ACCEPTANCE: PASS## Acceptance Review Summary" is WRONG
 
 Correct output: "ACCEPTANCE: PASS" alone on its own line, followed by a newline.
 

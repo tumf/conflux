@@ -116,48 +116,32 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 - **THEN** it SHALL return the last 5 lines prefixed with a line count indicator
 
 ### Requirement: Parallel execution acceptance loop
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
-The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
-When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
-**Acceptance state persistence**: Acceptance results are NOT persisted to disk or git commits. Therefore, on resume:
-- If workspace state is `Applying` or `Created`: Normal apply+acceptance loop proceeds
-- If workspace state is `Applied`: Acceptance MUST be re-run before archive
-- If workspace state is `Archiving` (archive files moved but not committed): Acceptance MUST be re-run before archive commit
-- If workspace state is `Archived` or `Merged`: Acceptance is not required (archive already complete)
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-This ensures quality gates are always enforced, even after interruptions.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
-- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
-- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
-- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
-- Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
-- Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
-- Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
-- If acceptance output is BLOCKED, the orchestrator MUST stop apply retries for the change and preserve the workspace for manual follow-up.
-- If acceptance output is BLOCKED, the change MUST be recorded as a terminal failure for dependency skipping in the current run.
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-#### Scenario: Parallel acceptance retry narrows to updated files and prior findings
-- **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **AND** acceptance output indicates CONTINUE
-- **WHEN** the orchestrator runs a subsequent acceptance attempt for the same change
-- **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
-- **AND** the acceptance prompt includes the prior acceptance findings for verification
-- **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-#### Scenario: Parallel acceptance failure logging uses tail lines
-- **GIVEN** acceptance output tail includes `ACCEPTANCE: FAIL` and `FINDINGS:` lines
-- **WHEN** the orchestrator records the acceptance failure
-- **THEN** the recorded findings exclude the acceptance markers and `FINDINGS:` header
-- **AND** logs do not report "N findings" based on tail line count
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-#### Scenario: Acceptance blocked preserves workspace and stops apply
-- **GIVEN** acceptance output indicates `ACCEPTANCE: BLOCKED`
-- **WHEN** the orchestrator processes the acceptance result
-- **THEN** the workspace is preserved for manual follow-up
-- **AND** apply retries for the change are stopped in the current run
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
+
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
+
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -1301,68 +1285,32 @@ When parallel merge verification runs after archive completion, a change that is
 **And** the system does not emit a merge verification error based only on missing merge commit subject
 
 ### Requirement: Parallel execution acceptance loop
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
-The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
-When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
 
-**Acceptance state persistence**: Acceptance results are NOT persisted to disk or git commits. Therefore, on resume:
-- If workspace state is `Applying` or `Created`: Normal apply+acceptance loop proceeds
-- If workspace state is `Applied`: Acceptance MUST be re-run before archive
-- If workspace state is `Archiving` (archive files moved but not committed): Acceptance MUST be re-run before archive commit
-- If workspace state is `Archived` or `Merged`: Acceptance is not required (archive already complete)
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-This ensures quality gates are always enforced, even after interruptions.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
-- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
-- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
-- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
-- Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
-- Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
-- Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
-- If acceptance output is BLOCKED, the orchestrator MUST stop apply retries for the change and preserve the workspace for manual follow-up.
-- If acceptance output is BLOCKED, the change MUST be recorded as a terminal failure for dependency skipping in the current run.
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-**Archive commit creation**: When `ensure_archive_commit()` detects a dirty working tree after the archive command, it SHALL first attempt a direct `git add -A && git commit` with message `"Archive: {change_id}"` without invoking the AI resolve command. If the direct commit succeeds and `is_archive_commit_complete()` returns true, the archive commit is considered finalized. If the direct commit fails (e.g., due to pre-commit hooks modifying files or rejecting the commit), the system SHALL fall back to the AI resolve command for recovery.
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-#### Scenario: Parallel acceptance retry narrows to updated files and prior findings
-- **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **AND** acceptance output indicates CONTINUE
-- **WHEN** the orchestrator runs a subsequent acceptance attempt for the same change
-- **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
-- **AND** the acceptance prompt includes the prior acceptance findings for verification
-- **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-#### Scenario: Parallel acceptance failure logging uses tail lines
-- **GIVEN** acceptance output tail includes `ACCEPTANCE: FAIL` and `FINDINGS:` lines
-- **WHEN** the orchestrator records the acceptance failure
-- **THEN** the recorded findings exclude the acceptance markers and `FINDINGS:` header
-- **AND** logs do not report "N findings" based on tail line count
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
-#### Scenario: Acceptance blocked preserves workspace and stops apply
-- **GIVEN** acceptance output indicates `ACCEPTANCE: BLOCKED`
-- **WHEN** the orchestrator processes the acceptance result
-- **THEN** the workspace is preserved for manual follow-up
-- **AND** apply retries for the change are stopped in the current run
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
 
-#### Scenario: Direct archive commit succeeds without AI resolve
-- **GIVEN** a change has been archived (files moved to archive directory)
-- **AND** the working tree is dirty with uncommitted archive changes
-- **WHEN** `ensure_archive_commit()` is called
-- **THEN** the system executes `git add -A && git commit -m "Archive: {change_id}"` directly
-- **AND** the AI resolve command is NOT invoked
-- **AND** `is_archive_commit_complete()` returns true
-
-#### Scenario: Direct archive commit fails and falls back to AI resolve
-- **GIVEN** a change has been archived (files moved to archive directory)
-- **AND** the working tree is dirty with uncommitted archive changes
-- **AND** a pre-commit hook rejects or modifies the commit
-- **WHEN** `ensure_archive_commit()` attempts the direct commit
-- **AND** the direct commit fails (non-zero exit code)
-- **THEN** the system logs a warning about the direct commit failure
-- **AND** the system falls back to the AI resolve command
-- **AND** the AI resolve command attempts to finalize the archive commit
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -1563,76 +1511,32 @@ ParallelRunService SHALL treat a confirmed blocked verdict as a terminal rejecti
 - **AND** the remaining worktree-only files are discarded with worktree cleanup
 
 ### Requirement: Parallel execution acceptance loop
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
-The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
-When resuming a workspace that has not completed archive, the orchestrator SHALL determine the next non-terminal step from the worktree state and MUST NOT start archive directly.
 
-**Acceptance state persistence**: Acceptance results are NOT persisted to disk or git commits. Therefore, on resume:
-- If the resumed worktree is terminal (`Archived`, `Merged`, or rejected): apply/acceptance are not required.
-- If the resumed worktree is non-terminal and its worktree-local `tasks.md` progress is 100%: acceptance MUST be re-run before archive.
-- If the resumed worktree is non-terminal and its worktree-local `tasks.md` progress is below 100% or unavailable: the orchestrator MUST resume with apply instead of archive.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-This ensures quality gates are always enforced, even after interruptions.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
-- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
-- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
-- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
-- Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
-- Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
-- Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
-- If acceptance output is BLOCKED, the orchestrator MUST stop apply retries for the change and preserve the workspace for manual follow-up.
-- If acceptance output is BLOCKED, the change MUST be recorded as a terminal failure for dependency skipping in the current run.
-- Before allowing archive to start, acceptance MUST verify that the workspace is ready for a real final archive commit under the repository's final-commit quality gates (SHALL). If those readiness checks fail, acceptance MUST return a non-pass verdict and record the blocking gate or command context instead of allowing archive to surface the failure later (MUST).
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-#### Scenario: Parallel acceptance retry narrows to updated files and prior findings
-- **GIVEN** a change completes an apply iteration successfully in parallel mode
-- **AND** acceptance output indicates CONTINUE
-- **WHEN** the orchestrator runs a subsequent acceptance attempt for the same change
-- **THEN** the acceptance prompt includes only the updated file list since the previous acceptance attempt (no diff content)
-- **AND** the acceptance prompt includes the prior acceptance findings for verification
-- **AND** the acceptance prompt instructs the agent to read files as needed to confirm fixes
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-#### Scenario: Parallel acceptance failure logging uses tail lines
-- **GIVEN** acceptance output tail includes `ACCEPTANCE: FAIL` and `FINDINGS:` lines
-- **WHEN** the orchestrator records the acceptance failure
-- **THEN** the recorded findings exclude the acceptance markers and `FINDINGS:` header
-- **AND** logs do not report "N findings" based on tail line count
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-#### Scenario: Acceptance blocked preserves workspace and stops apply
-- **GIVEN** acceptance output indicates `ACCEPTANCE: BLOCKED`
-- **WHEN** the orchestrator processes the acceptance result
-- **THEN** the workspace is preserved for manual follow-up
-- **AND** apply retries for the change are stopped in the current run
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
-#### Scenario: Acceptance catches archive-readiness blocker before archive
-- **GIVEN** apply has produced a workspace that appears functionally complete
-- **AND** the final archive commit would be rejected by a repository quality gate such as a pre-commit hook, formatting check, lint check, or test gate
-- **WHEN** acceptance evaluates archive-readiness
-- **THEN** acceptance returns a non-pass verdict before archive starts
-- **AND** acceptance findings identify the blocking gate or command context so the failure is actionable
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
 
-#### Scenario: Acceptance passes archive-ready workspace to archive
-- **GIVEN** apply has produced a workspace with no unresolved acceptance findings
-- **AND** the workspace satisfies the repository's final-commit quality gates for archive
-- **WHEN** acceptance completes
-- **THEN** the change may proceed to archive
-- **AND** archive remains responsible for executing and verifying the final archive commit
-
-#### Scenario: Resumed worktree with incomplete tasks returns to apply
-- **GIVEN** a parallel-mode worktree is resumed and has not completed archive
-- **AND** the worktree-local `openspec/changes/{change_id}/tasks.md` progress is below 100%
-- **WHEN** the orchestrator chooses the next step for the resumed change
-- **THEN** it resumes with apply
-- **AND** it does not start archive directly
-
-#### Scenario: Resumed worktree with complete tasks returns to acceptance
-- **GIVEN** a parallel-mode worktree is resumed and has not completed archive
-- **AND** the worktree-local task progress for the change is 100%
-- **WHEN** the orchestrator chooses the next step for the resumed change
-- **THEN** it resumes with acceptance
-- **AND** archive starts only after that acceptance pass succeeds
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -1784,88 +1688,59 @@ Parallel execution SHALL restore a non-terminal workspace containing `openspec/c
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
-The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
-When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-Parallel execution MUST persist enough workspace-local acceptance state to distinguish `pending`, `running`, `passed`, and non-pass terminal outcomes for the latest apply revision.
-Archive MUST NOT start unless the latest acceptance state for the current workspace revision is durably recorded as `passed`.
-If the orchestrator restarts after acceptance started but before a final verdict is recorded, the resumed workspace MUST treat that acceptance attempt as incomplete and MUST rerun acceptance before archive.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-#### Scenario: Interrupted acceptance is rerun before archive on resume
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-- **GIVEN** a parallel workspace has completed apply and tasks are 100% complete
-- **AND** the orchestrator recorded acceptance as `running`
-- **AND** the process stopped before recording `ACCEPTANCE: PASS` or `ACCEPTANCE: FAIL`
-- **WHEN** the workspace is resumed
-- **THEN** the orchestrator reruns acceptance before archive
-- **AND** it MUST NOT start archive from the interrupted acceptance state
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-#### Scenario: Applied workspace without durable acceptance pass cannot archive
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-- **GIVEN** a resumed parallel workspace is detected as `Applied`
-- **AND** tasks are complete
-- **AND** the latest durable acceptance state is `pending`, `running`, or `failed`
-- **WHEN** resume routing is evaluated
-- **THEN** the workspace is routed to acceptance
-- **AND** archive is not started
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
-#### Scenario: Archiving workspace without durable acceptance pass falls back to acceptance
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
 
-- **GIVEN** a resumed parallel workspace is detected as `Archiving`
-- **AND** archive files exist in the worktree
-- **AND** the latest durable acceptance state for the current revision is not `passed`
-- **WHEN** the orchestrator evaluates whether to continue archive
-- **THEN** it MUST NOT run archive
-- **AND** it reruns acceptance first
-
-#### Scenario: Archive guard rejects missing acceptance pass for current revision
-
-- **GIVEN** a parallel workspace is about to start archive
-- **AND** tasks are complete
-- **AND** no durable acceptance `passed` state exists for the current workspace revision
-- **WHEN** archive preconditions are checked
-- **THEN** the archive command is not executed
-- **AND** the orchestrator logs that acceptance must be rerun before archive
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
-The acceptance prompt MUST include a hardcoded acceptance prompt followed by configured `acceptance_prompt`.
-When resuming a workspace that has not completed archive, the orchestrator SHALL re-run acceptance before starting archive, even if tasks are already complete.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-Parallel execution MUST persist enough workspace-local acceptance state to distinguish `pending`, `running`, `passed`, and non-pass terminal outcomes for the latest apply revision.
-Archive MUST NOT start unless the latest acceptance state for the current workspace revision is durably recorded as `passed`.
-If the orchestrator restarts after acceptance started but before a final verdict is recorded, the resumed workspace MUST treat that acceptance attempt as incomplete and MUST rerun acceptance before archive.
-For implementation changes, resumed workspaces with unchecked task items in `tasks.md` MUST be routed back to apply before acceptance or archive routing is considered. The task completeness scope used by resume routing MUST match the scope used by the archive guard to prevent routing-guard mismatches.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-#### Scenario: Incomplete implementation tasks force Apply on resume
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-- **GIVEN** a resumed workspace belongs to an implementation change
-- **AND** `tasks.md` still contains unchecked task items (in any section counted by the archive guard)
-- **WHEN** resume routing is evaluated
-- **THEN** the workspace is routed to apply
-- **AND** it is not routed to acceptance
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-#### Scenario: Unchecked items in follow-up sections also force Apply on resume
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-- **GIVEN** a resumed workspace belongs to an implementation change
-- **AND** all items under `## Implementation Tasks` are complete
-- **AND** `tasks.md` contains unchecked items under `## Acceptance #N Failure Follow-up` or similar non-Future-Work sections
-- **WHEN** resume routing is evaluated
-- **THEN** the workspace is routed to apply
-- **AND** it is not routed to acceptance
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
-#### Scenario: Completed tasks keep existing acceptance routing
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
 
-- **GIVEN** a resumed workspace belongs to an implementation change
-- **AND** all task items in `tasks.md` (excluding `## Future Work`) are complete
-- **AND** the latest durable acceptance state is `pending`, `running`, or `failed`
-- **WHEN** resume routing is evaluated
-- **THEN** the workspace is routed to acceptance
-- **AND** archive is not started
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1988,40 +1863,29 @@ parallel mode で Conflux-managed isolated worktree 上の apply がタスク完
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When resuming a workspace that has not completed archive, the orchestrator SHALL route `Applied` or `Archiving` workspaces without a durable acceptance `passed` state for the current revision back to acceptance before archive. A resume cycle that selects `ResumeAction::Acceptance` MUST NOT hand off to archive unless acceptance for the current revision has returned `Pass` or an equivalent durable acceptance-pass record has been confirmed during that cycle.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-A durable acceptance state of `failed`, `running`, `pending`, or missing for the current revision MUST be treated as not archive-ready. Archive guardrails MAY reject such a workspace as a final defense, but dispatch control flow MUST prevent archive entry before that guard is reached.
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-#### Scenario: Applied workspace with failed durable state reruns acceptance before archive
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-- **GIVEN** a resumed parallel workspace is detected as `Applied`
-- **AND** the current revision has a durable acceptance state of `failed`
-- **WHEN** resume routing is evaluated
-- **THEN** the workspace is routed to acceptance
-- **AND** archive is not started for that cycle
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-#### Scenario: Applied workspace with missing durable pass does not hand off to archive
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
-- **GIVEN** a resumed parallel workspace is detected as `Applied`
-- **AND** no durable acceptance `passed` state exists for the current revision
-- **WHEN** the orchestrator resumes execution
-- **THEN** acceptance is executed for that revision
-- **AND** archive is not entered until acceptance returns `Pass`
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
 
-#### Scenario: Applied workspace with durable pass can continue archive
-
-- **GIVEN** a resumed parallel workspace is detected as `Applied`
-- **AND** a durable acceptance `passed` state exists for the current revision
-- **WHEN** resume routing is evaluated
-- **THEN** the workspace may continue to archive
-- **AND** acceptance may be skipped for that cycle
-
-#### Scenario: Resume log and executed phase stay consistent
-
-- **GIVEN** the orchestrator logs `state=Applied -> Acceptance` for a resumed workspace
-- **WHEN** that resume cycle begins execution
-- **THEN** acceptance execution is started in the same cycle
-- **AND** archive is not attempted before acceptance completion
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
 ### Requirement: Durable acceptance state gates archive on the current revision
 
@@ -2087,50 +1951,28 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace.
-The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
-The acceptance prompt MUST include the configured acceptance prompt context required for the current change and revision.
-When resuming a workspace that has not completed archive, the orchestrator SHALL determine the next non-terminal step from the worktree state and MUST NOT start archive directly.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-**Acceptance state persistence**: Acceptance results are NOT persisted to disk or git commits. Therefore, on resume:
-- If the resumed worktree is terminal (`Archived`, `Merged`, or rejected): apply/acceptance are not required.
-- If the resumed worktree is non-terminal and its worktree-local `tasks.md` progress is 100%: acceptance MUST be re-run before archive.
-- If the resumed worktree is non-terminal and its worktree-local `tasks.md` progress is below 100% or unavailable: the orchestrator MUST resume with apply instead of archive.
+When a canonical standalone acceptance verdict line has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. The runtime MUST NOT allow malformed trailing-text verdict strings such as `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` to satisfy the canonical PASS condition.
 
-This ensures archive handoff guardrails are always enforced, even after interruptions.
+#### Scenario: standalone PASS completes acceptance before process stall timeout
 
-- The second and later acceptance attempts MUST focus on the updated file list since the previous acceptance attempt and the previously reported findings, rather than performing a full re-check.
-- The acceptance prompt for second and later attempts MUST include the updated file list (file paths only) since the previous acceptance attempt.
-- The acceptance prompt for second and later attempts MUST include the previous acceptance findings and instruct the agent to verify whether those findings are resolved.
-- The acceptance prompt for second and later attempts MUST instruct the agent to read relevant files as needed; it MUST NOT include diff content.
-- Acceptance failures SHALL record findings using stdout/stderr tail lines without parsing `FINDINGS:` structure.
-- Acceptance findings MUST exclude `ACCEPTANCE:` markers and the `FINDINGS:` header line from the recorded tail lines.
-- Acceptance FAIL logs MUST NOT label tail line counts as "findings"; if counts are shown, they MUST be labeled as tail lines.
-- If acceptance output is BLOCKED, the orchestrator MUST stop apply retries for the change and preserve the workspace for manual follow-up.
-- If acceptance output is BLOCKED, the change MUST be recorded as a terminal failure for dependency skipping in the current run.
-- Before allowing archive to start, acceptance MUST verify that the workspace is ready for the real final archive commit under the target repository's actual commit path (SHALL). If those readiness checks fail, acceptance MUST return a non-pass verdict and record the blocking commit-path context instead of allowing archive to surface the failure later (MUST).
-- Acceptance MUST NOT assume that pre-commit hooks, tests, linters, or formatters exist in every repository (MUST NOT).
-- Acceptance MAY treat a hook, command, or other gate as relevant only when it actually blocks the archive commit path for the current repository (MAY).
+- **GIVEN** an acceptance command emits a standalone line exactly equal to `ACCEPTANCE: PASS`
+- **AND** the child process continues running without producing further useful output
+- **WHEN** the runtime processes streaming stdout for that acceptance execution
+- **THEN** the acceptance result is finalized as PASS for the current revision
+- **AND** archive handoff may proceed without waiting for inactivity timeout
 
-#### Scenario: Acceptance catches archive commit-path blocker before archive
+#### Scenario: trailing-text PASS does not satisfy canonical verdict
 
-- **GIVEN** apply has produced a workspace that appears functionally complete
-- **AND** the final archive commit would be rejected by an actual blocker on the repository's commit path
-- **WHEN** acceptance evaluates archive-readiness
-- **THEN** acceptance returns a non-pass verdict before archive starts
-- **AND** acceptance findings identify the blocking commit-path context so the failure is actionable
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASSAll checks completed`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance
 
-#### Scenario: Acceptance does not invent repo-wide toolchain gates
+#### Scenario: heading-concatenated PASS does not satisfy canonical verdict
 
-- **GIVEN** a repository does not define test, lint, format, or pre-commit execution as part of the actual archive commit path
-- **WHEN** acceptance evaluates archive-readiness
-- **THEN** acceptance does not fail merely because such gates are absent or not independently run
-- **AND** archive-readiness remains centered on whether the archive commit can succeed
-
-#### Scenario: Acceptance passes archive-ready workspace to archive
-
-- **GIVEN** apply has produced a workspace with no unresolved acceptance findings
-- **AND** the workspace satisfies the repository's actual final-commit path for archive
-- **WHEN** acceptance completes
-- **THEN** the change may proceed to archive
-- **AND** archive remains responsible for executing and verifying the final archive commit
+- **GIVEN** an acceptance command emits `ACCEPTANCE: PASS## Acceptance Review Summary`
+- **WHEN** the runtime evaluates canonical acceptance verdicts
+- **THEN** that line is not treated as a canonical PASS verdict
+- **AND** the runtime requires a valid standalone verdict or another terminal outcome before completing acceptance

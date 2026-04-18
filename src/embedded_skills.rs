@@ -304,4 +304,25 @@ mod tests {
             "cflx-workflow SKILL.md must include verdict formatting prohibition"
         );
     }
+
+    #[test]
+    fn test_cflx_workflow_reference_documents_strict_canonical_contract() {
+        // The runtime parser enforces standalone-line canonical matching and
+        // rejects trailing-text/heading-concatenation verdicts. The embedded
+        // workflow reference MUST document both the trailing-text rejection
+        // example and the heading-concatenation rejection example so agents
+        // are warned about the failure modes that drove this contract.
+        for required in &[
+            "NO trailing text",
+            "PASSAll",
+            "NO heading concatenation",
+            "PASS## Acceptance Review Summary",
+        ] {
+            assert!(
+                CFLX_WORKFLOW_REF_ACCEPT.contains(required),
+                "cflx-workflow references/cflx-accept.md must document '{}'",
+                required
+            );
+        }
+    }
 }
