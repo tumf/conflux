@@ -103,43 +103,27 @@ FINDINGS format requirements:
 
 Output format (output exactly ONCE at the end):
 
-**Primary (REQUIRED)** — emit a strict JSON verdict object as the LAST
-machine-readable payload, as its own line:
-
-- PASS:     `{"acceptance":"pass"}`
-- FAIL:     `{"acceptance":"fail","findings":["<evidence 1>","<evidence 2>"]}`
-- CONTINUE: `{"acceptance":"continue"}`
-- BLOCKED:  `{"acceptance":"blocked"}`
-
-The JSON verdict is the canonical machine-readable contract. For FAIL the
-`findings` array mirrors the FINDINGS section.
-
-**Fallback (backward-compatible)** — older runs still recognize legacy
-standalone plain-text markers on their own line. These remain supported so
-existing runs do not break:
+**Required for current compatibility** — emit exactly ONE legacy standalone
+plain-text verdict marker as the LAST machine-readable payload, as its own
+line:
 
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
 - `ACCEPTANCE: BLOCKED`
 
-When both a JSON verdict and a legacy text marker appear, the JSON verdict
-wins. Prefer the JSON contract.
+Some currently running orchestrators still recognize only the legacy marker
+contract. Do NOT rely on JSON-only verdict output from this worktree until the
+runtime rollout is complete.
 
-CRITICAL formatting rule: The JSON verdict (or the legacy fallback marker)
-MUST be on its own line with NOTHING else on that line. Do NOT wrap it in
-markdown formatting.
+CRITICAL formatting rule: The verdict marker MUST be on its own line with
+NOTHING else on that line. Do NOT wrap it in markdown formatting.
 
-The runtime parser enforces the contract strictly. Any line that is not a
-valid strict JSON verdict object and does not equal one of the legacy
-markers exactly (after stripping defensively-tolerated
-bold/italic/heading/blockquote/bullet prefixes) is rejected and treated as
-if no verdict was emitted, so acceptance will retry. The runtime also
-finalizes acceptance the moment a JSON verdict or a canonical standalone
-text marker is observed in stdout — including when wrapped inside an
-`opencode run --format json` assistant/result event — which means emitting
-the verdict immediately ends acceptance even if the agent process keeps
-stdout open afterwards.
+The runtime parser enforces the contract strictly. Any line that does not equal
+one of the legacy markers exactly (after stripping defensively-tolerated
+bold/italic/heading/blockquote/bullet prefixes) is rejected and treated as if
+no verdict was emitted, so acceptance will retry. The runtime also finalizes
+acceptance the moment a canonical standalone text marker is observed in stdout.
 
 Forbidden wrappings (will cause parser failures or unintended fallback):
 - NO markdown headings: "## ACCEPTANCE: PASS" is WRONG

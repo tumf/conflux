@@ -15,23 +15,19 @@ After a change has been accepted, this skill handles archiving: moving the chang
 
 ## Acceptance Handoff Contract
 
-Archive only runs after acceptance reached PASS. The acceptance verdict is
-resolved by the runtime from the acceptance agent's stdout using the
-following contract:
+Archive only runs after acceptance reached PASS. For current compatibility,
+the acceptance verdict is expected to be resolved from a legacy standalone
+plain-text marker on stdout:
 
-- **Primary**: strict JSON verdict object
-  (`{"acceptance":"pass|fail|continue|blocked", "findings":[...]}`) on its
-  own line, possibly wrapped inside an `opencode run --format json` event
-  payload.
-- **Fallback**: legacy standalone plain-text markers (`ACCEPTANCE: PASS`,
-  `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: BLOCKED`) remain
-  supported so older runs continue to hand off, but JSON wins when both are
-  present.
+- `ACCEPTANCE: PASS`
+- `ACCEPTANCE: FAIL`
+- `ACCEPTANCE: CONTINUE`
+- `ACCEPTANCE: BLOCKED`
 
 Archive MUST NOT redefine or relax this contract. When the upstream
-acceptance verdict is ambiguous (missing JSON, malformed legacy marker), the
-runtime returns CONTINUE and archive does not start — investigate upstream
-acceptance output rather than working around it here.
+acceptance verdict is ambiguous or malformed, the runtime returns CONTINUE and
+archive does not start — investigate upstream acceptance output rather than
+working around it here.
 
 ## Execution Steps
 
