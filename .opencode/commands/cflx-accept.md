@@ -70,37 +70,92 @@ FINDINGS format requirements:
 - Each finding MUST be actionable by the AI agent autonomously
 
 Output format (output exactly ONCE at the end):
-- If valid Implementation Blocker exists: Output "ACCEPTANCE: BLOCKED"
-- If all checks pass: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by FINDINGS and tasks.md update
-- If verification cannot complete in this session: Output "ACCEPTANCE: CONTINUE"
 
-CRITICAL formatting rule: The verdict marker (e.g. "ACCEPTANCE: PASS") MUST be on its own line
-with NOTHING else on that line. Do NOT wrap the marker in any markdown formatting.
+**Primary (REQUIRED)** — emit a strict JSON verdict object as the LAST
+machine-readable payload, as its own line, with NOTHING else on that line:
 
-This canonical standalone-line contract is owned by THIS command template.
-The runtime parser enforces the contract strictly: any verdict line that does
-not equal one of `ACCEPTANCE: PASS|FAIL|CONTINUE|BLOCKED` exactly (after
-stripping defensively-tolerated bold/italic/heading/blockquote/bullet
-prefixes) is rejected and treated as if no verdict was emitted, which forces
-acceptance to retry. The runtime also finalizes acceptance the moment a
-canonical standalone verdict line is observed in stdout, so emitting the
-verdict immediately ends acceptance even if the agent process keeps stdout
-open afterwards.
+- PASS:     `{"acceptance":"pass"}`
+- FAIL:     `{"acceptance":"fail","findings":["<evidence 1>","<evidence 2>"]}`
+- CONTINUE: `{"acceptance":"continue"}`
+- BLOCKED:  `{"acceptance":"blocked"}`
+
+Rules for the JSON verdict:
+
+- It MUST be a valid JSON object on a single line (no pretty-printing).
+- The `acceptance` field value MUST be one of `pass`, `fail`, `continue`,
+  `blocked` (case-insensitive, but lowercase is preferred).
+- For FAIL, `findings` MUST be an array of strings where each entry is a
+  concrete, actionable finding (file path + function/line when applicable).
+- Do NOT wrap the JSON verdict in code fences, markdown, or prose.
+- The runtime finalizes acceptance the moment the JSON verdict line is
+  observed in stdout — including when emitted inside an `opencode run
+  --format json` assistant/result event — so emit it as the final payload.
+
+**Fallback (backward-compatible)** — older runtimes still recognize the
+legacy standalone plain-text markers, which remain supported so existing
+runs do not break:
+
+- `ACCEPTANCE: PASS`
+- `ACCEPTANCE: FAIL`
+- `ACCEPTANCE: CONTINUE`
+- `ACCEPTANCE: BLOCKED`
+
+These legacy markers are fallback only. When both a JSON verdict and a text
+marker appear, the JSON verdict wins. Prefer the JSON contract.
+
+**Transition guidance — emit BOTH during rollout** — until all running
+Conflux orchestrator processes have been rebuilt with the JSON-aware
+acceptance parser, the agent MUST emit BOTH payloads as the final two lines
+of stdout, in this order, each on its own line with no markdown wrapping:
+
+1. The strict JSON verdict (canonical, primary).
+2. The matching legacy plain-text marker (fallback for older runtimes).
+
+Example PASS handoff (last two lines of stdout):
+
+```
+{"acceptance":"pass"}
+ACCEPTANCE: PASS
+```
+
+Newer runtimes will resolve the JSON verdict first and finalize; older
+runtimes that only recognize the legacy marker will still finalize on the
+text line. Once the runtime rollout is complete this transition rule may be
+relaxed to JSON-only, but the canonical contract remains JSON-primary.
+
+CRITICAL formatting rule: The JSON verdict (or the legacy fallback marker)
+MUST be on its own line with NOTHING else on that line. Do NOT wrap it in
+markdown formatting.
+
+This canonical verdict contract is owned by THIS command template. The
+runtime parser enforces the contract strictly:
+
+- Any line that is not a valid strict JSON verdict object and does not equal
+  one of the legacy markers exactly (after stripping defensively-tolerated
+  bold/italic/heading/blockquote/bullet prefixes) is rejected and treated as
+  if no verdict was emitted, which forces acceptance to retry.
 
 Forbidden wrappings (will cause parser failures or unintended fallback):
 - NO markdown headings: "## ACCEPTANCE: PASS" is WRONG
 - NO blockquotes: "> ACCEPTANCE: PASS" is WRONG
 - NO bullets: "- ACCEPTANCE: PASS" is WRONG
 - NO bold/italic: "**ACCEPTANCE: PASS**" is WRONG
-- NO code fences: wrapping in ``` blocks is WRONG
+- NO code fences: wrapping either the JSON verdict or the legacy marker in
+  ``` blocks is WRONG
 - NO trailing text: "ACCEPTANCE: PASSAll criteria verified" is WRONG
-- NO heading concatenation: "ACCEPTANCE: PASS## Acceptance Review Summary" is WRONG
+- NO heading concatenation: "ACCEPTANCE: PASS## Acceptance Review Summary"
+  is WRONG
+- NO multi-line JSON: the verdict JSON MUST fit on a single line
 
-Correct output: "ACCEPTANCE: PASS" alone on its own line, followed by a newline.
+Correct primary output:
+`{"acceptance":"pass"}` alone on its own line, followed by a newline.
+
+Correct fallback output:
+`ACCEPTANCE: PASS` alone on its own line, followed by a newline.
 
 CRITICAL - When outputting FAIL:
-1. List ALL issues discovered in the FINDINGS section
+1. List ALL issues discovered in the FINDINGS section (for human readers) AND
+   include them in the `findings` array of the JSON verdict (for the runtime).
 2. After listing all findings, update openspec/changes/<change_id>/tasks.md:
    - Determine the next acceptance attempt number (check existing "## Acceptance #N Failure Follow-up" sections)
    - Append or create the section for that attempt

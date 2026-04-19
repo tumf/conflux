@@ -4100,3 +4100,97 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
         "malformed trailing-text verdict must not produce durable acceptance-pass state"
     );
 }
+
+/// Regression for `adopt-json-acceptance-verdict`: a malformed trailing-text
+/// PASS previously forced CONTINUE (because the legacy standalone marker
+/// contract was the only accepted verdict). Under the JSON-primary contract,
+/// when the same acceptance run also emits a strict JSON verdict object
+/// (e.g. as the opencode final payload), the runtime MUST finalize acceptance
+/// as PASS and proceed to archive handoff instead of retrying.
+#[tokio::test]
+async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
+    use tempfile::TempDir;
+
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    // Emit the same malformed trailing-text PASS that previously fell through
+    // to CONTINUE, followed by a strict JSON verdict. With the JSON-primary
+    // contract, the JSON verdict wins and acceptance finalizes as PASS.
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(
+            "sh -c 'echo ACCEPTANCE: PASSAll acceptance criteria verified; \
+             echo {\\\"acceptance\\\":\\\"pass\\\"}'"
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("unexpected error");
+
+    assert!(
+        matches!(result, crate::orchestration::AcceptanceResult::Pass),
+        "JSON verdict MUST finalize acceptance as PASS even when preceded by a \
+         malformed trailing-text marker that legacy contract would reject; \
+         got {:?}",
+        result
+    );
+
+    // Durable acceptance state must reflect PASS so archive handoff can proceed
+    // for this revision.
+    let revision = get_current_commit(repo_root.path())
+        .await
+        .or_fail("unexpected error");
+    assert!(
+        crate::parallel::acceptance_state::has_durable_acceptance_pass(repo_root.path(), &revision)
+            .or_fail("unexpected error"),
+        "JSON verdict PASS must be persisted as durable acceptance state for \
+         archive handoff"
+    );
+}

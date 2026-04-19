@@ -1162,9 +1162,12 @@ pub async fn execute_acceptance_in_workspace(
                         .await;
                 }
 
-                // Detect canonical standalone verdict and start grace period.
-                // Strict matching: trailing-text concatenation does NOT count.
-                if !verdict_detected && crate::acceptance::canonical_verdict_kind(&s).is_some() {
+                // Detect canonical verdict and start grace period.
+                // Primary: strict JSON verdict object (standalone or wrapped in
+                // an opencode `--format json` event). Fallback: strict plain-text
+                // standalone canonical marker. Trailing-text concatenation on
+                // the plain-text marker does NOT count.
+                if !verdict_detected && crate::acceptance::detect_verdict_in_line(&s).is_some() {
                     verdict_detected = true;
                     verdict_deadline = Some(tokio::time::Instant::now() + verdict_grace_period);
                     info!(
