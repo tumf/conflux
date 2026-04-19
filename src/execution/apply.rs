@@ -24,8 +24,92 @@ use crate::vcs::{VcsBackend, VcsResult, WorkspaceManager};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Default grace period after observing apply completion (tasks.md complete or
+/// `REJECTED.md` present) before terminating a lingering agent process group.
+const APPLY_COMPLETION_GRACE_DEFAULT_SECS: u64 = 30;
+
+/// Minimum interval between workspace-state re-checks during the apply output
+/// stream. Keeps completion detection bounded even when the agent process keeps
+/// emitting output or holds its pipes open.
+const APPLY_COMPLETION_CHECK_INTERVAL_SECS: u64 = 5;
+
+tokio::task_local! {
+    /// Test-only task-local override for the apply completion grace period.
+    /// Scoped to the calling task so concurrent tests see the default.
+    pub(crate) static APPLY_COMPLETION_GRACE_OVERRIDE_SECS: u64;
+}
+
+tokio::task_local! {
+    /// Test-only task-local override for the apply completion check interval.
+    pub(crate) static APPLY_COMPLETION_CHECK_INTERVAL_OVERRIDE_MS: u64;
+}
+
+/// Returns the grace period applied after detecting apply completion. Tests may
+/// override via [`scoped_apply_completion_grace_secs_for_test`].
+pub(crate) fn apply_completion_grace_period() -> Duration {
+    let secs = APPLY_COMPLETION_GRACE_OVERRIDE_SECS
+        .try_with(|secs| *secs)
+        .ok()
+        .filter(|secs| *secs > 0)
+        .unwrap_or(APPLY_COMPLETION_GRACE_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Returns the interval between workspace-state completion probes.
+pub(crate) fn apply_completion_check_interval() -> Duration {
+    if let Ok(ms) = APPLY_COMPLETION_CHECK_INTERVAL_OVERRIDE_MS.try_with(|ms| *ms) {
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    Duration::from_secs(APPLY_COMPLETION_CHECK_INTERVAL_SECS)
+}
+
+/// Run `fut` with the apply-completion grace period overridden to `secs`.
+/// Scoped to the current task only. Test-only helper.
+#[cfg(test)]
+pub(crate) async fn scoped_apply_completion_grace_secs_for_test<F, R>(secs: u64, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    APPLY_COMPLETION_GRACE_OVERRIDE_SECS.scope(secs, fut).await
+}
+
+/// Run `fut` with the apply-completion check interval overridden to `ms`.
+/// Scoped to the current task only. Test-only helper.
+#[cfg(test)]
+pub(crate) async fn scoped_apply_completion_check_interval_ms_for_test<F, R>(ms: u64, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    APPLY_COMPLETION_CHECK_INTERVAL_OVERRIDE_MS
+        .scope(ms, fut)
+        .await
+}
+
+/// Observed reason apply completion was declared before the child process
+/// terminated naturally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyCompletionKind {
+    /// tasks.md reported all tasks complete.
+    TasksComplete,
+    /// `REJECTED.md` was produced by apply, signalling apply-blocked handoff.
+    BlockedHandoff,
+}
+
+fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
+    if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
+        return Some(ApplyCompletionKind::BlockedHandoff);
+    }
+    match check_task_progress(workspace_path, change_id) {
+        Ok(progress) if is_progress_complete(&progress) => Some(ApplyCompletionKind::TasksComplete),
+        _ => None,
+    }
+}
 
 /// Default maximum iterations for apply loops.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
@@ -731,9 +815,82 @@ where
         // Create output collector for history
         let mut output_collector = OutputCollector::new();
 
-        // Stream output
-        while let Some(line) = rx.recv().await {
-            // Collect output for history
+        // Stream output with apply-completion detection.
+        //
+        // apply commands occasionally keep their stdout/stderr pipes open even
+        // after tasks.md reaches a completion condition (all tasks checked or
+        // `REJECTED.md` produced). Without a grace-period guard, the orchestrator
+        // blocked on `rx.recv()` indefinitely, which previously left the apply
+        // handoff stuck and prevented acceptance from starting. Mirror the
+        // acceptance-verdict grace period: once we observe the completion
+        // condition via workspace state, start a bounded grace timer and
+        // terminate the child when it expires.
+        let grace_period = apply_completion_grace_period();
+        let check_interval = apply_completion_check_interval();
+        let mut completion_kind: Option<ApplyCompletionKind> = None;
+        let mut completion_deadline: Option<tokio::time::Instant> = None;
+        let mut early_terminated = false;
+        let mut next_check_at = tokio::time::Instant::now() + check_interval;
+
+        loop {
+            // Probe workspace state before awaiting the next line so a completion
+            // that lands between output bursts is observed promptly and does not
+            // depend on receiving further stdout/stderr data.
+            if completion_kind.is_none() && tokio::time::Instant::now() >= next_check_at {
+                completion_kind = detect_apply_completion(workspace_path, change_id);
+                next_check_at = tokio::time::Instant::now() + check_interval;
+                if let Some(kind) = completion_kind {
+                    completion_deadline = Some(tokio::time::Instant::now() + grace_period);
+                    info!(
+                        change_id = change_id,
+                        kind = ?kind,
+                        grace_secs = grace_period.as_secs(),
+                        "Apply completion observed; starting grace period before terminating lingering apply child"
+                    );
+                }
+            }
+
+            // Bound the receive so completion detection stays responsive even if
+            // the child floods or stalls the output pipe.
+            let wait_deadline = match completion_deadline {
+                Some(deadline) => deadline,
+                None => next_check_at,
+            };
+
+            let recv_result = tokio::time::timeout_at(wait_deadline, rx.recv()).await;
+
+            match recv_result {
+                Ok(Some(line)) => {
+                    match &line {
+                        OutputLine::Stdout(s) => output_collector.add_stdout(s),
+                        OutputLine::Stderr(s) => output_collector.add_stderr(s),
+                    }
+                    event_handler.on_apply_output(change_id, &line, iteration);
+                    output_handler(line).await;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    if let Some(deadline) = completion_deadline {
+                        if tokio::time::Instant::now() >= deadline {
+                            info!(
+                                change_id = change_id,
+                                kind = ?completion_kind,
+                                grace_secs = grace_period.as_secs(),
+                                "Apply completion grace period expired; terminating lingering apply child"
+                            );
+                            let _ = child.terminate();
+                            early_terminated = true;
+                            break;
+                        }
+                    }
+                    // Periodic wakeup: loop back and re-probe workspace state.
+                }
+            }
+        }
+
+        // Drain any remaining output that arrived after we signalled terminate,
+        // so the history tail reflects what the agent produced before exit.
+        while let Ok(line) = rx.try_recv() {
             match &line {
                 OutputLine::Stdout(s) => output_collector.add_stdout(s),
                 OutputLine::Stderr(s) => output_collector.add_stderr(s),
@@ -742,7 +899,9 @@ where
             output_handler(line).await;
         }
 
-        // Wait for child process
+        // Wait for child process. After an early grace-driven terminate this
+        // returns the signalled exit status, which is success-equivalent only
+        // when we observed a completion condition (see below).
         let status = child.wait().await.map_err(|e| {
             OrchestratorError::AgentCommand(format!(
                 "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
@@ -752,6 +911,13 @@ where
                 e
             ))
         })?;
+
+        // Completion-finalized run: non-zero exit produced by our own terminate
+        // after observing tasks-complete or blocked-handoff. Only this path is
+        // allowed to short-circuit the usual command-failure handling so that
+        // runs which never reached a completion condition are still treated as
+        // failures/retries per existing policy.
+        let completion_finalized_run = early_terminated && completion_kind.is_some();
 
         // Record apply attempt for history
         agent.record_apply_attempt(
@@ -774,7 +940,7 @@ where
             );
         }
 
-        if !status.success() && permission_reject.is_none() {
+        if !status.success() && permission_reject.is_none() && !completion_finalized_run {
             let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
 
             // Run on_error hook
@@ -804,6 +970,20 @@ where
             "After apply #{}: {}/{} tasks complete",
             iteration, new_progress.completed, new_progress.total
         );
+
+        // If apply was finalized via grace-driven terminate because REJECTED.md
+        // appeared, short-circuit immediately so the outer loop does not spawn
+        // another apply child or treat the empty snapshot as a stall. Tasks-
+        // complete runs fall through to the normal post_apply/final-commit path.
+        if completion_finalized_run
+            && matches!(completion_kind, Some(ApplyCompletionKind::BlockedHandoff))
+        {
+            info!(
+                change_id = change_id,
+                "Apply loop exiting for rejecting review handoff after grace-driven terminate"
+            );
+            break false;
+        }
 
         // Permission auto-reject is handled as a soft error.
         // Log the error and continue the loop to give the agent another iteration.
@@ -1294,6 +1474,161 @@ mod tests {
         assert!(
             result.blocked_handoff.is_some(),
             "blocked handoff metadata must be returned"
+        );
+    }
+
+    fn make_test_ai_runner() -> crate::ai_command_runner::AiCommandRunner {
+        let queue_config = crate::command_queue::CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            retry_error_patterns: Vec::new(),
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 0,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: false,
+        };
+        let shared_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        crate::ai_command_runner::AiCommandRunner::new(queue_config, shared_state)
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn test_execute_apply_loop_terminates_lingering_child_after_tasks_complete() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "linger-complete";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        // Apply command: mark tasks complete, then sleep far beyond the test
+        // budget. The grace period must terminate the sleeper.
+        let apply_cmd = "sh -c 'printf \"## Implementation Tasks\\n- [x] one\\n\" > openspec/changes/{change_id}/tasks.md; echo applied; sleep 120'".to_string();
+
+        let config = OrchestratorConfig {
+            apply_command: Some(apply_cmd),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+
+        let start = std::time::Instant::now();
+        let result = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Auto,
+                    None,
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect("apply loop must finish without error despite lingering child");
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "apply loop must exit within grace period + buffer, but took {:?}",
+            elapsed
+        );
+        assert!(
+            result.completed,
+            "tasks-complete run must be reported as completed"
+        );
+        assert!(
+            result.blocked_handoff.is_none(),
+            "tasks-complete run must not report a blocked handoff"
+        );
+        assert_eq!(
+            result.iterations, 1,
+            "tasks-complete grace-terminated run should exit in a single iteration"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn test_execute_apply_loop_terminates_lingering_child_after_blocked_handoff() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "linger-blocked";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        // Apply command: write REJECTED.md then sleep. The apply-blocked
+        // completion condition must trigger the grace period even though
+        // tasks.md remains incomplete.
+        let apply_cmd = "sh -c 'printf \"# REJECTED\\n\\n- change_id: linger-blocked\\n- reason: test\\n\" > openspec/changes/{change_id}/REJECTED.md; echo rejected; sleep 120'".to_string();
+
+        let config = OrchestratorConfig {
+            apply_command: Some(apply_cmd),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+
+        let start = std::time::Instant::now();
+        let result = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Auto,
+                    None,
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect("apply loop must finish without error despite lingering child");
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "blocked-handoff apply loop must exit within grace period + buffer, but took {:?}",
+            elapsed
+        );
+        assert!(
+            !result.completed,
+            "blocked-handoff grace-terminated run must not be reported as completed"
+        );
+        assert!(
+            result.blocked_handoff.is_some(),
+            "blocked-handoff grace-terminated run must expose rejected_path"
+        );
+        assert_eq!(
+            result.iterations, 1,
+            "blocked-handoff grace-terminated run should exit in a single iteration"
         );
     }
 }
