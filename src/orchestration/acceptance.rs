@@ -180,12 +180,15 @@ where
                 full_stdout.push('\n');
                 output.on_stdout(&s);
 
-                // Detect a canonical standalone verdict in stdout to start the
-                // grace period. This prevents indefinite blocking when the
-                // agent process does not exit after emitting the verdict.
-                // Strict canonical matching ensures malformed verdicts (e.g.
-                // "ACCEPTANCE: PASSAll ...") do not trigger early completion.
-                if !marker_detected && crate::acceptance::canonical_verdict_kind(&s).is_some() {
+                // Detect a canonical verdict in stdout to start the grace
+                // period. This prevents indefinite blocking when the agent
+                // process does not exit after emitting the verdict. The
+                // detector recognises the primary strict JSON verdict (as a
+                // standalone line or wrapped in an opencode `--format json`
+                // event) and, as fallback, the legacy standalone plain-text
+                // marker. Malformed markers with trailing text (for example
+                // "ACCEPTANCE: PASSAll ...") do NOT trigger early completion.
+                if !marker_detected && crate::acceptance::detect_verdict_in_line(&s).is_some() {
                     marker_detected = true;
                     marker_deadline = Some(tokio::time::Instant::now() + MARKER_GRACE_PERIOD);
                     info!(

@@ -102,22 +102,44 @@ FINDINGS format requirements:
 - If the problem is false completion, the finding MUST explicitly name the task/checklist claim that is unsupported
 
 Output format (output exactly ONCE at the end):
-- If valid Implementation Blocker exists: Output "ACCEPTANCE: BLOCKED"
-- If all checks pass: Output "ACCEPTANCE: PASS"
-- If checks fail: Output "ACCEPTANCE: FAIL" followed by FINDINGS and tasks.md update
-- If verification cannot complete in this session: Output "ACCEPTANCE: CONTINUE"
 
-CRITICAL formatting rule: The verdict marker (e.g. "ACCEPTANCE: PASS") MUST be on its own line
-with NOTHING else on that line. Do NOT wrap the marker in any markdown formatting.
+**Primary (REQUIRED)** — emit a strict JSON verdict object as the LAST
+machine-readable payload, as its own line:
 
-The runtime parser enforces this canonical contract strictly. Any verdict line
-that does not equal one of `ACCEPTANCE: PASS|FAIL|CONTINUE|BLOCKED` exactly
-(after stripping defensively-tolerated bold/italic/heading/blockquote/bullet
-prefixes) is rejected and treated as if no verdict was emitted, so acceptance
-will retry. The runtime also finalizes acceptance the moment a canonical
-standalone verdict line is observed in stdout, which means emitting the
-verdict immediately ends acceptance even if the agent process keeps stdout
-open afterwards.
+- PASS:     `{"acceptance":"pass"}`
+- FAIL:     `{"acceptance":"fail","findings":["<evidence 1>","<evidence 2>"]}`
+- CONTINUE: `{"acceptance":"continue"}`
+- BLOCKED:  `{"acceptance":"blocked"}`
+
+The JSON verdict is the canonical machine-readable contract. For FAIL the
+`findings` array mirrors the FINDINGS section.
+
+**Fallback (backward-compatible)** — older runs still recognize legacy
+standalone plain-text markers on their own line. These remain supported so
+existing runs do not break:
+
+- `ACCEPTANCE: PASS`
+- `ACCEPTANCE: FAIL`
+- `ACCEPTANCE: CONTINUE`
+- `ACCEPTANCE: BLOCKED`
+
+When both a JSON verdict and a legacy text marker appear, the JSON verdict
+wins. Prefer the JSON contract.
+
+CRITICAL formatting rule: The JSON verdict (or the legacy fallback marker)
+MUST be on its own line with NOTHING else on that line. Do NOT wrap it in
+markdown formatting.
+
+The runtime parser enforces the contract strictly. Any line that is not a
+valid strict JSON verdict object and does not equal one of the legacy
+markers exactly (after stripping defensively-tolerated
+bold/italic/heading/blockquote/bullet prefixes) is rejected and treated as
+if no verdict was emitted, so acceptance will retry. The runtime also
+finalizes acceptance the moment a JSON verdict or a canonical standalone
+text marker is observed in stdout — including when wrapped inside an
+`opencode run --format json` assistant/result event — which means emitting
+the verdict immediately ends acceptance even if the agent process keeps
+stdout open afterwards.
 
 Forbidden wrappings (will cause parser failures or unintended fallback):
 - NO markdown headings: "## ACCEPTANCE: PASS" is WRONG

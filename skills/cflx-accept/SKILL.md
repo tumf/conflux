@@ -19,7 +19,38 @@ This skill does NOT replace the command template. It supplements the orchestrato
 
 - **Mode**: Acceptance review
 - **Goal**: Verify implementation meets specifications with automated checks
-- **Output**: Exactly ONE verdict marker (PASS / FAIL / CONTINUE / BLOCKED)
+- **Output**: Exactly ONE machine-readable verdict at the end
+
+## Verdict Output Contract
+
+**Primary (preferred)** — emit a strict JSON verdict object as the final
+machine-readable payload, on its own line:
+
+- PASS:     `{"acceptance":"pass"}`
+- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
+- CONTINUE: `{"acceptance":"continue"}`
+- BLOCKED:  `{"acceptance":"blocked"}`
+
+The JSON verdict is the canonical machine-readable contract. The runtime
+parser resolves it with priority over the legacy plain-text marker, including
+when the JSON verdict is wrapped inside an `opencode run --format json`
+assistant/result event payload (the runtime unwraps the text and matches the
+JSON verdict inside it).
+
+**Fallback (backward-compatible)** — older runs still recognize the legacy
+standalone plain-text markers on their own line:
+
+- `ACCEPTANCE: PASS`
+- `ACCEPTANCE: FAIL`
+- `ACCEPTANCE: CONTINUE`
+- `ACCEPTANCE: BLOCKED`
+
+These markers are kept as a fallback so existing runs do not break. New
+acceptance runs SHOULD emit the JSON verdict; when both appear, JSON wins.
+
+The full verdict contract (forbidden wrappings, findings format, retry
+semantics) is owned by `.opencode/commands/cflx-accept.md`; this skill MUST
+NOT redefine it.
 
 ## Scoped Guidance
 

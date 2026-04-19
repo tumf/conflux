@@ -2,6 +2,19 @@
 //!
 //! This module provides functions to parse acceptance test output
 //! and determine pass/fail status with findings.
+//!
+//! Verdict contract (post `adopt-json-acceptance-verdict`):
+//!
+//! - **Primary**: a strict JSON verdict object of the form
+//!   `{"acceptance":"pass|fail|continue|blocked","findings":[...]}` emitted as
+//!   the final machine-readable verdict payload. JSON verdicts may appear
+//!   directly as a line on stdout, or wrapped inside an
+//!   `opencode run --format json` event (assistant / result / stream_event
+//!   text payloads). In either case the runtime unwraps the payload and
+//!   evaluates the JSON verdict.
+//! - **Fallback**: legacy plain-text standalone verdict markers of the form
+//!   `ACCEPTANCE: PASS|FAIL|CONTINUE|BLOCKED` remain supported for backward
+//!   compatibility, but JSON takes priority whenever both are present.
 
 /// Result of parsing acceptance output
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,17 +29,91 @@ pub enum AcceptanceResult {
     Blocked,
 }
 
-/// Canonical verdict variants. The runtime requires an unwrapped standalone
-/// line that exactly equals one of these markers (after stripping tolerated
-/// markdown decorations). Trailing text concatenation such as
-/// `ACCEPTANCE: PASSAll ...` or `ACCEPTANCE: PASS## ...` does NOT satisfy the
-/// canonical contract and falls through to the CONTINUE fallback.
+/// Canonical plain-text verdict variants. These remain supported as a
+/// backward-compatible fallback when no JSON verdict object is present.
+///
+/// The runtime requires an unwrapped standalone line that exactly equals one
+/// of these markers (after stripping tolerated markdown decorations).
+/// Trailing-text concatenation such as `ACCEPTANCE: PASSAll ...` or
+/// `ACCEPTANCE: PASS## ...` does NOT satisfy the fallback contract and falls
+/// through to the CONTINUE default.
 pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
     ("ACCEPTANCE: PASS", "pass"),
     ("ACCEPTANCE: FAIL", "fail"),
     ("ACCEPTANCE: CONTINUE", "continue"),
     ("ACCEPTANCE: BLOCKED", "blocked"),
 ];
+
+/// Attempt to parse a single line/text payload as a strict JSON acceptance
+/// verdict object. Returns `Some((kind, findings))` when the trimmed content is
+/// a JSON object with an `acceptance` field equal to one of
+/// `pass`/`fail`/`continue`/`blocked` (case-insensitive).
+///
+/// Accepted shapes:
+///
+/// ```json
+/// {"acceptance":"pass"}
+/// {"acceptance":"fail","findings":["src/foo.rs:10 issue"]}
+/// ```
+pub(crate) fn parse_json_verdict(text: &str) -> Option<(&'static str, Vec<String>)> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let obj = value.as_object()?;
+    let raw_kind = obj.get("acceptance")?.as_str()?;
+    let kind = match raw_kind.trim().to_ascii_lowercase().as_str() {
+        "pass" => "pass",
+        "fail" => "fail",
+        "continue" => "continue",
+        "blocked" => "blocked",
+        _ => return None,
+    };
+    let findings = obj
+        .get("findings")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some((kind, findings))
+}
+
+/// Detect a canonical verdict kind in a single output line.
+///
+/// Preference order:
+///
+/// 1. Strict JSON verdict object on the line itself (primary contract).
+/// 2. Strict JSON verdict object inside an unwrapped
+///    `opencode run --format json` event text payload.
+/// 3. Legacy plain-text standalone canonical marker on the line itself, or
+///    inside the unwrapped event payload (backward-compatible fallback).
+///
+/// Returns `None` when no verdict is recognized. This helper is used both for
+/// streaming verdict detection (grace-period trigger) and for full-output
+/// parsing fallback.
+pub fn detect_verdict_in_line(line: &str) -> Option<&'static str> {
+    if let Some((kind, _)) = parse_json_verdict(line) {
+        return Some(kind);
+    }
+    if let Some(text) = crate::stream_json_textifier::extract_text_from_stream_json(line) {
+        for inner in text.lines() {
+            if let Some((kind, _)) = parse_json_verdict(inner) {
+                return Some(kind);
+            }
+        }
+        for inner in text.lines() {
+            if let Some(kind) = canonical_verdict_kind(inner) {
+                return Some(kind);
+            }
+        }
+        return None;
+    }
+    canonical_verdict_kind(line)
+}
 
 /// Returns the canonical verdict kind for a single output line, or `None` when
 /// the line is not a standalone canonical verdict.
@@ -45,44 +132,30 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
 
 /// Parse acceptance output text and determine pass/fail/continue/blocked status.
 ///
-/// Canonical contract: the verdict MUST be an unwrapped standalone line equal to
-/// one of `ACCEPTANCE: PASS`, `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`,
-/// `ACCEPTANCE: BLOCKED`. Bold/italic/underline wrappers and leading
-/// heading/blockquote/bullet prefixes are tolerated defensively but trailing
-/// text concatenated onto the marker (for example `ACCEPTANCE: PASSAll ...` or
-/// `ACCEPTANCE: PASS## ...`) is NOT a canonical verdict and produces the
-/// CONTINUE fallback.
+/// Contract (JSON-primary, text-fallback):
 ///
-/// # Examples
+/// - Primary: a strict JSON verdict object
+///   `{"acceptance":"pass|fail|continue|blocked","findings":[...]}` emitted
+///   either directly as a line, or wrapped inside an `opencode run
+///   --format json` event payload (assistant / stream_event / result text).
+///   The first JSON verdict encountered wins, regardless of any earlier text
+///   marker.
+/// - Fallback: a standalone legacy line equal to one of `ACCEPTANCE: PASS`,
+///   `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: BLOCKED`.
+///   Bold/italic/underline wrappers and leading heading/blockquote/bullet
+///   prefixes are tolerated defensively, but trailing-text concatenation onto
+///   the marker (for example `ACCEPTANCE: PASSAll ...` or
+///   `ACCEPTANCE: PASS## ...`) is NOT a canonical marker. When no JSON verdict
+///   is found, the first canonical fallback line wins.
 ///
-/// ```ignore
-/// use conflux::acceptance::{parse_acceptance_output, AcceptanceResult};
-///
-/// let pass_output = "ACCEPTANCE: PASS\n";
-/// assert_eq!(parse_acceptance_output(pass_output), AcceptanceResult::Pass);
-///
-/// let fail_output = "ACCEPTANCE: FAIL\nFINDINGS:\n- Issue 1\n- Issue 2\n";
-/// match parse_acceptance_output(fail_output) {
-///     AcceptanceResult::Fail { findings } => {
-///         assert_eq!(findings.len(), 2);
-///         assert_eq!(findings[0], "Issue 1");
-///         assert_eq!(findings[1], "Issue 2");
-///     }
-///     _ => panic!("Expected Fail"),
-/// }
-///
-/// let continue_output = "ACCEPTANCE: CONTINUE\n";
-/// assert_eq!(parse_acceptance_output(continue_output), AcceptanceResult::Continue);
-///
-/// let blocked_output = "ACCEPTANCE: BLOCKED\n";
-/// assert_eq!(parse_acceptance_output(blocked_output), AcceptanceResult::Blocked);
-/// ```
+/// If neither is observed, the result defaults to [`AcceptanceResult::Continue`]
+/// so the acceptance loop can retry.
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
-    let mut acceptance_status: Option<&'static str> = None;
+    let mut fallback_kind: Option<&'static str> = None;
     let mut in_code_block = false;
 
-    for line in output.lines() {
-        let trimmed = line.trim();
+    for raw_line in output.lines() {
+        let trimmed = raw_line.trim();
 
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
@@ -93,13 +166,36 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
             continue;
         }
 
-        if let Some(kind) = canonical_verdict_kind(trimmed) {
-            acceptance_status = Some(kind);
-            break;
+        // Collect scan candidates: the raw line, plus unwrapped event text when
+        // the line is a stream-json event wrapper (from `opencode run
+        // --format json` and similar event streams).
+        let mut candidates: Vec<String> = vec![trimmed.to_string()];
+        if let Some(text) = crate::stream_json_textifier::extract_text_from_stream_json(trimmed) {
+            for inner in text.lines() {
+                candidates.push(inner.to_string());
+            }
+        }
+
+        for candidate in &candidates {
+            let cand = candidate.trim();
+            if let Some((kind, findings)) = parse_json_verdict(cand) {
+                return match kind {
+                    "pass" => AcceptanceResult::Pass,
+                    "fail" => AcceptanceResult::Fail { findings },
+                    "continue" => AcceptanceResult::Continue,
+                    "blocked" => AcceptanceResult::Blocked,
+                    _ => AcceptanceResult::Continue,
+                };
+            }
+            if fallback_kind.is_none() {
+                if let Some(kind) = canonical_verdict_kind(cand) {
+                    fallback_kind = Some(kind);
+                }
+            }
         }
     }
 
-    match acceptance_status {
+    match fallback_kind {
         Some("pass") => AcceptanceResult::Pass,
         Some("continue") => AcceptanceResult::Continue,
         Some("blocked") => AcceptanceResult::Blocked,
@@ -107,12 +203,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
             let findings = parse_findings(output);
             AcceptanceResult::Fail { findings }
         }
-        _ => {
-            // Default to continue if no canonical standalone verdict was found.
-            // Malformed verdicts (trailing text, code-block-only verdicts,
-            // unparseable output) fall here so the loop can retry.
-            AcceptanceResult::Continue
-        }
+        _ => AcceptanceResult::Continue,
     }
 }
 
@@ -741,5 +832,180 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             AcceptanceResult::Continue,
             "Parser must not match markers inside code fences"
         );
+    }
+
+    // --- JSON-primary verdict contract tests ---
+
+    #[test]
+    fn test_parse_json_verdict_pass() {
+        let line = r#"{"acceptance":"pass"}"#;
+        assert_eq!(
+            parse_json_verdict(line),
+            Some(("pass", Vec::<String>::new()))
+        );
+    }
+
+    #[test]
+    fn test_parse_json_verdict_fail_with_findings() {
+        let line = r#"{"acceptance":"fail","findings":["src/a.rs:1 bad","src/b.rs:2 worse"]}"#;
+        let (kind, findings) = parse_json_verdict(line).expect("strict JSON verdict");
+        assert_eq!(kind, "fail");
+        assert_eq!(findings, vec!["src/a.rs:1 bad", "src/b.rs:2 worse"]);
+    }
+
+    #[test]
+    fn test_parse_json_verdict_continue_and_blocked() {
+        assert_eq!(
+            parse_json_verdict(r#"{"acceptance":"continue"}"#),
+            Some(("continue", Vec::<String>::new()))
+        );
+        assert_eq!(
+            parse_json_verdict(r#"{"acceptance":"blocked"}"#),
+            Some(("blocked", Vec::<String>::new()))
+        );
+    }
+
+    #[test]
+    fn test_parse_json_verdict_case_insensitive_value() {
+        assert_eq!(
+            parse_json_verdict(r#"{"acceptance":"PASS"}"#),
+            Some(("pass", Vec::<String>::new()))
+        );
+        assert_eq!(
+            parse_json_verdict(r#"{"acceptance":"Fail"}"#),
+            Some(("fail", Vec::<String>::new()))
+        );
+    }
+
+    #[test]
+    fn test_parse_json_verdict_rejects_non_object_and_unknown_kind() {
+        assert_eq!(parse_json_verdict("pass"), None);
+        assert_eq!(parse_json_verdict(r#"["pass"]"#), None);
+        assert_eq!(parse_json_verdict(r#"{"acceptance":"maybe"}"#), None);
+        assert_eq!(parse_json_verdict(r#"{"other":"pass"}"#), None);
+        assert_eq!(parse_json_verdict("not json"), None);
+        assert_eq!(parse_json_verdict(""), None);
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_json_pass_single_line() {
+        // Primary contract: the final machine-readable verdict is a strict JSON
+        // object emitted as its own stdout line.
+        let output = r#"{"acceptance":"pass"}
+"#;
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_json_fail_findings_preferred_over_text_section() {
+        // JSON findings array is the source of truth when JSON verdict wins.
+        let output = r#"preamble
+{"acceptance":"fail","findings":["x","y"]}
+"#;
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings, vec!["x", "y"]);
+            }
+            other => panic!("expected Fail, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_json_beats_text_fallback_regardless_of_order() {
+        // JSON-primary: when both a text marker and a JSON verdict appear, the
+        // JSON verdict wins even if the text marker came first.
+        let output = "ACCEPTANCE: CONTINUE\n{\"acceptance\":\"pass\"}\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_text_fallback_when_no_json() {
+        // Backward compatibility: absent a JSON verdict, the legacy standalone
+        // text marker remains accepted as canonical.
+        let output = "ACCEPTANCE: PASS\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_json_inside_opencode_format_json_assistant_event() {
+        // `opencode run --format json` wraps final text in an assistant event.
+        // The parser must unwrap the text payload and still find the JSON verdict.
+        let event = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"acceptance\":\"pass\"}"}]}}"#;
+        let output = format!("{}\n", event);
+        assert_eq!(parse_acceptance_output(&output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_json_inside_opencode_format_json_result_event() {
+        // Final result event from `opencode run --format json` / Claude Code
+        // stream-json carries the assistant's final text in `result`. Parser
+        // must unwrap and accept the JSON verdict.
+        let event = r#"{"type":"result","subtype":"success","result":"{\"acceptance\":\"fail\",\"findings\":[\"a\"]}","is_error":false}"#;
+        let output = format!("{}\n", event);
+        match parse_acceptance_output(&output) {
+            AcceptanceResult::Fail { findings } => {
+                assert_eq!(findings, vec!["a".to_string()]);
+            }
+            other => panic!("expected Fail, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_detect_verdict_in_line_json_direct() {
+        assert_eq!(
+            detect_verdict_in_line(r#"{"acceptance":"pass"}"#),
+            Some("pass")
+        );
+        assert_eq!(
+            detect_verdict_in_line(r#"{"acceptance":"blocked"}"#),
+            Some("blocked")
+        );
+    }
+
+    #[test]
+    fn test_detect_verdict_in_line_json_inside_assistant_event() {
+        let event = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"acceptance\":\"pass\"}"}]}}"#;
+        assert_eq!(detect_verdict_in_line(event), Some("pass"));
+    }
+
+    #[test]
+    fn test_detect_verdict_in_line_text_fallback() {
+        assert_eq!(detect_verdict_in_line("ACCEPTANCE: PASS"), Some("pass"));
+        assert_eq!(detect_verdict_in_line("**ACCEPTANCE: FAIL**"), Some("fail"));
+        assert_eq!(
+            detect_verdict_in_line("ACCEPTANCE: PASSAll checks done"),
+            None,
+            "trailing-text PASS must not satisfy even the text fallback"
+        );
+    }
+
+    #[test]
+    fn test_detect_verdict_in_line_text_inside_assistant_event() {
+        // When the agent produces the legacy text marker but wrapped in a
+        // stream-json assistant event, the detector MUST still recognize the
+        // fallback so acceptance does not stall waiting for JSON.
+        let event = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ACCEPTANCE: PASS"}]}}"#;
+        assert_eq!(detect_verdict_in_line(event), Some("pass"));
+    }
+
+    #[test]
+    fn test_detect_verdict_in_line_unrelated_events_return_none() {
+        assert_eq!(
+            detect_verdict_in_line(r#"{"type":"system","subtype":"init"}"#),
+            None
+        );
+        assert_eq!(detect_verdict_in_line("plain log line"), None);
+        assert_eq!(detect_verdict_in_line(""), None);
+    }
+
+    /// Regression for the malformed trailing-text real-log case
+    /// (`ACCEPTANCE: PASS# ...`): with the legacy text-only contract, the
+    /// parser returned CONTINUE and the acceptance loop retried. Under the new
+    /// JSON-primary contract the agent emits a strict JSON verdict on a later
+    /// line, and that JSON verdict MUST win regardless of the earlier drift.
+    #[test]
+    fn test_regression_malformed_text_then_json_pass() {
+        let output = "ACCEPTANCE: PASS# Acceptance Review Summary\n{\"acceptance\":\"pass\"}\n";
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
     }
 }
