@@ -163,17 +163,33 @@ Read `proposal.md` and detect `Change Type`:
 
 ### Output Format
 
-Output exactly ONE legacy standalone verdict marker on its own line with NO
-markdown formatting.
+Output exactly ONE machine-readable verdict on its own line with NO markdown
+formatting.
+
+**Primary (preferred)** — strict JSON verdict object:
+
+- PASS:     `{"acceptance":"pass"}`
+- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}` (findings mirrors the FINDINGS section)
+- CONTINUE: `{"acceptance":"continue"}`
+- BLOCKED:  `{"acceptance":"blocked"}`
+
+**Fallback (backward-compatible)** — legacy standalone plain-text markers:
 
 - `ACCEPTANCE: PASS` - All checks pass
 - `ACCEPTANCE: FAIL` - Checks fail (followed by FINDINGS and tasks.md update)
 - `ACCEPTANCE: CONTINUE` - Verification incomplete
 - `ACCEPTANCE: BLOCKED` - Valid Implementation Blocker exists
 
-For current compatibility, do NOT switch this workflow to JSON-only verdict
-output yet. Some running orchestrators still recognize only the legacy marker
-contract.
+The JSON verdict is primary; legacy markers remain supported so existing runs
+do not break. When both are present, the JSON verdict wins.
+
+**Transition guidance — emit BOTH during rollout** — until all running
+Conflux orchestrator processes have been rebuilt with the JSON-aware
+acceptance parser, the agent MUST emit BOTH payloads as the final two lines
+of stdout (JSON verdict first, legacy marker second), each on its own line
+with no markdown wrapping. Newer runtimes resolve the JSON verdict and
+finalize; older runtimes still finalize on the legacy marker. The canonical
+contract remains JSON-primary.
 
 Do NOT wrap the verdict in headings (`##`), blockquotes (`>`), bullets (`-`), bold (`**`), or code fences.
 

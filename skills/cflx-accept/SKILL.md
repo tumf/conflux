@@ -19,21 +19,42 @@ This skill does NOT replace the command template. It supplements the orchestrato
 
 - **Mode**: Acceptance review
 - **Goal**: Verify implementation meets specifications with automated checks
-- **Output**: Exactly ONE legacy standalone verdict marker at the end
+- **Output**: Exactly ONE machine-readable verdict at the end
 
 ## Verdict Output Contract
 
-For current Conflux compatibility, emit exactly ONE legacy standalone
-plain-text verdict marker on its own line:
+**Primary (preferred)** — emit a strict JSON verdict object as the final
+machine-readable payload, on its own line:
+
+- PASS:     `{"acceptance":"pass"}`
+- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
+- CONTINUE: `{"acceptance":"continue"}`
+- BLOCKED:  `{"acceptance":"blocked"}`
+
+The JSON verdict is the canonical machine-readable contract. The runtime
+parser resolves it with priority over the legacy plain-text marker, including
+when the JSON verdict is wrapped inside an `opencode run --format json`
+assistant/result event payload (the runtime unwraps the text and matches the
+JSON verdict inside it).
+
+**Fallback (backward-compatible)** — older runs still recognize the legacy
+standalone plain-text markers on their own line:
 
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
 - `ACCEPTANCE: BLOCKED`
 
-Some currently running orchestrators still recognize only this legacy marker
-contract. Do NOT rely on JSON-only verdict output from this worktree until the
-runtime rollout is complete.
+These markers are kept as a fallback so existing runs do not break. New
+acceptance runs SHOULD emit the JSON verdict; when both appear, JSON wins.
+
+**Transition guidance — emit BOTH during rollout** — until all running
+Conflux orchestrator processes have been rebuilt with the JSON-aware
+acceptance parser, the agent MUST emit BOTH payloads as the final two lines
+of stdout (JSON verdict first, legacy marker second), each on its own line
+with no markdown wrapping. Newer runtimes resolve the JSON verdict first
+and finalize; older runtimes still finalize on the legacy marker. The
+canonical contract remains JSON-primary.
 
 The full verdict contract (forbidden wrappings, findings format, retry
 semantics) is owned by `.opencode/commands/cflx-accept.md`; this skill MUST
