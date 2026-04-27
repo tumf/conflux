@@ -1,16 +1,25 @@
 """Tests for Change Type classification and archive-risk warning in cflx.py validation."""
 
-import sys
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-# Allow importing cflx.py from the cflx-proposal skill
-SKILL_ROOT = Path(__file__).parent.parent / "cflx-proposal" / "scripts"
-sys.path.insert(0, str(SKILL_ROOT))
 
-from cflx import OpenSpecManager  # noqa: E402
+def _load_manager_class():
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "skills" / "cflx-workflow" / "scripts" / "cflx.py"
 
+    spec = importlib.util.spec_from_file_location("cflx_workflow_script", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec from {script_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.OpenSpecManager
+
+
+OpenSpecManager = _load_manager_class()
 FIXTURES = Path(__file__).parent / "fixtures" / "proposal_modes"
 
 
@@ -33,6 +42,7 @@ def _manager_for_fixture(name: str) -> tuple[OpenSpecManager, str]:
 # change_type_validation
 # ---------------------------------------------------------------------------
 
+
 class TestChangeTypeValidation:
     """Task 1.1: validate_change rejects missing or invalid Change Type in strict mode."""
 
@@ -40,19 +50,25 @@ class TestChangeTypeValidation:
         manager, cid = _manager_for_fixture("spec-only")
         ok, errors, warnings = manager.validate_change(cid, strict=True)
         change_type_errors = [e for e in errors if "Change Type" in e]
-        assert change_type_errors == [], f"Unexpected Change Type errors: {change_type_errors}"
+        assert change_type_errors == [], (
+            f"Unexpected Change Type errors: {change_type_errors}"
+        )
 
     def test_implementation_type_accepted(self):
         manager, cid = _manager_for_fixture("implementation")
         ok, errors, warnings = manager.validate_change(cid, strict=True)
         change_type_errors = [e for e in errors if "Change Type" in e]
-        assert change_type_errors == [], f"Unexpected Change Type errors: {change_type_errors}"
+        assert change_type_errors == [], (
+            f"Unexpected Change Type errors: {change_type_errors}"
+        )
 
     def test_hybrid_type_accepted(self):
         manager, cid = _manager_for_fixture("hybrid")
         ok, errors, warnings = manager.validate_change(cid, strict=True)
         change_type_errors = [e for e in errors if "Change Type" in e]
-        assert change_type_errors == [], f"Unexpected Change Type errors: {change_type_errors}"
+        assert change_type_errors == [], (
+            f"Unexpected Change Type errors: {change_type_errors}"
+        )
 
     def test_missing_change_type_rejected_in_strict_mode(self, tmp_path):
         """A proposal without a Change Type field fails strict validation."""
@@ -119,6 +135,7 @@ class TestChangeTypeValidation:
 # archive_risk_warning
 # ---------------------------------------------------------------------------
 
+
 class TestArchiveRiskWarning:
     """Task 2.2: spec-only proposals with MODIFIED/REMOVED-only deltas emit a warning."""
 
@@ -135,7 +152,9 @@ class TestArchiveRiskWarning:
         ok, errors, warnings = manager.validate_change(cid, strict=True)
         risk_warnings = [w for w in warnings if "ARCHIVE-RISK" in w]
         assert len(risk_warnings) >= 1, "Expected at least one ARCHIVE-RISK warning"
-        assert "MODIFIED" in risk_warnings[0] or "canonical promotion" in risk_warnings[0]
+        assert (
+            "MODIFIED" in risk_warnings[0] or "canonical promotion" in risk_warnings[0]
+        )
 
     def test_implementation_proposal_no_archive_warning(self):
         """Implementation proposals never get archive-risk warnings."""

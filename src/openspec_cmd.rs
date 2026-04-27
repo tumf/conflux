@@ -566,7 +566,20 @@ impl OpenSpecManager {
         // Validate tasks format
         if tasks_file.exists() {
             if let Ok(content) = fs::read_to_string(&tasks_file) {
-                let (te, tw) = validate_tasks_content(&content, &change_id, strict, evidence_mode);
+                let proposal_content = fs::read_to_string(&proposal_file).ok();
+                let change_type = proposal_content
+                    .as_deref()
+                    .and_then(extract_change_type)
+                    .as_deref()
+                    .map(str::to_string);
+                let (te, tw) = validate_tasks_content(
+                    &content,
+                    &change_id,
+                    strict,
+                    evidence_mode,
+                    change_type.as_deref(),
+                    proposal_content.as_deref(),
+                );
                 errors.extend(te);
                 warnings.extend(tw);
             }
@@ -980,6 +993,56 @@ const EVIDENCE_HINTS: &[&str] = &[
     "go test",
 ];
 
+const VERIFICATION_OWNERSHIP_MARKERS: &[&str] = &[
+    "unit",
+    "integration",
+    "e2e",
+    "manual",
+    "benchmark",
+    "not-testable",
+];
+
+const ARTIFACT_HEAVY_TASK_KEYWORDS: &[&str] = &["define ", "document ", "describe "];
+
+const EXECUTABLE_SURFACE_HINTS: &[&str] = &[
+    " cli",
+    " api",
+    "workflow",
+    " job",
+    " worker",
+    " background process",
+    " command",
+    " webhook",
+    " endpoint",
+];
+
+const EXECUTABLE_VERIFICATION_HINTS: &[&str] = &[
+    "curl ",
+    "http",
+    "api",
+    "cli",
+    "command",
+    "cflx openspec",
+    "cargo run",
+    "npm run",
+    "pytest",
+    "go test",
+    "cargo test",
+];
+
+const RUNTIME_BEHAVIOR_HINTS: &[&str] = &[
+    "handler",
+    "webhook",
+    "persist",
+    "persistence",
+    "notification",
+    "command",
+    "job",
+    "worker",
+    "queue",
+    "background process",
+];
+
 fn looks_like_behavior_task(task_text: &str) -> bool {
     let normalized = task_text.trim().to_lowercase();
     BEHAVIOR_TASK_KEYWORDS
@@ -992,11 +1055,48 @@ fn has_repository_evidence_hint(verification_text: &str) -> bool {
     EVIDENCE_HINTS.iter().any(|hint| normalized.contains(hint))
 }
 
+fn has_verification_ownership_marker(verification_text: &str) -> bool {
+    let normalized = verification_text.trim().to_lowercase();
+    VERIFICATION_OWNERSHIP_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn looks_like_artifact_heavy_task(task_text: &str) -> bool {
+    let normalized = task_text.trim().to_lowercase();
+    ARTIFACT_HEAVY_TASK_KEYWORDS
+        .iter()
+        .any(|kw| normalized.contains(kw))
+}
+
+fn proposal_mentions_executable_surface(proposal_content: &str) -> bool {
+    let normalized = format!(" {}", proposal_content.trim().to_lowercase());
+    EXECUTABLE_SURFACE_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+}
+
+fn verification_mentions_executable_surface(verification_text: &str) -> bool {
+    let normalized = verification_text.trim().to_lowercase();
+    EXECUTABLE_VERIFICATION_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+}
+
+fn proposal_mentions_runtime_behavior(proposal_content: &str) -> bool {
+    let normalized = proposal_content.trim().to_lowercase();
+    RUNTIME_BEHAVIOR_HINTS
+        .iter()
+        .any(|hint| normalized.contains(hint))
+}
+
 fn validate_tasks_content(
     content: &str,
     change_id: &str,
     strict: bool,
     evidence_mode: &str,
+    change_type: Option<&str>,
+    proposal_content: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -1015,6 +1115,15 @@ fn validate_tasks_content(
 
     let excluded_sections = ["future work", "out of scope", "notes"];
     let mut in_excluded = false;
+
+    let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
+    let proposal_text = proposal_content.unwrap_or_default();
+    let proposal_has_executable_surface = proposal_mentions_executable_surface(proposal_text);
+    let proposal_has_runtime_behavior = proposal_mentions_runtime_behavior(proposal_text);
+
+    let mut behavior_task_count = 0usize;
+    let mut artifact_task_count = 0usize;
+    let mut has_executable_runnable_verification = false;
 
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -1037,13 +1146,40 @@ fn validate_tasks_content(
         if let Some(caps) = checkbox_detail_re.captures(line) {
             if !in_excluded {
                 let task_text = caps.get(2).map_or("", |m| m.as_str()).trim();
+                let is_behavior_task = looks_like_behavior_task(task_text);
+                let is_artifact_task = looks_like_artifact_heavy_task(task_text);
+                if is_behavior_task {
+                    behavior_task_count += 1;
+                }
+                if is_artifact_task {
+                    artifact_task_count += 1;
+                }
 
-                if strict && evidence_mode != "off" && looks_like_behavior_task(task_text) {
-                    if let Some(vcaps) = verification_re.captures(task_text) {
+                let verification_match = verification_re.captures(task_text);
+                if let Some(vcaps) = &verification_match {
+                    let vtext = vcaps.get(1).map_or("", |m| m.as_str()).trim();
+                    if verification_mentions_executable_surface(vtext) {
+                        has_executable_runnable_verification = true;
+                    }
+                }
+
+                if strict && evidence_mode != "off" && is_behavior_task {
+                    if let Some(vcaps) = verification_match {
                         let vtext = vcaps.get(1).map_or("", |m| m.as_str()).trim();
                         if !has_repository_evidence_hint(vtext) {
                             let msg = format!(
                                 "{}: tasks.md:{}: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands",
+                                change_id, line_num
+                            );
+                            if evidence_mode == "error" {
+                                errors.push(msg);
+                            } else if evidence_mode == "warn" {
+                                warnings.push(msg);
+                            }
+                        }
+                        if !has_verification_ownership_marker(vtext) {
+                            let msg = format!(
+                                "{}: tasks.md:{}: Verification ownership missing for behavior-changing task (expected one of: unit, integration, e2e, manual, benchmark, not-testable)",
                                 change_id, line_num
                             );
                             if evidence_mode == "error" {
@@ -1081,6 +1217,44 @@ fn validate_tasks_content(
                     line_num,
                     &trimmed[..trimmed.len().min(50)]
                 ));
+            }
+        }
+    }
+
+    if strict && evidence_mode != "off" && is_behavior_change {
+        if artifact_task_count > 0 && artifact_task_count >= behavior_task_count.max(1) {
+            let msg = format!(
+                "{}: tasks.md: Artifact-oriented tasks dominate or match behavior-changing tasks",
+                change_id
+            );
+            if evidence_mode == "error" {
+                errors.push(msg);
+            } else if evidence_mode == "warn" {
+                warnings.push(msg);
+            }
+        }
+
+        if proposal_has_executable_surface && !has_executable_runnable_verification {
+            let msg = format!(
+                "{}: tasks.md: Executable-surface behavior lacks runnable verification coverage",
+                change_id
+            );
+            if evidence_mode == "error" {
+                errors.push(msg);
+            } else if evidence_mode == "warn" {
+                warnings.push(msg);
+            }
+        }
+
+        if proposal_has_runtime_behavior && behavior_task_count == 0 {
+            let msg = format!(
+                "{}: tasks.md: Runtime behavior is claimed without implementation-facing tasks",
+                change_id
+            );
+            if evidence_mode == "error" {
+                errors.push(msg);
+            } else if evidence_mode == "warn" {
+                warnings.push(msg);
             }
         }
     }
@@ -1502,14 +1676,14 @@ mod validation_tests {
     #[test]
     fn test_validate_tasks_checkbox_in_excluded() {
         let content = "## Future Work\n- [ ] Should not have checkbox\n";
-        let (errors, _) = validate_tasks_content(content, "test", false, "off");
+        let (errors, _) = validate_tasks_content(content, "test", false, "off", None, None);
         assert!(errors.iter().any(|e| e.contains("excluded section")));
     }
 
     #[test]
     fn test_validate_tasks_bare_task() {
         let content = "## Implementation\n- Some task without checkbox\n";
-        let (errors, _) = validate_tasks_content(content, "test", false, "off");
+        let (errors, _) = validate_tasks_content(content, "test", false, "off", None, None);
         assert!(errors
             .iter()
             .any(|e| e.contains("Possible task without checkbox")));
@@ -1518,7 +1692,8 @@ mod validation_tests {
     #[test]
     fn test_validate_tasks_evidence_warn() {
         let content = "- [ ] Add a new feature for users\n";
-        let (errors, warnings) = validate_tasks_content(content, "test", true, "warn");
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
         assert!(errors.is_empty());
         assert!(!warnings.is_empty());
         assert!(warnings[0].contains("Behavior-bearing task missing"));
@@ -1527,7 +1702,8 @@ mod validation_tests {
     #[test]
     fn test_validate_tasks_evidence_error() {
         let content = "- [ ] Add a new feature for users\n";
-        let (errors, _) = validate_tasks_content(content, "test", true, "error");
+        let (errors, _) =
+            validate_tasks_content(content, "test", true, "error", Some("implementation"), None);
         assert!(!errors.is_empty());
         assert!(errors[0].contains("Behavior-bearing task missing"));
     }
@@ -1536,7 +1712,8 @@ mod validation_tests {
     fn test_validate_tasks_with_verification_hint() {
         let content =
             "- [ ] Add a new feature (verification: unit - cargo test covers the feature)\n";
-        let (errors, warnings) = validate_tasks_content(content, "test", true, "warn");
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
     }
@@ -1544,10 +1721,80 @@ mod validation_tests {
     #[test]
     fn test_validate_tasks_with_weak_verification() {
         let content = "- [ ] Add a new feature (verification: manual review)\n";
-        let (errors, warnings) = validate_tasks_content(content, "test", true, "warn");
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
         assert!(errors.is_empty());
         // "manual review" lacks repository-verifiable hints
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_warns_missing_verification_ownership() {
+        let content = "- [ ] Implement handler update (verification: cargo test -- --nocapture)\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
+        assert!(errors.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Verification ownership missing")));
+    }
+
+    #[test]
+    fn test_warns_artifact_heavy_tasks_dominate() {
+        let content =
+            "- [ ] Define API contract (verification: manual - documented in docs/api.md)\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "warn",
+            Some("implementation"),
+            Some("# Change\n\n**Change Type**: implementation\n"),
+        );
+        assert!(errors.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Artifact-oriented tasks dominate")));
+    }
+
+    #[test]
+    fn test_warns_executable_surface_without_runnable_verification() {
+        let content =
+            "- [ ] Implement queue worker support (verification: manual - reviewer walkthrough)\n";
+        let proposal = "# Change\n\n**Change Type**: implementation\n\n## Problem\nAPI workflow must trigger worker job\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "warn",
+            Some("implementation"),
+            Some(proposal),
+        );
+        assert!(errors.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Executable-surface behavior lacks runnable verification")));
+    }
+
+    #[test]
+    fn test_warns_runtime_claim_without_behavior_tasks() {
+        let content = "- [ ] Document API rollout (verification: manual - docs review)\n";
+        let proposal = "# Change\n\n**Change Type**: implementation\n\n## Goal\nWebhook handler must persist notifications via background process\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "warn",
+            Some("implementation"),
+            Some(proposal),
+        );
+        assert!(errors.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w
+                    .contains("Runtime behavior is claimed without implementation-facing tasks"))
+        );
     }
 }
 
