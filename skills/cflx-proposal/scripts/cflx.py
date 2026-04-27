@@ -83,8 +83,93 @@ class OpenSpecManager:
         # Rust ecosystem
         "cargo test",
         "cargo build",
+        "cargo run",
         # Go ecosystem
         "go test",
+    )
+
+    _VERIFICATION_OWNERSHIP = (
+        "unit",
+        "integration",
+        "e2e",
+        "manual",
+        "benchmark",
+        "not-testable",
+    )
+
+    _ARTIFACT_ONLY_TASK_KEYWORDS = (
+        "define ",
+        "document ",
+        "describe ",
+        "record ",
+        "list ",
+        "note ",
+        "draft ",
+        "outline ",
+        "specify ",
+    )
+
+    _RUNNABLE_EVIDENCE_HINTS = (
+        "uv run ",
+        "pytest",
+        "python ",
+        "python3 ",
+        "cargo test",
+        "cargo run",
+        "npm test",
+        "npm run ",
+        "pnpm ",
+        "yarn ",
+        "go test",
+        "make ",
+        "just ",
+        "cflx ",
+        "curl ",
+        "./",
+    )
+
+    _EXECUTABLE_SURFACE_HINTS = (
+        " cli",
+        "command",
+        "subcommand",
+        "api",
+        "endpoint",
+        "route",
+        "workflow",
+        "job",
+        "cron",
+        "worker",
+        "background",
+        "daemon",
+        "queue",
+        "webhook",
+        "server",
+        "service",
+    )
+
+    _RUNTIME_CLAIM_HINTS = (
+        "implement",
+        "runtime",
+        "endpoint",
+        "route",
+        "handler",
+        "worker",
+        "job",
+        "persist",
+        "database",
+        "notification",
+        "webhook",
+        "cli",
+        "command",
+    )
+
+    _SPEC_ONLY_NEGATION_HINTS = (
+        "documentation only",
+        "spec only",
+        "spec-only",
+        "no runtime",
+        "no code changes",
+        "no implementation",
     )
 
     def __init__(self, root_dir: str = "."):
@@ -379,14 +464,17 @@ class OpenSpecManager:
         if not tasks_file.exists():
             errors.append(f"{change_id}: Missing tasks.md")
 
+        proposal_content = ""
+        change_type = None
+
         # Validate proposal structure
         if proposal_file.exists():
-            content = proposal_file.read_text(encoding="utf-8")
-            if not re.search(r"^#\s+.+$", content, re.MULTILINE):
+            proposal_content = proposal_file.read_text(encoding="utf-8")
+            if not re.search(r"^#\s+.+$", proposal_content, re.MULTILINE):
                 errors.append(f"{change_id}: proposal.md missing title heading")
 
             # Validate Change Type field
-            change_type = self._extract_change_type(content)
+            change_type = self._extract_change_type(proposal_content)
             if strict:
                 if change_type is None:
                     errors.append(
@@ -406,6 +494,8 @@ class OpenSpecManager:
                 change_id,
                 strict=strict,
                 evidence_mode=evidence_mode,
+                change_type=change_type,
+                proposal_content=proposal_content,
             )
             errors.extend(task_errors)
             warnings.extend(task_warnings)
@@ -437,6 +527,8 @@ class OpenSpecManager:
         change_id: str,
         strict: bool = False,
         evidence_mode: EvidenceMode = "off",
+        change_type: Optional[str] = None,
+        proposal_content: str = "",
     ) -> Tuple[List[str], List[str]]:
         """Validate tasks.md file format."""
         errors = []
@@ -446,6 +538,7 @@ class OpenSpecManager:
 
         in_excluded_section = False
         sections_to_exclude = ["future work", "out of scope", "notes"]
+        task_entries: List[Dict[str, object]] = []
 
         for i, line in enumerate(lines, 1):
             # Check section headers
@@ -471,6 +564,18 @@ class OpenSpecManager:
                     task_text,
                     re.IGNORECASE,
                 )
+                verification_text = (
+                    verification_match.group(1).strip() if verification_match else None
+                )
+                task_entries.append(
+                    {
+                        "line": i,
+                        "task_text": task_text,
+                        "verification_text": verification_text,
+                        "behavior": self._looks_like_behavior_task(task_text),
+                        "artifact_only": self._looks_like_artifact_only_task(task_text),
+                    }
+                )
                 if (
                     strict
                     and evidence_mode != "off"
@@ -485,7 +590,6 @@ class OpenSpecManager:
                             "'(verification: ...)' note",
                         )
                     else:
-                        verification_text = verification_match.group(1).strip()
                         if not self._has_repository_evidence_hint(verification_text):
                             self._append_evidence_issue(
                                 errors,
@@ -507,6 +611,14 @@ class OpenSpecManager:
                     errors.append(
                         f"{change_id}: tasks.md:{i}: Possible task without checkbox: {line.strip()[:50]}"
                     )
+
+        if strict and change_type in {"implementation", "hybrid"}:
+            validation_warnings = self._validate_behavior_task_quality(
+                change_id=change_id,
+                task_entries=task_entries,
+                proposal_content=proposal_content,
+            )
+            warnings.extend(validation_warnings)
 
         return errors, warnings
 
@@ -531,6 +643,106 @@ class OpenSpecManager:
     def _has_repository_evidence_hint(cls, verification_text: str) -> bool:
         normalized = verification_text.strip().lower()
         return any(hint in normalized for hint in cls._EVIDENCE_HINTS)
+
+    @classmethod
+    def _has_verification_ownership(cls, verification_text: str) -> bool:
+        normalized = verification_text.strip().lower()
+        return any(
+            normalized.startswith(f"{owner} ")
+            or normalized.startswith(f"{owner}:")
+            or f"{owner} -" in normalized
+            or f"{owner}:" in normalized
+            for owner in cls._VERIFICATION_OWNERSHIP
+        )
+
+    @classmethod
+    def _has_runnable_signal(cls, verification_text: str) -> bool:
+        normalized = verification_text.strip().lower()
+        return any(hint in normalized for hint in cls._RUNNABLE_EVIDENCE_HINTS)
+
+    @classmethod
+    def _looks_like_artifact_only_task(cls, task_text: str) -> bool:
+        normalized = task_text.strip().lower()
+        return any(
+            keyword in normalized for keyword in cls._ARTIFACT_ONLY_TASK_KEYWORDS
+        )
+
+    @classmethod
+    def _proposal_mentions_executable_surface(cls, proposal_content: str) -> bool:
+        normalized = proposal_content.lower()
+        return any(hint in normalized for hint in cls._EXECUTABLE_SURFACE_HINTS)
+
+    @classmethod
+    def _proposal_claims_runtime_behavior(cls, proposal_content: str) -> bool:
+        normalized = proposal_content.lower()
+        has_runtime_signal = any(
+            hint in normalized for hint in cls._RUNTIME_CLAIM_HINTS
+        )
+        negated = any(hint in normalized for hint in cls._SPEC_ONLY_NEGATION_HINTS)
+        return has_runtime_signal and not negated
+
+    def _validate_behavior_task_quality(
+        self,
+        change_id: str,
+        task_entries: List[Dict[str, object]],
+        proposal_content: str,
+    ) -> List[str]:
+        warnings: List[str] = []
+        behavior_tasks = [entry for entry in task_entries if entry.get("behavior")]
+        artifact_only_tasks = [
+            entry for entry in task_entries if entry.get("artifact_only")
+        ]
+
+        for entry in behavior_tasks:
+            line = int(entry["line"])
+            verification_text = entry.get("verification_text")
+            if not verification_text:
+                continue
+            verification_text = str(verification_text)
+            if not self._has_verification_ownership(verification_text):
+                warnings.append(
+                    f"{change_id}: tasks.md:{line}: Behavior-changing task should declare verification ownership "
+                    "using one of unit/integration/e2e/manual/benchmark/not-testable"
+                )
+
+        if artifact_only_tasks and (
+            not behavior_tasks or len(artifact_only_tasks) >= len(behavior_tasks)
+        ):
+            warnings.append(
+                f"{change_id}: tasks.md: Artifact-oriented tasks dominate or match behavior-changing tasks. "
+                "Split documentation/responsibility tasks from runtime wiring tasks so completion cannot rest on artifacts alone."
+            )
+
+        if behavior_tasks and not any(
+            entry.get("verification_text")
+            and self._has_runnable_signal(str(entry["verification_text"]))
+            for entry in behavior_tasks
+        ):
+            warnings.append(
+                f"{change_id}: tasks.md: Behavior-changing proposal has no runnable verification. "
+                "At least one major requirement should be proven by tests, executable commands, or explicit manual verification steps that would fail on a stub."
+            )
+
+        if self._proposal_mentions_executable_surface(proposal_content) and not any(
+            entry.get("verification_text")
+            and self._has_runnable_signal(str(entry["verification_text"]))
+            for entry in task_entries
+        ):
+            warnings.append(
+                f"{change_id}: proposal.md/tasks.md: Proposal mentions an executable surface (CLI/API/workflow/job/background process) "
+                "but no runnable verification is planned. Add minimal execution checks for success, safe mode, side-effect suppression, and error handling."
+            )
+
+        if (
+            self._proposal_claims_runtime_behavior(proposal_content)
+            and not behavior_tasks
+        ):
+            warnings.append(
+                f"{change_id}: proposal.md/tasks.md: Proposal appears to claim runtime behavior changes, but tasks.md is dominated by specification/documentation work. "
+                "Add implementation and wiring tasks proving the behavior is delivered in code."
+            )
+
+        return warnings
 
     def _validate_specs_dir(self, specs_dir: Path, change_id: str) -> List[str]:
         """Validate spec delta files."""

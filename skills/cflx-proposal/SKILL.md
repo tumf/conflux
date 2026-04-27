@@ -26,11 +26,16 @@ Create structured change proposals for Conflux (OpenSpec-based) projects through
 - Start the user-facing response with a short `Premise / Context` section summarizing the goals, constraints, and relevant repo architecture already discovered.
 - Do not ask the user to choose or confirm the `change-id`; generate a concise unique verb-led slug yourself.
 - If the request is sufficiently clear after context gathering, draft the proposal directly instead of forcing an extra clarification round.
-- For implementation-oriented proposals, make tasks evidence-bearing: each behavior-changing task should name repository-verifiable code, tests, or commands.
+- For implementation-oriented proposals, make tasks evidence-bearing: each behavior-changing task should name repository-verifiable code, tests, commands, or explicit manual checks.
 - For behavior-changing proposals, require verification coverage planning per requirement/task so verification ownership is explicit at proposal time.
+- Write tasks around required behavior, not artifact existence. Avoid task sets that can look complete when only contracts, docs, or placeholder wiring exist.
+- Separate responsibility-definition/documentation tasks from runtime wiring/integration tasks so the proposal cannot be marked done without code paths, state changes, side effects, or externally visible behavior being connected.
 - Because Conflux decides execution order autonomously, proposal-side task decomposition must be complete enough that an implementation agent does not need to infer missing required work from unstated intent.
 - Treat every user-visible requirement, dependency, migration, verification activity, and non-goal as something that must be explicitly represented in the proposal artifacts, not left implicit.
 - Every implementation-facing task must have an explicit completion condition so a later agent can determine done/not-done from repository evidence instead of judgment calls.
+- For each major behavior-changing requirement, include at least one verification path that would fail if the implementation were stubbed, no-op, or returning dummy data.
+- When the change exposes a CLI, API, workflow, job, or background process, include minimal execution verification covering a typical success path plus safe-mode / side-effect suppression / error handling where relevant.
+- Prefer warnings over silent acceptance when tasks are dominated by “define / document / describe” language or when runtime behavior is claimed without runnable verification.
 - Before choosing `spec-only`, explicitly classify the user's desired artifact as one of: `spec/documentation`, `implementation`, or `both`.
 - Use the standard verification vocabulary for ownership planning: `unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`.
 - Treat `manual` and `benchmark` as intentional coverage (not missing unit tests) when they fit the requirement better.
@@ -265,12 +270,15 @@ Create `openspec/changes/<id>/tasks.md`:
 - Ensure the task list is complete enough that Conflux can choose execution order without depending on unstated human intent
 - Represent every required implementation, integration, migration, verification, and documentation step needed to fully satisfy the request
 - For each behavior-changing requirement/task, record planned verification ownership using one of: `unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`
+- Start each behavior-bearing verification note with that ownership marker (for example `verification: integration - cargo test --test auth_flow`)
 - When `manual` or `benchmark` is selected, state why it is intentional coverage and how reviewers will evaluate completion
-- Specify integration/wiring tasks
+- Specify integration/wiring tasks separately from responsibility-definition or documentation tasks
 - Mark non-AI-executable tasks for Future Work
-- Prefer concrete repository evidence in verification notes (source paths, test files, or runnable commands), not vague statements like "verify implementation works"
+- Prefer concrete repository evidence in verification notes (source paths, test files, runnable commands, or explicit manual observation steps), not vague statements like "verify implementation works"
 - Make task verification notes traceable as ownership pairs: implementation task + verification path (for example `verification: integration - tests/api/test_auth_flow.rs`)
-- Every checkbox task must have a completion condition that can be evaluated from repo state, test results, or generated artifacts
+- Every checkbox task must have a completion condition that can be evaluated from repo state, test results, generated artifacts, or an explicit manual observation
+- For major requirements, at least one verification path must require real implementation behavior rather than spec text or placeholder wiring
+- If a CLI/API/workflow/job/background process is in scope, include a minimal runnable verification for expected success behavior and relevant safe-mode / no-op / error conditions
 - If omitting a task would leave some acceptance criterion unsatisfied, the task belongs in the proposal even if the implementation order is unknown
 
 **External dependency policy (mock-first / verification-first)**:
@@ -460,6 +468,11 @@ cflx openspec validate <id> --strict --evidence warn
 
 # Validate proposal with implementation-evidence errors
 cflx openspec validate <id> --strict --evidence error
+
+# Recommended authoring check for behavior-changing proposals
+cflx openspec validate <id> --strict --evidence warn
+# Resolve warnings about missing ownership, artifact-heavy tasks,
+# absent runnable verification, or executable surfaces lacking run checks
 ```
 
 ## Best Practices
