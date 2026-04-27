@@ -71,6 +71,9 @@ impl AppState {
             OrchestratorEvent::AcceptanceCompleted { change_id } => {
                 self.handle_acceptance_completed(change_id)
             }
+            OrchestratorEvent::ChangeRejected { change_id, reason } => {
+                self.handle_change_rejected(change_id, reason)
+            }
             OrchestratorEvent::BranchMergeFailed { branch_name, error } => {
                 self.handle_branch_merge_failed(branch_name, error)
             }

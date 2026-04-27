@@ -52,6 +52,14 @@ WebSocket メッセージの `RemoteChange` に `selected` フィールドが含
 **When**: ユーザーがチェックボックスをクリックする
 **Then**: toggle API が呼ばれ、チェックボックスの表示が更新される
 
+#### Scenario: rejected-row-selection-is-read-only
+
+**Given**: change `fix-auth` の status が `rejected` である
+**And**: レジストリに `selected: true` の古い値が残っている
+**When**: WebSocket の full-state payload を構築する
+**Then**: `fix-auth` の `selected` は `false` で返される
+**And**: rejected row は selection toggle を受け付けない read-only row として扱われる
+
 ### Requirement: global-orchestration-status
 
 サーバーはグローバルなオーケストレーション状態 (Idle/Running/Stopped) を管理する。

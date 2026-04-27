@@ -197,6 +197,7 @@ pub(super) async fn build_remote_project_snapshot_async(
 
     // Apply selected/error state from registry.
     for change in &mut changes {
+        let is_rejected = change.status == "rejected";
         let is_error = error_changes
             .and_then(|m| m.get(&change.id))
             .map(|error| {
@@ -206,10 +207,14 @@ pub(super) async fn build_remote_project_snapshot_async(
             })
             .unwrap_or(false);
         let default_selected = !is_error;
-        change.selected = change_selections
-            .and_then(|m| m.get(&change.id))
-            .copied()
-            .unwrap_or(default_selected);
+        change.selected = if is_rejected {
+            false
+        } else {
+            change_selections
+                .and_then(|m| m.get(&change.id))
+                .copied()
+                .unwrap_or(default_selected)
+        };
     }
 
     let status_str = match entry.status {
@@ -585,6 +590,57 @@ mod tests {
         assert_eq!(
             derive_change_status("change-a", &worktree_by_change, &status_map, "main", true).await,
             ("rejected".to_string(), None)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_remote_project_snapshot_clears_rejected_selection() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let worktree_path = temp_dir
+            .path()
+            .join("worktrees")
+            .join("project-1")
+            .join("main");
+        let rejected_change_dir = worktree_path
+            .join("openspec")
+            .join("changes")
+            .join("change-rejected");
+        std::fs::create_dir_all(&rejected_change_dir).unwrap();
+        std::fs::write(rejected_change_dir.join("proposal.md"), "# proposal\n").unwrap();
+        std::fs::write(rejected_change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let entry = ProjectEntry {
+            id: "project-1".to_string(),
+            remote_url: "https://github.com/example/repo.git".to_string(),
+            branch: "main".to_string(),
+            status: ProjectStatus::Idle,
+            sync_metadata: crate::server::registry::ProjectSyncMetadata::default(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::default(),
+        ));
+        let selections = std::collections::HashMap::from([("change-rejected".to_string(), true)]);
+
+        let snapshot = build_remote_project_snapshot_async(
+            temp_dir.path(),
+            &entry,
+            Some(&selections),
+            None,
+            &shared_state,
+        )
+        .await;
+
+        let rejected = snapshot
+            .changes
+            .iter()
+            .find(|change| change.id == "change-rejected")
+            .expect("rejected change should be present");
+        assert_eq!(rejected.status, "rejected");
+        assert!(
+            !rejected.selected,
+            "rejected dashboard row must always be unselected"
         );
     }
 

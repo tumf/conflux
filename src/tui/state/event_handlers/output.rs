@@ -107,6 +107,22 @@ impl AppState {
         self.add_log(LogEntry::warn(message));
     }
 
+    pub(crate) fn handle_change_rejected(&mut self, change_id: String, reason: String) {
+        if let Some(change) = self
+            .changes
+            .iter_mut()
+            .find(|change| change.id == change_id)
+        {
+            change.set_display_status_cache("rejected");
+            change.selected = false;
+        }
+
+        self.add_log(LogEntry::warn(format!(
+            "Change rejected: {} ({})",
+            change_id, reason
+        )));
+    }
+
     pub(crate) fn handle_parallel_start_rejected(
         &mut self,
         change_ids: Vec<String>,
@@ -269,6 +285,26 @@ mod tests {
         assert_eq!(decoded.project_id, entry.project_id);
         assert_eq!(decoded.operation, entry.operation);
         assert_eq!(decoded.iteration, entry.iteration);
+    }
+
+    #[test]
+    fn change_rejected_clears_only_target_selection() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.changes[0].selected = true;
+        app.changes[1].selected = true;
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.changes[1].display_status_cache = "queued".to_string();
+
+        app.handle_change_rejected("change-a".to_string(), "blocked by review".to_string());
+
+        assert_eq!(app.changes[0].display_status_cache, "rejected");
+        assert!(!app.changes[0].selected);
+        assert_eq!(app.changes[1].display_status_cache, "queued");
+        assert!(app.changes[1].selected);
     }
 
     #[test]

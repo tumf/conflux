@@ -377,6 +377,8 @@ The rejection flow SHALL be used by both serial and parallel execution services.
 
 The system SHALL treat `openspec/changes/<change_id>/REJECTED.md` as the durable rejection marker and SHALL exclude marker-bearing changes from the active listing returned by `list_changes_native()`.
 
+When a change transitions to terminal `Rejected`, the reducer SHALL clear only that change's execution mark intent (`queue_intent = NotQueued`) and SHALL preserve other changes' queue intent as-is.
+
 When a previously rejected change reappears in the active listing because its `REJECTED.md` marker has been removed from the base branch, the runtime SHALL clear the in-memory `Rejected` terminal state for that change and restore it to the default non-terminal state (`terminal = None`, `activity = Idle`, `wait_state = None`, `queue_intent = NotQueued`). A reactivated change SHALL be eligible for `AddToQueue` and SHALL display as `not queued` after refresh.
 
 This ensures rejected changes are not picked up by `cflx run` or presented as candidates for queue addition.
@@ -718,6 +720,8 @@ The system SHALL treat `openspec/changes/<change_id>/REJECTED.md` as the durable
 
 This exclusion contract applies to execution candidate discovery and queue addition. It SHALL NOT by itself forbid read-only operational surfaces such as the dashboard change list from showing the rejected change as a terminal status row.
 
+When a change transitions to terminal `Rejected`, the reducer SHALL clear only that change's execution mark intent (`queue_intent = NotQueued`) and SHALL preserve other changes' queue intent as-is.
+
 When a previously rejected change reappears in the active listing because its `REJECTED.md` marker has been removed from the base branch, the runtime SHALL clear the in-memory `Rejected` terminal state for that change and restore it to the default non-terminal state (`terminal = None`, `activity = Idle`, `wait_state = None`, `queue_intent = NotQueued`). A reactivated change SHALL be eligible for `AddToQueue` and SHALL display as `not queued` after refresh.
 
 #### Scenario: Rejected marker excludes change from active execution list
@@ -734,6 +738,14 @@ When a previously rejected change reappears in the active listing because its `R
 - **WHEN** a dashboard-facing change snapshot is built
 - **THEN** `fix-auth` MAY be included as a read-only rejected row
 - **AND** the execution-oriented active listing remains unchanged
+
+#### Scenario: Rejected transition clears only target execution mark intent
+
+- **GIVEN** change `fix-auth` and `add-search` are both queued
+- **WHEN** `ChangeRejected` is applied to `fix-auth`
+- **THEN** `fix-auth` transitions to `rejected`
+- **AND** `fix-auth` queue intent becomes `NotQueued`
+- **AND** `add-search` queue intent remains unchanged
 
 #### Scenario: Non-rejected change with proposal is included
 

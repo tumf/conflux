@@ -1112,6 +1112,18 @@ Git backend で未コミット変更がある場合、CLI は詳細なエラー�
 
 TUI は archived 状態の change の checkbox をグレー色で表示しなければならない（SHALL）。
 
+### Requirement: Rejected terminal row の execution mark クリア
+
+TUI は `rejected` terminal row を execution candidate として扱ってはならない（SHALL NOT）。
+`ChangeRejected` 遷移を受けた行は `selected=false` へ遷移し、他 change の execution mark は保持しなければならない（SHALL）。
+
+#### Scenario: rejected transition clears only target mark
+
+- **GIVEN** change `foo` と `bar` が execution mark 付きで queued 表示である
+- **WHEN** `foo` が `ChangeRejected` で `rejected` に遷移する
+- **THEN** `foo` の execution mark は clear される
+- **AND** `bar` の execution mark は保持される
+
 #### Scenario: 実行モードで archived 状態の change の checkbox がグレー表示
 
 - **GIVEN** TUI が実行モードである
