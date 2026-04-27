@@ -1,7 +1,7 @@
-# Graph Report - /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/clear-rejected-selection-mark  (2026-04-27)
+# Graph Report - /Users/tumf/work/conflux  (2026-04-27)
 
 ## Corpus Check
-- 228 files · ~1,238,440 words
+- 228 files · ~1,242,398 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -156,16 +156,16 @@
 10. `run_git()` - 44 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `Tests for spec-only acceptance behavior (archive-readiness checks).` --uses--> `OpenSpecManager`  [INFERRED]
-  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/clear-rejected-selection-mark/skills/cflx-workflow/scripts/cflx.py
-- `Spec-only changes with archive-risk deltas produce warnings that acceptance shou` --uses--> `OpenSpecManager`  [INFERRED]
-  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/clear-rejected-selection-mark/skills/cflx-workflow/scripts/cflx.py
-- `Tests for Change Type classification and archive-risk warning in cflx.py validat` --uses--> `OpenSpecManager`  [INFERRED]
-  skills/tests/test_cflx_proposal_change_types.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/clear-rejected-selection-mark/skills/cflx-workflow/scripts/cflx.py
-- `OpenSpecManager` --uses--> `Helper: scaffold a spec-only change and optional canonical spec.`  [INFERRED]
-  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/clear-rejected-selection-mark/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
-- `OpenSpecManager` --uses--> `Spec-only changes with ADDED deltas pass archive-readiness checks.`  [INFERRED]
-  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/clear-rejected-selection-mark/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
+- `test_blocked_rejection_flow_end_to_end_creates_marker_and_removes_worktree()` --calls--> `execute_rejection_flow()`  [INFERRED]
+  tests/e2e_git_worktree_tests.rs → src/orchestration/rejection.rs
+- `Handler` --calls--> `with_deduplicator()`  [INFERRED]
+  tests/fixtures/mock_opencode_server.py → src/tui/log_deduplicator.rs
+- `fetchAPI()` --calls--> `parse()`  [INFERRED]
+  dashboard/src/api/restClient.ts → src/config/jsonc.rs
+- `test_list_changes_ignores_invalid_dir()` --calls--> `list_changes()`  [INFERRED]
+  /Users/tumf/work/conflux/skills/tests/test_cflx_list_ignores_invalid_change_dirs.py → src/web/api.rs
+- `parse_delta_sections()` --calls--> `start()`  [INFERRED]
+  skills/shared/cflx_spec_promotion.py → src/service/mod.rs
 
 ## Communities
 
@@ -702,19 +702,19 @@ Nodes (1): Print detailed change information.
   These have ≤1 connection - possible missing edges or undocumented components.
 - **Thin community `Community 46`** (2 nodes): `send()`, `mock_acp_agent.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 47`** (2 nodes): `ProposalActions()`, `ProposalActions.tsx`
+- **Thin community `Community 47`** (2 nodes): `ProposalActions.tsx`, `ProposalActions()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 48`** (2 nodes): `DeleteWorktreeDialog()`, `DeleteWorktreeDialog.tsx`
+- **Thin community `Community 48`** (2 nodes): `DeleteWorktreeDialog.tsx`, `DeleteWorktreeDialog()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 49`** (2 nodes): `for()`, `FileViewPanel.tsx`
+- **Thin community `Community 49`** (2 nodes): `FileViewPanel.tsx`, `for()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 50`** (2 nodes): `TerminalTab()`, `TerminalTab.tsx`
+- **Thin community `Community 50`** (2 nodes): `TerminalTab.tsx`, `TerminalTab()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 51`** (2 nodes): `AddProjectDialog()`, `AddProjectDialog.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 52`** (2 nodes): `ProjectCard()`, `ProjectCard.tsx`
+- **Thin community `Community 52`** (2 nodes): `ProjectCard.tsx`, `ProjectCard()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 53`** (2 nodes): `DeleteDialog()`, `DeleteDialog.tsx`
+- **Thin community `Community 53`** (2 nodes): `DeleteDialog.tsx`, `DeleteDialog()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 54`** (2 nodes): `ChangesPanel()`, `ChangesPanel.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -724,23 +724,23 @@ Nodes (1): Print detailed change information.
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 57`** (2 nodes): `ChangesDrawer()`, `ChangesDrawer.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 58`** (2 nodes): `renderEntry()`, `LogEntry.test.tsx`
+- **Thin community `Community 58`** (2 nodes): `LogEntry.test.tsx`, `renderEntry()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 59`** (2 nodes): `StopChangeDialog()`, `StopChangeDialog.tsx`
+- **Thin community `Community 59`** (2 nodes): `StopChangeDialog.tsx`, `StopChangeDialog()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 60`** (2 nodes): `makeChange()`, `ChangeRow.test.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 61`** (2 nodes): `Badge()`, `badge.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 62`** (2 nodes): `ToolCallIndicator()`, `ToolCallIndicator.tsx`
+- **Thin community `Community 62`** (2 nodes): `ToolCallIndicator.tsx`, `ToolCallIndicator()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 63`** (2 nodes): `statusPlaceholder()`, `ProposalChat.tsx`
+- **Thin community `Community 63`** (2 nodes): `ProposalChat.tsx`, `statusPlaceholder()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 64`** (2 nodes): `LogsPanel()`, `LogsPanel.tsx`
+- **Thin community `Community 64`** (2 nodes): `LogsPanel.tsx`, `LogsPanel()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 65`** (2 nodes): `ChatInput()`, `ChatInput.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 66`** (2 nodes): `renderLogs()`, `LogsPanel.test.tsx`
+- **Thin community `Community 66`** (2 nodes): `LogsPanel.test.tsx`, `renderLogs()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 67`** (2 nodes): `setScrollMetrics()`, `ChatMessageList.test.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -876,12 +876,12 @@ Nodes (1): Print detailed change information.
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
+- **Why does `fetchAPI()` connect `Community 23` to `Community 0`, `Community 19`?**
+  _High betweenness centrality (0.035) - this node is a cross-community bridge._
+- **Why does `run_tui_loop()` connect `Community 10` to `Community 0`, `Community 1`, `Community 2`, `Community 4`, `Community 7`, `Community 8`, `Community 9`, `Community 12`, `Community 13`, `Community 14`, `Community 17`?**
+  _High betweenness centrality (0.035) - this node is a cross-community bridge._
 - **Why does `execute_acceptance_in_workspace()` connect `Community 3` to `Community 0`, `Community 1`, `Community 2`, `Community 6`, `Community 7`, `Community 16`, `Community 17`, `Community 20`, `Community 22`?**
-  _High betweenness centrality (0.031) - this node is a cross-community bridge._
-- **Why does `merge_spec_delta()` connect `Community 5` to `Community 0`, `Community 1`, `Community 2`, `Community 7`, `Community 8`?**
-  _High betweenness centrality (0.026) - this node is a cross-community bridge._
-- **Why does `run_orchestrator()` connect `Community 13` to `Community 0`, `Community 1`, `Community 2`, `Community 4`, `Community 5`, `Community 6`, `Community 7`, `Community 10`, `Community 11`, `Community 20`?**
-  _High betweenness centrality (0.023) - this node is a cross-community bridge._
+  _High betweenness centrality (0.032) - this node is a cross-community bridge._
 - **Are the 57 inferred relationships involving `execute_acceptance_in_workspace()` (e.g. with `.dispatch_change_to_workspace()` and `.is_cancelled()`) actually correct?**
   _`execute_acceptance_in_workspace()` has 57 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 55 inferred relationships involving `run_orchestrator()` (e.g. with `handle_start_processing_command()` and `.with_event_tx()`) actually correct?**
