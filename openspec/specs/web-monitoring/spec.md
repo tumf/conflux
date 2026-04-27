@@ -4,6 +4,7 @@
 
 Provides HTTP-based monitoring capabilities for the orchestrator, including REST API endpoints, WebSocket real-time updates, and a web dashboard UI. Enables both TUI and Web UI to maintain state parity through a unified state model and event stream architecture.
 ## Requirements
+
 ### Requirement: HTTP Server Lifecycle
 
 オーケストレーターは、オーケストレーション状態を監視するための任意のHTTPサーバーを提供しなければならない（SHALL）。
@@ -174,25 +175,19 @@ The HTTP server SHALL serve a web-based dashboard interface for visualizing orch
 - **THEN** server responds with HTTP 404 status
 
 ### Requirement: Dashboard UI - Change List Display
-Webダッシュボードは、TUIの表示語彙と一致するステータス語彙でchange一覧を表示しなければならない（SHALL）。processing/completed 表記は使用せず、`not queued, queued, applying, accepting, archiving, resolving, resolve pending, blocked, completed, archived, merged, rejected, merge wait, error` を使用すること。反復回数がある場合は `status:iteration` 形式で表示すること。
 
-#### Scenario: QueueStatusに一致するステータス表示
+Webダッシュボードは、TUI の表示語彙と一致するステータス語彙で change 一覧を表示しなければならない（SHALL）。
+
+Rejected row は read-only terminal row として表示してよいが、execution mark を保持した active candidate として表現してはならない（MUST NOT）。
+
+#### Scenario: rejected row is displayed without execution mark
+
 - **GIVEN** Web UI が change 一覧を表示している
-- **WHEN** change の queue_status が更新される
-- **THEN** Web UI は `not queued, queued, applying, accepting, archiving, resolving, resolve pending, blocked, completed, archived, merged, rejected, merge wait, error` の語彙で表示する
-- **AND** processing/completed の表記は表示しない
-
-#### Scenario: rejected row is rendered as read-only terminal row
-- **GIVEN** change の status が `rejected` である
-- **WHEN** Web UI が change 行を表示する
-- **THEN** checkbox は disabled として表示される
-- **AND** selection toggle API は呼ばれない
-
-#### Scenario: Applying の iteration 表示
-- **GIVEN** change の queue_status が applying である
-- **AND** iteration_number が 1 である
-- **WHEN** Web UI が change 行を表示する
-- **THEN** ステータス表示は `applying:1` となる
+- **AND** ある change の status が `rejected` である
+- **WHEN** dashboard row がレンダリングされる
+- **THEN** その row は `rejected` の visual treatment で表示される
+- **AND** row は `selected = false` として扱われる
+- **AND** active execution candidate と同じ checkbox semantics を保持しない
 
 ### Requirement: Dashboard UI - Real-time Updates
 The web dashboard SHALL automatically update when orchestrator state changes.
@@ -758,7 +753,6 @@ The web dashboard log panel SHALL render ANSI escape sequences in log messages a
 - **WHEN** the dashboard renders the log entry in the Logs panel
 - **THEN** the corresponding text is rendered with `font-weight: bold` or `text-decoration: underline` respectively
 
-
 ### Requirement: Web ステータスは Reducer から導出される
 Web API が返す `ChangeStatus.queue_status` は `OrchestratorState` 内の `ChangeRuntimeState::display_status()` から導出されなければならない（MUST）。
 
@@ -772,7 +766,6 @@ Web API が返す `ChangeStatus.queue_status` は `OrchestratorState` 内の `Ch
 #### Scenario: Web API レスポンスの queue_status が Reducer と一致する
 - **WHEN** Web API が `/api/state` エンドポイントでステータスを返す
 - **THEN** 各 Change の `queue_status` が `ChangeRuntimeState::display_status()` の返す文字列と一致する
-
 
 ### Requirement: Control API State Transitions
 The web monitoring API SHALL enforce execution-mode-aware control transitions.
