@@ -282,6 +282,7 @@ impl ChangeState {
             "resolving" => Color::LightCyan,
             "archived" => Color::Blue,
             "merged" => Color::LightBlue,
+            "rejected" => Color::LightRed,
             "error" => Color::Red,
             _ => Color::DarkGray,
         };
@@ -993,6 +994,12 @@ impl AppState {
         display_map: &HashMap<String, &'static str>,
     ) {
         for change in &mut self.changes {
+            if change.display_status_cache == "rejected" {
+                // rejected rows are display-only and remain immutable until marker removal.
+                change.selected = false;
+                continue;
+            }
+
             if let Some(&status_str) = display_map.get(&change.id) {
                 let normalized = match status_str {
                     "stopped" => "not queued",
@@ -1412,6 +1419,16 @@ impl AppState {
     /// to OrchestratorState::task_progress(). When updating UI state, progress is
     /// read from shared state to ensure consistency across TUI and orchestrator.
     fn update_changes(&mut self, fetched_changes: Vec<Change>) {
+        let active_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
+
+        // rejected marker-bearing rows are display-only and never execution targets.
+        let rejected_changes =
+            crate::openspec::list_rejected_changes_native().unwrap_or_else(|err| {
+                warn!(error = %err, "Failed to list rejected changes for TUI refresh");
+                Vec::new()
+            });
+        let rejected_ids: HashSet<String> = rejected_changes.iter().map(|c| c.id.clone()).collect();
+
         // Populate shared orchestration state with task progress from fetched changes
         // This ensures shared state reflects the current file-system state from openspec list
         if let Some(shared_state) = &self.shared_orchestrator_state {
@@ -1425,22 +1442,38 @@ impl AppState {
                         );
                     }
                 }
+                for change in &rejected_changes {
+                    if change.total_tasks > 0 {
+                        guard.set_task_progress(
+                            change.id.clone(),
+                            change.completed_tasks,
+                            change.total_tasks,
+                        );
+                    }
+                }
             }
         }
 
-        // Detect new changes
+        // Detect new changes (active + rejected display rows)
         let new_ids: Vec<String> = fetched_changes
             .iter()
+            .chain(rejected_changes.iter())
             .filter(|c| !self.known_change_ids.contains(&c.id))
             .map(|c| c.id.clone())
             .collect();
 
-        // Update existing changes
+        // Update existing active changes
         for fetched in &fetched_changes {
             if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
+                let was_rejected = existing.display_status_cache == "rejected";
                 let was_archived = existing.display_status_cache == "archived";
                 let is_merge_wait = existing.display_status_cache == "merge wait";
                 let is_resolve_wait = existing.display_status_cache == "resolve pending";
+
+                if was_rejected && !rejected_ids.contains(&fetched.id) {
+                    existing.set_display_status_cache("not queued");
+                    existing.selected = false;
+                }
 
                 // Get task progress from shared state (with fallback to fetched data)
                 let (completed, total) = if let Some(shared_state) = &self.shared_orchestrator_state
@@ -1526,12 +1559,49 @@ impl AppState {
             }
         }
 
-        // Add new changes
+        // Update existing rejected rows (read-only terminal rows).
+        for rejected in &rejected_changes {
+            if let Some(existing) = self.changes.iter_mut().find(|c| c.id == rejected.id) {
+                let (completed, total) = if let Some(shared_state) = &self.shared_orchestrator_state
+                {
+                    if let Ok(guard) = shared_state.try_read() {
+                        let progress = guard.task_progress(&rejected.id);
+                        if progress.1 > 0 {
+                            progress
+                        } else {
+                            (rejected.completed_tasks, rejected.total_tasks)
+                        }
+                    } else {
+                        (rejected.completed_tasks, rejected.total_tasks)
+                    }
+                } else {
+                    (rejected.completed_tasks, rejected.total_tasks)
+                };
+
+                if total > 0 {
+                    existing.completed_tasks = completed;
+                    existing.total_tasks = total;
+                }
+                existing.selected = false;
+                existing.set_display_status_cache("rejected");
+            }
+        }
+
+        // Add new changes (active + rejected display-only rows)
         for id in &new_ids {
             if let Some(fetched) = fetched_changes.iter().find(|c| &c.id == id) {
                 let mut new_state = ChangeState::from_change(fetched);
                 new_state.is_new = true;
                 self.changes.push(new_state);
+                continue;
+            }
+
+            if let Some(rejected) = rejected_changes.iter().find(|c| &c.id == id) {
+                let mut rejected_state = ChangeState::from_change(rejected);
+                rejected_state.is_new = true;
+                rejected_state.selected = false;
+                rejected_state.set_display_status_cache("rejected");
+                self.changes.push(rejected_state);
             }
         }
 
@@ -1569,10 +1639,11 @@ impl AppState {
         }
 
         // Remove changes that no longer exist (have been archived externally)
-        let current_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
         self.changes.retain(|c| {
-            // Keep if still exists, apply started in this session, or in a terminal state.
-            current_ids.contains(&c.id)
+            // Keep if still exists in active list or rejected display-only list,
+            // apply started in this session, or in a terminal state.
+            active_ids.contains(&c.id)
+                || rejected_ids.contains(&c.id)
                 || c.started_at.is_some()
                 || matches!(
                     c.display_status_cache.as_str(),
@@ -1582,6 +1653,7 @@ impl AppState {
                         | "merge wait"
                         | "resolving"
                         | "resolve pending"
+                        | "rejected"
                         | "error"
                 )
         });
@@ -1733,6 +1805,13 @@ mod guards {
         {
             return ToggleGuardResult::Blocked(format!(
                 "Cannot queue uncommitted change '{}' in parallel mode. Commit it first.",
+                change_id
+            ));
+        }
+
+        if display_status_cache == "rejected" {
+            return ToggleGuardResult::Blocked(format!(
+                "Change '{}' is rejected and read-only",
                 change_id
             ));
         }
@@ -3071,21 +3150,103 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_display_statuses_rejected_to_not_queued_reactivation() {
+    fn test_apply_display_statuses_keeps_rejected_row_read_only() {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);
 
-        // Start from rejected in TUI cache.
         app.changes[0].display_status_cache = "rejected".to_string();
+        app.changes[0].selected = true;
 
-        // After reactivation reducer returns not queued.
         let mut display_map = std::collections::HashMap::new();
         display_map.insert("change-a".to_string(), "not queued");
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(
+            app.changes[0].display_status_cache, "rejected",
+            "rejected row must stay immutable during reducer display sync"
+        );
+        assert!(
+            !app.changes[0].selected,
+            "rejected row must remain unselected"
+        );
+    }
+
+    #[test]
+    fn test_update_changes_reactivates_rejected_row_when_marker_removed() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes.clone());
+        app.changes[0].display_status_cache = "rejected".to_string();
+        app.changes[0].selected = true;
+
+        app.update_changes(changes);
+
+        assert_eq!(
             app.changes[0].display_status_cache, "not queued",
-            "reactivated change must transition from rejected to not queued"
+            "active refresh without marker should reactivate rejected row"
+        );
+        assert!(
+            !app.changes[0].selected,
+            "reactivated row must remain unselected until explicit user action"
+        );
+    }
+
+    #[test]
+    fn test_toggle_selection_blocks_rejected_row() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].display_status_cache = "rejected".to_string();
+        app.mode = AppMode::Select;
+
+        let cmd = app.toggle_selection();
+
+        assert!(cmd.is_none(), "rejected row must not emit toggle commands");
+        assert!(
+            !app.changes[0].selected,
+            "rejected row must remain unselected"
+        );
+        assert!(
+            app.warning_message
+                .as_deref()
+                .is_some_and(|m| m.contains("read-only")),
+            "rejected toggle should explain read-only guard"
+        );
+    }
+
+    #[test]
+    fn test_start_processing_excludes_rejected_rows() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Select;
+        app.changes[0].display_status_cache = "rejected".to_string();
+        app.changes[0].selected = true;
+
+        let cmd = app.start_processing();
+
+        assert!(cmd.is_none(), "F5 start must ignore rejected rows");
+        assert_eq!(app.changes[0].display_status_cache, "rejected");
+        assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn test_toggle_all_marks_ignores_rejected_rows() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Select;
+        app.changes[0].display_status_cache = "rejected".to_string();
+        app.changes[1].display_status_cache = "not queued".to_string();
+
+        let _ = app.toggle_all_marks();
+
+        assert!(
+            !app.changes[0].selected,
+            "bulk mark (@) must not mark rejected rows"
+        );
+        assert!(
+            app.changes[1].selected,
+            "eligible rows should still be marked"
         );
     }
 

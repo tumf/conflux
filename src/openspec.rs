@@ -469,6 +469,76 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
     Ok(changes)
 }
 
+/// List change directories that are marked as rejected (`REJECTED.md`) for
+/// read-only UI surfaces.
+///
+/// Unlike [`list_changes_native`], this function intentionally returns only
+/// marker-bearing rows and is not used for execution candidate discovery.
+pub fn list_rejected_changes_native() -> Result<Vec<Change>> {
+    let changes_dir = Path::new("openspec/changes");
+
+    if !changes_dir.exists() {
+        debug!("Changes directory does not exist: {:?}", changes_dir);
+        return Ok(Vec::new());
+    }
+
+    let entries = fs::read_dir(changes_dir).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to read changes directory: {}", e))
+    })?;
+
+    let mut changes = Vec::new();
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            OrchestratorError::ConfigLoad(format!("Failed to read directory entry: {}", e))
+        })?;
+
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+
+        if dir_name == "archive" || dir_name.starts_with('.') {
+            continue;
+        }
+
+        if !path.join("proposal.md").exists() || !path.join("REJECTED.md").exists() {
+            continue;
+        }
+
+        let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
+            Ok(progress) => (progress.completed, progress.total),
+            Err(_) => {
+                debug!(
+                    "Could not parse tasks for rejected change '{}', using 0/0",
+                    dir_name
+                );
+                (0, 0)
+            }
+        };
+
+        let metadata = parse_dependencies(dir_name);
+        let dependencies = metadata.dependencies.clone();
+
+        changes.push(Change {
+            id: dir_name.to_string(),
+            completed_tasks,
+            total_tasks,
+            last_modified: String::new(),
+            dependencies,
+            metadata,
+        });
+    }
+
+    changes.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +686,34 @@ mod tests {
             result.iter().all(|change| change.id != "change-rejected"),
             "changes with REJECTED.md marker must be excluded from active change list"
         );
+    }
+
+    #[test]
+    fn test_list_rejected_changes_native_returns_only_marker_rows() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("openspec").join("changes");
+
+        let rejected_dir = base.join("change-rejected");
+        fs::create_dir_all(&rejected_dir).unwrap();
+        fs::write(rejected_dir.join("proposal.md"), "# proposal").unwrap();
+        fs::write(rejected_dir.join("tasks.md"), "- [ ] pending task").unwrap();
+        fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED").unwrap();
+
+        let active_dir = base.join("change-active");
+        fs::create_dir_all(&active_dir).unwrap();
+        fs::write(active_dir.join("proposal.md"), "# proposal").unwrap();
+        fs::write(active_dir.join("tasks.md"), "- [ ] pending task").unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(temp_dir.path()).unwrap();
+
+        let result = list_rejected_changes_native().unwrap();
+
+        env::set_current_dir(original_dir).unwrap();
+
+        assert_eq!(result.len(), 1, "only rejected rows should be returned");
+        assert_eq!(result[0].id, "change-rejected");
     }
 
     #[test]
