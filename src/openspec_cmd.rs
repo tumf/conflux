@@ -287,24 +287,6 @@ impl OpenSpecManager {
             }
         }
 
-        // Also check archive
-        if self.archive_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&self.archive_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    if !path.join("proposal.md").exists() {
-                        continue;
-                    }
-                    if let Some(info) = self.get_change_info(&path, true) {
-                        changes.push(info);
-                    }
-                }
-            }
-        }
-
         changes.sort_by(|a, b| a.id.cmp(&b.id));
         changes
     }
@@ -352,7 +334,6 @@ impl OpenSpecManager {
         let mut info = ChangeInfo {
             id,
             path: rel_path,
-            archived,
             title: None,
             tasks_completed: 0,
             tasks_total: 0,
@@ -873,7 +854,6 @@ impl OpenSpecManager {
 struct ChangeInfo {
     id: String,
     path: String,
-    archived: bool,
     title: Option<String>,
     tasks_completed: u32,
     tasks_total: u32,
@@ -1320,12 +1300,7 @@ pub fn cmd_list(show_specs: bool) -> Result<(), String> {
         let changes = mgr.list_changes();
         println!("\n\x1b[1mChanges:\x1b[0m\n");
         for change in &changes {
-            let status = if change.archived {
-                "\x1b[93m[ARCHIVED]\x1b[0m"
-            } else {
-                "\x1b[92m[ACTIVE]\x1b[0m"
-            };
-            println!("  {} \x1b[1m{}\x1b[0m", status, change.id);
+            println!("  \x1b[92m[ACTIVE]\x1b[0m \x1b[1m{}\x1b[0m", change.id);
             if let Some(ref title) = change.title {
                 println!("    Title: {}", title);
             }
@@ -1343,6 +1318,15 @@ pub fn cmd_list(show_specs: bool) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn truncate_for_display(content: &str, max_chars: usize) -> String {
+    let truncated: String = content.chars().take(max_chars).collect();
+    if content.chars().count() > max_chars {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
 }
 
 /// `cflx openspec show` — show change details.
@@ -1418,22 +1402,14 @@ pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result
 
     if let Some(ref proposal) = info.proposal {
         println!("\n\x1b[1mProposal:\x1b[0m");
-        if proposal.len() > 500 {
-            println!("{}...", &proposal[..500]);
-        } else {
-            println!("{}", proposal);
-        }
+        println!("{}", truncate_for_display(proposal, 500));
     }
 
     if !info.specs.is_empty() {
         println!("\n\x1b[1mSpec Deltas:\x1b[0m");
         for (name, content) in &info.specs {
             println!("\n  \x1b[96m{}:\x1b[0m", name);
-            if content.len() > 300 {
-                println!("  {}...", &content[..300]);
-            } else {
-                println!("  {}", content);
-            }
+            println!("  {}", truncate_for_display(content, 300));
         }
     }
 
@@ -1795,6 +1771,80 @@ mod validation_tests {
                 .any(|w| w
                     .contains("Runtime behavior is claimed without implementation-facing tasks"))
         );
+    }
+}
+
+#[cfg(test)]
+mod openspec_list_show_tests {
+    use super::*;
+    use std::env;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    fn cwd_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn create_change(dir: &Path, proposal_title: &str, tasks: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("proposal.md"),
+            format!("# {}\n\nbody\n", proposal_title),
+        )
+        .unwrap();
+        fs::write(dir.join("tasks.md"), tasks).unwrap();
+    }
+
+    #[test]
+    fn test_list_changes_excludes_archived_entries() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        env::set_current_dir(temp.path()).unwrap();
+
+        let active_dir = temp.path().join("openspec/changes/active-change");
+        let archived_dir = temp
+            .path()
+            .join("openspec/changes/archive/2026-04-27-archived-change");
+
+        create_change(&active_dir, "Active Change", "- [x] done\n- [ ] pending\n");
+        create_change(&archived_dir, "Archived Change", "- [x] archived\n");
+
+        let mgr = OpenSpecManager::new();
+        let changes = mgr.list_changes();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, "active-change");
+        assert!(changes[0].path.contains("openspec/changes/active-change"));
+
+        env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_show_change_resolves_archived_entry() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        env::set_current_dir(temp.path()).unwrap();
+
+        let archived_dir = temp.path().join("openspec/changes/archive/archived-change");
+        create_change(&archived_dir, "Archived Change", "- [x] archived\n");
+
+        let mgr = OpenSpecManager::new();
+        let info = mgr
+            .show_change("archived-change", false)
+            .expect("archived change should resolve via show");
+
+        assert!(info.archived);
+        assert_eq!(info.id, "archived-change");
+        assert!(info
+            .path
+            .contains("openspec/changes/archive/archived-change"));
+
+        env::set_current_dir(original_cwd).unwrap();
     }
 }
 
