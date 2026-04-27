@@ -1,6 +1,5 @@
 use chrono::Utc;
 use std::path::Path;
-use std::process::Command;
 
 fn main() {
     // Generate UTC build number in YYYYMMDDHHmmss format
@@ -9,53 +8,25 @@ fn main() {
 
     println!("cargo:rustc-env=BUILD_NUMBER={}", build_number);
 
-    // Build dashboard frontend if dashboard directory exists
     let dashboard_dir = Path::new("dashboard");
     if dashboard_dir.exists() {
-        let build_script = dashboard_dir.join("build.sh");
-
-        if build_script.exists() {
-            println!("Building dashboard...");
-            let output = Command::new("bash")
-                .arg("build.sh")
-                .current_dir(dashboard_dir)
-                .output();
-
-            match output {
-                Ok(output) => {
-                    if !output.status.success() {
-                        eprintln!(
-                            "Dashboard build failed: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to run dashboard build: {}", e);
-                }
-            }
-        }
-
-        // Detect generated asset filenames and expose as env vars
         let assets_dir = Path::new("dashboard/dist/assets");
-        if assets_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(assets_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name.ends_with(".js") {
-                        println!("cargo:rustc-env=DASHBOARD_JS={}", name);
-                    } else if name.ends_with(".css") {
-                        println!("cargo:rustc-env=DASHBOARD_CSS={}", name);
-                    }
+        if let Ok(entries) = std::fs::read_dir(assets_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".js") {
+                    println!("cargo:rustc-env=DASHBOARD_JS={}", name);
+                } else if name.ends_with(".css") {
+                    println!("cargo:rustc-env=DASHBOARD_CSS={}", name);
                 }
             }
         }
 
-        // Rerun if dashboard source changes
-        println!("cargo:rerun-if-changed=dashboard/src");
-        println!("cargo:rerun-if-changed=dashboard/package.json");
         println!("cargo:rerun-if-changed=dashboard/dist/assets");
+        println!("cargo:rerun-if-changed=dashboard/dist/index.html");
+        println!("cargo:rerun-if-changed=dashboard/dist/favicon.svg");
+        println!("cargo:rerun-if-changed=dashboard/dist/icons.svg");
     }
 
     // Re-run if build script changes
