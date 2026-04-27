@@ -10,3 +10,6 @@
 
 - rejected reason を dashboard row に表示する追加 UX の検討
 - 他 terminal state（archived / merged / stopped / error）の mark semantics を横断整理する設計見直し
+
+## Acceptance #1 Failure Follow-up
+- [x] Commit-path blocker was resolved by rerunning `prek run --all-files` successfully (exit code 0 via agent-exec job `4cf40d42683437070eef820693141394`), with no remaining hook failure on `trailing-whitespace`.
