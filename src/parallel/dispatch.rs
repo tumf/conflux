@@ -7,7 +7,7 @@
 //! - Per-change cancellation monitoring
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
@@ -190,6 +190,35 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_follow_up_reopens_completed_tasks_for_apply_resume() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let change_id = "change-follow-up";
+        let change_dir = tmp.path().join("openspec/changes").join(change_id);
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "---\nchange_type: implementation\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+
+        crate::task_parser::record_acceptance_follow_up(
+            &change_dir.join("tasks.md"),
+            1,
+            &["restore missing repository test".to_string()],
+        )
+        .unwrap();
+
+        let action = decide_resume_action(change_id, tmp.path(), &WorkspaceState::Applied);
+        assert_eq!(action, ResumeAction::Apply);
+    }
+
+    #[test]
     fn decide_resume_action_keeps_archived_as_terminal() {
         let tmp = TempDir::new().unwrap();
         let action = decide_resume_action("change-archived", tmp.path(), &WorkspaceState::Archived);
@@ -229,6 +258,14 @@ pub(super) enum ResumeAction {
     Acceptance,
     Archive,
     Rejecting,
+}
+
+fn tasks_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
+    workspace_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("tasks.md")
 }
 
 pub(super) fn decide_resume_action(
@@ -1309,7 +1346,24 @@ impl ParallelExecutor {
                             cycle_count,
                             blocking_gate_context
                         );
-                        // Note: tasks.md is now updated by the acceptance agent itself
+                        let tasks_path = tasks_file_path(workspace.path.as_path(), &change_id);
+                        if let Err(err) = task_parser::record_acceptance_follow_up(
+                            &tasks_path,
+                            acceptance_iteration,
+                            &findings,
+                        ) {
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Failed to record acceptance follow-up tasks in {}: {}",
+                                    tasks_path.display(),
+                                    err
+                                )),
+                                rejected: None,
+                            };
+                        }
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
@@ -1325,7 +1379,6 @@ impl ParallelExecutor {
                                 ))
                                 .await;
                         }
-                        // Continue loop - retry apply with updated tasks
                         continue;
                     }
                     Ok((

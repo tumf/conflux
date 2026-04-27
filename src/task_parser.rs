@@ -6,6 +6,7 @@
 use crate::error::{OrchestratorError, Result};
 use crate::tui::log_deduplicator;
 use regex::Regex;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::OnceLock;
 use tracing::debug;
@@ -385,6 +386,74 @@ pub fn parse_progress_with_fallback(
     )))
 }
 
+fn acceptance_follow_up_heading(attempt: u32) -> String {
+    format!("## Acceptance #{} Failure Follow-up", attempt)
+}
+
+pub fn record_acceptance_follow_up(
+    tasks_path: &Path,
+    attempt: u32,
+    findings: &[String],
+) -> Result<()> {
+    let mut content = std::fs::read_to_string(tasks_path).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", tasks_path, e))
+    })?;
+
+    let heading = acceptance_follow_up_heading(attempt);
+    let mut normalized_findings = findings
+        .iter()
+        .map(|finding| finding.trim())
+        .filter(|finding| !finding.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    normalized_findings.sort();
+    normalized_findings.dedup();
+
+    if normalized_findings.is_empty() {
+        normalized_findings
+            .push("Investigate acceptance failure and apply the required fix".to_string());
+    }
+
+    if let Some(section_start) = content.find(&heading) {
+        let section_body_start = content[section_start..]
+            .find('\n')
+            .map(|offset| section_start + offset + 1)
+            .unwrap_or(content.len());
+        let section_end = content[section_body_start..]
+            .find("\n## ")
+            .map(|offset| section_body_start + offset + 1)
+            .unwrap_or(content.len());
+        let existing_section = &content[section_body_start..section_end];
+        let mut new_section = String::new();
+        for finding in normalized_findings {
+            let _ = writeln!(&mut new_section, "- [ ] {}", finding);
+        }
+        if existing_section.trim() != new_section.trim() {
+            content.replace_range(section_body_start..section_end, &new_section);
+        }
+    } else {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.ends_with("\n\n") {
+            content.push('\n');
+        }
+        let _ = writeln!(&mut content, "{}", heading);
+        for finding in normalized_findings {
+            let _ = writeln!(&mut content, "- [ ] {}", finding);
+        }
+    }
+
+    std::fs::write(tasks_path, content).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!(
+            "Failed to write tasks file {:?}: {}",
+            tasks_path, e
+        ))
+    })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +512,50 @@ mod tests {
         let progress = parse_content(content, None);
         assert_eq!(progress.total, 2);
         assert_eq!(progress.completed, 0);
+    }
+
+    #[test]
+    fn test_record_acceptance_follow_up_appends_unchecked_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
+
+        record_acceptance_follow_up(
+            &tasks_path,
+            2,
+            &[
+                "missing repository coverage".to_string(),
+                "add notification links".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
+        assert!(content.contains("- [ ] missing repository coverage"));
+        assert!(content.contains("- [ ] add notification links"));
+
+        let progress = parse_file(&tasks_path, None).unwrap();
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 3);
+    }
+
+    #[test]
+    fn test_record_acceptance_follow_up_replaces_existing_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] stale\n",
+        )
+        .unwrap();
+
+        record_acceptance_follow_up(&tasks_path, 1, &["fresh finding".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Acceptance #1 Failure Follow-up"));
+        assert!(content.contains("- [ ] fresh finding"));
+        assert!(!content.contains("- [x] stale"));
     }
 
     #[test]

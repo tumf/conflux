@@ -26,6 +26,7 @@ use crate::orchestration::{
     ArchiveResult, OutputHandler, RejectionReviewVerdict,
 };
 use crate::stall::{StallDetector, StallPhase};
+use crate::task_parser;
 use crate::task_parser::TaskProgress;
 use crate::vcs::VcsBackend;
 
@@ -561,6 +562,7 @@ impl SerialRunService {
                         Ok((result, _attempt_number, _command)) => Ok(self
                             .process_acceptance_result(
                                 &change.id,
+                                &self.repo_root,
                                 agent,
                                 result,
                                 is_single_change_stopped,
@@ -636,6 +638,7 @@ impl SerialRunService {
     fn process_acceptance_result<F>(
         &self,
         change_id: &str,
+        workspace_path: &std::path::Path,
         agent: &AgentRunner,
         acceptance_result: AcceptanceResult,
         is_single_change_stopped: F,
@@ -686,10 +689,30 @@ impl SerialRunService {
                     findings.len(),
                     blocking_gate_context
                 );
-                // Note: tasks.md is now updated by the acceptance agent itself
+                let tasks_path = workspace_path
+                    .join("openspec")
+                    .join("changes")
+                    .join(change_id)
+                    .join("tasks.md");
+                if let Err(err) = task_parser::record_acceptance_follow_up(
+                    &tasks_path,
+                    agent.next_acceptance_attempt_number(change_id),
+                    &findings,
+                ) {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!(
+                            "Failed to record acceptance follow-up tasks in {}: {}",
+                            tasks_path.display(),
+                            err
+                        ),
+                    };
+                }
                 ChangeProcessResult::AcceptanceFailed { findings }
             }
-            AcceptanceResult::CommandFailed { error, findings: _ } => {
+            AcceptanceResult::CommandFailed {
+                error,
+                findings: _findings,
+            } => {
                 error!("Acceptance command failed for {}: {}", change_id, error);
                 // Note: tasks.md is now updated by the acceptance agent itself
                 ChangeProcessResult::AcceptanceCommandFailed { error }
@@ -883,6 +906,7 @@ mod tests {
 
         let result = service.process_acceptance_result(
             "test-change",
+            temp_dir.path(),
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -910,6 +934,7 @@ mod tests {
 
         let result = service.process_acceptance_result(
             "test-change",
+            temp_dir.path(),
             &agent,
             AcceptanceResult::Pass,
             || false,
@@ -931,6 +956,7 @@ mod tests {
 
         let result = service.process_acceptance_result(
             "test-change",
+            temp_dir.path(),
             &agent,
             AcceptanceResult::Blocked,
             || false, // Not a single-change stop

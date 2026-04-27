@@ -2004,6 +2004,107 @@ async fn test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_chan
 }
 
 #[tokio::test]
+async fn test_acceptance_fail_records_follow_up_tasks() {
+    use tempfile::TempDir;
+
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let change_id = "change-a";
+    let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
+    std::fs::write(
+        tasks_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] 1. done\n",
+    )
+    .or_fail("unexpected error");
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(
+            "sh -c 'echo ACCEPTANCE: FAIL; echo; echo FINDINGS:; echo - missing regression test; echo - add repo coverage'"
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, iteration) = execute_acceptance_in_workspace(
+        change_id,
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("unexpected error");
+
+    match result {
+        crate::orchestration::AcceptanceResult::Fail { findings } => {
+            assert_eq!(findings.len(), 2);
+        }
+        other => panic!("expected acceptance fail, got {:?}", other),
+    }
+
+    crate::task_parser::record_acceptance_follow_up(
+        &tasks_dir.join("tasks.md"),
+        iteration,
+        &[
+            "missing regression test".to_string(),
+            "add repo coverage".to_string(),
+        ],
+    )
+    .or_fail("unexpected error");
+
+    let updated_tasks =
+        std::fs::read_to_string(tasks_dir.join("tasks.md")).or_fail("unexpected error");
+    assert!(updated_tasks.contains("## Acceptance #1 Failure Follow-up"));
+    assert!(updated_tasks.contains("- [ ] missing regression test"));
+    assert!(updated_tasks.contains("- [ ] add repo coverage"));
+
+    let progress = crate::task_parser::parse_file(&tasks_dir.join("tasks.md"), Some(change_id))
+        .or_fail("unexpected error");
+    assert_eq!(progress.completed, 1);
+    assert_eq!(progress.total, 3);
+}
+
+#[tokio::test]
 async fn test_acceptance_history_records_end_revision_when_head_changes() {
     use tempfile::TempDir;
 
