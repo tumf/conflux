@@ -375,48 +375,24 @@ The rejection flow SHALL be used by both serial and parallel execution services.
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 
-The system SHALL treat `openspec/changes/<change_id>/REJECTED.md` as the durable rejection marker and SHALL exclude marker-bearing changes from the active listing returned by `list_changes_native()`.
+The system SHALL continue to treat `openspec/changes/<change_id>/REJECTED.md` as the durable rejection marker and exclude marker-bearing changes from the execution-oriented active listing returned by `list_changes_native()`.
 
-When a previously rejected change reappears in the active listing because its `REJECTED.md` marker has been removed from the base branch, the runtime SHALL clear the in-memory `Rejected` terminal state for that change and restore it to the default non-terminal state (`terminal = None`, `activity = Idle`, `wait_state = None`, `queue_intent = NotQueued`). A reactivated change SHALL be eligible for `AddToQueue` and SHALL display as `not queued` after refresh.
+This exclusion contract applies to execution candidate discovery and queue addition. It SHALL NOT forbid read-only operational surfaces such as the TUI change list from showing the rejected change as a terminal row.
 
-This ensures rejected changes are not picked up by `cflx run` or presented as candidates for queue addition.
-
-#### Scenario: Rejected marker excludes change from active list
+#### Scenario: TUI may still show rejected change as read-only row
 
 - **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
 - **AND** `openspec/changes/fix-auth/proposal.md` exists
-- **WHEN** `list_changes_native()` is called
-- **THEN** `fix-auth` is NOT included in the returned change list
+- **WHEN** a TUI-facing change snapshot is built
+- **THEN** `fix-auth` MAY be included as a read-only rejected row
+- **AND** the execution-oriented active listing remains unchanged
 
-#### Scenario: Non-rejected change with proposal is included
+#### Scenario: Rejected marker still excludes execution candidate
 
-- **GIVEN** `openspec/changes/add-feature/proposal.md` exists
-- **AND** `openspec/changes/add-feature/REJECTED.md` does NOT exist
-- **WHEN** `list_changes_native()` is called
-- **THEN** `add-feature` IS included in the returned change list
-
-#### Scenario: Removal of REJECTED marker reactivates change in reducer
-
-- **GIVEN** change `fix-auth` was previously rejected and the runtime holds `TerminalState::Rejected` for it
-- **AND** the user deletes `openspec/changes/fix-auth/REJECTED.md` from the base branch
-- **WHEN** `ChangesRefreshed` fires with `fix-auth` present in the active change list
-- **THEN** the runtime clears `TerminalState::Rejected` for `fix-auth`
-- **AND** the display status for `fix-auth` becomes `not queued`
-- **AND** `AddToQueue("fix-auth")` succeeds (not NoOp)
-
-#### Scenario: Reactivated change can be queued again
-
-- **GIVEN** change `fix-auth` has been reactivated after `REJECTED.md` removal and refresh
-- **WHEN** the user queues `fix-auth` via `AddToQueue`
-- **THEN** the display status becomes `queued`
-- **AND** the change is eligible for execution dispatch
-
-#### Scenario: Marker still present keeps change excluded
-
-- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` still exists on the base branch
-- **WHEN** `ChangesRefreshed` fires
-- **THEN** `fix-auth` is NOT in the active change list
-- **AND** the runtime does NOT clear `TerminalState::Rejected`
+- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
+- **AND** `openspec/changes/fix-auth/proposal.md` exists
+- **WHEN** `list_changes_native()` is called for execution candidate discovery
+- **THEN** `fix-auth` is NOT included in the returned active change list
 
 ### Requirement: Parallel mode treats archive as merge-wait
 
@@ -714,76 +690,45 @@ If another change in the same Project has `ActivityState::Resolving`, the archiv
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 
-The system SHALL treat `openspec/changes/<change_id>/REJECTED.md` as the durable rejection marker and SHALL exclude marker-bearing changes from the execution-oriented active listing returned by `list_changes_native()`.
+The system SHALL continue to treat `openspec/changes/<change_id>/REJECTED.md` as the durable rejection marker and exclude marker-bearing changes from the execution-oriented active listing returned by `list_changes_native()`.
 
-This exclusion contract applies to execution candidate discovery and queue addition. It SHALL NOT by itself forbid read-only operational surfaces such as the dashboard change list from showing the rejected change as a terminal status row.
+This exclusion contract applies to execution candidate discovery and queue addition. It SHALL NOT forbid read-only operational surfaces such as the TUI change list from showing the rejected change as a terminal row.
 
-When a previously rejected change reappears in the active listing because its `REJECTED.md` marker has been removed from the base branch, the runtime SHALL clear the in-memory `Rejected` terminal state for that change and restore it to the default non-terminal state (`terminal = None`, `activity = Idle`, `wait_state = None`, `queue_intent = NotQueued`). A reactivated change SHALL be eligible for `AddToQueue` and SHALL display as `not queued` after refresh.
-
-#### Scenario: Rejected marker excludes change from active execution list
+#### Scenario: TUI may still show rejected change as read-only row
 
 - **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
 - **AND** `openspec/changes/fix-auth/proposal.md` exists
-- **WHEN** `list_changes_native()` is called
-- **THEN** `fix-auth` is NOT included in the returned change list
-
-#### Scenario: Dashboard may still show rejected change
-
-- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
-- **AND** `openspec/changes/fix-auth/proposal.md` exists
-- **WHEN** a dashboard-facing change snapshot is built
+- **WHEN** a TUI-facing change snapshot is built
 - **THEN** `fix-auth` MAY be included as a read-only rejected row
 - **AND** the execution-oriented active listing remains unchanged
 
-#### Scenario: Non-rejected change with proposal is included
+#### Scenario: Rejected marker still excludes execution candidate
 
-- **GIVEN** `openspec/changes/add-feature/proposal.md` exists
-- **AND** `openspec/changes/add-feature/REJECTED.md` does NOT exist
-- **WHEN** `list_changes_native()` is called
-- **THEN** `add-feature` IS included in the returned change list
-
-#### Scenario: Removal of REJECTED marker reactivates change in reducer
-
-- **GIVEN** change `fix-auth` was previously rejected and the runtime holds `TerminalState::Rejected` for it
-- **AND** the user deletes `openspec/changes/fix-auth/REJECTED.md` from the base branch
-- **WHEN** `ChangesRefreshed` fires with `fix-auth` present in the active change list
-- **THEN** the runtime clears `TerminalState::Rejected` for `fix-auth`
-- **AND** the display status for `fix-auth` becomes `not queued`
-- **AND** `AddToQueue("fix-auth")` succeeds (not NoOp)
-
-#### Scenario: Reactivated change can be queued again
-
-- **GIVEN** change `fix-auth` has been reactivated after `REJECTED.md` removal and refresh
-- **WHEN** the user queues `fix-auth` via `AddToQueue`
-- **THEN** the display status becomes `queued`
-- **AND** the change is eligible for execution dispatch
-
-#### Scenario: Marker still present keeps change excluded
-
-- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` still exists on the base branch
-- **WHEN** `ChangesRefreshed` fires
-- **THEN** `fix-auth` is NOT in the active change list
-- **AND** the runtime does NOT clear `TerminalState::Rejected`
+- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
+- **AND** `openspec/changes/fix-auth/proposal.md` exists
+- **WHEN** `list_changes_native()` is called for execution candidate discovery
+- **THEN** `fix-auth` is NOT included in the returned active change list
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 
-`list_changes_native()` SHALL remain execution-oriented and MUST exclude any change directory that contains both `proposal.md` and `REJECTED.md`.
+The system SHALL continue to treat `openspec/changes/<change_id>/REJECTED.md` as the durable rejection marker and exclude marker-bearing changes from the execution-oriented active listing returned by `list_changes_native()`.
 
-Read-only UI surfaces MAY query rejected marker-bearing changes separately, but this MUST NOT change execution candidate discovery semantics.
+This exclusion contract applies to execution candidate discovery and queue addition. It SHALL NOT forbid read-only operational surfaces such as the TUI change list from showing the rejected change as a terminal row.
 
-#### Scenario: Active listing excludes rejected marker-bearing change
+#### Scenario: TUI may still show rejected change as read-only row
 
-- **GIVEN** `openspec/changes/fix-auth/proposal.md` exists
-- **AND** `openspec/changes/fix-auth/REJECTED.md` exists
-- **WHEN** `list_changes_native()` is called
-- **THEN** `fix-auth` is excluded from the returned execution candidate list
+- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
+- **AND** `openspec/changes/fix-auth/proposal.md` exists
+- **WHEN** a TUI-facing change snapshot is built
+- **THEN** `fix-auth` MAY be included as a read-only rejected row
+- **AND** the execution-oriented active listing remains unchanged
 
-#### Scenario: Display-only rejected listing does not alter execution list
+#### Scenario: Rejected marker still excludes execution candidate
 
-- **GIVEN** one rejected change and one active change exist under `openspec/changes`
-- **WHEN** execution candidate discovery runs
-- **THEN** only the active change is returned for scheduling
-- **AND** rejected rows remain outside the execution queue lifecycle
+- **GIVEN** `openspec/changes/fix-auth/REJECTED.md` exists
+- **AND** `openspec/changes/fix-auth/proposal.md` exists
+- **WHEN** `list_changes_native()` is called for execution candidate discovery
+- **THEN** `fix-auth` is NOT included in the returned active change list
 
 ### Requirement: Resolve Wait Queue Ownership
 
