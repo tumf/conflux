@@ -10,3 +10,12 @@ error.log
 graphify-out/cache/
 graphify-out/manifest.json
 graphify-out/cost.json
+.opencode/
+.venv/
+dashboard/node_modules/
+skills/.pytest_cache/
+.tldr/
+src/.tldr/
+src/server/.tldr/
+src/tui/.tldr/
+src/tui/.tldrignore
