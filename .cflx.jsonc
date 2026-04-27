@@ -1,10 +1,5 @@
 {
     // Conflux Configuration - Project-specific overrides
-    "analyze_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
-    "apply_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
-    "archive_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
-    "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
-    "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
     // Web monitoring server configuration
     "web": {
