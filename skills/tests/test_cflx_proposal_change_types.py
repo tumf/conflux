@@ -1,16 +1,25 @@
 """Tests for Change Type classification and archive-risk warning in cflx.py validation."""
 
-import sys
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-# Allow importing cflx.py from the cflx-proposal skill
-SKILL_ROOT = Path(__file__).parent.parent / "cflx-proposal" / "scripts"
-sys.path.insert(0, str(SKILL_ROOT))
 
-from cflx import OpenSpecManager  # noqa: E402
+def _load_manager_class():
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "skills" / "cflx-workflow" / "scripts" / "cflx.py"
 
+    spec = importlib.util.spec_from_file_location("cflx_workflow_script", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec from {script_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.OpenSpecManager
+
+
+OpenSpecManager = _load_manager_class()
 FIXTURES = Path(__file__).parent / "fixtures" / "proposal_modes"
 
 

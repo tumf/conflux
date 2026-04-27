@@ -1,14 +1,25 @@
 """Tests for spec-only acceptance behavior (archive-readiness checks)."""
 
-import sys
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-SKILL_ROOT = Path(__file__).parent.parent / "cflx-proposal" / "scripts"
-sys.path.insert(0, str(SKILL_ROOT))
 
-from cflx import OpenSpecManager  # noqa: E402
+def _load_manager_class():
+    repo_root = Path(__file__).resolve().parents[2]
+    script_path = repo_root / "skills" / "cflx-workflow" / "scripts" / "cflx.py"
+
+    spec = importlib.util.spec_from_file_location("cflx_workflow_script", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec from {script_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.OpenSpecManager
+
+
+OpenSpecManager = _load_manager_class()
 
 FIXTURES = Path(__file__).parent / "fixtures" / "proposal_modes"
 
@@ -94,7 +105,9 @@ class TestSpecOnlyAcceptanceFail:
         manager = _create_spec_only_change(tmp_path, "spec-only-mod", delta)
         ok, errors, warnings = manager.validate_change("spec-only-mod", strict=True)
         risk_warnings = [w for w in warnings if "ARCHIVE-RISK" in w]
-        assert len(risk_warnings) >= 1, "Expected ARCHIVE-RISK warning for MODIFIED-only delta"
+        assert len(risk_warnings) >= 1, (
+            "Expected ARCHIVE-RISK warning for MODIFIED-only delta"
+        )
 
     def test_fixture_spec_only_risky_produces_warning(self):
         """The spec-only-risky fixture produces an ARCHIVE-RISK warning."""

@@ -7,31 +7,31 @@ The `_EVIDENCE_HINTS` tuple used by `_has_repository_evidence_hint` must include
 #### Scenario: Node.js npm run command accepted
 
 **Given**: A task with verification note `(verification: run npm run build -- succeeds)`
-**When**: `cflx.py validate <id> --strict --evidence error` is executed
+**When**: `cflx openspec validate <id> --strict --evidence error` is executed
 **Then**: The verification note is accepted (no error about missing repository-verifiable evidence)
 
 #### Scenario: Rust cargo test command accepted
 
 **Given**: A task with verification note `(verification: cargo test passes)`
-**When**: `cflx.py validate <id> --strict --evidence error` is executed
+**When**: `cflx openspec validate <id> --strict --evidence error` is executed
 **Then**: The verification note is accepted
 
 #### Scenario: Go test command accepted
 
 **Given**: A task with verification note `(verification: go test ./... passes)`
-**When**: `cflx.py validate <id> --strict --evidence error` is executed
+**When**: `cflx openspec validate <id> --strict --evidence error` is executed
 **Then**: The verification note is accepted
 
 #### Scenario: Test directory path accepted
 
 **Given**: A task with verification note `(verification: test/integration/auth.test.ts passes)`
-**When**: `cflx.py validate <id> --strict --evidence error` is executed
+**When**: `cflx openspec validate <id> --strict --evidence error` is executed
 **Then**: The verification note is accepted
 
 #### Scenario: Existing Python hints still accepted
 
 **Given**: A task with verification note `(verification: pytest tests/test_auth.py passes)`
-**When**: `cflx.py validate <id> --strict --evidence error` is executed
+**When**: `cflx openspec validate <id> --strict --evidence error` is executed
 **Then**: The verification note is accepted (backward compatible)
 
 ## Requirements
@@ -43,68 +43,92 @@ Strict validation MUST accept a change that has a `specs/.no-delta` marker file 
 #### Scenario: Change with .no-delta marker passes strict validation
 
 **Given**: A change directory contains `specs/.no-delta` and no subdirectories under `specs/`
-**When**: `cflx.py validate <id> --strict` is executed
+**When**: `cflx openspec validate <id> --strict` is executed
 **Then**: Validation passes without spec delta errors
 
 #### Scenario: .no-delta marker conflicts with existing spec deltas
 
 **Given**: A change directory contains both `specs/.no-delta` and one or more spec delta subdirectories under `specs/`
-**When**: `cflx.py validate <id> --strict` is executed
+**When**: `cflx openspec validate <id> --strict` is executed
 **Then**: Validation fails with an error indicating `.no-delta` conflicts with existing spec deltas
 
 #### Scenario: No .no-delta and no spec deltas fails strict validation
 
 **Given**: A change directory has no `specs/.no-delta` file and no spec delta subdirectories under `specs/`
-**When**: `cflx.py validate <id> --strict` is executed
+**When**: `cflx openspec validate <id> --strict` is executed
 **Then**: Validation fails with an error indicating no spec deltas found (unchanged from current behavior)
 
 ## Requirements
 
 ### Requirement: change-directory-validity-filter
 
-`cflx.py` の `list_changes()` および `_find_change_dir()` は、`proposal.md` が存在しないディレクトリを有効な change として扱ってはならない（MUST NOT）。invalid ディレクトリを検出した場合は stderr に警告を出力しなければならない（MUST）。
+`cflx openspec` の change 列挙および change 解決処理は、`proposal.md` が存在しないディレクトリを有効な change として扱ってはならない（MUST NOT）。invalid ディレクトリを検出した場合は stderr に警告を出力しなければならない（MUST）。
 
 #### Scenario: proposal.md のないディレクトリが list から除外される
 
 - **GIVEN** `openspec/changes/broken-dir/` が存在するが `proposal.md` を含まない
-- **WHEN** `cflx.py list` を実行する
+- **WHEN** `cflx openspec list` を実行する
 - **THEN** `broken-dir` は change 一覧に表示されない
 - **AND** stderr に `broken-dir` に関する警告が出力される
 
 #### Scenario: proposal.md のあるディレクトリは従来どおり表示される
 
 - **GIVEN** `openspec/changes/valid-change/proposal.md` が存在する
-- **WHEN** `cflx.py list` を実行する
+- **WHEN** `cflx openspec list` を実行する
 - **THEN** `valid-change` は change 一覧に表示される
 
 #### Scenario: _find_change_dir が invalid ディレクトリを返さない
 
 - **GIVEN** `openspec/changes/ghost-dir/` が存在するが `proposal.md` を含まない
-- **WHEN** `show ghost-dir` を実行する
+- **WHEN** `cflx openspec show ghost-dir` を実行する
 - **THEN** change が見つからないエラーが返る
 
 ## Requirements
 
 ### Requirement: Bundled skills use native OpenSpec CLI commands
 
-Conflux bundled skill sources and skill-facing documentation MUST instruct agents and users to call native `cflx openspec` subcommands for list/show/validate/archive operations. Distributed bundled skills MUST NOT require a bundled `scripts/cflx.py` auxiliary file solely to perform those operations.
+Conflux skill sources, active canonical specs, and repository-facing validator guidance MUST instruct agents and users to call native `cflx openspec` subcommands for list/show/validate/archive operations. The repository MUST NOT depend on `skills/cflx-proposal/scripts/cflx.py` as an executable validator contract once native CLI parity is complete.
 
-#### Scenario: Proposal skill references native validation command
+#### Scenario: repository no longer retains cflx.py validator helper
 
-- **GIVEN** the repository contains the bundled `cflx-proposal` skill source
-- **WHEN** the skill documents how to validate a proposal strictly
-- **THEN** it references `cflx openspec validate <id> --strict`
-- **AND** it does not require `python3 "<SKILL_ROOT>/scripts/cflx.py"`
+- **GIVEN** the native Rust validator already covers the proposal validation contract used by active Conflux workflows
+- **WHEN** repository validation and skill-distribution checks are executed
+- **THEN** the repository does not contain `skills/cflx-proposal/scripts/cflx.py`
+- **AND** proposal validation continues to work through `cflx openspec validate ...`
+- **AND** no active canonical spec or skill-facing documentation instructs the user to execute `cflx.py`
 
-#### Scenario: Workflow skill references native list/show/archive commands
+### Requirement: Native validator owns behavior-centric proposal checks
 
-- **GIVEN** the repository contains the bundled `cflx-workflow` skill source or references
-- **WHEN** the skill documents change lookup or archive actions
-- **THEN** it references `cflx openspec list`, `cflx openspec show`, and `cflx openspec archive`
-- **AND** it does not instruct the agent to call a bundled helper script for those operations
+The native `cflx openspec validate` implementation MUST be the sole executable contract for behavior-centric proposal validation. It MUST detect behavior-changing proposal tasks that appear complete through artifact existence alone rather than through provable runtime behavior delivery.
 
-#### Scenario: Installed bundled skills no longer ship cflx.py helpers
+#### Scenario: behavior-changing task without verification ownership is warned
 
-- **WHEN** the user runs `cflx install-skills`
-- **THEN** the installed `cflx-proposal` and `cflx-workflow` skill directories do not contain `scripts/cflx.py`
-- **AND** the installed instructions still provide native command guidance for the equivalent operations
+- **GIVEN** an implementation or hybrid proposal contains a behavior-changing checkbox task with a `(verification: ...)` note
+- **AND** the verification note does not declare one of `unit`, `integration`, `e2e`, `manual`, `benchmark`, or `not-testable`
+- **WHEN** `cflx openspec validate <change-id> --strict --evidence warn` runs
+- **THEN** validation succeeds
+- **AND** it emits a warning that verification ownership is missing for that behavior-changing task
+
+#### Scenario: artifact-oriented tasks dominate a runtime proposal
+
+- **GIVEN** an implementation or hybrid proposal claims runtime behavior changes
+- **AND** its active checkbox tasks are dominated by `define` / `document` / `describe` style tasks instead of implementation-facing wiring or behavior-delivery tasks
+- **WHEN** `cflx openspec validate <change-id> --strict --evidence warn` runs
+- **THEN** validation succeeds
+- **AND** it emits a warning that artifact-oriented tasks dominate or match behavior-changing tasks
+
+#### Scenario: executable surface lacks runnable verification
+
+- **GIVEN** an implementation or hybrid proposal mentions a CLI, API, workflow, job, worker, or background process as part of the requested behavior
+- **AND** its task verification notes do not include a runnable verification path that exercises the executable surface
+- **WHEN** `cflx openspec validate <change-id> --strict --evidence warn` runs
+- **THEN** validation succeeds
+- **AND** it emits a warning that executable-surface behavior lacks runnable verification coverage
+
+#### Scenario: runtime behavior claim lacks implementation-facing tasks
+
+- **GIVEN** an implementation or hybrid proposal claims runtime behavior changes such as handlers, webhook delivery, persistence, notifications, commands, or jobs
+- **AND** its checkbox tasks do not include implementation-facing behavior tasks
+- **WHEN** `cflx openspec validate <change-id> --strict --evidence warn` runs
+- **THEN** validation succeeds
+- **AND** it emits a warning that runtime behavior is claimed without implementation-facing tasks
