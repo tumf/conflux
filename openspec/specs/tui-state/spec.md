@@ -43,3 +43,39 @@ TUI 固有のステータス enum（旧 `QueueStatus`）を保持してはなら
 - **GIVEN** 同一 Project 内のある Change が `Resolving` 状態である（`is_resolving` が `true`）
 - **WHEN** ユーザーが MergeWait の別の Change に対して M キーを押す
 - **THEN** その Change は `resolve_queue` に追加され即時開始はされない（resolve 直列化は維持）
+
+### Requirement: TUI rejected row is visible but not selectable
+
+`openspec/changes/<change-id>/proposal.md` と `openspec/changes/<change-id>/REJECTED.md` が存在する場合、TUI は当該 change を `rejected` の read-only row として表示しなければならない（MUST）。
+
+この row は execution candidate ではなく、queue 操作の対象にしてはならない（MUST NOT）。
+
+#### Scenario: refresh adds rejected row as read-only
+
+- **GIVEN** `fix-auth` が `proposal.md` と `REJECTED.md` を持つ
+- **WHEN** TUI の refresh が change 一覧を再構築する
+- **THEN** `fix-auth` row は一覧に表示される
+- **AND** `display_status_cache` は `rejected` になる
+- **AND** `selected` は `false` のまま維持される
+
+#### Scenario: rejected row ignores queue toggles
+
+- **GIVEN** カーソルが `rejected` row にある
+- **WHEN** ユーザーが Space または `@` で mark/queue 操作を試みる
+- **THEN** row の `selected` は変更されない
+- **AND** queue intent を変更するコマンドは発行されない
+
+#### Scenario: rejected row is excluded from F5 start/resume/retry candidate selection
+
+- **GIVEN** `rejected` row が一覧に表示されている
+- **WHEN** ユーザーが F5 で start/resume/retry を実行する
+- **THEN** `rejected` row は実行対象 ID に含まれない
+- **AND** scheduler に投入されない
+
+#### Scenario: marker removal reactivates row as normal change
+
+- **GIVEN** 以前 `rejected` row として表示されていた `fix-auth` から `REJECTED.md` が削除された
+- **WHEN** 次回 refresh が active listing を取得する
+- **THEN** `fix-auth` は通常 row として再活性化される
+- **AND** `display_status_cache` は `not queued` になる
+- **AND** `selected` は `false` のままである

@@ -765,6 +765,26 @@ When a previously rejected change reappears in the active listing because its `R
 - **THEN** `fix-auth` is NOT in the active change list
 - **AND** the runtime does NOT clear `TerminalState::Rejected`
 
+### Requirement: Rejected Change Exclusion from Change Listing
+
+`list_changes_native()` SHALL remain execution-oriented and MUST exclude any change directory that contains both `proposal.md` and `REJECTED.md`.
+
+Read-only UI surfaces MAY query rejected marker-bearing changes separately, but this MUST NOT change execution candidate discovery semantics.
+
+#### Scenario: Active listing excludes rejected marker-bearing change
+
+- **GIVEN** `openspec/changes/fix-auth/proposal.md` exists
+- **AND** `openspec/changes/fix-auth/REJECTED.md` exists
+- **WHEN** `list_changes_native()` is called
+- **THEN** `fix-auth` is excluded from the returned execution candidate list
+
+#### Scenario: Display-only rejected listing does not alter execution list
+
+- **GIVEN** one rejected change and one active change exist under `openspec/changes`
+- **WHEN** execution candidate discovery runs
+- **THEN** only the active change is returned for scheduling
+- **AND** rejected rows remain outside the execution queue lifecycle
+
 ### Requirement: Resolve Wait Queue Ownership
 
 The system SHALL own the resolve wait queue in shared orchestration state rather than in TUI-local lifecycle state.
