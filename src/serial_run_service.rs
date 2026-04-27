@@ -903,6 +903,17 @@ mod tests {
             "blocking gate: cargo clippy -- -D warnings".to_string(),
             "src/orchestration/archive.rs:459".to_string(),
         ];
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
 
         let result = service.process_acceptance_result(
             "test-change",
