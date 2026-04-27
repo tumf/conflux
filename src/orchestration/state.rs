@@ -1779,6 +1779,26 @@ mod tests {
     }
 
     #[test]
+    fn test_change_rejected_clears_only_target_queue_intent() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::new(vec!["a".to_string(), "b".to_string()], 0);
+
+        state.apply_command(ReducerCommand::AddToQueue("a".to_string()));
+        state.apply_command(ReducerCommand::AddToQueue("b".to_string()));
+        assert_eq!(state.display_status("a"), "queued");
+        assert_eq!(state.display_status("b"), "queued");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeRejected {
+            change_id: "a".to_string(),
+            reason: "blocked".to_string(),
+        });
+
+        assert_eq!(state.display_status("a"), "rejected");
+        assert_eq!(state.display_status("b"), "queued");
+    }
+
+    #[test]
     fn test_changes_refreshed_reactivates_rejected_change() {
         use crate::events::ExecutionEvent;
         use crate::openspec::{Change, ProposalMetadata};

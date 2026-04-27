@@ -54,12 +54,17 @@ export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps)
   const cfg = statusConfig[change.status] ?? statusConfig.idle;
   const barColor = progressBarColor[change.status] ?? progressBarColor.idle;
 
+  const isRejectedTerminal = change.status === 'rejected';
+
   const handleToggle = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
+      if (isRejectedTerminal) {
+        return;
+      }
       toggleChangeSelection(change.project, change.id).catch(console.error);
     },
-    [change.project, change.id],
+    [change.project, change.id, isRejectedTerminal],
   );
 
   const isActive = ['applying', 'accepting', 'archiving', 'resolving'].includes(change.status);
@@ -111,11 +116,15 @@ export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps)
               role="checkbox"
               aria-checked={change.selected}
               aria-label={`Select change ${change.id}`}
+              aria-disabled={isRejectedTerminal}
+              disabled={isRejectedTerminal}
               onClick={handleToggle}
               className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
-                change.selected
-                  ? 'border-[#3b82f6] bg-[#3b82f6] text-white'
-                  : 'border-[#52525b] bg-transparent text-transparent hover:border-[#71717a]'
+                isRejectedTerminal
+                  ? 'border-[#7f1d1d] bg-[#450a0a] text-transparent cursor-not-allowed opacity-70'
+                  : change.selected
+                    ? 'border-[#3b82f6] bg-[#3b82f6] text-white'
+                    : 'border-[#52525b] bg-transparent text-transparent hover:border-[#71717a]'
               }`}
             >
               {change.selected && (
