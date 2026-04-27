@@ -1,7 +1,7 @@
 # Graph Report - /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/hide-archived-openspec-list  (2026-04-27)
 
 ## Corpus Check
-- 228 files · ~1,245,350 words
+- 228 files · ~1,246,024 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -886,12 +886,12 @@ Nodes (1): Print detailed change information.
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `run_tui_loop()` connect `Community 9` to `Community 0`, `Community 1`, `Community 4`, `Community 5`, `Community 6`, `Community 7`, `Community 12`, `Community 14`, `Community 15`, `Community 17`?**
-  _High betweenness centrality (0.037) - this node is a cross-community bridge._
-- **Why does `parse()` connect `Community 13` to `Community 0`, `Community 2`, `Community 5`, `Community 6`, `Community 9`, `Community 21`, `Community 25`?**
-  _High betweenness centrality (0.031) - this node is a cross-community bridge._
 - **Why does `run_orchestrator()` connect `Community 9` to `Community 0`, `Community 1`, `Community 2`, `Community 3`, `Community 5`, `Community 6`, `Community 7`, `Community 11`, `Community 12`, `Community 17`, `Community 21`?**
-  _High betweenness centrality (0.031) - this node is a cross-community bridge._
+  _High betweenness centrality (0.040) - this node is a cross-community bridge._
+- **Why does `execute_acceptance_in_workspace()` connect `Community 8` to `Community 0`, `Community 1`, `Community 2`, `Community 7`, `Community 10`, `Community 17`, `Community 18`, `Community 21`, `Community 24`?**
+  _High betweenness centrality (0.037) - this node is a cross-community bridge._
+- **Why does `run_tui_loop()` connect `Community 9` to `Community 0`, `Community 1`, `Community 4`, `Community 5`, `Community 6`, `Community 7`, `Community 12`, `Community 14`, `Community 15`, `Community 17`?**
+  _High betweenness centrality (0.028) - this node is a cross-community bridge._
 - **Are the 57 inferred relationships involving `execute_acceptance_in_workspace()` (e.g. with `.dispatch_change_to_workspace()` and `.is_cancelled()`) actually correct?**
   _`execute_acceptance_in_workspace()` has 57 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 55 inferred relationships involving `run_orchestrator()` (e.g. with `handle_start_processing_command()` and `.with_event_tx()`) actually correct?**

@@ -9,3 +9,7 @@
 
 - archived change を一覧したい運用向けに別コマンドまたは flag を追加するかの検討
 - TUI / Web UI 側でも archived/noise separation を揃えるべきかの別 proposal 検討
+
+## Acceptance #1 Failure Follow-up
+- [x] Commit-path blocker resolved: removed unused `ChangeInfo.archived` field in `src/openspec_cmd.rs` and verified `cargo clippy --locked --all-targets --all-features -- -D warnings` passes (job: /Users/tumf/.local/share/agent-exec/jobs/88d5c92b65ca80c0bd739fd008863218).
+- [x] Re-verified implementation contract after blocker fix: `list_changes()` still excludes archived entries, focused tests and strict validation pass (`cargo test openspec_list_show_tests -- --nocapture`, `cflx openspec validate hide-archived-openspec-list --strict`).

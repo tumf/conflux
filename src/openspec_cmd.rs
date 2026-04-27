@@ -334,7 +334,6 @@ impl OpenSpecManager {
         let mut info = ChangeInfo {
             id,
             path: rel_path,
-            archived,
             title: None,
             tasks_completed: 0,
             tasks_total: 0,
@@ -855,7 +854,6 @@ impl OpenSpecManager {
 struct ChangeInfo {
     id: String,
     path: String,
-    archived: bool,
     title: Option<String>,
     tasks_completed: u32,
     tasks_total: u32,
@@ -1819,7 +1817,7 @@ mod openspec_list_show_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].id, "active-change");
-        assert!(!changes[0].archived);
+        assert!(changes[0].path.contains("openspec/changes/active-change"));
 
         env::set_current_dir(original_cwd).unwrap();
     }
