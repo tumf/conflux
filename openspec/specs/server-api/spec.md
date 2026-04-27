@@ -2,19 +2,17 @@
 
 ### Requirement: change-selection-state
 
-サーバーは各プロジェクトの各 change について `selected: bool` 状態をインメモリで管理する。
+The server SHALL manage in-memory `selected: bool` state for each project change.
 
-#### Scenario: new-change-defaults-to-selected
+A change that is represented as terminal `rejected` in server-facing snapshots or state transitions MUST NOT remain selected. When rejection is confirmed, the server-visible selection state for that change SHALL be cleared to `selected = false`.
 
-**Given**: プロジェクトが登録されている
-**When**: 新しい change が検出される
-**Then**: その change の `selected` は `true` に設定される
+#### Scenario: rejected change selection is cleared in server state
 
-#### Scenario: server-restart-resets-selection
-
-**Given**: サーバーが再起動される
-**When**: change 一覧が初期化される
-**Then**: 全 change の `selected` は `true` に設定される
+**Given**: change `foo` is `selected: true`
+**And**: the system confirms rejection for change `foo`
+**When**: the server updates its change state snapshot
+**Then**: change `foo` is represented as `selected: false`
+**And**: unrelated changes keep their previous `selected` values
 
 ### Requirement: toggle-change-selection-api
 
@@ -44,13 +42,16 @@ WebSocket メッセージの `RemoteChange` に `selected` フィールドが含
 
 ### Requirement: dashboard-change-checkbox
 
-ダッシュボードの change 行にチェックボックスが表示される。
+The dashboard SHALL display a checkbox for change rows that participate in normal selection semantics.
 
-#### Scenario: checkbox-toggles-selection
+Rejected terminal rows MAY remain visible for read-only operational visibility, but they MUST NOT remain represented as selected execution candidates.
 
-**Given**: ダッシュボードに change が表示されている
-**When**: ユーザーがチェックボックスをクリックする
-**Then**: toggle API が呼ばれ、チェックボックスの表示が更新される
+#### Scenario: rejected row is not kept as selected
+
+**Given**: the dashboard renders a change row whose status is `rejected`
+**When**: the row is built from the latest server snapshot
+**Then**: that row is represented with `selected: false`
+**And**: it is not treated as an active execution candidate for global Run
 
 ### Requirement: global-orchestration-status
 
@@ -230,7 +231,6 @@ The dashboard SHALL expose a per-change control for active changes that invokes 
 - **WHEN** `GET /api/v1/control/status` を呼び出す
 - **THEN** 分割前と同一の JSON レスポンスが返される
 
-
 ### Requirement: WebSocket change list uses reducer-derived status
 
 The WebSocket change list payload SHALL use `ChangeRuntimeState.display_status()` as the authoritative source for each change's status field when orchestrator state is available.
@@ -251,7 +251,6 @@ The system SHALL NOT derive display status from `detect_workspace_state()` indep
 - **AND** workspace detection reports `WorkspaceState::Applied`
 - **WHEN** the WebSocket builds the change list payload
 - **THEN** the status field is `applied` (not `archiving`)
-
 
 ### Requirement: WebSocket change list uses reducer-derived status
 

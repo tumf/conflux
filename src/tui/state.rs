@@ -47,6 +47,7 @@ fn apply_remote_status(change: &mut ChangeState, status: &str) {
         "blocked" => Some("blocked"),
         "queued" => Some("queued"),
         "idle" => Some("not queued"),
+        "rejected" => Some("rejected"),
         "error" => Some("error"),
         _ => None,
     };
@@ -1015,6 +1016,9 @@ impl AppState {
                     change.set_display_status_cache("error");
                 } else {
                     change.set_display_status_cache(normalized);
+                    if normalized == "rejected" {
+                        change.selected = false;
+                    }
                 }
             }
         }
@@ -3243,6 +3247,23 @@ mod tests {
         assert!(
             app.changes[1].selected,
             "eligible rows should still be marked"
+        );
+    }
+
+    #[test]
+    fn test_apply_display_statuses_rejected_clears_selection() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].selected = true;
+
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("change-a".to_string(), "rejected");
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(app.changes[0].display_status_cache, "rejected");
+        assert!(
+            !app.changes[0].selected,
+            "rejected terminal row must not keep execution mark"
         );
     }
 
