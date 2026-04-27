@@ -7,3 +7,6 @@ error.log
 .playwright-cli/
 .tldrignore
 .cflx/acceptance-state.json
+graphify-out/cache/
+graphify-out/manifest.json
+graphify-out/cost.json
