@@ -1,0 +1,10 @@
+## Implementation Tasks
+
+- [ ] Port behavior-centric proposal validation checks into the native Rust validator used by `cflx openspec validate`, including verification ownership detection, artifact-oriented task warnings, missing runnable verification detection, executable-surface runnable-check warnings, and runtime-behavior-claim mismatches (verification: integration - targeted Rust validator tests in `src/openspec_cmd.rs` fail before the port and pass after the native warning paths are implemented).
+- [ ] Add native Rust regression coverage for the validator behaviors that are currently or newly asserted through `skills/tests/test_cflx_proposal_change_types.py`, so representative `warn` and `error` cases are enforced by the product runtime surface rather than a Python helper import (verification: integration - `cargo test openspec_cmd::tests -- --nocapture` covers archive-risk, change-type, evidence, verification-ownership, artifact-heavy, executable-surface, and runtime-claim warning scenarios).
+- [ ] Update active canonical specs and validator-facing docs so they describe `cflx openspec list/show/validate/archive` as the sole executable contract and bind the new behavior-centric warnings to repository-verifiable outcomes rather than helper-script internals (verification: unit/manual - strict spec validation passes and active spec/doc text references `cflx openspec ...` instead of executable `cflx.py` commands).
+- [ ] Remove `skills/cflx-proposal/scripts/cflx.py` and any remaining direct repository dependency on it only after native validator logic and tests fully cover its remaining responsibilities (verification: integration - after deleting the file, `cargo test`, `cargo test --test install_skills_test -- --nocapture`, and representative `cflx openspec validate retire-cflx-py-validator --strict --evidence warn` execution succeed without Python helper fallback).
+
+## Future Work
+
+- Normalize archived historical proposals/spec text that still mention `cflx.py` if the project later wants a full documentation cleanup pass.
