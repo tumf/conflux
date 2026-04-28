@@ -10,3 +10,7 @@
 
 - `dashboard/dist/` 配下の他 committed generated files（`index.html`, `svg`, `debug-ws.js`）に同じ hook policy を広げる必要があるかの再評価
 - generated artifact を Git 管理する配布戦略自体の見直し
+
+## Acceptance #1 Failure Follow-up
+- [x] `.pre-commit-config.yaml:8-13` では `end-of-file-fixer` の除外対象が `^dashboard/dist/assets/index-.*\.(js|css)$` のみで、実際に hook が書き換えた `graphify-out/GRAPH_REPORT.md`・`graphify-out/graph.html`・`graphify-out/graph.json` が未除外です。変更対象の dashboard asset 問題自体は回避できていますが、repository の実 commit path では別の generated artifact が同じ fixer で失敗する新規問題を導入/露呈しており、`make check`/archive 前検証が clean に完走できません。
+- [x] `bash dashboard/build.sh && prek run --all-files` の実行で `fix end of files` hook が失敗し、`graphify-out/GRAPH_REPORT.md`・`graphify-out/graph.html`・`graphify-out/graph.json` を自動修正して dirty worktree を残します（agent-exec job `584b8051494205adf09c0f9fffc9b837` の stdout 18-29 行、`git status --porcelain` で上記 3 ファイルが `M`）。archive 前の通常 commit 経路で `prek run --all-files` が blocker になるため、現状は archive commit readiness を満たしていません。
