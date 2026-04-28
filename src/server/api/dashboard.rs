@@ -36,8 +36,6 @@ pub(super) async fn dashboard_assets(Path(filename): Path<String>) -> Response {
         "application/octet-stream"
     };
 
-    // This simple approach requires manual asset mapping.
-    // For production, prefer a build.rs that generates asset routes dynamically.
     let response = match filename.as_str() {
         env!("DASHBOARD_CSS") => (
             StatusCode::OK,

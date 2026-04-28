@@ -10,30 +10,17 @@ homepage = "https://github.com/tumf/conflux"
 documentation = "https://github.com/tumf/conflux#readme"
 keywords = ["ai", "codegen", "orchestration", "git", "cli"]
 categories = ["command-line-utilities", "development-tools"]
-exclude = [
-  ".agents/**",
-  ".claude/**",
-  ".codex/**",
-  ".github/**",
-  ".leann/**",
-  ".opencode/**",
-  ".serena/**",
-  ".tldrignore",
-  ".wt/**",
-  ".pre-commit-config.yaml",
-  ".node-version",
-  ".setup-completed",
-  "docs/**",
-  "openspec/**",
-  "reports/**",
-  "scripts/**",
-  "skills/*.skill",
-  "skills/README.md",
-  "release.toml",
-  "dist-workspace.toml",
-  "AGENTS.md",
-  "CLAUDE.md",
-  "README.ja.md",
+include = [
+  "src/**",
+  "tests/**",
+  "skills/**",
+  "web/**",
+  "dashboard/dist/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "build.rs",
+  "README.md",
+  "LICENSE*",
 ]
 
 [lib]

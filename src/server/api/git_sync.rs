@@ -1738,7 +1738,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_git_sync_runs_resolve_when_shas_differ() {
+        let _cwd_lock = crate::test_support::cwd_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
 
         let origin = create_local_git_repo(temp_dir.path());
@@ -1902,7 +1904,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_git_sync_runs_resolve_when_remote_ahead() {
+        let _cwd_lock = crate::test_support::cwd_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
 
         let origin = create_local_git_repo(temp_dir.path());
