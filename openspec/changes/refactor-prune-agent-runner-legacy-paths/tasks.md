@@ -20,4 +20,4 @@
 - [x] cargo test が agent::tests::test_run_apply_with_runner_echo_command で失敗しています。src/agent/tests.rs:62-71 のテストが analyze_dependencies() を呼んでおり apply with runner の検証になっていないため、run_apply*_with_runner を検証する形へ修正するか実装に合わせて更新してください
 - [ ] git status --porcelain が空ではなく dirty working tree です: openspec/changes/refactor-prune-agent-runner-legacy-paths/tasks.md
 - [x] openspec/changes/refactor-prune-agent-runner-legacy-paths/tasks.md:9-22 の Implementation Blocker #1 は、根拠にしている legacy 直接呼び出しテストが既に除去されているため現状では正当な blocker ではありません。削除するか履歴メモへ移して現状と整合させてください
-- [ ] src/agent/runner.rs に #[allow(dead_code)] が run_archive_streaming 以外にも複数残っており task 4 の完了条件と不整合です（例: new_with_shared_state, run_archive_streaming_with_runner, format_archive_history, run_acceptance_streaming, run_archive, analyze_dependencies_streaming, run_resolve_streaming_in_dir, execute_shell_command）
+- [x] src/agent/runner.rs に #[allow(dead_code)] が run_archive_streaming 以外にも複数残っており task 4 の完了条件と不整合です（例: new_with_shared_state, run_archive_streaming_with_runner, format_archive_history, run_acceptance_streaming, run_archive, analyze_dependencies_streaming, run_resolve_streaming_in_dir, execute_shell_command）
