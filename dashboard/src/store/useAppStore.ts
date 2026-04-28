@@ -31,6 +31,7 @@ export interface AppState {
   uiState: Record<string, string>;
   activeCommands: ActiveCommand[];
   optimisticChangeSelection: Record<string, boolean>;
+  confirmedChangeSelection: Record<string, boolean>;
 }
 
 export type AppAction =
@@ -65,6 +66,7 @@ const initialState: AppState = {
   uiState: {},
   activeCommands: [],
   optimisticChangeSelection: {},
+  confirmedChangeSelection: {},
 };
 
 function changeSelectionKey(projectId: string, changeId: string): string {
@@ -141,6 +143,10 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       return {
         ...state,
         projects: nextProjects,
+        confirmedChangeSelection: {
+          ...state.confirmedChangeSelection,
+          [key]: incoming.selected,
+        },
       };
     }
 
@@ -177,8 +183,24 @@ export function appReducer(state: AppState, action: AppAction): AppState {
       }
 
       const { [key]: _, ...nextOptimistic } = state.optimisticChangeSelection;
+      const hasConfirmedSelection = key in state.confirmedChangeSelection;
+      const confirmedSelection = state.confirmedChangeSelection[key];
+      const nextProjects = hasConfirmedSelection
+        ? state.projects.map((project) => {
+            if (project.id !== projectId) {
+              return project;
+            }
+            return {
+              ...project,
+              changes: project.changes.map((change) =>
+                change.id === changeId ? { ...change, selected: confirmedSelection } : change,
+              ),
+            };
+          })
+        : state.projects;
       return {
         ...state,
+        projects: nextProjects,
         optimisticChangeSelection: nextOptimistic,
       };
     }

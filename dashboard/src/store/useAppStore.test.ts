@@ -61,6 +61,7 @@ const createState = (overrides: Partial<AppState> = {}): AppState => ({
   uiState: {},
   activeCommands: [],
   optimisticChangeSelection: {},
+  confirmedChangeSelection: {},
   ...overrides,
 });
 
@@ -150,7 +151,26 @@ describe('useAppStore reducer', () => {
       payload: { projectId: 'project-1', changeId: 'change-1' },
     });
 
+    expect(reconciled.projects[0].changes[0].selected).toBe(false);
     expect(reconciled.optimisticChangeSelection['project-1::change-1']).toBeUndefined();
+  });
+
+  it('CLEAR_OPTIMISTIC_CHANGE_SELECTION keeps current value when no confirmed server value exists', () => {
+    const project = createProject('project-1');
+    project.changes = [createChange('project-1', true)];
+
+    const optimisticState = createState({
+      projects: [project],
+      optimisticChangeSelection: { 'project-1::change-1': true },
+    });
+
+    const cleared = appReducer(optimisticState, {
+      type: 'CLEAR_OPTIMISTIC_CHANGE_SELECTION',
+      payload: { projectId: 'project-1', changeId: 'change-1' },
+    });
+
+    expect(cleared.projects[0].changes[0].selected).toBe(true);
+    expect(cleared.optimisticChangeSelection['project-1::change-1']).toBeUndefined();
   });
 
   it('REVERT_OPTIMISTIC_CHANGE_SELECTION restores prior selection when toggle fails', () => {
