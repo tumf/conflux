@@ -1,5 +1,5 @@
 # REJECTED
 
 - change_id: refactor-extract-git-sync-test-fixtures
-- reason: remote_ahead と shas_differ の fixture が現行 `git_sync` の fast-forward 前提と噛み合わず、要求された 200/synced + resolve 実行契約を再現できない
+- reason: Acceptance #2 follow-up の期待値（resolve 実行 + pushed）を満たす divergence fixture が現行 `git_sync` 実装契約と整合せず、実装完了不能
 - proposed_by: apply

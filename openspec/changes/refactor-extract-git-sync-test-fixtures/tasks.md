@@ -33,6 +33,20 @@
 - owner: server-api maintainers
 - decision_due: 2026-04-30
 
+## Implementation Blocker #2
+- category: spec_contradiction
+- summary: Acceptance #2 follow-up の期待値（resolve 実行 + pushed）を満たす divergence fixture が現行 `git_sync` 実装契約と整合せず、テストが再現不能
+- evidence:
+  - `cargo test test_git_sync_runs_resolve_when_ -- --nocapture` で `src/server/api/git_sync.rs:1827` が `left: Some(false) right: Some(true)` となり `test_git_sync_runs_resolve_when_shas_differ` が失敗
+  - 同コマンドで `src/server/api/git_sync.rs:1896` が `left: 422 right: 200` となり `test_git_sync_runs_resolve_when_remote_ahead` が失敗
+  - `src/server/api/git_sync.rs:401-418` の fetch 失敗ハンドリングは non-fast-forward 時に `422` を返す実装契約
+- impact: Acceptance #2 Failure Follow-up の2タスク（値固定 assertion）を満たすシナリオが現 fixture 手順では構築できず、実装修正なしでは完了不可
+- unblock_actions:
+  - `setup_git_sync_fixture` と divergence 生成手順を再設計し、`resolve_command` 実行まで到達する local/remote commit graph を deterministic に構築する
+  - あるいは OpenSpec 側で non-fast-forward 系シナリオを `422` 契約として分離し、200/synced 要件の対象シナリオを明確化する
+- owner: server-api maintainers
+- decision_due: 2026-04-30
+
 ## Rejecting Recovery Tasks
 
 - [ ] Investigate blocker in openspec/changes/refactor-extract-git-sync-test-fixtures/REJECTED.md and implement a non-rejection recovery path before rerunning apply
