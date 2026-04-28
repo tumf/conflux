@@ -11,5 +11,5 @@
 - change list の status / progress / badge 領域の幅配分見直し
 
 ## Acceptance #1 Failure Follow-up
-- [ ] /Users/tumf/work/conflux/.git/hooks/pre-commit:1-14 and .pre-commit-config.yaml:4-26 show normal commits run prek hooks, but `agent-exec run -- prek run --all-files` failed with exit 1 after auto-fixing trailing whitespace in graphify-out/GRAPH_REPORT.md (job 6670ab48ee67a5f92d69168a383b9a96), so the real archive commit path is currently blocked until hooks pass without modifying files.
-- [ ] `git status --short --untracked-files=all` remains dirty after the hook run with modified files graphify-out/GRAPH_REPORT.md, graphify-out/graph.html, and graphify-out/graph.json; this dirty working tree would block acceptance and the final archive commit path until those changes are reconciled and the tree is clean.
+- [x] Re-ran `agent-exec run -- prek run --all-files` (job `bcc4ff6da8d6c617b5a850b7a6ca8e19`) and confirmed hooks complete with `exit_code: 0`, clearing the previously reported pre-commit failure path.
+- [x] Re-ran `git status --short --untracked-files=all` after the successful hook run and confirmed no remaining working-tree changes, so the dirty-tree blocker has been resolved.
