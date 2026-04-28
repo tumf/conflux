@@ -64,11 +64,15 @@ async fn test_run_apply_with_runner_echo_command() {
         apply_command: Some("echo {change_id}".to_string()),
         ..Default::default()
     };
-    let runner = AgentRunner::new(config);
-    let result = runner.analyze_dependencies("test prompt").await;
+    let mut runner = AgentRunner::new(config);
+    let ai_runner = build_test_ai_runner();
 
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap().trim(), "test prompt");
+    let status = runner
+        .run_apply_with_runner("test-change", &ai_runner)
+        .await
+        .expect("run_apply_with_runner should succeed");
+
+    assert!(status.success());
 }
 
 #[tokio::test]

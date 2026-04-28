@@ -6,20 +6,6 @@
 - [x] 4. `#[allow(dead_code)]` の適用範囲を必要最小限へ整理し、不要な suppressions を減らす (verification: lint - `run_archive_streaming` のみ互換境界として明示コメント付き `#[allow(dead_code)]` を残し、`cargo clippy --all-targets --all-features -- -D warnings` 成功)
 - [x] 5. proposal delta と関連コード変更を strict validation と Rust 検証で確認する (verification: integration - `cflx openspec validate refactor-prune-agent-runner-legacy-paths --strict --evidence warn` 成功、`cargo test` 成功、`cargo clippy --all-targets --all-features -- -D warnings` 成功)
 
-## Implementation Blocker #1
-category: spec_contradiction
-summary: レガシーentrypoint削除/隔離要件と、同ファイル内でレガシーentrypointを直接検証している既存テスト群の同時維持が衝突している
-evidence:
-  src/agent/tests.rs:68 (`runner.run_apply("test-change")`)
-  src/agent/tests.rs:79 (`runner.run_archive("test-change")`)
-  src/agent/tests.rs:112,151,197 (`runner.run_apply_streaming(...)`)
-  src/agent/runner.rs:160-200,368-403,546-613,860-871,1006-1037 (legacy entrypoint definitions)
-impact: tasks 2-5 を現状の仕様解釈のまま完了すると、互換要件または既存テスト整合性のいずれかを破る
-unblock_actions:
-  レガシーentrypointを公開APIから外す対象範囲（テスト専用許容含む）を仕様に明記する
-  `src/agent/tests.rs` のレガシー依存テストを `*_with_runner` ベースへ置換するか、legacy境界検証として別目的に再定義する
-owner: conflux-maintainers
-decision_due: 2026-05-06
 
 ## Future Work
 
@@ -29,3 +15,9 @@ decision_due: 2026-05-06
 ## Rejecting Recovery Tasks
 
 - [x] Investigate blocker in openspec/changes/refactor-prune-agent-runner-legacy-paths/REJECTED.md and implement a non-rejection recovery path before rerunning apply (verification: integration - `src/agent/tests.rs` と `src/orchestration/archive.rs` の経路修正で blocker 根拠を解消し、`cflx openspec validate refactor-prune-agent-runner-legacy-paths --strict --evidence warn` が成功)
+
+## Acceptance #1 Failure Follow-up
+- [x] cargo test が agent::tests::test_run_apply_with_runner_echo_command で失敗しています。src/agent/tests.rs:62-71 のテストが analyze_dependencies() を呼んでおり apply with runner の検証になっていないため、run_apply*_with_runner を検証する形へ修正するか実装に合わせて更新してください
+- [ ] git status --porcelain が空ではなく dirty working tree です: openspec/changes/refactor-prune-agent-runner-legacy-paths/tasks.md
+- [x] openspec/changes/refactor-prune-agent-runner-legacy-paths/tasks.md:9-22 の Implementation Blocker #1 は、根拠にしている legacy 直接呼び出しテストが既に除去されているため現状では正当な blocker ではありません。削除するか履歴メモへ移して現状と整合させてください
+- [ ] src/agent/runner.rs に #[allow(dead_code)] が run_archive_streaming 以外にも複数残っており task 4 の完了条件と不整合です（例: new_with_shared_state, run_archive_streaming_with_runner, format_archive_history, run_acceptance_streaming, run_archive, analyze_dependencies_streaming, run_resolve_streaming_in_dir, execute_shell_command）
