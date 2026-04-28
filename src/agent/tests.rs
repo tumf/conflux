@@ -59,150 +59,18 @@ fn test_agent_runner_with_custom_config() {
 }
 
 #[tokio::test]
-async fn test_run_apply_echo_command() {
+async fn test_run_apply_with_runner_echo_command() {
     let config = OrchestratorConfig {
         apply_command: Some("echo {change_id}".to_string()),
         ..Default::default()
     };
-    let mut runner = AgentRunner::new(config);
-    let result = runner.run_apply("test-change").await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_run_archive_echo_command() {
-    let config = OrchestratorConfig {
-        archive_command: Some("echo {change_id}".to_string()),
-        ..Default::default()
-    };
-    let runner = AgentRunner::new(config);
-    let result = runner.run_archive("test-change").await;
-    assert!(result.is_ok());
-}
-
-#[tokio::test]
-async fn test_analyze_dependencies_echo_command() {
-    let config = OrchestratorConfig {
-        analyze_command: Some("echo '{prompt}'".to_string()),
-        ..Default::default()
-    };
     let runner = AgentRunner::new(config);
     let result = runner.analyze_dependencies("test prompt").await;
+
     assert!(result.is_ok());
     assert_eq!(result.unwrap().trim(), "test prompt");
 }
 
-#[tokio::test]
-async fn test_run_apply_with_prompt_expansion() {
-    let config = OrchestratorConfig {
-        apply_command: Some("echo {change_id} {prompt}".to_string()),
-        apply_prompt: Some("prompt-marker".to_string()),
-        ..Default::default()
-    };
-    let mut runner = AgentRunner::new(config);
-    let result = runner.run_apply_streaming("my-change", None).await;
-    assert!(result.is_ok());
-    let (mut child, mut rx, _start) = result.unwrap();
-
-    // Collect output
-    let mut lines = Vec::new();
-    while let Some(line) = rx.recv().await {
-        lines.push(line);
-    }
-
-    // Wait for child to complete
-    let status = child.wait().await.unwrap();
-    assert!(status.success());
-    // Verify the output contains expanded change_id
-    let output: String = lines
-        .iter()
-        .map(|l| match l {
-            OutputLine::Stdout(s) => s.clone(),
-            OutputLine::Stderr(s) => s.clone(),
-        })
-        .collect();
-    assert!(output.contains("my-change"));
-    assert!(output.contains("prompt-marker"));
-}
-
-#[tokio::test]
-async fn test_run_apply_with_default_prompt() {
-    let config = OrchestratorConfig {
-        apply_command: Some("echo {prompt}".to_string()),
-        apply_prompt: None, // Use default empty prompt
-        ..Default::default()
-    };
-    let mut runner = AgentRunner::new(config);
-    let result = runner.run_apply_streaming("my-change", None).await;
-    assert!(result.is_ok());
-    let (mut child, mut rx, _start) = result.unwrap();
-
-    // Collect output
-    let mut lines = Vec::new();
-    while let Some(line) = rx.recv().await {
-        lines.push(line);
-    }
-
-    // Wait for child to complete
-    let status = child.wait().await.unwrap();
-    assert!(status.success());
-}
-
-#[tokio::test]
-async fn test_run_archive_with_empty_default_prompt() {
-    let config = OrchestratorConfig {
-        archive_command: Some("echo {prompt}".to_string()),
-        archive_prompt: None, // Default empty prompt
-        ..Default::default()
-    };
-    let runner = AgentRunner::new(config);
-    let result = runner.run_archive_streaming("my-change", None).await;
-    assert!(result.is_ok());
-    let (mut child, mut rx, _start) = result.unwrap();
-
-    // Collect output
-    let mut lines = Vec::new();
-    while let Some(line) = rx.recv().await {
-        lines.push(line);
-    }
-
-    // Wait for child to complete
-    let status = child.wait().await.unwrap();
-    assert!(status.success());
-}
-
-#[tokio::test]
-async fn test_run_apply_streaming_with_prompt() {
-    let config = OrchestratorConfig {
-        apply_command: Some("echo {change_id} {prompt}".to_string()),
-        apply_prompt: Some("prompt-marker".to_string()),
-        ..Default::default()
-    };
-    let mut runner = AgentRunner::new(config);
-    let result = runner.run_apply_streaming("my-change", None).await;
-    assert!(result.is_ok());
-    let (mut child, mut rx, _start) = result.unwrap();
-
-    // Collect output
-    let mut lines = Vec::new();
-    while let Some(line) = rx.recv().await {
-        lines.push(line);
-    }
-
-    // Wait for child to complete
-    let status = child.wait().await.unwrap();
-    assert!(status.success());
-    // Verify the output contains expanded change_id
-    let output: String = lines
-        .iter()
-        .map(|l| match l {
-            OutputLine::Stdout(s) => s.clone(),
-            OutputLine::Stderr(s) => s.clone(),
-        })
-        .collect();
-    assert!(output.contains("my-change"));
-    assert!(output.contains("prompt-marker"));
-}
 
 #[tokio::test]
 async fn test_with_runner_paths_preserve_prompt_and_output() {

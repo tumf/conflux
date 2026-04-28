@@ -277,6 +277,7 @@ impl AgentRunner {
     /// The prompt is constructed as: user_prompt + history_context
     /// - user_prompt: from config.archive_prompt (user-customizable)
     /// - history_context: previous archive attempts (if any)
+    #[allow(dead_code)] // Legacy boundary for orchestration::archive compatibility
     pub async fn run_archive_streaming(
         &self,
         change_id: &str,
