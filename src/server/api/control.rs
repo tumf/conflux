@@ -1,7 +1,7 @@
 use super::*;
 
-use crate::server::api::ws::list_remote_changes_in_worktree;
 use crate::remote::types::RemoteStateUpdate;
+use crate::server::api::ws::list_remote_changes_in_worktree;
 
 // ─────────────────────────── /api/v1/control (global) ─────────────────────────
 
@@ -695,16 +695,20 @@ mod tests {
 
         let req = Request::builder()
             .method(Method::POST)
-            .uri(format!("/api/v1/projects/{}/changes/fix-a/toggle", entry.id))
+            .uri(format!(
+                "/api/v1/projects/{}/changes/fix-a/toggle",
+                entry.id
+            ))
             .body(Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let update = tokio::time::timeout(std::time::Duration::from_millis(500), state_updates.recv())
-            .await
-            .expect("change_update should be emitted immediately after toggle")
-            .expect("state update channel should stay open");
+        let update =
+            tokio::time::timeout(std::time::Duration::from_millis(500), state_updates.recv())
+                .await
+                .expect("change_update should be emitted immediately after toggle")
+                .expect("state update channel should stay open");
 
         match update {
             RemoteStateUpdate::ChangeUpdate { change } => {
@@ -758,10 +762,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["selected"], true);
 
-        let first_update = tokio::time::timeout(std::time::Duration::from_millis(500), state_updates.recv())
-            .await
-            .expect("toggle-all should emit immediate change_update")
-            .expect("state update channel should stay open");
+        let first_update =
+            tokio::time::timeout(std::time::Duration::from_millis(500), state_updates.recv())
+                .await
+                .expect("toggle-all should emit immediate change_update")
+                .expect("state update channel should stay open");
         match first_update {
             RemoteStateUpdate::ChangeUpdate { change } => {
                 assert_eq!(change.project, entry.id);
