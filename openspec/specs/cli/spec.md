@@ -638,11 +638,20 @@ The TUI SHALL NOT rely on retry loops to detect task completion for archiving pu
 
 archive 検証は `openspec/changes/{change_id}` が存在する場合に未アーカイブとして扱わなければならない（SHALL）。
 
+archive 検証と archived change 解決は、archive entry として direct match (`openspec/changes/archive/<change_id>`) と date-prefixed match (`openspec/changes/archive/<date>-<change_id>`) の両方を同一 change として扱わなければならない（MUST）。
+
 #### Scenario: changes が残っている場合は未アーカイブ扱い
 - **WHEN** archive コマンドが成功する
 - **AND** `openspec/changes/{change_id}` が存在している
 - **THEN** archive 検証は未アーカイブとして扱われる
 - **AND** archive コマンドは再実行される
+
+#### Scenario: dated archive entry is treated as archived completion
+- **GIVEN** `openspec/changes/{change_id}` は存在しない
+- **AND** `openspec/changes/archive/2026-01-08-{change_id}` が存在する
+- **WHEN** archive completion verification or archived change resolution runs for `{change_id}`
+- **THEN** the change is treated as archived
+- **AND** the implementation does not require a direct-match archive directory to exist
 
 ### Requirement: TUI Uses Native Change Discovery
 
@@ -1852,20 +1861,23 @@ When the user runs `cflx openspec list` without `--specs`, the command MUST enum
 
 Archived changes MAY still be resolved by detail-oriented subcommands such as `cflx openspec show <change-id>`.
 
-#### Scenario: List canonical specs through the native CLI
+The native `cflx openspec archive <change-id>` subcommand MUST archive successful changes into a date-prefixed destination under `openspec/changes/archive/` using the format `YYYY-MM-DD-<change-id>`.
 
-- **WHEN** the user runs `cflx openspec list --specs`
-- **THEN** the CLI lists canonical specifications from `openspec/specs/`
-- **AND** each listed spec includes its canonical requirement count derived from `### Requirement:` headings in `spec.md`
-- **AND** the command does not rely on `scripts/cflx.py`
+#### Scenario: archive subcommand stores change in dated archive directory
 
-#### Scenario: Canonical spec with no requirements shows zero count
+- **GIVEN** active change `add-env-openspec-cmd` exists under `openspec/changes/add-env-openspec-cmd`
+- **WHEN** the user runs `cflx openspec archive add-env-openspec-cmd`
+- **THEN** the active change directory is removed from `openspec/changes/add-env-openspec-cmd`
+- **AND** the archived change exists at `openspec/changes/archive/2026-01-08-add-env-openspec-cmd`
+- **AND** the success output reports `openspec/changes/archive/2026-01-08-add-env-openspec-cmd`
 
-- **GIVEN** a canonical spec exists under `openspec/specs/empty-spec/spec.md`
-- **AND** that file contains no `### Requirement:` headings
-- **WHEN** the user runs `cflx openspec list --specs`
-- **THEN** the CLI still lists `empty-spec`
-- **AND** it renders `Requirements: 0`
+#### Scenario: archive subcommand fails when dated destination already exists
+
+- **GIVEN** active change `add-env-openspec-cmd` exists under `openspec/changes/add-env-openspec-cmd`
+- **AND** `openspec/changes/archive/2026-01-08-add-env-openspec-cmd` already exists
+- **WHEN** the user runs `cflx openspec archive add-env-openspec-cmd`
+- **THEN** the command fails with an archive destination already exists error
+- **AND** the active change directory is not silently moved to another generated name
 
 ### Requirement: install-skills Subcommand
 

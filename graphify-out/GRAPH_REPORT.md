@@ -1,11 +1,11 @@
-# Graph Report - /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/fix-verification-line-validation-panic  (2026-04-28)
+# Graph Report - /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/use-dated-archive-names  (2026-04-28)
 
 ## Corpus Check
-- 228 files · ~1,251,252 words
+- 228 files · ~1,250,397 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4245 nodes · 11837 edges · 132 communities detected
+- 4247 nodes · 11849 edges · 132 communities detected
 - Extraction: 63% EXTRACTED · 37% INFERRED · 0% AMBIGUOUS · INFERRED: 4397 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
@@ -157,177 +157,177 @@
 
 ## Surprising Connections (you probably didn't know these)
 - `Tests for spec-only acceptance behavior (archive-readiness checks).` --uses--> `OpenSpecManager`  [INFERRED]
-  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/fix-verification-line-validation-panic/skills/cflx-workflow/scripts/cflx.py
+  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/use-dated-archive-names/skills/cflx-workflow/scripts/cflx.py
 - `Spec-only changes with archive-risk deltas produce warnings that acceptance shou` --uses--> `OpenSpecManager`  [INFERRED]
-  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/fix-verification-line-validation-panic/skills/cflx-workflow/scripts/cflx.py
+  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/use-dated-archive-names/skills/cflx-workflow/scripts/cflx.py
 - `Tests for Change Type classification and archive-risk warning in cflx.py validat` --uses--> `OpenSpecManager`  [INFERRED]
-  skills/tests/test_cflx_proposal_change_types.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/fix-verification-line-validation-panic/skills/cflx-workflow/scripts/cflx.py
+  skills/tests/test_cflx_proposal_change_types.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/use-dated-archive-names/skills/cflx-workflow/scripts/cflx.py
 - `OpenSpecManager` --uses--> `Helper: scaffold a spec-only change and optional canonical spec.`  [INFERRED]
-  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/fix-verification-line-validation-panic/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
+  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/use-dated-archive-names/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
 - `OpenSpecManager` --uses--> `Spec-only changes with ADDED deltas pass archive-readiness checks.`  [INFERRED]
-  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/fix-verification-line-validation-panic/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
+  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/use-dated-archive-names/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
 
 ## Communities
 
 ### Community 0 - "Community 0"
 Cohesion: 0.01
-Nodes (366): create_shared_active_commands(), check_task_progress(), archive_entry_exists(), ArchiveEventHandler, ArchiveLoopResult, ArchiveVerificationResult, build_archive_error_message(), delete_change_directory() (+358 more)
+Nodes (207): acceptance_test_streaming(), AiCommandRunner, OutputLine, test_inactivity_timeout_retry(), test_inactivity_timeout_streaming_pipeline(), test_post_completion_cleanup_on_cancellation(), test_post_completion_cleanup_on_failure(), test_post_completion_cleanup_on_success() (+199 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.02
-Nodes (164): Colors, main(), OpenSpecManager, print_change_detail(), print_changes(), Extract change information from directory., Count completed and total tasks., Show detailed information about a change. (+156 more)
+Nodes (242): handle_start_processing_command(), AppState, formatValue(), logHelperState(), onInput(), onKeydown(), AppState, processing_error_from_select_mode() (+234 more)
 
 ### Community 2 - "Community 2"
 Cohesion: 0.02
-Nodes (136): AcpClient, AcpMessage, create_worktree(), get_logs(), get_project_history(), get_stats_overview(), global_control_run(), global_control_stop() (+128 more)
+Nodes (285): create_shared_active_commands(), archive_entry_exists(), ArchiveEventHandler, ArchiveLoopResult, ArchiveVerificationResult, delete_change_directory(), ensure_archive_commit(), find_archive_entry_path() (+277 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.02
-Nodes (142): acceptance_resume_ready_for_archive(), acceptance_state_can_be_deleted(), acceptance_state_is_not_created_under_worktree(), acceptance_state_path(), acceptance_state_root_dir(), acceptance_state_roundtrip(), AcceptanceState, AcceptanceStateStatus (+134 more)
+Nodes (203): get_changed_files(), get_current_commit(), default_retry_patterns(), acceptance_verdict_grace_period(), commit_workspace_change(), create_test_config(), create_test_config_with(), execute_acceptance_in_workspace() (+195 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.02
-Nodes (155): AppState, formatValue(), logHelperState(), onInput(), onKeydown(), AppState, auto_resumable_merge_deferred_queues_when_resolving(), auto_resumable_merge_deferred_shows_resolve_wait_not_merge_wait() (+147 more)
+Nodes (166): Colors, main(), OpenSpecManager, print_change_detail(), print_changes(), Extract change information from directory., Count completed and total tasks., Show detailed information about a change. (+158 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.02
-Nodes (133): build_apply_prompt(), expand_apply_command(), test_openspec_directory_structure(), run_post_apply_cleanup_review(), escape_for_single_quoted_context(), escape_shell_value(), expand_change_id(), expand_conflict_files() (+125 more)
+Nodes (142): AcpMessage, BaseHTTPRequestHandler, get_project_history(), global_control_run(), global_control_stop(), start_single_project_run(), stop_and_dequeue_change(), toggle_all_change_selection() (+134 more)
 
 ### Community 6 - "Community 6"
 Cohesion: 0.02
-Nodes (135): branch_delete(), branch_exists(), check_git_repo(), checkout(), generate_unique_branch_name(), get_changed_files(), get_conflict_files(), get_current_branch() (+127 more)
+Nodes (157): delete_acceptance_state(), AcpContent, AcpElicitationParams, AcpError, AcpEvent, AcpPromptBlock, AcpUpdateParams, dispatch_jsonrpc_response() (+149 more)
 
 ### Community 7 - "Community 7"
 Cohesion: 0.02
-Nodes (144): AcpContent, AcpElicitationParams, AcpError, AcpEvent, AcpPromptBlock, AcpUpdateParams, dispatch_jsonrpc_response(), dispatch_jsonrpc_response_ignores_non_u64_id_without_consuming_waiters() (+136 more)
+Nodes (126): AcpClient, ArchiveResult, extract_tree_branch(), parse_project_url(), RemoteClient, resolve_default_branch(), resolve_project_url_and_branch(), test_add_project_no_auth_header() (+118 more)
 
 ### Community 8 - "Community 8"
-Cohesion: 0.03
-Nodes (115): execute_worktree_command(), BaseHTTPRequestHandler, handle_start_processing_command(), TuiCommandContext, handle_cursor_movement(), handle_editor_launch(), handle_enter_key(), handle_f5_key() (+107 more)
+Cohesion: 0.02
+Nodes (102): merge_worktree(), branch_delete(), branch_exists(), check_git_repo(), checkout(), generate_unique_branch_name(), get_conflict_files(), get_current_branch() (+94 more)
 
 ### Community 9 - "Community 9"
-Cohesion: 0.02
-Nodes (136): OrchestratorConfig, merge(), env_test_lock(), get_global_config_path(), get_global_config_paths(), get_platform_config_path(), get_xdg_config_path(), get_xdg_default_config_path() (+128 more)
+Cohesion: 0.04
+Nodes (49): make_ai_runner(), test_archive_change_retries_until_verified(), ParallelExecutor, AutoResolveGuard, build_conflict_resolve_prompt(), build_sequential_merge_resolve_prompt(), detect_conflicts(), get_vcs_status() (+41 more)
 
 ### Community 10 - "Community 10"
 Cohesion: 0.03
-Nodes (78): acceptance_test_streaming(), apply_change(), apply_change_streaming(), ApplyContext, ApplyResult, test_apply_context_new(), archive_change(), archive_change_streaming() (+70 more)
+Nodes (109): create_worktree(), delete_worktree(), test_cleanup_guard_all_preserved_does_nothing(), test_cleanup_guard_auto_backend_treated_as_git(), test_cleanup_guard_commit_enables_cleanup(), test_cleanup_guard_commit_on_success(), test_cleanup_guard_creation(), test_cleanup_guard_drop_with_empty_workspaces_does_nothing() (+101 more)
 
 ### Community 11 - "Community 11"
-Cohesion: 0.03
-Nodes (96): delete_worktree(), merge_worktree(), test_cleanup_guard_all_preserved_does_nothing(), test_cleanup_guard_auto_backend_treated_as_git(), test_cleanup_guard_commit_enables_cleanup(), test_cleanup_guard_commit_on_success(), test_cleanup_guard_creation(), test_cleanup_guard_drop_with_empty_workspaces_does_nothing() (+88 more)
-
-### Community 12 - "Community 12"
-Cohesion: 0.04
-Nodes (41): make_ai_runner(), test_archive_change_retries_until_verified(), create_test_config(), test_auto_resolve_counter_is_thread_safe(), test_auto_resolve_counter_reduces_available_slots(), test_combined_manual_and_auto_resolve_slots(), test_multiple_auto_resolves_consume_multiple_slots(), ParallelExecutor (+33 more)
-
-### Community 13 - "Community 13"
 Cohesion: 0.04
 Nodes (105): ChangeStateSnapshot, configure_logging(), global_deduplicator(), LogDeduplicator, maybe_log_summary(), should_log_change_count(), should_log_task_progress(), test_config() (+97 more)
 
-### Community 14 - "Community 14"
+### Community 12 - "Community 12"
 Cohesion: 0.04
-Nodes (70): dispatch_event(), post_archive_dispatch_event(), run_orchestrator(), test_archive_path_structure(), test_archive_verification_logic(), test_tui_archived_during_resolve(), test_tui_archived_no_active_resolve(), test_tui_shared_state_pending_changes_decrease_when_cleared() (+62 more)
+Nodes (71): dispatch_event(), post_archive_dispatch_event(), run_orchestrator_parallel(), test_archive_path_structure(), test_archive_verification_logic(), test_tui_archived_during_resolve(), test_tui_archived_no_active_resolve(), test_tui_rejection_removes_from_pending_selection() (+63 more)
+
+### Community 13 - "Community 13"
+Cohesion: 0.04
+Nodes (69): acceptance_resume_ready_for_archive(), acceptance_state_can_be_deleted(), acceptance_state_is_not_created_under_worktree(), acceptance_state_path(), acceptance_state_root_dir(), acceptance_state_roundtrip(), AcceptanceState, AcceptanceStateStatus (+61 more)
+
+### Community 14 - "Community 14"
+Cohesion: 0.05
+Nodes (80): control_cancel_stop(), control_force_stop(), control_retry(), control_start(), control_stop(), ControlResponse, create_test_change(), CreateWorktreeRequest (+72 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.05
-Nodes (75): control_cancel_stop(), control_force_stop(), control_retry(), control_start(), control_stop(), ControlResponse, create_test_change(), CreateWorktreeRequest (+67 more)
-
-### Community 16 - "Community 16"
 Cohesion: 0.02
 Nodes (31): check_git_available(), check_git_directory(), check_parallel_available(), CheckConflictsArgs, Cli, Commands, EvidenceMode, InitArgs (+23 more)
 
+### Community 16 - "Community 16"
+Cohesion: 0.04
+Nodes (59): apply_completion_check_interval(), apply_completion_grace_period(), ApplyBlockedHandoff, ApplyCompletionKind, ApplyConfig, ApplyEventHandler, ApplyIterationResult, ApplyLoopHookContext (+51 more)
+
 ### Community 17 - "Community 17"
-Cohesion: 0.05
-Nodes (55): AnalysisResult, AnalyzePromptMetadata, create_test_analyzer(), create_test_change(), ParallelGroup, ParallelizationAnalyzer, test_build_prompt_all_selected(), test_build_prompt_includes_frontmatter_metadata_context() (+47 more)
-
-### Community 18 - "Community 18"
-Cohesion: 0.05
-Nodes (47): confirmDeleteWorktree(), deleteWorktree(), escapeHtml(), fetchWorktrees(), mergeWorktree(), renderWorktrees(), WebMonitor, Template (+39 more)
-
-### Community 19 - "Community 19"
 Cohesion: 0.03
 Nodes (30): AcceptanceResult, build_acceptance_tail_findings(), canonical_verdict_kind(), detect_verdict_in_line(), parse_acceptance_output(), parse_findings(), parse_json_verdict(), strip_markdown_decorations() (+22 more)
 
-### Community 20 - "Community 20"
-Cohesion: 0.06
-Nodes (50): AiCommandRunner, OutputLine, test_inactivity_timeout_retry(), test_inactivity_timeout_streaming_pipeline(), test_post_completion_cleanup_on_cancellation(), test_post_completion_cleanup_on_failure(), test_post_completion_cleanup_on_success(), test_shared_stagger_state() (+42 more)
+### Community 18 - "Community 18"
+Cohesion: 0.05
+Nodes (56): AnalysisResult, AnalyzePromptMetadata, create_test_analyzer(), create_test_change(), ParallelGroup, ParallelizationAnalyzer, test_build_prompt_all_selected(), test_build_prompt_includes_frontmatter_metadata_context() (+48 more)
 
-### Community 21 - "Community 21"
+### Community 19 - "Community 19"
 Cohesion: 0.05
 Nodes (63): extract_assistant_tool_summary(), extract_from_assistant(), extract_from_result(), extract_from_stream_event(), extract_text_from_stream_json(), extract_tool_result_summary(), extract_tool_summary_from_stream_json(), extract_tool_use_summary() (+55 more)
 
+### Community 20 - "Community 20"
+Cohesion: 0.1
+Nodes (7): confirmDeleteWorktree(), deleteWorktree(), escapeHtml(), fetchWorktrees(), mergeWorktree(), renderWorktrees(), WebMonitor
+
+### Community 21 - "Community 21"
+Cohesion: 0.06
+Nodes (8): get_vcs_log_for_revisions(), MockWorkspaceManager, test_detect_conflicts_no_conflicts(), test_detect_conflicts_with_conflicts(), test_get_vcs_log_for_revisions(), test_get_vcs_status(), test_resolve_merges_with_retry_args_clone(), test_resolve_merges_with_retry_args_struct()
+
 ### Community 22 - "Community 22"
-Cohesion: 0.05
-Nodes (46): apply_completion_check_interval(), apply_completion_grace_period(), ApplyBlockedHandoff, ApplyCompletionKind, ApplyConfig, ApplyEventHandler, ApplyIterationResult, ApplyLoopHookContext (+38 more)
-
-### Community 23 - "Community 23"
-Cohesion: 0.05
-Nodes (33): analyze_with_llm(), build_analysis_prompt(), select_by_progress(), select_next_change(), test_build_analysis_prompt(), test_build_analysis_prompt_empty(), test_build_analysis_prompt_no_fixed_guidance(), test_change() (+25 more)
-
-### Community 24 - "Community 24"
 Cohesion: 0.09
 Nodes (33): addProject(), APIError, controlRun(), controlStop(), createProposalSession(), createTerminalSession(), createWorktree(), deleteProject() (+25 more)
 
-### Community 25 - "Community 25"
+### Community 23 - "Community 23"
 Cohesion: 0.07
 Nodes (14): test_workspace_status_failed_includes_message(), ExecutionContext, ExecutionContext<'a>, ExecutionResult, ProgressInfo, test_execution_context_is_parallel(), test_execution_context_new(), test_execution_context_working_dir() (+6 more)
 
+### Community 24 - "Community 24"
+Cohesion: 0.16
+Nodes (22): CommandQueue, CommandQueueConfig, StreamingOutputLine, test_config(), test_execute_with_retry_streaming_failure_no_retry(), test_execute_with_retry_streaming_success(), test_execute_with_retry_streaming_with_callback(), test_inactivity_timeout_error_message_format() (+14 more)
+
+### Community 25 - "Community 25"
+Cohesion: 0.12
+Nodes (15): test_manual_resolve_completion_notifies_scheduler(), DynamicQueue, test_dynamic_queue_contains(), test_dynamic_queue_dedup(), test_dynamic_queue_push_pop(), test_dynamic_queue_remove(), test_dynamic_queue_remove_from_empty(), test_dynamic_queue_remove_multiple() (+7 more)
+
 ### Community 26 - "Community 26"
-Cohesion: 0.07
-Nodes (1): ResumeTestManager
+Cohesion: 0.09
+Nodes (17): default_server_data_dir(), AcceptancePromptMode, default_error_circuit_breaker_enabled(), default_error_circuit_breaker_threshold(), default_proposal_session_inactivity_timeout_secs(), default_proposal_transport_args(), default_proposal_transport_command(), default_server_bind() (+9 more)
 
 ### Community 27 - "Community 27"
-Cohesion: 0.16
-Nodes (21): test_japanese_log_preview_truncation_no_panic(), restore_terminal(), clear_screen(), EditorTarget, find_change_dir(), get_version_string(), launch_editor_for_change(), launch_editor_in_dir() (+13 more)
+Cohesion: 0.07
+Nodes (1): ResumeTestManager
 
 ### Community 28 - "Community 28"
 Cohesion: 0.19
 Nodes (10): ActiveCommandGuard, ActiveCommandRegistry, make_key(), RootKind, test_acquire_and_release(), test_different_roots_independent(), test_double_acquire_fails(), test_guard_release_async() (+2 more)
 
 ### Community 29 - "Community 29"
-Cohesion: 0.22
-Nodes (12): CircuitBreakerConfig, ErrorHistory, normalize_error_message(), test_circuit_breaker_disabled(), test_clear_history(), test_detect_same_error_different_errors(), test_detect_same_error_with_threshold(), test_last_error() (+4 more)
+Cohesion: 0.2
+Nodes (13): CircuitBreakerConfig, ErrorHistory, normalize_error_message(), test_circuit_breaker_disabled(), test_clear_history(), test_detect_same_error_different_errors(), test_detect_same_error_with_threshold(), test_last_error() (+5 more)
 
 ### Community 30 - "Community 30"
+Cohesion: 0.28
+Nodes (14): Template, create_test_change(), ProgressDisplay, test_progress_archive_change(), test_progress_archive_without_current(), test_progress_complete_all(), test_progress_complete_change(), test_progress_complete_without_current() (+6 more)
+
+### Community 31 - "Community 31"
+Cohesion: 0.18
+Nodes (19): test_japanese_log_preview_truncation_no_panic(), EditorTarget, find_change_dir(), get_version_string(), launch_editor_for_change(), launch_editor_in_dir(), make_temp_dir(), resolve_editor_target() (+11 more)
+
+### Community 32 - "Community 32"
 Cohesion: 0.2
 Nodes (15): _blocks_equal(), delta_to_canonical(), merge_spec_delta(), parse_delta_sections(), Shared spec promotion engine for Conflux archive workflow.  Provides requirement, Split spec content into (preamble, [(normalized_key, full_block), ...]).      fu, Simulate spec promotion without writing any files.      Returns (result_content,, Convert a delta-format spec to canonical format for brand-new specs. (+7 more)
 
-### Community 31 - "Community 31"
+### Community 33 - "Community 33"
+Cohesion: 0.26
+Nodes (13): analyze_with_llm(), build_analysis_prompt(), select_by_progress(), select_next_change(), test_build_analysis_prompt(), test_build_analysis_prompt_empty(), test_build_analysis_prompt_no_fixed_guidance(), test_change() (+5 more)
+
+### Community 34 - "Community 34"
+Cohesion: 0.26
+Nodes (10): server_base_url(), test_server_base_url_localhost(), test_server_base_url_specific_address(), test_server_base_url_zero_address_does_not_expose_zeros(), build_access_url(), get_local_ip(), test_build_access_url_localhost(), test_build_access_url_specific_address() (+2 more)
+
+### Community 35 - "Community 35"
 Cohesion: 0.21
 Nodes (6): get_cflx_embedded_skills(), test_embedded_skills_count(), test_embedded_skills_have_auxiliary_files(), test_embedded_skills_names(), test_rust_prompt_builder_does_not_contain_acceptance_checklist(), get_archive_readiness_context()
 
-### Community 32 - "Community 32"
-Cohesion: 0.24
-Nodes (1): WebSocketClient
-
-### Community 33 - "Community 33"
+### Community 36 - "Community 36"
 Cohesion: 0.29
-Nodes (0): 
+Nodes (0):
 
-### Community 34 - "Community 34"
+### Community 37 - "Community 37"
 Cohesion: 0.29
 Nodes (6): AppMode, MergeConflictInfo, StopMode, ViewMode, WorktreeAction, WorktreeInfo
 
-### Community 35 - "Community 35"
-Cohesion: 0.33
-Nodes (2): TuiCommand, TuiEventSink
-
-### Community 36 - "Community 36"
-Cohesion: 0.6
-Nodes (5): generate_qr_string(), test_generate_qr_string_empty_url(), test_generate_qr_string_short_url(), test_generate_qr_string_valid_url(), test_generate_qr_string_without_feature()
-
-### Community 37 - "Community 37"
-Cohesion: 0.4
-Nodes (0): 
-
 ### Community 38 - "Community 38"
 Cohesion: 0.4
-Nodes (1): dashboard_assets()
+Nodes (0):
 
 ### Community 39 - "Community 39"
 Cohesion: 0.5
-Nodes (0): 
+Nodes (0):
 
 ### Community 40 - "Community 40"
 Cohesion: 0.67
@@ -335,19 +335,19 @@ Nodes (3): create_skill_structure(), main(), Create the skill directory structur
 
 ### Community 41 - "Community 41"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 42 - "Community 42"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 43 - "Community 43"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 44 - "Community 44"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 45 - "Community 45"
 Cohesion: 0.67
@@ -355,99 +355,99 @@ Nodes (1): ApiDoc
 
 ### Community 46 - "Community 46"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 47 - "Community 47"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 48 - "Community 48"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 49 - "Community 49"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 50 - "Community 50"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 51 - "Community 51"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 52 - "Community 52"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 53 - "Community 53"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 54 - "Community 54"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 55 - "Community 55"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 56 - "Community 56"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 57 - "Community 57"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 58 - "Community 58"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 59 - "Community 59"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 60 - "Community 60"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 61 - "Community 61"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 62 - "Community 62"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 63 - "Community 63"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 64 - "Community 64"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 65 - "Community 65"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 66 - "Community 66"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 67 - "Community 67"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 68 - "Community 68"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 69 - "Community 69"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 70 - "Community 70"
 Cohesion: 1.0
@@ -463,91 +463,91 @@ Nodes (1): OutputLine
 
 ### Community 73 - "Community 73"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 74 - "Community 74"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 75 - "Community 75"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 76 - "Community 76"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 77 - "Community 77"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 78 - "Community 78"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 79 - "Community 79"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 80 - "Community 80"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 81 - "Community 81"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 82 - "Community 82"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 83 - "Community 83"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 84 - "Community 84"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 85 - "Community 85"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 86 - "Community 86"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 87 - "Community 87"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 88 - "Community 88"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 89 - "Community 89"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 90 - "Community 90"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 91 - "Community 91"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 92 - "Community 92"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 93 - "Community 93"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 94 - "Community 94"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 95 - "Community 95"
 Cohesion: 1.0
@@ -555,63 +555,63 @@ Nodes (1): Emit warning for invalid change directory.
 
 ### Community 96 - "Community 96"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 97 - "Community 97"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 98 - "Community 98"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 99 - "Community 99"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 100 - "Community 100"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 101 - "Community 101"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 102 - "Community 102"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 103 - "Community 103"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 104 - "Community 104"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 105 - "Community 105"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 106 - "Community 106"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 107 - "Community 107"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 108 - "Community 108"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 109 - "Community 109"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 110 - "Community 110"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 111 - "Community 111"
 Cohesion: 1.0
@@ -876,12 +876,12 @@ Nodes (1): Print detailed change information.
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `parse()` connect `Community 17` to `Community 0`, `Community 7`, `Community 9`, `Community 10`, `Community 12`, `Community 20`, `Community 23`, `Community 24`?**
-  _High betweenness centrality (0.037) - this node is a cross-community bridge._
-- **Why does `fetchAPI()` connect `Community 24` to `Community 0`, `Community 17`?**
+- **Why does `main()` connect `Community 7` to `Community 0`, `Community 1`, `Community 2`, `Community 3`, `Community 4`, `Community 8`, `Community 9`, `Community 10`, `Community 11`, `Community 12`, `Community 15`, `Community 18`?**
   _High betweenness centrality (0.036) - this node is a cross-community bridge._
-- **Why does `merge_spec_delta()` connect `Community 1` to `Community 0`, `Community 2`, `Community 6`, `Community 7`, `Community 10`?**
-  _High betweenness centrality (0.031) - this node is a cross-community bridge._
+- **Why does `parse()` connect `Community 18` to `Community 0`, `Community 33`, `Community 2`, `Community 3`, `Community 6`, `Community 7`, `Community 9`, `Community 22`?**
+  _High betweenness centrality (0.029) - this node is a cross-community bridge._
+- **Why does `execute_apply_loop()` connect `Community 16` to `Community 0`, `Community 2`, `Community 6`, `Community 9`, `Community 13`?**
+  _High betweenness centrality (0.029) - this node is a cross-community bridge._
 - **Are the 57 inferred relationships involving `execute_acceptance_in_workspace()` (e.g. with `.dispatch_change_to_workspace()` and `.is_cancelled()`) actually correct?**
   _`execute_acceptance_in_workspace()` has 57 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 55 inferred relationships involving `run_orchestrator()` (e.g. with `handle_start_processing_command()` and `.with_event_tx()`) actually correct?**
