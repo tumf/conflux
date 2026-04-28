@@ -483,6 +483,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let parsed = split_remote_change_id(&change.id);
                 let display_id = parsed.change;
 
+                let status_text = format!("[{}]", change.display_status_cache.as_str());
+
                 let mut spans = vec![
                     Span::styled(
                         format!("{} {} ", checkbox, cursor),
@@ -511,6 +513,10 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
+                        format!(" {:>18}", status_text),
+                        Style::default().fg(change.display_color_cache),
+                    ),
+                    Span::styled(
                         format!(" {}/{} tasks", change.completed_tasks, change.total_tasks),
                         Style::default().fg(dim_color),
                     ),
@@ -530,6 +536,8 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                     let worktree_badge_width = if change.has_worktree { 3 } else { 0 }; // " WT"
                     let new_badge_width = if change.is_new { 4 } else { 0 }; // " NEW"
                     let uncommitted_badge_width = if show_uncommitted_badge { 11 } else { 0 }; // " UNCOMMITED"
+                    let status_text = format!("[{}]", change.display_status_cache.as_str());
+                    let status_width = format!(" {:>18}", status_text).len();
                     let tasks_text =
                         format!(" {}/{} tasks", change.completed_tasks, change.total_tasks);
                     let tasks_width = tasks_text.len();
@@ -542,6 +550,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                         + worktree_badge_width
                         + new_badge_width
                         + uncommitted_badge_width
+                        + status_width
                         + tasks_width
                         + percent_width
                         + list_border_width;
@@ -1911,6 +1920,7 @@ mod tests {
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
+        assert!(content.contains("[rejected]"));
         assert!(
             !content.contains(" NEW"),
             "rejected row must never render NEW badge in Select mode"
