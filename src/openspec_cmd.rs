@@ -1116,6 +1116,7 @@ fn validate_tasks_content(
     static CHECKBOX_DETAIL_RE: OnceLock<Regex> = OnceLock::new();
     static BARE_TASK_RE: OnceLock<Regex> = OnceLock::new();
     static VERIFICATION_RE: OnceLock<Regex> = OnceLock::new();
+    static VERIFICATION_CONTINUATION_RE: OnceLock<Regex> = OnceLock::new();
 
     let checkbox_re = CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
     let checkbox_detail_re =
@@ -1123,6 +1124,8 @@ fn validate_tasks_content(
     let bare_task_re = BARE_TASK_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+[^\[]").unwrap());
     let verification_re = VERIFICATION_RE
         .get_or_init(|| Regex::new(r"(?i)\(verification:\s*(.+?)\)\s*[.。]?$").unwrap());
+    let verification_continuation_re = VERIFICATION_CONTINUATION_RE
+        .get_or_init(|| Regex::new(r"^\s{2,}(?i:verification:)\s*(.+)$").unwrap());
 
     let excluded_sections = ["future work", "out of scope", "notes"];
     let mut in_excluded = false;
@@ -1135,6 +1138,8 @@ fn validate_tasks_content(
     let mut behavior_task_count = 0usize;
     let mut artifact_task_count = 0usize;
     let mut has_executable_runnable_verification = false;
+    let mut last_checkbox_line_num: Option<usize> = None;
+    let mut pending_behavior_task_without_verification: Option<usize> = None;
 
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -1155,6 +1160,7 @@ fn validate_tasks_content(
         }
 
         if let Some(caps) = checkbox_detail_re.captures(line) {
+            last_checkbox_line_num = Some(line_num);
             if !in_excluded {
                 let task_text = caps.get(2).map_or("", |m| m.as_str()).trim();
                 let is_behavior_task = looks_like_behavior_task(task_text);
@@ -1166,18 +1172,25 @@ fn validate_tasks_content(
                     artifact_task_count += 1;
                 }
 
-                let verification_match = verification_re.captures(task_text);
-                if let Some(vcaps) = &verification_match {
-                    let vtext = vcaps.get(1).map_or("", |m| m.as_str()).trim();
+                let inline_verification = verification_re
+                    .captures(task_text)
+                    .and_then(|vcaps| vcaps.get(1).map(|m| m.as_str().trim().to_string()));
+                let continuation_verification = verification_continuation_re
+                    .captures(line)
+                    .and_then(|vcaps| vcaps.get(1).map(|m| m.as_str().trim().to_string()));
+                let verification_text = inline_verification
+                    .or(continuation_verification)
+                    .filter(|v| !v.is_empty());
+
+                if let Some(vtext) = &verification_text {
                     if verification_mentions_executable_surface(vtext) {
                         has_executable_runnable_verification = true;
                     }
                 }
 
                 if strict && evidence_mode != "off" && is_behavior_task {
-                    if let Some(vcaps) = verification_match {
-                        let vtext = vcaps.get(1).map_or("", |m| m.as_str()).trim();
-                        if !has_repository_evidence_hint(vtext) {
+                    if let Some(vtext) = verification_text {
+                        if !has_repository_evidence_hint(&vtext) {
                             let msg = format!(
                                 "{}: tasks.md:{}: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands",
                                 change_id, line_num
@@ -1188,7 +1201,7 @@ fn validate_tasks_content(
                                 warnings.push(msg);
                             }
                         }
-                        if !has_verification_ownership_marker(vtext) {
+                        if !has_verification_ownership_marker(&vtext) {
                             let msg = format!(
                                 "{}: tasks.md:{}: Verification ownership missing for behavior-changing task (expected one of: unit, integration, e2e, manual, benchmark, not-testable)",
                                 change_id, line_num
@@ -1199,19 +1212,52 @@ fn validate_tasks_content(
                                 warnings.push(msg);
                             }
                         }
+                        pending_behavior_task_without_verification = None;
                     } else {
-                        let msg = format!(
-                            "{}: tasks.md:{}: Behavior-bearing task missing '(verification: ...)' note",
-                            change_id, line_num
-                        );
-                        if evidence_mode == "error" {
-                            errors.push(msg);
-                        } else if evidence_mode == "warn" {
-                            warnings.push(msg);
-                        }
+                        pending_behavior_task_without_verification = Some(line_num);
                     }
                 }
             }
+            continue;
+        }
+
+        if let Some(caps) = verification_continuation_re.captures(line) {
+            if !in_excluded {
+                if let Some(prev_line_num) = last_checkbox_line_num {
+                    let vtext = caps.get(1).map_or("", |m| m.as_str()).trim();
+                    if strict && evidence_mode != "off" && !vtext.is_empty() {
+                        if !has_repository_evidence_hint(vtext) {
+                            let msg = format!(
+                                "{}: tasks.md:{}: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands",
+                                change_id, prev_line_num
+                            );
+                            if evidence_mode == "error" {
+                                errors.push(msg);
+                            } else if evidence_mode == "warn" {
+                                warnings.push(msg);
+                            }
+                        }
+                        if !has_verification_ownership_marker(vtext) {
+                            let msg = format!(
+                                "{}: tasks.md:{}: Verification ownership missing for behavior-changing task (expected one of: unit, integration, e2e, manual, benchmark, not-testable)",
+                                change_id, prev_line_num
+                            );
+                            if evidence_mode == "error" {
+                                errors.push(msg);
+                            } else if evidence_mode == "warn" {
+                                warnings.push(msg);
+                            }
+                        }
+                    }
+                    if verification_mentions_executable_surface(vtext) {
+                        has_executable_runnable_verification = true;
+                    }
+                    if pending_behavior_task_without_verification == Some(prev_line_num) {
+                        pending_behavior_task_without_verification = None;
+                    }
+                }
+            }
+            continue;
         }
 
         // Check for tasks without checkboxes in active sections
@@ -1228,6 +1274,20 @@ fn validate_tasks_content(
                     line_num,
                     truncate_for_display(trimmed, 50)
                 ));
+            }
+        }
+    }
+
+    if strict && evidence_mode != "off" {
+        if let Some(line_num) = pending_behavior_task_without_verification {
+            let msg = format!(
+                "{}: tasks.md:{}: Behavior-bearing task missing '(verification: ...)' note",
+                change_id, line_num
+            );
+            if evidence_mode == "error" {
+                errors.push(msg);
+            } else if evidence_mode == "warn" {
+                warnings.push(msg);
             }
         }
     }
@@ -1759,6 +1819,31 @@ mod validation_tests {
             validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_tasks_with_standalone_verification_hint() {
+        let content =
+            "- [ ] Add a new feature\n  verification: unit - cargo test covers the feature\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_standalone_verification_line_utf8_no_panic_and_findings() {
+        let content = "## Implementation\n- [ ] Add a new feature\n  verification: 手動確認のみ\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
+        assert!(errors.is_empty());
+        assert!(!warnings.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Verification note should cite repository-verifiable evidence")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("Verification ownership missing")));
     }
 
     #[test]
