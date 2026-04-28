@@ -310,10 +310,12 @@ fn extract_assistant_tool_summary(value: &serde_json::Value) -> Option<String> {
 }
 
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{}...", truncated)
     }
 }
 
@@ -702,6 +704,21 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_use_summary_truncates_utf8_values_safely() {
+        let long_pattern = "あ".repeat(120);
+        let line = format!(
+            r#"{{"type":"tool_use","name":"grep","input":{{"pattern":"{}"}}}}"#,
+            long_pattern
+        );
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert!(summary.starts_with("[tool_use:grep]"));
+        assert!(summary.contains("pattern="));
+        assert!(summary.ends_with("..."));
+        assert!(summary.is_char_boundary(summary.len()));
+    }
+
+    #[test]
     fn test_extract_tool_result_summary() {
         let line =
             r#"{"type":"tool_result","tool_use_id":"tool_123","content":"Success: file created"}"#;
@@ -724,6 +741,20 @@ mod tests {
         let s = summary.unwrap();
         assert!(s.len() < line.len());
         assert!(s.contains("..."));
+    }
+
+    #[test]
+    fn test_extract_tool_result_truncates_utf8_content_safely() {
+        let long_content = "界".repeat(260);
+        let line = format!(
+            r#"{{"type":"tool_result","tool_use_id":"tool_utf8","content":"{}"}}"#,
+            long_content
+        );
+        let summary = extract_tool_summary_from_stream_json(&line).unwrap();
+
+        assert!(summary.starts_with("[tool_result:tool_utf8]"));
+        assert!(summary.ends_with("..."));
+        assert!(summary.is_char_boundary(summary.len()));
     }
 
     #[test]
