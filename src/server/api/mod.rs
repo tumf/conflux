@@ -44,6 +44,13 @@ use crate::vcs::GitWorkspaceManager;
 
 /// Maximum number of log entries retained in server-side log buffer (broadcast channel capacity)
 pub const SERVER_LOG_BUFFER_SIZE: usize = 1000;
+/// Maximum number of state updates retained for WebSocket incremental broadcast channel.
+pub const SERVER_STATE_UPDATE_BUFFER_SIZE: usize = 1024;
+
+pub fn create_state_update_channel() -> tokio::sync::broadcast::Sender<RemoteStateUpdate> {
+    let (tx, _) = tokio::sync::broadcast::channel(SERVER_STATE_UPDATE_BUFFER_SIZE);
+    tx
+}
 
 /// Poll interval for background remote sync-state monitoring.
 const REMOTE_SYNC_MONITOR_INTERVAL: Duration = Duration::from_secs(30);
@@ -63,6 +70,8 @@ pub struct AppState {
     pub resolve_command: Option<String>,
     /// Broadcast channel for streaming log entries to WebSocket clients
     pub log_tx: tokio::sync::broadcast::Sender<RemoteLogEntry>,
+    /// Broadcast channel for streaming incremental state updates to WebSocket clients
+    pub state_update_tx: tokio::sync::broadcast::Sender<RemoteStateUpdate>,
     /// Global orchestration status (Idle/Running/Stopped)
     pub orchestration_status: Arc<tokio::sync::RwLock<OrchestrationStatus>>,
     /// Reducer-owned per-change runtime state used as canonical display status source.

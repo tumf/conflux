@@ -9,6 +9,7 @@ use super::*;
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     let registry = state.registry.clone();
     let log_rx = state.log_tx.subscribe();
+    let state_update_rx = state.state_update_tx.subscribe();
     let context = WsSnapshotContext {
         sync_available: state.resolve_command.is_some(),
         orchestration_status: state.orchestration_status.clone(),
@@ -17,7 +18,7 @@ pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> 
         db: state.db.clone(),
     };
 
-    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx, context))
+    ws.on_upgrade(move |socket| handle_ws(socket, registry, log_rx, state_update_rx, context))
 }
 
 #[derive(Clone)]
@@ -34,6 +35,7 @@ async fn handle_ws(
     mut socket: WebSocket,
     registry: SharedRegistry,
     mut log_rx: tokio::sync::broadcast::Receiver<RemoteLogEntry>,
+    mut state_update_rx: tokio::sync::broadcast::Receiver<RemoteStateUpdate>,
     context: WsSnapshotContext,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -154,6 +156,24 @@ async fn handle_ws(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Sender closed – stop streaming logs but keep WS open
+                    }
+                }
+            }
+
+            state_update_result = state_update_rx.recv() => {
+                match state_update_result {
+                    Ok(update) => {
+                        if let Ok(payload) = serde_json::to_string(&update) {
+                            if socket.send(Message::Text(payload.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        debug!("WS state update receiver lagged by {} messages", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Sender closed – stop streaming incremental updates but keep WS open
                     }
                 }
             }
