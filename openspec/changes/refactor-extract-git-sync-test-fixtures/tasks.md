@@ -16,19 +16,20 @@
 - [x] `src/server/api/git_sync.rs:1788-1808` の `test_git_sync_runs_resolve_when_remote_ahead` も `json["status"] == "synced"` しか確認しておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/specs/testing/spec.md:18-21` が求める主要回帰シナリオの JSON 契約固定として不十分。remote ahead シナリオで `resolve_command_ran` / `resolve_exit_code` / `push.status` などの公開レスポンス項目を明示的に assertion すること。
 
 ## Acceptance #2 Failure Follow-up
-- [x] `src/server/api/git_sync.rs:1809-1818` の `test_git_sync_runs_resolve_when_shas_differ` は `resolve_command_ran` / `resolve_exit_code` / `push.status` / `skipped_reason` の存在や型しか見ておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/tasks.md:3` と `openspec/changes/refactor-extract-git-sync-test-fixtures/specs/testing/spec.md:18-21` が要求する characterization coverage として値を固定できていない。`src/server/api/git_sync.rs:575-582,615-623` の実装契約に合わせて `resolve_command_ran == true`, `resolve_exit_code == 0`, `push.status == "pushed"`, `skipped_reason == null` まで明示的に assertion すること。
+- [ ] `src/server/api/git_sync.rs:1809-1818` の `test_git_sync_runs_resolve_when_shas_differ` は `resolve_command_ran` / `resolve_exit_code` / `push.status` / `skipped_reason` の存在や型しか見ておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/tasks.md:3` と `openspec/changes/refactor-extract-git-sync-test-fixtures/specs/testing/spec.md:18-21` が要求する characterization coverage として値を固定できていない。`src/server/api/git_sync.rs:575-582,615-623` の実装契約に合わせて `resolve_command_ran == true`, `resolve_exit_code == 0`, `push.status == "pushed"`, `skipped_reason == null` まで明示的に assertion すること。
 - [ ] `src/server/api/git_sync.rs:1846-1855` の `test_git_sync_runs_resolve_when_remote_ahead` も `resolve_command_ran` / `resolve_exit_code` / `push.status` / `skipped_reason` を緩くしか検証しておらず、主要回帰シナリオの JSON 契約を固定できていない。`src/server/api/git_sync.rs:575-582,615-623` の success response に合わせて `resolve_command_ran == true`, `resolve_exit_code == 0`, `push.status == "pushed"`, `skipped_reason == null` を明示的に assertion すること。
 
 ## Implementation Blocker #1
 - category: spec_contradiction
-- summary: remote_ahead シナリオが現行 fixture では 200/synced 契約に到達せず 422 を返し、要求 assertion と両立しない
+- summary: remote_ahead と shas_differ の fixture が現行 `git_sync` の fast-forward 前提と噛み合わず、要求された 200/synced + resolve 実行契約を再現できない
 - evidence:
-  - /Users/tumf/.local/share/agent-exec/jobs/eada44d79c4d93deb593e81a1e305e0d/stdout.log:28-31
-  - src/server/api/git_sync.rs:1891 (remote_ahead test の status assertion)
-- impact: Acceptance #2 Failure Follow-up の remote_ahead 契約固定タスクを完了できない
+  - `cargo test test_git_sync_runs_resolve_when_ -- --nocapture` が `src/server/api/git_sync.rs:1825` で `left: Some(false) right: Some(true)` により失敗し、同プロセス内の `test_git_sync_runs_resolve_when_remote_ahead` も PoisonError で連鎖失敗
+  - `cargo test test_git_sync_runs_resolve_when_remote_ahead -- --nocapture` の単体実行で `src/server/api/git_sync.rs:1892` にて `left: 422 right: 200` 失敗を再現
+  - `src/server/api/git_sync.rs:401-418` の `git fetch refs/heads/main:refs/heads/main` が non-fast-forward 失敗時に `422` を返す実装契約
+- impact: Acceptance #2 Failure Follow-up の2タスク（shas_differ / remote_ahead の契約固定）を現状 fixture のまま完了できない
 - unblock_actions:
-  - remote_ahead fixture で non-fast-forward にならない再現条件（local/remote SHA 構成）を設計し直す
-  - 期待契約を 200/synced に固定するか、422 系を別シナリオとして仕様更新するかを明確化する
+  - 各シナリオで `resolve_command` 実行まで到達できる local/remote SHA 構成を fixture 側で再設計する
+  - もし non-fast-forward を意図するなら、期待契約を `422` 系として OpenSpec 側へ明示的に分離する
 - owner: server-api maintainers
 - decision_due: 2026-04-30
 
