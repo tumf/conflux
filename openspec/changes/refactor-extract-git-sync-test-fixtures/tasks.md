@@ -14,3 +14,20 @@
 ## Acceptance #1 Failure Follow-up
 - [x] `src/server/api/git_sync.rs:1721-1784` の `test_git_sync_runs_resolve_when_shas_differ` は最終的に `json2["status"] == "synced"` しか確認しておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/tasks.md:3` が要求する `resolve_command_ran` / `resolve_exit_code` / `push.status` などの公開レスポンス契約を明示的に検証していない。差分ありシナリオで対象フィールドを assertion すること。
 - [x] `src/server/api/git_sync.rs:1788-1808` の `test_git_sync_runs_resolve_when_remote_ahead` も `json["status"] == "synced"` しか確認しておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/specs/testing/spec.md:18-21` が求める主要回帰シナリオの JSON 契約固定として不十分。remote ahead シナリオで `resolve_command_ran` / `resolve_exit_code` / `push.status` などの公開レスポンス項目を明示的に assertion すること。
+
+## Acceptance #2 Failure Follow-up
+- [x] `src/server/api/git_sync.rs:1809-1818` の `test_git_sync_runs_resolve_when_shas_differ` は `resolve_command_ran` / `resolve_exit_code` / `push.status` / `skipped_reason` の存在や型しか見ておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/tasks.md:3` と `openspec/changes/refactor-extract-git-sync-test-fixtures/specs/testing/spec.md:18-21` が要求する characterization coverage として値を固定できていない。`src/server/api/git_sync.rs:575-582,615-623` の実装契約に合わせて `resolve_command_ran == true`, `resolve_exit_code == 0`, `push.status == "pushed"`, `skipped_reason == null` まで明示的に assertion すること。
+- [ ] `src/server/api/git_sync.rs:1846-1855` の `test_git_sync_runs_resolve_when_remote_ahead` も `resolve_command_ran` / `resolve_exit_code` / `push.status` / `skipped_reason` を緩くしか検証しておらず、主要回帰シナリオの JSON 契約を固定できていない。`src/server/api/git_sync.rs:575-582,615-623` の success response に合わせて `resolve_command_ran == true`, `resolve_exit_code == 0`, `push.status == "pushed"`, `skipped_reason == null` を明示的に assertion すること。
+
+## Implementation Blocker #1
+- category: spec_contradiction
+- summary: remote_ahead シナリオが現行 fixture では 200/synced 契約に到達せず 422 を返し、要求 assertion と両立しない
+- evidence:
+  - /Users/tumf/.local/share/agent-exec/jobs/eada44d79c4d93deb593e81a1e305e0d/stdout.log:28-31
+  - src/server/api/git_sync.rs:1891 (remote_ahead test の status assertion)
+- impact: Acceptance #2 Failure Follow-up の remote_ahead 契約固定タスクを完了できない
+- unblock_actions:
+  - remote_ahead fixture で non-fast-forward にならない再現条件（local/remote SHA 構成）を設計し直す
+  - 期待契約を 200/synced に固定するか、422 系を別シナリオとして仕様更新するかを明確化する
+- owner: server-api maintainers
+- decision_due: 2026-04-30
