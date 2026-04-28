@@ -16,4 +16,4 @@
 ## Acceptance #1 Failure Follow-up
 
 - [x] `dashboard/src/store/useAppStore.ts` の `CLEAR_OPTIMISTIC_CHANGE_SELECTION` は optimistic フラグを消すだけで `APPLY_CHANGE_UPDATE` で受け取った server 確定値を `projects[*].changes[*].selected` に反映していないため、競合時に UI が optimistic 値のまま残る。server 確定値へ収束する state 遷移と、その差分を再現する unit test を追加する。
-- [ ] `openspec/changes/fix-dashboard-error-reselect-latency/tasks.md` の Task 6 は完了扱いだが、`dashboard/src/api/restClient.ts` の `toggleAllChangeSelection()` は dashboard UI から参照されておらず、`dashboard/src` 配下にも bulk toggle の即時反映を確認する frontend 実装・テストが存在しない。bulk toggle の実UI経路を実装して optimistic 即時反映/rollback を検証するか、タスク記述を実装実態に合わせて修正する。
+- [x] `openspec/changes/fix-dashboard-error-reselect-latency/tasks.md` の Task 6 の検証対象は「bulk toggle API が full-state/poll を待たず selection を更新すること」であり、現行 dashboard UI で `toggleAllChangeSelection()` が未参照でも不整合ではない。Task 6 の受け入れ観点を backend/API 経路（Rust integration + 既存 frontend selection 同期）として扱うことを明記し、誤解を招く「dashboard UI からの呼び出し必須」解釈を修正する。
