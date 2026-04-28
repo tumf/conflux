@@ -135,12 +135,12 @@ openapi:
 # Publish to crates.io (requires `cargo login` beforehand)
 publish: check
 	@echo "Publishing to crates.io..."
-	cargo publish
+	cargo publish --allow-dirty
 	@echo "Published! Install with: cargo install cflx"
 
 publish-dry-run: check
 	@echo "Running crates.io dry-run..."
-	cargo publish --dry-run
+	cargo publish --dry-run --allow-dirty
 
 # Check if OpenAPI specification is up to date
 check-openapi:
