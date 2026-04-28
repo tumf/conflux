@@ -255,6 +255,12 @@ prek install
 
 The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it auto-runs `make openapi` and stages `docs/openapi.yaml`.
 
+### Dashboard generated publish artifacts and fixer-hook policy
+
+`dashboard/dist/assets` contains committed generated publish artifacts embedded at compile time. In particular, `dashboard/dist/assets/index-*.js` and `dashboard/dist/assets/index-*.css` are intentionally committed outputs.
+
+Because these files are generated artifacts, `end-of-file-fixer` excludes them to avoid producing dirty worktrees during standard validation. Developers should use the standard validation path (`bash dashboard/build.sh`, `prek run --all-files`, `make check`) and expect hook execution to complete without rewriting `dashboard/dist/assets/index-*` files.
+
 ## Adding New Features
 
 ### Adding a new hook
