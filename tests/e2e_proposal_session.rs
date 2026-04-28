@@ -17,7 +17,9 @@ use tower::ServiceExt;
 use conflux::config::ProposalSessionConfig;
 use conflux::remote::types::RemoteLogEntry;
 use conflux::server::active_commands::create_shared_active_commands;
-use conflux::server::api::{build_router, AppState, SERVER_LOG_BUFFER_SIZE};
+use conflux::server::api::{
+    build_router, create_state_update_channel, AppState, SERVER_LOG_BUFFER_SIZE,
+};
 use conflux::server::proposal_session::create_proposal_session_manager;
 use conflux::server::registry::{create_shared_registry, OrchestrationStatus};
 use conflux::server::runner::create_shared_runners;
@@ -129,6 +131,7 @@ fn make_state_with_transport_env(
 
     let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
     let (log_tx, _) = broadcast::channel::<RemoteLogEntry>(SERVER_LOG_BUFFER_SIZE);
+    let state_update_tx = create_state_update_channel();
 
     AppState {
         registry,
@@ -138,6 +141,7 @@ fn make_state_with_transport_env(
         max_concurrent_total: 4,
         resolve_command: None,
         log_tx,
+        state_update_tx,
         orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
         shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
             conflux::orchestration::state::OrchestratorState::new(Vec::new(), 1),

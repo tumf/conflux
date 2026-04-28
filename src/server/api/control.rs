@@ -1,10 +1,75 @@
 use super::*;
 
+use crate::remote::types::RemoteStateUpdate;
 use crate::server::api::ws::list_remote_changes_in_worktree;
 
 // ─────────────────────────── /api/v1/control (global) ─────────────────────────
 
 // ──────────────── Change selection toggle ────────────────────────────────────
+
+async fn build_remote_change_for_update(
+    state: &AppState,
+    project_id: &str,
+    change_id: &str,
+) -> Option<RemoteChange> {
+    let (entry, data_dir, selection_state, error_state) = {
+        let registry = state.registry.read().await;
+        let entry = registry.get(project_id)?.clone();
+        let data_dir = registry.data_dir().to_path_buf();
+        let selection_state = registry
+            .change_selections_for_project(project_id)
+            .and_then(|m| m.get(change_id))
+            .copied();
+        let error_state = registry
+            .error_changes_for_project(project_id)
+            .and_then(|m| m.get(change_id))
+            .cloned();
+        (entry, data_dir, selection_state, error_state)
+    };
+
+    let worktree_path = data_dir
+        .join("worktrees")
+        .join(&entry.id)
+        .join(&entry.branch);
+
+    let changes = list_remote_changes_in_worktree(
+        &worktree_path,
+        &entry.id,
+        &entry.branch,
+        &state.shared_orchestrator_state,
+    )
+    .await;
+
+    let mut change = changes.into_iter().find(|c| c.id == change_id)?;
+    let is_rejected = change.status == "rejected";
+    if is_rejected {
+        change.selected = false;
+        return Some(change);
+    }
+
+    if error_state.is_some() {
+        change.status = "error".to_string();
+        change.iteration_number = None;
+    }
+
+    let default_selected = error_state.is_none();
+    change.selected = selection_state.unwrap_or(default_selected);
+    Some(change)
+}
+
+async fn emit_change_update_if_available(state: &AppState, project_id: &str, change_id: &str) {
+    let Some(change) = build_remote_change_for_update(state, project_id, change_id).await else {
+        warn!(project_id = %project_id, change_id = %change_id, "Skip change_update broadcast because change snapshot is unavailable");
+        return;
+    };
+
+    if let Err(err) = state
+        .state_update_tx
+        .send(RemoteStateUpdate::ChangeUpdate { change })
+    {
+        debug!(project_id = %project_id, change_id = %change_id, error = %err, "No WebSocket subscribers received change_update broadcast");
+    }
+}
 
 /// POST /api/v1/projects/:id/changes/:change_id/toggle
 ///
@@ -18,9 +83,6 @@ pub async fn toggle_change_selection(
         return error_response(StatusCode::NOT_FOUND, "Project not found");
     }
     let new_selected = registry.toggle_change_selected(&project_id, &change_id);
-    if new_selected {
-        registry.clear_change_error(&project_id, &change_id);
-    }
 
     if let Some(db) = &state.db {
         let error_message = registry
@@ -36,6 +98,9 @@ pub async fn toggle_change_selection(
             );
         }
     }
+
+    drop(registry);
+    emit_change_update_if_available(&state, &project_id, &change_id).await;
 
     info!(
 
@@ -98,6 +163,12 @@ pub async fn toggle_all_change_selection(
                 );
             }
         }
+    }
+
+    drop(registry);
+
+    for change_id in &change_ids {
+        emit_change_update_if_available(&state, &project_id, change_id).await;
     }
 
     info!(
@@ -595,6 +666,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_toggle_change_selection_emits_change_update_without_waiting_full_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.mark_change_error(&entry.id, "fix-a", "boom".to_string());
+        }
+
+        let mut state_updates = state.state_update_tx.subscribe();
+        let router = build_router(state.clone());
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/v1/projects/{}/changes/fix-a/toggle",
+                entry.id
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let update =
+            tokio::time::timeout(std::time::Duration::from_millis(500), state_updates.recv())
+                .await
+                .expect("change_update should be emitted immediately after toggle")
+                .expect("state update channel should stay open");
+
+        match update {
+            RemoteStateUpdate::ChangeUpdate { change } => {
+                assert_eq!(change.project, entry.id);
+                assert_eq!(change.id, "fix-a");
+                assert_eq!(change.status, "error");
+                assert!(change.selected);
+            }
+            other => panic!("Expected ChangeUpdate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_toggle_all_change_selection_remarks_error_changes_for_next_run() {
         let temp_dir = TempDir::new().unwrap();
         let state = make_state(&temp_dir, None);
@@ -620,6 +747,8 @@ mod tests {
         }
 
         let router = build_router(state.clone());
+        let mut state_updates = state.state_update_tx.subscribe();
+
         let req = Request::builder()
             .method(Method::POST)
             .uri(format!("/api/v1/projects/{}/changes/toggle-all", entry.id))
@@ -632,6 +761,21 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["selected"], true);
+
+        let first_update =
+            tokio::time::timeout(std::time::Duration::from_millis(500), state_updates.recv())
+                .await
+                .expect("toggle-all should emit immediate change_update")
+                .expect("state update channel should stay open");
+        match first_update {
+            RemoteStateUpdate::ChangeUpdate { change } => {
+                assert_eq!(change.project, entry.id);
+                assert_eq!(change.id, "fix-a");
+                assert_eq!(change.status, "error");
+                assert!(change.selected);
+            }
+            other => panic!("Expected ChangeUpdate after toggle-all, got {other:?}"),
+        }
 
         let req = Request::builder()
             .method(Method::GET)

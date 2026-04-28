@@ -180,6 +180,10 @@ function App() {
           hasHydratedFromUiStateRef.current = true;
         });
     },
+    onChangeUpdate: ({ change }) => {
+      store.applyChangeUpdate(change);
+      store.clearOptimisticChangeSelection(change.project, change.id);
+    },
     onLogEntry: (entry) => store.appendLog(entry),
     onConnectionChange: (status) => store.setConnectionStatus(status),
     onError: (error) => {
@@ -615,6 +619,12 @@ function App() {
                       selectedProjectId={store.state.selectedProjectId}
                       onClickChange={handleClickChange}
                       selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
+                      onOptimisticSelectionChange={(change, selected) =>
+                        store.applyOptimisticChangeSelection(change.project, change.id, selected)
+                      }
+                      onOptimisticSelectionRollback={(change) =>
+                        store.revertOptimisticChangeSelection(change.project, change.id)
+                      }
                     />
                   ) : (
                     <WorktreesPanel
@@ -736,6 +746,12 @@ function App() {
                     selectedProjectId={store.state.selectedProjectId}
                     onClickChange={handleClickChange}
                     selectedChangeId={store.state.fileBrowseContext?.type === 'change' ? store.state.fileBrowseContext.changeId : null}
+                    onOptimisticSelectionChange={(change, selected) =>
+                      store.applyOptimisticChangeSelection(change.project, change.id, selected)
+                    }
+                    onOptimisticSelectionRollback={(change) =>
+                      store.revertOptimisticChangeSelection(change.project, change.id)
+                    }
                   />
                 )}
                 {activeTab === 'worktrees' && (

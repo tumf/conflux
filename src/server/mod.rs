@@ -76,8 +76,9 @@ pub async fn run_server(
         crate::config::ServerAuthMode::None => None,
     };
 
-    // Create log broadcast channel for streaming execution logs to WebSocket clients.
+    // Create broadcast channels for streaming execution logs and incremental state updates.
     let (log_tx, _) = tokio::sync::broadcast::channel(crate::server::api::SERVER_LOG_BUFFER_SIZE);
+    let state_update_tx = crate::server::api::create_state_update_channel();
 
     let proposal_session_manager = proposal_session::create_proposal_session_manager(
         proposal_session_config,
@@ -115,6 +116,7 @@ pub async fn run_server(
         max_concurrent_total: config.max_concurrent_total,
         resolve_command,
         log_tx,
+        state_update_tx,
         orchestration_status: std::sync::Arc::new(tokio::sync::RwLock::new(
             registry::OrchestrationStatus::default(),
         )),

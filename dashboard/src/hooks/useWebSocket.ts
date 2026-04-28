@@ -3,24 +3,28 @@
  */
 
 import { useEffect, useRef } from 'react';
-import { wsClient } from '../api/wsClient';
+import { ChangeUpdateMessage, wsClient } from '../api/wsClient';
 import { FullState, RemoteLogEntry } from '../api/types';
 
 export interface UseWebSocketOptions {
   onStateUpdate?: (state: FullState) => void;
+  onChangeUpdate?: (update: ChangeUpdateMessage) => void;
   onLogEntry?: (entry: RemoteLogEntry) => void;
   onConnectionChange?: (status: 'connected' | 'reconnecting' | 'disconnected') => void;
   onError?: (error: Error) => void;
 }
 
 export function useWebSocket(options: UseWebSocketOptions = {}) {
-  const { onStateUpdate, onLogEntry, onConnectionChange, onError } = options;
+  const { onStateUpdate, onChangeUpdate, onLogEntry, onConnectionChange, onError } = options;
   const callbacksRef = useRef(options);
   callbacksRef.current = options;
 
   useEffect(() => {
     wsClient.on('stateUpdate', (state: FullState) => {
       callbacksRef.current.onStateUpdate?.(state);
+    });
+    wsClient.on('changeUpdate', (update: ChangeUpdateMessage) => {
+      callbacksRef.current.onChangeUpdate?.(update);
     });
     wsClient.on('logEntry', (entry: RemoteLogEntry) => {
       callbacksRef.current.onLogEntry?.(entry);

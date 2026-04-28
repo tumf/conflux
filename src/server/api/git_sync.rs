@@ -1246,6 +1246,7 @@ mod tests {
 
         let registry = crate::server::registry::create_shared_registry(temp_dir.path(), 4).unwrap();
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1254,6 +1255,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1348,6 +1350,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1356,6 +1359,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("echo resolve".to_string()),
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1518,6 +1522,7 @@ mod tests {
         };
 
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state_with_project = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1526,6 +1531,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: None,
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1578,6 +1584,7 @@ mod tests {
         };
 
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1586,6 +1593,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: None,
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1628,6 +1636,7 @@ mod tests {
         };
 
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1636,6 +1645,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1689,6 +1699,7 @@ mod tests {
         };
 
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1697,6 +1708,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("false".to_string()),
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1754,6 +1766,7 @@ mod tests {
         };
 
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry: registry.clone(),
             runners: crate::server::runner::create_shared_runners(),
@@ -1762,6 +1775,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
@@ -1920,6 +1934,7 @@ mod tests {
         };
 
         let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+        let state_update_tx = create_state_update_channel();
         let state = AppState {
             registry,
             runners: crate::server::runner::create_shared_runners(),
@@ -1928,6 +1943,7 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: Some("true".to_string()),
             log_tx,
+            state_update_tx,
             orchestration_status: Arc::new(
                 tokio::sync::RwLock::new(OrchestrationStatus::default()),
             ),
