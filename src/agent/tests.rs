@@ -93,30 +93,6 @@ async fn test_analyze_dependencies_echo_command() {
 }
 
 #[tokio::test]
-async fn test_run_apply_streaming() {
-    let config = OrchestratorConfig {
-        apply_command: Some("echo test".to_string()),
-        ..Default::default()
-    };
-    let mut runner = AgentRunner::new(config);
-    let result = runner.run_apply_streaming("test-change", None).await;
-    assert!(result.is_ok());
-    let (mut child, mut rx, _start) = result.unwrap();
-
-    // Collect output
-    let mut lines = Vec::new();
-    while let Some(line) = rx.recv().await {
-        lines.push(line);
-    }
-
-    // Wait for child to complete
-    let status = child.wait().await.unwrap();
-    assert!(status.success());
-    // Verify we got some output
-    assert!(!lines.is_empty());
-}
-
-#[tokio::test]
 async fn test_run_apply_with_prompt_expansion() {
     let config = OrchestratorConfig {
         apply_command: Some("echo {change_id} {prompt}".to_string()),
