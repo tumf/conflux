@@ -99,19 +99,20 @@ Conflux skill sources, active canonical specs, and repository-facing validator g
 
 ### Requirement: Native validator owns behavior-centric proposal checks
 
-The native `cflx openspec validate` implementation MUST remain resilient when rendering task-preview text from valid UTF-8 proposal files. Preview truncation used in validation findings MUST preserve character boundaries so proposal validation reports structured results instead of panicking.
+Conflux-native textification and summary helpers used during proposal-oriented command execution MUST remain resilient when truncating valid UTF-8 text for display. Any bounded display truncation in these helpers MUST preserve character boundaries so logging and UI-adjacent summaries do not panic on multi-byte input.
 
-#### Scenario: Bare task warning with multi-byte characters does not panic
+#### Scenario: Assistant tool summary truncation with multi-byte UTF-8 does not panic
 
-- **GIVEN** a change `tasks.md` contains a bare task line long enough to trigger the `Possible task without checkbox` preview
-- **AND** the preview cutoff would fall inside a multi-byte UTF-8 character such as `§`
-- **WHEN** `cflx openspec validate <change-id> --strict` runs
-- **THEN** validation does not panic
-- **AND** it reports the `Possible task without checkbox` finding normally
+- **GIVEN** a stream-json assistant tool summary contains a long UTF-8 string value such as a `filePath`, `pattern`, `url`, `prompt`, or `args` field
+- **AND** the configured summary limit would otherwise cut through a multi-byte character
+- **WHEN** the summary is rendered for display
+- **THEN** rendering does not panic
+- **AND** the summary remains truncated and human-readable
 
-#### Scenario: Bare task preview truncates on character boundaries
+#### Scenario: Tool-result summary truncation with multi-byte UTF-8 does not panic
 
-- **GIVEN** a bare task line exceeds the validator preview length
-- **WHEN** `cflx openspec validate <change-id> --strict` runs
-- **THEN** the reported preview is truncated on UTF-8 character boundaries
-- **AND** the preview remains human-readable instead of containing partial code points
+- **GIVEN** a stream-json tool-result payload contains long UTF-8 text content
+- **AND** the configured summary limit would otherwise cut through a multi-byte character
+- **WHEN** the tool-result summary is rendered for display
+- **THEN** rendering does not panic
+- **AND** the displayed summary is truncated on UTF-8 character boundaries
