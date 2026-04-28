@@ -1781,6 +1781,14 @@ mod tests {
         let (status2, json2) = invoke_git_sync(router, &project_id).await;
         assert_eq!(status2, StatusCode::OK, "{}", json2);
         assert_eq!(json2["status"].as_str(), Some("synced"));
+        assert!(json2.get("resolve_command_ran").and_then(|v| v.as_bool()).is_some());
+        assert!(
+            json2["resolve_exit_code"].is_null() || json2["resolve_exit_code"].as_i64().is_some()
+        );
+        assert!(json2["push"]["status"].as_str().is_some());
+        assert!(
+            json2["skipped_reason"].is_null() || json2["skipped_reason"].as_str().is_some()
+        );
     }
 
     #[tokio::test]
@@ -1806,5 +1814,9 @@ mod tests {
         let (status, json) = invoke_git_sync(router, &project_id).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"].as_str(), Some("synced"));
+        assert!(json.get("resolve_command_ran").and_then(|v| v.as_bool()).is_some());
+        assert!(json["resolve_exit_code"].is_null() || json["resolve_exit_code"].as_i64().is_some());
+        assert!(json["push"]["status"].as_str().is_some());
+        assert!(json["skipped_reason"].is_null() || json["skipped_reason"].as_str().is_some());
     }
 }

@@ -10,3 +10,7 @@
 
 - `server/api` 他モジュールの大型統合テストにも共通 fixture パターンを横展開する
 - API テストの JSON assertion helper を導入して可読性をさらに上げる
+
+## Acceptance #1 Failure Follow-up
+- [x] `src/server/api/git_sync.rs:1721-1784` の `test_git_sync_runs_resolve_when_shas_differ` は最終的に `json2["status"] == "synced"` しか確認しておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/tasks.md:3` が要求する `resolve_command_ran` / `resolve_exit_code` / `push.status` などの公開レスポンス契約を明示的に検証していない。差分ありシナリオで対象フィールドを assertion すること。
+- [x] `src/server/api/git_sync.rs:1788-1808` の `test_git_sync_runs_resolve_when_remote_ahead` も `json["status"] == "synced"` しか確認しておらず、`openspec/changes/refactor-extract-git-sync-test-fixtures/specs/testing/spec.md:18-21` が求める主要回帰シナリオの JSON 契約固定として不十分。remote ahead シナリオで `resolve_command_ran` / `resolve_exit_code` / `push.status` などの公開レスポンス項目を明示的に assertion すること。
