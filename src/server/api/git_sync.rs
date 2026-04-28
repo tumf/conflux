@@ -1585,23 +1585,29 @@ mod tests {
             max_concurrent_total: 4,
             resolve_command: resolve_command.map(str::to_string),
             log_tx,
-            orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
+            orchestration_status: Arc::new(
+                tokio::sync::RwLock::new(OrchestrationStatus::default()),
+            ),
             shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
                 crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
             )),
             terminal_manager: crate::server::terminal::create_terminal_manager(),
             active_commands: crate::server::active_commands::create_shared_active_commands(),
-            proposal_session_manager: crate::server::proposal_session::create_proposal_session_manager(
-                crate::config::ProposalSessionConfig::default(),
-                None,
-            ),
+            proposal_session_manager:
+                crate::server::proposal_session::create_proposal_session_manager(
+                    crate::config::ProposalSessionConfig::default(),
+                    None,
+                ),
         };
         let router = build_router(state.clone());
 
         (project_id, state, router)
     }
 
-    async fn invoke_git_sync(router: axum::Router, project_id: &str) -> (StatusCode, serde_json::Value) {
+    async fn invoke_git_sync(
+        router: axum::Router,
+        project_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let resp = router
             .oneshot(
                 Request::builder()
@@ -1613,7 +1619,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         (status, json)
     }
@@ -1754,7 +1762,14 @@ mod tests {
         .to_string();
 
         let commit_out = std::process::Command::new("git")
-            .args(["commit-tree", &tree_sha, "-p", &parent_sha, "-m", "local only commit"])
+            .args([
+                "commit-tree",
+                &tree_sha,
+                "-p",
+                &parent_sha,
+                "-m",
+                "local only commit",
+            ])
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test")
@@ -1762,15 +1777,26 @@ mod tests {
             .current_dir(&local_bare)
             .output()
             .unwrap();
-        let new_sha = String::from_utf8_lossy(&commit_out.stdout).trim().to_string();
+        let new_sha = String::from_utf8_lossy(&commit_out.stdout)
+            .trim()
+            .to_string();
 
         run_git(&local_bare, &["update-ref", "refs/heads/main", &new_sha]);
-        run_git(&local_bare, &["update-ref", "refs/remotes/origin/main", &new_sha]);
+        run_git(
+            &local_bare,
+            &["update-ref", "refs/remotes/origin/main", &new_sha],
+        );
         run_git(&local_bare, &["update-ref", "refs/heads/main", &parent_sha]);
-        run_git(&local_bare, &["update-ref", "refs/remotes/origin/main", &parent_sha]);
+        run_git(
+            &local_bare,
+            &["update-ref", "refs/remotes/origin/main", &parent_sha],
+        );
 
         let scratch = temp_dir.path().join("scratch-work");
-        run_git(temp_dir.path(), &["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()]);
+        run_git(
+            temp_dir.path(),
+            &["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()],
+        );
         run_git(&scratch, &["config", "user.email", "test@example.com"]);
         run_git(&scratch, &["config", "user.name", "Test"]);
         std::fs::write(scratch.join("new-file.txt"), "origin-only").unwrap();
@@ -1781,14 +1807,15 @@ mod tests {
         let (status2, json2) = invoke_git_sync(router, &project_id).await;
         assert_eq!(status2, StatusCode::OK, "{}", json2);
         assert_eq!(json2["status"].as_str(), Some("synced"));
-        assert!(json2.get("resolve_command_ran").and_then(|v| v.as_bool()).is_some());
+        assert!(json2
+            .get("resolve_command_ran")
+            .and_then(|v| v.as_bool())
+            .is_some());
         assert!(
             json2["resolve_exit_code"].is_null() || json2["resolve_exit_code"].as_i64().is_some()
         );
         assert!(json2["push"]["status"].as_str().is_some());
-        assert!(
-            json2["skipped_reason"].is_null() || json2["skipped_reason"].as_str().is_some()
-        );
+        assert!(json2["skipped_reason"].is_null() || json2["skipped_reason"].as_str().is_some());
     }
 
     #[tokio::test]
@@ -1803,7 +1830,10 @@ mod tests {
         assert_eq!(initial_status, StatusCode::OK);
 
         let scratch = temp_dir.path().join("scratch-work-remote-ahead");
-        run_git(temp_dir.path(), &["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()]);
+        run_git(
+            temp_dir.path(),
+            &["clone", origin.to_str().unwrap(), scratch.to_str().unwrap()],
+        );
         run_git(&scratch, &["config", "user.email", "test@example.com"]);
         run_git(&scratch, &["config", "user.name", "Test"]);
         std::fs::write(scratch.join("remote-change.txt"), "new remote commit").unwrap();
@@ -1814,8 +1844,13 @@ mod tests {
         let (status, json) = invoke_git_sync(router, &project_id).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"].as_str(), Some("synced"));
-        assert!(json.get("resolve_command_ran").and_then(|v| v.as_bool()).is_some());
-        assert!(json["resolve_exit_code"].is_null() || json["resolve_exit_code"].as_i64().is_some());
+        assert!(json
+            .get("resolve_command_ran")
+            .and_then(|v| v.as_bool())
+            .is_some());
+        assert!(
+            json["resolve_exit_code"].is_null() || json["resolve_exit_code"].as_i64().is_some()
+        );
         assert!(json["push"]["status"].as_str().is_some());
         assert!(json["skipped_reason"].is_null() || json["skipped_reason"].as_str().is_some());
     }
