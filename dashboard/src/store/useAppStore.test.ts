@@ -26,6 +26,17 @@ const createProject = (id: string): RemoteProject => ({
   changes: [],
 });
 
+const createChange = (projectId: string, selected = false) => ({
+  id: 'change-1',
+  project: projectId,
+  completed_tasks: 0,
+  total_tasks: 2,
+  last_modified: '2026-03-29T00:00:00.000Z',
+  status: 'error' as const,
+  iteration_number: null,
+  selected,
+});
+
 const createLogEntry = (projectId: string, message: string, timestamp: string): RemoteLogEntry => ({
   message,
   level: 'info',
@@ -47,7 +58,9 @@ const createState = (overrides: Partial<AppState> = {}): AppState => ({
   fileBrowseContext: null,
   proposalSessionsByProjectId: {},
   activeProposalSessionId: null,
+  uiState: {},
   activeCommands: [],
+  optimisticChangeSelection: {},
   ...overrides,
 });
 
@@ -98,5 +111,64 @@ describe('useAppStore reducer', () => {
     );
 
     expect(state.selectedProjectId).toBeNull();
+  });
+
+  it('APPLY_OPTIMISTIC_CHANGE_SELECTION updates checkbox state immediately', () => {
+    const project = createProject('project-1');
+    project.changes = [createChange('project-1', false)];
+
+    const state = appReducer(
+      createState({ projects: [project] }),
+      {
+        type: 'APPLY_OPTIMISTIC_CHANGE_SELECTION',
+        payload: { projectId: 'project-1', changeId: 'change-1', selected: true },
+      },
+    );
+
+    expect(state.projects[0].changes[0].selected).toBe(true);
+    expect(state.optimisticChangeSelection['project-1::change-1']).toBe(true);
+  });
+
+  it('APPLY_CHANGE_UPDATE keeps optimistic state until server reconciliation clears it', () => {
+    const project = createProject('project-1');
+    project.changes = [createChange('project-1', true)];
+
+    const optimisticState = createState({
+      projects: [project],
+      optimisticChangeSelection: { 'project-1::change-1': true },
+    });
+
+    const withServerUpdate = appReducer(optimisticState, {
+      type: 'APPLY_CHANGE_UPDATE',
+      payload: { ...createChange('project-1', false), selected: false },
+    });
+
+    expect(withServerUpdate.projects[0].changes[0].selected).toBe(true);
+
+    const reconciled = appReducer(withServerUpdate, {
+      type: 'CLEAR_OPTIMISTIC_CHANGE_SELECTION',
+      payload: { projectId: 'project-1', changeId: 'change-1' },
+    });
+
+    expect(reconciled.optimisticChangeSelection['project-1::change-1']).toBeUndefined();
+  });
+
+  it('REVERT_OPTIMISTIC_CHANGE_SELECTION restores prior selection when toggle fails', () => {
+    const project = createProject('project-1');
+    project.changes = [createChange('project-1', true)];
+
+    const state = appReducer(
+      createState({
+        projects: [project],
+        optimisticChangeSelection: { 'project-1::change-1': true },
+      }),
+      {
+        type: 'REVERT_OPTIMISTIC_CHANGE_SELECTION',
+        payload: { projectId: 'project-1', changeId: 'change-1' },
+      },
+    );
+
+    expect(state.projects[0].changes[0].selected).toBe(false);
+    expect(state.optimisticChangeSelection['project-1::change-1']).toBeUndefined();
   });
 });

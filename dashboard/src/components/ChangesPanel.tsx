@@ -7,9 +7,18 @@ interface ChangesPanelProps {
   selectedProjectId: string | null;
   onClickChange?: (changeId: string) => void;
   selectedChangeId?: string | null;
+  onOptimisticSelectionChange?: (change: RemoteChange, selected: boolean) => void;
+  onOptimisticSelectionRollback?: (change: RemoteChange) => void;
 }
 
-export function ChangesPanel({ projects, selectedProjectId, onClickChange, selectedChangeId }: ChangesPanelProps) {
+export function ChangesPanel({
+  projects,
+  selectedProjectId,
+  onClickChange,
+  selectedChangeId,
+  onOptimisticSelectionChange,
+  onOptimisticSelectionRollback,
+}: ChangesPanelProps) {
   if (!selectedProjectId) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
@@ -37,6 +46,8 @@ export function ChangesPanel({ projects, selectedProjectId, onClickChange, selec
           change={change}
           onClickChange={onClickChange}
           isSelected={selectedChangeId === change.id}
+          onOptimisticSelectionChange={onOptimisticSelectionChange}
+          onOptimisticSelectionRollback={onOptimisticSelectionRollback}
         />
       ))}
     </div>

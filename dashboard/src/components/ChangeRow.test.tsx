@@ -3,17 +3,30 @@
  */
 
 import React from 'react';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ChangeRow } from './ChangeRow';
 import { RemoteChange } from '../api/types';
 
+const toggleChangeSelectionMock = vi.fn().mockResolvedValue({ change_id: 'change-a', selected: false });
 const stopAndDequeueChangeMock = vi.fn().mockResolvedValue(undefined);
+const toastErrorMock = vi.fn();
 
 vi.mock('../api/restClient', () => ({
-  toggleChangeSelection: vi.fn(),
+  APIError: class APIError extends Error {
+    constructor(public status: number, message: string) {
+      super(message);
+    }
+  },
+  toggleChangeSelection: (...args: unknown[]) => toggleChangeSelectionMock(...args),
   stopAndDequeueChange: (...args: unknown[]) => stopAndDequeueChangeMock(...args),
+}));
+
+vi.mock('sonner', () => ({
+  toast: {
+    error: (...args: unknown[]) => toastErrorMock(...args),
+  },
 }));
 
 function makeChange(status: RemoteChange['status']): RemoteChange {
@@ -30,7 +43,10 @@ function makeChange(status: RemoteChange['status']): RemoteChange {
 }
 
 afterEach(() => {
+  toggleChangeSelectionMock.mockReset();
+  toggleChangeSelectionMock.mockResolvedValue({ change_id: 'change-a', selected: false });
   stopAndDequeueChangeMock.mockClear();
+  toastErrorMock.mockClear();
   cleanup();
 });
 
@@ -78,5 +94,47 @@ describe('ChangeRow', () => {
     render(<ChangeRow change={makeChange('rejected')} />);
 
     expect(screen.queryByRole('button', { name: 'Stop and dequeue change-a' })).toBeNull();
+  });
+
+  it('applies optimistic selection immediately when toggled', () => {
+    const onOptimisticSelectionChange = vi.fn();
+    const change = { ...makeChange('error'), selected: false };
+
+    render(
+      <ChangeRow
+        change={change}
+        onOptimisticSelectionChange={onOptimisticSelectionChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select change change-a' }));
+
+    expect(onOptimisticSelectionChange).toHaveBeenCalledWith(change, true);
+    expect(toggleChangeSelectionMock).toHaveBeenCalledWith('project-1', 'change-a');
+  });
+
+  it('rolls back optimistic selection and shows error toast on toggle failure', async () => {
+    const failingChange = { ...makeChange('error'), selected: false };
+    const onOptimisticSelectionChange = vi.fn();
+    const onOptimisticSelectionRollback = vi.fn();
+
+    toggleChangeSelectionMock.mockRejectedValueOnce(new Error('network down'));
+
+    render(
+      <ChangeRow
+        change={failingChange}
+        onOptimisticSelectionChange={onOptimisticSelectionChange}
+        onOptimisticSelectionRollback={onOptimisticSelectionRollback}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select change change-a' }));
+
+    await waitFor(() => {
+      expect(onOptimisticSelectionRollback).toHaveBeenCalledWith(failingChange);
+    });
+
+    expect(onOptimisticSelectionChange).toHaveBeenCalledWith(failingChange, true);
+    expect(toastErrorMock).toHaveBeenCalled();
   });
 });

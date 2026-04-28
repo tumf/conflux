@@ -10,6 +10,7 @@ import {
   FullState,
   OrchestrationStatus,
   ProposalSession,
+  RemoteChange,
   RemoteLogEntry,
   RemoteProject,
   WorktreeInfo,
@@ -29,10 +30,15 @@ export interface AppState {
   activeProposalSessionId: string | null;
   uiState: Record<string, string>;
   activeCommands: ActiveCommand[];
+  optimisticChangeSelection: Record<string, boolean>;
 }
 
 export type AppAction =
   | { type: 'SET_FULL_STATE'; payload: FullState }
+  | { type: 'APPLY_CHANGE_UPDATE'; payload: RemoteChange }
+  | { type: 'APPLY_OPTIMISTIC_CHANGE_SELECTION'; payload: { projectId: string; changeId: string; selected: boolean } }
+  | { type: 'CLEAR_OPTIMISTIC_CHANGE_SELECTION'; payload: { projectId: string; changeId: string } }
+  | { type: 'REVERT_OPTIMISTIC_CHANGE_SELECTION'; payload: { projectId: string; changeId: string } }
   | { type: 'APPEND_LOG'; payload: RemoteLogEntry }
   | { type: 'SET_CONNECTION_STATUS'; payload: ConnectionStatus }
   | { type: 'SELECT_PROJECT'; payload: string | null }
@@ -58,14 +64,43 @@ const initialState: AppState = {
   activeProposalSessionId: null,
   uiState: {},
   activeCommands: [],
+  optimisticChangeSelection: {},
 };
+
+function changeSelectionKey(projectId: string, changeId: string): string {
+  return `${projectId}::${changeId}`;
+}
+
+function applyOptimisticSelections(
+  projects: RemoteProject[],
+  optimisticSelection: Record<string, boolean>,
+): RemoteProject[] {
+  if (Object.keys(optimisticSelection).length === 0) {
+    return projects;
+  }
+
+  return projects.map((project) => ({
+    ...project,
+    changes: project.changes.map((change) => {
+      const key = changeSelectionKey(project.id, change.id);
+      const optimisticValue = optimisticSelection[key];
+      if (typeof optimisticValue !== 'boolean') {
+        return change;
+      }
+      return {
+        ...change,
+        selected: optimisticValue,
+      };
+    }),
+  }));
+}
 
 export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'SET_FULL_STATE': {
       const next: AppState = {
         ...state,
-        projects: action.payload.projects,
+        projects: applyOptimisticSelections(action.payload.projects, state.optimisticChangeSelection),
         syncAvailable: action.payload.sync_available ?? false,
         orchestrationStatus: action.payload.orchestration_status ?? 'idle',
         uiState: action.payload.ui_state ?? {},
@@ -78,6 +113,108 @@ export function appReducer(state: AppState, action: AppAction): AppState {
         };
       }
       return next;
+    }
+
+    case 'APPLY_CHANGE_UPDATE': {
+      const incoming = action.payload;
+      const key = changeSelectionKey(incoming.project, incoming.id);
+      const shouldKeepOptimistic = key in state.optimisticChangeSelection;
+      const nextProjects = state.projects.map((project) => {
+        if (project.id !== incoming.project) {
+          return project;
+        }
+        return {
+          ...project,
+          changes: project.changes.map((change) => {
+            if (change.id !== incoming.id) {
+              return change;
+            }
+            return {
+              ...incoming,
+              selected: shouldKeepOptimistic
+                ? state.optimisticChangeSelection[key]
+                : incoming.selected,
+            };
+          }),
+        };
+      });
+      return {
+        ...state,
+        projects: nextProjects,
+      };
+    }
+
+    case 'APPLY_OPTIMISTIC_CHANGE_SELECTION': {
+      const { projectId, changeId, selected } = action.payload;
+      const key = changeSelectionKey(projectId, changeId);
+      const nextOptimistic = {
+        ...state.optimisticChangeSelection,
+        [key]: selected,
+      };
+      const nextProjects = state.projects.map((project) => {
+        if (project.id !== projectId) {
+          return project;
+        }
+        return {
+          ...project,
+          changes: project.changes.map((change) =>
+            change.id === changeId ? { ...change, selected } : change,
+          ),
+        };
+      });
+      return {
+        ...state,
+        projects: nextProjects,
+        optimisticChangeSelection: nextOptimistic,
+      };
+    }
+
+    case 'CLEAR_OPTIMISTIC_CHANGE_SELECTION': {
+      const { projectId, changeId } = action.payload;
+      const key = changeSelectionKey(projectId, changeId);
+      if (!(key in state.optimisticChangeSelection)) {
+        return state;
+      }
+
+      const { [key]: _, ...nextOptimistic } = state.optimisticChangeSelection;
+      return {
+        ...state,
+        optimisticChangeSelection: nextOptimistic,
+      };
+    }
+
+    case 'REVERT_OPTIMISTIC_CHANGE_SELECTION': {
+      const { projectId, changeId } = action.payload;
+      const key = changeSelectionKey(projectId, changeId);
+      if (!(key in state.optimisticChangeSelection)) {
+        return state;
+      }
+
+      const optimisticSelected = state.optimisticChangeSelection[key];
+      const { [key]: _, ...nextOptimistic } = state.optimisticChangeSelection;
+      const nextProjects = state.projects.map((project) => {
+        if (project.id !== projectId) {
+          return project;
+        }
+        return {
+          ...project,
+          changes: project.changes.map((change) => {
+            if (change.id !== changeId) {
+              return change;
+            }
+            return {
+              ...change,
+              selected: !optimisticSelected,
+            };
+          }),
+        };
+      });
+
+      return {
+        ...state,
+        projects: nextProjects,
+        optimisticChangeSelection: nextOptimistic,
+      };
     }
 
     case 'APPEND_LOG': {
@@ -198,6 +335,34 @@ export function useAppStore() {
     dispatch({ type: 'APPEND_LOG', payload: logEntry });
   }, []);
 
+  const applyChangeUpdate = useCallback((change: RemoteChange) => {
+    dispatch({ type: 'APPLY_CHANGE_UPDATE', payload: change });
+  }, []);
+
+  const applyOptimisticChangeSelection = useCallback(
+    (projectId: string, changeId: string, selected: boolean) => {
+      dispatch({
+        type: 'APPLY_OPTIMISTIC_CHANGE_SELECTION',
+        payload: { projectId, changeId, selected },
+      });
+    },
+    [],
+  );
+
+  const clearOptimisticChangeSelection = useCallback((projectId: string, changeId: string) => {
+    dispatch({
+      type: 'CLEAR_OPTIMISTIC_CHANGE_SELECTION',
+      payload: { projectId, changeId },
+    });
+  }, []);
+
+  const revertOptimisticChangeSelection = useCallback((projectId: string, changeId: string) => {
+    dispatch({
+      type: 'REVERT_OPTIMISTIC_CHANGE_SELECTION',
+      payload: { projectId, changeId },
+    });
+  }, []);
+
   const setConnectionStatus = useCallback((status: ConnectionStatus) => {
     dispatch({ type: 'SET_CONNECTION_STATUS', payload: status });
   }, []);
@@ -242,6 +407,10 @@ export function useAppStore() {
     state,
     setFullState,
     appendLog,
+    applyChangeUpdate,
+    applyOptimisticChangeSelection,
+    clearOptimisticChangeSelection,
+    revertOptimisticChangeSelection,
     setConnectionStatus,
     selectProject,
     clearLogs,
