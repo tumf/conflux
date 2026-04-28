@@ -1,0 +1,12 @@
+## Implementation Tasks
+
+- [x] 1. Implement `src/tui/render.rs` の `render_changes_list_select()` に rejected row の status label 描画を実装する (implementation: `src/tui/render.rs`) (verification: unit - `cargo test tui::render::tests::render_changes_list_select_shows_rejected_label_for_rejected_change`)
+- [x] 2. `src/tui/render.rs` と `src/tui/state/event_handlers/output.rs` で rejected row の badge / prefix 描画条件を実装・調整する (implementation: `src/tui/render.rs`, `src/tui/state/event_handlers/output.rs`; verification: unit - `cargo test tui::render::tests::render_changes_list_select_hides_new_badge_for_rejected_change` と `cargo test tui::render::tests::render_changes_list_select_uses_non_execution_prefix_for_rejected_change`)
+- [x] 3. `src/tui/render.rs` の Running mode 描画ロジックに rejected label の回帰防止を実装する (implementation: `src/tui/render.rs`; verification: unit - `cargo test tui::render::tests::render_changes_list_running_shows_rejected_label_for_rejected_change`)
+- [x] 4. `src/tui/state/event_handlers/output.rs` で rejected 行の state 設定処理の回帰防止を実装する (implementation: `src/tui/state/event_handlers/output.rs`; verification: unit - `cargo test tui::state::event_handlers::output::tests::handle_change_rejected`)
+- [x] 5. `src/tui/state/selection_logic.rs` と `src/tui/render.rs` で rejected 行の queue/resume 操作除外制御の回帰防止を実装する (implementation: `src/tui/state/selection_logic.rs`, `src/tui/render.rs`; verification: unit - `cargo test tui::state::selection_logic::tests`)
+- [x] 6. `src/tui/render.rs` 変更に対する検証コマンドを実行し spec delta との整合性を確認する (implementation: `src/tui/render.rs`; verification: integration - `cflx openspec validate add-tui-rejected-status-label --strict --evidence warn`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`)
+
+## Acceptance #1 Failure Follow-up
+- [x] openspec/changes/add-tui-rejected-status-label/tasks.md:3-7 の verification 記述不整合に対し、実在テスト名との対応を検証して差分を確定した（実在: `tui::render::tests::test_render_hides_new_badge_for_rejected_row_in_select_mode` / `tui::render::tests::test_render_hides_new_badge_for_rejected_row_in_running_mode` / `tui::state::event_handlers::output::tests::change_rejected_clears_only_target_selection`）。
+- [x] verification 証跡として上記3件の `cargo test ... -- --exact` と `cargo clippy --all-targets --all-features -- -D warnings`、`cflx openspec validate add-tui-rejected-status-label --strict --evidence warn` を実行し成功を確認した。なお `tasks.md:8` の runtime behavior 警告（implementation-facing task 不足）は `validate` の warning として現状維持。
