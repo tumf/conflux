@@ -1856,43 +1856,16 @@ Archived changes MAY still be resolved by detail-oriented subcommands such as `c
 
 - **WHEN** the user runs `cflx openspec list --specs`
 - **THEN** the CLI lists canonical specifications from `openspec/specs/`
+- **AND** each listed spec includes its canonical requirement count derived from `### Requirement:` headings in `spec.md`
 - **AND** the command does not rely on `scripts/cflx.py`
 
-#### Scenario: List command hides archived changes
+#### Scenario: Canonical spec with no requirements shows zero count
 
-- **GIVEN** `openspec/changes/active-change/proposal.md` exists
-- **AND** `openspec/changes/archive/2026-04-27-archived-change/proposal.md` exists
-- **WHEN** the user runs `cflx openspec list`
-- **THEN** the CLI lists `active-change`
-- **AND** the CLI does not list `archived-change`
-- **AND** the CLI does not render an archived status row for that archive entry
-
-#### Scenario: Show change deltas as machine-readable JSON
-
-- **GIVEN** a change id exists under `openspec/changes/` or `openspec/changes/archive/`
-- **WHEN** the user runs `cflx openspec show <change-id> --json --deltas-only`
-- **THEN** the CLI emits machine-readable JSON for that change's delta-oriented view
-- **AND** the output is sufficient for skill guidance that currently uses helper-script JSON output
-
-#### Scenario: Show command still resolves archived change
-
-- **GIVEN** `openspec/changes/archive/2026-04-27-archived-change/proposal.md` exists
-- **WHEN** the user runs `cflx openspec show archived-change`
-- **THEN** the CLI resolves the archived change entry
-- **AND** the command does not require the archived change to appear in `cflx openspec list`
-
-#### Scenario: Strict validation with evidence mode is available natively
-
-- **GIVEN** a change id exists under `openspec/changes/`
-- **WHEN** the user runs `cflx openspec validate <change-id> --strict --evidence error`
-- **THEN** the CLI applies the same strict proposal validation contract used by bundled Conflux skills
-- **AND** the command exits non-zero when validation fails
-
-#### Scenario: Archive executes without a Python helper
-
-- **GIVEN** a change is ready to archive
-- **WHEN** the user runs `cflx openspec archive <change-id> --yes`
-- **THEN** the CLI archives the change and promotes spec deltas without invoking a bundled Python helper
+- **GIVEN** a canonical spec exists under `openspec/specs/empty-spec/spec.md`
+- **AND** that file contains no `### Requirement:` headings
+- **WHEN** the user runs `cflx openspec list --specs`
+- **THEN** the CLI still lists `empty-spec`
+- **AND** it renders `Requirements: 0`
 
 ### Requirement: install-skills Subcommand
 

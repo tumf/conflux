@@ -311,9 +311,11 @@ impl OpenSpecManager {
                         .to_string_lossy()
                         .to_string();
                     let rel_path = format!("openspec/specs/{}/spec.md", name);
+                    let requirement_count = count_requirements_in_spec(&spec_file);
                     specs.push(SpecInfo {
                         name,
                         path: rel_path,
+                        requirement_count,
                     });
                 }
             }
@@ -862,6 +864,7 @@ struct ChangeInfo {
 struct SpecInfo {
     name: String,
     path: String,
+    requirement_count: usize,
 }
 
 struct ShowInfo {
@@ -877,6 +880,17 @@ struct ShowInfo {
 }
 
 // ─── Helper functions ────────────────────────────────────────────────────────
+
+fn count_requirements_in_spec(spec_path: &Path) -> usize {
+    static REQUIREMENT_RE: OnceLock<Regex> = OnceLock::new();
+    let requirement_re =
+        REQUIREMENT_RE.get_or_init(|| Regex::new(r"(?m)^### Requirement:").unwrap());
+
+    match fs::read_to_string(spec_path) {
+        Ok(content) => requirement_re.find_iter(&content).count(),
+        Err(_) => 0,
+    }
+}
 
 fn count_tasks(content: &str) -> (u32, u32) {
     static CHECKBOX_RE: OnceLock<Regex> = OnceLock::new();
@@ -1284,18 +1298,23 @@ fn check_archive_risk(specs_dir: &Path, change_id: &str) -> Vec<String> {
 
 // ─── Public command entry points ─────────────────────────────────────────────
 
+fn render_specs_output(specs: &[SpecInfo]) -> String {
+    let mut output = String::from("\n\x1b[1mSpecifications:\x1b[0m\n\n");
+    for spec in specs {
+        output.push_str(&format!("  \x1b[96m{}\x1b[0m\n", spec.name));
+        output.push_str(&format!("    Path: {}\n", spec.path));
+        output.push_str(&format!("    Requirements: {}\n\n", spec.requirement_count));
+    }
+    output
+}
+
 /// `cflx openspec list` — list changes or specs.
 pub fn cmd_list(show_specs: bool) -> Result<(), String> {
     let mgr = OpenSpecManager::new();
 
     if show_specs {
         let specs = mgr.list_specs();
-        println!("\n\x1b[1mSpecifications:\x1b[0m\n");
-        for spec in &specs {
-            println!("  \x1b[96m{}\x1b[0m", spec.name);
-            println!("    Path: {}", spec.path);
-            println!();
-        }
+        print!("{}", render_specs_output(&specs));
     } else {
         let changes = mgr.list_changes();
         println!("\n\x1b[1mChanges:\x1b[0m\n");
@@ -1818,6 +1837,50 @@ mod openspec_list_show_tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].id, "active-change");
         assert!(changes[0].path.contains("openspec/changes/active-change"));
+
+        env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_list_specs_includes_requirement_counts() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        env::set_current_dir(temp.path()).unwrap();
+
+        let foo_dir = temp.path().join("openspec/specs/foo-spec");
+        fs::create_dir_all(&foo_dir).unwrap();
+        fs::write(
+            foo_dir.join("spec.md"),
+            "# Foo\n\n### Requirement: One\n\nBody\n\n### Requirement: Two\n\nBody\n",
+        )
+        .unwrap();
+
+        let empty_dir = temp.path().join("openspec/specs/empty-spec");
+        fs::create_dir_all(&empty_dir).unwrap();
+        fs::write(
+            empty_dir.join("spec.md"),
+            "# Empty\n\nNo requirements here.\n",
+        )
+        .unwrap();
+
+        let mgr = OpenSpecManager::new();
+        let specs = mgr.list_specs();
+
+        let foo = specs.iter().find(|s| s.name == "foo-spec").unwrap();
+        assert_eq!(foo.requirement_count, 2);
+
+        let empty = specs.iter().find(|s| s.name == "empty-spec").unwrap();
+        assert_eq!(empty.requirement_count, 0);
+
+        let rendered = render_specs_output(&specs);
+        assert!(rendered.contains("  \x1b[96mempty-spec\x1b[0m"));
+        assert!(rendered.contains("    Path: openspec/specs/empty-spec/spec.md"));
+        assert!(rendered.contains("    Requirements: 0"));
+        assert!(rendered.contains("  \x1b[96mfoo-spec\x1b[0m"));
+        assert!(rendered.contains("    Path: openspec/specs/foo-spec/spec.md"));
+        assert!(rendered.contains("    Requirements: 2"));
 
         env::set_current_dir(original_cwd).unwrap();
     }
