@@ -1834,7 +1834,8 @@ mod tests {
         let _cwd_lock = crate::test_support::cwd_lock().lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let origin = create_local_git_repo(temp_dir.path());
-        let (project_id, _state, router) = setup_git_sync_fixture(&temp_dir, Some("true")).await;
+        let (project_id, _state, router) =
+            setup_git_sync_fixture(&temp_dir, Some("git reset --hard origin/main")).await;
 
         let (initial_status, _initial_json) = invoke_git_sync(router.clone(), &project_id).await;
         assert_eq!(initial_status, StatusCode::OK);
