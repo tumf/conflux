@@ -1298,19 +1298,23 @@ fn check_archive_risk(specs_dir: &Path, change_id: &str) -> Vec<String> {
 
 // ─── Public command entry points ─────────────────────────────────────────────
 
+fn render_specs_output(specs: &[SpecInfo]) -> String {
+    let mut output = String::from("\n\x1b[1mSpecifications:\x1b[0m\n\n");
+    for spec in specs {
+        output.push_str(&format!("  \x1b[96m{}\x1b[0m\n", spec.name));
+        output.push_str(&format!("    Path: {}\n", spec.path));
+        output.push_str(&format!("    Requirements: {}\n\n", spec.requirement_count));
+    }
+    output
+}
+
 /// `cflx openspec list` — list changes or specs.
 pub fn cmd_list(show_specs: bool) -> Result<(), String> {
     let mgr = OpenSpecManager::new();
 
     if show_specs {
         let specs = mgr.list_specs();
-        println!("\n\x1b[1mSpecifications:\x1b[0m\n");
-        for spec in &specs {
-            println!("  \x1b[96m{}\x1b[0m", spec.name);
-            println!("    Path: {}", spec.path);
-            println!("    Requirements: {}", spec.requirement_count);
-            println!();
-        }
+        print!("{}", render_specs_output(&specs));
     } else {
         let changes = mgr.list_changes();
         println!("\n\x1b[1mChanges:\x1b[0m\n");
@@ -1869,6 +1873,14 @@ mod openspec_list_show_tests {
 
         let empty = specs.iter().find(|s| s.name == "empty-spec").unwrap();
         assert_eq!(empty.requirement_count, 0);
+
+        let rendered = render_specs_output(&specs);
+        assert!(rendered.contains("  \x1b[96mempty-spec\x1b[0m"));
+        assert!(rendered.contains("    Path: openspec/specs/empty-spec/spec.md"));
+        assert!(rendered.contains("    Requirements: 0"));
+        assert!(rendered.contains("  \x1b[96mfoo-spec\x1b[0m"));
+        assert!(rendered.contains("    Path: openspec/specs/foo-spec/spec.md"));
+        assert!(rendered.contains("    Requirements: 2"));
 
         env::set_current_dir(original_cwd).unwrap();
     }
