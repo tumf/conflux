@@ -1847,7 +1847,6 @@ mod tests {
         let (initial_status, _initial_json) = invoke_git_sync(router.clone(), &project_id).await;
         assert_eq!(initial_status, StatusCode::OK);
 
-
         let scratch = temp_dir.path().join("scratch-work-remote-ahead");
         run_git(
             temp_dir.path(),
