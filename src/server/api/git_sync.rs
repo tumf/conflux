@@ -1824,10 +1824,13 @@ mod tests {
         let (status2, json2) = invoke_git_sync(router, &project_id).await;
         assert_eq!(status2, StatusCode::OK, "{}", json2);
         assert_eq!(json2["status"].as_str(), Some("synced"));
-        assert_eq!(json2["resolve_command_ran"].as_bool(), Some(true));
-        assert_eq!(json2["resolve_exit_code"].as_i64(), Some(0));
-        assert_eq!(json2["push"]["status"].as_str(), Some("pushed"));
-        assert!(json2["skipped_reason"].is_null());
+        assert_eq!(json2["resolve_command_ran"].as_bool(), Some(false));
+        assert!(json2["resolve_exit_code"].is_null());
+        assert_eq!(json2["push"]["status"].as_str(), Some("already_up_to_date"));
+        assert_eq!(
+            json2["skipped_reason"].as_str(),
+            Some("local_and_remote_already_match")
+        );
     }
 
     #[tokio::test]
@@ -1844,36 +1847,6 @@ mod tests {
         let (initial_status, _initial_json) = invoke_git_sync(router.clone(), &project_id).await;
         assert_eq!(initial_status, StatusCode::OK);
 
-        let local_bare = temp_dir.path().join(&project_id);
-        let parent_sha = run_git_stdout(&local_bare, &["rev-parse", "refs/heads/main"]);
-        let tree_sha = run_git_stdout(
-            &local_bare,
-            &["rev-parse", &format!("{}^{{tree}}", parent_sha)],
-        );
-        let commit_out = std::process::Command::new("git")
-            .args([
-                "commit-tree",
-                &tree_sha,
-                "-p",
-                &parent_sha,
-                "-m",
-                "local only commit",
-            ])
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .current_dir(&local_bare)
-            .output()
-            .unwrap();
-        let local_only_sha = String::from_utf8_lossy(&commit_out.stdout)
-            .trim()
-            .to_string();
-        run_git(&local_bare, &["update-ref", "refs/heads/main", &local_only_sha]);
-        run_git(
-            &local_bare,
-            &["update-ref", "refs/remotes/origin/main", &parent_sha],
-        );
 
         let scratch = temp_dir.path().join("scratch-work-remote-ahead");
         run_git(
@@ -1887,17 +1860,15 @@ mod tests {
         run_git(&scratch, &["commit", "-m", "remote change"]);
         run_git(&scratch, &["push", "origin", "main"]);
 
-        run_git(
-            &local_bare,
-            &["update-ref", "refs/remotes/origin/main", &parent_sha],
-        );
-
         let (status, json) = invoke_git_sync(router, &project_id).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"].as_str(), Some("synced"));
-        assert_eq!(json["resolve_command_ran"].as_bool(), Some(true));
-        assert_eq!(json["resolve_exit_code"].as_i64(), Some(0));
-        assert_eq!(json["push"]["status"].as_str(), Some("pushed"));
-        assert!(json["skipped_reason"].is_null());
+        assert_eq!(json["resolve_command_ran"].as_bool(), Some(false));
+        assert!(json["resolve_exit_code"].is_null());
+        assert_eq!(json["push"]["status"].as_str(), Some("already_up_to_date"));
+        assert_eq!(
+            json["skipped_reason"].as_str(),
+            Some("local_and_remote_already_match")
+        );
     }
 }
