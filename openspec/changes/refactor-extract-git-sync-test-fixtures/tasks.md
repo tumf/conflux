@@ -31,3 +31,7 @@
   - 期待契約を 200/synced に固定するか、422 系を別シナリオとして仕様更新するかを明確化する
 - owner: server-api maintainers
 - decision_due: 2026-04-30
+
+## Rejecting Recovery Tasks
+
+- [ ] Investigate blocker in openspec/changes/refactor-extract-git-sync-test-fixtures/REJECTED.md and implement a non-rejection recovery path before rerunning apply
