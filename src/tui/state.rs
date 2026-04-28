@@ -1419,14 +1419,22 @@ impl AppState {
     /// to OrchestratorState::task_progress(). When updating UI state, progress is
     /// read from shared state to ensure consistency across TUI and orchestrator.
     fn update_changes(&mut self, fetched_changes: Vec<Change>) {
-        let active_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
-
         // rejected marker-bearing rows are display-only and never execution targets.
         let rejected_changes =
             crate::openspec::list_rejected_changes_native().unwrap_or_else(|err| {
                 warn!(error = %err, "Failed to list rejected changes for TUI refresh");
                 Vec::new()
             });
+
+        self.update_changes_with_rejected(fetched_changes, rejected_changes);
+    }
+
+    fn update_changes_with_rejected(
+        &mut self,
+        fetched_changes: Vec<Change>,
+        rejected_changes: Vec<Change>,
+    ) {
+        let active_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
         let rejected_ids: HashSet<String> = rejected_changes.iter().map(|c| c.id.clone()).collect();
 
         // Populate shared orchestration state with task progress from fetched changes
@@ -1598,7 +1606,8 @@ impl AppState {
 
             if let Some(rejected) = rejected_changes.iter().find(|c| &c.id == id) {
                 let mut rejected_state = ChangeState::from_change(rejected);
-                rejected_state.is_new = true;
+                // Rejected rows are read-only terminal rows and must never carry NEW badge.
+                rejected_state.is_new = false;
                 rejected_state.selected = false;
                 rejected_state.set_display_status_cache("rejected");
                 self.changes.push(rejected_state);
@@ -1663,6 +1672,15 @@ impl AppState {
             self.cursor_index = self.changes.len() - 1;
             self.list_state.select(Some(self.cursor_index));
         }
+    }
+
+    #[cfg(test)]
+    fn update_changes_with_rejected_for_test(
+        &mut self,
+        fetched_changes: Vec<Change>,
+        rejected_changes: Vec<Change>,
+    ) {
+        self.update_changes_with_rejected(fetched_changes, rejected_changes);
     }
 }
 // Note: auto_clear_merge_wait() and apply_merge_wait_status() have been removed in Phase 5.3.
@@ -3187,6 +3205,29 @@ mod tests {
         assert!(
             !app.changes[0].selected,
             "reactivated row must remain unselected until explicit user action"
+        );
+    }
+
+    #[test]
+    fn test_update_changes_new_rejected_row_is_not_new_and_not_counted() {
+        let mut app = AppState::new(vec![]);
+
+        let rejected = create_test_change("change-rejected", 0, 1);
+        app.update_changes_with_rejected_for_test(vec![], vec![rejected]);
+
+        let row = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-rejected")
+            .expect("rejected row should be added");
+        assert_eq!(row.display_status_cache, "rejected");
+        assert!(
+            !row.is_new,
+            "newly surfaced rejected row must not carry NEW badge"
+        );
+        assert_eq!(
+            app.new_change_count, 0,
+            "rejected rows must not increment NEW counter"
         );
     }
 
