@@ -298,10 +298,9 @@ where
     use crate::agent::OutputLine;
 
     // Execute archive command with streaming
-    let (mut child, mut output_rx, start, _archive_command) =
-        agent
-            .run_archive_streaming_with_runner(change_id, ai_runner, None)
-            .await?;
+    let (mut child, mut output_rx, start, _archive_command) = agent
+        .run_archive_streaming_with_runner(change_id, ai_runner, None)
+        .await?;
 
     // Create output collector for history
     let mut output_collector = OutputCollector::new();

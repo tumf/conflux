@@ -71,7 +71,6 @@ async fn test_run_apply_with_runner_echo_command() {
     assert_eq!(result.unwrap().trim(), "test prompt");
 }
 
-
 #[tokio::test]
 async fn test_with_runner_paths_preserve_prompt_and_output() {
     let config = OrchestratorConfig {
@@ -143,7 +142,11 @@ async fn test_with_runner_paths_preserve_prompt_and_output() {
     assert!(analyze.contains("analyze:analyze-marker"));
 
     let (mut resolve_child, mut resolve_rx) = runner
-        .run_resolve_streaming_in_dir_with_runner("resolve-marker", std::path::Path::new("."), &ai_runner)
+        .run_resolve_streaming_in_dir_with_runner(
+            "resolve-marker",
+            std::path::Path::new("."),
+            &ai_runner,
+        )
         .await
         .unwrap();
     let mut resolve_output = String::new();
