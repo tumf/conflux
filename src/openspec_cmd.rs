@@ -3,6 +3,7 @@
 //! Replaces the former Python helper `scripts/cflx.py` with native Rust
 //! implementations for list, show, validate, and archive operations.
 
+use chrono::Local;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -250,12 +251,27 @@ impl OpenSpecManager {
         if change_dir.exists() && change_dir.join("proposal.md").exists() {
             return Some(change_dir);
         }
-        // Check archive
-        let archive_dir = self.archive_dir.join(change_id);
-        if archive_dir.exists() && archive_dir.join("proposal.md").exists() {
-            return Some(archive_dir);
+
+        // Check archive (both direct and dated entries)
+        if !self.archive_dir.exists() {
+            return None;
         }
-        None
+
+        fs::read_dir(&self.archive_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .find_map(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                let candidate = entry.path();
+                if (name_str == change_id || name_str.ends_with(&format!("-{}", change_id)))
+                    && candidate.join("proposal.md").exists()
+                {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            })
     }
 
     fn list_changes(&self) -> Vec<ChangeInfo> {
@@ -723,8 +739,9 @@ impl OpenSpecManager {
         fs::create_dir_all(&self.archive_dir)
             .map_err(|e| format!("Failed to create archive directory: {}", e))?;
 
-        // Move to archive
-        let archive_dest = self.archive_dir.join(change_id);
+        // Move to archive using dated destination (YYYY-MM-DD-<change_id>)
+        let archive_name = format!("{}-{}", Local::now().format("%Y-%m-%d"), change_id);
+        let archive_dest = self.archive_dir.join(&archive_name);
         if archive_dest.exists() {
             return Err(format!(
                 "Archive destination already exists: {}",
@@ -740,12 +757,12 @@ impl OpenSpecManager {
             let specs_updated = self.update_specs_from_change(&archive_dest);
             Ok(format!(
                 "Archived to openspec/changes/archive/{}\nSpecs updated: {:?}",
-                change_id, specs_updated
+                archive_name, specs_updated
             ))
         } else {
             Ok(format!(
                 "Archived to openspec/changes/archive/{}",
-                change_id
+                archive_name
             ))
         }
     }
@@ -1937,6 +1954,33 @@ mod openspec_list_show_tests {
         assert!(info
             .path
             .contains("openspec/changes/archive/archived-change"));
+
+        env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_show_change_resolves_dated_archived_entry() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let temp = TempDir::new().unwrap();
+
+        env::set_current_dir(temp.path()).unwrap();
+
+        let archived_dir = temp
+            .path()
+            .join("openspec/changes/archive/2026-04-28-archived-change");
+        create_change(&archived_dir, "Archived Change", "- [x] archived\n");
+
+        let mgr = OpenSpecManager::new();
+        let info = mgr
+            .show_change("archived-change", false)
+            .expect("dated archived change should resolve via show");
+
+        assert!(info.archived);
+        assert_eq!(info.id, "2026-04-28-archived-change");
+        assert!(info
+            .path
+            .contains("openspec/changes/archive/2026-04-28-archived-change"));
 
         env::set_current_dir(original_cwd).unwrap();
     }
