@@ -1209,7 +1209,7 @@ fn validate_tasks_content(
                     "{}: tasks.md:{}: Possible task without checkbox: {}",
                     change_id,
                     line_num,
-                    &trimmed[..trimmed.len().min(50)]
+                    truncate_for_display(trimmed, 50)
                 ));
             }
         }
@@ -1682,6 +1682,37 @@ mod validation_tests {
         assert!(errors
             .iter()
             .any(|e| e.contains("Possible task without checkbox")));
+    }
+
+    #[test]
+    fn test_validate_tasks_bare_task_utf8_safe_preview_boundary() {
+        let content =
+            "## Implementation\n- UTF8§12345678901234567890123456789012345678901234567890 task\n";
+        let (errors, _) = validate_tasks_content(content, "test", false, "off", None, None);
+
+        let warning = errors
+            .iter()
+            .find(|e| e.contains("Possible task without checkbox"))
+            .expect("bare-task warning should be present");
+
+        assert!(warning.contains("Possible task without checkbox"));
+        assert!(warning.contains("UTF8§"));
+        assert!(warning.contains("..."));
+    }
+
+    #[test]
+    fn test_validate_tasks_bare_task_long_preview_still_truncated() {
+        let content =
+            "## Implementation\n- abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n";
+        let (errors, _) = validate_tasks_content(content, "test", false, "off", None, None);
+
+        let warning = errors
+            .iter()
+            .find(|e| e.contains("Possible task without checkbox"))
+            .expect("bare-task warning should be present");
+
+        assert!(warning.contains("Possible task without checkbox"));
+        assert!(warning.contains("..."));
     }
 
     #[test]
