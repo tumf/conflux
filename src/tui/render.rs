@@ -453,7 +453,11 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 } else {
                     Color::Green
                 };
-                let new_badge = if change.is_new { " NEW" } else { "" };
+                let new_badge = if change.is_new && change.display_status_cache != "rejected" {
+                    " NEW"
+                } else {
+                    ""
+                };
                 let uncommitted_badge = if show_uncommitted_badge {
                     " UNCOMMITED"
                 } else {
@@ -747,7 +751,11 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 } else {
                     Color::Green
                 };
-                let new_badge = if change.is_new { " NEW" } else { "" };
+                let new_badge = if change.is_new && change.display_status_cache != "rejected" {
+                    " NEW"
+                } else {
+                    ""
+                };
                 let uncommitted_badge = if show_uncommitted_badge {
                     " UNCOMMITED"
                 } else {
@@ -1892,6 +1900,38 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 20);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("WT"));
+    }
+
+    #[test]
+    fn test_render_hides_new_badge_for_rejected_row_in_select_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Select;
+        app.changes[0].display_status_cache = "rejected".to_string();
+        app.changes[0].is_new = true;
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(
+            !content.contains(" NEW"),
+            "rejected row must never render NEW badge in Select mode"
+        );
+    }
+
+    #[test]
+    fn test_render_hides_new_badge_for_rejected_row_in_running_mode() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "rejected".to_string();
+        app.changes[0].is_new = true;
+        app.add_log(LogEntry::info("log"));
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("rejected"));
+        assert!(
+            !content.contains(" NEW"),
+            "rejected row must never render NEW badge in Running mode"
+        );
     }
 
     #[test]
