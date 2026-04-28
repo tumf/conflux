@@ -4,12 +4,19 @@
 
 import { FullState, RemoteChange, RemoteLogEntry, RemoteProject } from './types';
 
+export interface ChangeUpdateMessage {
+  type: 'change_update';
+  change: RemoteChange;
+}
+
 export type ConnectionStatus = 'connected' | 'reconnecting' | 'disconnected';
 
 interface WSMessage {
   type: 'full_state' | 'log' | 'change_update' | 'ping' | 'pong';
   /** Server sends projects with nested changes */
   projects?: RemoteProject[];
+  /** Incremental single-change update */
+  change?: RemoteChange;
   /** Per-project worktree information */
   worktrees?: FullState['worktrees'];
   /** Persisted dashboard UI state */
@@ -28,6 +35,7 @@ export class WebSocketClient {
   private url: string;
   private listeners: {
     onStateUpdate?: (state: FullState) => void;
+    onChangeUpdate?: (message: ChangeUpdateMessage) => void;
     onLogEntry?: (entry: RemoteLogEntry) => void;
     onConnectionChange?: (status: ConnectionStatus) => void;
     onError?: (error: Error) => void;
@@ -89,6 +97,11 @@ export class WebSocketClient {
                 orchestration_status: message.orchestration_status,
               };
               this.listeners.onStateUpdate?.(state);
+            } else if (message.type === 'change_update' && message.change) {
+              this.listeners.onChangeUpdate?.({
+                type: 'change_update',
+                change: message.change as RemoteChange,
+              });
             } else if (message.type === 'log' && message.entry) {
               this.listeners.onLogEntry?.(message.entry);
             }
@@ -153,11 +166,13 @@ export class WebSocketClient {
    * Register a listener
    */
   on(
-    event: 'stateUpdate' | 'logEntry' | 'connectionChange' | 'error',
+    event: 'stateUpdate' | 'changeUpdate' | 'logEntry' | 'connectionChange' | 'error',
     callback: (data: any) => void,
   ): void {
     if (event === 'stateUpdate') {
       this.listeners.onStateUpdate = callback;
+    } else if (event === 'changeUpdate') {
+      this.listeners.onChangeUpdate = callback;
     } else if (event === 'logEntry') {
       this.listeners.onLogEntry = callback;
     } else if (event === 'connectionChange') {

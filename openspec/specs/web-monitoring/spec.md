@@ -190,42 +190,37 @@ Rejected row は read-only terminal row として表示してよいが、executi
 - **AND** active execution candidate と同じ checkbox semantics を保持しない
 
 ### Requirement: Dashboard UI - Real-time Updates
+
 The web dashboard SHALL automatically update when orchestrator state changes.
 The web dashboard SHALL render a fresh initial state snapshot on page load.
 The web dashboard SHALL fall back to polling when WebSocket updates are unavailable.
 
-#### Scenario: Initial state render
-- **WHEN** dashboard loads
-- **THEN** JavaScript fetches the current state from `/api/state`
-- **AND** the fetch disables caching (equivalent to `Cache-Control: no-store` semantics)
-- **AND** dashboard renders progress and task counts from the fetched snapshot
+Explicit user-driven selection toggles MUST NOT feel deferred until the next background `full_state` or polling cycle. When the user toggles a change checkbox, the dashboard SHALL reflect the intended selection state immediately and then reconcile against the server-confirmed value.
 
-#### Scenario: WebSocket connection in dashboard
-- **WHEN** dashboard loads
-- **THEN** JavaScript establishes WebSocket connection to `/ws`
-- **AND** connection status indicator shows "Connected"
+#### Scenario: live-selection-toggle-does-not-wait-for-full-state
+- **GIVEN** the dashboard is connected and displays a change row with `selected = false`
+- **WHEN** the user toggles the checkbox for that row
+- **THEN** the dashboard immediately updates the row's visible checkbox state
+- **AND** the row does not wait for the next periodic refresh or unrelated `full_state` push before showing the intended selection change
 
-#### Scenario: Live progress updates
-- **WHEN** orchestrator completes a task
-- **THEN** WebSocket broadcast is received
-- **AND** dashboard updates progress bar without page reload
-- **AND** task count updates reflect new state
+#### Scenario: error-row-reselect-is-visible-immediately
+- **GIVEN** the dashboard displays a change row whose status is `error` and `selected = false`
+- **WHEN** the user re-selects that row for retry
+- **THEN** the checkbox becomes visibly checked immediately
+- **AND** the row continues to display error status treatment rather than changing to a non-error status prematurely
 
-#### Scenario: WebSocket reconnection
-- **WHEN** WebSocket connection is lost
-- **THEN** dashboard shows "Disconnected" status
-- **AND** JavaScript automatically attempts to reconnect
-- **AND** reconnection succeeds when server is available
+#### Scenario: failed-selection-toggle-rolls-back-ui
+- **GIVEN** the dashboard has optimistically updated a row checkbox after a user toggle
+- **AND** the server rejects or fails the toggle request
+- **WHEN** the failure is observed by the dashboard
+- **THEN** the dashboard restores the prior confirmed checkbox state
+- **AND** the dashboard surfaces an error indication to the user
 
-#### Scenario: Polling fallback updates
-- **WHEN** WebSocket is disconnected and reconnection has not succeeded
-- **THEN** dashboard periodically fetches `/api/state` every 5 seconds and updates the UI
-- **AND** updates continue until WebSocket is re-established
-
-#### Scenario: Manual reload shows current state
-- **WHEN** user reloads the dashboard page
-- **THEN** the dashboard renders the latest orchestrator state
-- **AND** the displayed progress reflects current `/api/state` content
+#### Scenario: bulk-selection-toggle-updates-visible-rows-immediately
+- **GIVEN** the dashboard displays multiple change rows including previously unselected error rows
+- **WHEN** the user invokes a bulk selection toggle
+- **THEN** the visible row checkbox states update immediately to the intended post-toggle values
+- **AND** the dashboard later reconciles to the server-confirmed values without leaving stale pre-toggle selections on screen
 
 ### Requirement: Dashboard UI - Task Status Visualization
 

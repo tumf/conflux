@@ -1,12 +1,15 @@
 import React, { useCallback, useState } from 'react';
+import { toast } from 'sonner';
 import { RemoteChange } from '../api/types';
-import { stopAndDequeueChange, toggleChangeSelection } from '../api/restClient';
+import { APIError, stopAndDequeueChange, toggleChangeSelection } from '../api/restClient';
 import { StopChangeDialog } from './StopChangeDialog';
 
 interface ChangeRowProps {
   change: RemoteChange;
   onClickChange?: (changeId: string) => void;
   isSelected?: boolean;
+  onOptimisticSelectionChange?: (change: RemoteChange, selected: boolean) => void;
+  onOptimisticSelectionRollback?: (change: RemoteChange) => void;
 }
 
 const statusConfig: Record<string, { color: string; bg: string }> = {
@@ -37,7 +40,13 @@ const progressBarColor: Record<string, string> = {
   error: 'bg-[#ef4444]',
 };
 
-export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps) {
+export function ChangeRow({
+  change,
+  onClickChange,
+  isSelected,
+  onOptimisticSelectionChange,
+  onOptimisticSelectionRollback,
+}: ChangeRowProps) {
   const [showStopDialog, setShowStopDialog] = useState(false);
   const [isStopLoading, setIsStopLoading] = useState(false);
 
@@ -62,9 +71,27 @@ export function ChangeRow({ change, onClickChange, isSelected }: ChangeRowProps)
       if (isRejectedTerminal) {
         return;
       }
-      toggleChangeSelection(change.project, change.id).catch(console.error);
+
+      const nextSelected = !change.selected;
+      onOptimisticSelectionChange?.(change, nextSelected);
+
+      toggleChangeSelection(change.project, change.id).catch((error) => {
+        onOptimisticSelectionRollback?.(change);
+        const message =
+          error instanceof APIError
+            ? error.message
+            : error instanceof Error
+              ? error.message
+              : String(error);
+        toast.error(`Failed to update selection for ${change.id}: ${message}`);
+      });
     },
-    [change.project, change.id, isRejectedTerminal],
+    [
+      change,
+      isRejectedTerminal,
+      onOptimisticSelectionChange,
+      onOptimisticSelectionRollback,
+    ],
   );
 
   const isActive = ['applying', 'accepting', 'archiving', 'resolving'].includes(change.status);

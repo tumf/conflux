@@ -46,7 +46,7 @@ TUI 固有のステータス enum（旧 `QueueStatus`）を保持してはなら
 
 When a change directory contains both `openspec/changes/<change_id>/proposal.md` and `openspec/changes/<change_id>/REJECTED.md`, the TUI change list SHALL display that change as a read-only `rejected` row rather than omitting it entirely.
 
-A rejected row SHALL NOT participate in execution mark, queue, resume, or new-change affordances. The TUI MUST keep its frontend-visible execution mark cleared (`selected = false`), MUST ignore queue-oriented key operations for that row, and MUST NOT label the row with the `NEW` badge or count it toward `new_change_count`.
+A rejected row SHALL NOT participate in execution mark, queue, or resume controls. The TUI MUST keep its frontend-visible execution mark cleared (`selected = false`), MUST ignore queue-oriented key operations for that row, MUST NOT label the row with the `NEW` badge, and MUST visibly present the row's terminal status as `rejected` in both Select and Running mode.
 
 #### Scenario: Rejected change is shown in TUI list
 
@@ -71,15 +71,18 @@ A rejected row SHALL NOT participate in execution mark, queue, resume, or new-ch
 - **THEN** `fix-auth` is not added to the execution queue
 - **AND** no execution start is requested for `fix-auth`
 
-#### Scenario: Rejected row is not marked as NEW on refresh
+#### Scenario: Select mode shows rejected status label
 
-- **GIVEN** `fix-auth` is not yet present in the current TUI list
-- **AND** `openspec/changes/fix-auth/proposal.md` exists
-- **AND** `openspec/changes/fix-auth/REJECTED.md` exists
-- **WHEN** the next TUI refresh adds `fix-auth` as a rejected row
-- **THEN** `fix-auth` is displayed as `rejected`
+- **GIVEN** `fix-auth` is displayed as a `rejected` row in the TUI Select mode
+- **WHEN** the change list row is rendered
+- **THEN** the row visibly includes the label `[rejected]`
 - **AND** the row does NOT show the `NEW` badge
-- **AND** `new_change_count` does NOT increase because of `fix-auth`
+
+#### Scenario: Running mode keeps rejected status label
+
+- **GIVEN** `fix-auth` is displayed as a `rejected` row in the TUI Running mode
+- **WHEN** the change list row is rendered
+- **THEN** the row visibly includes the label `[rejected]`
 
 #### Scenario: Marker removal reactivates the change as unselected active row
 
@@ -93,7 +96,7 @@ A rejected row SHALL NOT participate in execution mark, queue, resume, or new-ch
 
 When a change directory contains both `openspec/changes/<change_id>/proposal.md` and `openspec/changes/<change_id>/REJECTED.md`, the TUI change list SHALL display that change as a read-only `rejected` row rather than omitting it entirely.
 
-A rejected row SHALL NOT participate in execution mark, queue, resume, or new-change affordances. The TUI MUST keep its frontend-visible execution mark cleared (`selected = false`), MUST ignore queue-oriented key operations for that row, and MUST NOT label the row with the `NEW` badge or count it toward `new_change_count`.
+A rejected row SHALL NOT participate in execution mark, queue, or resume controls. The TUI MUST keep its frontend-visible execution mark cleared (`selected = false`), MUST ignore queue-oriented key operations for that row, MUST NOT label the row with the `NEW` badge, and MUST visibly present the row's terminal status as `rejected` in both Select and Running mode.
 
 #### Scenario: Rejected change is shown in TUI list
 
@@ -118,15 +121,18 @@ A rejected row SHALL NOT participate in execution mark, queue, resume, or new-ch
 - **THEN** `fix-auth` is not added to the execution queue
 - **AND** no execution start is requested for `fix-auth`
 
-#### Scenario: Rejected row is not marked as NEW on refresh
+#### Scenario: Select mode shows rejected status label
 
-- **GIVEN** `fix-auth` is not yet present in the current TUI list
-- **AND** `openspec/changes/fix-auth/proposal.md` exists
-- **AND** `openspec/changes/fix-auth/REJECTED.md` exists
-- **WHEN** the next TUI refresh adds `fix-auth` as a rejected row
-- **THEN** `fix-auth` is displayed as `rejected`
+- **GIVEN** `fix-auth` is displayed as a `rejected` row in the TUI Select mode
+- **WHEN** the change list row is rendered
+- **THEN** the row visibly includes the label `[rejected]`
 - **AND** the row does NOT show the `NEW` badge
-- **AND** `new_change_count` does NOT increase because of `fix-auth`
+
+#### Scenario: Running mode keeps rejected status label
+
+- **GIVEN** `fix-auth` is displayed as a `rejected` row in the TUI Running mode
+- **WHEN** the change list row is rendered
+- **THEN** the row visibly includes the label `[rejected]`
 
 #### Scenario: Marker removal reactivates the change as unselected active row
 
