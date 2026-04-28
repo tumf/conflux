@@ -3,6 +3,7 @@
 use super::history_ops;
 use super::output::OutputLine;
 use super::prompt::{build_acceptance_prompt, build_apply_prompt, build_archive_prompt};
+use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine};
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
@@ -21,8 +22,6 @@ use tracing::{debug, info};
 fn bridge_ai_output_channel(
     mut ai_rx: mpsc::Receiver<crate::ai_command_runner::OutputLine>,
 ) -> mpsc::Receiver<OutputLine> {
-    use crate::ai_command_runner::OutputLine as AiOutputLine;
-
     let (tx, rx) = mpsc::channel::<OutputLine>(1024);
     tokio::spawn(async move {
         while let Some(line) = ai_rx.recv().await {
@@ -1058,20 +1057,7 @@ impl AgentRunner {
             .execute_streaming_with_retry(&command, Some(cwd), Some("resolve"), None)
             .await?;
 
-        // Convert AiCommandRunner output to AgentRunner output format
-        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
-        tokio::spawn(async move {
-            let mut ai_rx = ai_rx;
-            while let Some(line) = ai_rx.recv().await {
-                let converted = match line {
-                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                if tx.send(converted).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx))
     }
