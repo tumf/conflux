@@ -42,6 +42,7 @@ fn strip_archive_date_prefix(name: &str) -> &str {
     name
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
     /// Execution order (recommended execution sequence considering dependencies)
     pub order: Vec<String>,
@@ -1372,6 +1373,47 @@ That's all."#;
         assert!(error_text.contains("nonexistent"));
         assert!(error_text.contains("allowed_queued_ids"));
         assert!(error_text.contains("allowed_in_flight_ids"));
+    }
+
+    #[test]
+    fn test_decorate_dependency_error_classifies_archived_dependency() {
+        let analyzer = create_test_analyzer();
+        let changes = vec![create_test_change("change-a")];
+        let in_flight_ids = vec!["inflight-x".to_string()];
+        let archived_ids = HashSet::from(["archived-x".to_string()]);
+        let err = "Invalid dependency reference: change 'change-a' depends on 'archived-x' outside allowed dependency targets";
+
+        let decorated = analyzer.decorate_dependency_error_with_archive_context(
+            err,
+            &changes,
+            &in_flight_ids,
+            &archived_ids,
+        );
+
+        assert!(decorated.contains("dependency_target_classification"));
+        assert!(decorated.contains("class:'archived'"));
+    }
+
+    #[test]
+    fn test_collect_archived_change_ids_strips_date_prefix() {
+        let analyzer = create_test_analyzer();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let archived_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-sample-change");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        std::fs::write(archived_dir.join("proposal.md"), "# Archived").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        let archived_ids = analyzer.collect_archived_change_ids();
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(archived_ids.contains("sample-change"));
     }
 
     #[test]

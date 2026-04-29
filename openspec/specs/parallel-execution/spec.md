@@ -40,6 +40,28 @@ ParallelRunService は、コミットツリーに存在しない change の除�
 - **THEN** `ParallelRunService` SHALL return an error indicating a git repository is required
 - **AND** no parallel execution is started
 
+### Requirement: Archived dependency references are explicitly classified
+
+システムは active proposal metadata の dependency target を少なくとも queued / in-flight / archived / missing の4分類で扱わなければならない（SHALL）。
+
+archived dependency reference は generic parse/json failure として潰してはならない（MUST NOT）。runtime/analyze/validation は archived と missing を区別した診断を返さなければならない（MUST）。
+
+#### Scenario: Archived dependency is surfaced with dedicated diagnostics
+
+- **GIVEN** active change `alpha` が dependency `beta` を参照している
+- **AND** `beta` は `openspec/changes/archive/` にのみ存在する
+- **WHEN** analyze または validate が dependency target を検証する
+- **THEN** 診断は archived dependency reference として報告される
+- **AND** 診断は generic `Analysis returned invalid JSON` として表示されない
+
+#### Scenario: Missing dependency remains an invalid dependency failure
+
+- **GIVEN** active change `alpha` が dependency `gamma` を参照している
+- **AND** `gamma` は queued / in-flight / archive のいずれにも存在しない
+- **WHEN** analyze または validate が dependency target を検証する
+- **THEN** 診断は missing dependency として失敗を返す
+- **AND** archived dependency case と区別できるメッセージを含む
+
 ### Requirement: Parallel Event Bridge for TUI
 
 The system SHALL provide a `ParallelEventBridge` that converts `ParallelEvent` to `OrchestratorEvent` for the TUI.
