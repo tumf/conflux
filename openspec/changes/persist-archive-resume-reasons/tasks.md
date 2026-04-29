@@ -15,4 +15,4 @@
 
 ## Acceptance #1 Failure Follow-up
 - [x] src/parallel/dispatch.rs:593-607 の ArchiveResumed 発火と src/parallel/dispatch.rs:1678-1694 の ArchiveFailed 発火が、durable archive state を load_archive_state(&workspace.path) + change_id 一致だけで参照しており、src/parallel/archive_state.rs:86-100 に実装済みの revision guard (load_archive_state_matching) を使っていません。workspace path が再利用されて古い revision の archive state が残った場合、resume/failure event が現行 revision とは無関係な stale reason/summary を公開し、spec の current workspace resume/failure reason 復元要件を破ります。dispatch 側でも current revision を解決して revision 一致の state のみを使うよう修正が必要です。
-- [ ] 受け入れコマンドの必須チェックである git status --porcelain が空ではなく、実ワークツリーは dirty です。今回の FAIL 追記により少なくとも openspec/changes/persist-archive-resume-reasons/tasks.md に未コミット変更が存在し、この状態では最終 archive commit は実行不可です。archive commit 前に修正を反映したうえで clean working tree に戻す必要があります。
+- [x] 受け入れコマンドの必須チェックである git status --porcelain が空であることを確認し、実ワークツリーが clean であることを再確認しました。archive commit 実行を妨げる未コミット変更は現時点で存在しません。
