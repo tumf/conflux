@@ -1,0 +1,12 @@
+## Implementation Tasks
+
+- [ ] 1. Add a canonical spec delta describing `openspec/changes/<id>/design.md` as an optional artifact for apply/acceptance context gathering, including the rule that missing optional design docs must not be surfaced as change errors. (verification: integration - `cflx openspec validate optional-design-read-noise --strict --evidence warn` succeeds and `openspec/changes/optional-design-read-noise/specs/agent-prompts/spec.md` contains separate scenarios for optional `design.md` absence vs required artifact absence)
+- [ ] 2. Trace and update the runtime/logging path in `src/tui/state.rs` and any related event/log surfacing code so missing optional `design.md` reads are downgraded to skip/info behavior instead of `Error: File not found`, while truly required file reads still fail. (verification: integration - repository evidence in `src/tui/state.rs` and the touched log/event helper paths shows `design.md` absence is handled as skip/info, and targeted Rust coverage around those paths exercises both optional `design.md` absence and required file absence)
+- [ ] 3. Review and update workflow/apply guidance references (`skills/cflx-apply/SKILL.md`, `skills/cflx-workflow/SKILL.md`, or the prompt-builder source that materializes them) so repository guidance and runtime behavior agree on `design.md` being optional and skippable. (verification: integration - `skills/cflx-apply/SKILL.md`, `skills/cflx-workflow/SKILL.md`, and any touched prompt-builder source all describe `design.md` with skip semantics and contain no contradictory error-oriented wording)
+- [ ] 4. Add regression coverage proving that a proposal without `design.md` can continue apply/acceptance context gathering without polluting failure tracking, while missing `proposal.md` or `tasks.md` still raises the existing failure path. (verification: integration - Rust tests in the touched module(s) cover optional `design.md` missing, required `proposal.md` missing, and required `tasks.md` missing as distinct outcomes)
+- [ ] 5. Run proposal and repository verification for the touched optional-file handling paths. (verification: integration - `cflx openspec validate optional-design-read-noise --strict --evidence warn`, relevant Rust tests for the touched modules, and `cargo clippy --all-targets --all-features -- -D warnings` all succeed)
+
+## Future Work
+
+- optional artifact handling を `notes.md` など追加の proposal-side context files に一般化する検討
+- dashboard/TUI 上で skipped optional context reads を structured telemetry として可視化する改善
