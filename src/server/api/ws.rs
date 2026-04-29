@@ -298,7 +298,9 @@ fn map_workspace_state_fallback(state: WorkspaceState) -> (String, Option<u32>) 
         WorkspaceState::Archiving => ("archiving".to_string(), None),
         WorkspaceState::Archived => ("archived".to_string(), None),
         WorkspaceState::Merged => ("merged".to_string(), None),
-        WorkspaceState::Blocked => ("blocked".to_string(), None),
+        // WorkspaceState::Blocked represents a resumable apply-side hold in runtime terms.
+        // Canonical display taxonomy maps this to "stalled" (distinct from dependency "blocked").
+        WorkspaceState::Blocked => ("stalled".to_string(), None),
         WorkspaceState::Rejecting => ("rejecting".to_string(), None),
     }
 }
@@ -471,6 +473,14 @@ mod tests {
         assert_eq!(
             map_workspace_state_fallback(WorkspaceState::Applied),
             ("applied".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_map_workspace_state_fallback_maps_runtime_blocked_to_stalled_display() {
+        assert_eq!(
+            map_workspace_state_fallback(WorkspaceState::Blocked),
+            ("stalled".to_string(), None)
         );
     }
 

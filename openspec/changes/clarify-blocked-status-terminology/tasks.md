@@ -12,3 +12,7 @@
 
 - stalled / acceptance-blocked の operator UX（resume action、reason editing、badge tooltip）を dashboard / TUI で磨く
 - archive/readiness/external unblock を含む broader blocker taxonomy を別 change で再整理する
+
+## Acceptance #1 Failure Follow-up
+- [x] openspec/changes/clarify-blocked-status-terminology/proposal.md:21,64、design.md:45、specs/orchestration-state/spec.md:19、tasks.md:13 に旧語 acceptance-blocked が残っており今回の canonical taxonomy (gated / acceptance-gated) と不整合なため、proposal/design/spec/tasks の語彙を統一して acceptance gate を gated と明記すること。
+- [x] src/server/api/ws.rs:293-303 の map_workspace_state_fallback() が WorkspaceState::Blocked を "blocked" に写像して apply-side resumable hold を dependency blocked と collapse しているため、resume/fallback 経路でも "stalled" へ写像し、Web/API snapshot が canonical taxonomy を維持するよう修正すること。

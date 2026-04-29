@@ -42,7 +42,7 @@ Conflux には少なくとも三つの異なる blocker 系事象が存在する
 
 - `blocked`: `WaitState` 相当の queue-side reason
 - `stalled`: `ActivityState` または同等の resumable non-terminal hold
-- `acceptance-blocked`: acceptance result / event reason / transient display state
+- `gated` (`acceptance-gated`): acceptance result / event reason / transient display state
 
 重要なのは、三者を同一 enum variant に押し込むことではなく、**user-facing semantics と reducer/frontend contract を分離すること** である。
 
