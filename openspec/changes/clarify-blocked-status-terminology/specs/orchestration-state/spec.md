@@ -16,7 +16,7 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **WHEN** the reducer applies the dependency-blocked input
 - **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
-- **AND** the change is not labeled `stalled` or `acceptance-blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
 #### Scenario: resumable apply hold is stalled
 - **GIVEN** apply or rejecting review reports a resumable blocker for a change
