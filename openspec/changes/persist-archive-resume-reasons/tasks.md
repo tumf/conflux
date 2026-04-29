@@ -16,3 +16,6 @@
 ## Acceptance #1 Failure Follow-up
 - [x] src/parallel/dispatch.rs:593-607 の ArchiveResumed 発火と src/parallel/dispatch.rs:1678-1694 の ArchiveFailed 発火が、durable archive state を load_archive_state(&workspace.path) + change_id 一致だけで参照しており、src/parallel/archive_state.rs:86-100 に実装済みの revision guard (load_archive_state_matching) を使っていません。workspace path が再利用されて古い revision の archive state が残った場合、resume/failure event が現行 revision とは無関係な stale reason/summary を公開し、spec の current workspace resume/failure reason 復元要件を破ります。dispatch 側でも current revision を解決して revision 一致の state のみを使うよう修正が必要です。
 - [x] 受け入れコマンドの必須チェックである git status --porcelain が空であることを確認し、実ワークツリーが clean であることを再確認しました。archive commit 実行を妨げる未コミット変更は現時点で存在しません。
+
+## Acceptance #2 Failure Follow-up
+- [x] src/parallel/dispatch.rs:596-604 の ArchiveResumed 経路と src/parallel/dispatch.rs:1691-1700 の ArchiveFailed 経路は、get_current_commit(&workspace.path) に失敗した場合に load_archive_state(&workspace.path) + change_id 一致へフォールバックしています。これだと前回指摘と同じく revision guard なしで durable archive state を採用してしまい、workspace path 再利用時や revision 解決失敗時に stale な reason / summary を現行 workspace の resume/failure event として公開できます。前回 finding が求めていた『current revision に対応する state のみを使う』条件をまだ満たしていないため、revision 未解決時は event reason/summary を出さないか、別の手段で現行 revision 一致を確認してから state を使うよう修正が必要です。

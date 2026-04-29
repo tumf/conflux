@@ -597,10 +597,13 @@ impl ParallelExecutor {
                     Some(revision) => load_archive_state_matching(&workspace.path, &change_id, revision)
                         .ok()
                         .flatten(),
-                    None => load_archive_state(&workspace.path)
-                        .ok()
-                        .flatten()
-                        .filter(|state| state.change_id == change_id),
+                    None => {
+                        warn!(
+                            "Skipping archive resume context for '{}' because current revision could not be resolved",
+                            change_id
+                        );
+                        None
+                    }
                 };
                 if let Some(archive_state) = archive_state {
                     if let Some(ref tx) = event_tx {
@@ -1694,10 +1697,13 @@ impl ParallelExecutor {
                                 .ok()
                                 .flatten()
                         }
-                        None => load_archive_state(&workspace.path)
-                            .ok()
-                            .flatten()
-                            .filter(|state| state.change_id == change_id),
+                        None => {
+                            warn!(
+                                "Skipping archive failure context for '{}' because current revision could not be resolved",
+                                change_id
+                            );
+                            None
+                        }
                     };
                     if let Some(ref tx) = event_tx {
                         let _ = tx
