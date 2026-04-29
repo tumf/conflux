@@ -27,7 +27,7 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::acceptance_resume_ready_for_archive;
-use super::archive_state::load_archive_state;
+use super::archive_state::{load_archive_state, load_archive_state_matching};
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
@@ -590,19 +590,29 @@ impl ParallelExecutor {
             };
 
             if was_resumed && matches!(effective_state, WorkspaceState::Archiving) {
-                if let Ok(Some(archive_state)) = load_archive_state(&workspace.path) {
-                    if archive_state.change_id == change_id {
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(ParallelEvent::ArchiveResumed {
-                                    change_id: change_id.clone(),
-                                    reason: archive_state
-                                        .primary_reason
-                                        .map(|reason| reason.as_str().to_string()),
-                                    summary: Some(archive_state.summary.clone()),
-                                })
-                                .await;
-                        }
+                let current_revision = crate::vcs::git::commands::get_current_commit(&workspace.path)
+                    .await
+                    .ok();
+                let archive_state = match current_revision.as_deref() {
+                    Some(revision) => load_archive_state_matching(&workspace.path, &change_id, revision)
+                        .ok()
+                        .flatten(),
+                    None => load_archive_state(&workspace.path)
+                        .ok()
+                        .flatten()
+                        .filter(|state| state.change_id == change_id),
+                };
+                if let Some(archive_state) = archive_state {
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::ArchiveResumed {
+                                change_id: change_id.clone(),
+                                reason: archive_state
+                                    .primary_reason
+                                    .map(|reason| reason.as_str().to_string()),
+                                summary: Some(archive_state.summary.clone()),
+                            })
+                            .await;
                     }
                 }
             }
@@ -1675,10 +1685,20 @@ impl ParallelExecutor {
                         }
                     }
                     warn!("Archive failed for {}: {}", change_id, e);
-                    let archive_resume_context = load_archive_state(&workspace.path)
-                        .ok()
-                        .flatten()
-                        .filter(|state| state.change_id == change_id);
+                    let current_revision = crate::vcs::git::commands::get_current_commit(&workspace.path)
+                        .await
+                        .ok();
+                    let archive_resume_context = match current_revision.as_deref() {
+                        Some(revision) => {
+                            load_archive_state_matching(&workspace.path, &change_id, revision)
+                                .ok()
+                                .flatten()
+                        }
+                        None => load_archive_state(&workspace.path)
+                            .ok()
+                            .flatten()
+                            .filter(|state| state.change_id == change_id),
+                    };
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::ArchiveFailed {
