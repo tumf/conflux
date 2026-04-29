@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 /// Default grace period after observing apply completion (tasks.md complete or
-/// `REJECTED.md` present) before terminating a lingering agent process group.
+/// blocker marker present) before terminating a lingering agent process group.
 const APPLY_COMPLETION_GRACE_DEFAULT_SECS: u64 = 30;
 
 /// Minimum interval between workspace-state re-checks during the apply output
@@ -97,7 +97,7 @@ where
 enum ApplyCompletionKind {
     /// tasks.md reported all tasks complete.
     TasksComplete,
-    /// `REJECTED.md` was produced by apply, signalling apply-blocked handoff.
+    /// Apply emitted explicit implementation-blocker marker.
     BlockedHandoff,
 }
 
@@ -628,32 +628,31 @@ pub struct ApplyLoopResult {
     pub completed: bool,
     /// Number of iterations executed
     pub iterations: u32,
-    /// Apply detected blocker handoff proposal (`REJECTED.md`) and stopped apply loop.
+    /// Apply detected implementation-blocker handoff and stopped apply loop.
     pub blocked_handoff: Option<ApplyBlockedHandoff>,
 }
 
-/// Structured metadata for apply-blocked handoff via `REJECTED.md` proposal artifact.
+/// Structured metadata for apply-blocked handoff marker artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyBlockedHandoff {
-    /// Absolute path to detected proposal file.
-    pub rejected_path: PathBuf,
+    /// Absolute path to detected blocker marker file.
+    pub blocker_path: PathBuf,
 }
 
 fn detect_apply_blocked_handoff(
     workspace_path: &Path,
     change_id: &str,
 ) -> Option<ApplyBlockedHandoff> {
-    if !crate::orchestration::has_rejection_proposal(workspace_path, change_id) {
-        return None;
-    }
-
-    let rejected_path = workspace_path
+    let blocker_path = workspace_path
         .join("openspec")
         .join("changes")
         .join(change_id)
-        .join("REJECTED.md");
+        .join("APPLY_BLOCKED")
+        .join("marker.md");
 
-    Some(ApplyBlockedHandoff { rejected_path })
+    blocker_path
+        .is_file()
+        .then_some(ApplyBlockedHandoff { blocker_path })
 }
 
 /// Execute apply iterations until tasks are complete or max iterations reached.
@@ -748,15 +747,15 @@ where
             event_handler.on_progress_updated(change_id, progress.completed, progress.total);
         }
 
-        // Apply-blocked handoff: if apply has produced REJECTED.md proposal,
-        // stop apply loop and hand off to dedicated rejecting review even when tasks remain unchecked.
+        // Apply-blocked handoff: if apply has produced blocker marker,
+        // stop apply loop and return blocked state even when tasks remain unchecked.
         if let Some(blocked_handoff) = detect_apply_blocked_handoff(workspace_path, change_id) {
             info!(
                 change_id = change_id,
-                rejected_path = %blocked_handoff.rejected_path.display(),
+                blocker_path = %blocked_handoff.blocker_path.display(),
                 completed = progress.completed,
                 total = progress.total,
-                "Apply blocked handoff detected via REJECTED.md; exiting apply loop for rejecting review"
+                "Apply blocked handoff detected via APPLY_BLOCKED marker; exiting apply loop as blocked"
             );
             break false;
         }
@@ -819,7 +818,7 @@ where
         //
         // apply commands occasionally keep their stdout/stderr pipes open even
         // after tasks.md reaches a completion condition (all tasks checked or
-        // `REJECTED.md` produced). Without a grace-period guard, the orchestrator
+        // blocker marker produced). Without a grace-period guard, the orchestrator
         // blocked on `rx.recv()` indefinitely, which previously left the apply
         // handoff stuck and prevented acceptance from starting. Mirror the
         // acceptance-verdict grace period: once we observe the completion
@@ -971,7 +970,7 @@ where
             iteration, new_progress.completed, new_progress.total
         );
 
-        // If apply was finalized via grace-driven terminate because REJECTED.md
+        // If apply was finalized via grace-driven terminate because blocker marker
         // appeared, short-circuit immediately so the outer loop does not spawn
         // another apply child or treat the empty snapshot as a stall. Tasks-
         // complete runs fall through to the normal post_apply/final-commit path.
@@ -1380,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_apply_blocked_handoff_absent_without_rejected_marker() {
+    fn test_detect_apply_blocked_handoff_absent_without_blocked_marker() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
 
@@ -1391,24 +1390,24 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_apply_blocked_handoff_present_with_rejected_marker() {
+    fn test_detect_apply_blocked_handoff_present_with_blocked_marker() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
-        let rejected_path = workspace
+        let blocker_path = workspace
             .join("openspec")
             .join("changes")
             .join("change-a")
-            .join("REJECTED.md");
-
-        std::fs::create_dir_all(rejected_path.parent().unwrap()).unwrap();
-        std::fs::write(&rejected_path, "# REJECTED\n- reason: blocked\n").unwrap();
+            .join("APPLY_BLOCKED")
+            .join("marker.md");
+        std::fs::create_dir_all(blocker_path.parent().unwrap()).unwrap();
+        std::fs::write(&blocker_path, "# APPLY_BLOCKED\n- reason: blocked\n").unwrap();
 
         let handoff = detect_apply_blocked_handoff(workspace, "change-a");
         assert!(handoff.is_some());
         assert_eq!(
-            handoff.unwrap().rejected_path,
-            rejected_path,
-            "detected handoff should point to REJECTED.md"
+            handoff.unwrap().blocker_path,
+            blocker_path,
+            "detected handoff should point to APPLY_BLOCKED marker"
         );
     }
 
@@ -1418,15 +1417,16 @@ mod tests {
         let workspace = temp_dir.path();
         let change_id = "blocked-change";
         let change_dir = workspace.join("openspec").join("changes").join(change_id);
-        std::fs::create_dir_all(&change_dir).unwrap();
+        let blocked_dir = change_dir.join("APPLY_BLOCKED");
+        std::fs::create_dir_all(&blocked_dir).unwrap();
         std::fs::write(
             change_dir.join("tasks.md"),
             "## Implementation Tasks\n- [ ] pending\n",
         )
         .unwrap();
         std::fs::write(
-            change_dir.join("REJECTED.md"),
-            "# REJECTED\n\n- change_id: blocked-change\n- reason: apply blocked\n",
+            blocked_dir.join("marker.md"),
+            "# APPLY_BLOCKED\n\n- change_id: blocked-change\n- reason: apply blocked\n",
         )
         .unwrap();
 
@@ -1576,10 +1576,9 @@ mod tests {
         )
         .unwrap();
 
-        // Apply command: write REJECTED.md then sleep. The apply-blocked
-        // completion condition must trigger the grace period even though
-        // tasks.md remains incomplete.
-        let apply_cmd = "sh -c 'printf \"# REJECTED\\n\\n- change_id: linger-blocked\\n- reason: test\\n\" > openspec/changes/{change_id}/REJECTED.md; echo rejected; sleep 120'".to_string();
+        // Apply command: write APPLY_BLOCKED marker then sleep. The apply-blocked
+        // completion detector should terminate this lingering process during grace.
+        let apply_cmd = "sh -c 'mkdir -p openspec/changes/{change_id}/APPLY_BLOCKED; printf \"# APPLY_BLOCKED\\n\\n- change_id: linger-blocked\\n- reason: test\\n\" > openspec/changes/{change_id}/APPLY_BLOCKED/marker.md; echo blocked; sleep 120'".to_string();
 
         let config = OrchestratorConfig {
             apply_command: Some(apply_cmd),
@@ -1624,7 +1623,7 @@ mod tests {
         );
         assert!(
             result.blocked_handoff.is_some(),
-            "blocked-handoff grace-terminated run must expose rejected_path"
+            "blocked-handoff grace-terminated run must expose blocker_path"
         );
         assert_eq!(
             result.iterations, 1,

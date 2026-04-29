@@ -191,6 +191,7 @@ impl LogEntry {
 pub enum RejectionOutcome {
     Confirm,
     Resume,
+    Block,
 }
 
 #[derive(Debug, Clone)]

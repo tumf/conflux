@@ -1057,6 +1057,11 @@ impl Orchestrator {
             state.mark_stalled(change_id.to_string());
             state.clear_stalled_change(change_id);
             state.clear_error_history(change_id);
+            state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: change_id.to_string(),
+                workspace_name: "serial-stalled".to_string(),
+                status: crate::vcs::WorkspaceStatus::Blocked,
+            });
         }
         self.stall_detector.clear_change(change_id);
 
@@ -1656,7 +1661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rejected_result_marks_change_rejected_state() {
+    async fn test_stalled_result_marks_change_blocked_state() {
         use crate::serial_run_service::ChangeProcessResult;
         use tempfile::TempDir;
 
@@ -1667,8 +1672,8 @@ mod tests {
 
         let blocked_change = create_test_change("blocked-change", 3, 5);
 
-        let result = ChangeProcessResult::Rejected {
-            reason: "Implementation blocker detected".to_string(),
+        let result = ChangeProcessResult::Stalled {
+            error: "Acceptance blocked with recoverable blocker".to_string(),
         };
 
         orchestrator
@@ -1677,7 +1682,7 @@ mod tests {
             .unwrap();
 
         let state = orchestrator.shared_state.read().await;
-        assert_eq!(state.display_status(&blocked_change.id), "rejected");
+        assert_eq!(state.display_status(&blocked_change.id), "blocked");
     }
 
     /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,

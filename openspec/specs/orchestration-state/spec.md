@@ -6,35 +6,50 @@ Provide a single, reducer-owned model for tracking the runtime lifecycle of each
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The system SHALL maintain reducer-owned runtime state for each change in `OrchestratorState`.
+The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
-The runtime state MUST distinguish at least the following concerns:
+A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
 
-- queue intent
-- active execution stage
-- wait reason
-- terminal result
-- workspace observation summary
-- execution mode (Serial or Parallel)
+For a `Blocked` change, the runtime state SHALL preserve:
+- queue intent when applicable
+- active worktree reference
+- current WIP / latest iteration snapshot context
+- tasks progress
+- blocker reason and unblock metadata
+- non-terminal resumable lifecycle status
 
-Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
+The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
 
-#### Scenario: Runtime state preserves queued intent while blocked
-
-- **GIVEN** a change is queued for execution
-- **AND** dependency analysis reports unresolved dependencies
-- **WHEN** the reducer applies the dependency-blocked input
-- **THEN** the runtime state records queued intent
-- **AND** the wait reason becomes blocked with dependency details
+#### Scenario: apply blocked state preserves resumable worktree context
+- **GIVEN** apply reports a recoverable blocker for a change
+- **WHEN** the reducer applies the blocked execution input
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
 - **AND** the derived display status is `blocked`
 
-#### Scenario: Runtime state distinguishes merge wait from archived result
+#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
+- **GIVEN** a change is in `Rejecting`
+- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
+- **WHEN** the reducer applies the completion event
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the existing worktree remains attached to the change
+- **AND** the derived display status is `blocked`
 
-- **GIVEN** archive has completed for a change in parallel execution mode
-- **WHEN** the reducer applies the `ChangeArchived` event
-- **THEN** the wait reason becomes merge-wait
-- **AND** the terminal state remains `None` (not yet terminal)
-- **AND** the derived display status is `merge wait`
+#### Scenario: blocked change can be explicitly re-queued or retried into applying
+- **GIVEN** a change is in `Blocked` non-terminal state
+- **AND** its worktree and unblock metadata are still present
+- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
+- **THEN** the reducer transitions the change back to `Applying`
+- **AND** the prior worktree context is reused rather than recreated from scratch
+
+#### Scenario: rejected change remains terminal and non-resumable
+- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **WHEN** the reducer applies the rejected completion event
+- **THEN** terminal state becomes `Rejected`
+- **AND** the derived display status is `rejected`
+- **AND** the change cannot be resumed through the blocked retry path
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -210,51 +225,50 @@ When a change is archived in parallel mode, the orchestrator must attempt to mer
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The Project SHALL maintain reducer-owned runtime state for each Change in `OrchestratorState`.
+The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
-The system follows a three-tier hierarchy: `Orchestration 1--* Project 1--* Change`.
+A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
 
-- **Orchestration**: The top-level runtime that manages one or more Projects.
-- **Project**: A set of Changes sharing one `OrchestratorState` instance, one resolve queue, and one execution mode (Serial or Parallel). `OrchestratorState` is the single source of truth for a Project's lifecycle.
-- **Change**: A unit of work within a Project, tracked by `ChangeRuntimeState` inside the Project's `OrchestratorState`.
+For a `Blocked` change, the runtime state SHALL preserve:
+- queue intent when applicable
+- active worktree reference
+- current WIP / latest iteration snapshot context
+- tasks progress
+- blocker reason and unblock metadata
+- non-terminal resumable lifecycle status
 
-The runtime state MUST distinguish at least the following concerns:
+The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
 
-- queue intent
-- active execution stage (per-Change: Applying, Accepting, Archiving, Resolving, Idle)
-- wait reason
-- terminal result
-- workspace observation summary
-- execution mode (Serial or Parallel)
-
-Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
-
-`is_resolving_active()` operates at Project scope: it returns true when any Change within the Project has `ActivityState::Resolving`. This Project-scoped flag SHALL be used exclusively for resolve operation serialization (ensuring only one resolve runs at a time within a Project). It SHALL NOT be used to block apply, accept, archive, or other non-resolve operations on other Changes within the same Project.
-
-#### Scenario: Runtime state preserves queued intent while blocked
-
-- **GIVEN** a Change is queued for execution within a Project
-- **AND** dependency analysis reports unresolved dependencies
-- **WHEN** the reducer applies the dependency-blocked input
-- **THEN** the runtime state records queued intent
-- **AND** the wait reason becomes blocked with dependency details
+#### Scenario: apply blocked state preserves resumable worktree context
+- **GIVEN** apply reports a recoverable blocker for a change
+- **WHEN** the reducer applies the blocked execution input
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
 - **AND** the derived display status is `blocked`
 
-#### Scenario: Runtime state distinguishes merge wait from archived result
+#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
+- **GIVEN** a change is in `Rejecting`
+- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
+- **WHEN** the reducer applies the completion event
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the existing worktree remains attached to the change
+- **AND** the derived display status is `blocked`
 
-- **GIVEN** archive has completed for a Change in parallel execution mode
-- **WHEN** the reducer applies the `ChangeArchived` event
-- **THEN** the wait reason becomes merge-wait
-- **AND** the terminal state remains `None` (not yet terminal)
-- **AND** the derived display status is `merge wait`
+#### Scenario: blocked change can be explicitly re-queued or retried into applying
+- **GIVEN** a change is in `Blocked` non-terminal state
+- **AND** its worktree and unblock metadata are still present
+- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
+- **THEN** the reducer transitions the change back to `Applying`
+- **AND** the prior worktree context is reused rather than recreated from scratch
 
-#### Scenario: is_resolving_active does not block non-resolve operations
-
-- **GIVEN** Change A within a Project has `ActivityState::Resolving`
-- **AND** Change B within the same Project is queued for apply
-- **WHEN** the orchestrator checks whether to start Change B's apply
-- **THEN** Change B's apply proceeds regardless of Change A's resolving state
-- **AND** `is_resolving_active()` is not consulted for this decision
+#### Scenario: rejected change remains terminal and non-resumable
+- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **WHEN** the reducer applies the rejected completion event
+- **THEN** terminal state becomes `Rejected`
+- **AND** the derived display status is `rejected`
+- **AND** the change cannot be resumed through the blocked retry path
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -290,54 +304,50 @@ Frontend MAY cache the resolve queue state for rendering purposes, but the cache
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The system SHALL maintain reducer-owned runtime state for each change in `OrchestratorState`.
+The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
-The runtime state MUST distinguish at least the following concerns:
+A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
 
-- queue intent
-- active execution stage
-- wait reason
-- terminal result
-- workspace observation summary
-- execution mode (Serial or Parallel)
+For a `Blocked` change, the runtime state SHALL preserve:
+- queue intent when applicable
+- active worktree reference
+- current WIP / latest iteration snapshot context
+- tasks progress
+- blocker reason and unblock metadata
+- non-terminal resumable lifecycle status
 
-The terminal result MUST include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where acceptance has determined the specification is unimplementable, requiring a rollback to the base branch with a documented reason.
+The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
 
-Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
-
-#### Scenario: Runtime state preserves queued intent while blocked
-
-- **GIVEN** a change is queued for execution
-- **AND** dependency analysis reports unresolved dependencies
-- **WHEN** the reducer applies the dependency-blocked input
-- **THEN** the runtime state records queued intent
-- **AND** the wait reason becomes blocked with dependency details
+#### Scenario: apply blocked state preserves resumable worktree context
+- **GIVEN** apply reports a recoverable blocker for a change
+- **WHEN** the reducer applies the blocked execution input
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
 - **AND** the derived display status is `blocked`
 
-#### Scenario: Runtime state distinguishes merge wait from archived result
+#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
+- **GIVEN** a change is in `Rejecting`
+- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
+- **WHEN** the reducer applies the completion event
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the existing worktree remains attached to the change
+- **AND** the derived display status is `blocked`
 
-- **GIVEN** archive has completed for a change in parallel execution mode
-- **WHEN** the reducer applies the `ChangeArchived` event
-- **THEN** the wait reason becomes merge-wait
-- **AND** the terminal state remains `None` (not yet terminal)
-- **AND** the derived display status is `merge wait`
+#### Scenario: blocked change can be explicitly re-queued or retried into applying
+- **GIVEN** a change is in `Blocked` non-terminal state
+- **AND** its worktree and unblock metadata are still present
+- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
+- **THEN** the reducer transitions the change back to `Applying`
+- **AND** the prior worktree context is reused rather than recreated from scratch
 
-#### Scenario: Acceptance Blocked transitions to Rejected terminal state
-
-- **GIVEN** acceptance returns a `Blocked` verdict for a change
-- **WHEN** the rejection flow completes (`REJECTED.md` committed and worktree removed)
-- **THEN** the terminal state becomes `Rejected` with the rejection reason
+#### Scenario: rejected change remains terminal and non-resumable
+- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **WHEN** the reducer applies the rejected completion event
+- **THEN** terminal state becomes `Rejected`
 - **AND** the derived display status is `rejected`
-- **AND** the change cannot be re-queued via `AddToQueue`
-
-#### Scenario: Rejected change cannot be re-queued
-
-- **GIVEN** a change is in `Rejected` terminal state
-- **WHEN** a user or system issues `AddToQueue` for that change
-- **THEN** the reducer returns `NoOp`
-- **AND** the runtime state remains unchanged
-
-## Requirements
+- **AND** the change cannot be resumed through the blocked retry path
 
 ### Requirement: Rejection Flow Execution
 
@@ -546,35 +556,50 @@ The operation MUST NOT convert permanent terminal changes such as `Archived`, `M
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The system SHALL maintain reducer-owned runtime state for each change in `OrchestratorState`.
+The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
-The runtime state MUST distinguish at least the following concerns:
+A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
 
-- queue intent
-- active execution stage
-- wait reason
-- terminal result
-- workspace observation summary
-- execution mode (Serial or Parallel)
+For a `Blocked` change, the runtime state SHALL preserve:
+- queue intent when applicable
+- active worktree reference
+- current WIP / latest iteration snapshot context
+- tasks progress
+- blocker reason and unblock metadata
+- non-terminal resumable lifecycle status
 
-The active execution stage SHALL include a dedicated `Rejecting` stage distinct from `Applying`, `Accepting`, `Archiving`, and `Resolving`. Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
+The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
 
-#### Scenario: Runtime state preserves queued intent while blocked
-
-- **GIVEN** a change is queued for execution
-- **AND** dependency analysis reports unresolved dependencies
-- **WHEN** the reducer applies the dependency-blocked input
-- **THEN** the runtime state records queued intent
-- **AND** the wait reason becomes blocked with dependency details
+#### Scenario: apply blocked state preserves resumable worktree context
+- **GIVEN** apply reports a recoverable blocker for a change
+- **WHEN** the reducer applies the blocked execution input
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
 - **AND** the derived display status is `blocked`
 
-#### Scenario: Runtime state exposes rejecting as active stage
+#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
+- **GIVEN** a change is in `Rejecting`
+- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
+- **WHEN** the reducer applies the completion event
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the existing worktree remains attached to the change
+- **AND** the derived display status is `blocked`
 
-- **GIVEN** apply execution generated `openspec/changes/fix-auth/REJECTED.md`
-- **WHEN** the reducer applies the rejection-review start event
-- **THEN** the active execution stage becomes `Rejecting`
-- **AND** the derived display status is `rejecting`
-- **AND** the change is not shown as `accepting`
+#### Scenario: blocked change can be explicitly re-queued or retried into applying
+- **GIVEN** a change is in `Blocked` non-terminal state
+- **AND** its worktree and unblock metadata are still present
+- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
+- **THEN** the reducer transitions the change back to `Applying`
+- **AND** the prior worktree context is reused rather than recreated from scratch
+
+#### Scenario: rejected change remains terminal and non-resumable
+- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **WHEN** the reducer applies the rejected completion event
+- **THEN** terminal state becomes `Rejected`
+- **AND** the derived display status is `rejected`
+- **AND** the change cannot be resumed through the blocked retry path
 
 ### Requirement: Rejected terminal state remains distinct from errors
 
@@ -606,31 +631,50 @@ Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The active execution stage SHALL include lifecycle events for entering and leaving the `Rejecting` stage. The reducer SHALL support two outcomes from rejection review: confirmation (transition to `Rejected` terminal) and dismissal/resume (transition back to `Applying`).
+The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
-#### Scenario: Rejection review confirm transitions to rejected terminal
+A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
 
-- **GIVEN** a change is in `Rejecting` activity stage
-- **WHEN** the reducer applies a rejection-review-completed event with `Confirm` outcome
-- **THEN** the activity becomes `Idle`
-- **AND** the terminal state becomes `Rejected`
+For a `Blocked` change, the runtime state SHALL preserve:
+- queue intent when applicable
+- active worktree reference
+- current WIP / latest iteration snapshot context
+- tasks progress
+- blocker reason and unblock metadata
+- non-terminal resumable lifecycle status
+
+The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
+
+#### Scenario: apply blocked state preserves resumable worktree context
+- **GIVEN** apply reports a recoverable blocker for a change
+- **WHEN** the reducer applies the blocked execution input
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+- **AND** the derived display status is `blocked`
+
+#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
+- **GIVEN** a change is in `Rejecting`
+- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
+- **WHEN** the reducer applies the completion event
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the existing worktree remains attached to the change
+- **AND** the derived display status is `blocked`
+
+#### Scenario: blocked change can be explicitly re-queued or retried into applying
+- **GIVEN** a change is in `Blocked` non-terminal state
+- **AND** its worktree and unblock metadata are still present
+- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
+- **THEN** the reducer transitions the change back to `Applying`
+- **AND** the prior worktree context is reused rather than recreated from scratch
+
+#### Scenario: rejected change remains terminal and non-resumable
+- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **WHEN** the reducer applies the rejected completion event
+- **THEN** terminal state becomes `Rejected`
 - **AND** the derived display status is `rejected`
-
-#### Scenario: Rejection review resume transitions back to applying
-
-- **GIVEN** a change is in `Rejecting` activity stage
-- **WHEN** the reducer applies a rejection-review-completed event with `Resume` outcome
-- **THEN** the activity becomes `Applying`
-- **AND** the terminal state remains `None`
-- **AND** the derived display status is `applying`
-
-#### Scenario: Rejection review failure transitions to error terminal
-
-- **GIVEN** a change is in `Rejecting` activity stage
-- **WHEN** the reducer applies a rejection-review-failed event
-- **THEN** the activity becomes `Idle`
-- **AND** the terminal state becomes `Error`
-- **AND** the derived display status is `error`
+- **AND** the change cannot be resumed through the blocked retry path
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -646,24 +690,50 @@ Workspace observations SHALL NOT regress a change from terminal `Merged` back to
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-Display status exposed to consumers MAY be derived from this runtime state, but consumers SHALL NOT own an independent lifecycle copy.
+The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
-Server-mode WebSocket API (`/api/v1/ws`) SHALL derive per-change display status exclusively from `ChangeRuntimeState.display_status()` when the orchestrator state is available. A fallback to workspace file-state detection is permitted only when orchestrator state is unavailable, and the fallback MUST NOT map intermediate workspace states to misleading display statuses.
+A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
 
-#### Scenario: WebSocket reports reducer-derived status for active change
+For a `Blocked` change, the runtime state SHALL preserve:
+- queue intent when applicable
+- active worktree reference
+- current WIP / latest iteration snapshot context
+- tasks progress
+- blocker reason and unblock metadata
+- non-terminal resumable lifecycle status
 
-- **GIVEN** a change is in `Accepting` activity stage in the reducer
-- **WHEN** a WebSocket client requests the change list
-- **THEN** the change status is reported as `accepting`
-- **AND** the status matches `ChangeRuntimeState.display_status()`
+The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
 
-#### Scenario: WebSocket fallback does not report misleading archiving
+#### Scenario: apply blocked state preserves resumable worktree context
+- **GIVEN** apply reports a recoverable blocker for a change
+- **WHEN** the reducer applies the blocked execution input
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+- **AND** the derived display status is `blocked`
 
-- **GIVEN** orchestrator state is unavailable
-- **AND** workspace detection reports `Applied` state
-- **WHEN** a WebSocket client requests the change list
-- **THEN** the change status is NOT reported as `archiving`
-- **AND** the change status reflects the intermediate state accurately
+#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
+- **GIVEN** a change is in `Rejecting`
+- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
+- **WHEN** the reducer applies the completion event
+- **THEN** the lifecycle state becomes `Blocked`
+- **AND** terminal result remains `None`
+- **AND** the existing worktree remains attached to the change
+- **AND** the derived display status is `blocked`
+
+#### Scenario: blocked change can be explicitly re-queued or retried into applying
+- **GIVEN** a change is in `Blocked` non-terminal state
+- **AND** its worktree and unblock metadata are still present
+- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
+- **THEN** the reducer transitions the change back to `Applying`
+- **AND** the prior worktree context is reused rather than recreated from scratch
+
+#### Scenario: rejected change remains terminal and non-resumable
+- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
+- **WHEN** the reducer applies the rejected completion event
+- **THEN** terminal state becomes `Rejected`
+- **AND** the derived display status is `rejected`
+- **AND** the change cannot be resumed through the blocked retry path
 
 ### Requirement: WebSocket change status consistency with TUI
 
