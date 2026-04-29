@@ -34,19 +34,22 @@ Permission Error Acceptance:
   - If unblocked tasks remain incomplete: Output "ACCEPTANCE: FAIL" with findings
 - If all unchecked tasks are permission-blocked and no actionable task was completed, output "ACCEPTANCE: FAIL" with findings (insufficient progress)
 
-- Permission errors are NOT treated as Implementation Blockers (do NOT output "ACCEPTANCE: BLOCKED")
+- Permission errors are NOT treated as Implementation Blockers (do NOT output `ACCEPTANCE: GATED` for permission-only issues)
 - Permission errors are expected workflow outcomes when file access is restricted
 
 Implementation Blocker review (acceptance stage scope):
 1. Check if tasks.md contains any "## Implementation Blocker #N" sections
-2. Check whether `openspec/changes/<change_id>/REJECTED.md` exists (apply-generated rejection proposal artifact)
-3. If both blocker section and `REJECTED.md` exist:
+2. Apply FAIL vs GATED rubric before deciding verdict:
+   - Output FAIL when the issue is solvable by autonomous repository work (code/tests/spec/tasks/docs updates inside this repo).
+   - Output GATED only when the blocker cannot be resolved by repository-only work in apply (human decision, repo-external prerequisite, missing external dependency resolution, or unresolved upstream constraint).
+3. Check whether `openspec/changes/<change_id>/REJECTED.md` exists (apply-generated rejection proposal artifact)
+4. If both blocker section and `REJECTED.md` exist:
    - Treat this as a rejecting-stage handoff signal that should be reviewed by rejecting flow, not acceptance.
    - Output `ACCEPTANCE: FAIL` with finding that routing is incorrect if acceptance is invoked directly for this state.
-4. If blocker section exists without `REJECTED.md`:
+5. If blocker section exists without `REJECTED.md`:
    - Treat as acceptance FAIL
    - Add finding requiring apply/rejecting flow to produce or clear blocker evidence consistently.
-5. If blocker section does not exist, run normal acceptance checks below.
+6. If blocker section does not exist, run normal acceptance checks below.
 
 Spec-only change detection:
 - Read `openspec/changes/<change_id>/proposal.md` and look for a `Change Type` field.
@@ -109,7 +112,7 @@ machine-readable payload, as its own line:
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence 1>","<evidence 2>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- BLOCKED:  `{"acceptance":"blocked"}`
+- GATED:    `{"acceptance":"gated"}`
 
 The JSON verdict is the canonical machine-readable contract. For FAIL the
 `findings` array mirrors the FINDINGS section.
@@ -121,7 +124,8 @@ existing runs do not break:
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
-- `ACCEPTANCE: BLOCKED`
+- `ACCEPTANCE: GATED`
+- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
 When both a JSON verdict and a legacy text marker appear, the JSON verdict
 wins. Prefer the JSON contract.

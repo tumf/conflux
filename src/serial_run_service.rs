@@ -919,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_acceptance_result_blocked_returns_stalled_result() {
+    fn test_process_acceptance_result_gated_returns_stalled_result() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -959,7 +959,7 @@ mod tests {
         let next = service.select_next_change(&changes);
         assert_eq!(next.map(|c| c.id.as_str()), Some("b"));
 
-        // Mark 'b' as stalled (simulating BLOCKED acceptance)
+        // Mark 'b' as stalled (simulating GATED acceptance)
         service.mark_stalled("b", "Implementation blocker detected");
 
         // After marking as stalled, 'b' should not be selected

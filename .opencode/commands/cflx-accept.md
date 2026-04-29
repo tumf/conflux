@@ -34,16 +34,19 @@ Permission Error Acceptance:
   - If unblocked tasks remain incomplete: Output "ACCEPTANCE: FAIL" with findings
 - If all unchecked tasks are permission-blocked and no actionable task was completed, output "ACCEPTANCE: FAIL" with findings (insufficient progress)
 
-- Permission errors are NOT treated as Implementation Blockers (do NOT output "ACCEPTANCE: BLOCKED")
+- Permission errors are NOT treated as Implementation Blockers (do NOT output `ACCEPTANCE: GATED` for permission-only issues)
 - Permission errors are expected workflow outcomes when file access is restricted
 
 Implementation Blocker review:
 1. Check if tasks.md contains any "## Implementation Blocker #N" sections
-2. If Implementation Blocker(s) exist:
+2. Apply FAIL vs GATED rubric before deciding verdict:
+   - Output FAIL when the issue is solvable by autonomous repository work (code/tests/spec/tasks/docs updates inside this repo).
+   - Output GATED only when the blocker cannot be resolved by repository-only work in apply (human decision, repo-external prerequisite, missing external dependency resolution, or unresolved upstream constraint).
+3. If Implementation Blocker(s) exist:
    a. Review each blocker's Category, Root Cause, Evidence, Impact, and Resolution Required
    b. Verify the blocker is legitimate (spec contradiction or truly non-mockable external constraint)
    c. If blocker is valid:
-      - Output "ACCEPTANCE: BLOCKED"
+      - Output `ACCEPTANCE: GATED` / `{"acceptance":"gated"}`
       - Do NOT output FINDINGS or update tasks.md
       - The orchestrator will stop the apply loop and preserve the workspace
    d. If blocker is NOT valid (issue is mockable or solvable autonomously):
@@ -81,13 +84,15 @@ machine-readable payload, as its own line, with NOTHING else on that line:
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence 1>","<evidence 2>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- BLOCKED:  `{"acceptance":"blocked"}`
+- GATED:    `{"acceptance":"gated"}`
 
 Rules for the JSON verdict:
 
 - It MUST be a valid JSON object on a single line (no pretty-printing).
 - The `acceptance` field value MUST be one of `pass`, `fail`, `continue`,
-  `blocked` (case-insensitive, but lowercase is preferred).
+  `gated` (case-insensitive, but lowercase is preferred).
+- Legacy compatibility: runtime parser MAY still accept legacy `blocked` as
+  backward-compatible input, but agents MUST emit canonical `gated`.
 - For FAIL, `findings` MUST be an array of strings where each entry is a
   concrete, actionable finding (file path + function/line when applicable).
 - Do NOT wrap the JSON verdict in code fences, markdown, or prose.
@@ -102,7 +107,8 @@ runs do not break:
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
-- `ACCEPTANCE: BLOCKED`
+- `ACCEPTANCE: GATED`
+- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
 These legacy markers are fallback only. When both a JSON verdict and a text
 marker appear, the JSON verdict wins. Prefer the JSON contract.

@@ -305,16 +305,16 @@ mod tests {
 
     #[test]
     fn test_acceptance_verdict_contract_consistency() {
-        // Verify the four canonical verdict markers are documented consistently
+        // Verify canonical verdict markers are documented consistently
         // across the parser, the command template reference, and the cflx-workflow skill.
         let canonical_markers = [
             "ACCEPTANCE: PASS",
             "ACCEPTANCE: FAIL",
             "ACCEPTANCE: CONTINUE",
-            "ACCEPTANCE: BLOCKED",
+            "ACCEPTANCE: GATED",
         ];
 
-        // cflx-workflow SKILL.md must mention all four markers
+        // cflx-workflow SKILL.md must mention all canonical markers
         for marker in &canonical_markers {
             assert!(
                 CFLX_WORKFLOW_SKILL_MD.contains(marker),
@@ -323,7 +323,7 @@ mod tests {
             );
         }
 
-        // cflx-workflow references/cflx-accept.md must mention all four markers
+        // cflx-workflow references/cflx-accept.md must mention all canonical markers
         for marker in &canonical_markers {
             assert!(
                 CFLX_WORKFLOW_REF_ACCEPT.contains(marker),
@@ -331,6 +331,12 @@ mod tests {
                 marker
             );
         }
+
+        // Legacy compatibility marker should remain documented during migration.
+        assert!(
+            CFLX_WORKFLOW_REF_ACCEPT.contains("ACCEPTANCE: BLOCKED"),
+            "cflx-workflow references/cflx-accept.md must document legacy acceptance marker 'ACCEPTANCE: BLOCKED'"
+        );
     }
 
     #[test]

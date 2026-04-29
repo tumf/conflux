@@ -29,7 +29,7 @@ machine-readable payload, on its own line:
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- BLOCKED:  `{"acceptance":"blocked"}`
+- GATED:    `{"acceptance":"gated"}`
 
 The JSON verdict is the canonical machine-readable contract. The runtime
 parser resolves it with priority over the legacy plain-text marker, including
@@ -43,7 +43,8 @@ standalone plain-text markers on their own line:
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
-- `ACCEPTANCE: BLOCKED`
+- `ACCEPTANCE: GATED`
+- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
 These markers are kept as a fallback so existing runs do not break. New
 acceptance runs SHOULD emit the JSON verdict; when both appear, JSON wins.
@@ -99,7 +100,11 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Each finding must be actionable by AI agent
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
-- `ACCEPTANCE: BLOCKED` is allowed only when a valid `Implementation Blocker #<n>` exists with concrete evidence and unblock actions
+- `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` is allowed only when a valid `Implementation Blocker #<n>` exists with concrete evidence and unblock actions
+- Legacy `blocked` acceptance verdict is input compatibility only; new output MUST use `gated`
+- FAIL vs GATED rubric:
+  - `FAIL`: repository-only autonomous work (code/tests/spec/tasks/docs in this repo) can resolve the issue.
+  - `GATED`: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, or missing upstream constraint resolution).
 - For behavior-changing work, missing/ambiguous verification planning is FAIL (not CONTINUE)
 
 ## Single-Source Constraint

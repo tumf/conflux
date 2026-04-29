@@ -125,7 +125,7 @@ cflx openspec archive <id> --yes  # Archive change
 ### Implementation Blocker Gate
 
 - Apply can escalate `IMPLEMENTATION_BLOCKER` when implementation is truly impossible in current loop
-- Accept can return `ACCEPTANCE: BLOCKED` only with concrete blocker evidence
+- Accept can return `ACCEPTANCE: GATED` only with concrete blocker evidence (legacy `BLOCKED` is input compatibility only)
 
 ### Autonomous Execution (all operation-specific skills)
 

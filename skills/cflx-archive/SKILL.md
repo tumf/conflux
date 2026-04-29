@@ -22,13 +22,15 @@ resolved by the runtime from the acceptance agent's stdout using the
 following contract:
 
 - **Primary**: strict JSON verdict object
-  (`{"acceptance":"pass|fail|continue|blocked", "findings":[...]}`) on its
+  (`{"acceptance":"pass|fail|continue|gated", "findings":[...]}`) on its
   own line, possibly wrapped inside an `opencode run --format json` event
   payload.
 - **Fallback**: legacy standalone plain-text markers (`ACCEPTANCE: PASS`,
-  `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: BLOCKED`) remain
+  `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: GATED`) remain
   supported so older runs continue to hand off, but JSON wins when both are
   present.
+- **Legacy compatibility**: runtimes MAY still accept legacy `blocked` acceptance
+  verdict input during migration, but canonical output remains `gated`.
 
 Archive MUST NOT redefine or relax this contract. When the upstream
 acceptance verdict is ambiguous (missing JSON, malformed legacy marker), the

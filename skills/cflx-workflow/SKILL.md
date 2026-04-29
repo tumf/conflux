@@ -112,7 +112,7 @@ If implementation is impossible, add `## Implementation Blocker #<n>` to `tasks.
 
 - On CONFIRM, runtime finalizes rejection flow.
 - On RESUME, runtime removes `REJECTED.md` and appends recovery task.
-- MUST NOT output `ACCEPTANCE: BLOCKED`.
+- MUST NOT output `ACCEPTANCE: GATED`.
 
 ---
 
@@ -171,14 +171,15 @@ formatting.
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}` (findings mirrors the FINDINGS section)
 - CONTINUE: `{"acceptance":"continue"}`
-- BLOCKED:  `{"acceptance":"blocked"}`
+- GATED:    `{"acceptance":"gated"}`
 
 **Fallback (backward-compatible)** — legacy standalone plain-text markers:
 
 - `ACCEPTANCE: PASS` - All checks pass
 - `ACCEPTANCE: FAIL` - Checks fail (followed by FINDINGS and tasks.md update)
 - `ACCEPTANCE: CONTINUE` - Verification incomplete
-- `ACCEPTANCE: BLOCKED` - Valid Implementation Blocker exists
+- `ACCEPTANCE: GATED` - Valid Implementation Blocker exists
+- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
 The JSON verdict is primary; legacy markers remain supported so existing runs
 do not break. When both are present, the JSON verdict wins.
@@ -198,7 +199,7 @@ Do NOT wrap the verdict in headings (`##`), blockquotes (`>`), bullets (`-`), bo
 - Each finding must include concrete evidence (file path, function, line)
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
-- BLOCKED only with valid `Implementation Blocker #<n>`
+- GATED only with valid `Implementation Blocker #<n>`
 
 **For detailed guidance**, read [references/cflx-accept.md](references/cflx-accept.md).
 
@@ -256,7 +257,7 @@ cflx openspec archive <id> --yes --skip-specs # Archive without spec updates
 | Apply | "apply \<id\>" | Completed tasks + code | No questions, update immediately |
 | Rejecting | "rejecting \<id\>" | CONFIRM / RESUME | Review blocker evidence |
 | Cleanup | "cleanup-review \<id\>" | CLEANUP_REVIEW: CLEAN | No blind staging |
-| Accept | "accept" | PASS/FAIL/CONTINUE/BLOCKED | Output once, cite evidence |
+| Accept | "accept" | PASS/FAIL/CONTINUE/GATED | Output once, cite evidence |
 | Archive | "archive \<id\>" | Archived change | Validate before/after |
 
 **REMEMBER**: This skill operates autonomously. Never ask questions. Make decisions based on available context.
