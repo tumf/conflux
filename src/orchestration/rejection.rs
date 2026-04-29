@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
@@ -151,23 +152,105 @@ async fn clear_rejected_proposal_marker(change_id: &str, workspace_path: &Path) 
     Ok(rejected_path)
 }
 
-async fn append_recovery_task(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
-    let tasks_path = workspace_path
+fn active_tasks_path(workspace_path: &Path, change_id: &str) -> PathBuf {
+    workspace_path
         .join("openspec")
         .join("changes")
         .join(change_id)
-        .join("tasks.md");
+        .join("tasks.md")
+}
+
+fn is_archive_dir_for_change(entry: &Path, change_id: &str) -> bool {
+    entry
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| name == change_id || name.ends_with(&format!("-{}", change_id)))
+        .unwrap_or(false)
+}
+
+/// Resolve canonical tasks.md for rejecting recovery writes.
+///
+/// Precedence is intentionally workspace-local and deterministic:
+/// 1. active change directory (`openspec/changes/<change_id>/tasks.md`)
+/// 2. archived change directory under workspace (`openspec/changes/archive/.../tasks.md`)
+///
+/// Unlike `task_parser::parse_progress_with_fallback`, this write path does not
+/// use base-tree fallback because rejecting recovery must mutate the currently
+/// resumed workspace context only.
+async fn resolve_recovery_tasks_path(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
+    let active = active_tasks_path(workspace_path, change_id);
+    if tokio::fs::metadata(&active).await.is_ok() {
+        debug!(
+            change_id = %change_id,
+            tasks_path = %active.display(),
+            "Resolved rejecting recovery tasks path to active change directory"
+        );
+        return Ok(active);
+    }
+
+    let archive_root = workspace_path
+        .join("openspec")
+        .join("changes")
+        .join("archive");
+    let mut explored = vec![
+        active.display().to_string(),
+        archive_root.display().to_string(),
+    ];
+
+    let mut archived_candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(&archive_root).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
+            if !is_dir || !is_archive_dir_for_change(&path, change_id) {
+                continue;
+            }
+            let tasks_path = path.join("tasks.md");
+            explored.push(tasks_path.display().to_string());
+            if tokio::fs::metadata(&tasks_path).await.is_ok() {
+                archived_candidates.push(tasks_path);
+            }
+        }
+    }
+
+    archived_candidates.sort();
+    if let Some(selected) = archived_candidates.into_iter().next() {
+        debug!(
+            change_id = %change_id,
+            tasks_path = %selected.display(),
+            "Resolved rejecting recovery tasks path to archived change directory"
+        );
+        return Ok(selected);
+    }
+
+    Err(OrchestratorError::AgentCommand(format!(
+        "Failed to resolve canonical tasks.md for rejecting recovery '{}'. Explored paths: {}",
+        change_id,
+        explored.join(", ")
+    )))
+}
+
+async fn append_recovery_task(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
+    let tasks_path = resolve_recovery_tasks_path(change_id, workspace_path).await?;
     let current = tokio::fs::read_to_string(&tasks_path).await.map_err(|e| {
         OrchestratorError::AgentCommand(format!(
-            "Failed to read tasks.md while updating rejecting recovery section for '{}': {}",
-            change_id, e
+            "Failed to read tasks.md while updating rejecting recovery section for '{}' at '{}': {}",
+            change_id,
+            tasks_path.display(),
+            e
         ))
     })?;
     let updated = append_recovery_task_section(&current, change_id);
     tokio::fs::write(&tasks_path, updated).await.map_err(|e| {
         OrchestratorError::AgentCommand(format!(
-            "Failed to update tasks.md while updating rejecting recovery section for '{}': {}",
-            change_id, e
+            "Failed to update tasks.md while updating rejecting recovery section for '{}' at '{}': {}",
+            change_id,
+            tasks_path.display(),
+            e
         ))
     })?;
 
@@ -489,6 +572,114 @@ mod tests {
             !updated.contains("Investigate blocker in openspec/changes/change-a/REJECTED.md"),
             "recovery task must not reference deleted worktree-local REJECTED.md"
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_recovery_tasks_path_prefers_active_tasks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace = temp_dir.path();
+        let change_id = "change-a";
+        let active_dir = workspace.join("openspec").join("changes").join(change_id);
+        fs::create_dir_all(&active_dir).expect("create active dir");
+        fs::write(active_dir.join("tasks.md"), "## Implementation Tasks\n").expect("write tasks");
+
+        let resolved = resolve_recovery_tasks_path(change_id, workspace)
+            .await
+            .expect("resolve path");
+
+        assert_eq!(resolved, active_dir.join("tasks.md"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_recovery_tasks_path_falls_back_to_archive_tasks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace = temp_dir.path();
+        let change_id = "change-a";
+        let archive_dir = workspace
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-change-a");
+        fs::create_dir_all(&archive_dir).expect("create archive dir");
+        fs::write(archive_dir.join("tasks.md"), "## Implementation Tasks\n").expect("write tasks");
+
+        let resolved = resolve_recovery_tasks_path(change_id, workspace)
+            .await
+            .expect("resolve path");
+
+        assert_eq!(resolved, archive_dir.join("tasks.md"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_recovery_tasks_path_reports_explored_paths_when_missing() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace = temp_dir.path();
+        let change_id = "change-a";
+        let archive_candidate = workspace
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-change-a");
+        fs::create_dir_all(&archive_candidate).expect("create archive candidate");
+
+        let err = resolve_recovery_tasks_path(change_id, workspace)
+            .await
+            .expect_err("expected path resolution failure");
+        let message = err.to_string();
+
+        assert!(message.contains("Explored paths:"));
+        assert!(message.contains("openspec/changes/change-a/tasks.md"));
+        assert!(message.contains("openspec/changes/archive/2026-04-29-change-a/tasks.md"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_resume_apply_from_rejecting_updates_archived_tasks_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace = temp_dir.path();
+        let change_id = "change-a";
+        let archive_dir = workspace
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-change-a");
+        fs::create_dir_all(&archive_dir).expect("create archive dir");
+        fs::write(
+            archive_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] keep\n",
+        )
+        .expect("write tasks");
+
+        handle_resume_apply_from_rejecting(change_id, workspace)
+            .await
+            .expect("resume should succeed with archived tasks path");
+
+        let updated = fs::read_to_string(archive_dir.join("tasks.md")).expect("read updated tasks");
+        assert!(updated.contains("## Rejecting Recovery Tasks"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_blocked_from_rejecting_updates_archived_tasks_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace = temp_dir.path();
+        let change_id = "change-a";
+        let archive_dir = workspace
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-change-a");
+        fs::create_dir_all(&archive_dir).expect("create archive dir");
+        fs::write(
+            archive_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] keep\n",
+        )
+        .expect("write tasks");
+
+        handle_blocked_from_rejecting(change_id, workspace)
+            .await
+            .expect("block should succeed with archived tasks path");
+
+        let updated = fs::read_to_string(archive_dir.join("tasks.md")).expect("read updated tasks");
+        assert!(updated.contains("## Rejecting Recovery Tasks"));
     }
 
     #[tokio::test]
