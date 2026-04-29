@@ -211,8 +211,12 @@ impl ParallelExecutor {
 
             // Check if this change was previously blocked and is now resolved
             if self.previously_blocked_changes.contains(change_id) {
-                info!("Change '{}' dependencies resolved, now ready", change_id);
+                info!(
+                    "Change '{}' dependencies resolved, forcing fresh workspace recreation",
+                    change_id
+                );
                 self.previously_blocked_changes.remove(change_id);
+                self.force_recreate_worktree.insert(change_id.clone());
                 // Send DependencyResolved event
                 send_event(
                     &self.event_tx,
