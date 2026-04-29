@@ -1889,6 +1889,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_rejection_review_resume_from_archived_workspace_context_sets_applying() {
+        use crate::events::{ExecutionEvent, RejectionOutcome};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        // Resume path can start from an archived workspace that re-entered rejecting review.
+        state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "c".to_string(),
+            workspace_name: "ws-c".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+        assert_eq!(state.display_status("c"), "rejecting");
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "c".to_string(),
+            outcome: RejectionOutcome::Resume,
+        });
+
+        assert_eq!(state.display_status("c"), "applying");
+    }
+
+    #[test]
+    fn test_rejection_review_block_from_archived_workspace_context_sets_stalled() {
+        use crate::events::{ExecutionEvent, RejectionOutcome};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+
+        state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
+        assert_eq!(state.display_status("c"), "merge wait");
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "c".to_string(),
+            workspace_name: "ws-c".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+        assert_eq!(state.display_status("c"), "rejecting");
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "c".to_string(),
+            outcome: RejectionOutcome::Block,
+        });
+
+        assert_eq!(state.display_status("c"), "stalled");
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2.4: apply_observation reconcile
     // -----------------------------------------------------------------------
