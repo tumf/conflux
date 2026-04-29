@@ -46,8 +46,10 @@ use crate::vcs::WorkspaceManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
+
+use crate::orchestration::state::OrchestratorState;
 
 const DEFAULT_MAX_CONFLICT_RETRIES: u32 = 3;
 
@@ -138,6 +140,8 @@ pub struct ParallelExecutor {
     pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Scheduler lifetime policy (finite for CLI run, persistent for loop-based frontends).
     scheduler_lifetime: SchedulerLifetime,
+    /// Optional reducer shared state used for scheduler-owned resolve/merge retry intent.
+    shared_orchestrator_state: Option<Arc<RwLock<OrchestratorState>>>,
 }
 
 #[cfg(test)]

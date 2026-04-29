@@ -682,6 +682,20 @@ impl OrchestratorState {
             .any(|rt| matches!(rt.activity, ActivityState::Resolving) && !rt.is_terminal())
     }
 
+    /// Return change IDs that are currently waiting for scheduler-owned resolve/merge retry.
+    pub fn resolve_wait_change_ids(&self) -> Vec<String> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| {
+                if matches!(rt.wait_state, WaitState::ResolveWait) && !rt.is_terminal() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Return a snapshot of display status strings for all known changes.
     /// Used by the TUI to sync `ChangeState.queue_status` from the reducer.
     pub fn all_display_statuses(&self) -> HashMap<String, &'static str> {

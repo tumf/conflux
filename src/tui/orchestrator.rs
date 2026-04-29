@@ -1137,6 +1137,7 @@ pub async fn run_orchestrator_parallel(
             Some(shared_queue_change.clone()),
             Some(Arc::new(dynamic_queue.clone())),
             Some(manual_resolve_counter.clone()),
+            Some(shared_state.clone()),
         ) => {
             result
         }

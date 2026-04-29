@@ -367,6 +367,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -670,6 +671,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -852,6 +854,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1003,6 +1006,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1186,6 +1190,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1383,6 +1388,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1586,6 +1592,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name];
