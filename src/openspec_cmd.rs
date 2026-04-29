@@ -1193,19 +1193,6 @@ const EXECUTABLE_VERIFICATION_HINTS: &[&str] = &[
     "cargo test",
 ];
 
-const RUNTIME_BEHAVIOR_HINTS: &[&str] = &[
-    "handler",
-    "webhook",
-    "persist",
-    "persistence",
-    "notification",
-    "command",
-    "job",
-    "worker",
-    "queue",
-    "background process",
-];
-
 fn looks_like_behavior_task(task_text: &str) -> bool {
     let normalized = task_text.trim().to_lowercase();
     BEHAVIOR_TASK_KEYWORDS
@@ -1246,13 +1233,6 @@ fn verification_mentions_executable_surface(verification_text: &str) -> bool {
         .any(|hint| normalized.contains(hint))
 }
 
-fn proposal_mentions_runtime_behavior(proposal_content: &str) -> bool {
-    let normalized = proposal_content.trim().to_lowercase();
-    RUNTIME_BEHAVIOR_HINTS
-        .iter()
-        .any(|hint| normalized.contains(hint))
-}
-
 fn validate_tasks_content(
     content: &str,
     change_id: &str,
@@ -1285,7 +1265,6 @@ fn validate_tasks_content(
     let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
     let proposal_text = proposal_content.unwrap_or_default();
     let proposal_has_executable_surface = proposal_mentions_executable_surface(proposal_text);
-    let proposal_has_runtime_behavior = proposal_mentions_runtime_behavior(proposal_text);
 
     let mut behavior_task_count = 0usize;
     let mut artifact_task_count = 0usize;
@@ -1460,18 +1439,6 @@ fn validate_tasks_content(
         if proposal_has_executable_surface && !has_executable_runnable_verification {
             let msg = format!(
                 "{}: tasks.md: Executable-surface behavior lacks runnable verification coverage",
-                change_id
-            );
-            if evidence_mode == "error" {
-                errors.push(msg);
-            } else if evidence_mode == "warn" {
-                warnings.push(msg);
-            }
-        }
-
-        if proposal_has_runtime_behavior && behavior_task_count == 0 {
-            let msg = format!(
-                "{}: tasks.md: Runtime behavior is claimed without implementation-facing tasks",
                 change_id
             );
             if evidence_mode == "error" {
@@ -2054,27 +2021,6 @@ mod validation_tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("Executable-surface behavior lacks runnable verification")));
-    }
-
-    #[test]
-    fn test_warns_runtime_claim_without_behavior_tasks() {
-        let content = "- [ ] Document API rollout (verification: manual - docs review)\n";
-        let proposal = "# Change\n\n**Change Type**: implementation\n\n## Goal\nWebhook handler must persist notifications via background process\n";
-        let (errors, warnings) = validate_tasks_content(
-            content,
-            "test",
-            true,
-            "warn",
-            Some("implementation"),
-            Some(proposal),
-        );
-        assert!(errors.is_empty());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w
-                    .contains("Runtime behavior is claimed without implementation-facing tasks"))
-        );
     }
 }
 

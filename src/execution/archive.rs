@@ -664,7 +664,6 @@ pub fn extract_archive_runtime_blocker(
 ) -> Option<String> {
     fn extract_line(text: &str) -> Option<String> {
         let candidates = [
-            "Runtime behavior is claimed without implementation-facing tasks",
             "validation failed",
             "not archive-ready",
             "archive readiness",
@@ -1445,7 +1444,7 @@ fi\n";
         let with_blocker = build_archive_error_message(
             "add-feature",
             Some(Path::new("/tmp/ws")),
-            Some("Runtime behavior is claimed without implementation-facing tasks"),
+            Some("validation failed: canonical promotion check"),
         );
         assert!(with_blocker.contains("Root cause from archive attempt"));
     }

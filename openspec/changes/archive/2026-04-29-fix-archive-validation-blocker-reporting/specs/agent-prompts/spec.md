@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: acceptance-detected archive blocker survives later archive verification noise
+### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
 archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. This change does not redefine the root-cause-preserving archive failure contract already covered by archived archive-readiness work.
 

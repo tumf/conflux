@@ -62,8 +62,12 @@ Required checks (only run if no valid Implementation Blocker exists):
 7. No stubbed runtime check: FAIL if the real execution path uses a mock/stub/fake/placeholder implementation.
    - Examples of disallowed runtime placeholders: `todo!()`, `unimplemented!()`, always-empty returns, `Fake*`/`Mock*`/`Stub*` clients in non-test code, or feature-flagged mocks enabled by default.
    - Mocks/stubs/fakes are allowed only in test-only code paths (`#[cfg(test)]`, `tests/`).
-8. Regression check: verify that existing features unrelated to this change are not broken.
-9. Evidence: cite at least one file path + function/method where the integration happens.
+8. Behavior-task adequacy check for behavior-changing work:
+   - If proposal/tasks claim runtime or user-visible behavior changes, verify tasks identify concrete implementation-facing work and repository-verifiable integration evidence.
+   - If missing, output FAIL with actionable findings referencing missing code/test/integration evidence.
+   - Do NOT defer this class of issue to archive; acceptance owns this judgment.
+9. Regression check: verify that existing features unrelated to this change are not broken.
+10. Evidence: cite at least one file path + function/method where the integration happens.
 
 FINDINGS format requirements:
 - Each finding MUST include concrete evidence (file path, function name, line number if relevant)

@@ -25,6 +25,8 @@ const CFLX_APPLY_REF: &str = include_str!("../skills/cflx-apply/references/cflx-
 const CFLX_REJECTING_SKILL_MD: &str = include_str!("../skills/cflx-rejecting/SKILL.md");
 const CFLX_CLEANUP_REVIEW_SKILL_MD: &str = include_str!("../skills/cflx-cleanup-review/SKILL.md");
 const CFLX_ACCEPT_SKILL_MD: &str = include_str!("../skills/cflx-accept/SKILL.md");
+#[cfg(test)]
+const CFLX_ACCEPT_COMMAND_MD: &str = include_str!("../.opencode/commands/cflx-accept.md");
 const CFLX_ARCHIVE_SKILL_MD: &str = include_str!("../skills/cflx-archive/SKILL.md");
 const CFLX_ARCHIVE_REF: &str = include_str!("../skills/cflx-archive/references/cflx-archive.md");
 const CFLX_RESOLVE_SKILL_MD: &str = include_str!("../skills/cflx-resolve/SKILL.md");
@@ -240,6 +242,21 @@ mod tests {
         assert!(
             CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
             "cflx-accept SKILL.md must reference the command template as single source"
+        );
+    }
+
+    #[test]
+    fn test_acceptance_command_template_enforces_behavior_task_adequacy_in_acceptance() {
+        assert!(
+            CFLX_ACCEPT_COMMAND_MD
+                .contains("Behavior-task adequacy check for behavior-changing work"),
+            "acceptance command template must require behavior-task adequacy review in acceptance"
+        );
+        assert!(
+            CFLX_ACCEPT_COMMAND_MD.contains(
+                "Do NOT defer this class of issue to archive; acceptance owns this judgment."
+            ),
+            "acceptance command template must keep behavior-task adequacy ownership in acceptance"
         );
     }
 
