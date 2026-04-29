@@ -5,7 +5,8 @@ dependencies: []
 references:
   - skills/cflx-apply/SKILL.md
   - skills/cflx-workflow/SKILL.md
-  - src/tui/state.rs
+  - src/openspec_cmd.rs
+  - skills/cflx-workflow/scripts/cflx.py
   - openspec/specs/agent-prompts/spec.md
   - openspec/specs/parallel-execution/spec.md
   - openspec/changes/handle-archived-dependency-references/proposal.md
@@ -63,7 +64,7 @@ optional OpenSpec artifact の不在を canonical contract で明文化し、run
 ## Explicit Completion Conditions
 
 - canonical spec delta が optional OpenSpec artifact (`design.md`) の read contract と non-error behavior を requirement/scenario として定義している。
-- `src/tui/state.rs` または関連 log/event surfacing 経路のどこを調整するかが tasks に明記されている。
+- `design.md` 不在を optional skip として扱う repository-verifiable な実装経路が tasks に明記されており、少なくとも確認済みの artifact reader (`src/openspec_cmd.rs`, `skills/cflx-workflow/scripts/cflx.py`) と必要に応じた error/log surfacing 経路の特定・修正が含まれている。
 - `skills/cflx-apply/SKILL.md` / `skills/cflx-workflow/SKILL.md` と runtime behavior の整合を確認する task が含まれている。
 - optional `design.md` missing と required file missing の両方を区別する regression coverage が tasks に含まれている。
 
