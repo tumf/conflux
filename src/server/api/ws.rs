@@ -550,8 +550,7 @@ mod tests {
             ("stalled".to_string(), None)
         );
         assert_eq!(
-            derive_change_status("c-gated", &worktree_by_change, &status_map, "main", false)
-                .await,
+            derive_change_status("c-gated", &worktree_by_change, &status_map, "main", false).await,
             ("gated".to_string(), None)
         );
     }
