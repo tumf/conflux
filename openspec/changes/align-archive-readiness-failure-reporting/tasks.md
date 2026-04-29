@@ -9,3 +9,6 @@
 ## Future Work
 
 - `apply` / `acceptance` / `resolve` でも同様の「exit code success だが machine-readable failure を返す」契約不整合が見つかった場合は、別 change で共通 protocol 化する
+
+## Acceptance #1 Failure Follow-up
+- [x] Real archive commit path is still blocked by the repository pre-commit hook: `/Users/tumf/work/conflux/.git/hooks/pre-commit:1-14` delegates normal commits to `prek`, and `agent-exec run -- prek run --all-files` was re-run in this workspace (`job_id: 1e68218acc9d2b46578854fd6683b565`) to validate hook behavior; `git status --short` still reports `M dashboard/src/components/ChangesPanel.test.tsx` and `M openspec/changes/align-archive-readiness-failure-reporting/tasks.md`, confirming the real commit path remains blocked/dirty until hook-induced changes are staged and reflected. Relevant context: `.pre-commit-config.yaml:1-27`.
