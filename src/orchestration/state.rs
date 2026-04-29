@@ -1030,6 +1030,18 @@ impl OrchestratorState {
                     rt.activity = ActivityState::Archiving;
                 }
             }
+            ExecutionEvent::ArchiveResumed { change_id, .. } => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() {
+                    rt.activity = ActivityState::Archiving;
+                }
+            }
+            ExecutionEvent::ArchiveRetryScheduled { change_id, .. } => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() {
+                    rt.activity = ActivityState::Archiving;
+                }
+            }
             ExecutionEvent::ChangeArchived(change_id) => {
                 self.mark_archived(change_id);
                 let mode = self.execution_mode;
@@ -1060,7 +1072,9 @@ impl OrchestratorState {
                     }
                 }
             }
-            ExecutionEvent::ArchiveFailed { change_id, error } => {
+            ExecutionEvent::ArchiveFailed {
+                change_id, error, ..
+            } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() {
                     rt.terminal = TerminalState::Error(error.clone());

@@ -227,11 +227,30 @@ pub enum ExecutionEvent {
     // Archive events
     /// Archive started for a change
     ArchiveStarted { change_id: String, command: String },
+    /// Archive resumed from durable resume state context.
+    ArchiveResumed {
+        change_id: String,
+        reason: Option<String>,
+        summary: Option<String>,
+    },
+    /// Archive retry scheduled with structured reason context.
+    ArchiveRetryScheduled {
+        change_id: String,
+        attempt: u32,
+        max_attempts: u32,
+        reason: Option<String>,
+        summary: Option<String>,
+    },
     /// Change archived successfully
     ChangeArchived(String),
     /// Change archive failed
     #[allow(dead_code)]
-    ArchiveFailed { change_id: String, error: String },
+    ArchiveFailed {
+        change_id: String,
+        error: String,
+        reason: Option<String>,
+        summary: Option<String>,
+    },
     /// Archive output (streaming)
     #[allow(dead_code)]
     ArchiveOutput {
