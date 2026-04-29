@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stalled_result_marks_change_blocked_state() {
+    async fn test_stalled_result_marks_change_stalled_state() {
         use crate::serial_run_service::ChangeProcessResult;
         use tempfile::TempDir;
 
@@ -1682,7 +1682,7 @@ mod tests {
             .unwrap();
 
         let state = orchestrator.shared_state.read().await;
-        assert_eq!(state.display_status(&blocked_change.id), "blocked");
+        assert_eq!(state.display_status(&blocked_change.id), "stalled");
     }
 
     /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,

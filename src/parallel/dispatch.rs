@@ -1421,6 +1421,15 @@ impl ParallelExecutor {
                             change_id
                         );
 
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::AcceptanceGated {
+                                    change_id: change_id.clone(),
+                                    reason: reason.clone(),
+                                })
+                                .await;
+                        }
+
                         let resolved_base = base_branch.clone();
 
                         match execute_rejection_flow(

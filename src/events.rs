@@ -383,6 +383,9 @@ pub enum ExecutionEvent {
     /// A change's dependencies were resolved and it can now be queued
     DependencyResolved { change_id: String },
 
+    /// Acceptance observed a gate and follow-up routing should classify it separately
+    AcceptanceGated { change_id: String, reason: String },
+
     // Analysis events (parallel mode)
     /// Analysis started for remaining changes
     #[allow(dead_code)]

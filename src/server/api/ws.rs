@@ -490,6 +490,8 @@ mod tests {
         status_map.insert("c-merge-wait".to_string(), "merge wait");
         status_map.insert("c-resolve-pending".to_string(), "resolve pending");
         status_map.insert("c-blocked".to_string(), "blocked");
+        status_map.insert("c-stalled".to_string(), "stalled");
+        status_map.insert("c-gated".to_string(), "gated");
 
         let worktree_by_change = std::collections::HashMap::new();
 
@@ -541,6 +543,16 @@ mod tests {
             derive_change_status("c-blocked", &worktree_by_change, &status_map, "main", false)
                 .await,
             ("blocked".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-stalled", &worktree_by_change, &status_map, "main", false)
+                .await,
+            ("stalled".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-gated", &worktree_by_change, &status_map, "main", false)
+                .await,
+            ("gated".to_string(), None)
         );
     }
 
