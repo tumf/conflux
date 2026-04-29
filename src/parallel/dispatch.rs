@@ -1425,7 +1425,8 @@ impl ParallelExecutor {
                             "Acceptance command failed for {} (cycle {}): {}",
                             change_id, cycle_count, error
                         );
-                        // Note: tasks.md is now updated by the acceptance agent itself
+                        // Canonical owner note: runtime appends follow-up tasks for FAIL verdicts,
+                        // while command-level failures are surfaced without forcing local tasks.md updates.
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
