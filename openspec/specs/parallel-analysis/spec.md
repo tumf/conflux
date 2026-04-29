@@ -18,6 +18,8 @@ TBD - created by archiving change pass-approved-changes-to-analyzer. Update Purp
 
 加えて、プロンプトは実行中（in-flight）の変更一覧を含め、これらは選択対象ではなく依存関係判定の対象としてのみ扱うよう明示しなければならない（MUST）。
 
+依存分析プロンプトは、`dependencies` に記載できる dependency target を **今回の queued change IDs** と **明示的に渡された in-flight change IDs** に限定しなければならない（MUST）。repo 上に存在するが今回の working set に含まれない active change、archived change、または単なる関連 change を dependency target として返してはならない（MUST NOT）。
+
 プロンプト構築と出力解析は別関数に分割してもよい（MAY）。ただし、プロンプト内容と選別ルールは既存と同一でなければならない（MUST）。
 
 #### Scenario: Return dependencies only for mandatory conditions

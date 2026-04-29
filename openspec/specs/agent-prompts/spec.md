@@ -445,6 +445,8 @@ The primary acceptance verdict contract MUST be a strict JSON object emitted as 
 
 The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary source of fixed operation guidance for dependency analysis and conflict resolution respectively. Rust-side prompt builders MAY inject variable runtime context, but they MUST NOT remain the primary home of fixed analyze / resolve rules, output contracts, safety constraints, sequential merge protocol, or commit conventions.
 
+The dedicated `cflx-analyze` skill MUST define the allowed dependency target set for analyze output as the current queued change IDs plus any explicitly supplied in-flight change IDs. Responses that reference other active, archived, or unrelated change IDs as dependency targets MUST be treated as invalid dependency contract output.
+
 #### Scenario: Analyze fixed guidance moves out of inline Rust prompt text
 
 - **GIVEN** dependency analysis is executed through the standard orchestrator path

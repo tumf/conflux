@@ -377,6 +377,8 @@ Your task:
 4. Treat proposal frontmatter `references` as supplemental analysis context only
 5. Consider currently executing changes as potential dependencies (but DO NOT include them in the order)
 6. Return execution order and dependencies
+7. `dependencies` may reference ONLY queued change IDs and explicitly listed in-flight IDs
+8. NEVER reference unrelated active changes, archived changes, or any ID outside that allowed set
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -397,6 +399,8 @@ Rules:
   - Example of REQUIRED dependency: "change-b implements a feature using the API defined in change-a"
   - Example of NOT a dependency: "change-a should ideally be done before change-b for efficiency"
   - Dependencies CAN reference currently executing changes if a queued change requires their output
+- Dependencies MUST reference only IDs from the queued `order` set and explicitly provided in-flight IDs
+- Do NOT reference active-but-not-queued IDs, archived IDs, or unrelated change IDs
 - Proposal metadata warnings are informational only; continue analysis using known metadata
 - Every change ID in the input list must appear exactly once in `order`
 - Dependencies are hard constraints: a change CANNOT start until all its dependencies are merged to base
@@ -643,9 +647,18 @@ Rules:
             // Check all dependencies exist in order or in-flight
             for dep_id in deps {
                 if !result.order.contains(dep_id) && !in_flight_set.contains(dep_id.as_str()) {
+                    let mut allowed_ids: Vec<String> = result.order.clone();
+                    allowed_ids.extend(in_flight_ids.iter().cloned());
+                    allowed_ids.sort();
+                    allowed_ids.dedup();
+
                     return Err(OrchestratorError::Parse(format!(
-                        "Invalid dependency reference: change '{}' depends on non-existent change '{}'",
-                        change_id, dep_id
+                        "Invalid dependency reference: change '{}' depends on '{}' outside allowed dependency targets. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_ids={:?}",
+                        change_id,
+                        dep_id,
+                        result.order,
+                        in_flight_ids,
+                        allowed_ids
                     )));
                 }
             }
@@ -1212,6 +1225,8 @@ That's all."#;
         assert!(prompt.contains("NOT selectable"));
         assert!(prompt.contains("DO NOT include currently executing changes in the order"));
         assert!(prompt.contains("Dependencies CAN reference currently executing changes"));
+        assert!(prompt.contains("`dependencies` may reference ONLY queued change IDs and explicitly listed in-flight IDs"));
+        assert!(prompt.contains("NEVER reference unrelated active changes, archived changes"));
     }
 
     #[test]
@@ -1254,6 +1269,12 @@ That's all."#;
             validation.is_err(),
             "Dependency on unknown ID should be rejected"
         );
+
+        let error_text = validation.err().unwrap().to_string();
+        assert!(error_text.contains("Invalid dependency reference"));
+        assert!(error_text.contains("nonexistent"));
+        assert!(error_text.contains("allowed_queued_ids"));
+        assert!(error_text.contains("allowed_in_flight_ids"));
     }
 
     #[test]
