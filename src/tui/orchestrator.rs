@@ -688,7 +688,7 @@ pub async fn run_orchestrator(
 
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                        "Acceptance blocked - rejection flow completed: {}",
+                        "Acceptance gated - rejection flow completed: {}",
                         reason
                     ))))
                     .await;

@@ -556,7 +556,7 @@ impl Orchestrator {
             }
             ChangeProcessResult::Rejected { reason } => {
                 info!(
-                    "Acceptance blocked for {} - rejected flow completed: {}",
+                    "Acceptance gated for {} - rejected flow completed: {}",
                     next.id, reason
                 );
                 self.update_shared_state(ExecutionEvent::ChangeRejected {
@@ -1673,7 +1673,7 @@ mod tests {
         let blocked_change = create_test_change("blocked-change", 3, 5);
 
         let result = ChangeProcessResult::Stalled {
-            error: "Acceptance blocked with recoverable blocker".to_string(),
+            error: "Acceptance gated with recoverable blocker".to_string(),
         };
 
         orchestrator

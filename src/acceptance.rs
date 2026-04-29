@@ -25,7 +25,7 @@ pub enum AcceptanceResult {
     Fail { findings: Vec<String> },
     /// Acceptance requires more investigation - continue later
     Continue,
-    /// Acceptance blocked due to implementation blocker
+    /// Acceptance gated due to implementation blocker
     Blocked,
 }
 

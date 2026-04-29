@@ -266,7 +266,7 @@ async fn cleanup_worktree(repo_root: &Path, worktree_path: &Path) {
     }
 }
 
-/// Execute rejection flow for acceptance-blocked changes.
+/// Execute rejection flow for acceptance-gated changes.
 ///
 /// Flow:
 /// 1. checkout base branch

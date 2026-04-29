@@ -6,50 +6,36 @@ Provide a single, reducer-owned model for tracking the runtime lifecycle of each
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
+The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
 
-A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
+- dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
+- apply/rejecting resumable hold (`stalled`)
+- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
 
-For a `Blocked` change, the runtime state SHALL preserve:
-- queue intent when applicable
-- active worktree reference
-- current WIP / latest iteration snapshot context
-- tasks progress
-- blocker reason and unblock metadata
-- non-terminal resumable lifecycle status
+Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
 
-The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
-
-#### Scenario: apply blocked state preserves resumable worktree context
-- **GIVEN** apply reports a recoverable blocker for a change
-- **WHEN** the reducer applies the blocked execution input
-- **THEN** the lifecycle state becomes `Blocked`
-- **AND** terminal result remains `None`
-- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+#### Scenario: dependency wait remains blocked
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
-#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
-- **GIVEN** a change is in `Rejecting`
-- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
-- **WHEN** the reducer applies the completion event
-- **THEN** the lifecycle state becomes `Blocked`
+#### Scenario: resumable apply hold is stalled
+- **GIVEN** apply or rejecting review reports a resumable blocker for a change
+- **WHEN** the reducer applies the hold transition
+- **THEN** the lifecycle state becomes `stalled`
 - **AND** terminal result remains `None`
-- **AND** the existing worktree remains attached to the change
-- **AND** the derived display status is `blocked`
+- **AND** the derived display status is `stalled`
+- **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: blocked change can be explicitly re-queued or retried into applying
-- **GIVEN** a change is in `Blocked` non-terminal state
-- **AND** its worktree and unblock metadata are still present
-- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
-- **THEN** the reducer transitions the change back to `Applying`
-- **AND** the prior worktree context is reused rather than recreated from scratch
-
-#### Scenario: rejected change remains terminal and non-resumable
-- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the reducer applies the rejected completion event
-- **THEN** terminal state becomes `Rejected`
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be resumed through the blocked retry path
+#### Scenario: acceptance gate is exposed separately
+- **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
+- **WHEN** reducer-owned state or its derived event/status surface exposes that observation
+- **THEN** the displayed wording is `gated`
+- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -225,50 +211,36 @@ When a change is archived in parallel mode, the orchestrator must attempt to mer
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
+The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
 
-A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
+- dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
+- apply/rejecting resumable hold (`stalled`)
+- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
 
-For a `Blocked` change, the runtime state SHALL preserve:
-- queue intent when applicable
-- active worktree reference
-- current WIP / latest iteration snapshot context
-- tasks progress
-- blocker reason and unblock metadata
-- non-terminal resumable lifecycle status
+Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
 
-The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
-
-#### Scenario: apply blocked state preserves resumable worktree context
-- **GIVEN** apply reports a recoverable blocker for a change
-- **WHEN** the reducer applies the blocked execution input
-- **THEN** the lifecycle state becomes `Blocked`
-- **AND** terminal result remains `None`
-- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+#### Scenario: dependency wait remains blocked
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
-#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
-- **GIVEN** a change is in `Rejecting`
-- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
-- **WHEN** the reducer applies the completion event
-- **THEN** the lifecycle state becomes `Blocked`
+#### Scenario: resumable apply hold is stalled
+- **GIVEN** apply or rejecting review reports a resumable blocker for a change
+- **WHEN** the reducer applies the hold transition
+- **THEN** the lifecycle state becomes `stalled`
 - **AND** terminal result remains `None`
-- **AND** the existing worktree remains attached to the change
-- **AND** the derived display status is `blocked`
+- **AND** the derived display status is `stalled`
+- **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: blocked change can be explicitly re-queued or retried into applying
-- **GIVEN** a change is in `Blocked` non-terminal state
-- **AND** its worktree and unblock metadata are still present
-- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
-- **THEN** the reducer transitions the change back to `Applying`
-- **AND** the prior worktree context is reused rather than recreated from scratch
-
-#### Scenario: rejected change remains terminal and non-resumable
-- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the reducer applies the rejected completion event
-- **THEN** terminal state becomes `Rejected`
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be resumed through the blocked retry path
+#### Scenario: acceptance gate is exposed separately
+- **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
+- **WHEN** reducer-owned state or its derived event/status surface exposes that observation
+- **THEN** the displayed wording is `gated`
+- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -304,50 +276,36 @@ Frontend MAY cache the resolve queue state for rendering purposes, but the cache
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
+The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
 
-A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
+- dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
+- apply/rejecting resumable hold (`stalled`)
+- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
 
-For a `Blocked` change, the runtime state SHALL preserve:
-- queue intent when applicable
-- active worktree reference
-- current WIP / latest iteration snapshot context
-- tasks progress
-- blocker reason and unblock metadata
-- non-terminal resumable lifecycle status
+Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
 
-The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
-
-#### Scenario: apply blocked state preserves resumable worktree context
-- **GIVEN** apply reports a recoverable blocker for a change
-- **WHEN** the reducer applies the blocked execution input
-- **THEN** the lifecycle state becomes `Blocked`
-- **AND** terminal result remains `None`
-- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+#### Scenario: dependency wait remains blocked
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
-#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
-- **GIVEN** a change is in `Rejecting`
-- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
-- **WHEN** the reducer applies the completion event
-- **THEN** the lifecycle state becomes `Blocked`
+#### Scenario: resumable apply hold is stalled
+- **GIVEN** apply or rejecting review reports a resumable blocker for a change
+- **WHEN** the reducer applies the hold transition
+- **THEN** the lifecycle state becomes `stalled`
 - **AND** terminal result remains `None`
-- **AND** the existing worktree remains attached to the change
-- **AND** the derived display status is `blocked`
+- **AND** the derived display status is `stalled`
+- **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: blocked change can be explicitly re-queued or retried into applying
-- **GIVEN** a change is in `Blocked` non-terminal state
-- **AND** its worktree and unblock metadata are still present
-- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
-- **THEN** the reducer transitions the change back to `Applying`
-- **AND** the prior worktree context is reused rather than recreated from scratch
-
-#### Scenario: rejected change remains terminal and non-resumable
-- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the reducer applies the rejected completion event
-- **THEN** terminal state becomes `Rejected`
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be resumed through the blocked retry path
+#### Scenario: acceptance gate is exposed separately
+- **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
+- **WHEN** reducer-owned state or its derived event/status surface exposes that observation
+- **THEN** the displayed wording is `gated`
+- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
 
 ### Requirement: Rejection Flow Execution
 
@@ -556,50 +514,36 @@ The operation MUST NOT convert permanent terminal changes such as `Archived`, `M
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
+The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
 
-A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
+- dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
+- apply/rejecting resumable hold (`stalled`)
+- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
 
-For a `Blocked` change, the runtime state SHALL preserve:
-- queue intent when applicable
-- active worktree reference
-- current WIP / latest iteration snapshot context
-- tasks progress
-- blocker reason and unblock metadata
-- non-terminal resumable lifecycle status
+Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
 
-The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
-
-#### Scenario: apply blocked state preserves resumable worktree context
-- **GIVEN** apply reports a recoverable blocker for a change
-- **WHEN** the reducer applies the blocked execution input
-- **THEN** the lifecycle state becomes `Blocked`
-- **AND** terminal result remains `None`
-- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+#### Scenario: dependency wait remains blocked
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
-#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
-- **GIVEN** a change is in `Rejecting`
-- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
-- **WHEN** the reducer applies the completion event
-- **THEN** the lifecycle state becomes `Blocked`
+#### Scenario: resumable apply hold is stalled
+- **GIVEN** apply or rejecting review reports a resumable blocker for a change
+- **WHEN** the reducer applies the hold transition
+- **THEN** the lifecycle state becomes `stalled`
 - **AND** terminal result remains `None`
-- **AND** the existing worktree remains attached to the change
-- **AND** the derived display status is `blocked`
+- **AND** the derived display status is `stalled`
+- **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: blocked change can be explicitly re-queued or retried into applying
-- **GIVEN** a change is in `Blocked` non-terminal state
-- **AND** its worktree and unblock metadata are still present
-- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
-- **THEN** the reducer transitions the change back to `Applying`
-- **AND** the prior worktree context is reused rather than recreated from scratch
-
-#### Scenario: rejected change remains terminal and non-resumable
-- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the reducer applies the rejected completion event
-- **THEN** terminal state becomes `Rejected`
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be resumed through the blocked retry path
+#### Scenario: acceptance gate is exposed separately
+- **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
+- **WHEN** reducer-owned state or its derived event/status surface exposes that observation
+- **THEN** the displayed wording is `gated`
+- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
 
 ### Requirement: Rejected terminal state remains distinct from errors
 
@@ -631,50 +575,36 @@ Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
+The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
 
-A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
+- dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
+- apply/rejecting resumable hold (`stalled`)
+- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
 
-For a `Blocked` change, the runtime state SHALL preserve:
-- queue intent when applicable
-- active worktree reference
-- current WIP / latest iteration snapshot context
-- tasks progress
-- blocker reason and unblock metadata
-- non-terminal resumable lifecycle status
+Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
 
-The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
-
-#### Scenario: apply blocked state preserves resumable worktree context
-- **GIVEN** apply reports a recoverable blocker for a change
-- **WHEN** the reducer applies the blocked execution input
-- **THEN** the lifecycle state becomes `Blocked`
-- **AND** terminal result remains `None`
-- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+#### Scenario: dependency wait remains blocked
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
-#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
-- **GIVEN** a change is in `Rejecting`
-- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
-- **WHEN** the reducer applies the completion event
-- **THEN** the lifecycle state becomes `Blocked`
+#### Scenario: resumable apply hold is stalled
+- **GIVEN** apply or rejecting review reports a resumable blocker for a change
+- **WHEN** the reducer applies the hold transition
+- **THEN** the lifecycle state becomes `stalled`
 - **AND** terminal result remains `None`
-- **AND** the existing worktree remains attached to the change
-- **AND** the derived display status is `blocked`
+- **AND** the derived display status is `stalled`
+- **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: blocked change can be explicitly re-queued or retried into applying
-- **GIVEN** a change is in `Blocked` non-terminal state
-- **AND** its worktree and unblock metadata are still present
-- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
-- **THEN** the reducer transitions the change back to `Applying`
-- **AND** the prior worktree context is reused rather than recreated from scratch
-
-#### Scenario: rejected change remains terminal and non-resumable
-- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the reducer applies the rejected completion event
-- **THEN** terminal state becomes `Rejected`
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be resumed through the blocked retry path
+#### Scenario: acceptance gate is exposed separately
+- **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
+- **WHEN** reducer-owned state or its derived event/status surface exposes that observation
+- **THEN** the displayed wording is `gated`
+- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -690,50 +620,36 @@ Workspace observations SHALL NOT regress a change from terminal `Merged` back to
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
+The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
 
-A `Blocked` change is one where the current apply or rejection-review path cannot proceed until additional information, specification clarification, dependency resolution, or explicit operator action is available, but the change itself remains valid and resumable.
+- dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
+- apply/rejecting resumable hold (`stalled`)
+- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
 
-For a `Blocked` change, the runtime state SHALL preserve:
-- queue intent when applicable
-- active worktree reference
-- current WIP / latest iteration snapshot context
-- tasks progress
-- blocker reason and unblock metadata
-- non-terminal resumable lifecycle status
+Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
 
-The terminal result MUST continue to include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejection review or acceptance has determined the change should be closed and the base branch has recorded a durable rejection reason.
-
-#### Scenario: apply blocked state preserves resumable worktree context
-- **GIVEN** apply reports a recoverable blocker for a change
-- **WHEN** the reducer applies the blocked execution input
-- **THEN** the lifecycle state becomes `Blocked`
-- **AND** terminal result remains `None`
-- **AND** the runtime preserves worktree reference, WIP context, tasks progress, and blocker metadata
+#### Scenario: dependency wait remains blocked
+- **GIVEN** a change is queued for execution
+- **AND** dependency analysis reports unresolved dependencies
+- **WHEN** the reducer applies the dependency-blocked input
+- **THEN** the wait reason becomes dependency `blocked`
 - **AND** the derived display status is `blocked`
+- **AND** the change is not labeled `stalled` or `gated`
 
-#### Scenario: rejecting review blocked outcome preserves change instead of rejecting it
-- **GIVEN** a change is in `Rejecting`
-- **AND** rejecting review returns a blocked-hold outcome rather than confirm or resume
-- **WHEN** the reducer applies the completion event
-- **THEN** the lifecycle state becomes `Blocked`
+#### Scenario: resumable apply hold is stalled
+- **GIVEN** apply or rejecting review reports a resumable blocker for a change
+- **WHEN** the reducer applies the hold transition
+- **THEN** the lifecycle state becomes `stalled`
 - **AND** terminal result remains `None`
-- **AND** the existing worktree remains attached to the change
-- **AND** the derived display status is `blocked`
+- **AND** the derived display status is `stalled`
+- **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: blocked change can be explicitly re-queued or retried into applying
-- **GIVEN** a change is in `Blocked` non-terminal state
-- **AND** its worktree and unblock metadata are still present
-- **WHEN** an explicit retry or resume action is issued after the unblock condition is satisfied
-- **THEN** the reducer transitions the change back to `Applying`
-- **AND** the prior worktree context is reused rather than recreated from scratch
-
-#### Scenario: rejected change remains terminal and non-resumable
-- **GIVEN** rejection flow has committed `openspec/changes/fix-auth/REJECTED.md` on the base branch
-- **WHEN** the reducer applies the rejected completion event
-- **THEN** terminal state becomes `Rejected`
-- **AND** the derived display status is `rejected`
-- **AND** the change cannot be resumed through the blocked retry path
+#### Scenario: acceptance gate is exposed separately
+- **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
+- **WHEN** reducer-owned state or its derived event/status surface exposes that observation
+- **THEN** the displayed wording is `gated`
+- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
 
 ### Requirement: WebSocket change status consistency with TUI
 

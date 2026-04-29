@@ -1417,7 +1417,7 @@ impl ParallelExecutor {
                                 "Acceptance-confirmed implementation blocker".to_string()
                             });
                         warn!(
-                            "Acceptance blocked for {} - running rejection flow",
+                            "Acceptance gated for {} - running rejection flow",
                             change_id
                         );
 
@@ -1446,7 +1446,7 @@ impl ParallelExecutor {
                                     let _ = tx
                                         .send(ParallelEvent::Log(
                                             LogEntry::warn(format!(
-                                                "Acceptance blocked - rejection flow completed ({})",
+                                                "Acceptance gated - rejection flow completed ({})",
                                                 resolved_base
                                             ))
                                             .with_change_id(&change_id)

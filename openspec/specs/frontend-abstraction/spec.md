@@ -6,54 +6,17 @@ Core（Reducer + オーケストレーションループ）とフロントエン
 
 ### Requirement: Core / Frontend 状態所有の境界
 
-Conflux のアーキテクチャは **Core**（Reducer + オーケストレーションループ）と **Frontend**（TUI, Web UI）の2層に分離される。各層が所有する状態の範囲を以下のように定義する。
+Core が所有する display status の正規ソースは、dependency wait の `blocked`（canonical concept: `dependency-blocked`）、apply/rejecting resumable hold の `stalled`、acceptance gate observation の `gated`（canonical concept: `acceptance-gated`）を区別しなければならない（MUST）。
 
-**Core が所有する状態（Frontend は独立コピーを持ってはならない）:**
-- Change lifecycle（ActivityState: Applying, Accepting, Archiving, Resolving, Idle）
-- Resolve queue（FIFO キュー）と resolve serialization フラグ
-- Execution state（apply count, iteration, pending/archived/completed sets）
-- Wait state（MergeWait, ResolveWait, DependencyBlocked）
-- Terminal state（Archived, Merged, Error）
-- Display status の正規ソース（`ChangeRuntimeState::display_status()` から導出）
+Frontend はこれらを独自の lifecycle copy や render-time simplification によって単一の `blocked` へ collapse してはならない（MUST NOT）。
 
-**Frontend が所有してよい状態（UI 固有状態）:**
-- Cursor position, focus, panel selection
-- View mode (Changes / Worktrees)
-- Selection state (checkboxes, execution marks)
-- Sort / filter preferences
-- Popup / modal state
-- Render cache（display_status_cache, display_color_cache）— Core の正規値から派生し、Core を上書きしない
-- Transport / session state（WebSocket 接続状態等）
-
-**Frontend が持ってはならない状態:**
-- Change lifecycle の独立コピー（旧 QueueStatus enum 等）
-- Resolve queue の独立コピー
-- Resolve serialization の判断ロジック（Core の `is_resolving_active()` を参照するのみ）
-- Merge / resolve の可否判断に使う独自フラグ（apply/accept/archive をブロックする用途）
-
-Frontend は Core の状態を **読み取り** と **コマンド発行** でのみ操作する。状態遷移は Core の reducer を経由しなければならない（MUST）。
-
-#### Scenario: Frontend は Core lifecycle の独立コピーを持たない
-
-- **GIVEN** TUI または Web UI が Change のステータスを表示する
-- **WHEN** ステータスの取得が必要になる
-- **THEN** shared orchestration state（OrchestratorState）の `display_status()` から導出された値を使用する
-- **AND** Frontend 固有の lifecycle enum や状態マシンを持たない
-
-#### Scenario: Frontend の render cache は Core を上書きしない
-
-- **GIVEN** TUI が display_status_cache を保持している
-- **WHEN** Core の display_status が更新される
-- **THEN** render cache は Core の最新値で上書きされる
-- **AND** render cache から Core への逆方向の上書きは発生しない
-
-#### Scenario: Resolve serialization は Core で判断される
-
-- **GIVEN** ユーザーが resolve 操作を要求する
-- **WHEN** Frontend が resolve 可否を判断する必要がある
-- **THEN** Core の `is_resolving_active()` を参照する
-- **AND** Frontend 独自の resolve serialization フラグでは判断しない
-- **AND** この判断は resolve 操作のみに影響し、apply/accept/archive はブロックしない
+#### Scenario: Frontend keeps blocked, stalled, and gated distinct
+- **GIVEN** Core が 3 種類の blocker-adjacent display status を提供している
+- **WHEN** TUI または Web UI が change row / API payload / status badge を描画する
+- **THEN** dependency wait は `blocked` として表示される
+- **AND** apply-side resumable hold は `stalled` として表示される
+- **AND** acceptance gate observation は `gated` として表示または配信される
+- **AND** Frontend はそれらを単一の `blocked` 値へ変換しない
 
 ### Requirement: EventSink トレイトによるフロントエンド抽象化
 
