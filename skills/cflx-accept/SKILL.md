@@ -64,6 +64,8 @@ NOT redefine it.
 
 ### Verification Planning & Ownership
 
+Acceptance owns proposal-quality judgment for behavior-changing work. When runtime or user-visible behavior is claimed, acceptance MUST determine whether tasks and repository evidence identify concrete implementation-facing work and integration points. Missing adequacy is an acceptance FAIL finding (not an archive blocker).
+
 Acceptance MUST enforce the verification ownership planned by proposal/task guidance:
 
 - Determine planned verification type per requirement/task (`unit`, `integration`, `e2e`, `manual`, `benchmark`, `not-testable`).

@@ -1041,19 +1041,6 @@ const EXECUTABLE_VERIFICATION_HINTS: &[&str] = &[
     "cargo test",
 ];
 
-const RUNTIME_BEHAVIOR_HINTS: &[&str] = &[
-    "handler",
-    "webhook",
-    "persist",
-    "persistence",
-    "notification",
-    "command",
-    "job",
-    "worker",
-    "queue",
-    "background process",
-];
-
 fn looks_like_behavior_task(task_text: &str) -> bool {
     let normalized = task_text.trim().to_lowercase();
     BEHAVIOR_TASK_KEYWORDS
@@ -1094,13 +1081,6 @@ fn verification_mentions_executable_surface(verification_text: &str) -> bool {
         .any(|hint| normalized.contains(hint))
 }
 
-fn proposal_mentions_runtime_behavior(proposal_content: &str) -> bool {
-    let normalized = proposal_content.trim().to_lowercase();
-    RUNTIME_BEHAVIOR_HINTS
-        .iter()
-        .any(|hint| normalized.contains(hint))
-}
-
 fn validate_tasks_content(
     content: &str,
     change_id: &str,
@@ -1133,7 +1113,6 @@ fn validate_tasks_content(
     let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
     let proposal_text = proposal_content.unwrap_or_default();
     let proposal_has_executable_surface = proposal_mentions_executable_surface(proposal_text);
-    let proposal_has_runtime_behavior = proposal_mentions_runtime_behavior(proposal_text);
 
     let mut behavior_task_count = 0usize;
     let mut artifact_task_count = 0usize;
