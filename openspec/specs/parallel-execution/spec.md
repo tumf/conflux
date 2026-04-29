@@ -529,25 +529,19 @@ archived の場合は apply/archive を再実行せず、merge のみ実行し�
 - **THEN** 状態は merged と判定される
 
 ### Requirement: Failed Change Tracking
-並列実行において、失敗した変更を追跡し、依存する変更の実行判断に使用しなければならない（MUST）。
 
-権限auto-rejectなど人手介入が必要なapply失敗は、失敗した変更として記録しなければならない（MUST）。
+Parallel execution SHALL continue to track failed changes for dependency-skip decisions, but the failure-side terminology MUST distinguish queue-side dependency blocking from resumable execution holds.
 
-#### Scenario: Failed change recorded
-- Given: 変更`change-A`のapplyがエラーで終了した
-- When: グループの実行が完了する
-- Then: `change-A`は失敗した変更として記録される
+A change held because apply cannot proceed yet but remains resumable SHALL be recorded as `stalled`, not `blocked`.
 
-#### Scenario: Failed change persists across groups
-- Given: グループ1で`change-A`が失敗として記録された
-- When: グループ2の実行が開始される
-- Then: `change-A`は引き続き失敗した変更として追跡される
+Dependency-based queue waiting SHALL continue to use `blocked` only for unresolved dependency conditions that prevent dispatch.
 
-#### Scenario: Permission auto-reject is recorded as failed
-- **GIVEN** apply出力に`permission requested`と`auto-rejecting`が含まれる
-- **WHEN** changeがstalled/blockedとして扱われる
-- **THEN** changeは失敗した変更として記録される
-- **AND** 依存するchangeはスキップ判定の対象となる
+#### Scenario: stalled apply blocker is recorded as failed without using blocked terminology
+- **GIVEN** apply output contains a resumable blocker such as permission auto-reject
+- **WHEN** the runtime records the failed change for downstream dependency-skip logic
+- **THEN** the change is recorded as `stalled`
+- **AND** dependent changes are still eligible for failure-based skip logic
+- **AND** the user-facing wording does not describe the change as dependency `blocked`
 
 ### Requirement: Dependent Change Skipping
 
@@ -1176,27 +1170,18 @@ dispatch は re-analysis ループのスケジューラによってのみ起動�
 - **AND** the remaining queued changes continue execution
 
 ### Requirement: Permission Auto-Reject Handling
-apply実行中にエージェント出力から権限要求のauto-rejectが検出された場合、システムは当該changeを実行不能として扱わなければならない（MUST）。
 
-システムは以下を満たさなければならない（MUST）。
-- applyの再試行を停止する
-- stalled/blockedとして記録する
-- 理由に拒否されたパスと権限設定の案内を含める
-- 空WIPコミットによるstall検出を当該changeについては実行しない
-- 依存スキップの判定に反映する
+When permission auto-reject is detected during apply, the system MUST stop apply retry for that change and record the change as `stalled`.
 
-#### Scenario: Permission auto-reject is detected during apply
-- **GIVEN** apply出力に`permission requested`と`auto-rejecting`が含まれる
-- **WHEN** applyループが出力を評価する
-- **THEN** changeはstalled/blockedとして記録される
-- **AND** applyの再試行は行われない
-- **AND** stall検出（空WIPコミット）は実行されない
-- **AND** 理由に拒否パスと権限設定の案内が含まれる
+The system MUST NOT label this condition as dependency `blocked`.
 
-#### Scenario: Non-permission errors do not trigger permission handling
-- **GIVEN** apply出力にpermission auto-rejectが含まれない
-- **WHEN** applyループが出力を評価する
-- **THEN** 通常の失敗処理が適用される
+#### Scenario: permission auto-reject becomes stalled
+- **GIVEN** apply output contains `permission requested` and `auto-rejecting`
+- **WHEN** the apply loop evaluates the output
+- **THEN** the change is recorded as `stalled`
+- **AND** apply retry does not continue
+- **AND** stall detection via empty WIP commits is skipped for that change
+- **AND** the recorded reason includes rejected paths and permission guidance
 
 ### Requirement: Resumed Archived Workspaces Preserve Merge Handoff
 
@@ -1911,6 +1896,22 @@ When archive is retried, resumed, or fails terminally, the runtime SHALL expose 
 - **THEN** the retry log or event payload includes a primary archive reason indicating verification failure
 - **AND** the payload includes a summary describing the concrete symptom
 - **AND** downstream consumers do not have to infer the reason only from a generic `retrying archive command` string
+
+### Requirement: Acceptance gating terminology is distinct from dependency blocked
+
+When acceptance detects an implementation blocker, the system SHALL expose that observation as `gated` rather than reusing dependency `blocked` terminology.
+
+Canonical spec prose SHALL describe this concept as `acceptance-gated` when it must be distinguished from `dependency-blocked` in architecture, reducer, or migration guidance.
+
+If acceptance follow-up later routes the change into an apply-side resumable hold, that hold SHALL use the apply-side `stalled` terminology rather than dependency `blocked`.
+
+#### Scenario: acceptance gate wording remains distinct from dependency wait
+- **GIVEN** acceptance parsing returns a blocker verdict for change `change-a`
+- **WHEN** runtime emits logs, events, or frontend-visible status for that blocker
+- **THEN** the blocker is described as `gated`
+- **AND** canonical status taxonomy identifies the condition as `acceptance-gated`
+- **AND** it is not described as dependency `blocked`
+- **AND** any later apply-side hold uses `stalled` wording instead of dependency `blocked`
 
 ### Requirement: archived dependency references have explicit scheduler and validation semantics
 

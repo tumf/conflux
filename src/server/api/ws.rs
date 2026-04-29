@@ -298,7 +298,9 @@ fn map_workspace_state_fallback(state: WorkspaceState) -> (String, Option<u32>) 
         WorkspaceState::Archiving => ("archiving".to_string(), None),
         WorkspaceState::Archived => ("archived".to_string(), None),
         WorkspaceState::Merged => ("merged".to_string(), None),
-        WorkspaceState::Blocked => ("blocked".to_string(), None),
+        // WorkspaceState::Blocked represents a resumable apply-side hold in runtime terms.
+        // Canonical display taxonomy maps this to "stalled" (distinct from dependency "blocked").
+        WorkspaceState::Blocked => ("stalled".to_string(), None),
         WorkspaceState::Rejecting => ("rejecting".to_string(), None),
     }
 }
@@ -475,6 +477,14 @@ mod tests {
     }
 
     #[test]
+    fn test_map_workspace_state_fallback_maps_runtime_blocked_to_stalled_display() {
+        assert_eq!(
+            map_workspace_state_fallback(WorkspaceState::Blocked),
+            ("stalled".to_string(), None)
+        );
+    }
+
+    #[test]
     fn test_map_workspace_state_fallback_preserves_iteration_for_applying() {
         assert_eq!(
             map_workspace_state_fallback(WorkspaceState::Applying { iteration: 7 }),
@@ -490,6 +500,8 @@ mod tests {
         status_map.insert("c-merge-wait".to_string(), "merge wait");
         status_map.insert("c-resolve-pending".to_string(), "resolve pending");
         status_map.insert("c-blocked".to_string(), "blocked");
+        status_map.insert("c-stalled".to_string(), "stalled");
+        status_map.insert("c-gated".to_string(), "gated");
 
         let worktree_by_change = std::collections::HashMap::new();
 
@@ -541,6 +553,15 @@ mod tests {
             derive_change_status("c-blocked", &worktree_by_change, &status_map, "main", false)
                 .await,
             ("blocked".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-stalled", &worktree_by_change, &status_map, "main", false)
+                .await,
+            ("stalled".to_string(), None)
+        );
+        assert_eq!(
+            derive_change_status("c-gated", &worktree_by_change, &status_map, "main", false).await,
+            ("gated".to_string(), None)
         );
     }
 

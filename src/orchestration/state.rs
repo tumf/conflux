@@ -121,10 +121,10 @@ pub enum WaitState {
     ResolveWait,
     /// Waiting because a dependency has not yet completed.
     DependencyBlocked,
-    /// Waiting because apply reported a recoverable blocker.
-    ApplyBlocked,
-    /// Waiting because rejecting review produced a block verdict.
-    RejectionBlocked,
+    /// Waiting because apply/rejecting reported a resumable hold.
+    Stalled,
+    /// Waiting because acceptance observed a gate before follow-up routing.
+    AcceptanceGated,
 }
 
 /// Additional metadata preserved while a change is blocked.
@@ -242,7 +242,7 @@ impl ChangeRuntimeState {
 
     /// Derive the display status string used by TUI and Web.
     ///
-    /// Returns one of: "not queued", "queued", "blocked", "applying",
+    /// Returns one of: "not queued", "queued", "blocked", "stalled", "gated", "applying",
     /// "accepting", "rejecting", "archiving", "resolving", "merge wait", "resolve pending",
     /// "archived", "merged", "error", "stopped".
     pub fn display_status(&self) -> &'static str {
@@ -268,9 +268,9 @@ impl ChangeRuntimeState {
         match self.wait_state {
             WaitState::MergeWait => return "merge wait",
             WaitState::ResolveWait => return "resolve pending",
-            WaitState::DependencyBlocked
-            | WaitState::ApplyBlocked
-            | WaitState::RejectionBlocked => return "blocked",
+            WaitState::DependencyBlocked => return "blocked",
+            WaitState::Stalled => return "stalled",
+            WaitState::AcceptanceGated => return "gated",
             WaitState::None => {}
         }
         // Queue intent.
@@ -287,6 +287,8 @@ impl ChangeRuntimeState {
             "not queued" => ratatui::style::Color::DarkGray,
             "queued" => ratatui::style::Color::Yellow,
             "blocked" => ratatui::style::Color::Gray,
+            "stalled" => ratatui::style::Color::LightYellow,
+            "gated" => ratatui::style::Color::LightRed,
             "applying" => ratatui::style::Color::Cyan,
             "accepting" => ratatui::style::Color::LightGreen,
             "rejecting" => ratatui::style::Color::LightYellow,
@@ -1031,12 +1033,12 @@ impl OrchestratorState {
                     }
                     crate::events::RejectionOutcome::Block => {
                         rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::RejectionBlocked;
+                        rt.wait_state = WaitState::Stalled;
                         rt.terminal = TerminalState::None;
                         rt.set_blocked_metadata(
                             "rejection review returned block; unresolved blocker remains",
                             "resolve unresolved blocker tasks in openspec/changes/<change_id>/tasks.md, then trigger explicit resume",
-                            "existing worktree and WIP context are preserved for blocked rejection review",
+                            "existing worktree and WIP context are preserved for stalled rejection review",
                         );
                     }
                 }
@@ -1068,11 +1070,11 @@ impl OrchestratorState {
                         }
                         crate::vcs::WorkspaceStatus::Blocked => {
                             rt.activity = ActivityState::Idle;
-                            rt.wait_state = WaitState::ApplyBlocked;
+                            rt.wait_state = WaitState::Stalled;
                             rt.set_blocked_metadata(
-                                "apply reported recoverable blocker; workspace remains blocked",
+                                "apply reported recoverable blocker; workspace remains stalled",
                                 "resolve implementation blocker section and pending unblock tasks before explicit retry",
-                                "existing worktree and WIP context are preserved while blocked",
+                                "existing worktree and WIP context are preserved while stalled",
                             );
                         }
                         crate::vcs::WorkspaceStatus::Rejecting => {
@@ -1233,14 +1235,22 @@ impl OrchestratorState {
             }
             ExecutionEvent::DependencyResolved { change_id } => {
                 let rt = self.runtime_entry(change_id);
-                if matches!(
-                    rt.wait_state,
-                    WaitState::DependencyBlocked
-                        | WaitState::ApplyBlocked
-                        | WaitState::RejectionBlocked
-                ) {
+                if matches!(rt.wait_state, WaitState::DependencyBlocked) {
                     rt.wait_state = WaitState::None;
                     rt.clear_blocked_metadata();
+                }
+            }
+            ExecutionEvent::AcceptanceGated { change_id, reason } => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::AcceptanceGated;
+                    rt.terminal = TerminalState::None;
+                    rt.set_blocked_metadata(
+                        "acceptance-gated",
+                        "review acceptance blocker evidence and decide resume/reject route",
+                        reason.clone(),
+                    );
                 }
             }
 
@@ -1837,9 +1847,9 @@ mod tests {
         let runtime = state
             .change_runtime("c")
             .expect("runtime for c after rejecting block");
-        assert_eq!(state.display_status("c"), "blocked");
+        assert_eq!(state.display_status("c"), "stalled");
         assert_eq!(runtime.activity, ActivityState::Idle);
-        assert_eq!(runtime.wait_state, WaitState::RejectionBlocked);
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
         assert!(matches!(runtime.terminal, TerminalState::None));
         assert_eq!(
             runtime.blocked_metadata.blocker_reason.as_deref(),
@@ -1853,7 +1863,7 @@ mod tests {
         );
         assert_eq!(
             runtime.blocked_metadata.worktree_snapshot.as_deref(),
-            Some("existing worktree and WIP context are preserved for blocked rejection review")
+            Some("existing worktree and WIP context are preserved for stalled rejection review")
         );
     }
 

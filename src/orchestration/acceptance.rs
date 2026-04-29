@@ -50,7 +50,7 @@ pub enum AcceptanceResult {
     Fail { findings: Vec<String> },
     /// Acceptance requires more investigation - retry acceptance.
     Continue,
-    /// Acceptance blocked due to implementation blocker - stop apply loop.
+    /// Acceptance gated due to implementation blocker - stop apply loop.
     Blocked,
     /// Acceptance command execution failed (non-zero exit).
     CommandFailed {
@@ -283,7 +283,7 @@ where
             (AcceptanceResult::Continue, false)
         }
         crate::acceptance::AcceptanceResult::Blocked => {
-            info!("Acceptance blocked for: {}", change.id);
+            info!("Acceptance gated for: {}", change.id);
             output.on_warn("Acceptance test: BLOCKED");
             (AcceptanceResult::Blocked, false)
         }

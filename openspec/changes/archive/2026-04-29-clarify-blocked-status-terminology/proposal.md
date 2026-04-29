@@ -2,12 +2,11 @@
 change_type: implementation
 priority: high
 dependencies:
-  - separate-apply-block-from-reject
+  - classify-acceptance-followup-routing
 references:
   - openspec/specs/parallel-execution/spec.md
   - openspec/specs/orchestration-state/spec.md
   - openspec/specs/frontend-abstraction/spec.md
-  - openspec/changes/separate-apply-block-from-reject/proposal.md
   - openspec/changes/classify-acceptance-followup-routing/proposal.md
   - src/parallel/queue_state.rs
   - src/orchestration/state.rs
@@ -19,7 +18,7 @@ references:
   - src/tui/state.rs
 ---
 
-# Change: blocked 用語を dependency wait 専用にし stalled / acceptance-blocked を分離する
+# Change: blocked 用語を dependency wait 専用にし stalled / gated を分離する
 
 **Change Type**: implementation
 
@@ -62,7 +61,7 @@ status taxonomy を以下のように再定義する。
 
 ## Explicit Completion Conditions
 
-- OpenSpec delta が dependency blocked、apply stalled、acceptance-blocked の canonical meaning と責務境界を明記している。
+- OpenSpec delta が dependency-blocked、stalled、acceptance-gated の canonical meaning と責務境界を明記している。
 - tasks が reducer/runtime/event/frontend/logging/test coverage の更新箇所を具体的な repository evidence 付きで列挙している。
 - active change との整合方針（少なくとも `separate-apply-block-from-reject` と `classify-acceptance-followup-routing`）が proposal または design に記録されている。
 - `cflx openspec validate clarify-blocked-status-terminology --strict --evidence warn` が成功する。

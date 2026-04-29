@@ -755,7 +755,7 @@ where
                 blocker_path = %blocked_handoff.blocker_path.display(),
                 completed = progress.completed,
                 total = progress.total,
-                "Apply blocked handoff detected via APPLY_BLOCKED marker; exiting apply loop as blocked"
+                "Apply stalled handoff detected via APPLY_BLOCKED marker; exiting apply loop as stalled"
             );
             break false;
         }

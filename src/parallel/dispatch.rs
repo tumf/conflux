@@ -1178,7 +1178,7 @@ impl ParallelExecutor {
                     info!(
                         change_id = %change_id,
                         blocker_path = %handoff.blocker_path.display(),
-                        "Apply emitted blocked handoff marker; staying blocked without rejecting flow"
+                        "Apply emitted stalled handoff marker; staying stalled without rejecting flow"
                     );
                     if let Some(ref tx) = event_tx {
                         let _ = tx
@@ -1191,7 +1191,7 @@ impl ParallelExecutor {
                         let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::warn(format!(
-                                    "Apply blocked handoff detected via {}; workspace remains blocked",
+                                    "Apply stalled handoff detected via {}; workspace remains stalled",
                                     handoff.blocker_path.display()
                                 ))
                                 .with_change_id(&change_id)
@@ -1437,9 +1437,18 @@ impl ParallelExecutor {
                                 "Acceptance-confirmed implementation blocker".to_string()
                             });
                         warn!(
-                            "Acceptance blocked for {} - running rejection flow",
+                            "Acceptance gated for {} - running rejection flow",
                             change_id
                         );
+
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::AcceptanceGated {
+                                    change_id: change_id.clone(),
+                                    reason: reason.clone(),
+                                })
+                                .await;
+                        }
 
                         let resolved_base = base_branch.clone();
 
@@ -1457,7 +1466,7 @@ impl ParallelExecutor {
                                     let _ = tx
                                         .send(ParallelEvent::Log(
                                             LogEntry::warn(format!(
-                                                "Acceptance blocked - rejection flow completed ({})",
+                                                "Acceptance gated - rejection flow completed ({})",
                                                 resolved_base
                                             ))
                                             .with_change_id(&change_id)

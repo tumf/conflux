@@ -520,7 +520,7 @@ impl SerialRunService {
                                 "Acceptance reported recoverable blocker; returning stalled for explicit unblock/resume"
                             );
                             Ok(ChangeProcessResult::Stalled {
-                                error: "Acceptance blocked with recoverable blocker".to_string(),
+                                error: "Acceptance gated with recoverable blocker".to_string(),
                             })
                         }
                         Ok((result, _attempt_number, _command)) => Ok(self
@@ -635,11 +635,11 @@ impl SerialRunService {
             }
             AcceptanceResult::Blocked => {
                 warn!(
-                    "Acceptance blocked for {} - preserving change as stalled/resumable",
+                    "Acceptance gated for {} - preserving change as stalled/resumable",
                     change_id
                 );
                 ChangeProcessResult::Stalled {
-                    error: "Acceptance blocked with recoverable blocker".to_string(),
+                    error: "Acceptance gated with recoverable blocker".to_string(),
                 }
             }
             AcceptanceResult::Fail { findings } => {
@@ -735,7 +735,7 @@ pub enum ChangeProcessResult {
     AcceptanceContinue,
     /// Acceptance CONTINUE limit exceeded
     AcceptanceContinueExceeded,
-    /// Acceptance blocked and change was rejected
+    /// Acceptance gated and change was rejected
     Rejected { reason: String },
 }
 
@@ -940,7 +940,7 @@ mod tests {
         assert!(matches!(
             result,
             ChangeProcessResult::Stalled { ref error }
-            if error == "Acceptance blocked with recoverable blocker"
+            if error == "Acceptance gated with recoverable blocker"
         ));
     }
 

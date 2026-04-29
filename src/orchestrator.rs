@@ -556,7 +556,7 @@ impl Orchestrator {
             }
             ChangeProcessResult::Rejected { reason } => {
                 info!(
-                    "Acceptance blocked for {} - rejected flow completed: {}",
+                    "Acceptance gated for {} - rejected flow completed: {}",
                     next.id, reason
                 );
                 self.update_shared_state(ExecutionEvent::ChangeRejected {
@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stalled_result_marks_change_blocked_state() {
+    async fn test_stalled_result_marks_change_stalled_state() {
         use crate::serial_run_service::ChangeProcessResult;
         use tempfile::TempDir;
 
@@ -1673,7 +1673,7 @@ mod tests {
         let blocked_change = create_test_change("blocked-change", 3, 5);
 
         let result = ChangeProcessResult::Stalled {
-            error: "Acceptance blocked with recoverable blocker".to_string(),
+            error: "Acceptance gated with recoverable blocker".to_string(),
         };
 
         orchestrator
@@ -1682,7 +1682,7 @@ mod tests {
             .unwrap();
 
         let state = orchestrator.shared_state.read().await;
-        assert_eq!(state.display_status(&blocked_change.id), "blocked");
+        assert_eq!(state.display_status(&blocked_change.id), "stalled");
     }
 
     /// Regression: when ALL requested changes are rejected by start-time eligibility filtering,
