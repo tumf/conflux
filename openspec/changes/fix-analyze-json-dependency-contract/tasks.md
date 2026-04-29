@@ -1,0 +1,13 @@
+## Implementation Tasks
+
+- [ ] 1. `openspec/specs/parallel-analysis/spec.md` と `openspec/specs/agent-prompts/spec.md` に、archived `update-analyze-use-proposal-frontmatter` が定義した metadata source ruleの上に、`dependencies` が参照してよい change ID は今回の queued set と明示された in-flight set に限る canonical rule を追加し、`src/analyzer.rs` / `src/parallel_run_service.rs` の runtime contract と対応づける (implementation: `src/analyzer.rs`, `src/parallel_run_service.rs`; verification: integration - `cflx openspec validate fix-analyze-json-dependency-contract --strict --evidence warn` が成功し、delta が closed-world dependency contract を明示する)
+- [ ] 2. `skills/cflx-analyze/SKILL.md` と analyze prompt builder 周辺 (`src/analyzer.rs` または prompt source) を更新し、repo 上の他 active change や関連 change を dependency に書かない strict guidance を追加する (implementation: `skills/cflx-analyze/SKILL.md`, `src/analyzer.rs`; verification: unit - analyze prompt tests が queued IDs / in-flight IDs だけを allowed dependency set として説明し、authoritative guidance が `cflx-analyze` と一致することを確認する)
+- [ ] 3. `src/analyzer.rs` の invalid dependency validation/error message を更新し、違反した dependency ID と allowed queued/in-flight IDs を含む actionable parse error を返すようにする (implementation: `src/analyzer.rs`; verification: unit - parser tests が unrelated active dependency を含む JSON で `Invalid dependency reference` と allowed set を含む error を返すことを確認する)
+- [ ] 4. `src/parallel_run_service.rs` か関連ログ整形経路を更新し、dependency-analysis failure が generic invalid JSON ではなく invalid dependency contract failure だったと UI/log から判別できるようにする (implementation: `src/parallel_run_service.rs`; verification: unit/integration - analysis failure logging tests が invalid dependency root cause を含む log/message を確認する)
+- [ ] 5. queued dependency・in-flight dependency・unrelated active dependency の3系統を固定する regression tests を追加し、`persist-archive-resume-reasons -> align-archive-readiness-failure-reporting` 型の範囲外参照が再発しないことを確認する (implementation: `src/analyzer.rs`, `src/agent/tests.rs`; verification: unit - tests が queued/in-flight の合法ケースを通し、unrelated active case だけ parse error になることを確認する)
+- [ ] 6. proposal delta と関連実装変更をまとめて検証する (implementation: `src/analyzer.rs`, `src/parallel_run_service.rs`, `skills/cflx-analyze/SKILL.md`; verification: integration - `cflx openspec validate fix-analyze-json-dependency-contract --strict --evidence warn`, `cargo test analyzer`, `cargo test parallel_run_service`, `cargo clippy --all-targets --all-features -- -D warnings`)
+
+## Future Work
+
+- LLM analyze failure 時の fallback policy を「全件並列」以外にも degradable order-preserving mode へ拡張する検討
+- dependency analysis result を machine-readable telemetry として履歴保存する改善
