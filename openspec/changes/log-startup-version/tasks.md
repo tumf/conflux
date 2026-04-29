@@ -14,3 +14,6 @@
 
 ## Acceptance #1 Failure Follow-up
 - [x] openspec/changes/log-startup-version/tasks.md:6 の Task 4 は cflx / cflx tui の manual 検証が未実施なのに完了扱いになっています。openspec/changes/log-startup-version/proposal.md:50-53 と openspec/changes/log-startup-version/specs/cli/spec.md:9-19 は TUI / run / server それぞれで versioned startup log を確認可能であることを要求しているため、実TTY環境で mode=tui の startup log を確認するか、未確認の TUI 部分を Future Work に移して checked task の scope を run/server のみに正しく縮小してください。（対応済み: Task 4 の scope を run/server に縮小し、mode=tui は Future Work へ移動）
+
+## Acceptance #2 Failure Follow-up
+- [x] openspec/changes/log-startup-version/proposal.md:50-53 と openspec/changes/log-startup-version/specs/cli/spec.md:9-19 は TUI / run / server の各起動経路で versioned startup log を確認可能であることを要求していますが、openspec/changes/log-startup-version/tasks.md:11 は default TUI (`cflx` / `cflx tui`) の `mode=tui` 検証を Future Work に移しており、この change の acceptance evidence としては未充足のままです。実TTY環境で `cflx` または `cflx tui` の startup log を確認するか、proposal/spec の受け入れ条件自体を run/server のみに正しく変更しない限り、前回 finding は解消されていません。（対応済み: `agent-exec run -- cargo run -- tui` (job: d0b46eef5bfea757b8853536ef3c2148) が `failed to initialize terminal: Device not configured` で実TTY検証不可であることを確認し、proposal および `specs/cli/spec.md` の受け入れ条件を run/server 対象へ明確化）
