@@ -653,8 +653,10 @@ impl SerialRunService {
                     findings.len(),
                     blocking_gate_context
                 );
-                match task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace_path)
-                {
+                match task_parser::resolve_acceptance_follow_up_tasks_path(
+                    change_id,
+                    workspace_path,
+                ) {
                     Ok(tasks_path) => {
                         if let Err(err) = task_parser::record_acceptance_follow_up(
                             &tasks_path,

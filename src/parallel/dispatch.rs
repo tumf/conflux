@@ -262,7 +262,6 @@ pub(super) enum ResumeAction {
     Rejecting,
 }
 
-
 pub(super) fn decide_resume_action(
     change_id: &str,
     workspace_path: &Path,
