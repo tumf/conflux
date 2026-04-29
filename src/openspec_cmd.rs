@@ -1316,18 +1316,6 @@ fn validate_tasks_content(
                 warnings.push(msg);
             }
         }
-
-        if proposal_has_runtime_behavior && behavior_task_count == 0 {
-            let msg = format!(
-                "{}: tasks.md: Runtime behavior is claimed without implementation-facing tasks",
-                change_id
-            );
-            if evidence_mode == "error" {
-                errors.push(msg);
-            } else if evidence_mode == "warn" {
-                warnings.push(msg);
-            }
-        }
     }
 
     (errors, warnings)
@@ -1902,27 +1890,6 @@ mod validation_tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("Executable-surface behavior lacks runnable verification")));
-    }
-
-    #[test]
-    fn test_warns_runtime_claim_without_behavior_tasks() {
-        let content = "- [ ] Document API rollout (verification: manual - docs review)\n";
-        let proposal = "# Change\n\n**Change Type**: implementation\n\n## Goal\nWebhook handler must persist notifications via background process\n";
-        let (errors, warnings) = validate_tasks_content(
-            content,
-            "test",
-            true,
-            "warn",
-            Some("implementation"),
-            Some(proposal),
-        );
-        assert!(errors.is_empty());
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w
-                    .contains("Runtime behavior is claimed without implementation-facing tasks"))
-        );
     }
 }
 
