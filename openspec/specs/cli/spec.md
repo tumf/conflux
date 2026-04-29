@@ -118,11 +118,12 @@ acceptance ループは change に対して `acceptance_command` を実行し、
 - **THEN** findings として保存される tail 行から `ACCEPTANCE:` マーカーと `FINDINGS:` 行が除外される
 - **AND** ログは "N findings" のような誤解を招く件数表現を出さない
 
-#### Scenario: Acceptance blocked stops apply loop
-- **GIVEN** acceptance output が `ACCEPTANCE: BLOCKED` を示す
+#### Scenario: Acceptance gated stops apply loop
+- **GIVEN** acceptance output が `ACCEPTANCE: GATED` または `{"acceptance":"gated"}` を示す
 - **WHEN** オーケストレーターが acceptance 結果を処理する
 - **THEN** 当該 change の apply ループは停止する
 - **AND** 同一 change の apply は再試行されない
+- **AND** dependency wait 用語の `blocked` と混同されない
 
 ### Requirement: Default TUI Launch
 

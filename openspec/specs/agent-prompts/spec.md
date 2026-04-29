@@ -215,12 +215,13 @@ Implementation Blocker の記録は以下を満たさなければならない（
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-acceptance プロンプトは Implementation Blocker を審査し、妥当と判断した場合は `ACCEPTANCE: BLOCKED` を出力しなければならない（MUST）。
+acceptance プロンプトは Implementation Blocker を審査し、妥当と判断した場合は canonical verdict として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力しなければならない（MUST）。
 
 acceptance は以下を満たさなければならない（MUST）。
 - `Implementation Blocker` の内容が不十分または誤りの場合は `ACCEPTANCE: FAIL` を出力し、follow-up タスクを tasks.md に追加する
-- `ACCEPTANCE: BLOCKED` の場合は blocker の概要を簡潔に出力する
-- apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を blocked のまま保留するか」を区別できなければならない
+- `ACCEPTANCE: GATED` の場合は blocker の概要を簡潔に出力する
+- apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を acceptance-gated のまま保留するか」を区別できなければならない
+- 移行期間中の legacy input 互換として `ACCEPTANCE: BLOCKED` / `{"acceptance":"blocked"}` を受理してもよいが、canonical output contract として新規に生成してはならない（MUST NOT）
 
 #### Scenario: rejecting review が reject proposal を却下しつつ blocked 保留を要求する
 - **GIVEN** rejecting review が apply-generated rejection proposal を評価している

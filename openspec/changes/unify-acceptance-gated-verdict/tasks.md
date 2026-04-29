@@ -11,3 +11,7 @@
 
 - legacy `blocked` acceptance verdict 受理の削除時期を別 proposal で決める
 - external integrations が `ACCEPTANCE: BLOCKED` を前提にしている場合の deprecation notice を整備する
+
+## Acceptance #1 Failure Follow-up
+- [x] openspec/specs/agent-prompts/spec.md:216-223 が canonical spec 側では依然として `ACCEPTANCE: BLOCKED` / blocked verdict を要求しており、change delta `openspec/changes/unify-acceptance-gated-verdict/specs/agent-prompts/spec.md:3-15` の `gated` 契約と矛盾しています。acceptance prompt の正規語彙を canonical spec でも `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` に更新し、legacy `blocked` は移行期入力互換のみであることを反映してください。
+- [x] openspec/specs/cli/spec.md:121-126 と openspec/specs/orchestration-state/spec.md:415-446 が still `Acceptance blocked stops apply loop` / `Blocked verdict` を canonical wording として残しており、proposal の acceptance criteria (openspec/changes/unify-acceptance-gated-verdict/proposal.md:52-57) にある「acceptance outcome を gated verdict へ統一」と一致していません。canonical spec の user-facing / orchestration wording を `gated verdict` / `acceptance-gated` に改め、dependency wait の `blocked` と混同しない形へ揃えてください。
