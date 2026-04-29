@@ -27,6 +27,7 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::acceptance_resume_ready_for_archive;
+use super::archive_state::load_archive_state;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
@@ -587,6 +588,24 @@ impl ParallelExecutor {
             } else {
                 ResumeAction::Apply
             };
+
+            if was_resumed && matches!(effective_state, WorkspaceState::Archiving) {
+                if let Ok(Some(archive_state)) = load_archive_state(&workspace.path) {
+                    if archive_state.change_id == change_id {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ArchiveResumed {
+                                    change_id: change_id.clone(),
+                                    reason: archive_state
+                                        .primary_reason
+                                        .map(|reason| reason.as_str().to_string()),
+                                    summary: Some(archive_state.summary.clone()),
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
 
             if was_resumed {
                 if let Some(ref tx) = event_tx {
@@ -1661,6 +1680,8 @@ impl ParallelExecutor {
                             .send(ParallelEvent::ArchiveFailed {
                                 change_id: change_id.clone(),
                                 error: e.to_string(),
+                                reason: None,
+                                summary: None,
                             })
                             .await;
                     }

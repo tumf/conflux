@@ -12,6 +12,7 @@ use super::acceptance_state::{
     delete_acceptance_state, has_durable_acceptance_pass, mark_acceptance_failed,
     mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
 };
+use super::archive_state::{save_archive_state_entry, ArchiveResumeStatus};
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
 use crate::stall::StallDetector;
@@ -523,10 +524,11 @@ pub async fn execute_archive_in_workspace(
             .await;
     }
 
-    use crate::execution::archive::{
-        build_archive_error_message, ensure_archive_commit, extract_archive_runtime_blocker,
-        verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
-    };
+use crate::execution::archive::{
+    build_archive_error_message, ensure_archive_commit, extract_archive_runtime_blocker,
+    verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+};
+use crate::history::ArchivePrimaryReason;
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
@@ -546,8 +548,27 @@ pub async fn execute_archive_in_workspace(
     };
     let mut empty_commit_streak = 0u32;
 
+    let _ = save_archive_state_entry(
+        workspace_path,
+        change_id,
+        &current_revision,
+        0,
+        ArchiveResumeStatus::Running,
+        None,
+        "archive operation started",
+    );
+
     loop {
         attempt += 1;
+        let _ = save_archive_state_entry(
+            workspace_path,
+            change_id,
+            &current_revision,
+            attempt,
+            ArchiveResumeStatus::Running,
+            None,
+            format!("archive attempt {} running", attempt),
+        );
         let start = std::time::Instant::now();
 
         // Execute command via AiCommandRunner (with stagger and retry)
@@ -679,6 +700,13 @@ pub async fn execute_archive_in_workspace(
                 } else {
                     Some("Archive command succeeded but verification failed".to_string())
                 },
+                primary_reason: if status.success() && verification.is_success() {
+                    None
+                } else if !status.success() {
+                    Some(ArchivePrimaryReason::CommandFailed)
+                } else {
+                    Some(ArchivePrimaryReason::VerificationFailed)
+                },
                 verification_result,
                 exit_code: status.code(),
                 stdout_tail: output_collector.stdout_tail(),
@@ -693,6 +721,15 @@ pub async fn execute_archive_in_workspace(
 
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
             if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::ArchiveRetryScheduled {
+                        change_id: change_id.to_string(),
+                        attempt,
+                        max_attempts,
+                        reason: Some(ArchivePrimaryReason::VerificationFailed.as_str().to_string()),
+                        summary: Some("archive verification failed; change directory still exists".to_string()),
+                    })
+                    .await;
                 let _ = tx
                     .send(ParallelEvent::Log(
                         crate::events::LogEntry::warn(format!(

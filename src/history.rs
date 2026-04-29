@@ -199,6 +199,31 @@ impl Default for ApplyHistory {
     }
 }
 
+/// Primary reason taxonomy for archive retry/resume contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchivePrimaryReason {
+    CommandFailed,
+    PrerequisiteBlocker,
+    VerificationFailed,
+    PostArchiveCompletionFailed,
+    Stalled,
+    ResumedContextOnly,
+}
+
+impl ArchivePrimaryReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CommandFailed => "command_failed",
+            Self::PrerequisiteBlocker => "prerequisite_blocker",
+            Self::VerificationFailed => "verification_failed",
+            Self::PostArchiveCompletionFailed => "post_archive_completion_failed",
+            Self::Stalled => "stalled",
+            Self::ResumedContextOnly => "resumed_context_only",
+        }
+    }
+}
+
 /// Summary of a single archive attempt
 #[derive(Debug, Clone)]
 pub struct ArchiveAttempt {
@@ -210,6 +235,8 @@ pub struct ArchiveAttempt {
     pub duration: Duration,
     /// Error message if failed (None if success)
     pub error: Option<String>,
+    /// Primary failure reason if available
+    pub primary_reason: Option<ArchivePrimaryReason>,
     /// Verification result (e.g., reason why NotArchived)
     pub verification_result: Option<String>,
     /// Exit code if available
@@ -281,6 +308,10 @@ impl ArchiveHistory {
                     Some(e) => format!("\nerror: {}", e),
                     None => String::new(),
                 };
+                let reason_line = match a.primary_reason {
+                    Some(reason) => format!("\nprimary_reason: {}", reason.as_str()),
+                    None => String::new(),
+                };
                 let verification_line = match &a.verification_result {
                     Some(v) => format!("\nverification_result: {}", v),
                     None => String::new(),
@@ -299,8 +330,16 @@ impl ArchiveHistory {
                 };
 
                 format!(
-                    "<last_archive attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}{}{}{}\n</last_archive>",
-                    a.attempt, status, duration_secs, error_line, verification_line, exit_code_line, stdout_line, stderr_line
+                    "<last_archive attempt=\"{}\">\nstatus: {}\nduration: {}s{}{}{}{}{}{}\n</last_archive>",
+                    a.attempt,
+                    status,
+                    duration_secs,
+                    error_line,
+                    reason_line,
+                    verification_line,
+                    exit_code_line,
+                    stdout_line,
+                    stderr_line
                 )
             })
             .collect::<Vec<_>>()
@@ -821,6 +860,11 @@ mod tests {
             } else {
                 Some("Archive verification failed".to_string())
             },
+            primary_reason: if success {
+                None
+            } else {
+                Some(ArchivePrimaryReason::VerificationFailed)
+            },
             verification_result,
             exit_code: if success { Some(0) } else { Some(1) },
             stdout_tail: None,
@@ -908,6 +952,7 @@ mod tests {
                 success: false,
                 duration: Duration::from_secs(5),
                 error: Some("Archive command succeeded but verification failed".to_string()),
+                primary_reason: Some(ArchivePrimaryReason::VerificationFailed),
                 verification_result: Some(
                     "Change still exists at openspec/changes/my-change".to_string(),
                 ),
@@ -938,6 +983,7 @@ mod tests {
                 success: false,
                 duration: Duration::from_secs(5),
                 error: Some("Verification failed".to_string()),
+                primary_reason: Some(ArchivePrimaryReason::VerificationFailed),
                 verification_result: Some("Change not moved".to_string()),
                 exit_code: Some(0),
                 stdout_tail: None,
@@ -951,6 +997,7 @@ mod tests {
                 success: false,
                 duration: Duration::from_secs(6),
                 error: Some("Still not archived".to_string()),
+                primary_reason: Some(ArchivePrimaryReason::VerificationFailed),
                 verification_result: Some("Change still exists".to_string()),
                 exit_code: Some(0),
                 stdout_tail: None,

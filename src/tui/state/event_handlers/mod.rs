@@ -54,9 +54,9 @@ impl AppState {
             OrchestratorEvent::ApplyFailed { change_id, error } => {
                 self.handle_apply_failed(change_id, error)
             }
-            OrchestratorEvent::ArchiveFailed { change_id, error } => {
-                self.handle_archive_failed(change_id, error)
-            }
+            OrchestratorEvent::ArchiveFailed {
+                change_id, error, ..
+            } => self.handle_archive_failed(change_id, error),
             OrchestratorEvent::ResolveFailed { change_id, error } => {
                 self.handle_resolve_failed(change_id, error)
             }
