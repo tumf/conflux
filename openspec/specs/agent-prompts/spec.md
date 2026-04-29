@@ -58,6 +58,18 @@ Future Work への移動は、**人間の作業**、**外部システムのデ�
 - **THEN** そのタスクは Future Work に移動されない
 - **AND** モック/スタブ/フィクスチャの実装タスクと検証タスクが優先される
 
+### Requirement: Acceptance owns behavior-task adequacy review
+
+Behavior-changing proposals MUST have their implementation-task adequacy judged by acceptance review rather than by native validator wording heuristics. Acceptance MUST fail when a proposal claims runtime or user-visible behavior changes but the change tasks and repository evidence do not identify concrete implementation-facing work or integration points sufficient to deliver that behavior.
+
+#### Scenario: acceptance fails behavior-changing proposal lacking concrete implementation evidence
+
+- **GIVEN** an implementation or hybrid proposal claims runtime or user-visible behavior changes
+- **AND** the change tasks do not identify concrete implementation-facing work or repository-verifiable integration evidence for delivering that behavior
+- **WHEN** acceptance review evaluates the change
+- **THEN** acceptance returns FAIL with actionable findings citing the missing code/test/integration evidence
+- **AND** archive does not become the first phase that surfaces this proposal-quality issue
+
 ### Requirement: Acceptance MUST fail if excluded sections contain checkboxes
 acceptance プロンプトは、Future Work / Out of Scope / Notes セクション内にチェックボックス（`- [ ]` または `- [x]`）が残っている場合、FAIL を出力し apply フェーズに戻さなければならない（MUST）。
 
@@ -91,23 +103,13 @@ acceptance プロンプトは Git の作業ツリーが完全にクリーンで�
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイル一覧と前回 findings を含める（MUST）。
+archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. This change does not redefine the root-cause-preserving archive failure contract already covered by archived archive-readiness work.
 
-acceptance プロンプトは、レビュー対象が archive へ進む前に **final archive commit が実際に成立するか** を確認する指示を含めなければならない（MUST）。ここで確認対象となるのは、archive フローに必要な commit を実際に阻害する blocker のみであり、pre-commit hook、test、lint、format、または特定言語の build/test tool の存在を一般論として仮定してはならない（MUST NOT）。
-
-acceptance は、archive フェーズで初めて発火する commit-path blocker を acceptance で先に露出しなければならない（MUST）。ただし、test / lint / format などを独立の一般 quality gate として追加要求してはならず（MUST NOT）、それらが実際の commit path を阻害する仕組みの一部である場合に限って、commitability の文脈で扱ってよい（MAY）。
-
-Conflux core の acceptance prompt builder は、特定アーキテクチャ・特定言語・特定 repository workflow に依存する gate をハードコードしてはならない（MUST NOT）。固定で埋め込める内容は、`load skills: cflx-*` のような workflow skill 読み込み、change metadata、paths、machine-readable protocol などの最小限に限定されなければならない（MUST）。
-
-archive readiness blocker が acceptance または archive CLI の事前検証で明示された場合、その blocker は downstream の archive 失敗表示でも primary root cause として保持されなければならない（MUST）。後続の file-state verification failure は補助説明として追加してよいが、earlier blocker summary を消してはならない（MUST NOT）。
-
-#### Scenario: acceptance-detected archive blocker survives later archive verification noise
-
-- **GIVEN** acceptance が change `beta` に対して archive readiness blocker を finding として記録している
-- **AND** その後の archive attempt では `openspec/changes/beta` が残って file-state verification も失敗する
-- **WHEN** orchestrator が最終 archive failure を履歴またはユーザー向けに整形する
-- **THEN** final message には acceptance/validation で見つかった blocker summary が含まれる
-- **AND** `changes` ディレクトリ残留は補助文脈としてのみ追加される
+#### Scenario: archive validation uses native evidence enum
+- **GIVEN** the archive path invokes native `cflx openspec validate`
+- **WHEN** evidence mode is requested during archive-side validation
+- **THEN** the command uses only `off`, `warn`, or `error`
+- **AND** it never emits `--evidence strict`
 
 ### Requirement: acceptance システムプロンプトは差分レビューの優先指示を含める
 acceptance システムプロンプトは、`<acceptance_diff_context>` が存在する場合に変更ファイルの確認を優先するよう明示的に指示しなければならない（MUST）。
@@ -271,23 +273,13 @@ unit test の主張と実際の test scope が一致しない場合、acceptance
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイル一覧と前回 findings を含める（MUST）。
+archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. This change does not redefine the root-cause-preserving archive failure contract already covered by archived archive-readiness work.
 
-acceptance プロンプトは、レビュー対象が archive へ進む前に **final archive commit が実際に成立するか** を確認する指示を含めなければならない（MUST）。ここで確認対象となるのは、archive フローに必要な commit を実際に阻害する blocker のみであり、pre-commit hook、test、lint、format、または特定言語の build/test tool の存在を一般論として仮定してはならない（MUST NOT）。
-
-acceptance は、archive フェーズで初めて発火する commit-path blocker を acceptance で先に露出しなければならない（MUST）。ただし、test / lint / format などを独立の一般 quality gate として追加要求してはならず（MUST NOT）、それらが実際の commit path を阻害する仕組みの一部である場合に限って、commitability の文脈で扱ってよい（MAY）。
-
-Conflux core の acceptance prompt builder は、特定アーキテクチャ・特定言語・特定 repository workflow に依存する gate をハードコードしてはならない（MUST NOT）。固定で埋め込める内容は、`load skills: cflx-*` のような workflow skill 読み込み、change metadata、paths、machine-readable protocol などの最小限に限定されなければならない（MUST）。
-
-archive readiness blocker が acceptance または archive CLI の事前検証で明示された場合、その blocker は downstream の archive 失敗表示でも primary root cause として保持されなければならない（MUST）。後続の file-state verification failure は補助説明として追加してよいが、earlier blocker summary を消してはならない（MUST NOT）。
-
-#### Scenario: acceptance-detected archive blocker survives later archive verification noise
-
-- **GIVEN** acceptance が change `beta` に対して archive readiness blocker を finding として記録している
-- **AND** その後の archive attempt では `openspec/changes/beta` が残って file-state verification も失敗する
-- **WHEN** orchestrator が最終 archive failure を履歴またはユーザー向けに整形する
-- **THEN** final message には acceptance/validation で見つかった blocker summary が含まれる
-- **AND** `changes` ディレクトリ残留は補助文脈としてのみ追加される
+#### Scenario: archive validation uses native evidence enum
+- **GIVEN** the archive path invokes native `cflx openspec validate`
+- **WHEN** evidence mode is requested during archive-side validation
+- **THEN** the command uses only `off`, `warn`, or `error`
+- **AND** it never emits `--evidence strict`
 
 ### Requirement: cflx-workflow MUST support cleanup-review operation prompts
 
@@ -317,23 +309,13 @@ Conflux の orchestrator は、managed worktree apply の post-apply handoff cle
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイル一覧と前回 findings を含める（MUST）。
+archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. This change does not redefine the root-cause-preserving archive failure contract already covered by archived archive-readiness work.
 
-acceptance プロンプトは、レビュー対象が archive へ進む前に **final archive commit が実際に成立するか** を確認する指示を含めなければならない（MUST）。ここで確認対象となるのは、archive フローに必要な commit を実際に阻害する blocker のみであり、pre-commit hook、test、lint、format、または特定言語の build/test tool の存在を一般論として仮定してはならない（MUST NOT）。
-
-acceptance は、archive フェーズで初めて発火する commit-path blocker を acceptance で先に露出しなければならない（MUST）。ただし、test / lint / format などを独立の一般 quality gate として追加要求してはならず（MUST NOT）、それらが実際の commit path を阻害する仕組みの一部である場合に限って、commitability の文脈で扱ってよい（MAY）。
-
-Conflux core の acceptance prompt builder は、特定アーキテクチャ・特定言語・特定 repository workflow に依存する gate をハードコードしてはならない（MUST NOT）。固定で埋め込める内容は、`load skills: cflx-*` のような workflow skill 読み込み、change metadata、paths、machine-readable protocol などの最小限に限定されなければならない（MUST）。
-
-archive readiness blocker が acceptance または archive CLI の事前検証で明示された場合、その blocker は downstream の archive 失敗表示でも primary root cause として保持されなければならない（MUST）。後続の file-state verification failure は補助説明として追加してよいが、earlier blocker summary を消してはならない（MUST NOT）。
-
-#### Scenario: acceptance-detected archive blocker survives later archive verification noise
-
-- **GIVEN** acceptance が change `beta` に対して archive readiness blocker を finding として記録している
-- **AND** その後の archive attempt では `openspec/changes/beta` が残って file-state verification も失敗する
-- **WHEN** orchestrator が最終 archive failure を履歴またはユーザー向けに整形する
-- **THEN** final message には acceptance/validation で見つかった blocker summary が含まれる
-- **AND** `changes` ディレクトリ残留は補助文脈としてのみ追加される
+#### Scenario: archive validation uses native evidence enum
+- **GIVEN** the archive path invokes native `cflx openspec validate`
+- **WHEN** evidence mode is requested during archive-side validation
+- **THEN** the command uses only `off`, `warn`, or `error`
+- **AND** it never emits `--evidence strict`
 
 ### Requirement: Operation-specific prompts MUST load dedicated skills
 
@@ -405,21 +387,13 @@ The bundled workflow skill `cflx-workflow` MUST remain installable for backward 
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
-The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary source of fixed operation guidance for dependency analysis and conflict resolution respectively. Rust-side prompt builders MAY inject variable runtime context, but they MUST NOT remain the primary home of fixed analyze / resolve rules.
+The dedicated `cflx-analyze` skill MUST define the allowed dependency target set for analyze output as the current queued change IDs plus any explicitly supplied in-flight change IDs. Rust prompt builders MAY provide those IDs as runtime context, but analyze guidance MUST NOT leave the allowed dependency universe ambiguous.
 
-#### Scenario: Analyze fixed guidance moves out of inline Rust prompt text
-
+#### Scenario: Analyze guidance declares closed-world dependency targets
 - **GIVEN** dependency analysis is executed through the standard orchestrator path
 - **WHEN** the analyze prompt is assembled
-- **THEN** fixed dependency-selection guidance comes from `cflx-analyze`
-- **AND** Rust primarily contributes variable context such as candidate changes and progress
-
-#### Scenario: Resolve fixed guidance moves out of inline Rust prompt text
-
-- **GIVEN** conflict resolution or merge-finalization recovery is executed through the standard orchestrator path
-- **WHEN** the resolve prompt is assembled
-- **THEN** fixed conflict-resolution guidance comes from `cflx-resolve`
-- **AND** Rust primarily contributes variable context such as conflict files, VCS state, and retry history
+- **THEN** the authoritative guidance from `cflx-analyze` states that `dependencies` may reference only queued change IDs and explicit in-flight change IDs
+- **AND** it forbids returning unrelated active/repo-local change IDs as dependency targets
 
 ### Requirement: cflx-accept MUST preserve acceptance command-template single source
 
@@ -443,20 +417,22 @@ The primary acceptance verdict contract MUST be a strict JSON object emitted as 
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
-The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary source of fixed operation guidance for dependency analysis and conflict resolution respectively. Rust-side prompt builders MAY inject variable runtime context, but they MUST NOT remain the primary home of fixed analyze / resolve rules, output contracts, safety constraints, sequential merge protocol, or commit conventions.
+The dedicated `cflx-analyze` skill MUST define the allowed dependency target set for analyze output as the current queued change IDs plus any explicitly supplied in-flight change IDs. Rust prompt builders MAY provide those IDs as runtime context, but analyze guidance MUST NOT leave the allowed dependency universe ambiguous.
 
-#### Scenario: Analyze fixed guidance moves out of inline Rust prompt text
-
+#### Scenario: Analyze guidance declares closed-world dependency targets
 - **GIVEN** dependency analysis is executed through the standard orchestrator path
 - **WHEN** the analyze prompt is assembled
-- **THEN** fixed dependency-selection guidance comes from `cflx-analyze`
-- **AND** Rust primarily contributes variable context such as candidate changes and progress
-- **AND** the Rust-side prompt body does not restate the analyze selection rules or output contract as authoritative instructions
+- **THEN** the authoritative guidance from `cflx-analyze` states that `dependencies` may reference only queued change IDs and explicit in-flight change IDs
+- **AND** it forbids returning unrelated active/repo-local change IDs as dependency targets
 
-#### Scenario: Resolve fixed guidance moves out of inline Rust prompt text
+### Requirement: Acceptance owns behavior-task adequacy review
 
-- **GIVEN** conflict resolution or merge-finalization recovery is executed through the standard orchestrator path
-- **WHEN** the resolve prompt is assembled
-- **THEN** fixed conflict-resolution guidance comes from `cflx-resolve`
-- **AND** Rust primarily contributes variable context such as conflict files, VCS state, merge plan, and retry history
-- **AND** the Rust-side prompt body does not restate the resolve safety rules, sequential merge protocol, or commit conventions as authoritative instructions
+Behavior-changing proposals MUST have their implementation-task adequacy judged by acceptance review rather than by native validator wording heuristics. Acceptance MUST fail when a proposal claims runtime or user-visible behavior changes but the change tasks and repository evidence do not identify concrete implementation-facing work or integration points sufficient to deliver that behavior.
+
+#### Scenario: acceptance fails behavior-changing proposal lacking concrete implementation evidence
+
+- **GIVEN** an implementation or hybrid proposal claims runtime or user-visible behavior changes
+- **AND** the change tasks do not identify concrete implementation-facing work or repository-verifiable integration evidence for delivering that behavior
+- **WHEN** acceptance review evaluates the change
+- **THEN** acceptance returns FAIL with actionable findings citing the missing code/test/integration evidence
+- **AND** archive does not become the first phase that surfaces this proposal-quality issue

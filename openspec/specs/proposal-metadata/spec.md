@@ -47,6 +47,13 @@ frontmatter の `dependencies` フィールドは change id の配列でなけ�
 **When**: proposal dependencies を解析する
 **Then**: 本文 `## Dependencies` の change id 一覧が依存関係として採用される
 
+#### Scenario: author guidance for archived dependency references
+
+**Given**: active proposal の `dependencies` に含まれる change が archive に移動済みである
+**When**: author が dependency metadata を見直す
+**Then**: author は archived dependency reference が queued dependency と同一ではないことを認識できる
+**And**: runtime/validation が archived reference を dedicated diagnostics で区別報告する前提で、依存が既に充足済みかどうかを proposal metadata から判断して更新可否を決められる
+
 ### Requirement: unknown frontmatter keys produce warnings
 
 frontmatter に既知ではない key が含まれていても、proposal tooling は proposal の読み取りを失敗させてはならない（MUST NOT）。既知ではない key は warning として報告されなければならない（MUST）。

@@ -6,8 +6,11 @@
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::{Change, ProposalFrontmatterMetadata};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// A group of changes that can be executed in parallel
@@ -23,6 +26,22 @@ pub struct ParallelGroup {
 }
 
 /// Result of parallelization analysis
+fn strip_archive_date_prefix(name: &str) -> &str {
+    if name.len() > 11 {
+        let bytes = name.as_bytes();
+        let has_date_prefix = bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'-'
+            && bytes[..4].iter().all(u8::is_ascii_digit)
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[8..10].iter().all(u8::is_ascii_digit);
+        if has_date_prefix {
+            return &name[11..];
+        }
+    }
+    name
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
     /// Execution order (recommended execution sequence considering dependencies)
@@ -218,6 +237,7 @@ impl ParallelizationAnalyzer {
         changes: &[Change],
         in_flight_ids: &[String],
     ) -> Result<AnalysisResult> {
+        let archived_ids = self.collect_archived_change_ids();
         // Extract result from stream-json format if applicable
         let response = self.extract_stream_json_result(full_output);
         debug!("LLM response: {}", response);
@@ -228,13 +248,30 @@ impl ParallelizationAnalyzer {
             .map_err(|e| {
             let preview = response.chars().take(200).collect::<String>();
             let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
-            OrchestratorError::Parse(format!(
-                "Analysis returned invalid JSON for changes [{}] (exit code: {:?}): {}. Response preview: {}",
-                change_ids.join(", "),
-                status.code(),
-                e,
-                preview
-            ))
+            let err_text = e.to_string();
+            if err_text.contains("Invalid dependency reference") {
+                let decorated = self.decorate_dependency_error_with_archive_context(
+                    &err_text,
+                    changes,
+                    in_flight_ids,
+                    &archived_ids,
+                );
+                OrchestratorError::Parse(format!(
+                    "Analysis dependency contract failure for changes [{}] (exit code: {:?}): {}. Response preview: {}",
+                    change_ids.join(", "),
+                    status.code(),
+                    decorated,
+                    preview
+                ))
+            } else {
+                OrchestratorError::Parse(format!(
+                    "Analysis returned invalid JSON for changes [{}] (exit code: {:?}): {}. Response preview: {}",
+                    change_ids.join(", "),
+                    status.code(),
+                    e,
+                    preview
+                ))
+            }
         })?;
 
         // Check exit code after successful JSON parsing
@@ -377,6 +414,8 @@ Your task:
 4. Treat proposal frontmatter `references` as supplemental analysis context only
 5. Consider currently executing changes as potential dependencies (but DO NOT include them in the order)
 6. Return execution order and dependencies
+7. `dependencies` may reference ONLY queued change IDs and explicitly listed in-flight IDs
+8. NEVER reference unrelated active changes, archived changes, or any ID outside that allowed set
 
 Return ONLY valid JSON in this exact format:
 {{
@@ -397,6 +436,8 @@ Rules:
   - Example of REQUIRED dependency: "change-b implements a feature using the API defined in change-a"
   - Example of NOT a dependency: "change-a should ideally be done before change-b for efficiency"
   - Dependencies CAN reference currently executing changes if a queued change requires their output
+- Dependencies MUST reference only IDs from the queued `order` set and explicitly provided in-flight IDs
+- Do NOT reference active-but-not-queued IDs, archived IDs, or unrelated change IDs
 - Proposal metadata warnings are informational only; continue analysis using known metadata
 - Every change ID in the input list must appear exactly once in `order`
 - Dependencies are hard constraints: a change CANNOT start until all its dependencies are merged to base
@@ -643,9 +684,18 @@ Rules:
             // Check all dependencies exist in order or in-flight
             for dep_id in deps {
                 if !result.order.contains(dep_id) && !in_flight_set.contains(dep_id.as_str()) {
+                    let mut allowed_ids: Vec<String> = result.order.clone();
+                    allowed_ids.extend(in_flight_ids.iter().cloned());
+                    allowed_ids.sort();
+                    allowed_ids.dedup();
+
                     return Err(OrchestratorError::Parse(format!(
-                        "Invalid dependency reference: change '{}' depends on non-existent change '{}'",
-                        change_id, dep_id
+                        "Invalid dependency reference: change '{}' depends on '{}' outside allowed dependency targets. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_ids={:?}",
+                        change_id,
+                        dep_id,
+                        result.order,
+                        in_flight_ids,
+                        allowed_ids
                     )));
                 }
             }
@@ -655,6 +705,67 @@ Rules:
         self.detect_cycles_from_dependencies(&result.dependencies)?;
 
         Ok(())
+    }
+
+    fn collect_archived_change_ids(&self) -> HashSet<String> {
+        let archive_dir = Path::new("openspec/changes/archive");
+        let Ok(entries) = std::fs::read_dir(archive_dir) else {
+            return HashSet::new();
+        };
+
+        entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() || !path.join("proposal.md").exists() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                Some(strip_archive_date_prefix(&name).to_string())
+            })
+            .collect()
+    }
+
+    fn decorate_dependency_error_with_archive_context(
+        &self,
+        err_text: &str,
+        changes: &[Change],
+        in_flight_ids: &[String],
+        archived_ids: &HashSet<String>,
+    ) -> String {
+        static DEP_RE: OnceLock<Regex> = OnceLock::new();
+        let dep_re = DEP_RE.get_or_init(|| {
+            Regex::new(r"change '([^']+)' depends on '([^']+)' outside allowed dependency targets")
+                .unwrap()
+        });
+
+        let Some(caps) = dep_re.captures(err_text) else {
+            return err_text.to_string();
+        };
+
+        let change_id = caps.get(1).map_or("", |m| m.as_str());
+        let dep_id = caps.get(2).map_or("", |m| m.as_str());
+        if change_id.is_empty() || dep_id.is_empty() {
+            return err_text.to_string();
+        }
+
+        let queued_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
+        let in_flight_set: HashSet<&str> = in_flight_ids.iter().map(|id| id.as_str()).collect();
+
+        let classification = if queued_ids.contains(&dep_id) {
+            "queued"
+        } else if in_flight_set.contains(dep_id) {
+            "in-flight"
+        } else if archived_ids.contains(dep_id) {
+            "archived"
+        } else {
+            "missing"
+        };
+
+        format!(
+            "{} dependency_target_classification={{change:'{}', dependency:'{}', class:'{}'}}",
+            err_text, change_id, dep_id, classification
+        )
     }
 
     /// Detect cycles in dependency graph (change-level dependencies)
@@ -1212,6 +1323,8 @@ That's all."#;
         assert!(prompt.contains("NOT selectable"));
         assert!(prompt.contains("DO NOT include currently executing changes in the order"));
         assert!(prompt.contains("Dependencies CAN reference currently executing changes"));
+        assert!(prompt.contains("`dependencies` may reference ONLY queued change IDs and explicitly listed in-flight IDs"));
+        assert!(prompt.contains("NEVER reference unrelated active changes, archived changes"));
     }
 
     #[test]
@@ -1254,6 +1367,53 @@ That's all."#;
             validation.is_err(),
             "Dependency on unknown ID should be rejected"
         );
+
+        let error_text = validation.err().unwrap().to_string();
+        assert!(error_text.contains("Invalid dependency reference"));
+        assert!(error_text.contains("nonexistent"));
+        assert!(error_text.contains("allowed_queued_ids"));
+        assert!(error_text.contains("allowed_in_flight_ids"));
+    }
+
+    #[test]
+    fn test_decorate_dependency_error_classifies_archived_dependency() {
+        let analyzer = create_test_analyzer();
+        let changes = vec![create_test_change("change-a")];
+        let in_flight_ids = vec!["inflight-x".to_string()];
+        let archived_ids = HashSet::from(["archived-x".to_string()]);
+        let err = "Invalid dependency reference: change 'change-a' depends on 'archived-x' outside allowed dependency targets";
+
+        let decorated = analyzer.decorate_dependency_error_with_archive_context(
+            err,
+            &changes,
+            &in_flight_ids,
+            &archived_ids,
+        );
+
+        assert!(decorated.contains("dependency_target_classification"));
+        assert!(decorated.contains("class:'archived'"));
+    }
+
+    #[test]
+    fn test_collect_archived_change_ids_strips_date_prefix() {
+        let analyzer = create_test_analyzer();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let archived_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-sample-change");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        std::fs::write(archived_dir.join("proposal.md"), "# Archived").unwrap();
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        let archived_ids = analyzer.collect_archived_change_ids();
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert!(archived_ids.contains("sample-change"));
     }
 
     #[test]

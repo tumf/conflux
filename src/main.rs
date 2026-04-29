@@ -50,6 +50,7 @@ mod test_support;
 use clap::Parser;
 use cli::{
     install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, ProjectCommands, TuiArgs,
+    VERSION_WITH_BUILD,
 };
 use config::OrchestratorConfig;
 use error::Result;
@@ -218,6 +219,10 @@ fn init_logging(enable_stdout: bool) -> Result<()> {
     Ok(())
 }
 
+fn log_startup(mode: &str) {
+    info!("Starting cflx {} mode={}.", VERSION_WITH_BUILD, mode);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -227,6 +232,7 @@ async fn main() -> Result<()> {
         None => {
             // Initialize logging: file only (avoid stdout noise in TUI)
             init_logging(false)?;
+            log_startup("tui");
 
             // Build TuiArgs from global flags (including remote server options)
             let tui_args = TuiArgs {
@@ -303,23 +309,24 @@ async fn main() -> Result<()> {
             .await?;
         }
 
-        // Explicit TUI subcommand
-        Some(Commands::Tui(args)) => {
+        // TUI subcommand: launch interactive TUI dashboard
+        Some(Commands::Tui(tui_args)) => {
             // Initialize logging: file only (avoid stdout noise in TUI)
             init_logging(false)?;
+            log_startup("tui");
 
             // Load config
-            let config = OrchestratorConfig::load(args.config.as_deref())?;
+            let config = OrchestratorConfig::load(tui_args.config.as_deref())?;
             tui::log_deduplicator::configure_logging(config.get_logging());
 
             // Get initial changes – either from a remote server or the local workspace
-            let changes = if args.server.is_some() {
+            let changes = if tui_args.server.is_some() {
                 // Remote mode: fetch changes from the server; do NOT read local changes
                 info!(
                     "Remote TUI mode: connecting to {}",
-                    args.server.as_deref().unwrap_or("")
+                    tui_args.server.as_deref().unwrap_or("")
                 );
-                load_remote_changes(&args).await?
+                load_remote_changes(&tui_args).await?
             } else {
                 // Local mode (unchanged behavior)
                 openspec::list_changes_native()?
@@ -327,9 +334,10 @@ async fn main() -> Result<()> {
 
             // Start web monitoring server if enabled and build URL
             #[cfg(feature = "web-monitoring")]
-            let (web_url, web_state_opt) = if args.web {
+            let (web_url, web_state_opt) = if tui_args.web {
                 let web_state = std::sync::Arc::new(web::WebState::new(&changes));
-                let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
+                let web_config =
+                    web::WebConfig::enabled(tui_args.web_port, tui_args.web_bind.clone());
                 match web::spawn_server_with_url(web_config, web_state.clone()).await {
                     Ok((_web_handle, url)) => (Some(url), Some(web_state)),
                     Err(e) => {
@@ -343,7 +351,7 @@ async fn main() -> Result<()> {
 
             #[cfg(not(feature = "web-monitoring"))]
             let web_url: Option<String> = {
-                if args.web {
+                if tui_args.web {
                     eprintln!(
                         "Warning: Web monitoring is not enabled. Compile with --features web-monitoring"
                     );
@@ -352,8 +360,8 @@ async fn main() -> Result<()> {
             };
 
             // Build remote client if --server was specified
-            let remote_client = if let Some(endpoint) = args.server.clone() {
-                let token = resolve_tui_token(&args);
+            let remote_client = if let Some(endpoint) = tui_args.server.clone() {
+                let token = resolve_tui_token(&tui_args);
                 Some(remote::RemoteClient::new(endpoint, token))
             } else {
                 None
@@ -375,6 +383,7 @@ async fn main() -> Result<()> {
         Some(Commands::Run(args)) => {
             // Initialize logging: include stdout for run mode
             init_logging(true)?;
+            log_startup("run");
 
             // Start web monitoring server if enabled
             #[cfg(feature = "web-monitoring")]
@@ -731,6 +740,7 @@ async fn main() -> Result<()> {
         Some(Commands::Server(args)) => {
             // Initialize logging (file + stdout)
             init_logging(true)?;
+            log_startup("server");
 
             // Build ServerConfig from global config and CLI overrides.
             // Server mode uses only global config (not project .cflx.jsonc).

@@ -23,8 +23,13 @@ const CFLX_ANALYZE_SKILL_MD: &str = include_str!("../skills/cflx-analyze/SKILL.m
 const CFLX_APPLY_SKILL_MD: &str = include_str!("../skills/cflx-apply/SKILL.md");
 const CFLX_APPLY_REF: &str = include_str!("../skills/cflx-apply/references/cflx-apply.md");
 const CFLX_REJECTING_SKILL_MD: &str = include_str!("../skills/cflx-rejecting/SKILL.md");
+const CFLX_REJECTION_GUIDE_SKILL_MD: &str = include_str!("../skills/cflx-rejection-guide/SKILL.md");
+const CFLX_REJECTION_GUIDE_REF: &str =
+    include_str!("../skills/cflx-rejection-guide/references/guide.md");
 const CFLX_CLEANUP_REVIEW_SKILL_MD: &str = include_str!("../skills/cflx-cleanup-review/SKILL.md");
 const CFLX_ACCEPT_SKILL_MD: &str = include_str!("../skills/cflx-accept/SKILL.md");
+#[cfg(test)]
+const CFLX_ACCEPT_COMMAND_MD: &str = include_str!("../.opencode/commands/cflx-accept.md");
 const CFLX_ARCHIVE_SKILL_MD: &str = include_str!("../skills/cflx-archive/SKILL.md");
 const CFLX_ARCHIVE_REF: &str = include_str!("../skills/cflx-archive/references/cflx-archive.md");
 const CFLX_RESOLVE_SKILL_MD: &str = include_str!("../skills/cflx-resolve/SKILL.md");
@@ -55,6 +60,10 @@ pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
     )?;
 
     let rejecting = register_embedded_skill(CFLX_REJECTING_SKILL_MD, &[])?;
+    let rejection_guide = register_embedded_skill(
+        CFLX_REJECTION_GUIDE_SKILL_MD,
+        &[("references/guide.md", CFLX_REJECTION_GUIDE_REF)],
+    )?;
 
     let cleanup_review = register_embedded_skill(CFLX_CLEANUP_REVIEW_SKILL_MD, &[])?;
 
@@ -74,6 +83,7 @@ pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
         analyze,
         apply,
         rejecting,
+        rejection_guide,
         cleanup_review,
         accept,
         archive,
@@ -88,7 +98,7 @@ mod tests {
     #[test]
     fn test_embedded_skills_count() {
         let skills = get_cflx_embedded_skills().expect("Failed to get embedded skills");
-        assert_eq!(skills.len(), 10, "Expected exactly 10 embedded skills");
+        assert_eq!(skills.len(), 11, "Expected exactly 11 embedded skills");
     }
 
     #[test]
@@ -102,6 +112,7 @@ mod tests {
             "cflx-analyze",
             "cflx-apply",
             "cflx-rejecting",
+            "cflx-rejection-guide",
             "cflx-cleanup-review",
             "cflx-accept",
             "cflx-archive",
@@ -186,10 +197,22 @@ mod tests {
             "cflx-archive must NOT have scripts/cflx.py"
         );
 
+        let rejection_guide = skills
+            .iter()
+            .find(|s| s.name == "cflx-rejection-guide")
+            .unwrap();
+        assert!(
+            rejection_guide
+                .auxiliary_files
+                .contains_key("references/guide.md"),
+            "cflx-rejection-guide must have references/guide.md"
+        );
+
         // Operation-specific skills without auxiliary files: no scripts/cflx.py
         for name in &[
             "cflx-analyze",
             "cflx-rejecting",
+            "cflx-rejection-guide",
             "cflx-cleanup-review",
             "cflx-accept",
             "cflx-resolve",
@@ -240,6 +263,21 @@ mod tests {
         assert!(
             CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
             "cflx-accept SKILL.md must reference the command template as single source"
+        );
+    }
+
+    #[test]
+    fn test_acceptance_command_template_enforces_behavior_task_adequacy_in_acceptance() {
+        assert!(
+            CFLX_ACCEPT_COMMAND_MD
+                .contains("Behavior-task adequacy check for behavior-changing work"),
+            "acceptance command template must require behavior-task adequacy review in acceptance"
+        );
+        assert!(
+            CFLX_ACCEPT_COMMAND_MD.contains(
+                "Do NOT defer this class of issue to archive; acceptance owns this judgment."
+            ),
+            "acceptance command template must keep behavior-task adequacy ownership in acceptance"
         );
     }
 

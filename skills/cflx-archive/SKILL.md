@@ -13,6 +13,8 @@ Archive deployed OpenSpec changes and update canonical specifications.
 
 After a change has been accepted, this skill handles archiving: moving the change to `changes/archive/`, promoting spec deltas to canonical specs, and verifying the result.
 
+Proposal-quality judgment (for example, behavior-task adequacy) belongs to acceptance review. Archive responsibility is limited to real archive-readiness and commit-path blockers (archive execution, canonical spec promotion, repository state), and MUST NOT reintroduce wording heuristic blockers.
+
 ## Acceptance Handoff Contract
 
 Archive only runs after acceptance reached PASS. The acceptance verdict is
@@ -59,7 +61,9 @@ acceptance output rather than working around it here.
    - Confirm specs updated
    ```bash
    cflx openspec validate --strict
+   cflx openspec validate <id> --strict --evidence warn
    ```
+   - Use only native evidence enum values (`off`, `warn`, `error`) when evidence validation is requested.
    - **Review canonical spec diff** -- run `git diff openspec/specs/` and verify each touched `openspec/specs/**` file shows the expected requirement changes. Do not rely solely on `Specs updated: [...]` output.
 
 ## Archive Completion Criteria

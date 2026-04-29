@@ -29,12 +29,20 @@ When multiple OpenSpec changes are queued for processing, this skill evaluates t
 
 ## Output Contract
 
-Output exactly ONE change ID on a single line. No explanation, no formatting, just the raw change ID.
+For standard single-change selection usage, output exactly ONE change ID on a single line. No explanation, no formatting, just the raw change ID.
 
 Example:
 ```
 add-feature-x
 ```
+
+For JSON dependency-analysis usage, `dependencies` must only reference IDs from:
+- the current queued change IDs, and
+- explicitly supplied in-flight change IDs.
+
+Never return active-but-not-queued IDs, archived IDs, or unrelated IDs as dependency targets.
+
+If you cannot satisfy that contract, fail rather than emitting out-of-scope dependency IDs.
 
 ## Context Provided by Orchestrator
 
