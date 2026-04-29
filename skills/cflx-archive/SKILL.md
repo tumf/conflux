@@ -59,7 +59,9 @@ acceptance output rather than working around it here.
    - Confirm specs updated
    ```bash
    cflx openspec validate --strict
+   cflx openspec validate <id> --strict --evidence warn
    ```
+   - Use only native evidence enum values (`off`, `warn`, `error`) when evidence validation is requested.
    - **Review canonical spec diff** -- run `git diff openspec/specs/` and verify each touched `openspec/specs/**` file shows the expected requirement changes. Do not rely solely on `Specs updated: [...]` output.
 
 ## Archive Completion Criteria

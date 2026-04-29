@@ -1583,6 +1583,15 @@ mod tests {
     }
 
     #[test]
+    fn test_openspec_validate_rejects_strict_as_evidence_mode_name() {
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from(["cflx", "openspec", "validate", "--evidence", "strict"]);
+
+        assert!(parsed.is_err(), "strict evidence mode should be rejected");
+    }
+
+    #[test]
     fn test_openspec_archive_basic() {
         let cli = Cli::parse_from(["cflx", "openspec", "archive", "my-change", "--yes"]);
         match cli.command {
