@@ -1527,7 +1527,7 @@ pub async fn execute_acceptance_in_workspace(
                 attempt_number,
             ))
         }
-        ParseResult::Blocked => {
+        ParseResult::Gated => {
             info!("Acceptance gated for: {}", change_id);
             let attempt_number = agent.next_acceptance_attempt_number(change_id);
             let attempt = crate::history::AcceptanceAttempt {
@@ -1570,7 +1570,7 @@ pub async fn execute_acceptance_in_workspace(
             }
 
             Ok((
-                crate::orchestration::AcceptanceResult::Blocked,
+                crate::orchestration::AcceptanceResult::Gated,
                 attempt_number,
             ))
         }

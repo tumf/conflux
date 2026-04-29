@@ -41,7 +41,7 @@ When an apply operation determines that implementation is impossible and creates
 
 - On `REJECTION_REVIEW: CONFIRM`, runtime finalizes rejection flow and base branch records only `openspec/changes/<change-id>/REJECTED.md`.
 - On `REJECTION_REVIEW: RESUME`, runtime removes worktree-local `REJECTED.md`, appends at least one unchecked non-rejection recovery task to `tasks.md`, and routes directly back to apply.
-- Rejecting review MUST NOT output `ACCEPTANCE: BLOCKED`; that marker is reserved for acceptance operation output.
+- Rejecting review MUST NOT output `ACCEPTANCE: GATED`; that marker is reserved for acceptance operation output.
 
 ## Output Contract
 

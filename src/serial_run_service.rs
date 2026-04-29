@@ -514,7 +514,7 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok((AcceptanceResult::Blocked, _attempt_number, _command)) => {
+                        Ok((AcceptanceResult::Gated, _attempt_number, _command)) => {
                             warn!(
                                 change_id = %change.id,
                                 "Acceptance reported recoverable blocker; returning stalled for explicit unblock/resume"
@@ -633,7 +633,7 @@ impl SerialRunService {
                     ChangeProcessResult::AcceptanceContinue
                 }
             }
-            AcceptanceResult::Blocked => {
+            AcceptanceResult::Gated => {
                 warn!(
                     "Acceptance gated for {} - preserving change as stalled/resumable",
                     change_id
@@ -919,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_acceptance_result_blocked_returns_stalled_result() {
+    fn test_process_acceptance_result_gated_returns_stalled_result() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -933,7 +933,7 @@ mod tests {
             "test-change",
             temp_dir.path(),
             &agent,
-            AcceptanceResult::Blocked,
+            AcceptanceResult::Gated,
             || false, // Not a single-change stop
         );
 
@@ -959,7 +959,7 @@ mod tests {
         let next = service.select_next_change(&changes);
         assert_eq!(next.map(|c| c.id.as_str()), Some("b"));
 
-        // Mark 'b' as stalled (simulating BLOCKED acceptance)
+        // Mark 'b' as stalled (simulating GATED acceptance)
         service.mark_stalled("b", "Implementation blocker detected");
 
         // After marking as stalled, 'b' should not be selected

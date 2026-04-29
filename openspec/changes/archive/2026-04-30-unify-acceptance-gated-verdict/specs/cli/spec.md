@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: CLI acceptance verdict parsing preserves canonical gating terminology
+### Requirement: Orchestration loop runs apply and archive
 
 acceptance ループは change に対して `acceptance_command` を実行し、出力テキストから pass/fail/continue/gated を判定して処理を分岐しなければならない（SHALL）。
 

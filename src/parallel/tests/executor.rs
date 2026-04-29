@@ -1880,7 +1880,12 @@ async fn test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_chan
             AcceptanceStateStatus::Failed,
         ),
         (
-            "blocked",
+            "gated",
+            "sh -c 'echo change-gated >> feature.rs; git add feature.rs; git commit -m gated-rev >/dev/null 2>&1; echo ACCEPTANCE: GATED'",
+            AcceptanceStateStatus::Failed,
+        ),
+        (
+            "legacy_blocked",
             "sh -c 'echo change-blocked >> feature.rs; git add feature.rs; git commit -m blocked-rev >/dev/null 2>&1; echo ACCEPTANCE: BLOCKED'",
             AcceptanceStateStatus::Failed,
         ),
@@ -1974,9 +1979,16 @@ async fn test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_chan
                 crate::orchestration::AcceptanceResult::Continue => {}
                 other => panic!("expected continue result, got {:?}", other),
             },
-            "blocked" => match result {
-                crate::orchestration::AcceptanceResult::Blocked => {}
-                other => panic!("expected blocked result, got {:?}", other),
+            "gated" => match result {
+                crate::orchestration::AcceptanceResult::Gated => {}
+                other => panic!("expected gated result, got {:?}", other),
+            },
+            "legacy_blocked" => match result {
+                crate::orchestration::AcceptanceResult::Gated => {}
+                other => panic!(
+                    "expected gated result from legacy blocked marker, got {:?}",
+                    other
+                ),
             },
             "command_failed" => match result {
                 crate::orchestration::AcceptanceResult::CommandFailed { .. } => {}

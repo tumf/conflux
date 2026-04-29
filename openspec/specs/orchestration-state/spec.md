@@ -412,19 +412,19 @@ A parallel archived change MUST leave `MergeWait` as soon as merge handling can 
 
 ### Requirement: Rejection Flow Execution
 
-The system SHALL execute a rejection flow when acceptance returns a `Blocked` verdict, including blocked verdicts that originated from apply execution through a rejection proposal file. Apply execution MAY generate `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal when it encounters an implementation blocker that prevents completion. This proposal file SHALL NOT become a terminal rejection by itself. Acceptance SHALL review the blocker and decide whether to confirm the rejection. Only after acceptance confirms the blocked verdict SHALL the runtime treat the change as rejected, commit only `REJECTED.md` on the base branch, and delete the worktree.
+The system SHALL execute a rejection flow when acceptance returns a `Gated` verdict, including compatibility inputs where legacy `Blocked` verdicts are parsed as acceptance-gated outcomes. Apply execution MAY generate `openspec/changes/<change_id>/REJECTED.md` as a rejection proposal when it encounters an implementation blocker that prevents completion. This proposal file SHALL NOT become a terminal rejection by itself. Acceptance SHALL review the blocker and decide whether to confirm the rejection. Only after acceptance confirms the gated verdict SHALL the runtime treat the change as rejected, commit only `REJECTED.md` on the base branch, and delete the worktree.
 
 #### Scenario: apply-generated rejection proposal requires acceptance confirmation
 
 - **GIVEN** apply execution writes `openspec/changes/fix-auth/REJECTED.md` because of an implementation blocker
-- **WHEN** acceptance has not yet confirmed the blocked verdict
+- **WHEN** acceptance has not yet confirmed the gated verdict
 - **THEN** the change is not yet in `Rejected` terminal state
 - **AND** no rejection flow commit is created on the base branch
 
 #### Scenario: acceptance-confirmed apply blocker transitions to rejected terminal state
 
 - **GIVEN** apply execution has generated `openspec/changes/fix-auth/REJECTED.md`
-- **AND** acceptance confirms the blocked verdict
+- **AND** acceptance confirms the gated verdict
 - **WHEN** the rejection flow completes
 - **THEN** the terminal state becomes `Rejected` with the rejection reason
 - **AND** the derived display status is `rejected`
@@ -432,18 +432,18 @@ The system SHALL execute a rejection flow when acceptance returns a `Blocked` ve
 
 ### Requirement: Rejection Flow Execution
 
-The system SHALL execute a rejection flow when acceptance returns a `Blocked` verdict, including blocked verdicts that originated from apply execution through a rejection proposal file. The rejection flow MUST write and commit only `openspec/changes/<change_id>/REJECTED.md` on the base branch. The rejection flow MUST NOT stage, merge, or commit any other files from the rejected worktree, including proposal, tasks, spec deltas, or product code changes. The runtime SHALL treat the `REJECTED.md` marker commit itself as the durable rejection record and SHALL NOT require `openspec resolve <change_id>` as part of the rejection flow.
+The system SHALL execute a rejection flow when acceptance returns a `Gated` verdict, including compatibility inputs where legacy `Blocked` verdicts are parsed as acceptance-gated outcomes. The rejection flow MUST write and commit only `openspec/changes/<change_id>/REJECTED.md` on the base branch. The rejection flow MUST NOT stage, merge, or commit any other files from the rejected worktree, including proposal, tasks, spec deltas, or product code changes. The runtime SHALL treat the `REJECTED.md` marker commit itself as the durable rejection record and SHALL NOT require `openspec resolve <change_id>` as part of the rejection flow.
 
 #### Scenario: rejection flow commits only REJECTED marker
 
-- **GIVEN** acceptance confirms a blocked verdict for `fix-auth`
+- **GIVEN** acceptance confirms a gated verdict for `fix-auth`
 - **WHEN** the rejection flow executes
 - **THEN** the base branch commit includes `openspec/changes/fix-auth/REJECTED.md`
 - **AND** no other files from the rejected worktree are staged or committed
 
 #### Scenario: rejection flow does not invoke openspec resolve
 
-- **GIVEN** acceptance confirms a blocked verdict for `fix-auth`
+- **GIVEN** acceptance confirms a gated verdict for `fix-auth`
 - **WHEN** the rejection flow executes
 - **THEN** `openspec resolve fix-auth` is not invoked
 - **AND** rejection completion does not depend on OpenSpec CLI availability
