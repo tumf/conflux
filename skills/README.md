@@ -46,21 +46,22 @@ Conflux uses a **router + per-operation skill** architecture. New orchestrator p
 - Verifies clean working tree and base branch
 - Runs Conflux orchestration and reviews the merge result
 
-### Operation-Specific Skills (Dedicated)
+### Dedicated Workflow Skills
 
-These skills are loaded directly by the orchestrator for each operation:
+Most of these skills are loaded directly by the orchestrator. `cflx-rejection-guide` is the operator-facing exception for rejected vs blocked guidance.
 
 | Skill | Operation | Purpose |
 |-------|-----------|---------|
 | `cflx-analyze` | analyze | Dependency analysis and change selection |
 | `cflx-apply` | apply | Implement approved changes |
 | `cflx-rejecting` | rejecting | Review rejection proposals |
+| `cflx-rejection-guide` | operator guide | Explain how to handle rejected vs blocked changes |
 | `cflx-cleanup-review` | cleanup-review | Post-apply worktree cleanup |
 | `cflx-accept` | accept | Acceptance review (operation identity) |
 | `cflx-archive` | archive | Finalize deployed changes |
 | `cflx-resolve` | resolve | Merge conflict resolution |
 
-All operation-specific skills are autonomous (cannot ask questions) and are called by the orchestration system, not for direct human use.
+The orchestrator-loaded operation skills are autonomous (cannot ask questions) and are called by the orchestration system. `cflx-rejection-guide` is intended for direct human/operator guidance.
 
 ### cflx-workflow (Compatibility Router)
 
@@ -84,6 +85,7 @@ This installs all bundled skills:
 - `cflx-analyze` - Dependency analysis
 - `cflx-apply` - Change implementation
 - `cflx-rejecting` - Rejection review
+- `cflx-rejection-guide` - Operator guidance for rejected vs blocked changes
 - `cflx-cleanup-review` - Post-apply cleanup
 - `cflx-accept` - Acceptance review identity
 - `cflx-archive` - Change archival
