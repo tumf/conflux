@@ -58,7 +58,8 @@ pub async fn get_or_create_workspace(
     }
 
     if force_recreate {
-        if let Ok(Some(workspace_info)) = workspace_manager.find_existing_workspace(change_id).await {
+        if let Ok(Some(workspace_info)) = workspace_manager.find_existing_workspace(change_id).await
+        {
             info!(
                 "Dependency resolved for '{}': cleaning up stale workspace '{}' before fresh recreation",
                 change_id, workspace_info.workspace_name
