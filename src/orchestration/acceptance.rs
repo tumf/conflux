@@ -282,7 +282,7 @@ where
             output.on_info("Acceptance test: CONTINUE");
             (AcceptanceResult::Continue, false)
         }
-        crate::acceptance::AcceptanceResult::Blocked => {
+        crate::acceptance::AcceptanceResult::Gated => {
             info!("Acceptance gated for: {}", change.id);
             output.on_warn("Acceptance test: BLOCKED");
             (AcceptanceResult::Blocked, false)

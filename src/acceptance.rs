@@ -6,14 +6,14 @@
 //! Verdict contract (post `adopt-json-acceptance-verdict`):
 //!
 //! - **Primary**: a strict JSON verdict object of the form
-//!   `{"acceptance":"pass|fail|continue|blocked","findings":[...]}` emitted as
+//!   `{"acceptance":"pass|fail|continue|gated","findings":[...]}` emitted as
 //!   the final machine-readable verdict payload. JSON verdicts may appear
 //!   directly as a line on stdout, or wrapped inside an
 //!   `opencode run --format json` event (assistant / result / stream_event
 //!   text payloads). In either case the runtime unwraps the payload and
 //!   evaluates the JSON verdict.
 //! - **Fallback**: legacy plain-text standalone verdict markers of the form
-//!   `ACCEPTANCE: PASS|FAIL|CONTINUE|BLOCKED` remain supported for backward
+//!   `ACCEPTANCE: PASS|FAIL|CONTINUE|GATED` remain supported for backward
 //!   compatibility, but JSON takes priority whenever both are present.
 
 /// Result of parsing acceptance output
@@ -26,7 +26,7 @@ pub enum AcceptanceResult {
     /// Acceptance requires more investigation - continue later
     Continue,
     /// Acceptance gated due to implementation blocker
-    Blocked,
+    Gated,
 }
 
 /// Canonical plain-text verdict variants. These remain supported as a
@@ -135,7 +135,7 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
 /// Contract (JSON-primary, text-fallback):
 ///
 /// - Primary: a strict JSON verdict object
-///   `{"acceptance":"pass|fail|continue|blocked","findings":[...]}` emitted
+///   `{"acceptance":"pass|fail|continue|gated","findings":[...]}` emitted
 ///   either directly as a line, or wrapped inside an `opencode run
 ///   --format json` event payload (assistant / stream_event / result text).
 ///   The first JSON verdict encountered wins, regardless of any earlier text
@@ -183,7 +183,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
                     "pass" => AcceptanceResult::Pass,
                     "fail" => AcceptanceResult::Fail { findings },
                     "continue" => AcceptanceResult::Continue,
-                    "blocked" => AcceptanceResult::Blocked,
+                    "gated" | "blocked" => AcceptanceResult::Gated,
                     _ => AcceptanceResult::Continue,
                 };
             }
@@ -198,7 +198,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     match fallback_kind {
         Some("pass") => AcceptanceResult::Pass,
         Some("continue") => AcceptanceResult::Continue,
-        Some("blocked") => AcceptanceResult::Blocked,
+        Some("blocked") => AcceptanceResult::Gated,
         Some("fail") => {
             let findings = parse_findings(output);
             AcceptanceResult::Fail { findings }
@@ -583,19 +583,19 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     #[test]
     fn test_parse_blocked() {
         let output = "ACCEPTANCE: BLOCKED\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
     }
 
     #[test]
     fn test_parse_blocked_with_extra_output() {
         let output = "Some debug output\nACCEPTANCE: BLOCKED\nMore output\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
     }
 
     #[test]
     fn test_parse_blocked_with_bold_decoration() {
         let output = "**ACCEPTANCE: BLOCKED**\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
     }
 
     // Characterization tests: document the exact contract that
@@ -694,7 +694,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     #[test]
     fn test_parse_blocked_with_heading_prefix() {
         let output = "## ACCEPTANCE: BLOCKED\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Blocked);
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
     }
 
     #[test]
@@ -769,6 +769,8 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             ("- ACCEPTANCE: PASS", "pass"),
             ("### **ACCEPTANCE: FAIL**", "fail"),
             ("ACCEPTANCE: CONTINUE", "continue"),
+            ("ACCEPTANCE: GATED", "gated"),
+            // Legacy compatibility during migration.
             ("ACCEPTANCE: BLOCKED", "blocked"),
             ("## ACCEPTANCE: BLOCKED", "blocked"),
             ("> ACCEPTANCE: FAIL", "fail"),
@@ -789,7 +791,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 AcceptanceResult::Pass => "pass",
                 AcceptanceResult::Fail { .. } => "fail",
                 AcceptanceResult::Continue => "continue",
-                AcceptanceResult::Blocked => "blocked",
+                AcceptanceResult::Gated => "blocked",
             };
             assert_eq!(
                 result_kind, *expected_kind,
