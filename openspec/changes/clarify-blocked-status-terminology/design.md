@@ -48,13 +48,21 @@ Conflux には少なくとも三つの異なる blocker 系事象が存在する
 
 ## Active Proposal Alignment
 
-### `separate-apply-block-from-reject`
-
-この active change は現在、apply/rejecting 側の resumable hold を `blocked` と呼んで実装・仕様化している。本 proposal ではまず dependency queue wait を `dependency-blocked`、acceptance gate failure を `acceptance-gated` / `gated` として固定し、そのうえで apply-side hold を canonical には `stalled` へ寄せる。したがって、当該 active change の runtime/display wording と spec delta には terminology refresh または明示的な移行注記が必要になる。
-
 ### `classify-acceptance-followup-routing`
 
-この active change は acceptance follow-up から blocked/non-apply hold へ送る routing を扱う。本 proposal 後は、acceptance gate failure の観測語彙を `acceptance-gated` / `gated` に寄せ、最終 hold state が apply-side resumable hold なら `stalled` を使う。
+この active change は acceptance follow-up の blocker-only case を apply へ戻さず、resumable hold (`WorkspaceStatus::Blocked`) を経由させる前提を持つ。`clarify-blocked-status-terminology` ではこの hold を canonical に `stalled` として扱うため、acceptance follow-up 側の「blocked」は queue-side dependency wait ではなく apply-side resumable hold として読まれるべきである。
+
+移行順序は以下を canonical とする。
+
+1. queue-side wait reason を `dependency-blocked` / `blocked` に固定する。
+2. acceptance gate observation を `acceptance-gated` / `gated` としてイベント化する。
+3. apply-side resumable hold (`WorkspaceStatus::Blocked`) を display semantics 上 `stalled` として扱う。
+
+この順序により、active proposal 間で `blocked` が指す責務境界（queue wait か apply hold か）を判別可能にし、実装 agent が vocabulary を誤用しないようにする。
+
+### 補足: `separate-apply-block-from-reject` 依存の整理
+
+`separate-apply-block-from-reject` proposal は本ブランチ上に存在しないため、本 change では依存列挙から除外し、`classify-acceptance-followup-routing` を active dependency として扱う。apply-side resumable hold の vocabulary は当該 change が `WorkspaceStatus::Blocked` を使用していても、core/frontend contract 上は `stalled` として取り扱う。
 
 ## Migration / Verification Notes
 

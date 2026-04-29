@@ -2,12 +2,11 @@
 change_type: implementation
 priority: high
 dependencies:
-  - separate-apply-block-from-reject
+  - classify-acceptance-followup-routing
 references:
   - openspec/specs/parallel-execution/spec.md
   - openspec/specs/orchestration-state/spec.md
   - openspec/specs/frontend-abstraction/spec.md
-  - openspec/changes/separate-apply-block-from-reject/proposal.md
   - openspec/changes/classify-acceptance-followup-routing/proposal.md
   - src/parallel/queue_state.rs
   - src/orchestration/state.rs

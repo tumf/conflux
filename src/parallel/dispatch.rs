@@ -1158,7 +1158,7 @@ impl ParallelExecutor {
                     info!(
                         change_id = %change_id,
                         blocker_path = %handoff.blocker_path.display(),
-                        "Apply emitted blocked handoff marker; staying blocked without rejecting flow"
+                        "Apply emitted stalled handoff marker; staying stalled without rejecting flow"
                     );
                     if let Some(ref tx) = event_tx {
                         let _ = tx
@@ -1171,7 +1171,7 @@ impl ParallelExecutor {
                         let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::warn(format!(
-                                    "Apply blocked handoff detected via {}; workspace remains blocked",
+                                    "Apply stalled handoff detected via {}; workspace remains stalled",
                                     handoff.blocker_path.display()
                                 ))
                                 .with_change_id(&change_id)
