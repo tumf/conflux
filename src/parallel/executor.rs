@@ -718,11 +718,13 @@ pub async fn execute_archive_in_workspace(
             output_collector.stdout_tail().as_deref(),
             output_collector.stderr_tail().as_deref(),
         );
-        return Err(OrchestratorError::AgentCommand(build_archive_error_message(
-            change_id,
-            Some(workspace_path),
-            runtime_blocker.as_deref(),
-        )));
+        return Err(OrchestratorError::AgentCommand(
+            build_archive_error_message(
+                change_id,
+                Some(workspace_path),
+                runtime_blocker.as_deref(),
+            ),
+        ));
     }
 
     info!(

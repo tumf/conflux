@@ -225,8 +225,7 @@ where
         }
 
         let runtime_blocker = extract_archive_runtime_blocker(None, None);
-        let error_msg =
-            build_archive_error_message(&change.id, None, runtime_blocker.as_deref());
+        let error_msg = build_archive_error_message(&change.id, None, runtime_blocker.as_deref());
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
     }

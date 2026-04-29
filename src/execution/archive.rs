@@ -658,7 +658,10 @@ pub fn get_task_progress(
 ///
 /// Creates a descriptive error message when archive verification fails,
 /// suitable for logging or sending to the user.
-pub fn extract_archive_runtime_blocker(stdout_tail: Option<&str>, stderr_tail: Option<&str>) -> Option<String> {
+pub fn extract_archive_runtime_blocker(
+    stdout_tail: Option<&str>,
+    stderr_tail: Option<&str>,
+) -> Option<String> {
     fn extract_line(text: &str) -> Option<String> {
         let candidates = [
             "Runtime behavior is claimed without implementation-facing tasks",
@@ -675,7 +678,10 @@ pub fn extract_archive_runtime_blocker(stdout_tail: Option<&str>, stderr_tail: O
                 return None;
             }
             let lower = trimmed.to_ascii_lowercase();
-            if candidates.iter().any(|needle| lower.contains(&needle.to_ascii_lowercase())) {
+            if candidates
+                .iter()
+                .any(|needle| lower.contains(&needle.to_ascii_lowercase()))
+            {
                 return Some(trimmed.to_string());
             }
             None
