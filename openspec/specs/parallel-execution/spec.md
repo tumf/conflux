@@ -40,6 +40,28 @@ ParallelRunService は、コミットツリーに存在しない change の除�
 - **THEN** `ParallelRunService` SHALL return an error indicating a git repository is required
 - **AND** no parallel execution is started
 
+### Requirement: Archived dependency references are explicitly classified
+
+システムは active proposal metadata の dependency target を少なくとも queued / in-flight / archived / missing の4分類で扱わなければならない（SHALL）。
+
+archived dependency reference は generic parse/json failure として潰してはならない（MUST NOT）。runtime/analyze/validation は archived と missing を区別した診断を返さなければならない（MUST）。
+
+#### Scenario: Archived dependency is surfaced with dedicated diagnostics
+
+- **GIVEN** active change `alpha` が dependency `beta` を参照している
+- **AND** `beta` は `openspec/changes/archive/` にのみ存在する
+- **WHEN** analyze または validate が dependency target を検証する
+- **THEN** 診断は archived dependency reference として報告される
+- **AND** 診断は generic `Analysis returned invalid JSON` として表示されない
+
+#### Scenario: Missing dependency remains an invalid dependency failure
+
+- **GIVEN** active change `alpha` が dependency `gamma` を参照している
+- **AND** `gamma` は queued / in-flight / archive のいずれにも存在しない
+- **WHEN** analyze または validate が dependency target を検証する
+- **THEN** 診断は missing dependency として失敗を返す
+- **AND** archived dependency case と区別できるメッセージを含む
+
 ### Requirement: Parallel Event Bridge for TUI
 
 The system SHALL provide a `ParallelEventBridge` that converts `ParallelEvent` to `OrchestratorEvent` for the TUI.
@@ -1889,3 +1911,25 @@ When archive is retried, resumed, or fails terminally, the runtime SHALL expose 
 - **THEN** the retry log or event payload includes a primary archive reason indicating verification failure
 - **AND** the payload includes a summary describing the concrete symptom
 - **AND** downstream consumers do not have to infer the reason only from a generic `retrying archive command` string
+
+### Requirement: archived dependency references have explicit scheduler and validation semantics
+
+The system SHALL classify dependency targets referenced from active change metadata into at least four categories: queued, in-flight, archived, and missing.
+
+Queued and in-flight dependency targets MAY participate in analyze ordering as dependency edges. Archived dependency targets MUST NOT be surfaced as generic JSON parse failures. The runtime and validation layers MUST either treat archived dependencies as explicitly satisfied/non-queued references or reject them with dedicated archived-dependency diagnostics, but in either case they MUST distinguish this condition from malformed JSON and from truly missing change IDs.
+
+#### Scenario: archived dependency reference is not reported as invalid JSON
+
+- **GIVEN** an active change references dependency `beta`
+- **AND** `beta` exists only under `openspec/changes/archive/`
+- **WHEN** dependency validation or analyze-order parsing evaluates the reference
+- **THEN** the reported outcome identifies the archived-dependency condition explicitly
+- **AND** user-visible diagnostics do not collapse the condition into generic `Analysis returned invalid JSON`
+
+#### Scenario: missing dependency remains a true invalid reference
+
+- **GIVEN** an active change references dependency `gamma`
+- **AND** `gamma` exists neither in the queued set, nor the in-flight set, nor the archive tree
+- **WHEN** dependency validation evaluates the reference
+- **THEN** the system reports a dedicated invalid dependency reference failure
+- **AND** the diagnostics include enough context to distinguish it from the archived-dependency case

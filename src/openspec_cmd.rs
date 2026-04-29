@@ -5,7 +5,7 @@
 
 use chrono::Local;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -559,6 +559,16 @@ impl OpenSpecManager {
                         _ => {}
                     }
                 }
+
+                let dependency_diagnostics =
+                    classify_proposal_dependency_targets(&change_id, &proposal_file);
+                for diagnostic in dependency_diagnostics {
+                    match diagnostic.classification {
+                        DependencyTargetClass::Missing => errors.push(diagnostic.message),
+                        DependencyTargetClass::Archived => warnings.push(diagnostic.message),
+                        DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                    }
+                }
             }
         }
 
@@ -957,6 +967,148 @@ fn extract_change_type(proposal_content: &str) -> Option<String> {
             .to_lowercase();
         value
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyTargetClass {
+    Queued,
+    InFlight,
+    Archived,
+    Missing,
+}
+
+#[derive(Debug, Clone)]
+struct DependencyTargetDiagnostic {
+    classification: DependencyTargetClass,
+    message: String,
+}
+
+fn classify_proposal_dependency_targets(
+    change_id: &str,
+    proposal_file: &Path,
+) -> Vec<DependencyTargetDiagnostic> {
+    let proposal_metadata = crate::openspec::parse_proposal_metadata_from_file(proposal_file);
+    if proposal_metadata.dependencies.is_empty() {
+        return Vec::new();
+    }
+
+    let active_ids = collect_active_change_ids();
+    let in_flight_ids = collect_in_flight_change_ids();
+    let archived_ids = collect_archived_change_ids();
+
+    proposal_metadata
+        .dependencies
+        .into_iter()
+        .map(|dependency| {
+            let classification = if active_ids.contains(&dependency) {
+                DependencyTargetClass::Queued
+            } else if in_flight_ids.contains(&dependency) {
+                DependencyTargetClass::InFlight
+            } else if archived_ids.contains(&dependency) {
+                DependencyTargetClass::Archived
+            } else {
+                DependencyTargetClass::Missing
+            };
+
+            let message = match classification {
+                DependencyTargetClass::Queued => format!(
+                    "{}: proposal dependency '{}' classified as queued (active change)",
+                    change_id, dependency
+                ),
+                DependencyTargetClass::InFlight => format!(
+                    "{}: proposal dependency '{}' classified as in-flight (workspace execution marker)",
+                    change_id, dependency
+                ),
+                DependencyTargetClass::Archived => format!(
+                    "{}: proposal dependency '{}' classified as archived dependency reference (warning: metadata should be reviewed after archive)",
+                    change_id, dependency
+                ),
+                DependencyTargetClass::Missing => format!(
+                    "{}: proposal dependency '{}' is invalid: not found in active, in-flight, or archived change targets",
+                    change_id, dependency
+                ),
+            };
+
+            DependencyTargetDiagnostic {
+                classification,
+                message,
+            }
+        })
+        .collect()
+}
+
+fn collect_active_change_ids() -> HashSet<String> {
+    let changes_dir = Path::new("openspec/changes");
+    let Ok(entries) = fs::read_dir(changes_dir) else {
+        return HashSet::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "archive" || name.starts_with('.') {
+                return None;
+            }
+            if !path.join("proposal.md").exists() {
+                return None;
+            }
+            Some(name)
+        })
+        .collect()
+}
+
+fn collect_in_flight_change_ids() -> HashSet<String> {
+    let state_file = Path::new(".conflux-inflight");
+    let Ok(content) = fs::read_to_string(state_file) else {
+        return HashSet::new();
+    };
+
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn strip_archive_date_prefix(name: &str) -> &str {
+    if name.len() > 11 {
+        let bytes = name.as_bytes();
+        let has_date_prefix = bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'-'
+            && bytes[..4].iter().all(u8::is_ascii_digit)
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[8..10].iter().all(u8::is_ascii_digit);
+        if has_date_prefix {
+            return &name[11..];
+        }
+    }
+    name
+}
+
+fn collect_archived_change_ids() -> HashSet<String> {
+    let archive_dir = Path::new("openspec/changes/archive");
+    let Ok(entries) = fs::read_dir(archive_dir) else {
+        return HashSet::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("proposal.md").exists() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            Some(strip_archive_date_prefix(&name).to_string())
+        })
+        .collect()
 }
 
 /// Behavior-bearing task keywords
@@ -1894,6 +2046,37 @@ mod openspec_list_show_tests {
         fs::write(dir.join("tasks.md"), tasks).unwrap();
     }
 
+    fn create_change_with_frontmatter_dependencies(
+        dir: &Path,
+        proposal_title: &str,
+        dependencies: &[&str],
+        tasks: &str,
+    ) {
+        fs::create_dir_all(dir).unwrap();
+        let deps_yaml = if dependencies.is_empty() {
+            "[]".to_string()
+        } else {
+            let mut lines = String::new();
+            for dep in dependencies {
+                lines.push_str(&format!("\n  - {}", dep));
+            }
+            lines
+        };
+        let proposal = if dependencies.is_empty() {
+            format!(
+                "---\ndependencies: []\n---\n\n# {}\n\nbody\n",
+                proposal_title
+            )
+        } else {
+            format!(
+                "---\ndependencies:{}\n---\n\n# {}\n\nbody\n",
+                deps_yaml, proposal_title
+            )
+        };
+        fs::write(dir.join("proposal.md"), proposal).unwrap();
+        fs::write(dir.join("tasks.md"), tasks).unwrap();
+    }
+
     fn create_strict_valid_change(dir: &Path, proposal_title: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(
@@ -2102,6 +2285,65 @@ mod openspec_list_show_tests {
 
         assert!(err.contains("Archive destination already exists"));
         assert!(change_dir.exists());
+
+        env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_change_classifies_archived_dependency_as_warning() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let temp = TempDir::new().unwrap();
+        env::set_current_dir(temp.path()).unwrap();
+
+        let active_change = temp.path().join("openspec/changes/active-change");
+        create_change_with_frontmatter_dependencies(
+            &active_change,
+            "Active Change",
+            &["archived-dep"],
+            "- [ ] 1. task (verification: integration - cargo test)",
+        );
+
+        let archived_change = temp
+            .path()
+            .join("openspec/changes/archive/2026-04-29-archived-dep");
+        create_change(&archived_change, "Archived Dep", "- [x] done\n");
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, warnings) = mgr.validate_change(Some("active-change"), false, "off");
+
+        assert!(is_valid);
+        assert!(errors.is_empty());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("classified as archived dependency reference")));
+
+        env::set_current_dir(original_cwd).unwrap();
+    }
+
+    #[test]
+    fn test_validate_change_reports_missing_dependency_as_error() {
+        let _guard = cwd_lock().lock().unwrap();
+        let original_cwd = env::current_dir().unwrap();
+        let temp = TempDir::new().unwrap();
+        env::set_current_dir(temp.path()).unwrap();
+
+        let active_change = temp.path().join("openspec/changes/active-change");
+        create_change_with_frontmatter_dependencies(
+            &active_change,
+            "Active Change",
+            &["missing-dep"],
+            "- [ ] 1. task (verification: integration - cargo test)",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, warnings) = mgr.validate_change(Some("active-change"), false, "off");
+
+        assert!(!is_valid);
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("missing-dep") && e.contains("invalid")));
+        assert!(warnings.is_empty());
 
         env::set_current_dir(original_cwd).unwrap();
     }
