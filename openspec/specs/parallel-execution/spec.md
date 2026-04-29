@@ -119,29 +119,15 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
-
-#### Scenario: JSON event stream text payload is normalized into verdict
-
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
-
-#### Scenario: legacy standalone marker remains fallback only
-
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -1288,29 +1274,15 @@ When parallel merge verification runs after archive completion, a change that is
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
-
-#### Scenario: JSON event stream text payload is normalized into verdict
-
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
-
-#### Scenario: legacy standalone marker remains fallback only
-
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -1498,29 +1470,15 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
-
-#### Scenario: JSON event stream text payload is normalized into verdict
-
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
-
-#### Scenario: legacy standalone marker remains fallback only
-
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -1635,57 +1593,29 @@ Parallel execution SHALL restore a non-terminal workspace containing `openspec/c
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
-
-#### Scenario: JSON event stream text payload is normalized into verdict
-
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
-
-#### Scenario: legacy standalone marker remains fallback only
-
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
 ### Requirement: Parallel execution acceptance loop
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
-
-#### Scenario: JSON event stream text payload is normalized into verdict
-
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
-
-#### Scenario: legacy standalone marker remains fallback only
-
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1820,29 +1750,15 @@ apply runtime が tasks.md 上の完了条件、または `REJECTED.md` によ�
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
-
-#### Scenario: JSON event stream text payload is normalized into verdict
-
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
-
-#### Scenario: legacy standalone marker remains fallback only
-
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
 ### Requirement: Durable acceptance state gates archive on the current revision
 
@@ -1910,26 +1826,48 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
 
-When a strict JSON acceptance verdict object has already been observed for the current acceptance execution, the runtime MAY complete the acceptance operation based on that verdict without waiting for additional trailing output or eventual inactivity timeout. Legacy plain-text standalone verdict lines such as `ACCEPTANCE: PASS` MAY remain supported as a fallback only when no JSON verdict object is present.
+When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
 
-#### Scenario: strict JSON verdict completes acceptance
+#### Scenario: archive prerequisite blocker remains visible after archive verification failure
 
-- **GIVEN** an acceptance command emits a strict JSON verdict object indicating `pass`
-- **WHEN** the runtime processes streaming stdout for that acceptance execution
-- **THEN** the acceptance result is finalized as PASS for the current revision
-- **AND** archive handoff may proceed without requiring a legacy text verdict line
+- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
+- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
+- **WHEN** the runtime reports the archive failure to history, logs, or the user
+- **THEN** the reported failure still includes the earlier blocker summary
+- **AND** the file-state verification result is reported only as supplemental context
 
-#### Scenario: JSON event stream text payload is normalized into verdict
+### Requirement: Archive retry and resume reasons persist across process restarts
 
-- **GIVEN** an acceptance command emits JSON event lines where the final assistant text payload contains a strict JSON verdict object
-- **WHEN** the runtime evaluates the streaming output
-- **THEN** it extracts and normalizes that payload into the canonical acceptance verdict
-- **AND** the verdict result matches the non-event-stream JSON contract
+Parallel archive execution SHALL persist the primary archive retry/resume reason outside the worktree so that an interrupted or restarted runtime can explain why archive is being retried or resumed.
 
-#### Scenario: legacy standalone marker remains fallback only
+#### Scenario: archiving workspace restores prior archive reason on resume
 
-- **GIVEN** an acceptance command emits no strict JSON verdict object
-- **AND** it emits a standalone line exactly equal to `ACCEPTANCE: PASS`
-- **WHEN** the runtime evaluates canonical acceptance verdicts
-- **THEN** that legacy marker is still accepted as PASS
-- **AND** it is treated as fallback behavior rather than the primary contract
+- **GIVEN** change `alpha` previously entered archive and recorded a durable archive failure state with primary reason `verification_failed`
+- **AND** the workspace file state is later detected as `Archiving`
+- **WHEN** the runtime resumes processing after process restart
+- **THEN** the archive resume context includes the previously recorded primary reason and summary
+- **AND** the next archive retry path can surface that reason to logs, events, or agent context without depending on in-memory history from the prior process
+
+### Requirement: Archived workspaces remain terminal even when durable archive state exists
+
+Durable archive retry/resume state MUST NOT cause an already archived workspace to re-enter apply, acceptance, or archive.
+
+#### Scenario: archived workspace ignores stale retry state and goes to merge handoff
+
+- **GIVEN** change `beta` has a durable archive retry state from an earlier failed archive attempt
+- **AND** current workspace file state is detected as `Archived`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as terminal for archive purposes and hands it off to merge handling
+- **AND** the stale durable archive retry state does not route the change back into apply, acceptance, or archive
+
+### Requirement: Archive retry observability includes a structured primary reason
+
+When archive is retried, resumed, or fails terminally, the runtime SHALL expose a structured primary reason plus supplemental context rather than only a generic retry/failure message.
+
+#### Scenario: archive retry log/event names the retry reason
+
+- **GIVEN** change `gamma` fails archive verification because the change directory still exists after the archive attempt
+- **WHEN** the runtime schedules another archive retry
+- **THEN** the retry log or event payload includes a primary archive reason indicating verification failure
+- **AND** the payload includes a summary describing the concrete symptom
+- **AND** downstream consumers do not have to infer the reason only from a generic `retrying archive command` string

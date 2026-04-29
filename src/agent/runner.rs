@@ -8,7 +8,9 @@ use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::history::{AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory};
+use crate::history::{
+    AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory, OutputCollector,
+};
 use crate::process_manager::{ManagedChild, StreamingChildHandle};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -891,7 +893,7 @@ impl AgentRunner {
         &self,
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
-    ) -> Result<ExitStatus> {
+    ) -> Result<(ExitStatus, Option<String>, Option<String>)> {
         let template = self.config.get_archive_command()?;
         let user_prompt = self.config.get_archive_prompt();
         let history_context = self.archive_history.format_context(change_id);
@@ -910,16 +912,28 @@ impl AgentRunner {
             .execute_streaming_with_retry(&command, None, Some("archive"), Some(change_id))
             .await?;
 
-        // Drain output (not needed for archive, but required to complete execution)
-        while let Some(_line) = output_rx.recv().await {
-            // Discard output - archive doesn't need it for history
+        // Collect output tails for downstream failure classification.
+        let mut output_collector = OutputCollector::new();
+        while let Some(line) = output_rx.recv().await {
+            match line {
+                AiOutputLine::Stdout(text) => {
+                    output_collector.add_stdout(&text);
+                }
+                AiOutputLine::Stderr(text) => {
+                    output_collector.add_stderr(&text);
+                }
+            }
         }
 
         let status = child.wait().await.map_err(|e| {
             OrchestratorError::AgentCommand(format!("Archive command failed: {}", e))
         })?;
 
-        Ok(status)
+        Ok((
+            status,
+            output_collector.stdout_tail(),
+            output_collector.stderr_tail(),
+        ))
     }
 
     /// Analyze dependencies using the configured analyze command (blocking)

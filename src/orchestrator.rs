@@ -1325,6 +1325,28 @@ impl Orchestrator {
                         info!("Archive started for {}", change_id);
                         println!("[{} archive] {}", change_id, command);
                     }
+                    ParallelEvent::ArchiveResumed {
+                        change_id,
+                        reason,
+                        summary,
+                    } => {
+                        info!(
+                            "Archive resumed for {} (reason={:?}, summary={:?})",
+                            change_id, reason, summary
+                        );
+                    }
+                    ParallelEvent::ArchiveRetryScheduled {
+                        change_id,
+                        attempt,
+                        max_attempts,
+                        reason,
+                        summary,
+                    } => {
+                        warn!(
+                            "Archive retry scheduled for {} ({}/{}): reason={:?}, summary={:?}",
+                            change_id, attempt, max_attempts, reason, summary
+                        );
+                    }
                     ParallelEvent::ArchiveOutput {
                         change_id,
                         output,
@@ -1335,8 +1357,16 @@ impl Orchestrator {
                     ParallelEvent::ChangeArchived(change_id) => {
                         info!("Archived {}", change_id);
                     }
-                    ParallelEvent::ArchiveFailed { change_id, error } => {
-                        error!("Archive failed for {}: {}", change_id, error);
+                    ParallelEvent::ArchiveFailed {
+                        change_id,
+                        error,
+                        reason,
+                        summary,
+                    } => {
+                        error!(
+                            "Archive failed for {}: {} (reason={:?}, summary={:?})",
+                            change_id, error, reason, summary
+                        );
                     }
                     ParallelEvent::AllCompleted => {
                         info!("All parallel execution completed");

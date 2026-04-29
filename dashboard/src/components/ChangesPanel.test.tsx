@@ -95,7 +95,7 @@ describe('ChangesPanel bulk toggle', () => {
         projects={[buildProject()]}
         selectedProjectId="project-1"
         onOptimisticSelectionChange={onOptimisticSelectionChange}
-      />, 
+      />,
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Select all changes' }));

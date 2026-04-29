@@ -12,6 +12,7 @@
 //! - `orchestration`: order-based re-analysis scheduler loop
 
 mod acceptance_state;
+mod archive_state;
 mod builder;
 mod cleanup;
 mod conflict;

@@ -2,7 +2,7 @@
 
 use crate::history::{
     AcceptanceAttempt, AcceptanceHistory, ApplyAttempt, ApplyHistory, ArchiveAttempt,
-    ArchiveHistory,
+    ArchiveHistory, ArchivePrimaryReason,
 };
 use std::process::ExitStatus;
 use std::time::Instant;
@@ -59,6 +59,13 @@ pub fn record_archive_attempt(
             ))
         } else {
             Some(format!("Exit code: {:?}", status.code()))
+        },
+        primary_reason: if status.success() && verification_result.is_none() {
+            None
+        } else if verification_result.is_some() {
+            Some(ArchivePrimaryReason::VerificationFailed)
+        } else {
+            Some(ArchivePrimaryReason::CommandFailed)
         },
         verification_result,
         exit_code: status.code(),

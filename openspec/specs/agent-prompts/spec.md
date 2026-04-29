@@ -90,17 +90,24 @@ acceptance プロンプトは Git の作業ツリーが完全にクリーンで�
 - **AND** FINDINGS に未コミット変更と未追跡ファイルのパスを明記する
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
-acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイルと前回 findings を含める（MUST）。
 
-#### Scenario: 初回 acceptance で base 差分を提示する
-- **GIVEN** acceptance 初回で base branch が判定できる
-- **WHEN** acceptance プロンプトを構築する
-- **THEN** `<acceptance_diff_context>` に base branch → 現在コミットの変更ファイル一覧が含まれる
+acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイル一覧と前回 findings を含める（MUST）。
 
-#### Scenario: 2回目以降は前回 acceptance からの差分と findings を提示する
-- **GIVEN** acceptance の過去試行が存在する
-- **WHEN** acceptance プロンプトを構築する
-- **THEN** `<acceptance_diff_context>` に前回 acceptance からの差分ファイルと previous findings が含まれる
+acceptance プロンプトは、レビュー対象が archive へ進む前に **final archive commit が実際に成立するか** を確認する指示を含めなければならない（MUST）。ここで確認対象となるのは、archive フローに必要な commit を実際に阻害する blocker のみであり、pre-commit hook、test、lint、format、または特定言語の build/test tool の存在を一般論として仮定してはならない（MUST NOT）。
+
+acceptance は、archive フェーズで初めて発火する commit-path blocker を acceptance で先に露出しなければならない（MUST）。ただし、test / lint / format などを独立の一般 quality gate として追加要求してはならず（MUST NOT）、それらが実際の commit path を阻害する仕組みの一部である場合に限って、commitability の文脈で扱ってよい（MAY）。
+
+Conflux core の acceptance prompt builder は、特定アーキテクチャ・特定言語・特定 repository workflow に依存する gate をハードコードしてはならない（MUST NOT）。固定で埋め込める内容は、`load skills: cflx-*` のような workflow skill 読み込み、change metadata、paths、machine-readable protocol などの最小限に限定されなければならない（MUST）。
+
+archive readiness blocker が acceptance または archive CLI の事前検証で明示された場合、その blocker は downstream の archive 失敗表示でも primary root cause として保持されなければならない（MUST）。後続の file-state verification failure は補助説明として追加してよいが、earlier blocker summary を消してはならない（MUST NOT）。
+
+#### Scenario: acceptance-detected archive blocker survives later archive verification noise
+
+- **GIVEN** acceptance が change `beta` に対して archive readiness blocker を finding として記録している
+- **AND** その後の archive attempt では `openspec/changes/beta` が残って file-state verification も失敗する
+- **WHEN** orchestrator が最終 archive failure を履歴またはユーザー向けに整形する
+- **THEN** final message には acceptance/validation で見つかった blocker summary が含まれる
+- **AND** `changes` ディレクトリ残留は補助文脈としてのみ追加される
 
 ### Requirement: acceptance システムプロンプトは差分レビューの優先指示を含める
 acceptance システムプロンプトは、`<acceptance_diff_context>` が存在する場合に変更ファイルの確認を優先するよう明示的に指示しなければならない（MUST）。
@@ -264,26 +271,23 @@ unit test の主張と実際の test scope が一致しない場合、acceptance
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイルと前回 findings を含める（MUST）。また acceptance プロンプトは、レビュー対象が archive へ進む前に final archive commit を阻害する品質ゲートがないか確認する指示を含めなければならない（MUST）。その確認には、リポジトリ標準の final-commit quality gate（pre-commit hook、format、lint、test、またはそれに準ずる documented gate）を使い、archive フェーズで初めて発火する失敗を acceptance で先に露出させなければならない（MUST）。
+acceptance プロンプトは `<acceptance_diff_context>` ブロックで差分レビュー対象を提示しなければならない（MUST）。初回は base branch と現在コミットの差分ファイル一覧を含め、2回目以降は前回 acceptance のコミットからの差分ファイル一覧と前回 findings を含める（MUST）。
 
-#### Scenario: 初回 acceptance で base 差分を提示する
-- **GIVEN** acceptance 初回で base branch が判定できる
-- **WHEN** acceptance プロンプトを構築する
-- **THEN** `<acceptance_diff_context>` に base branch → 現在コミットの変更ファイル一覧が含まれる
+acceptance プロンプトは、レビュー対象が archive へ進む前に **final archive commit が実際に成立するか** を確認する指示を含めなければならない（MUST）。ここで確認対象となるのは、archive フローに必要な commit を実際に阻害する blocker のみであり、pre-commit hook、test、lint、format、または特定言語の build/test tool の存在を一般論として仮定してはならない（MUST NOT）。
 
-#### Scenario: 2回目以降は前回 acceptance からの差分と findings を提示する
-- **GIVEN** acceptance の過去試行が存在する
-- **WHEN** acceptance プロンプトを構築する
-- **THEN** `<acceptance_diff_context>` に前回 acceptance コミットからの変更ファイル一覧が含まれる
-- **AND** 前回 findings が含まれる
+acceptance は、archive フェーズで初めて発火する commit-path blocker を acceptance で先に露出しなければならない（MUST）。ただし、test / lint / format などを独立の一般 quality gate として追加要求してはならず（MUST NOT）、それらが実際の commit path を阻害する仕組みの一部である場合に限って、commitability の文脈で扱ってよい（MAY）。
 
-#### Scenario: acceptance prompts archive-readiness verification
-- **GIVEN** acceptance プロンプトが archive 前の最終レビューとして生成される
-- **WHEN** acceptance が実行される
-- **THEN** プロンプトは final archive commit を阻害する quality gate がないか確認するよう指示する
-- **AND** その gate failure を単なる後続 archive 問題として見逃さない
+Conflux core の acceptance prompt builder は、特定アーキテクチャ・特定言語・特定 repository workflow に依存する gate をハードコードしてはならない（MUST NOT）。固定で埋め込める内容は、`load skills: cflx-*` のような workflow skill 読み込み、change metadata、paths、machine-readable protocol などの最小限に限定されなければならない（MUST）。
 
-## Requirements
+archive readiness blocker が acceptance または archive CLI の事前検証で明示された場合、その blocker は downstream の archive 失敗表示でも primary root cause として保持されなければならない（MUST）。後続の file-state verification failure は補助説明として追加してよいが、earlier blocker summary を消してはならない（MUST NOT）。
+
+#### Scenario: acceptance-detected archive blocker survives later archive verification noise
+
+- **GIVEN** acceptance が change `beta` に対して archive readiness blocker を finding として記録している
+- **AND** その後の archive attempt では `openspec/changes/beta` が残って file-state verification も失敗する
+- **WHEN** orchestrator が最終 archive failure を履歴またはユーザー向けに整形する
+- **THEN** final message には acceptance/validation で見つかった blocker summary が含まれる
+- **AND** `changes` ディレクトリ残留は補助文脈としてのみ追加される
 
 ### Requirement: cflx-workflow MUST support cleanup-review operation prompts
 
@@ -321,27 +325,15 @@ acceptance は、archive フェーズで初めて発火する commit-path blocke
 
 Conflux core の acceptance prompt builder は、特定アーキテクチャ・特定言語・特定 repository workflow に依存する gate をハードコードしてはならない（MUST NOT）。固定で埋め込める内容は、`load skills: cflx-*` のような workflow skill 読み込み、change metadata、paths、machine-readable protocol などの最小限に限定されなければならない（MUST）。
 
-#### Scenario: acceptance prompts archive-commitability verification
+archive readiness blocker が acceptance または archive CLI の事前検証で明示された場合、その blocker は downstream の archive 失敗表示でも primary root cause として保持されなければならない（MUST）。後続の file-state verification failure は補助説明として追加してよいが、earlier blocker summary を消してはならない（MUST NOT）。
 
-- **GIVEN** acceptance プロンプトが archive 前の最終レビューとして生成される
-- **WHEN** acceptance が実行される
-- **THEN** プロンプトは final archive commit の成立を阻害する実 blocker がないか確認するよう指示する
-- **AND** その blocker failure を単なる後続 archive 問題として見逃さない
+#### Scenario: acceptance-detected archive blocker survives later archive verification noise
 
-#### Scenario: acceptance does not assume generic test or lint gates
-
-- **GIVEN** target repository に test、lint、format、pre-commit hook の一部または全部が存在しない
-- **WHEN** acceptance プロンプトを構築する
-- **THEN** プロンプトはそれらの存在を前提にしない
-- **AND** archive commit の成立可否のみを readiness の中心として扱う
-
-#### Scenario: commit-path hook remains relevant when it blocks archive commit
-
-- **GIVEN** target repository では通常の commit 実行時に pre-commit hook が走る
-- **AND** その hook failure が archive commit を実際に阻害する
-- **WHEN** acceptance が archive-readiness を判定する
-- **THEN** acceptance はその commit-path blocker を relevant な readiness finding として扱う
-- **AND** hook 内部の test/lint/format を独立 gate として追加列挙しない
+- **GIVEN** acceptance が change `beta` に対して archive readiness blocker を finding として記録している
+- **AND** その後の archive attempt では `openspec/changes/beta` が残って file-state verification も失敗する
+- **WHEN** orchestrator が最終 archive failure を履歴またはユーザー向けに整形する
+- **THEN** final message には acceptance/validation で見つかった blocker summary が含まれる
+- **AND** `changes` ディレクトリ残留は補助文脈としてのみ追加される
 
 ### Requirement: Operation-specific prompts MUST load dedicated skills
 
