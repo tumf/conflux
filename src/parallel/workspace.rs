@@ -11,7 +11,7 @@ use crate::parallel::ParallelEvent;
 use crate::vcs::{Workspace, WorkspaceManager};
 use std::collections::HashSet;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Get or create a workspace for a change.
 ///
@@ -33,8 +33,10 @@ pub async fn get_or_create_workspace(
     force_recreate_worktree: &HashSet<String>,
     event_tx: &Option<mpsc::Sender<ParallelEvent>>,
 ) -> Result<(Workspace, bool)> {
+    let force_recreate = force_recreate_worktree.contains(change_id);
+
     // Check for existing workspace (resume scenario)
-    if !no_resume && !force_recreate_worktree.contains(change_id) {
+    if !no_resume && !force_recreate {
         if let Ok(Some(workspace_info)) = workspace_manager.find_existing_workspace(change_id).await
         {
             info!(
@@ -51,6 +53,25 @@ pub async fn get_or_create_workspace(
                 )
                 .await;
                 return Ok((ws, true));
+            }
+        }
+    }
+
+    if force_recreate {
+        if let Ok(Some(workspace_info)) = workspace_manager.find_existing_workspace(change_id).await
+        {
+            info!(
+                "Dependency resolved for '{}': cleaning up stale workspace '{}' before fresh recreation",
+                change_id, workspace_info.workspace_name
+            );
+            if let Err(err) = workspace_manager
+                .cleanup_workspace(&workspace_info.workspace_name)
+                .await
+            {
+                warn!(
+                    "Failed to cleanup stale workspace '{}' for '{}': {}",
+                    workspace_info.workspace_name, change_id, err
+                );
             }
         }
     }

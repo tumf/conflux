@@ -1,8 +1,4 @@
-# parallel-analysis Specification
-
-## Purpose
-TBD - created by archiving change pass-approved-changes-to-analyzer. Update Purpose after archive.
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Parallel dependency analysis prompt
 

@@ -509,13 +509,33 @@ impl ParallelExecutor {
             OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
         })?;
 
+        let force_recreate = self.force_recreate_worktree.remove(&change_id);
+        if force_recreate {
+            info!(
+                "Dispatching '{}' with forced fresh workspace recreation after dependency resolution",
+                change_id
+            );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Log(LogEntry::info(format!(
+                    "Dependency resolved: forcing fresh workspace for {}",
+                    change_id
+                ))),
+            )
+            .await;
+        }
+
         // Create or reuse workspace; was_resumed=true means an existing workspace was reused.
+        let mut force_recreate_set = HashSet::new();
+        if force_recreate {
+            force_recreate_set.insert(change_id.clone());
+        }
         let (workspace_val, was_resumed) = workspace::get_or_create_workspace(
             self.workspace_manager.as_mut(),
             &change_id,
             &base_revision,
             self.no_resume,
-            &self.force_recreate_worktree,
+            &force_recreate_set,
             &self.event_tx,
         )
         .await?;
