@@ -27,7 +27,7 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::acceptance_resume_ready_for_archive;
-use super::archive_state::{load_archive_state, load_archive_state_matching};
+use super::archive_state::load_archive_state_matching;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
