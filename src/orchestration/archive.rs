@@ -148,7 +148,8 @@ where
         let start = std::time::Instant::now();
 
         // Execute archive command via AiCommandRunner (with shared stagger state)
-        let status = agent.run_archive_with_runner(&change.id, ai_runner).await?;
+        let (status, stdout_tail, stderr_tail) =
+            agent.run_archive_with_runner(&change.id, ai_runner).await?;
 
         if !status.success() {
             let error_msg = format!("Archive command failed with exit code: {:?}", status.code());
@@ -159,8 +160,8 @@ where
                 &status,
                 start,
                 Some(error_msg.clone()),
-                None, // No stdout available in non-streaming mode
-                None, // No stderr available in non-streaming mode
+                stdout_tail.clone(),
+                stderr_tail.clone(),
             );
 
             // Run on_error hook
@@ -193,9 +194,12 @@ where
         if verification_status.is_success() {
             // Record successful attempt
             agent.record_archive_attempt(
-                &change.id, &status, start, None,
-                None, // No stdout available in non-streaming mode
-                None, // No stderr available in non-streaming mode
+                &change.id,
+                &status,
+                start,
+                None,
+                stdout_tail.clone(),
+                stderr_tail.clone(),
             );
             break;
         }
@@ -212,8 +216,8 @@ where
             &status,
             start,
             Some(verification_reason.clone()),
-            None, // No stdout available in non-streaming mode
-            None, // No stderr available in non-streaming mode
+            stdout_tail.clone(),
+            stderr_tail.clone(),
         );
 
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
@@ -224,7 +228,8 @@ where
             continue;
         }
 
-        let runtime_blocker = extract_archive_runtime_blocker(None, None);
+        let runtime_blocker =
+            extract_archive_runtime_blocker(stdout_tail.as_deref(), stderr_tail.as_deref());
         let error_msg = build_archive_error_message(&change.id, None, runtime_blocker.as_deref());
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
@@ -691,18 +696,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "heavy-tests")]
-    use crate::config::OrchestratorConfig;
-    #[cfg(feature = "heavy-tests")]
-    use crate::hooks::HookRunner;
-    #[cfg(feature = "heavy-tests")]
-    use crate::openspec::Change;
-    #[cfg(feature = "heavy-tests")]
-    use crate::orchestration::output::NullOutputHandler;
-    #[cfg(feature = "heavy-tests")]
-    use std::fs;
-    #[cfg(feature = "heavy-tests")]
-    use tempfile::TempDir;
 
     #[test]
     fn test_archive_result_is_success() {
@@ -747,10 +740,120 @@ mod tests {
         assert!(archive_path.starts_with("openspec/changes/archive"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_archive_change_reports_runtime_blocker_when_archive_not_started() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            use crate::config::OrchestratorConfig;
+            use crate::hooks::HookRunner;
+            use crate::openspec::Change;
+            use crate::orchestration::output::NullOutputHandler;
+            use std::fs;
+            use tempfile::TempDir;
+            let temp_dir = TempDir::new().unwrap();
+
+            let change_id = "blocked-change";
+            let change_dir = temp_dir.path().join("openspec/changes").join(change_id);
+            fs::create_dir_all(&change_dir).unwrap();
+
+            let script_path = temp_dir.path().join("archive_blocked.sh");
+            let script = r#"#!/bin/sh
+printf 'ARCHIVE_READINESS_BLOCKER: missing accepted tasks\n'
+exit 0
+"#;
+            fs::write(&script_path, script).unwrap();
+
+            let config = OrchestratorConfig {
+                archive_command: Some(format!("sh \"{}\" {change_id}", script_path.display())),
+                // Keep regression test in default suite under 1s by removing queue staggering.
+                command_queue_stagger_delay_ms: Some(0),
+                ..Default::default()
+            };
+
+            let mut agent = AgentRunner::new(config.clone());
+            let hooks = HookRunner::empty();
+            let output = NullOutputHandler::new();
+            let context = ArchiveContext::new(0, 1, 1, 0);
+            let change = Change {
+                id: change_id.to_string(),
+                completed_tasks: 1,
+                total_tasks: 1,
+                last_modified: "".to_string(),
+                dependencies: Vec::new(),
+                metadata: crate::openspec::ProposalMetadata::default(),
+            };
+
+            use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
+            use crate::command_queue::CommandQueueConfig;
+            use crate::config::defaults::*;
+            use std::sync::Arc;
+            use tokio::sync::Mutex;
+            let queue_config = CommandQueueConfig {
+                stagger_delay_ms: config
+                    .command_queue_stagger_delay_ms
+                    .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+                max_retries: config
+                    .command_queue_max_retries
+                    .unwrap_or(DEFAULT_MAX_RETRIES),
+                retry_delay_ms: config
+                    .command_queue_retry_delay_ms
+                    .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+                retry_error_patterns: config
+                    .command_queue_retry_patterns
+                    .clone()
+                    .unwrap_or_else(default_retry_patterns),
+                retry_if_duration_under_secs: config
+                    .command_queue_retry_if_duration_under_secs
+                    .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+                inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+                inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
+                inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+                strict_process_cleanup: config.get_command_strict_process_cleanup(),
+            };
+            let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
+            let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+
+            let stall_config = OrchestratorConfig::default().get_stall_detection();
+            let result = archive_change(
+                &change,
+                &mut agent,
+                &ai_runner,
+                &hooks,
+                &context,
+                &output,
+                Some(temp_dir.path()),
+                &stall_config,
+            )
+            .await
+            .unwrap();
+
+            match result {
+                ArchiveResult::Failed { error } => {
+                    assert!(error.contains("ARCHIVE_READINESS_BLOCKER"));
+                    assert!(error.contains("missing accepted tasks"));
+                }
+                other => panic!("expected failure with blocker summary, got: {other:?}"),
+            }
+
+            assert!(change_dir.exists());
+        });
+    }
+
     #[cfg(feature = "heavy-tests")]
     #[cfg(unix)]
     #[tokio::test]
     async fn test_archive_change_retries_until_verified() {
+        use crate::config::OrchestratorConfig;
+        use crate::hooks::HookRunner;
+        use crate::openspec::Change;
+        use crate::orchestration::output::NullOutputHandler;
+        use std::fs;
+        use tempfile::TempDir;
         let temp_dir = TempDir::new().unwrap();
 
         let change_id = "retry-change";
