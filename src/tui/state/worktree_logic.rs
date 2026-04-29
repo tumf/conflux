@@ -13,6 +13,26 @@ pub(super) fn can_extract_change_id_from_worktree(worktree: &WorktreeInfo) -> bo
     !worktree.branch.is_empty() && !worktree.is_detached
 }
 
+pub(super) fn previous_worktree_cursor_index(current: usize, worktree_len: usize) -> Option<usize> {
+    if worktree_len == 0 {
+        return None;
+    }
+
+    Some(if current == 0 {
+        worktree_len - 1
+    } else {
+        current - 1
+    })
+}
+
+pub(super) fn next_worktree_cursor_index(current: usize, worktree_len: usize) -> Option<usize> {
+    if worktree_len == 0 {
+        return None;
+    }
+
+    Some((current + 1) % worktree_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +102,27 @@ mod tests {
 
         assert!(can_extract_change_id_from_worktree(&branch_set));
         assert!(!can_extract_change_id_from_worktree(&detached));
+    }
+
+    #[test]
+    fn previous_worktree_cursor_index_wraps_when_at_top() {
+        assert_eq!(previous_worktree_cursor_index(0, 3), Some(2));
+        assert_eq!(previous_worktree_cursor_index(2, 3), Some(1));
+    }
+
+    #[test]
+    fn previous_worktree_cursor_index_returns_none_for_empty_list() {
+        assert_eq!(previous_worktree_cursor_index(0, 0), None);
+    }
+
+    #[test]
+    fn next_worktree_cursor_index_wraps_when_at_bottom() {
+        assert_eq!(next_worktree_cursor_index(2, 3), Some(0));
+        assert_eq!(next_worktree_cursor_index(0, 3), Some(1));
+    }
+
+    #[test]
+    fn next_worktree_cursor_index_returns_none_for_empty_list() {
+        assert_eq!(next_worktree_cursor_index(0, 0), None);
     }
 }
