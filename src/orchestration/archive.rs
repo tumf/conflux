@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use crate::agent::AgentRunner;
+use crate::ai_command_runner::AiCommandRunner;
 use crate::config::StallDetectionConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::execution::archive::ArchiveVerificationResult;
@@ -280,6 +281,7 @@ where
 /// Returns the exit status and output collector.
 async fn execute_archive_command_streaming<O, F>(
     agent: &mut AgentRunner,
+    ai_runner: &AiCommandRunner,
     change_id: &str,
     attempt: u32,
     output: &O,
@@ -296,7 +298,9 @@ where
     use crate::agent::OutputLine;
 
     // Execute archive command with streaming
-    let (mut child, mut output_rx, start) = agent.run_archive_streaming(change_id, None).await?;
+    let (mut child, mut output_rx, start, _archive_command) = agent
+        .run_archive_streaming_with_runner(change_id, ai_runner, None)
+        .await?;
 
     // Create output collector for history
     let mut output_collector = OutputCollector::new();
@@ -522,6 +526,7 @@ where
 pub async fn archive_change_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
+    ai_runner: &AiCommandRunner,
     hooks: &HookRunner,
     context: &ArchiveContext,
     output: &O,
@@ -570,6 +575,7 @@ where
         // Execute archive command with streaming
         let (status, output_collector, start) = match execute_archive_command_streaming(
             agent,
+            ai_runner,
             &change.id,
             attempt,
             output,

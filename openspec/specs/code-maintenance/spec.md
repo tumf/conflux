@@ -440,3 +440,29 @@ archive ループの実装は、フック実行・コマンド実行・検証・
 - **WHEN** AppState 更新が実行される
 - **THEN** 表示オフセット、auto-scroll、cursor 移動、guard 判定は既存どおりである
 - **AND** `src/tui/state.rs` の構造整理は利用者可視の挙動を変えない
+
+#### Scenario: リファクタ後もマージガードの判定が変わらない
+- **GIVEN** ワークツリーのマージ前提条件を満たさない状態がある
+- **WHEN** TUI がマージ可能性を検証する
+- **THEN** 既存どおりマージは拒否される
+- **AND** CLI公開挙動は変更されない
+
+### Requirement: AgentRunner の現役実行経路を単一化する
+
+システムは Agent 実行の正系フローとして、AiCommandRunner ベースの現役経路を明確に維持しなければならない（SHALL）。
+
+レガシー entrypoint を互換上の理由で残す場合でも、それらは現役フローと混在しない明示的な境界に隔離され、prompt 展開順・履歴注入順・出力伝播の公開挙動を変えてはならない（MUST）。
+
+#### Scenario: apply / acceptance / archive / analyze / resolve の正系挙動が維持される
+
+- **GIVEN** CLI / TUI / server が Agent 実行を開始する
+- **WHEN** apply / acceptance / archive / analyze / resolve のいずれかを実行する
+- **THEN** prompt 展開順、履歴注入順、出力伝播はリファクタ前と同じである
+- **AND** 利用者から見える API / CLI の挙動は変化しない
+
+#### Scenario: レガシー entrypoint は現役フローから分離される
+
+- **GIVEN** 開発者が `src/agent/runner.rs` 周辺の実装を調査する
+- **WHEN** AgentRunner の実行 entrypoint を確認する
+- **THEN** 現役経路とレガシー経路の境界が明確である
+- **AND** 不要な `#[allow(dead_code)]` が正系フローの理解を妨げない

@@ -484,6 +484,7 @@ impl ProjectRegistry {
     }
 
     /// Clear the tracked error state for a change.
+    #[allow(dead_code)]
     pub fn clear_change_error(&mut self, project_id: &str, change_id: &str) {
         if let Some(project_errors) = self.error_changes.get_mut(project_id) {
             project_errors.remove(change_id);

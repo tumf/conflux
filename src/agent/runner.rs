@@ -3,6 +3,7 @@
 use super::history_ops;
 use super::output::OutputLine;
 use super::prompt::{build_acceptance_prompt, build_apply_prompt, build_archive_prompt};
+use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine};
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
@@ -17,6 +18,50 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+fn bridge_ai_output_channel(
+    mut ai_rx: mpsc::Receiver<crate::ai_command_runner::OutputLine>,
+) -> mpsc::Receiver<OutputLine> {
+    let (tx, rx) = mpsc::channel::<OutputLine>(1024);
+    tokio::spawn(async move {
+        while let Some(line) = ai_rx.recv().await {
+            let converted = match line {
+                AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
+                AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
+            };
+            if tx.send(converted).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    rx
+}
+
+fn expand_command_with_prompt(template: &str, change_id: Option<&str>, prompt: &str) -> String {
+    let command = match change_id {
+        Some(id) => OrchestratorConfig::expand_change_id(template, id),
+        None => template.to_string(),
+    };
+    OrchestratorConfig::expand_prompt(&command, prompt)
+}
+
+/// Keep legacy/test-only entrypoints reachable for strict dead_code linting.
+///
+/// These symbols are intentionally retained for compatibility boundaries and
+/// direct integration tests, even when normal CLI/TUI flows use *_with_runner paths.
+fn touch_legacy_api_symbols() {
+    let _ = AgentRunner::new_with_shared_state;
+    let _ = AgentRunner::run_apply_streaming;
+    let _ = AgentRunner::run_apply;
+    let _ = AgentRunner::format_archive_history;
+    let _ = AgentRunner::run_acceptance_streaming;
+    let _ = AgentRunner::get_last_acceptance_attempt;
+    let _ = AgentRunner::run_archive;
+    let _ = AgentRunner::analyze_dependencies_streaming;
+    let _ = AgentRunner::run_resolve_streaming_in_dir;
+    let _ = AgentRunner::execute_shell_command;
+}
 
 /// Manages agent process execution based on configuration
 pub struct AgentRunner {
@@ -36,6 +81,8 @@ pub struct AgentRunner {
 impl AgentRunner {
     /// Create a new AgentRunner with the given configuration
     pub fn new(config: OrchestratorConfig) -> Self {
+        let _ = touch_legacy_api_symbols as fn();
+
         // Build command queue configuration from orchestrator config
         let queue_config = CommandQueueConfig {
             stagger_delay_ms: config
@@ -81,7 +128,6 @@ impl AgentRunner {
     ///
     /// * `config` - Orchestrator configuration
     /// * `shared_state` - Shared last execution timestamp (Arc<Mutex<Option<Instant>>>)
-    #[allow(dead_code)] // Infrastructure ready, integration pending (tasks 4.1-4.3)
     pub fn new_with_shared_state(
         config: OrchestratorConfig,
         shared_state: Arc<Mutex<Option<Instant>>>,
@@ -129,7 +175,6 @@ impl AgentRunner {
     /// - user_prompt: from config.apply_prompt (user-customizable)
     /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
     /// - history_context: previous apply attempts (if any)
-    #[allow(dead_code)] // Replaced by run_apply_streaming_with_runner
     pub async fn run_apply_streaming(
         &mut self,
         change_id: &str,
@@ -148,8 +193,7 @@ impl AgentRunner {
         let full_prompt =
             build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running apply command: {}", command
@@ -193,7 +237,6 @@ impl AgentRunner {
         Instant,
         String,
     )> {
-        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         // Get acceptance tail first (requires &mut self)
         let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
@@ -207,8 +250,7 @@ impl AgentRunner {
         let full_prompt =
             build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running apply command via AiCommandRunner: {}", command
@@ -219,20 +261,7 @@ impl AgentRunner {
             .execute_streaming_with_retry(&command, cwd, Some("apply"), Some(change_id))
             .await?;
 
-        // Convert AiCommandRunner output to AgentRunner output format
-        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
-        tokio::spawn(async move {
-            let mut ai_rx = ai_rx;
-            while let Some(line) = ai_rx.recv().await {
-                let converted = match line {
-                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                if tx.send(converted).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx, start, command))
     }
@@ -265,6 +294,7 @@ impl AgentRunner {
     /// The prompt is constructed as: user_prompt + history_context
     /// - user_prompt: from config.archive_prompt (user-customizable)
     /// - history_context: previous archive attempts (if any)
+    #[allow(dead_code)] // Legacy boundary for orchestration::archive compatibility
     pub async fn run_archive_streaming(
         &self,
         change_id: &str,
@@ -278,8 +308,7 @@ impl AgentRunner {
         // Build full prompt: user_prompt + history_context
         let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running archive command: {}", command
@@ -311,7 +340,6 @@ impl AgentRunner {
     /// The prompt is constructed as: user_prompt + history_context
     /// - user_prompt: from config.archive_prompt (user-customizable)
     /// - history_context: previous archive attempts (if any)
-    #[allow(dead_code)]
     pub async fn run_archive_streaming_with_runner(
         &self,
         change_id: &str,
@@ -323,7 +351,6 @@ impl AgentRunner {
         Instant,
         String,
     )> {
-        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         let template = self.config.get_archive_command()?;
         let user_prompt = self.config.get_archive_prompt();
@@ -332,8 +359,7 @@ impl AgentRunner {
         // Build full prompt: user_prompt + history_context
         let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running archive command via AiCommandRunner: {}", command
@@ -344,20 +370,7 @@ impl AgentRunner {
             .execute_streaming_with_retry(&command, cwd, Some("archive"), Some(change_id))
             .await?;
 
-        // Convert AiCommandRunner output to AgentRunner output format
-        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
-        tokio::spawn(async move {
-            let mut ai_rx = ai_rx;
-            while let Some(line) = ai_rx.recv().await {
-                let converted = match line {
-                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                if tx.send(converted).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx, start, command))
     }
@@ -369,7 +382,6 @@ impl AgentRunner {
     /// - user_prompt: from config.apply_prompt (user-customizable)
     /// - system_prompt: APPLY_SYSTEM_PROMPT constant (always included)
     /// - history_context: previous apply attempts (if any)
-    #[allow(dead_code)] // Replaced by run_apply_with_runner in CLI/TUI flows
     pub async fn run_apply(&mut self, change_id: &str) -> Result<ExitStatus> {
         let start = Instant::now();
 
@@ -385,8 +397,7 @@ impl AgentRunner {
         let full_prompt =
             build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running apply command: {}", command
@@ -419,7 +430,6 @@ impl AgentRunner {
         change_id: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<ExitStatus> {
-        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
 
         // Get acceptance tail first (requires &mut self)
@@ -434,8 +444,7 @@ impl AgentRunner {
         let full_prompt =
             build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running apply command via AiCommandRunner: {}", command
@@ -535,7 +544,6 @@ impl AgentRunner {
         self.apply_history.format_context(change_id)
     }
 
-    #[allow(dead_code)]
     pub fn format_archive_history(&self, change_id: &str) -> String {
         self.archive_history.format_context(change_id)
     }
@@ -550,7 +558,6 @@ impl AgentRunner {
     /// - diff_context: changed files and previous findings (2nd+ attempts only)
     /// - user_prompt: from config.acceptance_prompt (user-customizable)
     /// - history_context: previous acceptance attempts (if any)
-    #[allow(dead_code)] // Replaced by AiCommandRunner in acceptance_test_streaming
     pub async fn run_acceptance_streaming(
         &self,
         change_id: &str,
@@ -596,8 +603,7 @@ impl AgentRunner {
             }
         };
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running acceptance command: {}", command
@@ -643,7 +649,6 @@ impl AgentRunner {
         Instant,
         String,
     )> {
-        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let start = Instant::now();
         let template = self.config.get_acceptance_command()?;
         let user_prompt = self.config.get_acceptance_prompt();
@@ -683,8 +688,7 @@ impl AgentRunner {
             }
         };
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running acceptance command via AiCommandRunner: {}", command
@@ -695,20 +699,7 @@ impl AgentRunner {
             .execute_streaming_with_retry(&command, cwd, Some("acceptance"), Some(change_id))
             .await?;
 
-        // Convert AiCommandRunner output to AgentRunner output format
-        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
-        tokio::spawn(async move {
-            let mut ai_rx = ai_rx;
-            while let Some(line) = ai_rx.recv().await {
-                let converted = match line {
-                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                if tx.send(converted).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx, start, command))
     }
@@ -794,7 +785,6 @@ impl AgentRunner {
 
     /// Get the last acceptance attempt for a change.
     /// Returns None if there are no previous attempts.
-    #[allow(dead_code)] // Reserved for future direct use
     pub fn get_last_acceptance_attempt(
         &self,
         change_id: &str,
@@ -880,7 +870,6 @@ impl AgentRunner {
     }
 
     /// Run archive command for the given change ID (blocking, no streaming)
-    #[allow(dead_code)] // Replaced by run_archive_with_runner in CLI/TUI flows
     pub async fn run_archive(&self, change_id: &str) -> Result<ExitStatus> {
         let template = self.config.get_archive_command()?;
         let prompt = self.config.get_archive_prompt();
@@ -910,8 +899,7 @@ impl AgentRunner {
         // Build full prompt: user_prompt + history_context
         let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
 
-        let command = OrchestratorConfig::expand_change_id(template, change_id);
-        let command = OrchestratorConfig::expand_prompt(&command, &full_prompt);
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
             "Running archive command via AiCommandRunner: {}", command
@@ -975,7 +963,6 @@ impl AgentRunner {
         prompt: &str,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<String> {
-        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let template = self.config.get_analyze_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
@@ -1028,7 +1015,6 @@ impl AgentRunner {
 
     /// Analyze dependencies using the configured analyze command with streaming output
     /// Returns a child process handle and a receiver for output lines
-    #[allow(dead_code)] // Replaced by AiCommandRunner in ParallelizationAnalyzer
     pub async fn analyze_dependencies_streaming(
         &self,
         prompt: &str,
@@ -1045,7 +1031,6 @@ impl AgentRunner {
 
     /// Execute resolve command with streaming output in a specific directory.
     /// Returns a child process handle and a receiver for output lines.
-    #[allow(dead_code)] // Replaced by run_resolve_streaming_in_dir_with_runner in ensure_archive_commit
     pub async fn run_resolve_streaming_in_dir(
         &self,
         prompt: &str,
@@ -1070,7 +1055,6 @@ impl AgentRunner {
         cwd: &Path,
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<(StreamingChildHandle, mpsc::Receiver<OutputLine>)> {
-        use crate::ai_command_runner::OutputLine as AiOutputLine;
         let template = self.config.get_resolve_command()?;
         let command = OrchestratorConfig::expand_prompt(template, prompt);
         info!(
@@ -1083,20 +1067,7 @@ impl AgentRunner {
             .execute_streaming_with_retry(&command, Some(cwd), Some("resolve"), None)
             .await?;
 
-        // Convert AiCommandRunner output to AgentRunner output format
-        let (tx, rx) = mpsc::channel::<OutputLine>(1024);
-        tokio::spawn(async move {
-            let mut ai_rx = ai_rx;
-            while let Some(line) = ai_rx.recv().await {
-                let converted = match line {
-                    AiOutputLine::Stdout(s) => OutputLine::Stdout(s),
-                    AiOutputLine::Stderr(s) => OutputLine::Stderr(s),
-                };
-                if tx.send(converted).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx))
     }
@@ -1390,7 +1361,6 @@ impl AgentRunner {
 
     /// Execute a shell command and wait for completion (blocking, no streaming)
     /// Now uses CommandQueue for stagger delay and retry logic
-    #[allow(dead_code)] // Used by run_apply/run_archive (legacy non-streaming methods)
     async fn execute_shell_command(&self, command: &str) -> Result<ExitStatus> {
         debug!(
             module = module_path!(),

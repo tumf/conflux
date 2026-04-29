@@ -8,13 +8,15 @@ use axum::Router;
 use tempfile::TempDir;
 
 use crate::server::api::{
-    build_router, refresh_project_sync_states_once, AppState, SERVER_LOG_BUFFER_SIZE,
+    build_router, create_state_update_channel, refresh_project_sync_states_once, AppState,
+    SERVER_LOG_BUFFER_SIZE,
 };
 use crate::server::registry::{create_shared_registry, OrchestrationStatus};
 
 pub(crate) fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
     let registry = create_shared_registry(temp_dir.path(), 4).unwrap();
     let (log_tx, _) = tokio::sync::broadcast::channel(SERVER_LOG_BUFFER_SIZE);
+    let state_update_tx = create_state_update_channel();
     AppState {
         registry,
         runners: crate::server::runner::create_shared_runners(),
@@ -23,6 +25,7 @@ pub(crate) fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppSta
         max_concurrent_total: 4,
         resolve_command: None,
         log_tx,
+        state_update_tx,
         orchestration_status: Arc::new(tokio::sync::RwLock::new(OrchestrationStatus::default())),
         shared_orchestrator_state: Arc::new(tokio::sync::RwLock::new(
             crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
