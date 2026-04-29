@@ -1206,12 +1206,19 @@ impl OrchestratorState {
             }
             ExecutionEvent::ResolveCompleted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if matches!(rt.activity, ActivityState::Resolving) {
+                if !rt.is_terminal()
+                    && !rt.dequeued
+                    && (matches!(rt.activity, ActivityState::Resolving)
+                        || matches!(rt.wait_state, WaitState::ResolveWait))
+                {
                     rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::None;
                     // Successful resolve means the change is now merged. Setting terminal
                     // prevents a subsequent ChangesRefreshed from resurrecting ResolveWait
                     // via apply_observation (which skips terminal entries).
                     rt.terminal = TerminalState::Merged;
+                    rt.queue_intent = QueueIntent::NotQueued;
+                    rt.clear_blocked_metadata();
                 }
                 self.resolve_wait_queue.retain(|id| id != change_id);
             }
@@ -1284,6 +1291,7 @@ impl OrchestratorState {
                 rt.clear_blocked_metadata();
                 rt.queue_intent = QueueIntent::NotQueued;
                 rt.dequeued = true;
+                self.resolve_wait_queue.retain(|id| id != change_id);
             }
 
             // Dynamic queue support
@@ -2154,26 +2162,30 @@ mod tests {
     fn test_resolve_completed_clears_resolve_wait_and_survives_refresh() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        // Parallel mode is required to model MergeWait/ResolveWait lifecycle.
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
 
-        // Step 1: change reaches MergeWait via manual-intervention deferral.
-        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
-            change_id: "c".to_string(),
-            reason: "base dirty".to_string(),
-            auto_resumable: false,
-        });
+        // Step 1: change archived -> enters MergeWait in parallel mode.
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
         assert_eq!(state.display_status("c"), "merge wait");
 
         // Step 2: user triggers manual resolve → reducer transitions to ResolveWait.
         state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
         assert_eq!(state.display_status("c"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["c".to_string()]);
 
-        // Step 3: resolve task starts.
-        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
-            change_id: "c".to_string(),
-            command: "resolve".to_string(),
+        // Step 3: a refresh still sees merge_wait/worktree branch and emits observations.
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![],
+            committed_change_ids: std::collections::HashSet::new(),
+            uncommitted_file_change_ids: std::collections::HashSet::new(),
+            worktree_change_ids: std::collections::HashSet::from(["c".to_string()]),
+            worktree_paths: std::collections::HashMap::new(),
+            worktree_not_ahead_ids: std::collections::HashSet::new(),
+            merge_wait_ids: std::collections::HashSet::from(["c".to_string()]),
         });
-        assert_eq!(state.display_status("c"), "resolving");
+        assert_eq!(state.display_status("c"), "resolve pending");
 
         // Step 4: resolve succeeds → must transition to merged, not stall at resolve pending.
         state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
@@ -2181,22 +2193,26 @@ mod tests {
             worktree_change_ids: None,
         });
         assert_eq!(state.display_status("c"), "merged");
+        assert!(
+            state.resolve_wait_change_ids().is_empty(),
+            "resolve completion must clear queued resolve intent"
+        );
 
-        // Step 5: a subsequent ChangesRefreshed (workspace still shows the archived worktree)
+        // Step 5: another refresh still seeing stale merge_wait/worktree signals
         // must NOT regress the row back to "resolve pending" or "merge wait".
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
-            committed_change_ids: Default::default(),
-            uncommitted_file_change_ids: Default::default(),
-            worktree_change_ids: Default::default(),
-            worktree_paths: Default::default(),
-            worktree_not_ahead_ids: Default::default(),
-            // Change still appears in merge_wait_ids from workspace scan.
-            merge_wait_ids: ["c".to_string()].into_iter().collect(),
+            committed_change_ids: std::collections::HashSet::new(),
+            uncommitted_file_change_ids: std::collections::HashSet::new(),
+            worktree_change_ids: std::collections::HashSet::from(["c".to_string()]),
+            worktree_paths: std::collections::HashMap::new(),
+            worktree_not_ahead_ids: std::collections::HashSet::new(),
+            merge_wait_ids: std::collections::HashSet::from(["c".to_string()]),
         });
-        assert_eq!(
+        assert_eq!(state.display_status("c"), "merged");
+        assert_ne!(
             state.display_status("c"),
-            "merged",
+            "resolve pending",
             "row must not regress to resolve pending after successful resolve + refresh"
         );
     }

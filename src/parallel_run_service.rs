@@ -418,6 +418,7 @@ impl ParallelRunService {
     ///
     /// The `shared_queue_change` parameter allows tracking queue changes across multiple
     /// re-analysis iterations for proper debouncing behavior.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_parallel_with_channel_and_queue_state(
         &self,
         changes: Vec<Change>,

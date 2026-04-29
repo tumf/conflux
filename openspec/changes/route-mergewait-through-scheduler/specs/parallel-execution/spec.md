@@ -10,6 +10,8 @@ When execution slots remain available, queued changes and retry-eligible `MergeW
 
 Completion of a scheduler-owned merge / resolve retry MUST feed back into the same completion semantics used for ordinary scheduler progress, so that re-analysis and dispatch resume from scheduler state rather than from a TUI-only notify side effect.
 
+Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer state), scheduler loop is the **sole execution owner** for merge/resolve retry start, and reducer completion events (`ResolveCompleted`/`ResolveFailed`) are the **sole authority** for clearing or transitioning wait state.
+
 #### Scenario: M key registers retry intent instead of direct execution
 - **GIVEN** change `alpha` is in `MergeWait`
 - **WHEN** the user presses `M`

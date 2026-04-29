@@ -362,6 +362,7 @@ impl ParallelExecutor {
         Ok(MergeAttempt::Merged { revision })
     }
 
+    #[cfg(test)]
     pub async fn resolve_merge_for_change(&mut self, change_id: &str) -> Result<()> {
         let workspace_info = self
             .workspace_manager
@@ -782,6 +783,7 @@ impl ParallelExecutor {
     }
 }
 
+#[cfg(test)]
 pub async fn resolve_deferred_merge(
     repo_root: PathBuf,
     config: crate::config::OrchestratorConfig,

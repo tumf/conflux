@@ -8,6 +8,8 @@ The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned sched
 
 Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
+Canonical rule: ownership is split as **intent in reducer**, **execution in scheduler**, **completion semantics in reducer events**. `ResolveCompleted` MUST clear `ResolveWait` intent and set terminal lifecycle consistently, while dequeue/stop/cancel paths MUST also clear queued resolve intent so refresh cannot reintroduce stale `resolve pending` state.
+
 #### Scenario: resolve request becomes scheduler-visible intent
 - **GIVEN** change `alpha` is in `MergeWait`
 - **WHEN** the user requests resolve via `M`
