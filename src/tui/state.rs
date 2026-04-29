@@ -15,20 +15,20 @@
 //! Both TUI and Web states are updated via `ExecutionEvent` messages, ensuring consistency.
 
 use crate::openspec::Change;
-use crate::task_parser;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
 use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
-use crate::vcs::GitWorkspaceManager;
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 mod log_logic;
+mod processing_logic;
 mod selection_logic;
+mod worktree_action_logic;
 mod worktree_logic;
 
 fn apply_remote_status(change: &mut ChangeState, status: &str) {
@@ -443,24 +443,28 @@ impl AppState {
 
     /// Move worktree cursor up
     pub fn worktree_cursor_up(&mut self) {
-        if self.worktrees.is_empty() {
+        let Some(next_index) = worktree_logic::previous_worktree_cursor_index(
+            self.worktree_cursor_index,
+            self.worktrees.len(),
+        ) else {
             return;
-        }
-        self.worktree_cursor_index = if self.worktree_cursor_index == 0 {
-            self.worktrees.len() - 1
-        } else {
-            self.worktree_cursor_index - 1
         };
+
+        self.worktree_cursor_index = next_index;
         self.worktree_list_state
             .select(Some(self.worktree_cursor_index));
     }
 
     /// Move worktree cursor down
     pub fn worktree_cursor_down(&mut self) {
-        if self.worktrees.is_empty() {
+        let Some(next_index) = worktree_logic::next_worktree_cursor_index(
+            self.worktree_cursor_index,
+            self.worktrees.len(),
+        ) else {
             return;
-        }
-        self.worktree_cursor_index = (self.worktree_cursor_index + 1) % self.worktrees.len();
+        };
+
+        self.worktree_cursor_index = next_index;
         self.worktree_list_state
             .select(Some(self.worktree_cursor_index));
     }
@@ -492,57 +496,27 @@ impl AppState {
     ///
     /// Returns Some(TuiCommand) if deletion should proceed, None if it should be blocked
     pub fn request_worktree_delete_from_list(&mut self) -> Option<TuiCommand> {
-        if self.worktrees.is_empty() || self.worktree_cursor_index >= self.worktrees.len() {
-            return None;
-        }
-
-        let worktree = &self.worktrees[self.worktree_cursor_index];
-
-        // Cannot delete main worktree
-        if worktree.is_main {
-            self.warning_message = Some("Cannot delete main worktree".to_string());
-            return None;
-        }
-
-        // Extract change_id from worktree branch name
-        let change_id_opt = if worktree_logic::can_extract_change_id_from_worktree(worktree) {
-            GitWorkspaceManager::extract_change_id_from_worktree_name(&worktree.branch)
-        } else {
-            None
-        };
-
-        // Check if the worktree is related to a change that is queued or processing
-        if let Some(change_id) = change_id_opt {
-            if let Some(change) = self.changes.iter().find(|c| c.id == change_id) {
-                // Block deletion if change is in active processing states
-                if worktree_logic::is_change_in_active_state(change) {
-                    self.warning_message = Some(format!(
-                        "Cannot delete worktree: change '{}' is {}",
-                        change_id,
-                        change.display_status_cache.as_str()
-                    ));
-                    return None;
-                }
+        match worktree_action_logic::validate_delete_request(
+            &self.worktrees,
+            self.worktree_cursor_index,
+            &self.changes,
+        ) {
+            Ok((path, branch)) => {
+                worktree_action_logic::apply_delete_confirmation_state(
+                    path,
+                    branch,
+                    &mut self.mode,
+                    &mut self.pending_worktree_action,
+                    &mut self.pending_worktree_branch,
+                    &mut self.previous_mode,
+                );
+                None
+            }
+            Err(msg) => {
+                self.warning_message = Some(msg);
+                None
             }
         }
-
-        // Get the worktree path as string
-        let path_str = worktree.path.display().to_string();
-
-        // Get the branch name (if not detached and branch exists)
-        let branch_name = if !worktree.is_detached && !worktree.branch.is_empty() {
-            Some(worktree.branch.clone())
-        } else {
-            None
-        };
-
-        // Store pending action for confirmation
-        self.pending_worktree_action = Some((path_str, WorktreeAction::Delete));
-        self.pending_worktree_branch = branch_name;
-        self.previous_mode = Some(self.mode.clone());
-        self.mode = AppMode::ConfirmWorktreeDelete;
-
-        None // User needs to confirm first
     }
 
     /// Confirm and execute pending worktree action
@@ -581,82 +555,7 @@ impl AppState {
     ///
     /// Returns Some(TuiCommand) if merge should proceed, None if blocked.
     pub fn request_merge_worktree_branch(&mut self) -> Option<TuiCommand> {
-        debug!(
-            "request_merge_worktree_branch called: view_mode={:?}, worktrees_len={}, cursor_index={}",
-            self.view_mode,
-            self.worktrees.len(),
-            self.worktree_cursor_index
-        );
-
-        // Validate view mode
-        if let guards::MergeGuardResult::Blocked(msg) = guards::validate_view_mode(self.view_mode) {
-            debug!(
-                "Merge blocked: view_mode is {:?}, not Worktrees",
-                self.view_mode
-            );
-            self.warning_message = Some(msg);
-            return None;
-        }
-
-        // Validate not resolving
-        if let guards::MergeGuardResult::Blocked(msg) =
-            guards::validate_not_resolving(self.is_resolving)
-        {
-            debug!("Merge blocked: resolve operation in progress");
-            self.warning_message = Some(msg);
-            return None;
-        }
-
-        // Validate worktrees not empty
-        if let guards::MergeGuardResult::Blocked(msg) =
-            guards::validate_worktrees_not_empty(self.worktrees.len())
-        {
-            debug!("Merge blocked: worktrees list is empty");
-            self.warning_message = Some(msg);
-            return None;
-        }
-
-        // Validate cursor in bounds
-        if let guards::MergeGuardResult::Blocked(msg) =
-            guards::validate_cursor_in_bounds(self.worktree_cursor_index, self.worktrees.len())
-        {
-            debug!(
-                "Merge blocked: cursor out of range: {} >= {}",
-                self.worktree_cursor_index,
-                self.worktrees.len()
-            );
-            self.warning_message = Some(msg);
-            return None;
-        }
-
-        let worktree = &self.worktrees[self.worktree_cursor_index];
-        debug!(
-            "Worktree selected: path={}, branch={}, is_main={}, is_detached={}, has_conflict={}",
-            worktree.path.display(),
-            worktree.branch,
-            worktree.is_main,
-            worktree.is_detached,
-            worktree.has_merge_conflict()
-        );
-
-        // Validate worktree is mergeable
-        if let guards::MergeGuardResult::Blocked(msg) =
-            guards::validate_worktree_mergeable(worktree)
-        {
-            debug!("Merge blocked: worktree validation failed");
-            self.warning_message = Some(msg);
-            return None;
-        }
-
-        // Get worktree path and branch name
-        let path = worktree.path.clone();
-        let branch_name = worktree.branch.clone();
-
-        debug!("Merge initiated: creating TuiCommand::MergeWorktreeBranch");
-        Some(TuiCommand::MergeWorktreeBranch {
-            worktree_path: path,
-            branch_name,
-        })
+        worktree_action_logic::request_merge_worktree_branch(self)
     }
 
     /// Toggle selection of the current change
@@ -667,82 +566,7 @@ impl AppState {
     /// In Running/Completed mode:
     /// - Changes can be added to or removed from the queue
     pub fn toggle_selection(&mut self) -> Option<TuiCommand> {
-        if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
-            return None;
-        }
-
-        let change = &mut self.changes[self.cursor_index];
-
-        // Validate that the change can be toggled
-        if let guards::ToggleGuardResult::Blocked(msg) = guards::validate_change_toggleable(
-            change.is_parallel_eligible,
-            self.parallel_mode,
-            &change.display_status_cache,
-            &change.id,
-        ) {
-            self.warning_message = Some(msg);
-            return None;
-        }
-
-        // Dispatch to mode-specific handlers
-        match self.mode {
-            AppMode::Select => {
-                match guards::handle_toggle_select_mode(change, &mut self.new_change_count) {
-                    guards::ToggleActionResult::StateOnly(log_msg) => {
-                        if let Some(msg) = log_msg {
-                            self.add_log(LogEntry::info(msg));
-                        }
-                        None
-                    }
-                    guards::ToggleActionResult::Command(cmd, log_msg) => {
-                        if let Some(msg) = log_msg {
-                            self.add_log(LogEntry::info(msg));
-                        }
-                        Some(cmd)
-                    }
-                    guards::ToggleActionResult::None => None,
-                }
-            }
-            AppMode::Running => {
-                match guards::handle_toggle_running_mode(change, &mut self.new_change_count) {
-                    guards::ToggleActionResult::StateOnly(log_msg) => {
-                        if let Some(msg) = log_msg {
-                            self.add_log(LogEntry::info(msg));
-                        }
-                        None
-                    }
-                    guards::ToggleActionResult::Command(cmd, log_msg) => {
-                        if let Some(msg) = log_msg {
-                            self.add_log(LogEntry::info(msg));
-                        }
-                        Some(cmd)
-                    }
-                    guards::ToggleActionResult::None => None,
-                }
-            }
-            AppMode::Stopped => {
-                match guards::handle_toggle_stopped_mode(change, &mut self.new_change_count) {
-                    guards::ToggleActionResult::StateOnly(log_msg) => {
-                        if let Some(msg) = log_msg {
-                            self.add_log(LogEntry::info(msg));
-                        }
-                        None
-                    }
-                    guards::ToggleActionResult::Command(cmd, log_msg) => {
-                        if let Some(msg) = log_msg {
-                            self.add_log(LogEntry::info(msg));
-                        }
-                        Some(cmd)
-                    }
-                    guards::ToggleActionResult::None => None,
-                }
-            }
-            AppMode::Stopping
-            | AppMode::Error
-            | AppMode::ConfirmWorktreeDelete
-            | AppMode::QrPopup
-            | AppMode::ConfirmForceKill { .. } => None,
-        }
+        selection_logic::toggle_selection(self)
     }
 
     fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
@@ -1093,175 +917,19 @@ impl AppState {
 
     /// Start processing selected changes
     pub fn start_processing(&mut self) -> Option<TuiCommand> {
-        if self.mode != AppMode::Select {
-            return None;
-        }
-
-        // Only NotQueued changes can be transitioned to Queued by StartProcessing.
-        // Active states (Applying, Accepting, Archiving, Blocked, Queued) and terminal
-        // states (Merged, Error, MergeWait, ResolveWait, Archived) are excluded.
-        let selected: Vec<String> = self
-            .changes
-            .iter()
-            .filter(|c| c.selected && matches!(c.display_status_cache.as_str(), "not queued"))
-            .map(|c| c.id.clone())
-            .collect();
-
-        if self.parallel_mode {
-            let ineligible: Vec<String> = self
-                .changes
-                .iter()
-                .filter(|c| {
-                    c.selected
-                        && !c.is_parallel_eligible
-                        && matches!(c.display_status_cache.as_str(), "not queued")
-                })
-                .map(|c| c.id.clone())
-                .collect();
-            if !ineligible.is_empty() {
-                self.warning_message = Some(format!(
-                    "Parallel mode requires committed changes. Uncommitted: {}",
-                    ineligible.join(", ")
-                ));
-                return None;
-            }
-        }
-
-        if selected.is_empty() {
-            self.warning_message = Some("No changes selected".to_string());
-            return None;
-        }
-
-        // Mark selected NotQueued changes as Queued
-        for change in &mut self.changes {
-            if change.selected && matches!(change.display_status_cache.as_str(), "not queued") {
-                change.set_display_status_cache("queued");
-            }
-        }
-
-        // Sync queue intent into the shared reducer so that reducer-driven display
-        // sync (apply_display_statuses_from_reducer) cannot regress these rows back
-        // to "not queued" before the orchestrator processes them.
-        if let Some(shared) = &self.shared_orchestrator_state {
-            if let Ok(mut guard) = shared.try_write() {
-                for id in &selected {
-                    guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
-                        id.clone(),
-                    ));
-                }
-            }
-        }
-
-        self.reset_for_run();
-        self.mode = AppMode::Running;
-        self.add_log(LogEntry::info(format!(
-            "Starting processing {} change(s)",
-            selected.len()
-        )));
-
-        Some(TuiCommand::StartProcessing(selected))
+        selection_logic::start_processing(self)
     }
 
     /// Resume processing from Stopped mode
     /// Converts execution-marked (selected) changes to Queued and starts processing
     pub fn resume_processing(&mut self) -> Option<TuiCommand> {
-        if self.mode != AppMode::Stopped {
-            return None;
-        }
-
-        // Find execution-marked changes (selected=true, display_status_cache=NotQueued)
-        let marked_ids: Vec<String> = self
-            .changes
-            .iter()
-            .filter(|c| c.selected && matches!(c.display_status_cache.as_str(), "not queued"))
-            .map(|c| c.id.clone())
-            .collect();
-
-        if marked_ids.is_empty() {
-            self.warning_message = Some("No changes marked for execution".to_string());
-            return None;
-        }
-
-        // Convert execution-marked changes to Queued
-        for change in &mut self.changes {
-            if marked_ids.contains(&change.id) {
-                change.set_display_status_cache("queued");
-            }
-        }
-
-        // Sync queue intent into the shared reducer so that reducer-driven display
-        // sync cannot regress these rows back to "not queued" before the orchestrator
-        // processes them.
-        if let Some(shared) = &self.shared_orchestrator_state {
-            if let Ok(mut guard) = shared.try_write() {
-                for id in &marked_ids {
-                    guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
-                        id.clone(),
-                    ));
-                }
-            }
-        }
-
-        self.reset_for_run();
-        self.mode = AppMode::Running;
-        self.add_log(LogEntry::info(format!(
-            "Resuming processing {} change(s)...",
-            marked_ids.len()
-        )));
-
-        Some(TuiCommand::StartProcessing(marked_ids))
+        selection_logic::resume_processing(self)
     }
 
     /// Retry error changes - resets error changes to queued and returns their IDs
     /// Returns None if not in Error mode or no error changes found
     pub fn retry_error_changes(&mut self) -> Option<TuiCommand> {
-        if self.mode != AppMode::Error {
-            return None;
-        }
-
-        // Collect error change IDs
-        let error_ids: Vec<String> = self
-            .changes
-            .iter()
-            .filter(|c| c.display_status_cache == "error")
-            .map(|c| c.id.clone())
-            .collect();
-
-        if error_ids.is_empty() {
-            return None;
-        }
-
-        // Reset error changes to queued
-        for change in &mut self.changes {
-            if change.display_status_cache == "error" {
-                change.set_display_status_cache("queued");
-                change.selected = true;
-            }
-        }
-
-        // Sync queue intent into the shared reducer.  AddToQueue clears retryable
-        // terminal (Error/Stopped) states so that reducer-driven display sync will
-        // return "queued" for these rows instead of "error".
-        if let Some(shared) = &self.shared_orchestrator_state {
-            if let Ok(mut guard) = shared.try_write() {
-                for id in &error_ids {
-                    guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
-                        id.clone(),
-                    ));
-                }
-            }
-        }
-
-        // Add retry log messages
-        for id in &error_ids {
-            self.add_log(LogEntry::info(format!("Retrying: {}", id)));
-        }
-
-        // Reset error state and transition to Running
-        self.reset_for_run();
-        self.mode = AppMode::Running;
-
-        Some(TuiCommand::StartProcessing(error_ids))
+        selection_logic::retry_error_changes(self)
     }
 }
 
@@ -1360,15 +1028,15 @@ impl AppState {
 
     /// Scroll logs up by a page (show older entries)
     pub fn scroll_logs_up(&mut self, page_size: usize) {
-        let max_offset = self.logs.len().saturating_sub(1);
-        self.log_scroll_offset = (self.log_scroll_offset + page_size).min(max_offset);
+        self.log_scroll_offset =
+            log_logic::scroll_logs_up(self.log_scroll_offset, self.logs.len(), page_size);
         // Disable auto-scroll when user scrolls up
         self.log_auto_scroll = false;
     }
 
     /// Scroll logs down by a page (show newer entries)
     pub fn scroll_logs_down(&mut self, page_size: usize) {
-        self.log_scroll_offset = self.log_scroll_offset.saturating_sub(page_size);
+        self.log_scroll_offset = log_logic::scroll_logs_down(self.log_scroll_offset, page_size);
         // Re-enable auto-scroll when at bottom
         if self.log_scroll_offset == 0 {
             self.log_auto_scroll = true;
@@ -1377,8 +1045,7 @@ impl AppState {
 
     /// Jump to the oldest log entry (top of history)
     pub fn scroll_logs_to_top(&mut self) {
-        let max_offset = self.logs.len().saturating_sub(1);
-        self.log_scroll_offset = max_offset;
+        self.log_scroll_offset = log_logic::scroll_logs_to_top(self.logs.len());
         self.log_auto_scroll = false;
     }
 
@@ -1390,7 +1057,7 @@ impl AppState {
 
     /// Toggle log panel visibility
     pub fn toggle_logs_panel(&mut self) {
-        self.logs_panel_enabled = !self.logs_panel_enabled;
+        self.logs_panel_enabled = log_logic::toggle_logs_panel(self.logs_panel_enabled);
     }
 }
 
@@ -1419,259 +1086,7 @@ impl AppState {
     /// to OrchestratorState::task_progress(). When updating UI state, progress is
     /// read from shared state to ensure consistency across TUI and orchestrator.
     fn update_changes(&mut self, fetched_changes: Vec<Change>) {
-        // rejected marker-bearing rows are display-only and never execution targets.
-        let rejected_changes =
-            crate::openspec::list_rejected_changes_native().unwrap_or_else(|err| {
-                warn!(error = %err, "Failed to list rejected changes for TUI refresh");
-                Vec::new()
-            });
-
-        self.update_changes_with_rejected(fetched_changes, rejected_changes);
-    }
-
-    fn update_changes_with_rejected(
-        &mut self,
-        fetched_changes: Vec<Change>,
-        rejected_changes: Vec<Change>,
-    ) {
-        let active_ids: HashSet<String> = fetched_changes.iter().map(|c| c.id.clone()).collect();
-        let rejected_ids: HashSet<String> = rejected_changes.iter().map(|c| c.id.clone()).collect();
-
-        // Populate shared orchestration state with task progress from fetched changes
-        // This ensures shared state reflects the current file-system state from openspec list
-        if let Some(shared_state) = &self.shared_orchestrator_state {
-            if let Ok(mut guard) = shared_state.try_write() {
-                for change in &fetched_changes {
-                    if change.total_tasks > 0 {
-                        guard.set_task_progress(
-                            change.id.clone(),
-                            change.completed_tasks,
-                            change.total_tasks,
-                        );
-                    }
-                }
-                for change in &rejected_changes {
-                    if change.total_tasks > 0 {
-                        guard.set_task_progress(
-                            change.id.clone(),
-                            change.completed_tasks,
-                            change.total_tasks,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Detect new changes (active + rejected display rows)
-        let new_ids: Vec<String> = fetched_changes
-            .iter()
-            .chain(rejected_changes.iter())
-            .filter(|c| !self.known_change_ids.contains(&c.id))
-            .map(|c| c.id.clone())
-            .collect();
-
-        // Update existing active changes
-        for fetched in &fetched_changes {
-            if let Some(existing) = self.changes.iter_mut().find(|c| c.id == fetched.id) {
-                let was_rejected = existing.display_status_cache == "rejected";
-                let was_archived = existing.display_status_cache == "archived";
-                let is_merge_wait = existing.display_status_cache == "merge wait";
-                let is_resolve_wait = existing.display_status_cache == "resolve pending";
-
-                if was_rejected && !rejected_ids.contains(&fetched.id) {
-                    existing.set_display_status_cache("not queued");
-                    existing.selected = false;
-                }
-
-                // Get task progress from shared state (with fallback to fetched data)
-                let (completed, total) = if let Some(shared_state) = &self.shared_orchestrator_state
-                {
-                    if let Ok(guard) = shared_state.try_read() {
-                        let progress = guard.task_progress(&fetched.id);
-                        if progress.1 > 0 {
-                            progress
-                        } else {
-                            (fetched.completed_tasks, fetched.total_tasks)
-                        }
-                    } else {
-                        (fetched.completed_tasks, fetched.total_tasks)
-                    }
-                } else {
-                    (fetched.completed_tasks, fetched.total_tasks)
-                };
-
-                if was_archived {
-                    // If change still exists after archiving, it means archive failed
-                    // Revert to NotQueued status
-                    existing.set_display_status_cache("not queued");
-                    // Update progress for unarchived changes
-                    if total > 0 {
-                        existing.completed_tasks = completed;
-                        existing.total_tasks = total;
-                    }
-                    // If total == 0, preserve existing progress
-                } else if is_merge_wait {
-                    // Preserve MergeWait status during auto-refresh
-                    // MergeWait is a persistent state that requires explicit user action (M key)
-                    // to transition to Resolving, and should not be cleared by progress updates
-                    // Update progress for all states (including MergeWait)
-                    if total > 0 {
-                        existing.completed_tasks = completed;
-                        existing.total_tasks = total;
-                    }
-                    // If total == 0, preserve existing progress
-                } else if is_resolve_wait {
-                    // Preserve ResolveWait status during auto-refresh
-                    // ResolveWait is a persistent state indicating archive is complete
-                    // and the change is waiting for resolve execution
-                    // Update progress for ResolveWait changes
-                    if total > 0 {
-                        existing.completed_tasks = completed;
-                        existing.total_tasks = total;
-                    }
-                    // If total == 0, preserve existing progress
-                } else {
-                    // Update progress for all other states when valid data is available
-                    // Only update if total > 0 to avoid resetting progress on retrieval failure
-                    if total > 0 {
-                        existing.completed_tasks = completed;
-                        existing.total_tasks = total;
-                    } else {
-                        // fetched.total_tasks == 0: Retrieval failed, preserve existing progress
-                        // For archiving/resolving/archived/merged, try worktree fallback
-                        let worktree_path =
-                            self.worktree_paths.get(&fetched.id).map(|p| p.as_path());
-
-                        match existing.display_status_cache.as_str() {
-                            "archiving" | "resolving" | "archived" | "merged" => {
-                                // Use comprehensive fallback: worktree active -> worktree archive -> base active -> base archive
-                                if let Ok(progress) = task_parser::parse_progress_with_fallback(
-                                    &fetched.id,
-                                    worktree_path,
-                                ) {
-                                    // Only update if valid progress (not 0/0)
-                                    if progress.total > 0 {
-                                        existing.completed_tasks = progress.completed;
-                                        existing.total_tasks = progress.total;
-                                    }
-                                    // If 0/0, preserve existing progress
-                                }
-                                // If fails or returns 0/0, preserve existing progress
-                            }
-                            _ => {
-                                // For all other states: preserve existing progress (do nothing)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Update existing rejected rows (read-only terminal rows).
-        for rejected in &rejected_changes {
-            if let Some(existing) = self.changes.iter_mut().find(|c| c.id == rejected.id) {
-                let (completed, total) = if let Some(shared_state) = &self.shared_orchestrator_state
-                {
-                    if let Ok(guard) = shared_state.try_read() {
-                        let progress = guard.task_progress(&rejected.id);
-                        if progress.1 > 0 {
-                            progress
-                        } else {
-                            (rejected.completed_tasks, rejected.total_tasks)
-                        }
-                    } else {
-                        (rejected.completed_tasks, rejected.total_tasks)
-                    }
-                } else {
-                    (rejected.completed_tasks, rejected.total_tasks)
-                };
-
-                if total > 0 {
-                    existing.completed_tasks = completed;
-                    existing.total_tasks = total;
-                }
-                existing.selected = false;
-                existing.set_display_status_cache("rejected");
-            }
-        }
-
-        // Add new changes (active + rejected display-only rows)
-        for id in &new_ids {
-            if let Some(fetched) = fetched_changes.iter().find(|c| &c.id == id) {
-                let mut new_state = ChangeState::from_change(fetched);
-                new_state.is_new = true;
-                self.changes.push(new_state);
-                continue;
-            }
-
-            if let Some(rejected) = rejected_changes.iter().find(|c| &c.id == id) {
-                let mut rejected_state = ChangeState::from_change(rejected);
-                // Rejected rows are read-only terminal rows and must never carry NEW badge.
-                rejected_state.is_new = false;
-                rejected_state.selected = false;
-                rejected_state.set_display_status_cache("rejected");
-                self.changes.push(rejected_state);
-            }
-        }
-
-        // Track all known IDs (new + existing)
-        self.known_change_ids.extend(new_ids);
-
-        self.new_change_count = self.changes.iter().filter(|c| c.is_new).count();
-        self.last_refresh = Instant::now();
-
-        // Enrich change metadata from shared orchestration state if available
-        // This provides apply counts (iteration_number) for display
-        if let Some(shared_state) = &self.shared_orchestrator_state {
-            // Attempt to read shared state, but don't block if lock is held
-            if let Ok(guard) = shared_state.try_read() {
-                for change in &mut self.changes {
-                    // Set iteration_number from apply_count if available
-                    // Use monotonic merge: only update if new value is greater than existing
-                    let apply_count = guard.apply_count(&change.id);
-                    if apply_count > 0 {
-                        match change.iteration_number {
-                            Some(existing) => {
-                                // Only update if new value is greater (monotonic increase)
-                                if apply_count > existing {
-                                    change.iteration_number = Some(apply_count);
-                                }
-                            }
-                            None => {
-                                // No existing value, set the new value
-                                change.iteration_number = Some(apply_count);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Remove changes that no longer exist (have been archived externally)
-        self.changes.retain(|c| {
-            // Keep if still exists in active list or rejected display-only list,
-            // apply started in this session, or in a terminal state.
-            active_ids.contains(&c.id)
-                || rejected_ids.contains(&c.id)
-                || c.started_at.is_some()
-                || matches!(
-                    c.display_status_cache.as_str(),
-                    "archiving"
-                        | "archived"
-                        | "merged"
-                        | "merge wait"
-                        | "resolving"
-                        | "resolve pending"
-                        | "rejected"
-                        | "error"
-                )
-        });
-
-        // Ensure cursor is valid
-        if self.cursor_index >= self.changes.len() && !self.changes.is_empty() {
-            self.cursor_index = self.changes.len() - 1;
-            self.list_state.select(Some(self.cursor_index));
-        }
+        processing_logic::update_changes(self, fetched_changes);
     }
 
     #[cfg(test)]
@@ -1680,7 +1095,7 @@ impl AppState {
         fetched_changes: Vec<Change>,
         rejected_changes: Vec<Change>,
     ) {
-        self.update_changes_with_rejected(fetched_changes, rejected_changes);
+        processing_logic::update_changes_with_rejected(self, fetched_changes, rejected_changes);
     }
 }
 // Note: auto_clear_merge_wait() and apply_merge_wait_status() have been removed in Phase 5.3.
