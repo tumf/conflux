@@ -53,6 +53,15 @@ resumed workspace が `Applied` / `Archiving` 相当のとき:
 
 acceptance fail の immediate reroute でも同じ分類を使う。
 
+### 4. blocked / rejected judgment guideline
+
+follow-up classification だけでなく、blocked と rejected の境界も runtime / spec / prompt で同じ語彙にそろえる。
+
+- **Blocked**: change の妥当性は維持されており、環境修復・依存解消・追加情報・human approval・commit-path repair により再開可能
+- **Rejected**: change 自体を閉じる判断が妥当であり、前提破綻・superseded・scope closure・継続価値消失などにより resume より closure を選ぶべき
+
+特に `No space left on device`、ローカル CI/検証不能、archive readiness blocker、commit-path blocker のようなケースは temporary blocker として `Blocked` に入るべきであり、`Rejected` にしてはならない。
+
 ## Dependency on blocked lifecycle
 
 この change は `separate-apply-block-from-reject` に依存する。理由は、blocker-only follow-up を `Apply` 以外へ送る先として resumable `Blocked` lifecycle が必要だからである。

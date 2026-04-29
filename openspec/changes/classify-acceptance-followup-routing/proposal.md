@@ -24,6 +24,7 @@ references:
 - 実ログでは `add-running-agents-restart-button` が、実装完了後に archive commit blocker だけ未解消の状態で `Apply` へ戻され、空 WIP commit 連続による stall error へ入った。
 - `align-archive-readiness-failure-reporting` は archive failure の root cause 表示を扱うが、acceptance follow-up をどの phase に戻すかまでは扱っていない。
 - `separate-apply-block-from-reject` は resumable `Blocked` state の導入を進めており、この change はその blocked lifecycle を acceptance follow-up routing に接続する。
+- 直近ではこの proposal 自体がローカル環境のディスク不足で reject されたが、change の妥当性が失われたわけではなく、環境修復後に再開可能な temporary blocker であることが確認された。
 
 ## Requested Artifact
 
@@ -44,6 +45,7 @@ acceptance follow-up を phase-aware に分類し、resume/apply routing が raw
 - `task_parser` と runtime helper は follow-up section を section-aware に解析し、`Implementation Tasks` と apply-driving remediation task のみを「apply に戻す理由」として数える。
 - resumed workspace が `Applied` で、未解決項目が blocker-only follow-up だけの場合、runtime は `Apply` を強制せず、依存 proposal で導入する `Blocked` hold か、同等の non-apply routing へ送る。
 - acceptance fail → next cycle routing も同じ分類を使い、non-implementation blocker だけで empty WIP stall loop に再突入しないようにする。
+- blocked / rejected の判断基準を spec・design・コードコメントで明文化し、環境修復や依存解消で再開可能な temporary blocker（例: `No space left on device`, commit-path blocker, archive readiness blocker, external approval待ち）は `Blocked` として保持し、change 自体を閉じるべき前提破綻・superseded・closure妥当ケースのみ `Rejected` に送る。
 - log / event wording も更新し、`implementation tasks incomplete` ではなく、`acceptance follow-up requires apply remediation` か `blocker-only follow-up remains` かを区別して表示する。
 
 ## Acceptance Criteria
@@ -53,6 +55,7 @@ acceptance follow-up を phase-aware に分類し、resume/apply routing が raw
 - acceptance failure が commit-path blocker または archive readiness blocker のみを記録したケースでは、runtime は empty WIP commit を増やすためだけの `Apply` 再実行を行わない。
 - acceptance failure が実装 remediation を含むケースでは、従来どおり `Apply` に戻って修正作業を継続できる。
 - user-visible logs / events / tests は、`implementation incomplete` と `blocker-only follow-up` を区別して観測できる。
+- disk exhaustion や一時的なローカル検証不能のように、change 妥当性を壊さず環境修復後に再開可能な failure は `Rejected` ではなく `Blocked` として分類される。
 
 ## Explicit Completion Conditions
 

@@ -8,6 +8,7 @@ follow-up 記録は、repo 実装差分が必要な remediation と、archive-re
 
 - remediation finding は `## Acceptance #<n> Failure Follow-up` 配下の unchecked checkbox として記録する
 - blocker-only finding は同 section 内で non-checkbox note として記録し、raw progress を増やす apply-driving task として扱ってはならない（MUST NOT）
+- temporary blocker（例: disk exhaustion、ローカル検証不能、archive-readiness blocker、commit-path blocker）のみが残る場合、それを change closure の理由として `Rejected` 相当に扱ってはならない（MUST NOT）。そのような finding は resume 可能な `Blocked` hold の根拠として記録しなければならない（MUST）。
 - `ACCEPTANCE:` / `FINDINGS:` 行を tasks.md に追加してはならない（MUST NOT）
 
 #### Scenario: acceptance records remediation and blocker notes separately
@@ -18,3 +19,10 @@ follow-up 記録は、repo 実装差分が必要な remediation と、archive-re
 - **THEN** remediation は unchecked checkbox として記録される
 - **AND** blocker-only finding は non-checkbox note として記録される
 - **AND** runtime は blocker-only note を implementation progress 未完了の唯一の根拠として扱わない
+
+#### Scenario: local disk exhaustion is recorded as blocked follow-up, not closure
+- **GIVEN** acceptance または follow-up review が required verification を行えない
+- **AND** 原因が `No space left on device` のようなローカル環境修復可能な temporary blocker である
+- **WHEN** tasks.md に follow-up を記録する
+- **THEN** finding は blocker-only note として記録される
+- **AND** change を閉じる `Rejected` 相当の判断根拠としては扱われない

@@ -27,6 +27,8 @@ Existing workspaces SHALL be classified for resume using worktree state plus fol
 
 A resumed workspace in `Applied` state with only blocker-only follow-up remaining MUST NOT log or route as though implementation tasks are incomplete. A resumed workspace with implementation remediation remaining MAY route to apply. A resumed workspace with no apply-driving follow-up and no durable acceptance pass MAY route to acceptance.
 
+Temporary blocker conditions that preserve the change's validity — including local environment failures such as disk exhaustion, missing execution capacity for required verification, archive-readiness blockers, commit-path blockers, and other resumable unblock conditions — SHALL be classified as `blocked`, not `rejected`. `Rejected` SHALL be reserved for cases where closure is the correct outcome because the change premise has failed, the change has been superseded, or continuing implementation is no longer appropriate.
+
 #### Scenario: resumed applied workspace distinguishes blocker-only follow-up from implementation work
 - **GIVEN** a resumed workspace for change `gamma` is detected as `Applied`
 - **AND** `Implementation Tasks` are complete
@@ -34,3 +36,10 @@ A resumed workspace in `Applied` state with only blocker-only follow-up remainin
 - **WHEN** resume classification is performed
 - **THEN** the runtime does not emit an `implementation tasks incomplete` routing reason
 - **AND** apply is not selected as the first resumed step solely because the blocker notes exist
+
+#### Scenario: disk exhaustion remains blocked instead of rejected
+- **GIVEN** a change remains otherwise valid
+- **AND** required verification cannot run because the local environment reports `No space left on device`
+- **WHEN** runtime or review logic classifies the blocker
+- **THEN** the change is held as `blocked`
+- **AND** the rejection path is not chosen solely because the environment must be repaired before resume
