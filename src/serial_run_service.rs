@@ -653,23 +653,28 @@ impl SerialRunService {
                     findings.len(),
                     blocking_gate_context
                 );
-                let tasks_path = workspace_path
-                    .join("openspec")
-                    .join("changes")
-                    .join(change_id)
-                    .join("tasks.md");
-                if let Err(err) = task_parser::record_acceptance_follow_up(
-                    &tasks_path,
-                    agent.next_acceptance_attempt_number(change_id),
-                    &findings,
-                ) {
-                    return ChangeProcessResult::AcceptanceCommandFailed {
-                        error: format!(
-                            "Failed to record acceptance follow-up tasks in {}: {}",
-                            tasks_path.display(),
-                            err
-                        ),
-                    };
+                match task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace_path)
+                {
+                    Ok(tasks_path) => {
+                        if let Err(err) = task_parser::record_acceptance_follow_up(
+                            &tasks_path,
+                            agent.next_acceptance_attempt_number(change_id),
+                            &findings,
+                        ) {
+                            warn!(
+                                "Acceptance follow-up persistence degraded for {} at {}: {}",
+                                change_id,
+                                tasks_path.display(),
+                                err
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Acceptance follow-up persistence path resolution degraded for {}: {}",
+                            change_id, err
+                        );
+                    }
                 }
                 ChangeProcessResult::AcceptanceFailed { findings }
             }

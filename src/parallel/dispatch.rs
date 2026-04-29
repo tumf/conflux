@@ -7,7 +7,7 @@
 //! - Per-change cancellation monitoring
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
@@ -262,13 +262,6 @@ pub(super) enum ResumeAction {
     Rejecting,
 }
 
-fn tasks_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
-    workspace_path
-        .join("openspec")
-        .join("changes")
-        .join(change_id)
-        .join("tasks.md")
-}
 
 pub(super) fn decide_resume_action(
     change_id: &str,
@@ -1352,23 +1345,57 @@ impl ParallelExecutor {
                             cycle_count,
                             blocking_gate_context
                         );
-                        let tasks_path = tasks_file_path(workspace.path.as_path(), &change_id);
-                        if let Err(err) = task_parser::record_acceptance_follow_up(
-                            &tasks_path,
-                            acceptance_iteration,
-                            &findings,
+                        match task_parser::resolve_acceptance_follow_up_tasks_path(
+                            &change_id,
+                            workspace.path.as_path(),
                         ) {
-                            return WorkspaceResult {
-                                change_id,
-                                workspace_name: workspace.name,
-                                final_revision: None,
-                                error: Some(format!(
-                                    "Failed to record acceptance follow-up tasks in {}: {}",
-                                    tasks_path.display(),
-                                    err
-                                )),
-                                rejected: None,
-                            };
+                            Ok(tasks_path) => {
+                                if let Err(err) = task_parser::record_acceptance_follow_up(
+                                    &tasks_path,
+                                    acceptance_iteration,
+                                    &findings,
+                                ) {
+                                    warn!(
+                                        "Acceptance follow-up persistence degraded for {} at {}: {}",
+                                        change_id,
+                                        tasks_path.display(),
+                                        err
+                                    );
+                                    if let Some(ref tx) = event_tx {
+                                        let _ = tx
+                                            .send(ParallelEvent::Log(
+                                                LogEntry::warn(format!(
+                                                    "Acceptance follow-up persistence degraded at {}: {}",
+                                                    tasks_path.display(),
+                                                    err
+                                                ))
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance")
+                                                .with_iteration(acceptance_iteration),
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Acceptance follow-up persistence path resolution degraded for {}: {}",
+                                    change_id, err
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn(format!(
+                                                "Acceptance follow-up persistence path unavailable: {}",
+                                                err
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                            }
                         }
                         if let Some(ref tx) = event_tx {
                             let _ = tx
