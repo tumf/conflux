@@ -721,10 +721,8 @@ impl AppState {
             }
             None
         } else {
-            // Resolve is not running: start immediately
-            // Set resolving flag synchronously so consecutive M presses in the same
-            // event loop tick are routed to the queueing path.
-            self.is_resolving = true;
+            // Resolve is not running: register scheduler-owned retry intent.
+            // Execution starts only when ResolveStarted event is received.
             if matches!(self.mode, AppMode::Select | AppMode::Stopped) {
                 self.mode = AppMode::Running;
             }

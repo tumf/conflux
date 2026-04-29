@@ -118,7 +118,7 @@ impl AppState {
             }
             self.add_to_resolve_queue(&change_id);
             self.add_log(LogEntry::warn(format!(
-                "Merge deferred for '{}' (auto-resumable, starting resolve): {}",
+                "Merge deferred for '{}' (auto-resumable, queued scheduler retry intent): {}",
                 change_id, reason
             )));
             Some(TuiCommand::ResolveMerge(change_id))

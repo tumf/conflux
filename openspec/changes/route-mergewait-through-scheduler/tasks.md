@@ -13,3 +13,7 @@
 
 - reducer-owned retry intent を dashboard / Web UI でも操作できるようにする
 - queued resolve / merge retry の可視化を timeline 上で改善する
+
+## Acceptance #1 Failure Follow-up
+- [x] `src/tui/state.rs:724-744` の `handle_resolve_merge()` は、scheduler が `ResolveStarted` を発火する前に `self.is_resolving = true` を立て、`display_status_cache` を `"resolve pending"` に更新しています。proposal/spec は「`M` は reducer-owned retry intent を記録するだけで、execution ownership は scheduler にある」と要求していますが、この TUI-local optimistic state は scheduler-owned execution 開始を先取りしており、`ResolveStarted` が唯一の開始源になっていません。`ResolveStarted`/`handle_resolve_started()` 側だけで resolving 開始状態を立てるよう修正が必要です。
+- [x] `src/tui/state/event_handlers/errors.rs:115-124` の auto-resumable deferred merge 分岐は `"Merge deferred for '{}' (auto-resumable, starting resolve): {}"` とログし、さらに `Some(TuiCommand::ResolveMerge(change_id))` を返しています。実際には command handler (`src/tui/command_handlers.rs:562-576`) は scheduler-visible retry intent を記録するだけで resolve を開始しないため、この wording/flow は「scheduler-owned retry intent」ではなく「今すぐ resolve 開始」に見える誤表示です。`ResolveStarted` event だけが開始を表すよう、文言と分岐意図を修正する必要があります。
