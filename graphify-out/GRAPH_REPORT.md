@@ -1,12 +1,12 @@
-# Graph Report - /Users/tumf/work/conflux  (2026-04-29)
+# Graph Report - /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/align-archive-readiness-failure-reporting  (2026-04-29)
 
 ## Corpus Check
-- 231 files · ~1,264,150 words
+- 229 files · ~1,260,674 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 4298 nodes · 12037 edges · 132 communities detected
-- Extraction: 62% EXTRACTED · 38% INFERRED · 0% AMBIGUOUS · INFERRED: 4516 edges (avg confidence: 0.8)
+- 4267 nodes · 11952 edges · 132 communities detected
+- Extraction: 63% EXTRACTED · 37% INFERRED · 0% AMBIGUOUS · INFERRED: 4437 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -147,191 +147,191 @@
 1. `execute_acceptance_in_workspace()` - 62 edges
 2. `run_orchestrator()` - 58 edges
 3. `main()` - 56 edges
-4. `run_tui_loop()` - 51 edges
-5. `create_test_app()` - 50 edges
-6. `render_buffer()` - 50 edges
+4. `create_test_app()` - 50 edges
+5. `render_buffer()` - 50 edges
+6. `run_tui_loop()` - 49 edges
 7. `OrchestratorState` - 49 edges
 8. `buffer_to_string()` - 46 edges
 9. `build_router()` - 45 edges
-10. `GitWorkspaceManager` - 44 edges
+10. `execute_archive_in_workspace()` - 44 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `test_blocked_rejection_flow_end_to_end_creates_marker_and_removes_worktree()` --calls--> `execute_rejection_flow()`  [INFERRED]
-  tests/e2e_git_worktree_tests.rs → src/orchestration/rejection.rs
-- `Handler` --calls--> `with_deduplicator()`  [INFERRED]
-  tests/fixtures/mock_opencode_server.py → src/tui/log_deduplicator.rs
-- `fetchAPI()` --calls--> `parse()`  [INFERRED]
-  dashboard/src/api/restClient.ts → src/config/jsonc.rs
-- `test_list_changes_ignores_invalid_dir()` --calls--> `list_changes()`  [INFERRED]
-  /Users/tumf/work/conflux/skills/tests/test_cflx_list_ignores_invalid_change_dirs.py → src/web/api.rs
-- `parse_delta_sections()` --calls--> `start()`  [INFERRED]
-  skills/shared/cflx_spec_promotion.py → src/service/mod.rs
+- `Tests for spec-only acceptance behavior (archive-readiness checks).` --uses--> `OpenSpecManager`  [INFERRED]
+  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/align-archive-readiness-failure-reporting/skills/cflx-workflow/scripts/cflx.py
+- `Spec-only changes with archive-risk deltas produce warnings that acceptance shou` --uses--> `OpenSpecManager`  [INFERRED]
+  skills/tests/test_spec_only_acceptance.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/align-archive-readiness-failure-reporting/skills/cflx-workflow/scripts/cflx.py
+- `Tests for Change Type classification and archive-risk warning in cflx.py validat` --uses--> `OpenSpecManager`  [INFERRED]
+  skills/tests/test_cflx_proposal_change_types.py → /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/align-archive-readiness-failure-reporting/skills/cflx-workflow/scripts/cflx.py
+- `OpenSpecManager` --uses--> `Helper: scaffold a spec-only change and optional canonical spec.`  [INFERRED]
+  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/align-archive-readiness-failure-reporting/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
+- `OpenSpecManager` --uses--> `Spec-only changes with ADDED deltas pass archive-readiness checks.`  [INFERRED]
+  /Users/tumf/.local/share/cflx/worktrees/conflux-bda270b8/align-archive-readiness-failure-reporting/skills/cflx-workflow/scripts/cflx.py → skills/tests/test_spec_only_acceptance.py
 
 ## Communities
 
 ### Community 0 - "Community 0"
 Cohesion: 0.02
-Nodes (258): create_worktree(), execute_worktree_command(), main(), handle_start_processing_command(), handle_tui_command(), TuiCommandContext, AppState, ParallelExecutor (+250 more)
+Nodes (223): create_shared_active_commands(), ArchiveResult, extract_tree_branch(), parse_project_url(), RemoteClient, resolve_default_branch(), resolve_project_url_and_branch(), test_add_project_no_auth_header() (+215 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.02
-Nodes (299): create_shared_active_commands(), check_task_progress(), archive_entry_exists(), ArchiveEventHandler, ArchiveLoopResult, ArchiveVerificationResult, build_archive_error_message(), delete_change_directory() (+291 more)
+Nodes (223): check_task_progress(), archive_entry_exists(), ArchiveEventHandler, ArchiveLoopResult, ArchiveVerificationResult, build_archive_error_message(), delete_change_directory(), ensure_archive_commit() (+215 more)
 
 ### Community 2 - "Community 2"
 Cohesion: 0.02
-Nodes (150): AcpClient, AcpMessage, BaseHTTPRequestHandler, build_remote_change_for_update(), emit_change_update_if_available(), get_logs(), get_project_history(), get_stats_overview() (+142 more)
+Nodes (156): AcpClient, AcpMessage, BaseHTTPRequestHandler, build_remote_change_for_update(), emit_change_update_if_available(), get_logs(), get_project_history(), get_stats_overview() (+148 more)
 
 ### Community 3 - "Community 3"
 Cohesion: 0.02
-Nodes (168): Colors, main(), OpenSpecManager, print_change_detail(), print_changes(), Extract change information from directory., Count completed and total tasks., Show detailed information about a change. (+160 more)
+Nodes (135): AiCommandRunner, OutputLine, test_inactivity_timeout_retry(), test_inactivity_timeout_streaming_pipeline(), test_post_completion_cleanup_on_cancellation(), test_post_completion_cleanup_on_failure(), test_post_completion_cleanup_on_success(), test_shared_stagger_state() (+127 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.02
-Nodes (169): delete_acceptance_state(), AcpContent, AcpElicitationParams, AcpError, AcpEvent, AcpPromptBlock, AcpUpdateParams, dispatch_jsonrpc_response() (+161 more)
+Nodes (203): ArchiveLoopHookContext, get_changed_files(), get_current_commit(), default_retry_patterns(), acceptance_verdict_grace_period(), commit_workspace_change(), create_test_config(), create_test_config_with() (+195 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.02
-Nodes (127): AiCommandRunner, OutputLine, test_inactivity_timeout_retry(), test_inactivity_timeout_streaming_pipeline(), test_post_completion_cleanup_on_cancellation(), test_post_completion_cleanup_on_failure(), test_post_completion_cleanup_on_success(), test_shared_stagger_state() (+119 more)
+Nodes (169): Colors, main(), OpenSpecManager, print_change_detail(), print_changes(), Extract change information from directory., Count completed and total tasks., Show detailed information about a change. (+161 more)
 
 ### Community 6 - "Community 6"
 Cohesion: 0.02
-Nodes (152): OrchestratorConfig, merge(), env_test_lock(), get_global_config_path(), get_global_config_paths(), get_platform_config_path(), get_xdg_config_path(), get_xdg_default_config_path() (+144 more)
+Nodes (174): delete_acceptance_state(), AcpContent, AcpElicitationParams, AcpError, AcpEvent, AcpPromptBlock, AcpUpdateParams, dispatch_jsonrpc_response() (+166 more)
 
 ### Community 7 - "Community 7"
-Cohesion: 0.02
-Nodes (112): ArchiveLoopHookContext, branch_delete(), branch_exists(), check_git_repo(), checkout(), generate_unique_branch_name(), get_changed_files(), get_conflict_files() (+104 more)
+Cohesion: 0.03
+Nodes (136): execute_worktree_command(), check_git_repo(), handle_start_processing_command(), handle_tui_command(), TuiCommandContext, check_vcs_available(), AppState, ParallelExecutor (+128 more)
 
 ### Community 8 - "Community 8"
 Cohesion: 0.02
-Nodes (110): delete_worktree(), merge_worktree(), test_cleanup_guard_all_preserved_does_nothing(), test_cleanup_guard_auto_backend_treated_as_git(), test_cleanup_guard_commit_enables_cleanup(), test_cleanup_guard_commit_on_success(), test_cleanup_guard_creation(), test_cleanup_guard_drop_with_empty_workspaces_does_nothing() (+102 more)
+Nodes (117): create_worktree(), delete_worktree(), merge_worktree(), branch_delete(), branch_exists(), checkout(), generate_unique_branch_name(), get_conflict_files() (+109 more)
 
 ### Community 9 - "Community 9"
 Cohesion: 0.03
-Nodes (72): acceptance_test_streaming(), apply_change(), apply_change_streaming(), ApplyContext, ApplyResult, test_apply_context_new(), archive_change(), archive_change_streaming() (+64 more)
+Nodes (98): Template, create_test_change(), dispatch_event(), LoopControl, Orchestrator, post_archive_dispatch_event(), SerialSnapshot, test_archive_path_structure() (+90 more)
 
 ### Community 10 - "Community 10"
 Cohesion: 0.03
-Nodes (100): ArchiveResult, extract_tree_branch(), parse_project_url(), RemoteClient, resolve_default_branch(), resolve_project_url_and_branch(), test_add_project_no_auth_header(), test_authorization_header_sent_with_token() (+92 more)
+Nodes (74): acceptance_test_streaming(), apply_change(), apply_change_streaming(), ApplyContext, ApplyResult, test_apply_context_new(), archive_change(), archive_change_streaming() (+66 more)
 
 ### Community 11 - "Community 11"
 Cohesion: 0.03
-Nodes (64): test_archive_change_retries_until_verified(), create_test_config(), test_auto_resolve_counter_is_thread_safe(), test_auto_resolve_counter_reduces_available_slots(), test_combined_manual_and_auto_resolve_slots(), test_multiple_auto_resolves_consume_multiple_slots(), ParallelExecutor, Template (+56 more)
+Nodes (91): test_cleanup_guard_all_preserved_does_nothing(), test_cleanup_guard_auto_backend_treated_as_git(), test_cleanup_guard_commit_enables_cleanup(), test_cleanup_guard_commit_on_success(), test_cleanup_guard_creation(), test_cleanup_guard_drop_with_empty_workspaces_does_nothing(), test_cleanup_guard_drop_without_commit_preserves_workspaces(), test_cleanup_guard_git_backend() (+83 more)
 
 ### Community 12 - "Community 12"
-Cohesion: 0.02
-Nodes (85): apply_completion_check_interval(), apply_completion_grace_period(), ApplyBlockedHandoff, ApplyCompletionKind, ApplyConfig, ApplyEventHandler, ApplyIterationResult, ApplyLoopHookContext (+77 more)
+Cohesion: 0.04
+Nodes (105): acceptance_resume_ready_for_archive(), acceptance_state_can_be_deleted(), acceptance_state_is_not_created_under_worktree(), acceptance_state_path(), acceptance_state_root_dir(), acceptance_state_roundtrip(), AcceptanceState, AcceptanceStateStatus (+97 more)
 
 ### Community 13 - "Community 13"
 Cohesion: 0.04
-Nodes (83): get_current_commit(), default_retry_patterns(), ReanalysisReason, should_reanalyze_queue(), acceptance_verdict_grace_period(), commit_workspace_change(), create_test_config(), create_test_config_with() (+75 more)
+Nodes (90): handle_merge_key(), can_bulk_toggle_change(), make_change_state(), parallel_mode_excludes_uncommitted_rows_from_bulk_toggle(), running_mode_excludes_active_rows_from_bulk_toggle(), apply_remote_status(), ChangeState, handle_toggle_running_mode() (+82 more)
 
 ### Community 14 - "Community 14"
-Cohesion: 0.04
-Nodes (108): acceptance_follow_up_reopens_completed_tasks_for_apply_resume(), ChangeStateSnapshot, configure_logging(), global_deduplicator(), LogDeduplicator, maybe_log_summary(), should_log_change_count(), should_log_task_progress() (+100 more)
+Cohesion: 0.05
+Nodes (75): control_cancel_stop(), control_force_stop(), control_retry(), control_start(), control_stop(), ControlResponse, create_test_change(), CreateWorktreeRequest (+67 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.04
-Nodes (72): dispatch_event(), post_archive_dispatch_event(), run_orchestrator(), test_archive_path_structure(), test_archive_verification_logic(), test_tui_archived_during_resolve(), test_tui_archived_no_active_resolve(), test_tui_shared_state_pending_changes_decrease_when_cleared() (+64 more)
-
-### Community 16 - "Community 16"
 Cohesion: 0.02
 Nodes (31): check_git_available(), check_git_directory(), check_parallel_available(), CheckConflictsArgs, Cli, Commands, EvidenceMode, InitArgs (+23 more)
 
+### Community 16 - "Community 16"
+Cohesion: 0.04
+Nodes (60): AcceptanceAttempt, AcceptanceHistory, ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory, create_test_archive_attempt(), create_test_attempt() (+52 more)
+
 ### Community 17 - "Community 17"
-Cohesion: 0.05
-Nodes (74): control_cancel_stop(), control_force_stop(), control_retry(), control_start(), control_stop(), ControlResponse, create_test_change(), CreateWorktreeRequest (+66 more)
+Cohesion: 0.04
+Nodes (54): apply_completion_check_interval(), apply_completion_grace_period(), ApplyBlockedHandoff, ApplyCompletionKind, ApplyConfig, ApplyEventHandler, ApplyIterationResult, ApplyLoopHookContext (+46 more)
 
 ### Community 18 - "Community 18"
-Cohesion: 0.04
-Nodes (56): AnalysisResult, AnalyzePromptMetadata, create_test_analyzer(), create_test_change(), ParallelGroup, ParallelizationAnalyzer, test_build_prompt_all_selected(), test_build_prompt_includes_frontmatter_metadata_context() (+48 more)
-
-### Community 19 - "Community 19"
 Cohesion: 0.03
 Nodes (30): AcceptanceResult, build_acceptance_tail_findings(), canonical_verdict_kind(), detect_verdict_in_line(), parse_acceptance_output(), parse_findings(), parse_json_verdict(), strip_markdown_decorations() (+22 more)
 
-### Community 20 - "Community 20"
-Cohesion: 0.05
-Nodes (54): test_openspec_directory_structure(), AcceptanceAttempt, AcceptanceHistory, ApplyAttempt, ApplyHistory, ArchiveAttempt, ArchiveHistory, create_test_archive_attempt() (+46 more)
-
-### Community 21 - "Community 21"
+### Community 19 - "Community 19"
 Cohesion: 0.05
 Nodes (63): extract_assistant_tool_summary(), extract_from_assistant(), extract_from_result(), extract_from_stream_event(), extract_text_from_stream_json(), extract_tool_result_summary(), extract_tool_summary_from_stream_json(), extract_tool_use_summary() (+55 more)
 
+### Community 20 - "Community 20"
+Cohesion: 0.06
+Nodes (44): AnalysisResult, AnalyzePromptMetadata, create_test_analyzer(), create_test_change(), ParallelGroup, ParallelizationAnalyzer, test_build_prompt_all_selected(), test_build_prompt_includes_frontmatter_metadata_context() (+36 more)
+
+### Community 21 - "Community 21"
+Cohesion: 0.05
+Nodes (45): append_recovery_task_section(), cleanup_worktree(), execute_rejection_flow(), extract_rejected_reason(), handle_resume_apply_from_rejecting(), has_rejection_proposal(), init_git_repo(), parse_rejection_review_output() (+37 more)
+
 ### Community 22 - "Community 22"
-Cohesion: 0.1
-Nodes (7): confirmDeleteWorktree(), deleteWorktree(), escapeHtml(), fetchWorktrees(), mergeWorktree(), renderWorktrees(), WebMonitor
+Cohesion: 0.04
+Nodes (28): detect_vcs_backend(), format_command_error(), test_vcs_backend_default_is_auto(), test_vcs_backend_deserialization(), test_vcs_error_constructors(), test_vcs_error_io(), test_workspace_creation(), test_workspace_status_failed_includes_message() (+20 more)
 
 ### Community 23 - "Community 23"
 Cohesion: 0.1
-Nodes (36): acceptance_resume_ready_for_archive(), acceptance_state_can_be_deleted(), acceptance_state_is_not_created_under_worktree(), acceptance_state_path(), acceptance_state_root_dir(), acceptance_state_roundtrip(), AcceptanceState, AcceptanceStateStatus (+28 more)
+Nodes (7): confirmDeleteWorktree(), deleteWorktree(), escapeHtml(), fetchWorktrees(), mergeWorktree(), renderWorktrees(), WebMonitor
 
 ### Community 24 - "Community 24"
 Cohesion: 0.09
 Nodes (33): addProject(), APIError, controlRun(), controlStop(), createProposalSession(), createTerminalSession(), createWorktree(), deleteProject() (+25 more)
 
 ### Community 25 - "Community 25"
-Cohesion: 0.07
-Nodes (1): ResumeTestManager
+Cohesion: 0.16
+Nodes (22): CommandQueue, CommandQueueConfig, StreamingOutputLine, test_config(), test_execute_with_retry_streaming_failure_no_retry(), test_execute_with_retry_streaming_success(), test_execute_with_retry_streaming_with_callback(), test_inactivity_timeout_error_message_format() (+14 more)
 
 ### Community 26 - "Community 26"
-Cohesion: 0.14
-Nodes (23): test_japanese_log_preview_truncation_no_panic(), run_tui(), run_tui_with_remote(), restore_terminal(), clear_screen(), EditorTarget, find_change_dir(), get_version_string() (+15 more)
+Cohesion: 0.09
+Nodes (16): AcceptancePromptMode, default_error_circuit_breaker_enabled(), default_error_circuit_breaker_threshold(), default_proposal_session_inactivity_timeout_secs(), default_proposal_transport_args(), default_proposal_transport_command(), default_server_bind(), default_server_data_dir() (+8 more)
 
 ### Community 27 - "Community 27"
 Cohesion: 0.19
 Nodes (10): ActiveCommandGuard, ActiveCommandRegistry, make_key(), RootKind, test_acquire_and_release(), test_different_roots_independent(), test_double_acquire_fails(), test_guard_release_async() (+2 more)
 
 ### Community 28 - "Community 28"
-Cohesion: 0.22
-Nodes (12): CircuitBreakerConfig, ErrorHistory, normalize_error_message(), test_circuit_breaker_disabled(), test_clear_history(), test_detect_same_error_different_errors(), test_detect_same_error_with_threshold(), test_last_error() (+4 more)
+Cohesion: 0.18
+Nodes (19): test_japanese_log_preview_truncation_no_panic(), EditorTarget, find_change_dir(), get_version_string(), launch_editor_for_change(), launch_editor_in_dir(), make_temp_dir(), resolve_editor_target() (+11 more)
 
 ### Community 29 - "Community 29"
+Cohesion: 0.26
+Nodes (12): CircuitBreakerConfig, ErrorHistory, normalize_error_message(), test_circuit_breaker_disabled(), test_clear_history(), test_detect_same_error_different_errors(), test_detect_same_error_with_threshold(), test_last_error() (+4 more)
+
+### Community 30 - "Community 30"
+Cohesion: 0.13
+Nodes (2): MockWebSocket, WebSocketClient
+
+### Community 31 - "Community 31"
 Cohesion: 0.2
 Nodes (15): _blocks_equal(), delta_to_canonical(), merge_spec_delta(), parse_delta_sections(), Shared spec promotion engine for Conflux archive workflow.  Provides requirement, Split spec content into (preamble, [(normalized_key, full_block), ...]).      fu, Simulate spec promotion without writing any files.      Returns (result_content,, Convert a delta-format spec to canonical format for brand-new specs. (+7 more)
 
-### Community 30 - "Community 30"
+### Community 32 - "Community 32"
 Cohesion: 0.26
-Nodes (13): analyze_with_llm(), build_analysis_prompt(), select_by_progress(), select_next_change(), test_build_analysis_prompt(), test_build_analysis_prompt_empty(), test_build_analysis_prompt_no_fixed_guidance(), test_change() (+5 more)
+Nodes (10): server_base_url(), test_server_base_url_localhost(), test_server_base_url_specific_address(), test_server_base_url_zero_address_does_not_expose_zeros(), build_access_url(), get_local_ip(), test_build_access_url_localhost(), test_build_access_url_specific_address() (+2 more)
 
-### Community 31 - "Community 31"
+### Community 33 - "Community 33"
 Cohesion: 0.21
 Nodes (6): get_cflx_embedded_skills(), test_embedded_skills_count(), test_embedded_skills_have_auxiliary_files(), test_embedded_skills_names(), test_rust_prompt_builder_does_not_contain_acceptance_checklist(), get_archive_readiness_context()
 
-### Community 32 - "Community 32"
+### Community 34 - "Community 34"
 Cohesion: 0.29
 Nodes (0):
 
-### Community 33 - "Community 33"
+### Community 35 - "Community 35"
 Cohesion: 0.29
 Nodes (6): AppMode, MergeConflictInfo, StopMode, ViewMode, WorktreeAction, WorktreeInfo
 
-### Community 34 - "Community 34"
-Cohesion: 0.6
-Nodes (5): generate_qr_string(), test_generate_qr_string_empty_url(), test_generate_qr_string_short_url(), test_generate_qr_string_valid_url(), test_generate_qr_string_without_feature()
-
-### Community 35 - "Community 35"
+### Community 36 - "Community 36"
 Cohesion: 0.7
 Nodes (4): formatValue(), logHelperState(), onInput(), onKeydown()
-
-### Community 36 - "Community 36"
-Cohesion: 0.4
-Nodes (0):
 
 ### Community 37 - "Community 37"
 Cohesion: 0.4
 Nodes (0):
 
 ### Community 38 - "Community 38"
+Cohesion: 0.4
+Nodes (0):
+
+### Community 39 - "Community 39"
 Cohesion: 0.6
 Nodes (3): applyOptimisticSelections(), appReducer(), changeSelectionKey()
 
-### Community 39 - "Community 39"
-Cohesion: 0.67
-Nodes (3): create_skill_structure(), main(), Create the skill directory structure with template files.
-
 ### Community 40 - "Community 40"
 Cohesion: 0.67
-Nodes (0):
+Nodes (3): create_skill_structure(), main(), Create the skill directory structure with template files.
 
 ### Community 41 - "Community 41"
 Cohesion: 0.67
@@ -347,15 +347,15 @@ Nodes (0):
 
 ### Community 44 - "Community 44"
 Cohesion: 0.67
-Nodes (1): ApiDoc
+Nodes (0):
 
 ### Community 45 - "Community 45"
-Cohesion: 1.0
+Cohesion: 0.67
 Nodes (0):
 
 ### Community 46 - "Community 46"
-Cohesion: 1.0
-Nodes (0):
+Cohesion: 0.67
+Nodes (1): ApiDoc
 
 ### Community 47 - "Community 47"
 Cohesion: 1.0
@@ -443,19 +443,19 @@ Nodes (0):
 
 ### Community 68 - "Community 68"
 Cohesion: 1.0
-Nodes (1): Configure sys.path so shared modules are importable from tests.
+Nodes (0):
 
 ### Community 69 - "Community 69"
 Cohesion: 1.0
-Nodes (1): Result<T, E>
+Nodes (1): Configure sys.path so shared modules are importable from tests.
 
 ### Community 70 - "Community 70"
 Cohesion: 1.0
-Nodes (1): OutputLine
+Nodes (1): Result<T, E>
 
 ### Community 71 - "Community 71"
 Cohesion: 1.0
-Nodes (0):
+Nodes (1): OutputLine
 
 ### Community 72 - "Community 72"
 Cohesion: 1.0
@@ -700,67 +700,63 @@ Nodes (1): Print detailed change information.
 ## Knowledge Gaps
 - **292 isolated node(s):** `Create the skill directory structure with template files.`, `Validate YAML frontmatter in SKILL.md.`, `Validate skill directory structure.`, `Package skill into a .skill file (zip with .skill extension).`, `Configure sys.path so shared modules are importable from tests.` (+287 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **Thin community `Community 45`** (2 nodes): `send()`, `mock_acp_agent.py`
+- **Thin community `Community 47`** (2 nodes): `send()`, `mock_acp_agent.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 46`** (2 nodes): `setCloseSessionTarget()`, `App.tsx`
+- **Thin community `Community 48`** (2 nodes): `ProposalActions()`, `ProposalActions.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 47`** (2 nodes): `ProposalActions.tsx`, `ProposalActions()`
+- **Thin community `Community 49`** (2 nodes): `DeleteWorktreeDialog()`, `DeleteWorktreeDialog.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 48`** (2 nodes): `DeleteWorktreeDialog.tsx`, `DeleteWorktreeDialog()`
+- **Thin community `Community 50`** (2 nodes): `for()`, `FileViewPanel.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 49`** (2 nodes): `FileViewPanel.tsx`, `for()`
+- **Thin community `Community 51`** (2 nodes): `TerminalTab()`, `TerminalTab.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 50`** (2 nodes): `TerminalTab.tsx`, `TerminalTab()`
+- **Thin community `Community 52`** (2 nodes): `AddProjectDialog()`, `AddProjectDialog.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 51`** (2 nodes): `AddProjectDialog()`, `AddProjectDialog.tsx`
+- **Thin community `Community 53`** (2 nodes): `ProjectCard()`, `ProjectCard.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 52`** (2 nodes): `ProjectCard.tsx`, `ProjectCard()`
+- **Thin community `Community 54`** (2 nodes): `DeleteDialog()`, `DeleteDialog.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 53`** (2 nodes): `DeleteDialog.tsx`, `DeleteDialog()`
+- **Thin community `Community 55`** (2 nodes): `WorktreeRow.tsx`, `handleRowClick()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 54`** (2 nodes): `WorktreeRow.tsx`, `handleRowClick()`
+- **Thin community `Community 56`** (2 nodes): `CreateWorktreeDialog()`, `CreateWorktreeDialog.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 55`** (2 nodes): `CreateWorktreeDialog()`, `CreateWorktreeDialog.tsx`
+- **Thin community `Community 57`** (2 nodes): `ChangesDrawer()`, `ChangesDrawer.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 56`** (2 nodes): `ChangesDrawer()`, `ChangesDrawer.tsx`
+- **Thin community `Community 58`** (2 nodes): `renderEntry()`, `LogEntry.test.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 57`** (2 nodes): `LogEntry.test.tsx`, `renderEntry()`
+- **Thin community `Community 59`** (2 nodes): `StopChangeDialog()`, `StopChangeDialog.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 58`** (2 nodes): `StopChangeDialog.tsx`, `StopChangeDialog()`
+- **Thin community `Community 60`** (2 nodes): `Badge()`, `badge.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 59`** (2 nodes): `Badge()`, `badge.tsx`
+- **Thin community `Community 61`** (2 nodes): `ToolCallIndicator()`, `ToolCallIndicator.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 60`** (2 nodes): `ToolCallIndicator.tsx`, `ToolCallIndicator()`
+- **Thin community `Community 62`** (2 nodes): `statusPlaceholder()`, `ProposalChat.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 61`** (2 nodes): `ProposalChat.tsx`, `statusPlaceholder()`
+- **Thin community `Community 63`** (2 nodes): `LogsPanel()`, `LogsPanel.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 62`** (2 nodes): `LogsPanel.tsx`, `LogsPanel()`
+- **Thin community `Community 64`** (2 nodes): `ChatInput()`, `ChatInput.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 63`** (2 nodes): `ChatInput()`, `ChatInput.tsx`
+- **Thin community `Community 65`** (2 nodes): `renderLogs()`, `LogsPanel.test.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 64`** (2 nodes): `LogsPanel.test.tsx`, `renderLogs()`
+- **Thin community `Community 66`** (2 nodes): `setScrollMetrics()`, `ChatMessageList.test.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 65`** (2 nodes): `setScrollMetrics()`, `ChatMessageList.test.tsx`
+- **Thin community `Community 67`** (2 nodes): `useWebSocket.ts`, `useWebSocket()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 66`** (2 nodes): `useWebSocket.ts`, `useWebSocket()`
+- **Thin community `Community 68`** (2 nodes): `utils.ts`, `cn()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 67`** (2 nodes): `utils.ts`, `cn()`
+- **Thin community `Community 69`** (2 nodes): `Configure sys.path so shared modules are importable from tests.`, `conftest.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 68`** (2 nodes): `Configure sys.path so shared modules are importable from tests.`, `conftest.py`
+- **Thin community `Community 70`** (2 nodes): `Result<T, E>`, `.or_fail()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 69`** (2 nodes): `Result<T, E>`, `.or_fail()`
+- **Thin community `Community 71`** (2 nodes): `OutputLine`, `output.rs`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 70`** (2 nodes): `OutputLine`, `output.rs`
+- **Thin community `Community 72`** (1 nodes): `tailwind.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 71`** (1 nodes): `tailwind.config.js`
+- **Thin community `Community 73`** (1 nodes): `vite.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 72`** (1 nodes): `vite.config.js`
+- **Thin community `Community 74`** (1 nodes): `eslint.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 73`** (1 nodes): `eslint.config.js`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 74`** (1 nodes): `postcss.config.js`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 75`** (1 nodes): `main.jsx`
+- **Thin community `Community 75`** (1 nodes): `postcss.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 76`** (1 nodes): `App.persistence.test.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -878,17 +874,17 @@ Nodes (1): Print detailed change information.
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `execute_acceptance_in_workspace()` connect `Community 13` to `Community 0`, `Community 1`, `Community 4`, `Community 5`, `Community 7`, `Community 9`, `Community 10`, `Community 12`, `Community 19`, `Community 20`, `Community 23`?**
-  _High betweenness centrality (0.046) - this node is a cross-community bridge._
-- **Why does `run_tui_loop()` connect `Community 0` to `Community 1`, `Community 2`, `Community 4`, `Community 5`, `Community 7`, `Community 8`, `Community 10`, `Community 11`, `Community 15`, `Community 16`, `Community 17`, `Community 20`, `Community 26`?**
-  _High betweenness centrality (0.029) - this node is a cross-community bridge._
-- **Why does `fetchAPI()` connect `Community 24` to `Community 1`, `Community 18`?**
-  _High betweenness centrality (0.026) - this node is a cross-community bridge._
+- **Why does `run_tui_loop()` connect `Community 3` to `Community 0`, `Community 1`, `Community 2`, `Community 6`, `Community 7`, `Community 8`, `Community 9`, `Community 11`, `Community 13`, `Community 14`, `Community 15`, `Community 16`?**
+  _High betweenness centrality (0.035) - this node is a cross-community bridge._
+- **Why does `main()` connect `Community 0` to `Community 1`, `Community 2`, `Community 3`, `Community 4`, `Community 5`, `Community 7`, `Community 8`, `Community 9`, `Community 11`, `Community 12`, `Community 14`, `Community 15`, `Community 20`?**
+  _High betweenness centrality (0.028) - this node is a cross-community bridge._
+- **Why does `parse()` connect `Community 20` to `Community 0`, `Community 3`, `Community 4`, `Community 6`, `Community 10`, `Community 21`, `Community 24`?**
+  _High betweenness centrality (0.024) - this node is a cross-community bridge._
 - **Are the 57 inferred relationships involving `execute_acceptance_in_workspace()` (e.g. with `.dispatch_change_to_workspace()` and `.is_cancelled()`) actually correct?**
   _`execute_acceptance_in_workspace()` has 57 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 55 inferred relationships involving `run_orchestrator()` (e.g. with `handle_start_processing_command()` and `.with_event_tx()`) actually correct?**
   _`run_orchestrator()` has 55 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 49 inferred relationships involving `main()` (e.g. with `parse()` and `.load()`) actually correct?**
   _`main()` has 49 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 49 inferred relationships involving `run_tui_loop()` (e.g. with `.new()` and `list_changes_in_head()`) actually correct?**
-  _`run_tui_loop()` has 49 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 2 inferred relationships involving `create_test_app()` (e.g. with `.new()` and `.clear()`) actually correct?**
+  _`create_test_app()` has 2 INFERRED edges - model-reasoned connections that need verification._
