@@ -1675,13 +1675,22 @@ impl ParallelExecutor {
                         }
                     }
                     warn!("Archive failed for {}: {}", change_id, e);
+                    let archive_resume_context = load_archive_state(&workspace.path)
+                        .ok()
+                        .flatten()
+                        .filter(|state| state.change_id == change_id);
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::ArchiveFailed {
                                 change_id: change_id.clone(),
                                 error: e.to_string(),
-                                reason: None,
-                                summary: None,
+                                reason: archive_resume_context
+                                    .as_ref()
+                                    .and_then(|state| state.primary_reason)
+                                    .map(|reason| reason.as_str().to_string()),
+                                summary: archive_resume_context
+                                    .as_ref()
+                                    .map(|state| state.summary.clone()),
                             })
                             .await;
                     }

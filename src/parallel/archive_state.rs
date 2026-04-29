@@ -83,6 +83,23 @@ pub fn load_archive_state(workspace_path: &Path) -> Result<Option<ArchiveResumeS
     Ok(Some(state))
 }
 
+pub fn load_archive_state_matching(
+    workspace_path: &Path,
+    change_id: &str,
+    expected_revision: &str,
+) -> Result<Option<ArchiveResumeState>> {
+    let Some(state) = load_archive_state(workspace_path)? else {
+        return Ok(None);
+    };
+
+    if state.change_id != change_id || state.revision != expected_revision {
+        delete_archive_state(workspace_path)?;
+        return Ok(None);
+    }
+
+    Ok(Some(state))
+}
+
 pub fn save_archive_state(workspace_path: &Path, state: ArchiveResumeState) -> Result<()> {
     let state_dir = archive_state_root_dir();
     std::fs::create_dir_all(&state_dir).map_err(|e| {
@@ -179,6 +196,27 @@ mod tests {
         );
 
         delete_archive_state(workspace).unwrap();
+        assert!(load_archive_state(workspace).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_archive_state_matching_deletes_mismatched_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path();
+
+        save_archive_state_entry(
+            workspace,
+            "change-a",
+            "rev-a",
+            1,
+            ArchiveResumeStatus::Running,
+            None,
+            "running",
+        )
+        .unwrap();
+
+        let loaded = load_archive_state_matching(workspace, "change-a", "rev-b").unwrap();
+        assert!(loaded.is_none());
         assert!(load_archive_state(workspace).unwrap().is_none());
     }
 }

@@ -12,7 +12,9 @@ use super::acceptance_state::{
     delete_acceptance_state, has_durable_acceptance_pass, mark_acceptance_failed,
     mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
 };
-use super::archive_state::{save_archive_state_entry, ArchiveResumeStatus};
+use super::archive_state::{
+    delete_archive_state, load_archive_state_matching, save_archive_state_entry, ArchiveResumeStatus,
+};
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
 use crate::stall::StallDetector;
@@ -500,6 +502,32 @@ pub async fn execute_archive_in_workspace(
         }
     }
 
+    if let Ok(Some(resume_state)) =
+        load_archive_state_matching(workspace_path, change_id, &current_revision)
+    {
+        if !resume_state.summary.trim().is_empty() {
+            let mut history = archive_history.lock().await;
+            if history.count(change_id) == 0 {
+                history.record(
+                    change_id,
+                    crate::history::ArchiveAttempt {
+                        attempt: resume_state.attempt.max(1),
+                        success: false,
+                        duration: std::time::Duration::from_secs(0),
+                        error: Some(resume_state.summary.clone()),
+                        primary_reason: resume_state
+                            .primary_reason
+                            .or(Some(ArchivePrimaryReason::ResumedContextOnly)),
+                        verification_result: Some(resume_state.summary.clone()),
+                        exit_code: None,
+                        stdout_tail: None,
+                        stderr_tail: None,
+                    },
+                );
+            }
+        }
+    }
+
     // Build prompt with history context
     let user_prompt = config.get_archive_prompt();
     let history_context = {
@@ -628,6 +656,21 @@ use crate::history::ArchivePrimaryReason;
         })?;
 
         if !status.success() {
+            let failure_summary = format!(
+                "archive command failed (attempt {}/{}), exit_code={:?}",
+                attempt,
+                max_attempts,
+                status.code()
+            );
+            let _ = save_archive_state_entry(
+                workspace_path,
+                change_id,
+                &current_revision,
+                attempt,
+                ArchiveResumeStatus::Failed,
+                Some(ArchivePrimaryReason::CommandFailed),
+                failure_summary.clone(),
+            );
             return Err(OrchestratorError::AgentCommand(format!(
                 "Archive command failed for change '{}' in workspace '{}' (attempt {}) with exit code: {:?}",
                 change_id,
@@ -662,6 +705,15 @@ use crate::history::ArchivePrimaryReason;
                                 "{} (threshold {})",
                                 message,
                                 stall_detector.config().threshold
+                            );
+                            let _ = save_archive_state_entry(
+                                workspace_path,
+                                change_id,
+                                &current_revision,
+                                attempt,
+                                ArchiveResumeStatus::Stalled,
+                                Some(ArchivePrimaryReason::Stalled),
+                                message.clone(),
                             );
                             return Err(OrchestratorError::AgentCommand(message));
                         }
@@ -716,10 +768,29 @@ use crate::history::ArchivePrimaryReason;
         }
 
         if verification.is_success() {
+            let _ = save_archive_state_entry(
+                workspace_path,
+                change_id,
+                &current_revision,
+                attempt,
+                ArchiveResumeStatus::Passed,
+                None,
+                format!("archive verification passed at attempt {}/{}", attempt, max_attempts),
+            );
             break;
         }
 
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
+            let retry_summary = "archive verification failed; change directory still exists".to_string();
+            let _ = save_archive_state_entry(
+                workspace_path,
+                change_id,
+                &current_revision,
+                attempt,
+                ArchiveResumeStatus::Failed,
+                Some(ArchivePrimaryReason::VerificationFailed),
+                retry_summary.clone(),
+            );
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(ParallelEvent::ArchiveRetryScheduled {
@@ -727,7 +798,7 @@ use crate::history::ArchivePrimaryReason;
                         attempt,
                         max_attempts,
                         reason: Some(ArchivePrimaryReason::VerificationFailed.as_str().to_string()),
-                        summary: Some("archive verification failed; change directory still exists".to_string()),
+                        summary: Some(retry_summary),
                     })
                     .await;
                 let _ = tx
@@ -755,13 +826,26 @@ use crate::history::ArchivePrimaryReason;
             output_collector.stdout_tail().as_deref(),
             output_collector.stderr_tail().as_deref(),
         );
-        return Err(OrchestratorError::AgentCommand(
-            build_archive_error_message(
-                change_id,
-                Some(workspace_path),
-                runtime_blocker.as_deref(),
+        let final_error = build_archive_error_message(
+            change_id,
+            Some(workspace_path),
+            runtime_blocker.as_deref(),
+        );
+        let _ = save_archive_state_entry(
+            workspace_path,
+            change_id,
+            &current_revision,
+            attempt,
+            ArchiveResumeStatus::Failed,
+            Some(
+                runtime_blocker
+                    .as_ref()
+                    .map(|_| ArchivePrimaryReason::PrerequisiteBlocker)
+                    .unwrap_or(ArchivePrimaryReason::VerificationFailed),
             ),
-        ));
+            final_error.clone(),
+        );
+        return Err(OrchestratorError::AgentCommand(final_error));
     }
 
     info!(
@@ -919,6 +1003,13 @@ use crate::history::ArchivePrimaryReason;
         apply_hist.clear(change_id);
         let mut archive_hist = archive_history.lock().await;
         archive_hist.clear(change_id);
+    }
+
+    if let Err(err) = delete_archive_state(workspace_path) {
+        warn!(
+            "Failed to delete archive state for {} after archive completion: {}",
+            change_id, err
+        );
     }
 
     Ok(revision)
