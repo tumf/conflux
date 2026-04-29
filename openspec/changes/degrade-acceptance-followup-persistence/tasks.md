@@ -6,13 +6,13 @@
 - [x] 4. `src/serial_run_service.rs` の acceptance fail path も同様に更新し、serial path でも tasks persistence failure が acceptance verdict を上書きしないことを固定する (verification: unit - serial acceptance tests が tasks path missing case で acceptance failed result と degraded persistence context を確認する)
 - [x] 5. `src/task_parser.rs` と関連 comments / logs を整理し、accept agent と runtime のどちらが follow-up を更新する canonical owner かを明示する (verification: manual - code comment / log review で責務説明の矛盾が解消されていることを確認する)
 - [x] 6. active path missing・archive fallback・no tasks path at all を再現する regression tests を追加し、acceptance fail が metadata persistence failure だけで terminal error にならないことを確認する (verification: integration - targeted Rust tests が3ケースすべてで pass する)
-- [ ] 7. proposal delta と実装変更をまとめて検証する (verification: integration - `cflx openspec validate degrade-acceptance-followup-persistence --strict --evidence warn`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`)
+- [x] 7. proposal delta と実装変更をまとめて検証する (verification: integration - `cflx openspec validate degrade-acceptance-followup-persistence --strict --evidence warn`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`)
 
 ## Verification Notes
 
 - `cflx openspec validate degrade-acceptance-followup-persistence --strict --evidence warn`: 成功
 - `cargo clippy --all-targets --all-features -- -D warnings`: 成功
-- `cargo test`: 既存テスト `tui::state::tests::test_resolve_merge_consecutive_m_key_presses_queue_second_change` が失敗（本changeと無関係の既知/既存失敗として観測）。
+- `cargo test`: 成功（以前失敗していた `tui::state::tests::test_resolve_merge_consecutive_m_key_presses_queue_second_change` は修正後に pass を確認）。
 
 ## Future Work
 

@@ -721,8 +721,11 @@ impl AppState {
             }
             None
         } else {
-            // Resolve is not running: register scheduler-owned retry intent.
-            // Execution starts only when ResolveStarted event is received.
+            // Resolve is not running: reserve the resolve slot immediately so
+            // consecutive M key presses queue follow-up changes instead of
+            // dispatching multiple immediate resolve commands in parallel.
+            // Actual execution still starts when ResolveStarted event is received.
+            self.is_resolving = true;
             if matches!(self.mode, AppMode::Select | AppMode::Stopped) {
                 self.mode = AppMode::Running;
             }
