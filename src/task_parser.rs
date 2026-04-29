@@ -396,6 +396,34 @@ fn acceptance_follow_up_heading(attempt: u32) -> String {
     format!("## Acceptance #{} Failure Follow-up", attempt)
 }
 
+pub fn resolve_acceptance_follow_up_tasks_path(
+    change_id: &str,
+    worktree_path: &Path,
+) -> Result<std::path::PathBuf> {
+    let active_path = worktree_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("tasks.md");
+
+    if active_path.exists() {
+        return Ok(active_path);
+    }
+
+    if let Some(archive_path) = find_archive_directory(change_id, Some(worktree_path)) {
+        let archive_tasks = archive_path.join("tasks.md");
+        if archive_tasks.exists() {
+            return Ok(archive_tasks);
+        }
+    }
+
+    Err(OrchestratorError::ConfigLoad(format!(
+        "Acceptance follow-up tasks path not found for change '{}' under worktree '{}'",
+        change_id,
+        worktree_path.display()
+    )))
+}
+
 pub fn record_acceptance_follow_up(
     tasks_path: &Path,
     attempt: u32,
@@ -562,6 +590,41 @@ mod tests {
         assert!(content.contains("## Acceptance #1 Failure Follow-up"));
         assert!(content.contains("- [ ] fresh finding"));
         assert!(!content.contains("- [x] stale"));
+    }
+
+    #[test]
+    fn test_resolve_acceptance_follow_up_tasks_path_prefers_active_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let change_id = "change-a";
+        let active_dir = dir.path().join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&active_dir).unwrap();
+        let active_tasks = active_dir.join("tasks.md");
+        std::fs::write(&active_tasks, "- [ ] active task").unwrap();
+
+        let resolved = resolve_acceptance_follow_up_tasks_path(change_id, dir.path()).unwrap();
+        assert_eq!(resolved, active_tasks);
+    }
+
+    #[test]
+    fn test_resolve_acceptance_follow_up_tasks_path_falls_back_to_archive_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let change_id = "change-b";
+        let archive_dir = dir.path().join("openspec/changes/archive").join(change_id);
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        let archive_tasks = archive_dir.join("tasks.md");
+        std::fs::write(&archive_tasks, "- [ ] archived task").unwrap();
+
+        let resolved = resolve_acceptance_follow_up_tasks_path(change_id, dir.path()).unwrap();
+        assert_eq!(resolved, archive_tasks);
+    }
+
+    #[test]
+    fn test_resolve_acceptance_follow_up_tasks_path_errors_when_missing_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let change_id = "change-c";
+
+        let result = resolve_acceptance_follow_up_tasks_path(change_id, dir.path());
+        assert!(result.is_err());
     }
 
     #[test]

@@ -653,23 +653,30 @@ impl SerialRunService {
                     findings.len(),
                     blocking_gate_context
                 );
-                let tasks_path = workspace_path
-                    .join("openspec")
-                    .join("changes")
-                    .join(change_id)
-                    .join("tasks.md");
-                if let Err(err) = task_parser::record_acceptance_follow_up(
-                    &tasks_path,
-                    agent.next_acceptance_attempt_number(change_id),
-                    &findings,
+                match task_parser::resolve_acceptance_follow_up_tasks_path(
+                    change_id,
+                    workspace_path,
                 ) {
-                    return ChangeProcessResult::AcceptanceCommandFailed {
-                        error: format!(
-                            "Failed to record acceptance follow-up tasks in {}: {}",
-                            tasks_path.display(),
-                            err
-                        ),
-                    };
+                    Ok(tasks_path) => {
+                        if let Err(err) = task_parser::record_acceptance_follow_up(
+                            &tasks_path,
+                            agent.next_acceptance_attempt_number(change_id),
+                            &findings,
+                        ) {
+                            warn!(
+                                "Acceptance follow-up persistence degraded for {} at {}: {}",
+                                change_id,
+                                tasks_path.display(),
+                                err
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Acceptance follow-up persistence path resolution degraded for {}: {}",
+                            change_id, err
+                        );
+                    }
                 }
                 ChangeProcessResult::AcceptanceFailed { findings }
             }
@@ -678,7 +685,8 @@ impl SerialRunService {
                 findings: _findings,
             } => {
                 error!("Acceptance command failed for {}: {}", change_id, error);
-                // Note: tasks.md is now updated by the acceptance agent itself
+                // Canonical owner note: runtime appends follow-up tasks for FAIL verdicts,
+                // while command-level failures are surfaced without forcing local tasks.md updates.
                 ChangeProcessResult::AcceptanceCommandFailed { error }
             }
             AcceptanceResult::Cancelled => {
@@ -878,6 +886,79 @@ mod tests {
             "## Implementation Tasks\n- [x] done\n",
         )
         .unwrap();
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Fail {
+                findings: findings.clone(),
+            },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { findings: returned }
+            if returned == findings
+        ));
+    }
+
+    #[test]
+    fn test_process_acceptance_result_fail_uses_archive_tasks_fallback_when_active_missing() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let archive_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("test-change");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+
+        let findings = vec!["archive fallback finding".to_string()];
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Fail {
+                findings: findings.clone(),
+            },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { findings: returned }
+            if returned == findings
+        ));
+
+        let content = std::fs::read_to_string(archive_dir.join("tasks.md")).unwrap();
+        assert!(content.contains("## Acceptance #1 Failure Follow-up"));
+        assert!(content.contains("- [ ] archive fallback finding"));
+    }
+
+    #[test]
+    fn test_process_acceptance_result_fail_degrades_when_no_tasks_path_available() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let findings = vec!["missing tasks path finding".to_string()];
 
         let result = service.process_acceptance_result(
             "test-change",
