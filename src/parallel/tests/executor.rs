@@ -1978,7 +1978,10 @@ async fn test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_chan
             },
             "legacy_blocked" => match result {
                 crate::orchestration::AcceptanceResult::Gated => {}
-                other => panic!("expected gated result from legacy blocked marker, got {:?}", other),
+                other => panic!(
+                    "expected gated result from legacy blocked marker, got {:?}",
+                    other
+                ),
             },
             "command_failed" => match result {
                 crate::orchestration::AcceptanceResult::CommandFailed { .. } => {}
