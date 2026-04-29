@@ -436,14 +436,14 @@ The system SHALL execute a rejection flow when acceptance returns a `Gated` verd
 
 #### Scenario: rejection flow commits only REJECTED marker
 
-- **GIVEN** acceptance confirms a blocked verdict for `fix-auth`
+- **GIVEN** acceptance confirms a gated verdict for `fix-auth`
 - **WHEN** the rejection flow executes
 - **THEN** the base branch commit includes `openspec/changes/fix-auth/REJECTED.md`
 - **AND** no other files from the rejected worktree are staged or committed
 
 #### Scenario: rejection flow does not invoke openspec resolve
 
-- **GIVEN** acceptance confirms a blocked verdict for `fix-auth`
+- **GIVEN** acceptance confirms a gated verdict for `fix-auth`
 - **WHEN** the rejection flow executes
 - **THEN** `openspec resolve fix-auth` is not invoked
 - **AND** rejection completion does not depend on OpenSpec CLI availability

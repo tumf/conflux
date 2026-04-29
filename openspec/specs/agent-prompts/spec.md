@@ -223,13 +223,13 @@ acceptance は以下を満たさなければならない（MUST）。
 - apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を acceptance-gated のまま保留するか」を区別できなければならない
 - 移行期間中の legacy input 互換として `ACCEPTANCE: BLOCKED` / `{"acceptance":"blocked"}` を受理してもよいが、canonical output contract として新規に生成してはならない（MUST NOT）
 
-#### Scenario: rejecting review が reject proposal を却下しつつ blocked 保留を要求する
+#### Scenario: rejecting review が reject proposal を却下しつつ gated hold を要求する
 - **GIVEN** rejecting review が apply-generated rejection proposal を評価している
 - **AND** reviewer は change 全体の reject には同意しない
 - **AND** 追加情報、仕様整理、fixture 再設計、または依存解消がないと apply を再開しても同じ blocker が再発すると判断する
 - **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は immediate apply resume とは区別された blocked 保留 outcome になる
-- **AND** runtime は change を `Blocked` へ送る前提でその verdict を扱う
+- **THEN** verdict は immediate apply resume とは区別された gated hold outcome になる
+- **AND** runtime は change を `acceptance-gated` へ送る前提でその verdict を扱う
 
 ### Requirement: Prompts MUST apply a mock-first external dependency policy
 
