@@ -46,6 +46,11 @@ impl ParallelExecutor {
 
     #[cfg(test)]
     pub(super) fn has_resolve_wait(&self) -> bool {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            if let Ok(guard) = shared.try_read() {
+                return !guard.resolve_wait_change_ids().is_empty();
+            }
+        }
         !self.resolve_wait_changes.is_empty()
     }
 
@@ -417,6 +422,11 @@ impl ParallelExecutor {
     /// - If still deferred and manual action required → move to MergeWait.
     /// - On error → log and keep in ResolveWait for the next retry opportunity.
     pub(super) async fn retry_deferred_merges(&mut self) {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let guard = shared.read().await;
+            self.resolve_wait_changes = guard.resolve_wait_change_ids().into_iter().collect();
+        }
+
         if self.resolve_wait_changes.is_empty() {
             return;
         }

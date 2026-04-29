@@ -51,34 +51,32 @@ Workspace observations SHALL NOT regress a change from terminal `Merged` back to
 
 ### Requirement: Resolve Wait Queue Ownership
 
-The system SHALL own the resolve wait queue in shared orchestration state rather than in TUI-local lifecycle state.
+The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-`ResolveWait` SHALL represent reducer-owned queued resolve intent while another resolve is active.
+`ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-Manual resolve lifecycle events that clear or complete queued resolve intent MUST also be applied to the shared orchestration reducer before later refresh-driven display reconciliation can occur.
+Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
-#### Scenario: Resolve wait queue is reducer-owned
+Canonical rule: ownership is split as **intent in reducer**, **execution in scheduler**, **completion semantics in reducer events**. `ResolveCompleted` MUST clear `ResolveWait` intent and set terminal lifecycle consistently, while dequeue/stop/cancel paths MUST also clear queued resolve intent so refresh cannot reintroduce stale `resolve pending` state.
 
-- **GIVEN** one change is currently resolving
-- **AND** the user requests resolve for another change in `MergeWait`
-- **WHEN** the reducer processes the command
-- **THEN** the second change enters `ResolveWait`
-- **AND** the change_id is stored in the shared resolve wait queue
+#### Scenario: resolve request becomes scheduler-visible intent
+- **GIVEN** change `alpha` is in `MergeWait`
+- **WHEN** the user requests resolve via `M`
+- **THEN** shared orchestration state records retry intent for `alpha`
+- **AND** the scheduler can observe that intent without requiring TUI-local direct execution state
 
-#### Scenario: ResolveWait is not reconstructed from workspace only
+#### Scenario: scheduler starts retry from shared intent
+- **GIVEN** shared orchestration state contains retry intent for change `alpha`
+- **AND** execution preconditions allow merge / resolve retry to proceed
+- **WHEN** the scheduler evaluates runnable work
+- **THEN** the scheduler starts the retry for `alpha`
+- **AND** execution ownership remains in the normal scheduler lifecycle
 
-- **GIVEN** a change has an archived workspace that is still ahead of base
-- **WHEN** the system rebuilds state from workspace observation alone
-- **THEN** the reducer may recover `MergeWait`
-- **AND** the reducer does not recover `ResolveWait` unless the shared resolve wait queue contains that change
-
-#### Scenario: Manual resolve completion clears reducer-owned resolve wait
-
-- **GIVEN** the user has triggered manual resolve for a change that entered `ResolveWait`
-- **AND** the shared reducer currently derives display status `resolve pending`
-- **WHEN** the manual resolve completes successfully and the merge result becomes terminal
-- **THEN** the shared reducer clears the queued resolve wait for that change
-- **AND** subsequent `ChangesRefreshed` reconciliation does not derive `resolve pending` for the merged change
+#### Scenario: retry completion clears shared intent without TUI-local lane
+- **GIVEN** change `alpha` entered `ResolveWait` or equivalent queued retry intent in shared orchestration state
+- **WHEN** the scheduler-owned retry for `alpha` completes and the merge result becomes terminal
+- **THEN** the reducer clears the queued retry intent for `alpha`
+- **AND** subsequent refresh reconciliation does not require a separate TUI-local execution path to derive the terminal state
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
@@ -132,27 +130,32 @@ This resume-time archive-complete transition MUST preserve the user-visible merg
 
 ### Requirement: Resolve Wait Queue Ownership
 
-The system SHALL own the resolve wait queue in shared orchestration state rather than in TUI-local lifecycle state.
+The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-`ResolveWait` SHALL represent reducer-owned queued resolve intent while another resolve is active, or a deferred change that has been auto-promoted into the next resolve flow after dependency or merge preconditions are satisfied.
+`ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-Manual resolve lifecycle events that clear or complete queued resolve intent MUST also be applied to the shared orchestration reducer before later refresh-driven display reconciliation can occur.
+Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
-Workspace observation alone MAY recover `MergeWait` for archived-but-unmerged workspaces, but it MUST NOT erase reducer-owned auto-resolve intent that was established from `MergeDeferred` reason tracking.
+Canonical rule: ownership is split as **intent in reducer**, **execution in scheduler**, **completion semantics in reducer events**. `ResolveCompleted` MUST clear `ResolveWait` intent and set terminal lifecycle consistently, while dequeue/stop/cancel paths MUST also clear queued resolve intent so refresh cannot reintroduce stale `resolve pending` state.
 
-#### Scenario: Auto-promoted deferred change enters reducer-owned resolve wait
-- **GIVEN** a change was deferred because another merge or resolve had to complete first
-- **WHEN** that prerequisite completes and the reducer receives the promotion signal
-- **THEN** the change enters reducer-owned `ResolveWait` or `Resolving`
-- **AND** subsequent refresh reconciliation does not regress it to `MergeWait`
+#### Scenario: resolve request becomes scheduler-visible intent
+- **GIVEN** change `alpha` is in `MergeWait`
+- **WHEN** the user requests resolve via `M`
+- **THEN** shared orchestration state records retry intent for `alpha`
+- **AND** the scheduler can observe that intent without requiring TUI-local direct execution state
 
-#### Scenario: Workspace refresh does not overwrite auto-resolve intent
-- **GIVEN** a change has already been auto-promoted from deferred merge waiting into reducer-owned resolve intent
-- **WHEN** a later `ChangesRefreshed` event observes the workspace as archived
-- **THEN** the reducer preserves the auto-resolve wait state
-- **AND** the displayed status does not regress to a stale manual-wait state
+#### Scenario: scheduler starts retry from shared intent
+- **GIVEN** shared orchestration state contains retry intent for change `alpha`
+- **AND** execution preconditions allow merge / resolve retry to proceed
+- **WHEN** the scheduler evaluates runnable work
+- **THEN** the scheduler starts the retry for `alpha`
+- **AND** execution ownership remains in the normal scheduler lifecycle
 
-## Requirements
+#### Scenario: retry completion clears shared intent without TUI-local lane
+- **GIVEN** change `alpha` entered `ResolveWait` or equivalent queued retry intent in shared orchestration state
+- **WHEN** the scheduler-owned retry for `alpha` completes and the merge result becomes terminal
+- **THEN** the reducer clears the queued retry intent for `alpha`
+- **AND** subsequent refresh reconciliation does not require a separate TUI-local execution path to derive the terminal state
 
 ### Requirement: merge-deferred-reducer-sync
 
@@ -244,35 +247,32 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 
 ### Requirement: Resolve Wait Queue Ownership
 
-The Project SHALL own the resolve wait queue in shared orchestration state (`OrchestratorState`) rather than in TUI-local lifecycle state. This is a Core-owned state; Frontend implementations (TUI, Web) SHALL NOT maintain independent copies of the resolve queue.
+The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-`ResolveWait` SHALL represent reducer-owned queued resolve intent while another resolve is active within the same Project.
+`ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-Manual resolve lifecycle events that clear or complete queued resolve intent MUST also be applied to the shared orchestration reducer before later refresh-driven display reconciliation can occur.
+Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
-Frontend MAY cache the resolve queue state for rendering purposes, but the cache MUST be derived from the Core's `OrchestratorState` and MUST NOT serve as the source of truth for resolve ordering or execution decisions.
-#### Scenario: Resolve wait queue is reducer-owned
+Canonical rule: ownership is split as **intent in reducer**, **execution in scheduler**, **completion semantics in reducer events**. `ResolveCompleted` MUST clear `ResolveWait` intent and set terminal lifecycle consistently, while dequeue/stop/cancel paths MUST also clear queued resolve intent so refresh cannot reintroduce stale `resolve pending` state.
 
-- **GIVEN** one Change within a Project is currently resolving
-- **AND** the user requests resolve for another Change in `MergeWait` within the same Project
-- **WHEN** the reducer processes the command
-- **THEN** the second Change enters `ResolveWait`
-- **AND** the change_id is stored in the Project's shared resolve wait queue
-- **AND** Frontend render caches are updated from this Core state
+#### Scenario: resolve request becomes scheduler-visible intent
+- **GIVEN** change `alpha` is in `MergeWait`
+- **WHEN** the user requests resolve via `M`
+- **THEN** shared orchestration state records retry intent for `alpha`
+- **AND** the scheduler can observe that intent without requiring TUI-local direct execution state
 
-#### Scenario: ResolveWait is not reconstructed from workspace only
+#### Scenario: scheduler starts retry from shared intent
+- **GIVEN** shared orchestration state contains retry intent for change `alpha`
+- **AND** execution preconditions allow merge / resolve retry to proceed
+- **WHEN** the scheduler evaluates runnable work
+- **THEN** the scheduler starts the retry for `alpha`
+- **AND** execution ownership remains in the normal scheduler lifecycle
 
-- **GIVEN** a Change has an archived workspace that is still ahead of base
-- **WHEN** the system rebuilds state from workspace observation alone
-- **THEN** the reducer may recover `MergeWait`
-- **AND** the reducer does not recover `ResolveWait` unless the Project's shared resolve wait queue contains that Change
-
-#### Scenario: Frontend does not own resolve queue independently
-
-- **GIVEN** TUI or Web UI needs to display the resolve queue
-- **WHEN** the resolve queue is accessed for rendering
-- **THEN** the displayed queue is derived from `OrchestratorState.resolve_wait_queue`
-- **AND** Frontend does not maintain a separate FIFO queue that diverges from Core state
+#### Scenario: retry completion clears shared intent without TUI-local lane
+- **GIVEN** change `alpha` entered `ResolveWait` or equivalent queued retry intent in shared orchestration state
+- **WHEN** the scheduler-owned retry for `alpha` completes and the merge result becomes terminal
+- **THEN** the reducer clears the queued retry intent for `alpha`
+- **AND** subsequent refresh reconciliation does not require a separate TUI-local execution path to derive the terminal state
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -741,24 +741,29 @@ This execution-mark clear applies only to the rejected change. It MUST NOT clear
 
 ### Requirement: Resolve Wait Queue Ownership
 
-The system SHALL own the resolve wait queue in shared orchestration state rather than in TUI-local lifecycle state.
+The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-`ResolveWait` SHALL represent reducer-owned queued resolve intent for auto-resumable deferred merges, including deferred changes promoted after archive when another resolve or merge prerequisite must complete first.
+`ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-`MergeWait` SHALL remain the manual-intervention wait state for deferred merges that cannot be retried automatically, such as dirty-base conditions.
+Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
-Workspace observation alone MAY recover `MergeWait` for archived-but-unmerged workspaces, but it MUST NOT erase reducer-owned auto-resolve intent or reclassify auto-resumable deferred merges based on free-form reason strings.
+Canonical rule: ownership is split as **intent in reducer**, **execution in scheduler**, **completion semantics in reducer events**. `ResolveCompleted` MUST clear `ResolveWait` intent and set terminal lifecycle consistently, while dequeue/stop/cancel paths MUST also clear queued resolve intent so refresh cannot reintroduce stale `resolve pending` state.
 
-#### Scenario: auto-resumable-merge-deferred-enters-resolve-wait
+#### Scenario: resolve request becomes scheduler-visible intent
+- **GIVEN** change `alpha` is in `MergeWait`
+- **WHEN** the user requests resolve via `M`
+- **THEN** shared orchestration state records retry intent for `alpha`
+- **AND** the scheduler can observe that intent without requiring TUI-local direct execution state
 
-**Given**: A change receives a deferred merge result that is explicitly classified as auto-resumable
-**When**: The reducer applies that execution event
-**Then**: the change enters reducer-owned `ResolveWait`
-**And**: later refresh reconciliation does not regress it to `MergeWait`
+#### Scenario: scheduler starts retry from shared intent
+- **GIVEN** shared orchestration state contains retry intent for change `alpha`
+- **AND** execution preconditions allow merge / resolve retry to proceed
+- **WHEN** the scheduler evaluates runnable work
+- **THEN** the scheduler starts the retry for `alpha`
+- **AND** execution ownership remains in the normal scheduler lifecycle
 
-#### Scenario: manual-deferred-merge-remains-merge-wait
-
-**Given**: A change receives a deferred merge result that requires manual intervention
-**When**: The reducer applies that execution event
-**Then**: the change remains in `MergeWait`
-**And**: it is not added to the auto-resumable resolve wait queue
+#### Scenario: retry completion clears shared intent without TUI-local lane
+- **GIVEN** change `alpha` entered `ResolveWait` or equivalent queued retry intent in shared orchestration state
+- **WHEN** the scheduler-owned retry for `alpha` completes and the merge result becomes terminal
+- **THEN** the reducer clears the queued retry intent for `alpha`
+- **AND** subsequent refresh reconciliation does not require a separate TUI-local execution path to derive the terminal state

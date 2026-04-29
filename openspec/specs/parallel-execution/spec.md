@@ -1662,41 +1662,37 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 ### Requirement: State-Driven Reanalysis Scheduling
 
-The parallel scheduler SHALL determine whether to perform dependency re-analysis based on observable scheduler state at each loop iteration, rather than relying on an event-set boolean flag.
+The parallel scheduler SHALL treat `MergeWait` retry requests and queued change dispatch as scheduler-owned state transitions derived from observable reducer / scheduler state, rather than as direct TUI execution side effects.
 
-The scheduler MUST perform re-analysis when ALL of the following conditions hold:
-- The queued change list is non-empty
-- Available execution slots are greater than zero
-- The debounce period has elapsed since the last queue change (or a debounce-bypass condition is active)
+A user pressing `M` for a `MergeWait` change MUST register retry intent that becomes visible to the scheduler, but MUST NOT by itself execute `resolve_deferred_merge(...)` or any equivalent merge / resolve operation outside the scheduler loop.
 
-The scheduler MUST NOT skip re-analysis due to a stale or unset flag when the above conditions are met.
+When execution slots remain available, queued changes and retry-eligible `MergeWait` changes MUST be evaluated within the same scheduler loop. A retry intent for one change MUST NOT suppress dependency re-analysis or dispatch of another queued change when the normal re-analysis conditions are satisfied.
 
-#### Scenario: Queued change dispatches while resolve is active
+Completion of a scheduler-owned merge / resolve retry MUST feed back into the same completion semantics used for ordinary scheduler progress, so that re-analysis and dispatch resume from scheduler state rather than from a TUI-only notify side effect.
 
-- **GIVEN** one change is in `Resolving` activity stage consuming one execution slot
-- **AND** `max_parallelism` is greater than one so at least one slot is available
-- **AND** one change has been added to the queue
-- **WHEN** the debounce period elapses
-- **THEN** the scheduler performs re-analysis
-- **AND** the queued change is dispatched to an available slot
-- **AND** the change transitions from `queued` to `applying`
+Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer state), scheduler loop is the **sole execution owner** for merge/resolve retry start, and reducer completion events (`ResolveCompleted`/`ResolveFailed`) are the **sole authority** for clearing or transitioning wait state.
 
-#### Scenario: Failed dispatch does not suppress next re-analysis
+#### Scenario: M key registers retry intent instead of direct execution
+- **GIVEN** change `alpha` is in `MergeWait`
+- **WHEN** the user presses `M`
+- **THEN** the system records scheduler-visible retry intent for `alpha`
+- **AND** the TUI command path does not directly execute `resolve_deferred_merge(...)`
 
-- **GIVEN** the scheduler performed re-analysis but dispatched zero changes (e.g., all candidates were dependency-blocked)
-- **AND** queued changes still exist
-- **WHEN** the next loop iteration begins
-- **THEN** the scheduler evaluates re-analysis conditions from state again
-- **AND** re-analysis is not suppressed by a stale flag
+#### Scenario: queued change still dispatches while another change is resolving
+- **GIVEN** change `alpha` is already in `Resolving` and consumes one execution slot
+- **AND** `max_parallelism` is greater than one so at least one slot remains available
+- **AND** change `beta` is newly queued
+- **AND** change `gamma` has scheduler-visible retry intent from `MergeWait`
+- **WHEN** the scheduler evaluates re-analysis and dispatch from observable state
+- **THEN** the scheduler may dispatch `beta` using the remaining available slot
+- **AND** retry intent for `gamma` does not by itself suppress `beta` analysis or dispatch
 
-#### Scenario: Queue notification triggers evaluation on next loop
-
-- **GIVEN** a queue notification arrives from the dynamic queue
-- **WHEN** the scheduler processes the notification and enters the next loop iteration
-- **THEN** the scheduler evaluates re-analysis conditions from observable state
-- **AND** if conditions are met (queued non-empty, slots available, debounce elapsed), re-analysis proceeds
-
-## Requirements
+#### Scenario: retry completion resumes scheduler semantics
+- **GIVEN** change `alpha` has scheduler-owned retry intent and the scheduler starts its merge / resolve retry
+- **AND** another queued change `beta` remains waiting
+- **WHEN** the retry for `alpha` completes or clears its queued resolve wait
+- **THEN** the scheduler resumes evaluation using its normal completion semantics
+- **AND** `beta` is reconsidered for analysis / dispatch without requiring a TUI-only direct execution callback path
 
 ### Requirement: Managed worktree apply MUST run post-apply cleanup review before acceptance handoff
 

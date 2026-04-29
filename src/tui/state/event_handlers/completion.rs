@@ -91,7 +91,7 @@ impl AppState {
 
         if let Some(next_change_id) = self.pop_from_resolve_queue() {
             self.add_log(LogEntry::info(format!(
-                "Auto-starting resolve for '{}' from queue",
+                "Queueing scheduler retry intent for '{}' from resolve queue",
                 next_change_id
             )));
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {

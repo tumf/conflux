@@ -560,149 +560,20 @@ pub async fn handle_tui_command(
             }
         }
         TuiCommand::ResolveMerge(id) => {
-            // Apply reducer command first so shared state reflects resolve intent.
+            // Apply reducer command first so shared state reflects scheduler-visible resolve intent.
             shared_state
                 .write()
                 .await
                 .apply_command(ReducerCommand::ResolveMerge(id.clone()));
-            let resolve_tx = ctx.tx.clone();
-            let resolve_repo_root = ctx.repo_root.to_path_buf();
-            let resolve_config = ctx.config.clone();
-            let resolve_counter = manual_resolve_counter.clone();
-            let resolve_dynamic_queue = ctx.dynamic_queue.clone();
-            tokio::spawn(async move {
-                // Increment counter when resolve starts (consumes a parallel execution slot)
-                resolve_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                // Note: ResolveStarted event is sent by resolve_deferred_merge -> resolve_merges_with_retry
-                // with the actual expanded command. We don't send it here to avoid duplicate events.
-
-                // Helper closure to decrement counter, wake the scheduler, and send event.
-                // Notifying before the event ensures the parallel loop observes freed capacity
-                // immediately instead of waiting for the debounce timer after queue edits.
-                let finish_resolve = |event: OrchestratorEvent| async {
-                    resolve_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                    resolve_dynamic_queue.notify_scheduler();
-                    let _ = resolve_tx.send(event).await;
-                };
-
-                if resolve_counter.load(std::sync::atomic::Ordering::SeqCst) > 1 {
-                    finish_resolve(OrchestratorEvent::MergeDeferred {
-                        change_id: id.clone(),
-                        reason: "Resolve in progress for another change".to_string(),
-                        auto_resumable: true,
-                    })
-                    .await;
-                    return;
-                }
-
-                match crate::parallel::base_dirty_reason(&resolve_repo_root).await {
-                    Ok(Some(reason)) => {
-                        finish_resolve(OrchestratorEvent::ResolveFailed {
-                            change_id: id.clone(),
-                            error: format!("Base is dirty: {}", reason),
-                        })
-                        .await;
-                        return;
-                    }
-                    Err(e) => {
-                        finish_resolve(OrchestratorEvent::ResolveFailed {
-                            change_id: id.clone(),
-                            error: format!("Failed to check base status: {}", e),
-                        })
-                        .await;
-                        return;
-                    }
-                    Ok(None) => {}
-                }
-
-                // Transition ResolveWait -> Resolving once the resolve task actually begins.
-                // We intentionally send a ResolveStarted event here so the TUI shows "resolving"
-                // immediately, even when the merge completes without conflicts (no AI resolve command).
-                let _ = resolve_tx
-                    .send(OrchestratorEvent::ResolveStarted {
-                        change_id: id.clone(),
-                        command: format!("resolve_deferred_merge {}", id),
-                    })
-                    .await;
-
-                match crate::parallel::resolve_deferred_merge(
-                    resolve_repo_root.clone(),
-                    resolve_config.clone(),
-                    &id,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        // Run on_merged hook before ResolveCompleted event (before merged status transition)
-                        let hooks_config = resolve_config.get_hooks();
-                        let hooks = crate::hooks::HookRunner::with_event_tx(
-                            hooks_config,
-                            resolve_repo_root.clone(),
-                            resolve_tx.clone(),
-                        );
-
-                        // Fetch actual task counts from change data
-                        let (completed_tasks, total_tasks) =
-                            match crate::openspec::list_changes_native() {
-                                Ok(changes) => changes
-                                    .iter()
-                                    .find(|c| c.id == id)
-                                    .map(|c| (c.completed_tasks, c.total_tasks))
-                                    .unwrap_or((0, 0)),
-                                Err(e) => {
-                                    warn!("Failed to fetch task counts for on_merged hook: {}", e);
-                                    (0, 0)
-                                }
-                            };
-
-                        let hook_context = crate::hooks::HookContext::new(
-                            0, // changes_processed not available in manual resolve
-                            0, // total_changes not available
-                            0, // remaining_changes not available
-                            false,
-                        )
-                        .with_change(&id, completed_tasks, total_tasks)
-                        .with_apply_count(0)
-                        .with_parallel_context("", None);
-
-                        if let Err(e) = hooks
-                            .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
-                            .await
-                        {
-                            warn!("on_merged hook failed for {}: {}", id, e);
-                        }
-
-                        let worktree_change_ids =
-                            match crate::vcs::git::list_worktree_change_ids(&resolve_repo_root)
-                                .await
-                            {
-                                Ok(ids) => Some(ids),
-                                Err(err) => {
-                                    let _ = resolve_tx
-                                        .send(OrchestratorEvent::Log(LogEntry::warn(format!(
-                                            "Failed to refresh worktree snapshot: {}",
-                                            err
-                                        ))))
-                                        .await;
-                                    None
-                                }
-                            };
-                        finish_resolve(OrchestratorEvent::ResolveCompleted {
-                            change_id: id.clone(),
-                            worktree_change_ids,
-                        })
-                        .await;
-                    }
-                    Err(e) => {
-                        finish_resolve(OrchestratorEvent::ResolveFailed {
-                            change_id: id.clone(),
-                            error: e.to_string(),
-                        })
-                        .await;
-                    }
-                }
-            });
+            // Scheduler-owned execution model:
+            // - command handler MUST NOT execute resolve_deferred_merge directly
+            // - wake scheduler so normal loop can pick up retry intent and queued work together
+            ctx.dynamic_queue.notify_scheduler();
+            ctx.app.add_log(LogEntry::info(format!(
+                "Scheduled merge-wait retry intent for '{}'; execution will be started by scheduler",
+                id
+            )));
         }
     }
 

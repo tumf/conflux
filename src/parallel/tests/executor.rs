@@ -367,6 +367,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -670,6 +671,7 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -852,6 +854,7 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1003,6 +1006,7 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1186,6 +1190,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1383,6 +1388,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1586,6 +1592,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        shared_orchestrator_state: None,
     };
 
     let revisions = vec![workspace_a.name];
@@ -2772,6 +2779,71 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
     assert_eq!(iteration, 2);
     assert!(queued.is_empty());
     assert_eq!(in_flight.len(), 1);
+
+    while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_resolving_with_free_slot_still_dispatches_queued_change() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    // gamma has scheduler-visible retry intent, while alpha is already consuming one slot.
+    executor
+        .resolve_wait_changes
+        .insert("gamma-merge-wait".to_string());
+
+    let semaphore = Arc::new(Semaphore::new(2));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("beta-queued")];
+    let mut in_flight = HashSet::from(["alpha-resolving".to_string()]);
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            2,
+            1,
+            ReanalysisReason::QueueNotification,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    assert!(!should_break);
+    assert_eq!(iteration, 2, "free slot should advance scheduler iteration");
+    assert!(queued.is_empty(), "queued change should be dispatched");
+    assert_eq!(
+        in_flight.len(),
+        2,
+        "queued change should dispatch even when another change is resolving"
+    );
+    assert!(
+        in_flight.contains("beta-queued"),
+        "beta must become in-flight when slot is available"
+    );
 
     while join_set.join_next().await.is_some() {}
 }

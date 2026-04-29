@@ -161,6 +161,7 @@ impl ParallelExecutor {
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             scheduler_lifetime: SchedulerLifetime::Finite,
+            shared_orchestrator_state: None,
         }
     }
 
@@ -187,6 +188,14 @@ impl ParallelExecutor {
     /// are reused to resume interrupted work.
     pub fn set_no_resume(&mut self, no_resume: bool) {
         self.no_resume = no_resume;
+    }
+
+    /// Set shared reducer state for scheduler-owned resolve retry intent.
+    pub fn set_shared_orchestrator_state(
+        &mut self,
+        shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    ) {
+        self.shared_orchestrator_state = Some(shared_state);
     }
 
     /// Set the cancellation token for force stop cleanup.
