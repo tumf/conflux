@@ -281,6 +281,44 @@ async fn test_get_or_create_workspace_no_resume_creates_fresh() {
     );
 }
 
+/// dependency resolved 直後に force_recreate 指定された change は
+/// 既存 workspace があっても再利用せず新規作成する。
+#[tokio::test]
+async fn test_get_or_create_workspace_force_recreate_bypasses_reuse() {
+    let tmp = TempDir::new().unwrap();
+    let workspace_info = WorkspaceInfo {
+        workspace_name: "ws-my-change".to_string(),
+        path: tmp.path().to_path_buf(),
+        change_id: "my-change".to_string(),
+        last_modified: SystemTime::UNIX_EPOCH,
+    };
+    let mut manager = ResumeTestManager {
+        existing: Some(workspace_info),
+        workspace_path: tmp.path().to_path_buf(),
+    };
+    let (tx, _rx) = mpsc::channel::<ParallelEvent>(16);
+    let event_tx = Some(tx);
+
+    let mut force_recreate = HashSet::new();
+    force_recreate.insert("my-change".to_string());
+
+    let (_ws, was_resumed) = get_or_create_workspace(
+        &mut manager,
+        "my-change",
+        "base-rev",
+        false,
+        &force_recreate,
+        &event_tx,
+    )
+    .await
+    .expect("get_or_create_workspace should succeed");
+
+    assert!(
+        !was_resumed,
+        "force_recreate 対象は既存 workspace を再利用してはならない"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // detect_workspace_state: regression for the "Archived silently treated as
 // fresh start" scenario described in the proposal.

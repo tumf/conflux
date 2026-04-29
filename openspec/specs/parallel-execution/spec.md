@@ -978,6 +978,26 @@ WIP スナップショットとスタール検知は Git バックエンド時�
 - **THEN** WIP スナップショットは作成されない
 - **AND** スタール検知は実行されない
 
+### Requirement: Dependency-resolved change recreates workspace once
+
+dependency blocked だった change が `DependencyResolved` になった直後の最初の dispatch では、システムは既存 workspace を再利用せず fresh workspace を作成しなければならない（MUST）。
+
+この dependency-resolved workspace recreation は通常 resume の例外としてのみ適用され、依存解決と無関係な通常 resume に対しては既存 workspace 再利用を禁止してはならない（MUST NOT）。
+
+#### Scenario: dependency resolved change recreates workspace instead of resume
+- **GIVEN** change `B` は dependency blocked 状態から `DependencyResolved` へ遷移した
+- **AND** `B` に対応する既存 workspace が存在する
+- **WHEN** scheduler が `B` を次に dispatch する
+- **THEN** システムは `find_existing_workspace()` / `reuse_workspace()` で既存 workspace を再利用しない
+- **AND** fresh workspace を新規作成して apply pipeline を開始する
+
+#### Scenario: regular resume still reuses workspace
+- **GIVEN** change `C` は dependency blocked を経由せず通常の resume 対象である
+- **AND** `C` に対応する既存 workspace が存在する
+- **WHEN** scheduler が `C` を dispatch する
+- **THEN** システムは既存 workspace を再利用して `WorkspaceResumed` を発行できる
+- **AND** dependency-resolved 例外を理由に強制再作成してはならない
+
 ### Requirement: Parallel execution enforces workspace concurrency limit
 システムは parallel 実行時、worktree 作成・apply・archive を含むすべての工程で `max_concurrent_workspaces` の上限を厳密に適用しなければならない（MUST）。これにより、同時に存在する worktree 数と同時実行される change 数が上限を超えないことを保証する。
 
