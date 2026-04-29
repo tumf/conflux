@@ -13,7 +13,8 @@ use super::acceptance_state::{
     mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
 };
 use super::archive_state::{
-    delete_archive_state, load_archive_state_matching, save_archive_state_entry, ArchiveResumeStatus,
+    delete_archive_state, load_archive_state_matching, save_archive_state_entry,
+    ArchiveResumeStatus,
 };
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
@@ -552,11 +553,11 @@ pub async fn execute_archive_in_workspace(
             .await;
     }
 
-use crate::execution::archive::{
-    build_archive_error_message, ensure_archive_commit, extract_archive_runtime_blocker,
-    verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
-};
-use crate::history::ArchivePrimaryReason;
+    use crate::execution::archive::{
+        build_archive_error_message, ensure_archive_commit, extract_archive_runtime_blocker,
+        verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
+    use crate::history::ArchivePrimaryReason;
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
@@ -775,13 +776,17 @@ use crate::history::ArchivePrimaryReason;
                 attempt,
                 ArchiveResumeStatus::Passed,
                 None,
-                format!("archive verification passed at attempt {}/{}", attempt, max_attempts),
+                format!(
+                    "archive verification passed at attempt {}/{}",
+                    attempt, max_attempts
+                ),
             );
             break;
         }
 
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
-            let retry_summary = "archive verification failed; change directory still exists".to_string();
+            let retry_summary =
+                "archive verification failed; change directory still exists".to_string();
             let _ = save_archive_state_entry(
                 workspace_path,
                 change_id,
@@ -797,7 +802,11 @@ use crate::history::ArchivePrimaryReason;
                         change_id: change_id.to_string(),
                         attempt,
                         max_attempts,
-                        reason: Some(ArchivePrimaryReason::VerificationFailed.as_str().to_string()),
+                        reason: Some(
+                            ArchivePrimaryReason::VerificationFailed
+                                .as_str()
+                                .to_string(),
+                        ),
                         summary: Some(retry_summary),
                     })
                     .await;
