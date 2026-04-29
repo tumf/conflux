@@ -13,4 +13,4 @@
 - build metadata 以外の commit SHA や dirty state を運用ログへ含める拡張
 
 ## Acceptance #1 Failure Follow-up
-- [ ] openspec/changes/log-startup-version/tasks.md:6 の Task 4 は cflx / cflx tui の manual 検証が未実施なのに完了扱いになっています。openspec/changes/log-startup-version/proposal.md:50-53 と openspec/changes/log-startup-version/specs/cli/spec.md:9-19 は TUI / run / server それぞれで versioned startup log を確認可能であることを要求しているため、実TTY環境で mode=tui の startup log を確認するか、未確認の TUI 部分を Future Work に移して checked task の scope を run/server のみに正しく縮小してください。
+- [x] openspec/changes/log-startup-version/tasks.md:6 の Task 4 は cflx / cflx tui の manual 検証が未実施なのに完了扱いになっています。openspec/changes/log-startup-version/proposal.md:50-53 と openspec/changes/log-startup-version/specs/cli/spec.md:9-19 は TUI / run / server それぞれで versioned startup log を確認可能であることを要求しているため、実TTY環境で mode=tui の startup log を確認するか、未確認の TUI 部分を Future Work に移して checked task の scope を run/server のみに正しく縮小してください。（対応済み: Task 4 の scope を run/server に縮小し、mode=tui は Future Work へ移動）
