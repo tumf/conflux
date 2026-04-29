@@ -13,6 +13,8 @@ Archive deployed OpenSpec changes and update canonical specifications.
 
 After a change has been accepted, this skill handles archiving: moving the change to `changes/archive/`, promoting spec deltas to canonical specs, and verifying the result.
 
+Proposal-quality judgment (for example, behavior-task adequacy) belongs to acceptance review. Archive responsibility is limited to real archive-readiness and commit-path blockers (archive execution, canonical spec promotion, repository state), and MUST NOT reintroduce wording heuristic blockers.
+
 ## Acceptance Handoff Contract
 
 Archive only runs after acceptance reached PASS. The acceptance verdict is

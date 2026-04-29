@@ -1,0 +1,13 @@
+## Implementation Tasks
+
+- [x] 1. Update `openspec/specs/cflx-proposal-validation/spec.md` と関連 delta で、native validator responsibility を deterministic authoring contract に限定し、runtime-behavior / implementation-facing-task adequacy heuristic を validator scope から外す canonical rule を追加する (verification: integration - source paths `openspec/specs/cflx-proposal-validation/spec.md`, `openspec/changes/shift-behavior-quality-checks-to-acceptance/specs/cflx-proposal-validation/spec.md`; commands `cflx openspec validate shift-behavior-quality-checks-to-acceptance --strict`, `cargo test -p conflux openspec_cmd`)
+- [x] 2. Update `openspec/specs/agent-prompts/spec.md` と `.opencode/commands/cflx-accept.md` で、behavior-changing work の implementation-task adequacy を acceptance review が concrete repository evidence で判断する requirement を acceptance contract に追加する (verification: integration - source paths `openspec/specs/agent-prompts/spec.md`, `.opencode/commands/cflx-accept.md`; commands `cflx openspec validate shift-behavior-quality-checks-to-acceptance --strict`, `cargo test acceptance`)
+- [x] 3. Implement `src/openspec_cmd.rs` の behavior-centric validation 変更として、`Runtime behavior is claimed without implementation-facing tasks` を発火する heuristic とその関連 aggregation を削除または縮退する (verification: unit - file `src/openspec_cmd.rs`; command `cargo test -p conflux openspec_cmd`)
+- [x] 4. Add acceptance-side contract tests または prompt validation coverage を追加し、behavior-changing proposal に implementation-facing tasks / concrete integration evidence が不足する場合は acceptance FAIL finding で扱えることを固定する (verification: integration - source paths `.opencode/commands/cflx-accept.md`, `skills/cflx-accept/SKILL.md`; command `cargo test acceptance`)
+- [x] 5. Update `skills/cflx-accept/SKILL.md` と `skills/cflx-archive/SKILL.md` で、proposal-quality judgement は acceptance responsibility、archive は real archive readiness / commit-path blocker responsibility であることを明記する (verification: manual - source paths `skills/cflx-accept/SKILL.md`, `skills/cflx-archive/SKILL.md`; commands `cflx openspec validate shift-behavior-quality-checks-to-acceptance --strict`, `cargo test acceptance`)
+- [x] 6. Verify proposal delta と関連変更をまとめて検証する (verification: integration - `cflx openspec validate shift-behavior-quality-checks-to-acceptance --strict --evidence warn`, relevant Rust tests for `src/openspec_cmd.rs` and acceptance contract coverage, `cargo clippy --all-targets --all-features -- -D warnings`)
+
+## Future Work
+
+- verification ownership / executable-surface runnable coverage の deterministic checks も acceptance-first に寄せるべきか別 change で再評価する
+- acceptance reviewer を structured rubric 化し、proposal-quality findings の分類をより安定化する
