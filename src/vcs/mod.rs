@@ -185,6 +185,8 @@ pub enum WorkspaceStatus {
     Applied(String),
     /// Running acceptance tests
     Accepting,
+    /// Execution is blocked and waiting for manual unblock/resume decision
+    Blocked,
     /// Running dedicated rejection review
     Rejecting,
     /// Currently being archived
@@ -216,6 +218,7 @@ impl WorkspaceStatus {
             WorkspaceStatus::Applying => true,
             WorkspaceStatus::Applied(_) => true,
             WorkspaceStatus::Accepting => true,
+            WorkspaceStatus::Blocked => false,
             WorkspaceStatus::Rejecting => true,
             WorkspaceStatus::Archiving => true,
             WorkspaceStatus::Resolving => true,

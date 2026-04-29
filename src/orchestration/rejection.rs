@@ -12,6 +12,7 @@ use crate::vcs::git::commands as git_commands;
 pub enum RejectionReviewVerdict {
     Confirm,
     Resume,
+    Block,
 }
 
 fn rejected_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
@@ -22,6 +23,7 @@ fn rejected_file_path(workspace_path: &Path, change_id: &str) -> PathBuf {
         .join("REJECTED.md")
 }
 
+#[allow(dead_code)]
 pub fn has_rejection_proposal(workspace_path: &Path, change_id: &str) -> bool {
     rejected_file_path(workspace_path, change_id).is_file()
 }
@@ -57,6 +59,9 @@ fn parse_rejection_review_output(output: &str) -> Option<RejectionReviewVerdict>
         if trimmed == "REJECTION_REVIEW: RESUME" {
             return Some(RejectionReviewVerdict::Resume);
         }
+        if trimmed == "REJECTION_REVIEW: BLOCK" {
+            return Some(RejectionReviewVerdict::Block);
+        }
     }
 
     None
@@ -65,7 +70,7 @@ fn parse_rejection_review_output(output: &str) -> Option<RejectionReviewVerdict>
 fn append_recovery_task_section(existing: &str, change_id: &str) -> String {
     let heading = "## Rejecting Recovery Tasks";
     let task = format!(
-        "- [ ] Investigate blocker in openspec/changes/{}/REJECTED.md and implement a non-rejection recovery path before rerunning apply",
+        "- [ ] Capture unresolved blocker details in tasks.md (do not recreate REJECTED.md) and implement a non-rejection recovery path before rerunning apply for {}",
         change_id
     );
 
@@ -132,21 +137,21 @@ pub async fn run_rejection_review(
 
     parse_rejection_review_output(&stdout).ok_or_else(|| {
         OrchestratorError::AgentCommand(format!(
-            "Rejecting review output missing required marker for '{}' (expected exactly one of REJECTION_REVIEW: CONFIRM|RESUME)",
+            "Rejecting review output missing required marker for '{}' (expected exactly one of REJECTION_REVIEW: CONFIRM|RESUME|BLOCK)",
             change_id
         ))
     })
 }
 
-pub async fn handle_resume_apply_from_rejecting(
-    change_id: &str,
-    workspace_path: &Path,
-) -> Result<()> {
+async fn clear_rejected_proposal_marker(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
     let rejected_path = rejected_file_path(workspace_path, change_id);
     if rejected_path.exists() {
         tokio::fs::remove_file(&rejected_path).await?;
     }
+    Ok(rejected_path)
+}
 
+async fn append_recovery_task(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
     let tasks_path = workspace_path
         .join("openspec")
         .join("changes")
@@ -154,23 +159,47 @@ pub async fn handle_resume_apply_from_rejecting(
         .join("tasks.md");
     let current = tokio::fs::read_to_string(&tasks_path).await.map_err(|e| {
         OrchestratorError::AgentCommand(format!(
-            "Failed to read tasks.md while resuming apply for '{}': {}",
+            "Failed to read tasks.md while updating rejecting recovery section for '{}': {}",
             change_id, e
         ))
     })?;
     let updated = append_recovery_task_section(&current, change_id);
     tokio::fs::write(&tasks_path, updated).await.map_err(|e| {
         OrchestratorError::AgentCommand(format!(
-            "Failed to update tasks.md while resuming apply for '{}': {}",
+            "Failed to update tasks.md while updating rejecting recovery section for '{}': {}",
             change_id, e
         ))
     })?;
+
+    Ok(tasks_path)
+}
+
+pub async fn handle_resume_apply_from_rejecting(
+    change_id: &str,
+    workspace_path: &Path,
+) -> Result<()> {
+    let rejected_path = clear_rejected_proposal_marker(change_id, workspace_path).await?;
+    let tasks_path = append_recovery_task(change_id, workspace_path).await?;
 
     info!(
         change_id = %change_id,
         rejected_path = %rejected_path.display(),
         tasks_path = %tasks_path.display(),
         "Resumed apply from rejecting review"
+    );
+
+    Ok(())
+}
+
+pub async fn handle_blocked_from_rejecting(change_id: &str, workspace_path: &Path) -> Result<()> {
+    let rejected_path = clear_rejected_proposal_marker(change_id, workspace_path).await?;
+    let tasks_path = append_recovery_task(change_id, workspace_path).await?;
+
+    info!(
+        change_id = %change_id,
+        rejected_path = %rejected_path.display(),
+        tasks_path = %tasks_path.display(),
+        "Rejecting review returned BLOCK; workspace remains blocked"
     );
 
     Ok(())
@@ -441,6 +470,24 @@ mod tests {
         assert!(
             has_rejection_proposal(temp_dir.path(), "change-a"),
             "proposal should be detected after REJECTED.md is created"
+        );
+    }
+
+    #[test]
+    fn test_append_recovery_task_section_avoids_deleted_rejected_marker_reference() {
+        let existing = "## Implementation Tasks\n\n- [ ] keep going\n";
+        let updated = append_recovery_task_section(existing, "change-a");
+        assert!(
+            updated.contains("## Rejecting Recovery Tasks"),
+            "recovery section should be appended"
+        );
+        assert!(
+            updated.contains("do not recreate REJECTED.md"),
+            "recovery task should explicitly avoid relying on deleted marker"
+        );
+        assert!(
+            !updated.contains("Investigate blocker in openspec/changes/change-a/REJECTED.md"),
+            "recovery task must not reference deleted worktree-local REJECTED.md"
         );
     }
 

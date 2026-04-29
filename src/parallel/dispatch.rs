@@ -20,8 +20,8 @@ use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, WorkspaceState};
 use crate::orchestration::{
-    execute_rejection_flow, handle_resume_apply_from_rejecting, run_rejection_review,
-    RejectionReviewVerdict,
+    execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
+    run_rejection_review, RejectionReviewVerdict,
 };
 use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
@@ -257,6 +257,7 @@ pub(super) enum ResumeAction {
     Apply,
     Acceptance,
     Archive,
+    Blocked,
     Rejecting,
 }
 
@@ -327,6 +328,7 @@ pub(super) fn decide_resume_action(
                 ResumeAction::Acceptance
             }
         }
+        WorkspaceState::Blocked => ResumeAction::Blocked,
         WorkspaceState::Rejecting => ResumeAction::Rejecting,
         WorkspaceState::Created | WorkspaceState::Applying { .. } => ResumeAction::Apply,
     }
@@ -605,6 +607,25 @@ impl ParallelExecutor {
             // Early return for terminal states: Archived and Merged workspaces must not
             // re-enter the apply/acceptance/archive pipeline.  Doing so silently creates
             // duplicate apply commits or masks already-complete work as a fresh start.
+            if matches!(resume_action, ResumeAction::Blocked) {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                            change_id: change_id.clone(),
+                            workspace_name: workspace.name.clone(),
+                            status: WorkspaceStatus::Blocked,
+                        })
+                        .await;
+                }
+                return WorkspaceResult {
+                    change_id,
+                    workspace_name: workspace.name,
+                    final_revision: None,
+                    error: None,
+                    rejected: None,
+                };
+            }
+
             if matches!(resume_action, ResumeAction::Terminal) {
                 match &effective_state {
                     WorkspaceState::Merged => {
@@ -871,6 +892,53 @@ impl ParallelExecutor {
                                 .await;
                         }
                     }
+                    Ok(RejectionReviewVerdict::Block) => {
+                        if let Err(e) = handle_blocked_from_rejecting(&change_id, &workspace.path).await {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::RejectionReviewFailed {
+                                        change_id: change_id.clone(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Failed to transition rejecting verdict BLOCK into blocked state: {}",
+                                    e
+                                )),
+                                rejected: None,
+                            };
+                        }
+
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::RejectionReviewCompleted {
+                                    change_id: change_id.clone(),
+                                    outcome: crate::events::RejectionOutcome::Block,
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::warn("Rejecting review returned BLOCK; cleared rejection proposal and preserved blocked workspace")
+                                        .with_change_id(&change_id)
+                                        .with_operation("rejecting"),
+                                ))
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None,
+                            rejected: None,
+                        };
+                    }
                     Err(e) => {
                         if let Some(ref tx) = event_tx {
                             let _ = tx
@@ -1057,150 +1125,36 @@ impl ParallelExecutor {
                 if let Some(handoff) = &blocked_handoff {
                     info!(
                         change_id = %change_id,
-                        rejected_path = %handoff.rejected_path.display(),
-                        "Apply emitted blocked handoff proposal; routing to rejecting stage"
+                        blocker_path = %handoff.blocker_path.display(),
+                        "Apply emitted blocked handoff marker; staying blocked without rejecting flow"
                     );
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::WorkspaceStatusUpdated {
                                 change_id: change_id.clone(),
                                 workspace_name: workspace.name.clone(),
-                                status: WorkspaceStatus::Rejecting,
+                                status: WorkspaceStatus::Blocked,
                             })
                             .await;
                         let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::warn(format!(
-                                    "Apply blocked handoff detected via {}; entering rejecting stage",
-                                    handoff.rejected_path.display()
+                                    "Apply blocked handoff detected via {}; workspace remains blocked",
+                                    handoff.blocker_path.display()
                                 ))
                                 .with_change_id(&change_id)
-                                .with_operation("rejecting"),
+                                .with_operation("apply"),
                             ))
                             .await;
                     }
 
-                    match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
-                        Ok(RejectionReviewVerdict::Confirm) => {
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::RejectionReviewCompleted {
-                                        change_id: change_id.clone(),
-                                        outcome: crate::events::RejectionOutcome::Confirm,
-                                    })
-                                    .await;
-                            }
-                            let reason = format!(
-                                "Apply-blocked rejection confirmed by rejecting review (proposal: {})",
-                                handoff.rejected_path.display()
-                            );
-                            let resolved_base = base_branch.clone();
-                            match execute_rejection_flow(
-                                &change_id,
-                                &reason,
-                                &workspace.path,
-                                &resolved_base,
-                                &repo_root,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx
-                                            .send(ParallelEvent::ChangeRejected {
-                                                change_id: change_id.clone(),
-                                                reason: reason.clone(),
-                                            })
-                                            .await;
-                                        let _ = tx
-                                            .send(ParallelEvent::ChangeDequeued {
-                                                change_id: change_id.clone(),
-                                            })
-                                            .await;
-                                    }
-                                    return WorkspaceResult {
-                                        change_id,
-                                        workspace_name: workspace.name,
-                                        final_revision: None,
-                                        error: None,
-                                        rejected: Some(reason),
-                                    };
-                                }
-                                Err(e) => {
-                                    return WorkspaceResult {
-                                        change_id,
-                                        workspace_name: workspace.name,
-                                        final_revision: None,
-                                        error: Some(format!(
-                                            "Rejected flow failed after rejecting CONFIRM verdict: {}",
-                                            e
-                                        )),
-                                        rejected: None,
-                                    };
-                                }
-                            }
-                        }
-                        Ok(RejectionReviewVerdict::Resume) => {
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::RejectionReviewCompleted {
-                                        change_id: change_id.clone(),
-                                        outcome: crate::events::RejectionOutcome::Resume,
-                                    })
-                                    .await;
-                            }
-                            if let Err(e) = handle_resume_apply_from_rejecting(&change_id, &workspace.path).await {
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::RejectionReviewFailed {
-                                            change_id: change_id.clone(),
-                                            error: e.to_string(),
-                                        })
-                                        .await;
-                                }
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name: workspace.name,
-                                    final_revision: None,
-                                    error: Some(format!(
-                                        "Failed to resume apply from rejecting verdict: {}",
-                                        e
-                                    )),
-                                    rejected: None,
-                                };
-                            }
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::Log(
-                                        LogEntry::warn("Rejecting review returned RESUME; returning to apply loop")
-                                            .with_change_id(&change_id)
-                                            .with_operation("rejecting"),
-                                    ))
-                                    .await;
-                            }
-                            continue;
-                        }
-                        Err(e) => {
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::RejectionReviewFailed {
-                                        change_id: change_id.clone(),
-                                        error: e.to_string(),
-                                    })
-                                    .await;
-                            }
-                            return WorkspaceResult {
-                                change_id,
-                                workspace_name: workspace.name,
-                                final_revision: None,
-                                error: Some(format!(
-                                    "Rejecting review failed after apply blocked handoff: {}",
-                                    e
-                                )),
-                                rejected: None,
-                            };
-                        }
-                    }
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: None,
+                        rejected: None,
+                    };
                 }
 
                 // Send ApplyCompleted event
@@ -1424,7 +1378,7 @@ impl ParallelExecutor {
                             .map(|handoff| {
                                 format!(
                                     "Acceptance-confirmed apply blocker (proposal: {})",
-                                    handoff.rejected_path.display()
+                                    handoff.blocker_path.display()
                                 )
                             })
                             .unwrap_or_else(|| {

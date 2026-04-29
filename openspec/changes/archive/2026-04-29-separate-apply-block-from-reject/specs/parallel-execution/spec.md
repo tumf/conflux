@@ -55,7 +55,7 @@ The rejecting review operation SHALL end with exactly one dedicated marker line:
 - **THEN** the runtime transitions the change back to `applying`
 - **AND** the same worktree and prior WIP context are reused
 
-### Requirement: ParallelRunService rejection flow completion events reflect blocked hold outcome
+### Requirement: ParallelRunService rejection flow on blocked execution
 
 After rejecting review completes, the runtime SHALL emit a `RejectionReviewCompleted` execution event with one of `Confirm`, `Resume`, or `Block` outcome. The reducer SHALL use this event to drive the `Rejecting → Rejected`, `Rejecting → Applying`, or `Rejecting → Blocked` transition.
 

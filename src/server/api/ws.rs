@@ -298,6 +298,7 @@ fn map_workspace_state_fallback(state: WorkspaceState) -> (String, Option<u32>) 
         WorkspaceState::Archiving => ("archiving".to_string(), None),
         WorkspaceState::Archived => ("archived".to_string(), None),
         WorkspaceState::Merged => ("merged".to_string(), None),
+        WorkspaceState::Blocked => ("blocked".to_string(), None),
         WorkspaceState::Rejecting => ("rejecting".to_string(), None),
     }
 }

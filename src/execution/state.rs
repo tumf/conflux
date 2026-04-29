@@ -22,6 +22,7 @@
 //! match state {
 //!     WorkspaceState::Created => { /* start apply */ }
 //!     WorkspaceState::Applying { iteration } => { /* resume from iteration */ }
+//!     WorkspaceState::Blocked => { /* wait for unblock/resume */ }
 //!     WorkspaceState::Rejecting => { /* run rejecting review */ }
 //!     WorkspaceState::Applied => { /* defer to resume-action router (apply or acceptance) */ }
 //!     WorkspaceState::Archiving => { /* resume archive loop after acceptance handoff */ }
@@ -45,7 +46,9 @@ pub enum WorkspaceState {
     /// Apply in progress, WIP commits exist.
     /// The iteration number indicates the next iteration to resume from.
     Applying { iteration: u32 },
-    /// Apply-generated rejection proposal exists and requires rejection review.
+    /// Apply-generated blocker marker exists and change should remain blocked.
+    Blocked,
+    /// Rejection proposal exists and requires rejection review.
     Rejecting,
     /// Apply complete, archive not complete.
     Applied,
@@ -382,9 +385,11 @@ pub async fn has_apply_commit(change_id: &str, repo_root: &Path) -> Result<bool>
 /// 2. Check if archive commit complete → `Archived`
 /// 3. Check if archive files exist (but commit incomplete) → `Archiving`
 ///    - This only resumes an archive step that was already started after acceptance handoff.
-/// 4. Check if worktree-local `REJECTED.md` exists → `Rejecting`
-///    - Apply-generated rejection proposals must resume into dedicated rejecting review.
-/// 5. Check if apply commit exists → `Applied`
+/// 4. Check if worktree-local apply blocker marker exists → `Blocked`
+///    - Apply-generated blockers resume as blocked, not rejecting.
+/// 5. Check if worktree-local `REJECTED.md` exists → `Rejecting`
+///    - Terminal rejection proposals resume into dedicated rejecting review.
+/// 6. Check if apply commit exists → `Applied`
 ///    - Resume router decides apply vs acceptance from worktree task progress; no direct archive jump for non-terminal resumes.
 /// 6. Check for WIP commits → `Applying { iteration }`
 /// 7. Otherwise → `Created`
@@ -422,7 +427,23 @@ pub async fn detect_workspace_state(
         return Ok(WorkspaceState::Archiving);
     }
 
-    // 4. Check if apply-generated rejection proposal exists in workspace
+    // 4. Check if apply-blocked marker exists in workspace
+    let blocked_marker_path = repo_root
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("APPLY_BLOCKED")
+        .join("marker.md");
+    if blocked_marker_path.exists() {
+        debug!(
+            change_id = %change_id,
+            blocked_marker_path = %blocked_marker_path.display(),
+            "State: Blocked"
+        );
+        return Ok(WorkspaceState::Blocked);
+    }
+
+    // 5. Check if rejection proposal exists in workspace
     let rejected_path = repo_root
         .join("openspec")
         .join("changes")
@@ -437,7 +458,7 @@ pub async fn detect_workspace_state(
         return Ok(WorkspaceState::Rejecting);
     }
 
-    // 5. Check if apply commit exists
+    // 6. Check if apply commit exists
     if has_apply_commit(change_id, repo_root).await? {
         debug!(change_id = %change_id, "State: Applied");
         return Ok(WorkspaceState::Applied);

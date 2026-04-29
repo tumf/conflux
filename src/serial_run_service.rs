@@ -21,9 +21,8 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::{
-    acceptance_test_streaming, archive_change, execute_rejection_flow,
-    handle_resume_apply_from_rejecting, run_rejection_review, AcceptanceResult, ArchiveContext,
-    ArchiveResult, OutputHandler, RejectionReviewVerdict,
+    acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
+    OutputHandler,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser;
@@ -467,9 +466,9 @@ impl SerialRunService {
             } else if let Some(ref handoff) = apply_blocked_handoff {
                 warn!(
                     change_id = %change.id,
-                    rejected_path = %handoff.rejected_path.display(),
+                    blocker_path = %handoff.blocker_path.display(),
                     iterations = apply_result.iterations,
-                    "Apply blocked handoff detected; proceeding to rejecting review with incomplete tasks"
+                    "Apply blocked handoff detected; keeping change blocked with preserved worktree context"
                 );
             }
 
@@ -485,41 +484,16 @@ impl SerialRunService {
                 if let Some(ref handoff) = apply_blocked_handoff {
                     warn!(
                         change_id = %change.id,
-                        rejected_path = %handoff.rejected_path.display(),
-                        "Running rejecting review for apply-blocked handoff with unchecked tasks"
+                        blocker_path = %handoff.blocker_path.display(),
+                        "Apply reported recoverable blocker; leaving change stalled for explicit unblock/resume"
                     );
 
-                    Self::update_operation_tracker(&operation_tracker, "rejecting");
-                    match run_rejection_review(&change.id, &self.repo_root, &self.config, ai_runner)
-                        .await?
-                    {
-                        RejectionReviewVerdict::Confirm => {
-                            let reason = format!(
-                                "Apply-blocked rejection confirmed by rejecting review (proposal: {})",
-                                handoff.rejected_path.display()
-                            );
-                            let base_branch =
-                                crate::vcs::git::commands::get_current_branch(&self.repo_root)
-                                    .await
-                                    .map_err(crate::error::OrchestratorError::from_vcs_error)?
-                                    .unwrap_or_else(|| "main".to_string());
-
-                            execute_rejection_flow(
-                                &change.id,
-                                &reason,
-                                &self.repo_root,
-                                &base_branch,
-                                &self.repo_root,
-                            )
-                            .await?;
-
-                            Ok(ChangeProcessResult::Rejected { reason })
-                        }
-                        RejectionReviewVerdict::Resume => {
-                            handle_resume_apply_from_rejecting(&change.id, &self.repo_root).await?;
-                            Ok(ChangeProcessResult::ApplySuccessIncomplete)
-                        }
-                    }
+                    Ok(ChangeProcessResult::Stalled {
+                        error: format!(
+                            "Apply blocked handoff recorded at {}",
+                            handoff.blocker_path.display()
+                        ),
+                    })
                 } else {
                     info!(
                         "Tasks complete for {}, running acceptance test...",
@@ -541,23 +515,13 @@ impl SerialRunService {
                     .await
                     {
                         Ok((AcceptanceResult::Blocked, _attempt_number, _command)) => {
-                            let reason = "Implementation blocker detected".to_string();
-                            let base_branch =
-                                crate::vcs::git::commands::get_current_branch(&self.repo_root)
-                                    .await
-                                    .map_err(crate::error::OrchestratorError::from_vcs_error)?
-                                    .unwrap_or_else(|| "main".to_string());
-
-                            execute_rejection_flow(
-                                &change.id,
-                                &reason,
-                                &self.repo_root,
-                                &base_branch,
-                                &self.repo_root,
-                            )
-                            .await?;
-
-                            Ok(ChangeProcessResult::Rejected { reason })
+                            warn!(
+                                change_id = %change.id,
+                                "Acceptance reported recoverable blocker; returning stalled for explicit unblock/resume"
+                            );
+                            Ok(ChangeProcessResult::Stalled {
+                                error: "Acceptance blocked with recoverable blocker".to_string(),
+                            })
                         }
                         Ok((result, _attempt_number, _command)) => Ok(self
                             .process_acceptance_result(
@@ -671,11 +635,11 @@ impl SerialRunService {
             }
             AcceptanceResult::Blocked => {
                 warn!(
-                    "Acceptance blocked for {} - implementation blocker detected",
+                    "Acceptance blocked for {} - preserving change as stalled/resumable",
                     change_id
                 );
-                ChangeProcessResult::ApplyFailed {
-                    error: "Blocked acceptance reached unexpected fallback path".to_string(),
+                ChangeProcessResult::Stalled {
+                    error: "Acceptance blocked with recoverable blocker".to_string(),
                 }
             }
             AcceptanceResult::Fail { findings } => {
@@ -955,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_process_acceptance_result_blocked_returns_fallback_error_variant() {
+    fn test_process_acceptance_result_blocked_returns_stalled_result() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -975,8 +939,8 @@ mod tests {
 
         assert!(matches!(
             result,
-            ChangeProcessResult::ApplyFailed { ref error }
-            if error == "Blocked acceptance reached unexpected fallback path"
+            ChangeProcessResult::Stalled { ref error }
+            if error == "Acceptance blocked with recoverable blocker"
         ));
     }
 

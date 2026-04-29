@@ -121,6 +121,21 @@ pub enum WaitState {
     ResolveWait,
     /// Waiting because a dependency has not yet completed.
     DependencyBlocked,
+    /// Waiting because apply reported a recoverable blocker.
+    ApplyBlocked,
+    /// Waiting because rejecting review produced a block verdict.
+    RejectionBlocked,
+}
+
+/// Additional metadata preserved while a change is blocked.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BlockedMetadata {
+    /// Machine-readable blocker category.
+    pub blocker_reason: Option<String>,
+    /// Optional operator-facing unblock guidance.
+    pub unblock_metadata: Option<String>,
+    /// Optional snapshot of worktree context captured when blocker was recorded.
+    pub worktree_snapshot: Option<String>,
 }
 
 /// Terminal outcome for a change (once reached, no further transitions).
@@ -164,6 +179,8 @@ pub struct ChangeRuntimeState {
     pub activity: ActivityState,
     /// Wait condition (may co-exist with `Queued` intent).
     pub wait_state: WaitState,
+    /// Preserved metadata for blocked states.
+    pub blocked_metadata: BlockedMetadata,
     /// Terminal outcome once reached.
     pub terminal: TerminalState,
     /// Latest workspace observation (used for reconcile only).
@@ -174,6 +191,23 @@ pub struct ChangeRuntimeState {
 }
 
 impl ChangeRuntimeState {
+    fn clear_blocked_metadata(&mut self) {
+        self.blocked_metadata = BlockedMetadata::default();
+    }
+
+    fn set_blocked_metadata(
+        &mut self,
+        blocker_reason: impl Into<String>,
+        unblock_metadata: impl Into<String>,
+        worktree_snapshot: impl Into<String>,
+    ) {
+        self.blocked_metadata = BlockedMetadata {
+            blocker_reason: Some(blocker_reason.into()),
+            unblock_metadata: Some(unblock_metadata.into()),
+            worktree_snapshot: Some(worktree_snapshot.into()),
+        };
+    }
+
     /// Check whether this runtime state represents active execution
     /// (applying, accepting, archiving, or resolving).
     pub fn is_active(&self) -> bool {
@@ -234,7 +268,9 @@ impl ChangeRuntimeState {
         match self.wait_state {
             WaitState::MergeWait => return "merge wait",
             WaitState::ResolveWait => return "resolve pending",
-            WaitState::DependencyBlocked => return "blocked",
+            WaitState::DependencyBlocked
+            | WaitState::ApplyBlocked
+            | WaitState::RejectionBlocked => return "blocked",
             WaitState::None => {}
         }
         // Queue intent.
@@ -746,10 +782,12 @@ impl OrchestratorState {
                         rt.terminal = TerminalState::None;
                         rt.activity = ActivityState::Idle;
                         rt.wait_state = WaitState::None;
+                        rt.clear_blocked_metadata();
                     }
                     rt.dequeued = false;
                     rt.queue_intent = QueueIntent::Queued;
                     rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                 }
                 self.add_dynamic_change(change_id.clone());
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
@@ -793,6 +831,7 @@ impl OrchestratorState {
                 rt.terminal = TerminalState::None;
                 rt.activity = ActivityState::Idle;
                 rt.wait_state = WaitState::None;
+                rt.clear_blocked_metadata();
                 rt.queue_intent = QueueIntent::NotQueued;
                 rt.dequeued = true;
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
@@ -808,6 +847,7 @@ impl OrchestratorState {
                 rt.terminal = TerminalState::Stopped;
                 rt.activity = ActivityState::Idle;
                 rt.wait_state = WaitState::None;
+                rt.clear_blocked_metadata();
                 rt.queue_intent = QueueIntent::NotQueued;
                 ReduceOutcome::Changed(ReducerEffect::TerminalStateSet {
                     change_id,
@@ -843,6 +883,7 @@ impl OrchestratorState {
                 // Clear MergeWait when worktree is no longer ahead.
                 if matches!(rt.wait_state, WaitState::MergeWait) {
                     rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                 }
                 rt.observation = WorkspaceObservation::WorktreeNotAhead;
             }
@@ -889,6 +930,7 @@ impl OrchestratorState {
                     rt.terminal = TerminalState::Error(error.clone());
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                 }
             }
 
@@ -903,6 +945,7 @@ impl OrchestratorState {
                     if !rt.is_terminal() && !rt.dequeued {
                         rt.activity = ActivityState::Applying;
                         rt.wait_state = WaitState::None;
+                        rt.clear_blocked_metadata();
                         should_start = true;
                     }
                 }
@@ -924,6 +967,7 @@ impl OrchestratorState {
                     rt.terminal = TerminalState::Error(error.clone());
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                 }
             }
 
@@ -954,6 +998,7 @@ impl OrchestratorState {
                     rt.terminal = TerminalState::Rejected(reason.clone());
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                     rt.queue_intent = QueueIntent::NotQueued;
                 }
             }
@@ -968,10 +1013,11 @@ impl OrchestratorState {
                 if rt.is_terminal() || rt.dequeued {
                     return;
                 }
-                match outcome {
+                match *outcome {
                     crate::events::RejectionOutcome::Confirm => {
                         rt.activity = ActivityState::Idle;
                         rt.wait_state = WaitState::None;
+                        rt.clear_blocked_metadata();
                         rt.queue_intent = QueueIntent::NotQueued;
                         rt.terminal = TerminalState::Rejected(
                             "rejecting review confirmed rejection".to_string(),
@@ -980,7 +1026,18 @@ impl OrchestratorState {
                     crate::events::RejectionOutcome::Resume => {
                         rt.activity = ActivityState::Applying;
                         rt.wait_state = WaitState::None;
+                        rt.clear_blocked_metadata();
                         rt.terminal = TerminalState::None;
+                    }
+                    crate::events::RejectionOutcome::Block => {
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::RejectionBlocked;
+                        rt.terminal = TerminalState::None;
+                        rt.set_blocked_metadata(
+                            "rejection review returned block; unresolved blocker remains",
+                            "resolve unresolved blocker tasks in openspec/changes/<change_id>/tasks.md, then trigger explicit resume",
+                            "existing worktree and WIP context are preserved for blocked rejection review",
+                        );
                     }
                 }
             }
@@ -1008,6 +1065,15 @@ impl OrchestratorState {
                         }
                         crate::vcs::WorkspaceStatus::Accepting => {
                             rt.activity = ActivityState::Accepting;
+                        }
+                        crate::vcs::WorkspaceStatus::Blocked => {
+                            rt.activity = ActivityState::Idle;
+                            rt.wait_state = WaitState::ApplyBlocked;
+                            rt.set_blocked_metadata(
+                                "apply reported recoverable blocker; workspace remains blocked",
+                                "resolve implementation blocker section and pending unblock tasks before explicit retry",
+                                "existing worktree and WIP context are preserved while blocked",
+                            );
                         }
                         crate::vcs::WorkspaceStatus::Rejecting => {
                             rt.activity = ActivityState::Rejecting;
@@ -1144,12 +1210,23 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.is_active() {
                     rt.wait_state = WaitState::DependencyBlocked;
+                    rt.set_blocked_metadata(
+                        "dependency_blocked",
+                        "resolve dependencies and retry queue",
+                        "worktree snapshot not required for dependency blocker",
+                    );
                 }
             }
             ExecutionEvent::DependencyResolved { change_id } => {
                 let rt = self.runtime_entry(change_id);
-                if matches!(rt.wait_state, WaitState::DependencyBlocked) {
+                if matches!(
+                    rt.wait_state,
+                    WaitState::DependencyBlocked
+                        | WaitState::ApplyBlocked
+                        | WaitState::RejectionBlocked
+                ) {
                     rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                 }
             }
 
@@ -1166,6 +1243,7 @@ impl OrchestratorState {
                 rt.terminal = TerminalState::None;
                 rt.activity = ActivityState::Idle;
                 rt.wait_state = WaitState::None;
+                rt.clear_blocked_metadata();
                 rt.queue_intent = QueueIntent::NotQueued;
                 rt.dequeued = true;
             }
@@ -1198,6 +1276,7 @@ impl OrchestratorState {
                         rt.terminal = TerminalState::None;
                         rt.activity = ActivityState::Idle;
                         rt.wait_state = WaitState::None;
+                        rt.clear_blocked_metadata();
                         rt.queue_intent = QueueIntent::NotQueued;
                     }
                 }
@@ -1720,6 +1799,47 @@ mod tests {
                 .expect("runtime for c after rejecting confirm")
                 .activity,
             ActivityState::Rejecting
+        );
+    }
+
+    #[test]
+    fn test_rejection_review_block_transitions_to_blocked_with_metadata() {
+        use crate::events::{ExecutionEvent, RejectionOutcome};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ProcessingStarted("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "c".to_string(),
+            workspace_name: "ws-c".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+        assert_eq!(state.display_status("c"), "rejecting");
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "c".to_string(),
+            outcome: RejectionOutcome::Block,
+        });
+
+        let runtime = state
+            .change_runtime("c")
+            .expect("runtime for c after rejecting block");
+        assert_eq!(state.display_status("c"), "blocked");
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert_eq!(runtime.wait_state, WaitState::RejectionBlocked);
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        assert_eq!(
+            runtime.blocked_metadata.blocker_reason.as_deref(),
+            Some("rejection review returned block; unresolved blocker remains")
+        );
+        assert_eq!(
+            runtime.blocked_metadata.unblock_metadata.as_deref(),
+            Some(
+                "resolve unresolved blocker tasks in openspec/changes/<change_id>/tasks.md, then trigger explicit resume"
+            )
+        );
+        assert_eq!(
+            runtime.blocked_metadata.worktree_snapshot.as_deref(),
+            Some("existing worktree and WIP context are preserved for blocked rejection review")
         );
     }
 

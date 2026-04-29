@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Runtime state models blocked as resumable non-terminal work
+### Requirement: Reducer-Owned Change Runtime State
 
 The runtime state MUST distinguish `Blocked` from terminal `Rejected`.
 
