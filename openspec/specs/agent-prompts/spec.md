@@ -405,21 +405,13 @@ The bundled workflow skill `cflx-workflow` MUST remain installable for backward 
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
-The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary source of fixed operation guidance for dependency analysis and conflict resolution respectively. Rust-side prompt builders MAY inject variable runtime context, but they MUST NOT remain the primary home of fixed analyze / resolve rules.
+The dedicated `cflx-analyze` skill MUST define the allowed dependency target set for analyze output as the current queued change IDs plus any explicitly supplied in-flight change IDs. Rust prompt builders MAY provide those IDs as runtime context, but analyze guidance MUST NOT leave the allowed dependency universe ambiguous.
 
-#### Scenario: Analyze fixed guidance moves out of inline Rust prompt text
-
+#### Scenario: Analyze guidance declares closed-world dependency targets
 - **GIVEN** dependency analysis is executed through the standard orchestrator path
 - **WHEN** the analyze prompt is assembled
-- **THEN** fixed dependency-selection guidance comes from `cflx-analyze`
-- **AND** Rust primarily contributes variable context such as candidate changes and progress
-
-#### Scenario: Resolve fixed guidance moves out of inline Rust prompt text
-
-- **GIVEN** conflict resolution or merge-finalization recovery is executed through the standard orchestrator path
-- **WHEN** the resolve prompt is assembled
-- **THEN** fixed conflict-resolution guidance comes from `cflx-resolve`
-- **AND** Rust primarily contributes variable context such as conflict files, VCS state, and retry history
+- **THEN** the authoritative guidance from `cflx-analyze` states that `dependencies` may reference only queued change IDs and explicit in-flight change IDs
+- **AND** it forbids returning unrelated active/repo-local change IDs as dependency targets
 
 ### Requirement: cflx-accept MUST preserve acceptance command-template single source
 
@@ -443,22 +435,10 @@ The primary acceptance verdict contract MUST be a strict JSON object emitted as 
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
-The dedicated `cflx-analyze` and `cflx-resolve` skills MUST become the primary source of fixed operation guidance for dependency analysis and conflict resolution respectively. Rust-side prompt builders MAY inject variable runtime context, but they MUST NOT remain the primary home of fixed analyze / resolve rules, output contracts, safety constraints, sequential merge protocol, or commit conventions.
+The dedicated `cflx-analyze` skill MUST define the allowed dependency target set for analyze output as the current queued change IDs plus any explicitly supplied in-flight change IDs. Rust prompt builders MAY provide those IDs as runtime context, but analyze guidance MUST NOT leave the allowed dependency universe ambiguous.
 
-The dedicated `cflx-analyze` skill MUST define the allowed dependency target set for analyze output as the current queued change IDs plus any explicitly supplied in-flight change IDs. Responses that reference other active, archived, or unrelated change IDs as dependency targets MUST be treated as invalid dependency contract output.
-
-#### Scenario: Analyze fixed guidance moves out of inline Rust prompt text
-
+#### Scenario: Analyze guidance declares closed-world dependency targets
 - **GIVEN** dependency analysis is executed through the standard orchestrator path
 - **WHEN** the analyze prompt is assembled
-- **THEN** fixed dependency-selection guidance comes from `cflx-analyze`
-- **AND** Rust primarily contributes variable context such as candidate changes and progress
-- **AND** the Rust-side prompt body does not restate the analyze selection rules or output contract as authoritative instructions
-
-#### Scenario: Resolve fixed guidance moves out of inline Rust prompt text
-
-- **GIVEN** conflict resolution or merge-finalization recovery is executed through the standard orchestrator path
-- **WHEN** the resolve prompt is assembled
-- **THEN** fixed conflict-resolution guidance comes from `cflx-resolve`
-- **AND** Rust primarily contributes variable context such as conflict files, VCS state, merge plan, and retry history
-- **AND** the Rust-side prompt body does not restate the resolve safety rules, sequential merge protocol, or commit conventions as authoritative instructions
+- **THEN** the authoritative guidance from `cflx-analyze` states that `dependencies` may reference only queued change IDs and explicit in-flight change IDs
+- **AND** it forbids returning unrelated active/repo-local change IDs as dependency targets
