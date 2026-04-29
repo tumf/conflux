@@ -3,15 +3,18 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tracing::debug;
 
+/// Build metadata included in versioned user-facing logs and output.
+pub const VERSION_WITH_BUILD: &str = concat!(
+    "v",
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BUILD_NUMBER"),
+    ")"
+);
+
 /// Get version string with build number
 const fn get_version_string() -> &'static str {
-    concat!(
-        "v",
-        env!("CARGO_PKG_VERSION"),
-        " (",
-        env!("BUILD_NUMBER"),
-        ")"
-    )
+    VERSION_WITH_BUILD
 }
 
 /// OpenSpec Orchestrator - Automate OpenSpec workflow

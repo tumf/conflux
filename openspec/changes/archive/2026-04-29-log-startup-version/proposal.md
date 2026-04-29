@@ -39,18 +39,17 @@ Conflux のログは起動後の挙動確認や障害調査に使われるが、
 
 起動ログに使う共通のバージョン文字列を一箇所に定義し、各主要起動経路の earliest startup log に `cflx v{version} ({build})` と mode 情報を含める。
 
-- `cflx` のデフォルト TUI 起動と `cflx tui` の明示起動は、logging 初期化直後に TUI mode の versioned startup log を 1 回記録する。
 - `cflx run` は orchestration 開始前の startup log に version と mode を含める。
 - `cflx server` は daemon startup log に version と mode を含め、server bind 情報と併記しても version が欠落しないようにする。
+- TUI 起動 (`cflx` / `cflx tui`) は端末初期化制約により本 change の acceptance 対象外とし、将来の実TTY検証タスクで追跡する。
 - 既存の `Starting orchestrator` / `Starting server daemon` / 類似ログは、必要なら wording を統一するが、プロセス開始 1 回につき versioned startup log の冗長重複を最小化する。
 - OpenSpec の observability / cli spec に「起動時ログは version/build を含む」要求を追加し、ログファイルと stdout の両方で追跡可能にする。
 
 ## Acceptance Criteria
 
-- `cflx` または `cflx tui` を起動したとき、起動直後の `info!` ログの少なくとも 1 件に `cflx` の version と build number が含まれる。
 - `cflx run` を起動したとき、orchestration 開始前に出る startup log から、その run を出力した cflx version/build を判別できる。
 - `cflx server` を起動したとき、server daemon startup log から、その daemon を出力した cflx version/build を判別できる。
-- versioned startup log は mode を識別でき、TUI / run / server のどの起動経路かがログ単体で分かる。
+- versioned startup log は mode を識別でき、run / server のどの起動経路かがログ単体で分かる。
 - 既存の起動ログ群が version なしの類似メッセージを大量重複させる状態にはならず、プロセス開始のたびに少数の一貫した startup log に収束する。
 
 ## Explicit Completion Conditions

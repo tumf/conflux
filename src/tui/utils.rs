@@ -13,6 +13,7 @@ use crossterm::{
 use tracing::info;
 use unicode_width::UnicodeWidthStr;
 
+use crate::cli::VERSION_WITH_BUILD;
 use crate::error::{OrchestratorError, Result};
 
 fn find_change_dir(change_id: &str, base_path: Option<&Path>) -> Option<PathBuf> {
@@ -175,11 +176,7 @@ pub fn clear_screen() -> Result<()> {
 
 /// Get version string for display
 pub fn get_version_string() -> String {
-    format!(
-        "cflx v{} ({})",
-        env!("CARGO_PKG_VERSION"),
-        env!("BUILD_NUMBER")
-    )
+    format!("cflx {}", VERSION_WITH_BUILD)
 }
 
 #[cfg(test)]
