@@ -302,6 +302,12 @@ pub fn parse_archived_change_with_worktree_fallback(
 /// 3. Try base tree archive location: openspec/changes/archive/{change_id}/tasks.md (or date-prefixed)
 /// 4. Try base tree active location: openspec/changes/{change_id}/tasks.md
 ///
+/// Note:
+/// This helper is for task *progress reads* across worktree/base-tree boundaries.
+/// Rejecting recovery task *writes* use `orchestration::rejection` with a stricter
+/// workspace-local canonical order (active change dir first, then archived change dir)
+/// and intentionally do not fall back to base-tree paths.
+///
 /// # Arguments
 /// * `change_id` - The ID of the change to retrieve progress for
 /// * `worktree_path` - Optional path to the worktree (for uncommitted changes)

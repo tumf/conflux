@@ -168,6 +168,15 @@ fn is_archive_dir_for_change(entry: &Path, change_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve canonical tasks.md for rejecting recovery writes.
+///
+/// Precedence is intentionally workspace-local and deterministic:
+/// 1. active change directory (`openspec/changes/<change_id>/tasks.md`)
+/// 2. archived change directory under workspace (`openspec/changes/archive/.../tasks.md`)
+///
+/// Unlike `task_parser::parse_progress_with_fallback`, this write path does not
+/// use base-tree fallback because rejecting recovery must mutate the currently
+/// resumed workspace context only.
 async fn resolve_recovery_tasks_path(change_id: &str, workspace_path: &Path) -> Result<PathBuf> {
     let active = active_tasks_path(workspace_path, change_id);
     if tokio::fs::metadata(&active).await.is_ok() {
