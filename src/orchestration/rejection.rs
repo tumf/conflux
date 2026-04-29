@@ -188,14 +188,24 @@ async fn resolve_recovery_tasks_path(change_id: &str, workspace_path: &Path) -> 
         return Ok(active);
     }
 
-    let archive_root = workspace_path.join("openspec").join("changes").join("archive");
-    let mut explored = vec![active.display().to_string(), archive_root.display().to_string()];
+    let archive_root = workspace_path
+        .join("openspec")
+        .join("changes")
+        .join("archive");
+    let mut explored = vec![
+        active.display().to_string(),
+        archive_root.display().to_string(),
+    ];
 
     let mut archived_candidates: Vec<PathBuf> = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(&archive_root).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let is_dir = entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false);
             if !is_dir || !is_archive_dir_for_change(&path, change_id) {
                 continue;
             }
@@ -633,8 +643,11 @@ mod tests {
             .join("archive")
             .join("2026-04-29-change-a");
         fs::create_dir_all(&archive_dir).expect("create archive dir");
-        fs::write(archive_dir.join("tasks.md"), "## Implementation Tasks\n- [ ] keep\n")
-            .expect("write tasks");
+        fs::write(
+            archive_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] keep\n",
+        )
+        .expect("write tasks");
 
         handle_resume_apply_from_rejecting(change_id, workspace)
             .await
@@ -655,8 +668,11 @@ mod tests {
             .join("archive")
             .join("2026-04-29-change-a");
         fs::create_dir_all(&archive_dir).expect("create archive dir");
-        fs::write(archive_dir.join("tasks.md"), "## Implementation Tasks\n- [ ] keep\n")
-            .expect("write tasks");
+        fs::write(
+            archive_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] keep\n",
+        )
+        .expect("write tasks");
 
         handle_blocked_from_rejecting(change_id, workspace)
             .await
