@@ -8,6 +8,9 @@
 - [x] 6. `classify-acceptance-followup-routing` のような dependency-coupled change を想定した regression test を追加し、依存 change 完了後に stale base worktree ではなく最新 base 前提で downstream change が再開されることを確認する (verification: integration - `src/parallel/tests/workspace_resume.rs` または scheduler integration test で dependency unblock 後の recreate を通し、`classify-acceptance-followup-routing` 相当の downstream change が stale worktree reuse ではなく fresh base dispatch へ進むことを確認する)
 - [x] 7. proposal delta と関連実装変更をまとめて検証する (verification: integration - `cflx openspec validate fix-dependency-resolved-worktree-recreation --strict --evidence warn`, `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`)
 
+## Acceptance #1 Failure Follow-up
+- [x] `src/parallel/dispatch.rs:512-540` と `src/parallel/workspace.rs:36-72` の dependency-resolved fresh recreate 経路は、`force_recreate_worktree` を消費して `find_existing_workspace()/reuse_workspace()` を避けるだけで、既存の registered worktree / branch を dispatch 前に cleanup していません。spec/task 4 が要求する「stale worktree が残っていた場合の cleanup または equivalent invalidation」に対する実装証拠がなく、既存 worktree が残る実ケースでは `create_workspace()` が branch/path 競合に依存した挙動になります。
+- [x] `src/parallel/tests/workspace_resume.rs:284-319` の追加テストは mock `WorkspaceManager` 上で「再利用しない」ことしか確認しておらず、dependency-resolved change に既存の valid worktree が残っている場合でも fresh recreate 前に cleanup/invalidation が走ることを検証していません。これでは `openspec/changes/fix-dependency-resolved-worktree-recreation/tasks.md:6` の verification（cleanup を伴う recreate 成功）と `tasks.md:8` の regression requirement を満たした証明になっていません。
 ## Future Work
 
 - dependency-unblocked stale worktree を operator が明示確認できる dashboard / TUI 表示改善

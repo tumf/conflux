@@ -68,6 +68,8 @@ struct ResumeTestManager {
     existing: Option<WorkspaceInfo>,
     /// The workspace path returned for all workspace operations.
     workspace_path: PathBuf,
+    /// Tracks cleanup calls for stale workspace invalidation assertions.
+    cleanup_calls: Vec<String>,
 }
 
 #[async_trait]
@@ -116,7 +118,8 @@ impl WorkspaceManager for ResumeTestManager {
     async fn merge_workspaces(&self, _revisions: &[String]) -> VcsResult<String> {
         Ok("merge-rev".to_string())
     }
-    async fn cleanup_workspace(&mut self, _workspace_name: &str) -> VcsResult<()> {
+    async fn cleanup_workspace(&mut self, workspace_name: &str) -> VcsResult<()> {
+        self.cleanup_calls.push(workspace_name.to_string());
         Ok(())
     }
     async fn cleanup_all(&mut self) -> VcsResult<()> {
@@ -194,6 +197,7 @@ async fn test_get_or_create_workspace_new_returns_not_resumed() {
     let mut manager = ResumeTestManager {
         existing: None,
         workspace_path: tmp.path().to_path_buf(),
+        cleanup_calls: vec![],
     };
     let (tx, _rx) = mpsc::channel::<ParallelEvent>(16);
     let event_tx = Some(tx);
@@ -225,6 +229,7 @@ async fn test_get_or_create_workspace_reuse_returns_resumed() {
     let mut manager = ResumeTestManager {
         existing: Some(workspace_info),
         workspace_path: tmp.path().to_path_buf(),
+        cleanup_calls: vec![],
     };
     let (tx, _rx) = mpsc::channel::<ParallelEvent>(16);
     let event_tx = Some(tx);
@@ -260,6 +265,7 @@ async fn test_get_or_create_workspace_no_resume_creates_fresh() {
     let mut manager = ResumeTestManager {
         existing: Some(workspace_info),
         workspace_path: tmp.path().to_path_buf(),
+        cleanup_calls: vec![],
     };
     let (tx, _rx) = mpsc::channel::<ParallelEvent>(16);
     let event_tx = Some(tx);
@@ -295,6 +301,7 @@ async fn test_get_or_create_workspace_force_recreate_bypasses_reuse() {
     let mut manager = ResumeTestManager {
         existing: Some(workspace_info),
         workspace_path: tmp.path().to_path_buf(),
+        cleanup_calls: vec![],
     };
     let (tx, _rx) = mpsc::channel::<ParallelEvent>(16);
     let event_tx = Some(tx);
@@ -316,6 +323,11 @@ async fn test_get_or_create_workspace_force_recreate_bypasses_reuse() {
     assert!(
         !was_resumed,
         "force_recreate 対象は既存 workspace を再利用してはならない"
+    );
+    assert_eq!(
+        manager.cleanup_calls,
+        vec!["ws-my-change".to_string()],
+        "force_recreate 対象は stale workspace を cleanup してから fresh recreate すべき"
     );
 }
 
