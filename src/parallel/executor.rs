@@ -524,8 +524,8 @@ pub async fn execute_archive_in_workspace(
     }
 
     use crate::execution::archive::{
-        build_archive_error_message, ensure_archive_commit, verify_archive_completion,
-        ARCHIVE_COMMAND_MAX_RETRIES,
+        build_archive_error_message, ensure_archive_commit, extract_archive_runtime_blocker,
+        verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
     };
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
@@ -714,9 +714,15 @@ pub async fn execute_archive_in_workspace(
             continue;
         }
 
-        return Err(OrchestratorError::AgentCommand(
-            build_archive_error_message(change_id, Some(workspace_path)),
-        ));
+        let runtime_blocker = extract_archive_runtime_blocker(
+            output_collector.stdout_tail().as_deref(),
+            output_collector.stderr_tail().as_deref(),
+        );
+        return Err(OrchestratorError::AgentCommand(build_archive_error_message(
+            change_id,
+            Some(workspace_path),
+            runtime_blocker.as_deref(),
+        )));
     }
 
     info!(

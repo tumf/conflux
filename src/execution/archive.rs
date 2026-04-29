@@ -658,20 +658,57 @@ pub fn get_task_progress(
 ///
 /// Creates a descriptive error message when archive verification fails,
 /// suitable for logging or sending to the user.
-pub fn build_archive_error_message(change_id: &str, workspace_path: Option<&Path>) -> String {
+pub fn extract_archive_runtime_blocker(stdout_tail: Option<&str>, stderr_tail: Option<&str>) -> Option<String> {
+    fn extract_line(text: &str) -> Option<String> {
+        let candidates = [
+            "Runtime behavior is claimed without implementation-facing tasks",
+            "validation failed",
+            "not archive-ready",
+            "archive readiness",
+            "precondition",
+            "blocker",
+            "failed",
+        ];
+        text.lines().rev().find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if candidates.iter().any(|needle| lower.contains(&needle.to_ascii_lowercase())) {
+                return Some(trimmed.to_string());
+            }
+            None
+        })
+    }
+
+    extract_line(stdout_tail.unwrap_or("")).or_else(|| extract_line(stderr_tail.unwrap_or("")))
+}
+
+pub fn build_archive_error_message(
+    change_id: &str,
+    workspace_path: Option<&Path>,
+    runtime_blocker: Option<&str>,
+) -> String {
+    let root_cause = runtime_blocker
+        .map(|b| format!(" Root cause from archive attempt: {}.", b))
+        .unwrap_or_default();
+
     match workspace_path {
         Some(path) => format!(
-            "Archive command succeeded but change '{}' in workspace '{}' was not actually archived. \
-             The change directory still exists in openspec/changes/. \
-             The archive command may not have executed 'openspec archive' correctly.",
+            "Archive command did not complete for change '{}' in workspace '{}'. \
+             The change directory still exists in openspec/changes/ after archive verification.{} \
+             Treat this as an archive failure with preserved root cause instead of a generic verification-only failure.",
             change_id,
-            path.display()
+            path.display(),
+            root_cause
         ),
         None => format!(
-            "Archive command succeeded but change '{}' was not actually archived. \
-             The change directory still exists in openspec/changes/. \
-             The archive command may not have executed 'openspec archive' correctly.",
-            change_id
+            "Archive command did not complete for change '{}'. \
+             The change directory still exists in openspec/changes/ after archive verification.{} \
+             Treat this as an archive failure with preserved root cause instead of a generic verification-only failure.",
+            change_id,
+            root_cause
         ),
     }
 }
@@ -1388,15 +1425,23 @@ fi\n";
 
     #[test]
     fn test_build_archive_error_message() {
-        let msg = build_archive_error_message("add-feature", None);
+        let msg = build_archive_error_message("add-feature", None, None);
         assert!(msg.contains("add-feature"));
-        assert!(msg.contains("not actually archived"));
+        assert!(msg.contains("did not complete"));
         assert!(msg.contains("openspec/changes"));
 
-        let msg_with_path = build_archive_error_message("add-feature", Some(Path::new("/tmp/ws")));
+        let msg_with_path =
+            build_archive_error_message("add-feature", Some(Path::new("/tmp/ws")), None);
         assert!(msg_with_path.contains("add-feature"));
         assert!(msg_with_path.contains("in workspace '/tmp/ws'"));
-        assert!(msg_with_path.contains("not actually archived"));
+        assert!(msg_with_path.contains("did not complete"));
+
+        let with_blocker = build_archive_error_message(
+            "add-feature",
+            Some(Path::new("/tmp/ws")),
+            Some("Runtime behavior is claimed without implementation-facing tasks"),
+        );
+        assert!(with_blocker.contains("Root cause from archive attempt"));
     }
 
     // ===========================

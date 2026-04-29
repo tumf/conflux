@@ -125,7 +125,8 @@ where
     output.on_info(&format!("Archiving: {}", change.id));
 
     use crate::execution::archive::{
-        build_archive_error_message, verify_archive_completion, ARCHIVE_COMMAND_MAX_RETRIES,
+        build_archive_error_message, extract_archive_runtime_blocker, verify_archive_completion,
+        ARCHIVE_COMMAND_MAX_RETRIES,
     };
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
@@ -223,7 +224,9 @@ where
             continue;
         }
 
-        let error_msg = build_archive_error_message(&change.id, None);
+        let runtime_blocker = extract_archive_runtime_blocker(None, None);
+        let error_msg =
+            build_archive_error_message(&change.id, None, runtime_blocker.as_deref());
         output.on_error(&error_msg);
         return Ok(ArchiveResult::Failed { error: error_msg });
     }
@@ -555,7 +558,9 @@ where
 
     output.on_info(&format!("Archiving: {}", change.id));
 
-    use crate::execution::archive::{build_archive_error_message, ARCHIVE_COMMAND_MAX_RETRIES};
+    use crate::execution::archive::{
+        build_archive_error_message, extract_archive_runtime_blocker, ARCHIVE_COMMAND_MAX_RETRIES,
+    };
 
     let max_attempts = ARCHIVE_COMMAND_MAX_RETRIES.saturating_add(1);
     let mut attempt: u32 = 0;
@@ -652,7 +657,12 @@ where
         }
 
         if attempt > ARCHIVE_COMMAND_MAX_RETRIES {
-            let error_msg = build_archive_error_message(&change.id, None);
+            let runtime_blocker = extract_archive_runtime_blocker(
+                output_collector.stdout_tail().as_deref(),
+                output_collector.stderr_tail().as_deref(),
+            );
+            let error_msg =
+                build_archive_error_message(&change.id, None, runtime_blocker.as_deref());
             output.on_error(&error_msg);
             return Ok(ArchiveResult::Failed { error: error_msg });
         }
