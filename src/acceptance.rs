@@ -41,13 +41,16 @@ pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
     ("ACCEPTANCE: PASS", "pass"),
     ("ACCEPTANCE: FAIL", "fail"),
     ("ACCEPTANCE: CONTINUE", "continue"),
-    ("ACCEPTANCE: BLOCKED", "blocked"),
+    ("ACCEPTANCE: GATED", "gated"),
+    // Legacy backward-compatibility marker during migration.
+    ("ACCEPTANCE: BLOCKED", "gated"),
 ];
 
 /// Attempt to parse a single line/text payload as a strict JSON acceptance
 /// verdict object. Returns `Some((kind, findings))` when the trimmed content is
 /// a JSON object with an `acceptance` field equal to one of
-/// `pass`/`fail`/`continue`/`blocked` (case-insensitive).
+/// `pass`/`fail`/`continue`/`gated` (case-insensitive).
+/// Legacy `blocked` input is accepted as backward-compatible alias.
 ///
 /// Accepted shapes:
 ///
@@ -67,7 +70,8 @@ pub(crate) fn parse_json_verdict(text: &str) -> Option<(&'static str, Vec<String
         "pass" => "pass",
         "fail" => "fail",
         "continue" => "continue",
-        "blocked" => "blocked",
+        "gated" => "gated",
+        "blocked" => "gated",
         _ => return None,
     };
     let findings = obj
@@ -130,7 +134,7 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
         .map(|(_, kind)| *kind)
 }
 
-/// Parse acceptance output text and determine pass/fail/continue/blocked status.
+/// Parse acceptance output text and determine pass/fail/continue/gated status.
 ///
 /// Contract (JSON-primary, text-fallback):
 ///
@@ -141,7 +145,8 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
 ///   The first JSON verdict encountered wins, regardless of any earlier text
 ///   marker.
 /// - Fallback: a standalone legacy line equal to one of `ACCEPTANCE: PASS`,
-///   `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: BLOCKED`.
+///   `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: GATED`,
+///   or (legacy-compatibility) `ACCEPTANCE: BLOCKED`.
 ///   Bold/italic/underline wrappers and leading heading/blockquote/bullet
 ///   prefixes are tolerated defensively, but trailing-text concatenation onto
 ///   the marker (for example `ACCEPTANCE: PASSAll ...` or
@@ -198,7 +203,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     match fallback_kind {
         Some("pass") => AcceptanceResult::Pass,
         Some("continue") => AcceptanceResult::Continue,
-        Some("blocked") => AcceptanceResult::Gated,
+        Some("gated") => AcceptanceResult::Gated,
         Some("fail") => {
             let findings = parse_findings(output);
             AcceptanceResult::Fail { findings }
@@ -771,8 +776,8 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             ("ACCEPTANCE: CONTINUE", "continue"),
             ("ACCEPTANCE: GATED", "gated"),
             // Legacy compatibility during migration.
-            ("ACCEPTANCE: BLOCKED", "blocked"),
-            ("## ACCEPTANCE: BLOCKED", "blocked"),
+            ("ACCEPTANCE: BLOCKED", "gated"),
+            ("## ACCEPTANCE: BLOCKED", "gated"),
             ("> ACCEPTANCE: FAIL", "fail"),
         ];
 
@@ -791,7 +796,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 AcceptanceResult::Pass => "pass",
                 AcceptanceResult::Fail { .. } => "fail",
                 AcceptanceResult::Continue => "continue",
-                AcceptanceResult::Gated => "blocked",
+                AcceptanceResult::Gated => "gated",
             };
             assert_eq!(
                 result_kind, *expected_kind,
@@ -856,14 +861,18 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     }
 
     #[test]
-    fn test_parse_json_verdict_continue_and_blocked() {
+    fn test_parse_json_verdict_continue_gated_and_legacy_blocked() {
         assert_eq!(
             parse_json_verdict(r#"{"acceptance":"continue"}"#),
             Some(("continue", Vec::<String>::new()))
         );
         assert_eq!(
+            parse_json_verdict(r#"{"acceptance":"gated"}"#),
+            Some(("gated", Vec::<String>::new()))
+        );
+        assert_eq!(
             parse_json_verdict(r#"{"acceptance":"blocked"}"#),
-            Some(("blocked", Vec::<String>::new()))
+            Some(("gated", Vec::<String>::new()))
         );
     }
 
@@ -959,8 +968,12 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             Some("pass")
         );
         assert_eq!(
+            detect_verdict_in_line(r#"{"acceptance":"gated"}"#),
+            Some("gated")
+        );
+        assert_eq!(
             detect_verdict_in_line(r#"{"acceptance":"blocked"}"#),
-            Some("blocked")
+            Some("gated")
         );
     }
 

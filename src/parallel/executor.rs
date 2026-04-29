@@ -1570,7 +1570,7 @@ pub async fn execute_acceptance_in_workspace(
             }
 
             Ok((
-                crate::orchestration::AcceptanceResult::Blocked,
+                crate::orchestration::AcceptanceResult::Gated,
                 attempt_number,
             ))
         }

@@ -1422,7 +1422,7 @@ impl ParallelExecutor {
                         };
                     }
                     Ok((
-                        crate::orchestration::AcceptanceResult::Blocked,
+                        crate::orchestration::AcceptanceResult::Gated,
                         acceptance_iteration,
                     )) => {
                         let reason = blocked_handoff

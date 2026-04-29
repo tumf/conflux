@@ -1968,7 +1968,7 @@ async fn test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_chan
                 other => panic!("expected continue result, got {:?}", other),
             },
             "blocked" => match result {
-                crate::orchestration::AcceptanceResult::Blocked => {}
+                crate::orchestration::AcceptanceResult::Gated => {}
                 other => panic!("expected blocked result, got {:?}", other),
             },
             "command_failed" => match result {

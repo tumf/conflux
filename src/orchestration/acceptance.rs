@@ -51,7 +51,7 @@ pub enum AcceptanceResult {
     /// Acceptance requires more investigation - retry acceptance.
     Continue,
     /// Acceptance gated due to implementation blocker - stop apply loop.
-    Blocked,
+    Gated,
     /// Acceptance command execution failed (non-zero exit).
     CommandFailed {
         error: String,
@@ -284,8 +284,8 @@ where
         }
         crate::acceptance::AcceptanceResult::Gated => {
             info!("Acceptance gated for: {}", change.id);
-            output.on_warn("Acceptance test: BLOCKED");
-            (AcceptanceResult::Blocked, false)
+            output.on_warn("Acceptance test: GATED");
+            (AcceptanceResult::Gated, false)
         }
     };
 
@@ -346,7 +346,7 @@ mod tests {
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());
-        assert!(!AcceptanceResult::Blocked.is_pass());
+        assert!(!AcceptanceResult::Gated.is_pass());
     }
 
     #[test]

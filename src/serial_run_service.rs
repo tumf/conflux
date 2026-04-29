@@ -514,7 +514,7 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok((AcceptanceResult::Blocked, _attempt_number, _command)) => {
+                        Ok((AcceptanceResult::Gated, _attempt_number, _command)) => {
                             warn!(
                                 change_id = %change.id,
                                 "Acceptance reported recoverable blocker; returning stalled for explicit unblock/resume"
@@ -633,7 +633,7 @@ impl SerialRunService {
                     ChangeProcessResult::AcceptanceContinue
                 }
             }
-            AcceptanceResult::Blocked => {
+            AcceptanceResult::Gated => {
                 warn!(
                     "Acceptance gated for {} - preserving change as stalled/resumable",
                     change_id
@@ -933,7 +933,7 @@ mod tests {
             "test-change",
             temp_dir.path(),
             &agent,
-            AcceptanceResult::Blocked,
+            AcceptanceResult::Gated,
             || false, // Not a single-change stop
         );
 
