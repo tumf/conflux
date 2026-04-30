@@ -38,6 +38,13 @@ The build output (`dashboard/dist/`) is embedded into the Rust binary via `inclu
 * Parallel mode: Mainly used
 * Serial mode: Obsolete (to be removed)
 
+## Workspace State Principle
+
+* Workflow state must be derivable from the workspace alone.
+* Do not introduce or depend on out-of-worktree durable workflow state for resume routing, acceptance gating, or archive routing.
+* Deleting `~/.local/state/cflx/**` must not change the next action chosen for the same workspace contents.
+* External logs, metrics, or UI caches are allowed only as non-authoritative observability outputs and must never be used as workflow control inputs.
+
 ## Skills
 
 It also depends on `cflx-*` skills developed under the `skills/` directory.
