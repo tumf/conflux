@@ -15,6 +15,8 @@ When an apply operation determines that implementation is impossible and creates
 
 ## Required Checks
 
+- If `openspec/CONSTITUTION.md` exists, read it before rejection review and treat it as higher-priority project law than proposal/spec deltas.
+
 1. Confirm `openspec/changes/<change-id>/REJECTED.md` exists and contains a concrete reason.
 2. Confirm blocker evidence in `tasks.md` (`## Implementation Blocker #N`) is specific and actionable.
 3. Decide one outcome only:

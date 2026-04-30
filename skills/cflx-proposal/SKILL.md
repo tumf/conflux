@@ -16,6 +16,8 @@ Create structured change proposals for Conflux (OpenSpec-based) projects through
 
 ## Guardrails (Match Command Behavior)
 
+- If `openspec/CONSTITUTION.md` exists, read it before drafting the proposal and treat it as higher-priority project law than proposal/spec deltas.
+- Do not draft a proposal that violates `openspec/CONSTITUTION.md` unless the proposal explicitly changes that constitution first.
 - Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
 - Keep changes tightly scoped to the requested outcome.
 - Default to proposal splitting: when requirements can be decomposed into independent scopes, create separate change proposals.

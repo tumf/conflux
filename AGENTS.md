@@ -38,6 +38,11 @@ The build output (`dashboard/dist/`) is embedded into the Rust binary via `inclu
 * Parallel mode: Mainly used
 * Serial mode: Obsolete (to be removed)
 
+## Constitution
+
+* `openspec/CONSTITUTION.md` が存在する場合、proposal・spec・implementation より上位の規範として必ず従うこと。
+* 憲法レベルの原則を変更する場合は、`openspec/CONSTITUTION.md` 自体を同じ change で明示的に更新すること。
+
 ## Skills
 
 It also depends on `cflx-*` skills developed under the `skills/` directory.

@@ -9,6 +9,11 @@ Self-contained legacy compatibility router for Conflux workflow operations. New 
 
 **CRITICAL**: This skill CANNOT ask questions to users. All decisions must be made autonomously based on available context.
 
+## Constitutional Priority
+
+- If `openspec/CONSTITUTION.md` exists, read it before routing or executing any operation and treat it as higher-priority project law than proposal/spec deltas.
+- Do not route, approve, or implement changes that violate `openspec/CONSTITUTION.md` unless that constitution is explicitly changed first.
+
 ## Operation Selection
 
 Parse the invocation to determine the operation:

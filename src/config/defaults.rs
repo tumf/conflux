@@ -80,7 +80,7 @@ pub const DEFAULT_LOG_SUMMARY_INTERVAL_SECS: u64 = 60;
 pub const DEFAULT_STALL_DETECTION_ENABLED: bool = true;
 
 /// Default threshold for consecutive empty WIP commits before stalling
-pub const DEFAULT_STALL_DETECTION_THRESHOLD: u32 = 3;
+pub const DEFAULT_STALL_DETECTION_THRESHOLD: u32 = 5;
 
 /// Default delay between command executions (milliseconds)
 pub const DEFAULT_STAGGER_DELAY_MS: u64 = 2000;
