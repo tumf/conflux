@@ -1659,135 +1659,6 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
-    let mut agent = AgentRunner::new(config.clone());
-    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
-
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-
-    let (result, _iteration) = execute_acceptance_in_workspace(
-        "change-a",
-        repo_root.path(),
-        &mut agent,
-        Some(event_tx),
-        None,
-        &ai_runner,
-        &config,
-        &acceptance_tail_injected,
-        &acceptance_history,
-        Some("main"),
-    )
-    .await
-    .or_fail("unexpected error");
-
-    match result {
-        crate::orchestration::AcceptanceResult::Fail { findings } => {
-            assert_eq!(findings.len(), 2);
-            assert!(
-                findings[0].contains("archive-readiness gate failed: cargo clippy -- -D warnings"),
-                "first finding should retain gate-specific archive-readiness context"
-            );
-            assert_eq!(
-                ParsedAcceptanceResult::Fail {
-                    findings: findings.clone()
-                },
-                ParsedAcceptanceResult::Fail {
-                    findings: vec![
-                        "archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)"
-                            .to_string(),
-                        "secondary finding".to_string(),
-                    ]
-                },
-                "acceptance parsing should preserve findings used by parallel failure reporting"
-            );
-        }
-        other => panic!("expected acceptance fail result, got {:?}", other),
-    }
-
-    let mut saw_gate_specific_warn_log = false;
-    let mut saw_acceptance_completed = false;
-    while let Ok(event) = event_rx.try_recv() {
-        match event {
-            crate::events::ExecutionEvent::Log(entry)
-                if entry.level == crate::events::LogLevel::Warn
-                    && entry.operation.as_deref() == Some("acceptance")
-                    && entry.message.contains("blocking gate context")
-                    && entry
-                        .message
-                        .contains("archive-readiness gate failed: cargo clippy -- -D warnings") =>
-            {
-                saw_gate_specific_warn_log = true;
-            }
-            crate::events::ExecutionEvent::AcceptanceCompleted { change_id }
-                if change_id == "change-a" =>
-            {
-                saw_acceptance_completed = true;
-            }
-            _ => {}
-        }
-    }
-
-    assert!(
-        saw_gate_specific_warn_log,
-        "parallel acceptance must emit a warn log that keeps archive-readiness gate context"
-    );
-    assert!(
-        saw_acceptance_completed,
-        "parallel acceptance should emit AcceptanceCompleted after failure handling"
-    );
-}
-
-#[tokio::test]
-async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
-    use tempfile::TempDir;
-
-    let repo_root = TempDir::new().or_fail("unexpected error");
-    init_git_repo(repo_root.path()).await;
-
-    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
-        .or_fail("unexpected error");
-    Command::new("git")
-        .args(["add", "feature.rs"])
-        .current_dir(repo_root.path())
-        .output()
-        .await
-        .or_fail("unexpected error");
-    Command::new("git")
-        .args(["commit", "-m", "Apply: change-a"])
-        .current_dir(repo_root.path())
-        .output()
-        .await
-        .or_fail("unexpected error");
-
-    let change_id = "change-a";
-    let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
-    std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
-    std::fs::write(
-        tasks_dir.join("tasks.md"),
-        "## Implementation Tasks\n\n- [x] 1. done\n",
-    )
-    .or_fail("unexpected error");
-
-    let acceptance_config = create_test_config_with(OrchestratorConfig {
-        acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS; exit 9'".to_string()),
-        archive_command: Some("sh -c 'echo archive-ran > archive-ran.txt'".to_string()),
-        ..Default::default()
-    });
-
-    let queue_config = CommandQueueConfig {
-        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
-        max_retries: DEFAULT_MAX_RETRIES,
-        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-        retry_error_patterns: default_retry_patterns(),
-        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
-        inactivity_timeout_secs: 0,
-        inactivity_kill_grace_secs: 10,
-        inactivity_timeout_max_retries: 0,
-        strict_process_cleanup: true,
-    };
-
-    let shared_stagger_state = Arc::new(Mutex::new(None));
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
     let mut agent = AgentRunner::new(acceptance_config.clone());
     let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -2247,7 +2118,7 @@ async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
         &shared_stagger_state,
     )
     .await
-    .or_fail("archive should pass with durable acceptance state on end revision");
+    .or_fail("archive should pass when workspace-local acceptance evidence allows handoff");
 
     assert!(
         repo_root.path().join("archive-ran.txt").exists(),
@@ -4012,14 +3883,9 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
         elapsed
     );
 
-    // Durable acceptance state must reflect PASS for the current revision.
-    let revision = get_current_commit(repo_root.path())
-        .await
-        .or_fail("unexpected error");
     assert!(
-        crate::parallel::acceptance_state::has_durable_acceptance_pass(repo_root.path(), &revision)
-            .or_fail("unexpected error"),
-        "verdict-finalized PASS must be persisted as durable acceptance state"
+        repo_root.path().join("ACCEPTANCE_REPORT.json").exists(),
+        "verdict-finalized PASS must produce workspace-local acceptance evidence"
     );
 }
 
@@ -4095,17 +3961,9 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
         result
     );
 
-    // Durable acceptance state must NOT mark a malformed verdict as passed.
-    let revision = get_current_commit(repo_root.path())
-        .await
-        .or_fail("unexpected error");
     assert!(
-        !crate::parallel::acceptance_state::has_durable_acceptance_pass(
-            repo_root.path(),
-            &revision
-        )
-        .or_fail("unexpected error"),
-        "malformed trailing-text verdict must not produce durable acceptance-pass state"
+        !repo_root.path().join("ACCEPTANCE_REPORT.json").exists(),
+        "malformed trailing-text verdict must not produce workspace-local acceptance evidence"
     );
 }
 
@@ -4190,15 +4048,23 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
         result
     );
 
-    // Durable acceptance state must reflect PASS so archive handoff can proceed
-    // for this revision.
-    let revision = get_current_commit(repo_root.path())
-        .await
-        .or_fail("unexpected error");
-    assert!(
-        crate::parallel::acceptance_state::has_durable_acceptance_pass(repo_root.path(), &revision)
+    execute_archive_in_workspace(
+        "change-a",
+        repo_root.path(),
+        acceptance_config
+            .get_archive_command()
             .or_fail("unexpected error"),
-        "JSON verdict PASS must be persisted as durable acceptance state for \
-         archive handoff"
-    );
+        &acceptance_config,
+        None,
+        VcsBackend::Git,
+        None,
+        None,
+        None,
+        &ai_runner,
+        &Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
+        &Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
+        &shared_stagger_state,
+    )
+    .await
+    .or_fail("archive should pass when JSON verdict finalizes acceptance");
 }
