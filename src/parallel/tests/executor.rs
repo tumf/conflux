@@ -1614,9 +1614,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
 
 #[tokio::test]
 async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_context() {
-    use crate::acceptance::AcceptanceResult as ParsedAcceptanceResult;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
 
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
@@ -1637,12 +1635,25 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
         .await
         .or_fail("unexpected error");
 
+    let change_id = "change-a";
+    let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
+    std::fs::write(
+        tasks_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] 1. done\n",
+    )
+    .or_fail("unexpected error");
+
     let acceptance_output = "ACCEPTANCE: FAIL\n\nFINDINGS:\n- archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)\n- secondary finding\n";
-    let config = create_test_config_with(OrchestratorConfig {
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
         acceptance_command: Some(format!(
             "printf '{}'",
             acceptance_output.replace('\n', "\\n")
         )),
+        archive_command: Some(
+            "sh -c 'mkdir -p openspec/changes/archive && mv openspec/changes/change-a openspec/changes/archive/change-a && echo archive-ran > archive-ran.txt'"
+                .to_string(),
+        ),
         ..Default::default()
     });
 
@@ -1680,8 +1691,16 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     .or_fail("unexpected error");
 
     match result {
-        crate::orchestration::AcceptanceResult::CommandFailed { .. } => {}
-        other => panic!("expected acceptance command failure, got {:?}", other),
+        crate::orchestration::AcceptanceResult::Fail { findings } => {
+            assert_eq!(findings.len(), 2);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.contains("archive-readiness gate failed")),
+                "expected archive-readiness finding in acceptance output"
+            );
+        }
+        other => panic!("expected acceptance fail result, got {:?}", other),
     }
 
     let archive_result = execute_archive_in_workspace(
@@ -3995,6 +4014,15 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
         .await
         .or_fail("unexpected error");
 
+    let change_id = "change-a";
+    let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
+    std::fs::write(
+        tasks_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] 1. done\n",
+    )
+    .or_fail("unexpected error");
+
     // Emit the same malformed trailing-text PASS that previously fell through
     // to CONTINUE, followed by a strict JSON verdict. With the JSON-primary
     // contract, the JSON verdict wins and acceptance finalizes as PASS.
@@ -4002,6 +4030,10 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
         acceptance_command: Some(
             "sh -c 'echo ACCEPTANCE: PASSAll acceptance criteria verified; \
              echo {\\\"acceptance\\\":\\\"pass\\\"}'"
+                .to_string(),
+        ),
+        archive_command: Some(
+            "sh -c 'mkdir -p openspec/changes/archive && mv openspec/changes/change-a openspec/changes/archive/change-a && echo archive-ran > archive-ran.txt'"
                 .to_string(),
         ),
         ..Default::default()
@@ -4020,7 +4052,7 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
     };
 
     let shared_stagger_state = Arc::new(Mutex::new(None));
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
     let mut agent = AgentRunner::new(acceptance_config.clone());
     let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
