@@ -195,7 +195,7 @@ pub fn merge_spec_delta(canonical: &str, delta: &str) -> (String, Vec<String>) {
 }
 
 /// Convert a delta-format spec to canonical format for brand-new specs.
-pub fn delta_to_canonical(delta: &str) -> String {
+pub fn delta_to_canonical(delta: &str) -> Result<String, String> {
     let sections = parse_delta_sections(delta);
     let mut all_blocks: Vec<(String, String)> = Vec::new();
     all_blocks.extend(sections.added);
@@ -203,21 +203,22 @@ pub fn delta_to_canonical(delta: &str) -> String {
     all_blocks.extend(sections.removed);
 
     if all_blocks.is_empty() {
-        // Fallback: strip section markers when no requirement blocks were parsed
-        static FALLBACK_RE: OnceLock<Regex> = OnceLock::new();
-        let re = FALLBACK_RE.get_or_init(|| {
-            Regex::new(r"(?m)^## (?:ADDED|MODIFIED|REMOVED) Requirements\s*\n").unwrap()
-        });
-        return re.replace_all(delta, "## Requirements\n").to_string();
+        return Err(
+            "Spec delta parse error: no canonical requirement blocks found for promotion"
+                .to_string(),
+        );
     }
 
-    reconstruct("", &all_blocks)
+    Ok(reconstruct("", &all_blocks))
 }
 
 /// Simulate spec promotion without writing files.
 pub fn simulate_promotion(canonical: Option<&str>, delta: &str) -> (String, Vec<String>) {
     match canonical {
-        None => (delta_to_canonical(delta), Vec::new()),
+        None => match delta_to_canonical(delta) {
+            Ok(canonicalized) => (canonicalized, Vec::new()),
+            Err(err) => (delta.to_string(), vec![err]),
+        },
         Some(canonical) => merge_spec_delta(canonical, delta),
     }
 }
@@ -864,13 +865,31 @@ impl OpenSpecManager {
 
                 if canonical_spec.exists() {
                     let canonical_content = fs::read_to_string(&canonical_spec).unwrap_or_default();
-                    let (merged, _) = merge_spec_delta(&canonical_content, &delta_content);
-                    let _ = fs::write(&canonical_spec, merged);
+                    let (merged, errors) = merge_spec_delta(&canonical_content, &delta_content);
+                    if errors.is_empty() {
+                        let _ = fs::write(&canonical_spec, merged);
+                        updated.push(spec_name);
+                    } else {
+                        eprintln!(
+                            "parse error/promotion error for spec '{}': {}",
+                            spec_name,
+                            errors.join("; ")
+                        );
+                    }
                 } else {
-                    let _ = fs::write(&canonical_spec, delta_to_canonical(&delta_content));
+                    match delta_to_canonical(&delta_content) {
+                        Ok(canonicalized) => {
+                            let _ = fs::write(&canonical_spec, canonicalized);
+                            updated.push(spec_name);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "parse error/promotion error for spec '{}': {}",
+                                spec_name, err
+                            );
+                        }
+                    }
                 }
-
-                updated.push(spec_name);
             }
         }
 
@@ -1111,22 +1130,6 @@ fn collect_archived_change_ids() -> HashSet<String> {
         .collect()
 }
 
-/// Behavior-bearing task keywords
-const BEHAVIOR_TASK_KEYWORDS: &[&str] = &[
-    "add ",
-    "implement ",
-    "create ",
-    "update ",
-    "modify ",
-    "introduce ",
-    "wire ",
-    "integrate ",
-    "expose ",
-    "persist ",
-    "support ",
-    "build ",
-];
-
 /// Evidence hint patterns
 const EVIDENCE_HINTS: &[&str] = &[
     "src/",
@@ -1165,8 +1168,6 @@ const VERIFICATION_OWNERSHIP_MARKERS: &[&str] = &[
     "not-testable",
 ];
 
-const ARTIFACT_HEAVY_TASK_KEYWORDS: &[&str] = &["define ", "document ", "describe "];
-
 const EXECUTABLE_SURFACE_HINTS: &[&str] = &[
     " cli",
     " api",
@@ -1192,13 +1193,6 @@ const EXECUTABLE_VERIFICATION_HINTS: &[&str] = &[
     "go test",
     "cargo test",
 ];
-
-fn looks_like_behavior_task(task_text: &str) -> bool {
-    let normalized = task_text.trim().to_lowercase();
-    BEHAVIOR_TASK_KEYWORDS
-        .iter()
-        .any(|kw| normalized.contains(kw))
-}
 
 fn has_repository_evidence_hint(verification_text: &str) -> bool {
     let normalized = verification_text.trim().to_lowercase();
@@ -1793,17 +1787,17 @@ mod spec_promotion_tests {
     #[test]
     fn test_delta_to_canonical() {
         let delta = "## ADDED Requirements\n\n### Requirement: Feature A\n\nContent A.\n";
-        let result = delta_to_canonical(delta);
+        let result =
+            delta_to_canonical(delta).expect("delta should parse into canonical requirements");
         assert!(result.contains("### Requirement: Feature A"));
         assert!(!result.contains("## ADDED"));
     }
 
     #[test]
-    fn test_delta_to_canonical_fallback() {
+    fn test_delta_to_canonical_parse_error() {
         let delta = "## ADDED Requirements\n\nSome content without requirement blocks.\n";
-        let result = delta_to_canonical(delta);
-        assert!(result.contains("## Requirements"));
-        assert!(!result.contains("## ADDED"));
+        let err = delta_to_canonical(delta).expect_err("malformed delta must fail closed");
+        assert!(err.contains("parse error"));
     }
 
     #[test]
