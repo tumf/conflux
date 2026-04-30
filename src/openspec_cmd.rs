@@ -195,7 +195,7 @@ pub fn merge_spec_delta(canonical: &str, delta: &str) -> (String, Vec<String>) {
 }
 
 /// Convert a delta-format spec to canonical format for brand-new specs.
-pub fn delta_to_canonical(delta: &str) -> String {
+pub fn delta_to_canonical(delta: &str) -> Result<String, String> {
     let sections = parse_delta_sections(delta);
     let mut all_blocks: Vec<(String, String)> = Vec::new();
     all_blocks.extend(sections.added);
@@ -203,21 +203,22 @@ pub fn delta_to_canonical(delta: &str) -> String {
     all_blocks.extend(sections.removed);
 
     if all_blocks.is_empty() {
-        // Fallback: strip section markers when no requirement blocks were parsed
-        static FALLBACK_RE: OnceLock<Regex> = OnceLock::new();
-        let re = FALLBACK_RE.get_or_init(|| {
-            Regex::new(r"(?m)^## (?:ADDED|MODIFIED|REMOVED) Requirements\s*\n").unwrap()
-        });
-        return re.replace_all(delta, "## Requirements\n").to_string();
+        return Err(
+            "Spec delta parse error: no canonical requirement blocks found for promotion"
+                .to_string(),
+        );
     }
 
-    reconstruct("", &all_blocks)
+    Ok(reconstruct("", &all_blocks))
 }
 
 /// Simulate spec promotion without writing files.
 pub fn simulate_promotion(canonical: Option<&str>, delta: &str) -> (String, Vec<String>) {
     match canonical {
-        None => (delta_to_canonical(delta), Vec::new()),
+        None => match delta_to_canonical(delta) {
+            Ok(canonicalized) => (canonicalized, Vec::new()),
+            Err(err) => (delta.to_string(), vec![err]),
+        },
         Some(canonical) => merge_spec_delta(canonical, delta),
     }
 }
@@ -864,13 +865,31 @@ impl OpenSpecManager {
 
                 if canonical_spec.exists() {
                     let canonical_content = fs::read_to_string(&canonical_spec).unwrap_or_default();
-                    let (merged, _) = merge_spec_delta(&canonical_content, &delta_content);
-                    let _ = fs::write(&canonical_spec, merged);
+                    let (merged, errors) = merge_spec_delta(&canonical_content, &delta_content);
+                    if errors.is_empty() {
+                        let _ = fs::write(&canonical_spec, merged);
+                        updated.push(spec_name);
+                    } else {
+                        eprintln!(
+                            "parse error/promotion error for spec '{}': {}",
+                            spec_name,
+                            errors.join("; ")
+                        );
+                    }
                 } else {
-                    let _ = fs::write(&canonical_spec, delta_to_canonical(&delta_content));
+                    match delta_to_canonical(&delta_content) {
+                        Ok(canonicalized) => {
+                            let _ = fs::write(&canonical_spec, canonicalized);
+                            updated.push(spec_name);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "parse error/promotion error for spec '{}': {}",
+                                spec_name, err
+                            );
+                        }
+                    }
                 }
-
-                updated.push(spec_name);
             }
         }
 
@@ -1111,22 +1130,6 @@ fn collect_archived_change_ids() -> HashSet<String> {
         .collect()
 }
 
-/// Behavior-bearing task keywords
-const BEHAVIOR_TASK_KEYWORDS: &[&str] = &[
-    "add ",
-    "implement ",
-    "create ",
-    "update ",
-    "modify ",
-    "introduce ",
-    "wire ",
-    "integrate ",
-    "expose ",
-    "persist ",
-    "support ",
-    "build ",
-];
-
 /// Evidence hint patterns
 const EVIDENCE_HINTS: &[&str] = &[
     "src/",
@@ -1165,41 +1168,6 @@ const VERIFICATION_OWNERSHIP_MARKERS: &[&str] = &[
     "not-testable",
 ];
 
-const ARTIFACT_HEAVY_TASK_KEYWORDS: &[&str] = &["define ", "document ", "describe "];
-
-const EXECUTABLE_SURFACE_HINTS: &[&str] = &[
-    " cli",
-    " api",
-    "workflow",
-    " job",
-    " worker",
-    " background process",
-    " command",
-    " webhook",
-    " endpoint",
-];
-
-const EXECUTABLE_VERIFICATION_HINTS: &[&str] = &[
-    "curl ",
-    "http",
-    "api",
-    "cli",
-    "command",
-    "cflx openspec",
-    "cargo run",
-    "npm run",
-    "pytest",
-    "go test",
-    "cargo test",
-];
-
-fn looks_like_behavior_task(task_text: &str) -> bool {
-    let normalized = task_text.trim().to_lowercase();
-    BEHAVIOR_TASK_KEYWORDS
-        .iter()
-        .any(|kw| normalized.contains(kw))
-}
-
 fn has_repository_evidence_hint(verification_text: &str) -> bool {
     let normalized = verification_text.trim().to_lowercase();
     EVIDENCE_HINTS.iter().any(|hint| normalized.contains(hint))
@@ -1212,34 +1180,13 @@ fn has_verification_ownership_marker(verification_text: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
-fn looks_like_artifact_heavy_task(task_text: &str) -> bool {
-    let normalized = task_text.trim().to_lowercase();
-    ARTIFACT_HEAVY_TASK_KEYWORDS
-        .iter()
-        .any(|kw| normalized.contains(kw))
-}
-
-fn proposal_mentions_executable_surface(proposal_content: &str) -> bool {
-    let normalized = format!(" {}", proposal_content.trim().to_lowercase());
-    EXECUTABLE_SURFACE_HINTS
-        .iter()
-        .any(|hint| normalized.contains(hint))
-}
-
-fn verification_mentions_executable_surface(verification_text: &str) -> bool {
-    let normalized = verification_text.trim().to_lowercase();
-    EXECUTABLE_VERIFICATION_HINTS
-        .iter()
-        .any(|hint| normalized.contains(hint))
-}
-
 fn validate_tasks_content(
     content: &str,
     change_id: &str,
     strict: bool,
     evidence_mode: &str,
     change_type: Option<&str>,
-    proposal_content: Option<&str>,
+    _proposal_content: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -1263,12 +1210,7 @@ fn validate_tasks_content(
     let mut in_excluded = false;
 
     let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
-    let proposal_text = proposal_content.unwrap_or_default();
-    let proposal_has_executable_surface = proposal_mentions_executable_surface(proposal_text);
 
-    let mut behavior_task_count = 0usize;
-    let mut artifact_task_count = 0usize;
-    let mut has_executable_runnable_verification = false;
     let mut last_checkbox_line_num: Option<usize> = None;
     let mut pending_behavior_task_without_verification: Option<usize> = None;
 
@@ -1294,14 +1236,6 @@ fn validate_tasks_content(
             last_checkbox_line_num = Some(line_num);
             if !in_excluded {
                 let task_text = caps.get(2).map_or("", |m| m.as_str()).trim();
-                let is_behavior_task = looks_like_behavior_task(task_text);
-                let is_artifact_task = looks_like_artifact_heavy_task(task_text);
-                if is_behavior_task {
-                    behavior_task_count += 1;
-                }
-                if is_artifact_task {
-                    artifact_task_count += 1;
-                }
 
                 let inline_verification = verification_re
                     .captures(task_text)
@@ -1313,13 +1247,7 @@ fn validate_tasks_content(
                     .or(continuation_verification)
                     .filter(|v| !v.is_empty());
 
-                if let Some(vtext) = &verification_text {
-                    if verification_mentions_executable_surface(vtext) {
-                        has_executable_runnable_verification = true;
-                    }
-                }
-
-                if strict && evidence_mode != "off" && is_behavior_task {
+                if strict && evidence_mode != "off" && is_behavior_change {
                     if let Some(vtext) = verification_text {
                         if !has_repository_evidence_hint(&vtext) {
                             let msg = format!(
@@ -1380,9 +1308,6 @@ fn validate_tasks_content(
                             }
                         }
                     }
-                    if verification_mentions_executable_surface(vtext) {
-                        has_executable_runnable_verification = true;
-                    }
                     if pending_behavior_task_without_verification == Some(prev_line_num) {
                         pending_behavior_task_without_verification = None;
                     }
@@ -1414,32 +1339,6 @@ fn validate_tasks_content(
             let msg = format!(
                 "{}: tasks.md:{}: Behavior-bearing task missing '(verification: ...)' note",
                 change_id, line_num
-            );
-            if evidence_mode == "error" {
-                errors.push(msg);
-            } else if evidence_mode == "warn" {
-                warnings.push(msg);
-            }
-        }
-    }
-
-    if strict && evidence_mode != "off" && is_behavior_change {
-        if artifact_task_count > 0 && artifact_task_count >= behavior_task_count.max(1) {
-            let msg = format!(
-                "{}: tasks.md: Artifact-oriented tasks dominate or match behavior-changing tasks",
-                change_id
-            );
-            if evidence_mode == "error" {
-                errors.push(msg);
-            } else if evidence_mode == "warn" {
-                warnings.push(msg);
-            }
-        }
-
-        if proposal_has_executable_surface && !has_executable_runnable_verification {
-            let msg = format!(
-                "{}: tasks.md: Executable-surface behavior lacks runnable verification coverage",
-                change_id
             );
             if evidence_mode == "error" {
                 errors.push(msg);
@@ -1793,17 +1692,17 @@ mod spec_promotion_tests {
     #[test]
     fn test_delta_to_canonical() {
         let delta = "## ADDED Requirements\n\n### Requirement: Feature A\n\nContent A.\n";
-        let result = delta_to_canonical(delta);
+        let result =
+            delta_to_canonical(delta).expect("delta should parse into canonical requirements");
         assert!(result.contains("### Requirement: Feature A"));
         assert!(!result.contains("## ADDED"));
     }
 
     #[test]
-    fn test_delta_to_canonical_fallback() {
+    fn test_delta_to_canonical_parse_error() {
         let delta = "## ADDED Requirements\n\nSome content without requirement blocks.\n";
-        let result = delta_to_canonical(delta);
-        assert!(result.contains("## Requirements"));
-        assert!(!result.contains("## ADDED"));
+        let err = delta_to_canonical(delta).expect_err("malformed delta must fail closed");
+        assert!(err.contains("parse error"));
     }
 
     #[test]
@@ -1984,43 +1883,6 @@ mod validation_tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("Verification ownership missing")));
-    }
-
-    #[test]
-    fn test_warns_artifact_heavy_tasks_dominate() {
-        let content =
-            "- [ ] Define API contract (verification: manual - documented in docs/api.md)\n";
-        let (errors, warnings) = validate_tasks_content(
-            content,
-            "test",
-            true,
-            "warn",
-            Some("implementation"),
-            Some("# Change\n\n**Change Type**: implementation\n"),
-        );
-        assert!(errors.is_empty());
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("Artifact-oriented tasks dominate")));
-    }
-
-    #[test]
-    fn test_warns_executable_surface_without_runnable_verification() {
-        let content =
-            "- [ ] Implement queue worker support (verification: manual - reviewer walkthrough)\n";
-        let proposal = "# Change\n\n**Change Type**: implementation\n\n## Problem\nAPI workflow must trigger worker job\n";
-        let (errors, warnings) = validate_tasks_content(
-            content,
-            "test",
-            true,
-            "warn",
-            Some("implementation"),
-            Some(proposal),
-        );
-        assert!(errors.is_empty());
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("Executable-surface behavior lacks runnable verification")));
     }
 }
 
