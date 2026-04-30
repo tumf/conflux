@@ -139,17 +139,42 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
+
+#### Scenario: external durable state deletion does not change routing
+
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
+
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
+
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
+
+#### Scenario: stale external state cannot revive an archived workspace
+
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -1301,17 +1326,42 @@ When parallel merge verification runs after archive completion, a change that is
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
+
+#### Scenario: external durable state deletion does not change routing
+
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
+
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
+
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
+
+#### Scenario: stale external state cannot revive an archived workspace
+
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -1497,17 +1547,42 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
+
+#### Scenario: external durable state deletion does not change routing
+
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
+
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
+
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
+
+#### Scenario: stale external state cannot revive an archived workspace
+
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -1620,31 +1695,81 @@ Parallel execution SHALL restore a non-terminal workspace containing `openspec/c
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
+
+#### Scenario: external durable state deletion does not change routing
+
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
+
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
+
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
+
+#### Scenario: stale external state cannot revive an archived workspace
+
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
+
+#### Scenario: external durable state deletion does not change routing
+
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
+
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
+
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
+
+#### Scenario: stale external state cannot revive an archived workspace
+
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1769,55 +1894,76 @@ runtime は dependency blocked だった change が resolved になったこと�
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
 
-### Requirement: Durable acceptance state gates archive on the current revision
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
 
-Parallel execution MUST persist enough workspace-local acceptance state to distinguish `pending`, `running`, `passed`, and non-pass terminal outcomes for the latest apply revision.
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
 
-Archive MUST NOT start unless the latest acceptance state for the current workspace revision is durably recorded as `passed`.
+#### Scenario: external durable state deletion does not change routing
 
-When acceptance execution mutates the worktree or creates commits, the durable acceptance state recorded at the end of the acceptance attempt MUST use the workspace HEAD that exists after the acceptance command completes, not the revision captured before the command started.
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
 
-If the orchestrator restarts after acceptance started but before a final verdict is recorded, the resumed workspace MUST treat that acceptance attempt as incomplete and MUST rerun acceptance before archive.
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
 
-#### Scenario: Acceptance pass records final head after acceptance-created commit
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
 
-- **GIVEN** a parallel workspace starts an acceptance attempt at revision `rev-start`
-- **AND** the acceptance command creates a commit so that workspace HEAD becomes `rev-final` before it exits
-- **AND** the acceptance verdict is `PASS`
-- **WHEN** the orchestrator durably records the acceptance result
-- **THEN** the durable acceptance state is stored as `passed`
-- **AND** its recorded revision is `rev-final`
-- **AND** archive guard for the same workspace revision treats the workspace as archive-ready
+#### Scenario: stale external state cannot revive an archived workspace
 
-#### Scenario: Non-pass acceptance records final head after acceptance-created commit
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
 
-- **GIVEN** a parallel workspace starts an acceptance attempt at revision `rev-start`
-- **AND** the acceptance command creates a commit so that workspace HEAD becomes `rev-final` before it exits
-- **AND** the final acceptance verdict is one of `FAIL`, `CONTINUE`, `BLOCKED`, or command failure
-- **WHEN** the orchestrator durably records the acceptance result
-- **THEN** the durable acceptance state revision is `rev-final`
-- **AND** archive is not considered ready for `rev-final`
+### Requirement: Applied resume uses workspace-local evidence only
 
-#### Scenario: Acceptance without head change keeps the same revision
+Parallel execution MUST determine `Applied` resume routing from workspace-local evidence only.
 
-- **GIVEN** a parallel workspace starts an acceptance attempt at revision `rev-same`
-- **AND** the acceptance command does not change workspace HEAD
-- **AND** the acceptance verdict is recorded
-- **WHEN** the orchestrator saves the durable acceptance state
-- **THEN** the durable acceptance state revision remains `rev-same`
-- **AND** existing archive gating semantics are preserved
+For implementation changes, if implementation tasks are incomplete, resume routing MUST return to apply.
+
+Otherwise, `Applied` MUST resume acceptance before archive unless workspace-local state is already `Archiving`.
+
+Out-of-worktree durable state (for example under `~/.local/state/cflx/**`) MUST NOT be used as authoritative input for this decision.
+
+#### Scenario: applied workspace resumes acceptance regardless of external durable state
+
+- **GIVEN** a workspace is detected as `Applied`
+- **AND** implementation tasks are complete
+- **AND** external durable acceptance/archive state files exist or do not exist
+- **WHEN** resume routing is evaluated
+- **THEN** the next action is `Acceptance`
+- **AND** the result is identical regardless of external state presence
+
+#### Scenario: applied workspace with incomplete implementation tasks resumes apply
+
+- **GIVEN** a workspace is detected as `Applied`
+- **AND** implementation tasks are incomplete
+- **WHEN** resume routing is evaluated
+- **THEN** the next action is `Apply`
+- **AND** acceptance/archive are not entered in that cycle
+
+#### Scenario: archiving workspace resumes archive without external context
+
+- **GIVEN** a workspace is detected as `Archiving`
+- **WHEN** resume routing is evaluated
+- **THEN** the next action is `Archive`
+- **AND** no out-of-worktree durable state is required to continue
 
 ### Requirement: post-archive-merge-dispatch
 
@@ -1845,29 +1991,56 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse machine-readable acceptance output to determine pass/fail/continue/blocked, and MUST NOT use exit code to determine acceptance verdict.
+Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
 
-When acceptance determines that final archive commit readiness is blocked by a commit-path failure, strict validation failure, or other archive-start blocker, that blocker MUST remain the primary failure context for downstream archive handling. Later archive filesystem verification MAY add supplemental context, but it MUST NOT replace or erase the earlier root cause.
+Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
 
-#### Scenario: archive prerequisite blocker remains visible after archive verification failure
+When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
 
-- **GIVEN** acceptance or archive guidance has already identified a concrete archive-start blocker for change `alpha`
-- **AND** a later archive attempt still leaves `openspec/changes/alpha` in place
-- **WHEN** the runtime reports the archive failure to history, logs, or the user
-- **THEN** the reported failure still includes the earlier blocker summary
-- **AND** the file-state verification result is reported only as supplemental context
+#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
 
-### Requirement: Archive retry and resume reasons persist across process restarts
+- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
+- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
+- **WHEN** the runtime resumes processing
+- **THEN** the next phase is acceptance
+- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
 
-Parallel archive execution SHALL persist the primary archive retry/resume reason outside the worktree so that an interrupted or restarted runtime can explain why archive is being retried or resumed.
+For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
 
-#### Scenario: archiving workspace restores prior archive reason on resume
+#### Scenario: external durable state deletion does not change routing
 
-- **GIVEN** change `alpha` previously entered archive and recorded a durable archive failure state with primary reason `verification_failed`
-- **AND** the workspace file state is later detected as `Archiving`
-- **WHEN** the runtime resumes processing after process restart
-- **THEN** the archive resume context includes the previously recorded primary reason and summary
-- **AND** the next archive retry path can surface that reason to logs, events, or agent context without depending on in-memory history from the prior process
+- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
+- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
+- **AND** another runtime run deletes those directories before resume
+- **WHEN** both runs evaluate resume routing for the same workspace contents
+- **THEN** both runs choose the same next phase
+- **AND** any difference in observability output does not alter workflow control
+
+`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
+
+External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
+
+#### Scenario: stale external state cannot revive an archived workspace
+
+- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
+- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
+- **WHEN** resume routing is performed
+- **THEN** the runtime treats the workspace as archived and hands it to merge handling
+- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+
+### Requirement: Archive retry observability is non-authoritative
+
+Parallel archive execution MAY emit retry/resume reasons to logs/events/history for observability.
+
+Those observability outputs MUST be treated as non-authoritative and MUST NOT control workflow routing decisions.
+
+#### Scenario: archiving workspace resumes without external durable reason cache
+
+- **GIVEN** change `alpha` is detected as `Archiving`
+- **AND** no out-of-worktree archive reason cache is available
+- **WHEN** the runtime resumes processing
+- **THEN** archive resumes from workspace-local state
+- **AND** absence of external reason cache does not change the selected next phase
 
 ### Requirement: Archived workspaces remain terminal even when durable archive state exists
 

@@ -16,8 +16,6 @@ When an `Applied` workspace resumes and workspace-local evidence does not prove 
 - **THEN** the next phase is acceptance
 - **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
 
-### Requirement: Resume routing is independent of out-of-worktree durable state
-
 For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
 
 #### Scenario: external durable state deletion does not change routing
@@ -28,8 +26,6 @@ For the same workspace contents, resume routing MUST produce the same result reg
 - **WHEN** both runs evaluate resume routing for the same workspace contents
 - **THEN** both runs choose the same next phase
 - **AND** any difference in observability output does not alter workflow control
-
-### Requirement: Archiving and archived states remain workspace-local
 
 `Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
 
