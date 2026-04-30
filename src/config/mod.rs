@@ -189,6 +189,8 @@ mod tests {
             config.get_stall_detection(),
             StallDetectionConfig::default()
         );
+        assert!(config.get_stall_detection().enabled);
+        assert_eq!(config.get_stall_detection().threshold, 5);
     }
 
     #[test]

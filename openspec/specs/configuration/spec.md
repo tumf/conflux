@@ -37,6 +37,29 @@ Defines the configuration file format, agent command templates, and settings for
 - **THEN** 設定ロード時にエラーとして失敗する
 - **AND** エラーメッセージに欠落しているコマンド名が含まれる
 
+### Requirement: stall_detection 設定
+
+オーケストレーターは進捗停滞検出の挙動を設定ファイルで制御できなければならない (MUST)。
+
+- `stall_detection.enabled`: 停滞検出を有効化する（default: `true`）
+- `stall_detection.threshold`: 空WIPコミット連続回数のしきい値（default: `5`）
+
+#### Scenario: デフォルト値が適用される
+- **GIVEN** 設定ファイルに `stall_detection` が存在しない
+- **WHEN** orchestrator を実行する
+- **THEN** `stall_detection.enabled` は `true` として扱われる
+- **AND** `stall_detection.threshold` は `5` として扱われる
+
+#### Scenario: enabled=false で停滞検出が無効化される
+- **GIVEN** config 内で `stall_detection.enabled = false` が設定されている
+- **WHEN** 空WIPコミットが連続して発生する
+- **THEN** stall 判定は行われない
+
+#### Scenario: threshold を変更できる
+- **GIVEN** config 内で `stall_detection.threshold = 5` が設定されている
+- **WHEN** 空WIPコミットが5回連続で発生する
+- **THEN** stall と判定される
+
 ### Requirement: 設定ファイルの優先順位
 
 オーケストレーターは以下の優先順位で設定ファイルを読み込み、項目ごとにマージしなければならない (MUST):
