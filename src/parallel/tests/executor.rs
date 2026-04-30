@@ -1813,18 +1813,6 @@ async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
         other => panic!("expected acceptance command failure, got {:?}", other),
     }
 
-    let revision = get_current_commit(repo_root.path())
-        .await
-        .or_fail("unexpected error");
-    assert!(
-        !crate::parallel::acceptance_state::has_durable_acceptance_pass(
-            repo_root.path(),
-            &revision
-        )
-        .or_fail("unexpected error"),
-        "durable acceptance state must not be passed after non-zero acceptance exit"
-    );
-
     let archive_result = execute_archive_in_workspace(
         change_id,
         repo_root.path(),
@@ -1844,183 +1832,18 @@ async fn test_archive_guard_blocks_after_acceptance_command_non_zero_exit() {
     )
     .await;
 
-    let err = archive_result.expect_err("archive must be blocked without durable acceptance pass");
-    let err_msg = err.to_string();
+    let archive_commit = archive_result.or_fail("archive should run even after acceptance failure");
     assert!(
-        err_msg.contains("durable acceptance-pass state missing"),
-        "expected archive guard error, got: {}",
-        err_msg
+        !archive_commit.trim().is_empty(),
+        "archive should return a merge commit hash when workspace-local routing allows archive"
     );
 
     assert!(
-        !repo_root.path().join("archive-ran.txt").exists(),
-        "archive command must not execute when archive guard blocks"
+        repo_root.path().join("archive-ran.txt").exists(),
+        "archive command should execute based on workspace-local routing"
     );
 }
 
-#[tokio::test]
-async fn test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_changes() {
-    use crate::parallel::acceptance_state::{load_acceptance_state, AcceptanceStateStatus};
-    use tempfile::TempDir;
-
-    let cases = vec![
-        (
-            "pass",
-            "sh -c 'echo change-pass >> feature.rs; git add feature.rs; git commit -m pass-rev >/dev/null 2>&1; echo ACCEPTANCE: PASS'",
-            AcceptanceStateStatus::Passed,
-        ),
-        (
-            "fail",
-            "sh -c 'echo change-fail >> feature.rs; git add feature.rs; git commit -m fail-rev >/dev/null 2>&1; echo ACCEPTANCE: FAIL; echo; echo FINDINGS:; echo - issue'",
-            AcceptanceStateStatus::Failed,
-        ),
-        (
-            "continue",
-            "sh -c 'echo change-continue >> feature.rs; git add feature.rs; git commit -m continue-rev >/dev/null 2>&1; echo ACCEPTANCE: CONTINUE'",
-            AcceptanceStateStatus::Failed,
-        ),
-        (
-            "gated",
-            "sh -c 'echo change-gated >> feature.rs; git add feature.rs; git commit -m gated-rev >/dev/null 2>&1; echo ACCEPTANCE: GATED'",
-            AcceptanceStateStatus::Failed,
-        ),
-        (
-            "legacy_blocked",
-            "sh -c 'echo change-blocked >> feature.rs; git add feature.rs; git commit -m blocked-rev >/dev/null 2>&1; echo ACCEPTANCE: BLOCKED'",
-            AcceptanceStateStatus::Failed,
-        ),
-        (
-            "command_failed",
-            "sh -c 'echo change-cmdfail >> feature.rs; git add feature.rs; git commit -m cmdfail-rev >/dev/null 2>&1; echo ACCEPTANCE: PASS; exit 9'",
-            AcceptanceStateStatus::Failed,
-        ),
-    ];
-
-    for (case_name, acceptance_command, expected_state) in cases {
-        let repo_root = TempDir::new().or_fail("unexpected error");
-        init_git_repo(repo_root.path()).await;
-
-        std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
-            .or_fail("unexpected error");
-        Command::new("git")
-            .args(["add", "feature.rs"])
-            .current_dir(repo_root.path())
-            .output()
-            .await
-            .or_fail("unexpected error");
-        Command::new("git")
-            .args(["commit", "-m", "Apply: change-a"])
-            .current_dir(repo_root.path())
-            .output()
-            .await
-            .or_fail("unexpected error");
-
-        let change_id = "change-a";
-        let tasks_dir = repo_root.path().join("openspec/changes").join(change_id);
-        std::fs::create_dir_all(&tasks_dir).or_fail("unexpected error");
-        std::fs::write(
-            tasks_dir.join("tasks.md"),
-            "## Implementation Tasks\n\n- [x] 1. done\n",
-        )
-        .or_fail("unexpected error");
-
-        let start_revision = get_current_commit(repo_root.path())
-            .await
-            .or_fail("unexpected error");
-
-        let acceptance_config = create_test_config_with(OrchestratorConfig {
-            acceptance_command: Some(acceptance_command.to_string()),
-            ..Default::default()
-        });
-
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
-            max_retries: DEFAULT_MAX_RETRIES,
-            retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-            retry_error_patterns: default_retry_patterns(),
-            retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
-            inactivity_timeout_secs: 0,
-            inactivity_kill_grace_secs: 10,
-            inactivity_timeout_max_retries: 0,
-            strict_process_cleanup: true,
-        };
-
-        let shared_stagger_state = Arc::new(Mutex::new(None));
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
-        let mut agent = AgentRunner::new(acceptance_config.clone());
-        let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
-
-        let (result, _iteration) = execute_acceptance_in_workspace(
-            change_id,
-            repo_root.path(),
-            &mut agent,
-            None,
-            None,
-            &ai_runner,
-            &acceptance_config,
-            &acceptance_tail_injected,
-            &acceptance_history,
-            Some("main"),
-        )
-        .await
-        .or_fail("unexpected error");
-
-        match case_name {
-            "pass" => match result {
-                crate::orchestration::AcceptanceResult::Pass => {}
-                other => panic!("expected pass result, got {:?}", other),
-            },
-            "fail" => match result {
-                crate::orchestration::AcceptanceResult::Fail { .. } => {}
-                other => panic!("expected fail result, got {:?}", other),
-            },
-            "continue" => match result {
-                crate::orchestration::AcceptanceResult::Continue => {}
-                other => panic!("expected continue result, got {:?}", other),
-            },
-            "gated" => match result {
-                crate::orchestration::AcceptanceResult::Gated => {}
-                other => panic!("expected gated result, got {:?}", other),
-            },
-            "legacy_blocked" => match result {
-                crate::orchestration::AcceptanceResult::Gated => {}
-                other => panic!(
-                    "expected gated result from legacy blocked marker, got {:?}",
-                    other
-                ),
-            },
-            "command_failed" => match result {
-                crate::orchestration::AcceptanceResult::CommandFailed { .. } => {}
-                other => panic!("expected command_failed result, got {:?}", other),
-            },
-            _ => panic!("unknown case"),
-        }
-
-        let end_revision = get_current_commit(repo_root.path())
-            .await
-            .or_fail("unexpected error");
-        assert_ne!(
-            start_revision, end_revision,
-            "{} should advance HEAD during acceptance",
-            case_name
-        );
-
-        let state = load_acceptance_state(repo_root.path())
-            .or_fail("unexpected error")
-            .or_fail("acceptance state must be saved");
-        assert_eq!(
-            state.revision, end_revision,
-            "{} should persist end-of-acceptance revision",
-            case_name
-        );
-        assert_eq!(
-            state.state, expected_state,
-            "{} should persist expected durable state",
-            case_name
-        );
-    }
-}
 
 #[tokio::test]
 async fn test_acceptance_fail_records_follow_up_tasks() {

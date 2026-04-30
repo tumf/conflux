@@ -9,3 +9,8 @@
 ## Future Work
 
 - Human review of whether any remaining non-workflow observability caches under `~/.local/state/cflx/` should be relocated or renamed for clarity.
+
+## Acceptance #1 Failure Follow-up
+- [ ] Archive commit path blocker: git working tree is dirty (`git status --short` shows `M openspec/changes/eliminate-durable-workflow-state/tasks.md`), so the workspace is not ready for the final archive commit until the acceptance follow-up changes are implemented and the tree is clean.
+- [ ] openspec/changes/eliminate-durable-workflow-state/tasks.md lines 3-7: add explicit verification ownership (`unit`, `integration`, `e2e`, `manual`, `benchmark`, or `not-testable`) and repository-verifiable evidence for each behavior-changing task; `agent-exec run -- cflx openspec validate eliminate-durable-workflow-state --strict --evidence warn` still emits ownership warnings for tasks.md:3-7.
+- [x] src/parallel/tests/executor.rs lines 1820-1857, 1863-2021, 4192-4200, 4370-4379: remove or rewrite stale durable-state assertions (`has_durable_acceptance_pass`, `load_acceptance_state`, archive guard on `durable acceptance-pass state missing`) to match the new workspace-local-only routing in src/parallel/acceptance_state.rs lines 24-75 and src/parallel/dispatch.rs lines 252-267 (verification: integration; `cargo test test_acceptance_failure_does_not_set_durable_pass_state` passes after replacing archive-block expectations with workspace-local archive execution assertions, and obsolete `test_acceptance_state_uses_end_revision_for_all_outcomes_when_head_changes` durable-state persistence test was removed).
