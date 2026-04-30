@@ -125,7 +125,6 @@ mod tests {
         assert_eq!(action, ResumeAction::Acceptance);
     }
 
-
     #[test]
     fn decide_resume_action_routes_applied_to_apply_when_implementation_tasks_incomplete() {
         let tmp = TempDir::new().unwrap();

@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::error::Result;
 use crate::history::ArchivePrimaryReason;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveResumeStatus {
@@ -13,6 +14,7 @@ pub enum ArchiveResumeStatus {
     Passed,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveResumeState {
     pub change_id: String,
@@ -24,10 +26,12 @@ pub struct ArchiveResumeState {
     pub updated_at: String,
 }
 
+#[allow(dead_code)]
 pub fn load_archive_state(_workspace_path: &Path) -> Result<Option<ArchiveResumeState>> {
     Ok(None)
 }
 
+#[allow(dead_code)]
 pub fn load_archive_state_matching(
     _workspace_path: &Path,
     _change_id: &str,
@@ -41,6 +45,7 @@ pub fn delete_archive_state(_workspace_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn save_archive_state_entry(
     _workspace_path: &Path,
     _change_id: &str,

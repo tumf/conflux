@@ -1734,7 +1734,6 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
     );
 }
 
-
 #[tokio::test]
 async fn test_acceptance_fail_records_follow_up_tasks() {
     use tempfile::TempDir;
