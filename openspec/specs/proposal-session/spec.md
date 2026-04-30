@@ -1,4 +1,3 @@
-
 ### Requirement: proposal-session-opencode-config
 
 Proposal sessions must not auto-generate or inject opencode configuration files. When no `OPENCODE_CONFIG` is specified in `proposal_session.transport_env`, opencode uses its own default configuration. Users may optionally override the config by setting `OPENCODE_CONFIG` in their `.cflx.jsonc`.
@@ -14,7 +13,6 @@ Proposal sessions must not auto-generate or inject opencode configuration files.
 **Given**: `OPENCODE_CONFIG` is set to `/path/to/custom/opencode.json` in `proposal_session.transport_env`
 **When**: A proposal session is created
 **Then**: The ACP subprocess is spawned with `OPENCODE_CONFIG=/path/to/custom/opencode.json` in its environment
-
 
 ### Requirement: auto-generate-opencode-proposal-config
 
@@ -101,3 +99,15 @@ The proposal workflow MUST guide authors to write tasks that make verification o
 **When**: the `cflx-proposal` skill drafts `tasks.md`
 **Then**: the guidance instructs the author to record the planned verification path alongside repository-verifiable evidence
 **And**: reviewers can tell whether a task is intended for unit, integration, e2e, manual, or benchmark verification
+
+### Requirement: Proposal workflow guidance must align with explicit structural validation
+
+Proposal workflow guidance SHALL tell authors to provide explicit structure for validation-relevant fields rather than relying on wording that a validator might interpret heuristically.
+
+When verification ownership, executable surfaces, or similar validation-relevant concerns matter, the guidance SHALL require an explicit marker or declared field recognized by the validator.
+
+#### Scenario: proposal guidance requires explicit markers rather than wording cues
+- **GIVEN** a proposal introduces validation-relevant concerns such as verification ownership or executable surfaces
+- **WHEN** the workflow guidance instructs the author how to express them
+- **THEN** the guidance asks for explicit markers or fields recognized by the validator
+- **AND** it does not tell the author that descriptive wording alone is sufficient for machine validation
