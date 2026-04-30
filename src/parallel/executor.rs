@@ -8,14 +8,8 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::parallel::output_bridge::ParallelApplyEventHandler;
 
-use super::acceptance_state::{
-    delete_acceptance_state, has_durable_acceptance_pass, mark_acceptance_failed,
-    mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
-};
-use super::archive_state::{
-    delete_archive_state, load_archive_state_matching, save_archive_state_entry,
-    ArchiveResumeStatus,
-};
+use super::acceptance_state::delete_acceptance_state;
+use super::archive_state::delete_archive_state;
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
 use crate::stall::StallDetector;
@@ -336,9 +330,8 @@ pub async fn execute_apply_in_workspace(
         }
     }
 
-    mark_apply_completed(workspace_path, &apply_result.revision, change_id)?;
     info!(
-        "Durable acceptance state updated to pending after apply for {} (revision={})",
+        "Apply completed for {} (revision={})",
         change_id, apply_result.revision
     );
 
@@ -424,36 +417,16 @@ pub async fn execute_archive_in_workspace(
         }
     };
 
-    let current_revision = crate::vcs::git::commands::get_current_commit(workspace_path)
+    crate::vcs::git::commands::get_current_commit(workspace_path)
         .await
         .map_err(|e| {
             OrchestratorError::AgentCommand(format!(
-                "Cannot archive '{}' in workspace '{}': failed to resolve current revision for acceptance guard: {}",
+                "Cannot archive '{}' in workspace '{}': failed to resolve current revision: {}",
                 change_id,
                 workspace_path.display(),
                 e
             ))
         })?;
-
-    let has_passed_guard = has_durable_acceptance_pass(workspace_path, &current_revision)?;
-    if !has_passed_guard {
-        warn!(
-            "Archive guard blocked for {} in '{}': durable acceptance-pass state missing or stale (revision={})",
-            change_id,
-            workspace_path.display(),
-            current_revision
-        );
-        return Err(OrchestratorError::AgentCommand(format!(
-            "Cannot archive '{}' in workspace '{}': durable acceptance-pass state missing for revision {}",
-            change_id,
-            workspace_path.display(),
-            current_revision
-        )));
-    }
-    info!(
-        "Archive guard passed for {} with durable acceptance-pass state (revision={})",
-        change_id, current_revision
-    );
 
     let stall_detector = StallDetector::new(config.get_stall_detection());
 
@@ -499,32 +472,6 @@ pub async fn execute_archive_in_workspace(
                         .await;
                 }
                 return Err(e);
-            }
-        }
-    }
-
-    if let Ok(Some(resume_state)) =
-        load_archive_state_matching(workspace_path, change_id, &current_revision)
-    {
-        if !resume_state.summary.trim().is_empty() {
-            let mut history = archive_history.lock().await;
-            if history.count(change_id) == 0 {
-                history.record(
-                    change_id,
-                    crate::history::ArchiveAttempt {
-                        attempt: resume_state.attempt.max(1),
-                        success: false,
-                        duration: std::time::Duration::from_secs(0),
-                        error: Some(resume_state.summary.clone()),
-                        primary_reason: resume_state
-                            .primary_reason
-                            .or(Some(ArchivePrimaryReason::ResumedContextOnly)),
-                        verification_result: Some(resume_state.summary.clone()),
-                        exit_code: None,
-                        stdout_tail: None,
-                        stderr_tail: None,
-                    },
-                );
             }
         }
     }
@@ -577,27 +524,8 @@ pub async fn execute_archive_in_workspace(
     };
     let mut empty_commit_streak = 0u32;
 
-    let _ = save_archive_state_entry(
-        workspace_path,
-        change_id,
-        &current_revision,
-        0,
-        ArchiveResumeStatus::Running,
-        None,
-        "archive operation started",
-    );
-
     loop {
         attempt += 1;
-        let _ = save_archive_state_entry(
-            workspace_path,
-            change_id,
-            &current_revision,
-            attempt,
-            ArchiveResumeStatus::Running,
-            None,
-            format!("archive attempt {} running", attempt),
-        );
         let start = std::time::Instant::now();
 
         // Execute command via AiCommandRunner (with stagger and retry)
@@ -657,21 +585,6 @@ pub async fn execute_archive_in_workspace(
         })?;
 
         if !status.success() {
-            let failure_summary = format!(
-                "archive command failed (attempt {}/{}), exit_code={:?}",
-                attempt,
-                max_attempts,
-                status.code()
-            );
-            let _ = save_archive_state_entry(
-                workspace_path,
-                change_id,
-                &current_revision,
-                attempt,
-                ArchiveResumeStatus::Failed,
-                Some(ArchivePrimaryReason::CommandFailed),
-                failure_summary.clone(),
-            );
             return Err(OrchestratorError::AgentCommand(format!(
                 "Archive command failed for change '{}' in workspace '{}' (attempt {}) with exit code: {:?}",
                 change_id,
@@ -706,15 +619,6 @@ pub async fn execute_archive_in_workspace(
                                 "{} (threshold {})",
                                 message,
                                 stall_detector.config().threshold
-                            );
-                            let _ = save_archive_state_entry(
-                                workspace_path,
-                                change_id,
-                                &current_revision,
-                                attempt,
-                                ArchiveResumeStatus::Stalled,
-                                Some(ArchivePrimaryReason::Stalled),
-                                message.clone(),
                             );
                             return Err(OrchestratorError::AgentCommand(message));
                         }
@@ -769,33 +673,12 @@ pub async fn execute_archive_in_workspace(
         }
 
         if verification.is_success() {
-            let _ = save_archive_state_entry(
-                workspace_path,
-                change_id,
-                &current_revision,
-                attempt,
-                ArchiveResumeStatus::Passed,
-                None,
-                format!(
-                    "archive verification passed at attempt {}/{}",
-                    attempt, max_attempts
-                ),
-            );
             break;
         }
 
         if attempt <= ARCHIVE_COMMAND_MAX_RETRIES {
             let retry_summary =
                 "archive verification failed; change directory still exists".to_string();
-            let _ = save_archive_state_entry(
-                workspace_path,
-                change_id,
-                &current_revision,
-                attempt,
-                ArchiveResumeStatus::Failed,
-                Some(ArchivePrimaryReason::VerificationFailed),
-                retry_summary.clone(),
-            );
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(ParallelEvent::ArchiveRetryScheduled {
@@ -839,20 +722,6 @@ pub async fn execute_archive_in_workspace(
             change_id,
             Some(workspace_path),
             runtime_blocker.as_deref(),
-        );
-        let _ = save_archive_state_entry(
-            workspace_path,
-            change_id,
-            &current_revision,
-            attempt,
-            ArchiveResumeStatus::Failed,
-            Some(
-                runtime_blocker
-                    .as_ref()
-                    .map(|_| ArchivePrimaryReason::PrerequisiteBlocker)
-                    .unwrap_or(ArchivePrimaryReason::VerificationFailed),
-            ),
-            final_error.clone(),
         );
         return Err(OrchestratorError::AgentCommand(final_error));
     }
@@ -1213,11 +1082,6 @@ pub async fn execute_acceptance_in_workspace(
     );
 
     let start_revision = commit_hash.clone().unwrap_or_else(|| "unknown".to_string());
-    mark_acceptance_started(workspace_path, &start_revision, change_id)?;
-    info!(
-        "Durable acceptance state updated to running for {} (revision={})",
-        change_id, start_revision
-    );
 
     // Send AcceptanceStarted event with command
     if let Some(ref tx) = event_tx {
@@ -1404,11 +1268,6 @@ pub async fn execute_acceptance_in_workspace(
         // Record to both agent history (local) and shared acceptance history
         agent.record_acceptance_attempt(change_id, attempt.clone());
         acceptance_history.lock().await.record(change_id, attempt);
-        mark_acceptance_failed(workspace_path, &end_revision, Some(change_id))?;
-        info!(
-            "Durable acceptance state updated to failed for {} (revision={})",
-            change_id, end_revision
-        );
 
         // Reset acceptance tail injection flag so next apply can receive new output
         acceptance_tail_injected.lock().await.remove(change_id);
@@ -1456,12 +1315,8 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_passed(workspace_path, &end_revision, Some(change_id))?;
-            info!(
-                "Durable acceptance state updated to passed for {} (revision={})",
-                change_id, end_revision
-            );
             // Reset acceptance tail injection flag so next apply can receive new output
+
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
@@ -1498,12 +1353,8 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_failed(workspace_path, &end_revision, Some(change_id))?;
-            info!(
-                "Durable acceptance state updated to failed for {} (revision={})",
-                change_id, end_revision
-            );
             // Reset acceptance tail injection flag so next apply can receive new output
+
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
@@ -1543,12 +1394,8 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_failed(workspace_path, &end_revision, Some(change_id))?;
-            info!(
-                "Durable acceptance state updated to failed for {} (revision={})",
-                change_id, end_revision
-            );
             // Reset acceptance tail injection flag so next apply can receive new output
+
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
@@ -1604,12 +1451,8 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            mark_acceptance_failed(workspace_path, &end_revision, Some(change_id))?;
-            info!(
-                "Durable acceptance state updated to failed for {} (revision={})",
-                change_id, end_revision
-            );
             // Reset acceptance tail injection flag so next apply can receive new output
+
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {

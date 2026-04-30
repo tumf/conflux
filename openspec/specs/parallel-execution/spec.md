@@ -1781,43 +1781,39 @@ When acceptance determines that final archive commit readiness is blocked by a c
 - **THEN** the reported failure still includes the earlier blocker summary
 - **AND** the file-state verification result is reported only as supplemental context
 
-### Requirement: Durable acceptance state gates archive on the current revision
+### Requirement: Applied resume uses workspace-local evidence only
 
-Parallel execution MUST persist enough workspace-local acceptance state to distinguish `pending`, `running`, `passed`, and non-pass terminal outcomes for the latest apply revision.
+Parallel execution MUST determine `Applied` resume routing from workspace-local evidence only.
 
-Archive MUST NOT start unless the latest acceptance state for the current workspace revision is durably recorded as `passed`.
+For implementation changes, if implementation tasks are incomplete, resume routing MUST return to apply.
 
-When acceptance execution mutates the worktree or creates commits, the durable acceptance state recorded at the end of the acceptance attempt MUST use the workspace HEAD that exists after the acceptance command completes, not the revision captured before the command started.
+Otherwise, `Applied` MUST resume acceptance before archive unless workspace-local state is already `Archiving`.
 
-If the orchestrator restarts after acceptance started but before a final verdict is recorded, the resumed workspace MUST treat that acceptance attempt as incomplete and MUST rerun acceptance before archive.
+Out-of-worktree durable state (for example under `~/.local/state/cflx/**`) MUST NOT be used as authoritative input for this decision.
 
-#### Scenario: Acceptance pass records final head after acceptance-created commit
+#### Scenario: applied workspace resumes acceptance regardless of external durable state
 
-- **GIVEN** a parallel workspace starts an acceptance attempt at revision `rev-start`
-- **AND** the acceptance command creates a commit so that workspace HEAD becomes `rev-final` before it exits
-- **AND** the acceptance verdict is `PASS`
-- **WHEN** the orchestrator durably records the acceptance result
-- **THEN** the durable acceptance state is stored as `passed`
-- **AND** its recorded revision is `rev-final`
-- **AND** archive guard for the same workspace revision treats the workspace as archive-ready
+- **GIVEN** a workspace is detected as `Applied`
+- **AND** implementation tasks are complete
+- **AND** external durable acceptance/archive state files exist or do not exist
+- **WHEN** resume routing is evaluated
+- **THEN** the next action is `Acceptance`
+- **AND** the result is identical regardless of external state presence
 
-#### Scenario: Non-pass acceptance records final head after acceptance-created commit
+#### Scenario: applied workspace with incomplete implementation tasks resumes apply
 
-- **GIVEN** a parallel workspace starts an acceptance attempt at revision `rev-start`
-- **AND** the acceptance command creates a commit so that workspace HEAD becomes `rev-final` before it exits
-- **AND** the final acceptance verdict is one of `FAIL`, `CONTINUE`, `BLOCKED`, or command failure
-- **WHEN** the orchestrator durably records the acceptance result
-- **THEN** the durable acceptance state revision is `rev-final`
-- **AND** archive is not considered ready for `rev-final`
+- **GIVEN** a workspace is detected as `Applied`
+- **AND** implementation tasks are incomplete
+- **WHEN** resume routing is evaluated
+- **THEN** the next action is `Apply`
+- **AND** acceptance/archive are not entered in that cycle
 
-#### Scenario: Acceptance without head change keeps the same revision
+#### Scenario: archiving workspace resumes archive without external context
 
-- **GIVEN** a parallel workspace starts an acceptance attempt at revision `rev-same`
-- **AND** the acceptance command does not change workspace HEAD
-- **AND** the acceptance verdict is recorded
-- **WHEN** the orchestrator saves the durable acceptance state
-- **THEN** the durable acceptance state revision remains `rev-same`
-- **AND** existing archive gating semantics are preserved
+- **GIVEN** a workspace is detected as `Archiving`
+- **WHEN** resume routing is evaluated
+- **THEN** the next action is `Archive`
+- **AND** no out-of-worktree durable state is required to continue
 
 ### Requirement: post-archive-merge-dispatch
 
@@ -1857,17 +1853,19 @@ When acceptance determines that final archive commit readiness is blocked by a c
 - **THEN** the reported failure still includes the earlier blocker summary
 - **AND** the file-state verification result is reported only as supplemental context
 
-### Requirement: Archive retry and resume reasons persist across process restarts
+### Requirement: Archive retry observability is non-authoritative
 
-Parallel archive execution SHALL persist the primary archive retry/resume reason outside the worktree so that an interrupted or restarted runtime can explain why archive is being retried or resumed.
+Parallel archive execution MAY emit retry/resume reasons to logs/events/history for observability.
 
-#### Scenario: archiving workspace restores prior archive reason on resume
+Those observability outputs MUST be treated as non-authoritative and MUST NOT control workflow routing decisions.
 
-- **GIVEN** change `alpha` previously entered archive and recorded a durable archive failure state with primary reason `verification_failed`
-- **AND** the workspace file state is later detected as `Archiving`
-- **WHEN** the runtime resumes processing after process restart
-- **THEN** the archive resume context includes the previously recorded primary reason and summary
-- **AND** the next archive retry path can surface that reason to logs, events, or agent context without depending on in-memory history from the prior process
+#### Scenario: archiving workspace resumes without external durable reason cache
+
+- **GIVEN** change `alpha` is detected as `Archiving`
+- **AND** no out-of-worktree archive reason cache is available
+- **WHEN** the runtime resumes processing
+- **THEN** archive resumes from workspace-local state
+- **AND** absence of external reason cache does not change the selected next phase
 
 ### Requirement: Archived workspaces remain terminal even when durable archive state exists
 

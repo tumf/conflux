@@ -26,8 +26,6 @@ use crate::orchestration::{
 use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
-use super::acceptance_state::acceptance_resume_ready_for_archive;
-use super::archive_state::load_archive_state_matching;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
@@ -98,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_resume_action_routes_applied_to_archive_with_passed_state() {
+    fn decide_resume_action_routes_applied_to_acceptance_even_with_external_durable_state() {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
         let change_dir = tmp.path().join("openspec/changes/change-complete");
@@ -114,38 +112,19 @@ mod tests {
         )
         .unwrap();
 
-        let revision = super::resolve_current_revision_sync(tmp.path()).unwrap();
+        let revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let revision = String::from_utf8_lossy(&revision.stdout).trim().to_string();
         crate::parallel::acceptance_state::mark_acceptance_passed(tmp.path(), &revision, None)
             .unwrap();
 
         let action = decide_resume_action("change-complete", tmp.path(), &WorkspaceState::Applied);
-        assert_eq!(action, ResumeAction::Archive);
-    }
-
-    #[test]
-    fn decide_resume_action_routes_applied_to_acceptance_with_failed_durable_state() {
-        let tmp = TempDir::new().unwrap();
-        init_git_workspace(tmp.path());
-        let change_dir = tmp.path().join("openspec/changes/change-failed");
-        fs::create_dir_all(&change_dir).unwrap();
-        fs::write(
-            change_dir.join("proposal.md"),
-            "---\nchange_type: implementation\n---\n# Change\n",
-        )
-        .unwrap();
-        fs::write(
-            change_dir.join("tasks.md"),
-            "## Implementation Tasks\n- [x] done\n",
-        )
-        .unwrap();
-
-        let revision = super::resolve_current_revision_sync(tmp.path()).unwrap();
-        crate::parallel::acceptance_state::mark_acceptance_failed(tmp.path(), &revision, None)
-            .unwrap();
-
-        let action = decide_resume_action("change-failed", tmp.path(), &WorkspaceState::Applied);
         assert_eq!(action, ResumeAction::Acceptance);
     }
+
 
     #[test]
     fn decide_resume_action_routes_applied_to_apply_when_implementation_tasks_incomplete() {
@@ -269,7 +248,8 @@ pub(super) fn decide_resume_action(
 ) -> ResumeAction {
     match state {
         WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
-        WorkspaceState::Archiving | WorkspaceState::Applied => {
+        WorkspaceState::Archiving => ResumeAction::Archive,
+        WorkspaceState::Applied => {
             if should_route_to_apply_for_incomplete_implementation_tasks(change_id, workspace_path)
             {
                 info!(
@@ -279,47 +259,11 @@ pub(super) fn decide_resume_action(
                 return ResumeAction::Apply;
             }
 
-            let current_revision = resolve_current_revision_sync(workspace_path);
-            let has_passed = current_revision
-                .as_deref()
-                .and_then(|revision| {
-                    acceptance_resume_ready_for_archive(workspace_path, revision)
-                        .map_err(|e| {
-                            warn!(
-                                "Failed to evaluate durable acceptance state for '{}' in '{}': {}",
-                                change_id,
-                                workspace_path.display(),
-                                e
-                            );
-                            e
-                        })
-                        .ok()
-                })
-                .unwrap_or(false);
-
-            if let Some(revision) = current_revision.as_deref() {
-                if has_passed {
-                    info!(
-                        "Resume route for '{}' allows archive continuation (durable acceptance-pass found, revision={})",
-                        change_id,
-                        revision
-                    );
-                    ResumeAction::Archive
-                } else {
-                    info!(
-                        "Resume route forcing acceptance for '{}' because durable acceptance-pass state is missing or stale (revision={})",
-                        change_id,
-                        revision
-                    );
-                    ResumeAction::Acceptance
-                }
-            } else {
-                info!(
-                    "Resume route forcing acceptance for '{}' because current revision could not be resolved for durable acceptance guard",
-                    change_id
-                );
-                ResumeAction::Acceptance
-            }
+            info!(
+                "Resume route forcing acceptance for '{}' in Applied state based on workspace-local evidence",
+                change_id
+            );
+            ResumeAction::Acceptance
         }
         WorkspaceState::Blocked => ResumeAction::Blocked,
         WorkspaceState::Rejecting => ResumeAction::Rejecting,
@@ -401,25 +345,6 @@ fn read_implementation_task_progress(
         Ok(None)
     } else {
         Ok(Some((progress.completed, progress.total)))
-    }
-}
-
-fn resolve_current_revision_sync(workspace_path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(workspace_path)
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let revision = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if revision.is_empty() {
-        None
-    } else {
-        Some(revision)
     }
 }
 
@@ -604,33 +529,17 @@ impl ParallelExecutor {
             };
 
             if was_resumed && matches!(effective_state, WorkspaceState::Archiving) {
-                let current_revision = crate::vcs::git::commands::get_current_commit(&workspace.path)
-                    .await
-                    .ok();
-                let archive_state = match current_revision.as_deref() {
-                    Some(revision) => load_archive_state_matching(&workspace.path, &change_id, revision)
-                        .ok()
-                        .flatten(),
-                    None => {
-                        warn!(
-                            "Skipping archive resume context for '{}' because current revision could not be resolved",
-                            change_id
-                        );
-                        None
-                    }
-                };
-                if let Some(archive_state) = archive_state {
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx
-                            .send(ParallelEvent::ArchiveResumed {
-                                change_id: change_id.clone(),
-                                reason: archive_state
-                                    .primary_reason
-                                    .map(|reason| reason.as_str().to_string()),
-                                summary: Some(archive_state.summary.clone()),
-                            })
-                            .await;
-                    }
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ArchiveResumed {
+                            change_id: change_id.clone(),
+                            reason: None,
+                            summary: Some(
+                                "Resuming archive from workspace-local archiving state"
+                                    .to_string(),
+                            ),
+                        })
+                        .await;
                 }
             }
 
@@ -1211,8 +1120,8 @@ impl ParallelExecutor {
                         .await;
                 }
 
-                // Step 2: Execute acceptance test after apply succeeds unless resume already proved
-                // durable acceptance-pass state for this exact revision.
+                // Step 2: Execute acceptance test after apply succeeds unless this cycle is
+                // resuming directly into archive from workspace-local Archiving state.
                 if !skip_acceptance_once {
                     // Update status to Accepting
                     if let Some(ref tx) = event_tx {
@@ -1236,7 +1145,7 @@ impl ParallelExecutor {
                         let _ = tx
                             .send(ParallelEvent::Log(
                                 LogEntry::info(
-                                    "Skipping acceptance on resume because durable acceptance-pass state already exists for current revision",
+                                    "Skipping acceptance on resume because workspace is already in Archiving state",
                                 )
                                 .with_change_id(&change_id)
                                 .with_operation("acceptance"),
@@ -1698,38 +1607,20 @@ impl ParallelExecutor {
                         }
                     }
                     warn!("Archive failed for {}: {}", change_id, e);
-                    let current_revision = crate::vcs::git::commands::get_current_commit(&workspace.path)
-                        .await
-                        .ok();
-                    let archive_resume_context = match current_revision.as_deref() {
-                        Some(revision) => {
-                            load_archive_state_matching(&workspace.path, &change_id, revision)
-                                .ok()
-                                .flatten()
-                        }
-                        None => {
-                            warn!(
-                                "Skipping archive failure context for '{}' because current revision could not be resolved",
-                                change_id
-                            );
-                            None
-                        }
-                    };
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::ArchiveFailed {
                                 change_id: change_id.clone(),
                                 error: e.to_string(),
-                                reason: archive_resume_context
-                                    .as_ref()
-                                    .and_then(|state| state.primary_reason)
-                                    .map(|reason| reason.as_str().to_string()),
-                                summary: archive_resume_context
-                                    .as_ref()
-                                    .map(|state| state.summary.clone()),
+                                reason: None,
+                                summary: Some(
+                                    "Archive failed; external resume state is non-authoritative"
+                                        .to_string(),
+                                ),
                             })
                             .await;
                     }
+
                     cancel_monitor.abort();
                     // Archive failed - do not merge unarchived changes
                     WorkspaceResult {
