@@ -15,6 +15,8 @@ After an apply operation completes all tasks, the managed worktree may have unco
 
 ## Required Behavior
 
+- If `openspec/CONSTITUTION.md` exists, read it before cleanup review and treat it as higher-priority project law than proposal/spec deltas.
+
 1. Run inside the managed worktree for the given change.
 2. Review dirty files and clean only post-apply handoff artifacts.
 3. **NEVER** use blind staging such as `git add -A` or `git add .`.

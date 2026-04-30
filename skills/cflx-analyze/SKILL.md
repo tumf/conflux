@@ -22,6 +22,7 @@ When multiple OpenSpec changes are queued for processing, this skill evaluates t
 
 ## Selection Rules
 
+- If `openspec/CONSTITUTION.md` exists, read it before selecting changes and treat it as higher-priority project law than proposal/spec deltas.
 - A change that depends on another incomplete change MUST NOT be selected before its dependency.
 - If all candidates have unsatisfied dependencies, select the one with the fewest blockers.
 - When two candidates are equally viable, prefer the one with higher completion percentage.

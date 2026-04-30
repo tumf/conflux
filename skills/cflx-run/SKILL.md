@@ -31,6 +31,8 @@ Trigger this skill when users ask to:
 
 ## Core Rules
 
+- If `openspec/CONSTITUTION.md` exists, read it before running `cflx run` and treat it as higher-priority project law than proposal/spec deltas.
+- Do not start orchestration from a base branch state that knowingly violates `openspec/CONSTITUTION.md`.
 - Treat the currently checked out branch as the candidate base branch.
 - Before running `cflx run`, verify the repository is clean with `git status`.
 - If the working tree is dirty, stop and tell the user exactly what must be cleaned up first.

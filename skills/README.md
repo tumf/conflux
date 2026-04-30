@@ -133,6 +133,12 @@ cflx openspec archive <id> --yes  # Archive change
 - Make decisions based on available context
 - Do not defer tasks based on difficulty
 
+### Constitutional Priority
+
+- If `openspec/CONSTITUTION.md` exists, read it before authoring, selecting, applying, accepting, archiving, resolving, or reviewing changes.
+- Treat `openspec/CONSTITUTION.md` as higher-priority project law than proposal/spec deltas when they conflict.
+- Do not author, approve, or implement changes that violate `openspec/CONSTITUTION.md` unless that constitution is explicitly changed first.
+
 ## License
 
 MIT

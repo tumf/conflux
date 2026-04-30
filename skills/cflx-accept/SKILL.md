@@ -13,6 +13,8 @@ Provides operation identity and scoped acceptance guidance for Conflux orchestra
 
 This skill identifies the current operation as acceptance review and provides scoped guidance. The fixed acceptance procedure (checklist, verdict workflow, output format) remains defined by `.opencode/commands/cflx-accept.md` as the single source of truth.
 
+If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat it as higher-priority project law than proposal/spec deltas when judging correctness.
+
 This skill does NOT replace the command template. It supplements the orchestrator prompt with operation identity so the agent knows which operation mode it is in.
 
 ## Operation Identity

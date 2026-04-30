@@ -15,6 +15,8 @@ Implement the approved change fully, updating `tasks.md` as progress is made, an
 
 ## Critical Constraints
 
+- If `openspec/CONSTITUTION.md` exists, read it before implementation and treat it as higher-priority project law than proposal/spec deltas.
+- Do not implement changes that violate `openspec/CONSTITUTION.md` unless that constitution is explicitly changed first.
 - **NO QUESTIONS** - Make autonomous decisions based on available context
 - **NO DEFERRAL** - Do not defer tasks based on difficulty or complexity
 - **IMMEDIATE UPDATES** - Update `tasks.md` after EVERY completed task

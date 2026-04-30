@@ -15,6 +15,8 @@ When Conflux processes multiple changes in parallel, merge conflicts may arise w
 
 ## Conflict Resolution Rules
 
+- If `openspec/CONSTITUTION.md` exists, read it before conflict resolution and treat it as higher-priority project law than proposal/spec deltas.
+
 ### Safety Constraints
 
 - Do NOT use `--no-verify` flag when committing. Always run pre-commit hooks.
