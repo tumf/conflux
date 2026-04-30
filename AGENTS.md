@@ -38,12 +38,10 @@ The build output (`dashboard/dist/`) is embedded into the Rust binary via `inclu
 * Parallel mode: Mainly used
 * Serial mode: Obsolete (to be removed)
 
-## Workspace State Principle
+## Constitution
 
-* Workflow state must be derivable from the workspace alone.
-* Do not introduce or depend on out-of-worktree durable workflow state for resume routing, acceptance gating, or archive routing.
-* Deleting `~/.local/state/cflx/**` must not change the next action chosen for the same workspace contents.
-* External logs, metrics, or UI caches are allowed only as non-authoritative observability outputs and must never be used as workflow control inputs.
+* `openspec/CONSTITUTION.md` が存在する場合、proposal・spec・implementation より上位の規範として必ず従うこと。
+* 憲法レベルの原則を変更する場合は、`openspec/CONSTITUTION.md` 自体を同じ change で明示的に更新すること。
 
 ## Skills
 
