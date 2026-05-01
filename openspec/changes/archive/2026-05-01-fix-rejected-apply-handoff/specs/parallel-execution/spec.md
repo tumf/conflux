@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: apply-generated rejection proposal enters rejecting review
+### Requirement: Parallel execution acceptance loop
 
 When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
