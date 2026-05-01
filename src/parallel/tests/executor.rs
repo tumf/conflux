@@ -2281,7 +2281,11 @@ async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_chan
     init_git_repo(repo_dir.path()).await;
 
     let change_id = "change-rejected";
-    let change_dir = repo_dir.path().join("openspec").join("changes").join(change_id);
+    let change_dir = repo_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join(change_id);
     std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
     std::fs::write(
         change_dir.join("proposal.md"),
@@ -2349,7 +2353,11 @@ async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_chan
         .or_fail("workspace task should exist")
         .or_fail("workspace task join should succeed");
 
-    assert!(result.error.is_none(), "unexpected error: {:?}", result.error);
+    assert!(
+        result.error.is_none(),
+        "unexpected error: {:?}",
+        result.error
+    );
     assert!(
         result.rejected.is_some(),
         "rejected reason should be set after apply-time rejecting confirm"
