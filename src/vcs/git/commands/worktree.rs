@@ -1581,9 +1581,14 @@ mod tests {
 
         let worktree_path = temp_dir.path().join("worktrees").join("teardown-ok");
         std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
-        worktree_add(temp_dir.path(), worktree_path.to_str().unwrap(), "teardown-ok", "HEAD")
-            .await
-            .unwrap();
+        worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "teardown-ok",
+            "HEAD",
+        )
+        .await
+        .unwrap();
 
         let teardown_dir = worktree_path.join(".wt");
         std::fs::create_dir_all(&teardown_dir).unwrap();
@@ -1672,7 +1677,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!worktree_path.exists(), "worktree should be removed with skip");
+        assert!(
+            !worktree_path.exists(),
+            "worktree should be removed with skip"
+        );
     }
 
     #[tokio::test]
