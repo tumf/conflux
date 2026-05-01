@@ -175,19 +175,60 @@ TUI runner の `apply_to_reducer` 条件に `MergeDeferred` イベントを含�
 
 ### Requirement: post-archive-merge-dispatch
 
-When a change is archived in parallel mode, the orchestrator must attempt to merge or queue the change for resolve, rather than leaving it in MergeWait indefinitely.
+When a change is archived in parallel mode, the orchestrator must attempt to merge immediately unless another non-terminal change is actively occupying the automatic retry blocker lane. The only lifecycle activities that occupy that lane are `Resolving` and `Rejecting` on another change.
 
-#### Scenario: archive-completes-while-resolve-active
+Automatic `ResolveWait` / `resolve pending` MUST NOT be created solely because another change is `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, terminal `Merged`, terminal `Error`, `Stalled`, `Gated`, `Blocked`, `Queued`, `MergeWait`, or absent.
 
-**Given**: Change A is in Resolving state and change B has just been archived in parallel mode
-**When**: The ChangeArchived event for B is processed by the TUI orchestrator
-**Then**: B transitions to ResolveWait (not MergeWait) and is added to the resolve queue for automatic execution after A's resolve completes
+Manual/user resolve intent for an existing `MergeWait` row remains valid and may still transition that row to `ResolveWait` through the reducer-owned `ResolveMerge` command.
 
-#### Scenario: archive-completes-no-active-resolve
+#### Scenario: archive completes while another change is resolving
 
-**Given**: No resolve is currently active and change B has just been archived in parallel mode
-**When**: The ChangeArchived event for B is processed by the TUI orchestrator
-**Then**: An immediate merge attempt is initiated for B (via ResolveMerge command)
+**Given**: Change A is in active `Resolving` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B transitions to `ResolveWait`
+**And**: B's derived display status is `resolve pending`
+**And**: B is eligible for automatic retry after A's resolve completes
+
+#### Scenario: archive completes while another change is rejecting
+
+**Given**: Change A is in active `Rejecting` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B transitions to `ResolveWait`
+**And**: B's derived display status is `resolve pending`
+**And**: B is eligible for automatic retry after A's rejection review completes or fails
+
+#### Scenario: archive completes while another change is applying
+
+**Given**: Change A is in active `Applying` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B does not transition to `ResolveWait` because of A
+**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+
+#### Scenario: archive completes while another change is accepting
+
+**Given**: Change A is in active `Accepting` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B does not transition to `ResolveWait` because of A
+**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+
+#### Scenario: terminal rejected change does not create resolve pending
+
+**Given**: Change A is terminal `Rejected`
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B does not transition to `ResolveWait` because of A
+**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+
+#### Scenario: no active blocker starts immediate merge path
+
+**Given**: no other change is actively `Resolving` or `Rejecting`
+**And**: Change B has just been archived in parallel mode
+**When**: post-archive dispatch is evaluated
+**Then**: the orchestrator attempts the immediate merge/resolve path for B instead of recording automatic `ResolveWait`
 
 ### Requirement: OrchestratorState が唯一のループ状態ソースである
 `OrchestratorState` はオーケストレーションループの状態（apply 回数、pending/archived/completed 変更セット、イテレーション番号、current change ID）の唯一の正規ソースでなければならない（MUST）。
@@ -676,25 +717,60 @@ The parallel scheduler's decision to dispatch queued changes SHALL be derived fr
 
 ### Requirement: post-archive-merge-dispatch
 
-When a change is archived in parallel mode, the project-scoped reducer and orchestrator MUST classify the archived change according to whether another change in the same Project is already resolving.
+When a change is archived in parallel mode, the orchestrator must attempt to merge immediately unless another non-terminal change is actively occupying the automatic retry blocker lane. The only lifecycle activities that occupy that lane are `Resolving` and `Rejecting` on another change.
 
-If another change in the same Project has `ActivityState::Resolving`, the archived change MUST enter `ResolveWait` so it remains eligible for automatic continuation after the active resolve completes. Otherwise, the archived change MAY enter `MergeWait` for manual or immediate merge handling according to the existing post-archive flow.
+Automatic `ResolveWait` / `resolve pending` MUST NOT be created solely because another change is `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, terminal `Merged`, terminal `Error`, `Stalled`, `Gated`, `Blocked`, `Queued`, `MergeWait`, or absent.
 
-#### Scenario: archive-completes-while-project-resolve-active
+Manual/user resolve intent for an existing `MergeWait` row remains valid and may still transition that row to `ResolveWait` through the reducer-owned `ResolveMerge` command.
 
-- **Given** Change A in a Project is in `Resolving`
-- **And** Change B in the same Project has just been archived in parallel mode
-- **When** the reducer processes `ChangeArchived` for Change B
-- **Then** Change B enters `ResolveWait`
-- **And** the derived display status is `resolve pending`
+#### Scenario: archive completes while another change is resolving
 
-#### Scenario: archive-completes-without-project-resolve-active
+**Given**: Change A is in active `Resolving` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B transitions to `ResolveWait`
+**And**: B's derived display status is `resolve pending`
+**And**: B is eligible for automatic retry after A's resolve completes
 
-- **Given** no other Change in the same Project is in `Resolving`
-- **And** Change B has just been archived in parallel mode
-- **When** the reducer processes `ChangeArchived` for Change B
-- **Then** Change B enters `MergeWait`
-- **And** the derived display status is `merge wait`
+#### Scenario: archive completes while another change is rejecting
+
+**Given**: Change A is in active `Rejecting` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B transitions to `ResolveWait`
+**And**: B's derived display status is `resolve pending`
+**And**: B is eligible for automatic retry after A's rejection review completes or fails
+
+#### Scenario: archive completes while another change is applying
+
+**Given**: Change A is in active `Applying` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B does not transition to `ResolveWait` because of A
+**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+
+#### Scenario: archive completes while another change is accepting
+
+**Given**: Change A is in active `Accepting` state
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B does not transition to `ResolveWait` because of A
+**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+
+#### Scenario: terminal rejected change does not create resolve pending
+
+**Given**: Change A is terminal `Rejected`
+**And**: Change B has just been archived in parallel mode
+**When**: the `ChangeArchived` event for B is processed
+**Then**: B does not transition to `ResolveWait` because of A
+**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+
+#### Scenario: no active blocker starts immediate merge path
+
+**Given**: no other change is actively `Resolving` or `Rejecting`
+**And**: Change B has just been archived in parallel mode
+**When**: post-archive dispatch is evaluated
+**Then**: the orchestrator attempts the immediate merge/resolve path for B instead of recording automatic `ResolveWait`
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 
