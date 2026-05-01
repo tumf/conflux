@@ -13,3 +13,9 @@
 ## Future Work
 
 - Add optional end-to-end examples for Docker Compose cleanup only if a future repository fixture can run them quickly and without external credentials.
+
+## Acceptance #1 Failure Follow-up
+- [x] Acceptance appended the required follow-up section to `openspec/changes/add-worktree-teardown-hook/tasks.md`, so `git status --porcelain` now reports `M openspec/changes/add-worktree-teardown-hook/tasks.md`. This is an acceptance-generated FAIL follow-up edit, not a separate archive-readiness blocker.
+- [x] Checklist truthfulness / verification ownership mismatch: tasks 1 and 2 claim `unit` verification, but the located tests in `src/vcs/git/commands/worktree.rs:1577-1718` create real git repositories, real worktrees, filesystem teardown scripts, and subprocesses. Reclassify those task verification claims as integration or extract pure teardown decision logic and cover it with true unit tests.
+- [x] Proposal-session cleanup paths do not surface teardown blocking failures: `close_session`, `merge_session`, and `cleanup_all` (`src/server/proposal_session.rs:909-921`, `987-999`, `1143-1155`) only log a warning after `worktree_remove_with_options` fails, then continue deleting branch/session state. Return an actionable error or otherwise keep recoverable session state when default teardown blocks deletion.
+- [x] `GitWorkspaceManager::cleanup_worktree` (`src/vcs/git/mod.rs:298-313`) and `cleanup_inconsistent_worktree` (`src/vcs/git/mod.rs:663-681`) call `worktree_remove_with_options`, but on any error they fall back to `std::fs::remove_dir_all`. This violates teardown failure preservation because a failing executable `.wt/teardown` returns an error before Git removal, then these paths delete the worktree directory anyway. Remove or narrowly gate the filesystem fallback so teardown failure preserves the worktree unless an explicit skip/recovery option is used.

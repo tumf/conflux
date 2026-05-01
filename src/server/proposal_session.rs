@@ -892,7 +892,7 @@ impl ProposalSessionManager {
 
         let session = self
             .sessions
-            .remove(session_id)
+            .get_mut(session_id)
             .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
 
         info!(
@@ -904,21 +904,26 @@ impl ProposalSessionManager {
         // Kill ACP process
         session.acp_client.kill().await;
 
-        // Remove worktree
+        // Remove worktree; abort close on teardown failure to preserve recoverable session state.
         let wt_path_str = session.worktree_path.to_string_lossy().to_string();
-        if let Err(e) = git::worktree_remove_with_options(
+        git::worktree_remove_with_options(
             repo_root,
             &wt_path_str,
             git::WorktreeRemoveOptions::default(),
         )
         .await
-        {
-            warn!(
-                error = %e,
-                worktree = %session.worktree_path.display(),
-                "Failed to remove worktree (may already be removed)"
-            );
-        }
+        .map_err(|e| {
+            ProposalSessionError::Git(format!(
+                "Failed to remove worktree '{}' during close_session: {}",
+                session.worktree_path.display(),
+                e
+            ))
+        })?;
+
+        let session = self
+            .sessions
+            .remove(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
 
         // Delete the branch
         if let Err(e) = git::branch_delete(repo_root, &session.worktree_branch).await {
@@ -972,31 +977,37 @@ impl ProposalSessionManager {
             .await
             .map_err(|e| ProposalSessionError::MergeConflict(format!("{}", e)))?;
 
+        // Keep session state until worktree teardown/removal succeeds.
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
+
+        // Kill ACP process
+        session.acp_client.kill().await;
+
+        // Remove worktree; abort merge-session cleanup on teardown failure.
+        let wt_path_str = session.worktree_path.to_string_lossy().to_string();
+        git::worktree_remove_with_options(
+            repo_root,
+            &wt_path_str,
+            git::WorktreeRemoveOptions::default(),
+        )
+        .await
+        .map_err(|e| {
+            ProposalSessionError::Git(format!(
+                "Failed to remove worktree '{}' during merge_session cleanup: {}",
+                session.worktree_path.display(),
+                e
+            ))
+        })?;
+
         // Now close the session (force=true since we just merged)
         // Remove from sessions map
         let session = self
             .sessions
             .remove(session_id)
             .ok_or(ProposalSessionError::NotFound(session_id.to_string()))?;
-
-        // Kill ACP process
-        session.acp_client.kill().await;
-
-        // Remove worktree
-        let wt_path_str = session.worktree_path.to_string_lossy().to_string();
-        if let Err(e) = git::worktree_remove_with_options(
-            repo_root,
-            &wt_path_str,
-            git::WorktreeRemoveOptions::default(),
-        )
-        .await
-        {
-            warn!(
-                error = %e,
-                worktree = %session.worktree_path.display(),
-                "Failed to remove worktree after merge"
-            );
-        }
 
         // Delete the branch
         if let Err(e) = git::branch_delete(repo_root, &worktree_branch).await {

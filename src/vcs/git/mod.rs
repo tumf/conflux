@@ -293,24 +293,22 @@ impl GitWorkspaceManager {
 
         info!("Cleaning up worktree '{}'", workspace_name);
 
-        // Remove worktree
+        // Remove worktree. Keep directory on teardown failure for operator recovery.
         if worktree_path.exists() {
-            if let Err(e) = commands::worktree_remove_with_options(
+            commands::worktree_remove_with_options(
                 &self.repo_root,
                 worktree_path.to_str().unwrap(),
                 commands::WorktreeRemoveOptions::default(),
             )
             .await
-            {
-                warn!("Failed to remove worktree '{}': {}", workspace_name, e);
-                // Try force removal via filesystem
-                if let Err(e) = std::fs::remove_dir_all(&worktree_path) {
-                    warn!(
-                        "Failed to force remove worktree directory {:?}: {}",
-                        worktree_path, e
-                    );
-                }
-            }
+            .map_err(|e| {
+                VcsError::Other(format!(
+                    "Failed to remove worktree '{}' at '{}': {}",
+                    workspace_name,
+                    worktree_path.display(),
+                    e
+                ))
+            })?;
         }
 
         // Delete branch (ignore errors - branch may have been merged)
@@ -658,27 +656,22 @@ impl GitWorkspaceManager {
             workspace_info.workspace_name, workspace_info.path
         );
 
-        // Remove the worktree if it exists
+        // Remove the worktree if it exists. Keep directory on teardown failure.
         if workspace_info.path.exists() {
-            if let Err(e) = commands::worktree_remove_with_options(
+            commands::worktree_remove_with_options(
                 &self.repo_root,
                 workspace_info.path.to_str().unwrap(),
                 commands::WorktreeRemoveOptions::default(),
             )
             .await
-            {
-                warn!(
-                    "Failed to remove worktree '{}': {}",
-                    workspace_info.workspace_name, e
-                );
-                // Try force removal via filesystem
-                if let Err(e) = std::fs::remove_dir_all(&workspace_info.path) {
-                    warn!(
-                        "Failed to force remove worktree directory {:?}: {}",
-                        workspace_info.path, e
-                    );
-                }
-            }
+            .map_err(|e| {
+                VcsError::Other(format!(
+                    "Failed to remove inconsistent worktree '{}' at '{}': {}",
+                    workspace_info.workspace_name,
+                    workspace_info.path.display(),
+                    e
+                ))
+            })?;
         }
 
         // Delete the branch
