@@ -99,11 +99,16 @@ enum ApplyCompletionKind {
     TasksComplete,
     /// Apply emitted explicit implementation-blocker marker.
     BlockedHandoff,
+    /// Apply emitted REJECTED.md proposal and should hand off to rejecting review.
+    RejectingHandoff,
 }
 
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
     if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
         return Some(ApplyCompletionKind::BlockedHandoff);
+    }
+    if detect_apply_rejected_handoff(workspace_path, change_id).is_some() {
+        return Some(ApplyCompletionKind::RejectingHandoff);
     }
     match check_task_progress(workspace_path, change_id) {
         Ok(progress) if is_progress_complete(&progress) => Some(ApplyCompletionKind::TasksComplete),
@@ -630,6 +635,8 @@ pub struct ApplyLoopResult {
     pub iterations: u32,
     /// Apply detected implementation-blocker handoff and stopped apply loop.
     pub blocked_handoff: Option<ApplyBlockedHandoff>,
+    /// Apply detected REJECTED.md handoff and stopped apply loop.
+    pub rejected_handoff: Option<ApplyRejectedHandoff>,
 }
 
 /// Structured metadata for apply-blocked handoff marker artifact.
@@ -637,6 +644,13 @@ pub struct ApplyLoopResult {
 pub struct ApplyBlockedHandoff {
     /// Absolute path to detected blocker marker file.
     pub blocker_path: PathBuf,
+}
+
+/// Structured metadata for apply-generated rejection proposal artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyRejectedHandoff {
+    /// Absolute path to detected rejection proposal file.
+    pub rejected_path: PathBuf,
 }
 
 fn detect_apply_blocked_handoff(
@@ -653,6 +667,21 @@ fn detect_apply_blocked_handoff(
     blocker_path
         .is_file()
         .then_some(ApplyBlockedHandoff { blocker_path })
+}
+
+fn detect_apply_rejected_handoff(
+    workspace_path: &Path,
+    change_id: &str,
+) -> Option<ApplyRejectedHandoff> {
+    let rejected_path = workspace_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("REJECTED.md");
+
+    rejected_path
+        .is_file()
+        .then_some(ApplyRejectedHandoff { rejected_path })
 }
 
 /// Execute apply iterations until tasks are complete or max iterations reached.
@@ -975,11 +1004,15 @@ where
         // another apply child or treat the empty snapshot as a stall. Tasks-
         // complete runs fall through to the normal post_apply/final-commit path.
         if completion_finalized_run
-            && matches!(completion_kind, Some(ApplyCompletionKind::BlockedHandoff))
+            && matches!(
+                completion_kind,
+                Some(ApplyCompletionKind::BlockedHandoff | ApplyCompletionKind::RejectingHandoff)
+            )
         {
             info!(
                 change_id = change_id,
-                "Apply loop exiting for rejecting review handoff after grace-driven terminate"
+                completion_kind = ?completion_kind,
+                "Apply loop exiting for non-complete handoff after grace-driven terminate"
             );
             break false;
         }
@@ -1171,12 +1204,18 @@ where
     } else {
         detect_apply_blocked_handoff(workspace_path, change_id)
     };
+    let rejected_handoff = if apply_succeeded {
+        None
+    } else {
+        detect_apply_rejected_handoff(workspace_path, change_id)
+    };
 
     Ok(ApplyLoopResult {
         revision,
         completed: apply_succeeded,
         iterations: iteration,
         blocked_handoff,
+        rejected_handoff,
     })
 }
 

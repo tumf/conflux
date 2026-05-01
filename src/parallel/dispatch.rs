@@ -921,7 +921,7 @@ impl ParallelExecutor {
                 // Skip apply only for the first cycle when resuming from an already-applied state.
                 // Even when apply is skipped, this cycle must still execute acceptance unless
                 // resume_action explicitly allows archive continuation.
-                let (revision, final_iteration, blocked_handoff) = if !should_run_apply(&mut skip_apply_once) {
+                let (revision, final_iteration, blocked_handoff, rejected_handoff) = if !should_run_apply(&mut skip_apply_once) {
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::Log(
@@ -935,7 +935,7 @@ impl ParallelExecutor {
                     }
 
                     match crate::vcs::git::commands::get_current_commit(&workspace.path).await {
-                        Ok(revision) => (revision, cumulative_iteration, None),
+                        Ok(revision) => (revision, cumulative_iteration, None, None),
                         Err(e) => {
                             cancel_monitor.abort();
                             return WorkspaceResult {
@@ -1025,7 +1025,9 @@ impl ParallelExecutor {
                 .await;
 
                 match apply_result {
-                    Ok((rev, iter, blocked_handoff)) => (rev, iter, blocked_handoff),
+                    Ok((rev, iter, blocked_handoff, rejected_handoff)) => {
+                        (rev, iter, blocked_handoff, rejected_handoff)
+                    },
                     Err(e) => {
                         // Check if this was a single-change stop
                         let error_str = e.to_string();
@@ -1073,6 +1075,124 @@ impl ParallelExecutor {
 
                 // Update cumulative iteration count
                 cumulative_iteration = final_iteration;
+
+                if let Some(handoff) = &rejected_handoff {
+                    info!(
+                        change_id = %change_id,
+                        rejected_path = %handoff.rejected_path.display(),
+                        "Apply emitted rejection proposal; entering rejecting review flow"
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::WorkspaceStatusUpdated {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace.name.clone(),
+                                status: WorkspaceStatus::Rejecting,
+                            })
+                            .await;
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::warn(format!(
+                                    "Apply rejection proposal detected via {}; entering rejecting review",
+                                    handoff.rejected_path.display()
+                                ))
+                                .with_change_id(&change_id)
+                                .with_operation("apply"),
+                            ))
+                            .await;
+                    }
+
+                    match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
+                        Ok(verdict) => match verdict {
+                            RejectionReviewVerdict::Confirm { proposal_path, reason } => {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn(format!(
+                                                "Rejecting review confirmed rejection (proposal: {})",
+                                                proposal_path
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("rejecting"),
+                                        ))
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::ChangeDequeued {
+                                            change_id: change_id.clone(),
+                                        })
+                                        .await;
+                                }
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None,
+                                    rejected: Some(reason),
+                                };
+                            }
+                            RejectionReviewVerdict::Resume { rejection_proposal, blocker_path } => {
+                                let _ = handle_resume_apply_from_rejecting(
+                                    &change_id,
+                                    &workspace.path,
+                                    rejection_proposal.as_deref(),
+                                    blocker_path.as_deref(),
+                                )
+                                .await;
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn("Rejecting review returned RESUME; returning to apply loop")
+                                                .with_change_id(&change_id)
+                                                .with_operation("rejecting"),
+                                        ))
+                                        .await;
+                                }
+                                continue;
+                            }
+                            RejectionReviewVerdict::Block { rejection_proposal, blocker_path } => {
+                                let _ = handle_blocked_from_rejecting(
+                                    &change_id,
+                                    &workspace.path,
+                                    rejection_proposal.as_deref(),
+                                    blocker_path.as_deref(),
+                                )
+                                .await;
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                                            change_id: change_id.clone(),
+                                            workspace_name: workspace.name.clone(),
+                                            status: WorkspaceStatus::Blocked,
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn("Rejecting review returned BLOCK; cleared rejection proposal and preserved blocked workspace")
+                                                .with_change_id(&change_id)
+                                                .with_operation("rejecting"),
+                                        ))
+                                        .await;
+                                }
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None,
+                                    rejected: None,
+                                };
+                            }
+                        },
+                        Err(e) => {
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Rejecting review failed after apply handoff: {}", e)),
+                                rejected: None,
+                            };
+                        }
+                    }
+                }
 
                 if let Some(handoff) = &blocked_handoff {
                     info!(
