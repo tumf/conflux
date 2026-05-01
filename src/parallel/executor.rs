@@ -181,6 +181,7 @@ pub async fn execute_apply_in_workspace(
     String,
     u32,
     Option<crate::execution::apply::ApplyBlockedHandoff>,
+    Option<crate::execution::apply::ApplyRejectedHandoff>,
 )> {
     // Validate that workspace_path is a worktree, not the base repository
     match git_commands::is_worktree(repo_root, workspace_path).await {
@@ -310,7 +311,7 @@ pub async fn execute_apply_in_workspace(
         Err(e) => return Err(e),
     };
 
-    if apply_result.blocked_handoff.is_none() {
+    if apply_result.blocked_handoff.is_none() && apply_result.rejected_handoff.is_none() {
         let (is_dirty, dirty_status) =
             has_uncommitted_changes(workspace_path).await.map_err(|e| {
                 OrchestratorError::AgentCommand(format!(
@@ -340,6 +341,7 @@ pub async fn execute_apply_in_workspace(
         apply_result.revision,
         apply_result.iterations,
         apply_result.blocked_handoff,
+        apply_result.rejected_handoff,
     ))
 }
 
