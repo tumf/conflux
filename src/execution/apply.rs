@@ -1467,7 +1467,11 @@ mod tests {
         let workspace = temp_dir.path();
         let change_dir = workspace.join("openspec").join("changes").join("change-a");
         std::fs::create_dir_all(&change_dir).unwrap();
-        std::fs::write(change_dir.join("tasks.md"), "## Implementation Tasks\n- [ ] pending\n").unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
         std::fs::write(change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
 
         let completion = detect_apply_completion(workspace, "change-a");
@@ -1492,8 +1496,7 @@ mod tests {
         assert_eq!(blocked.blocker_path, blocked_marker);
         assert_eq!(rejected.rejected_path, change_dir.join("REJECTED.md"));
         assert_ne!(
-            blocked.blocker_path,
-            rejected.rejected_path,
+            blocked.blocker_path, rejected.rejected_path,
             "blocked and rejected handoff artifacts must stay distinct"
         );
     }
@@ -1536,7 +1539,10 @@ mod tests {
         .await
         .expect("apply loop should return rejecting handoff without stall error");
 
-        assert!(!result.completed, "rejected handoff must not mark apply complete");
+        assert!(
+            !result.completed,
+            "rejected handoff must not mark apply complete"
+        );
         assert_eq!(
             result.iterations, 1,
             "rejected handoff should exit before retry/stall loop"
