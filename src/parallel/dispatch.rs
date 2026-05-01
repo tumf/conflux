@@ -1104,16 +1104,23 @@ impl ParallelExecutor {
 
                     match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
                         Ok(verdict) => match verdict {
-                            RejectionReviewVerdict::Confirm { proposal_path, reason } => {
+                            RejectionReviewVerdict::Confirm => {
+                                let rejected_path = workspace
+                                    .path
+                                    .join("openspec")
+                                    .join("changes")
+                                    .join(&change_id)
+                                    .join("REJECTED.md");
+                                let reason = format!(
+                                    "Rejecting review confirmed rejection (proposal: {})",
+                                    rejected_path.display()
+                                );
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
                                         .send(ParallelEvent::Log(
-                                            LogEntry::warn(format!(
-                                                "Rejecting review confirmed rejection (proposal: {})",
-                                                proposal_path
-                                            ))
-                                            .with_change_id(&change_id)
-                                            .with_operation("rejecting"),
+                                            LogEntry::warn(reason.clone())
+                                                .with_change_id(&change_id)
+                                                .with_operation("rejecting"),
                                         ))
                                         .await;
                                     let _ = tx
@@ -1130,14 +1137,8 @@ impl ParallelExecutor {
                                     rejected: Some(reason),
                                 };
                             }
-                            RejectionReviewVerdict::Resume { rejection_proposal, blocker_path } => {
-                                let _ = handle_resume_apply_from_rejecting(
-                                    &change_id,
-                                    &workspace.path,
-                                    rejection_proposal.as_deref(),
-                                    blocker_path.as_deref(),
-                                )
-                                .await;
+                            RejectionReviewVerdict::Resume => {
+                                let _ = handle_resume_apply_from_rejecting(&change_id, &workspace.path).await;
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
                                         .send(ParallelEvent::Log(
@@ -1149,14 +1150,8 @@ impl ParallelExecutor {
                                 }
                                 continue;
                             }
-                            RejectionReviewVerdict::Block { rejection_proposal, blocker_path } => {
-                                let _ = handle_blocked_from_rejecting(
-                                    &change_id,
-                                    &workspace.path,
-                                    rejection_proposal.as_deref(),
-                                    blocker_path.as_deref(),
-                                )
-                                .await;
+                            RejectionReviewVerdict::Block => {
+                                let _ = handle_blocked_from_rejecting(&change_id, &workspace.path).await;
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
                                         .send(ParallelEvent::WorkspaceStatusUpdated {
