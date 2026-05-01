@@ -9,6 +9,11 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorktreeRemoveOptions {
+    pub skip_teardown: bool,
+}
+
 /// Classification of worktree add failures based on stderr output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeAddFailure {
@@ -449,9 +454,29 @@ pub async fn worktree_add_detached<P: AsRef<Path>>(
 }
 
 /// Remove a worktree.
+#[allow(dead_code)]
 pub async fn worktree_remove<P: AsRef<Path>>(cwd: P, worktree_path: &str) -> VcsResult<()> {
+    worktree_remove_with_options(cwd, worktree_path, WorktreeRemoveOptions::default()).await
+}
+
+/// Remove a worktree with teardown behavior options.
+pub async fn worktree_remove_with_options<P: AsRef<Path>>(
+    cwd: P,
+    worktree_path: &str,
+    options: WorktreeRemoveOptions,
+) -> VcsResult<()> {
+    let cwd_ref = cwd.as_ref();
+    if options.skip_teardown {
+        info!(
+            worktree_path = %worktree_path,
+            "Skipping .wt/teardown due to explicit skip_teardown option"
+        );
+    } else {
+        run_worktree_teardown(cwd_ref, worktree_path).await?;
+    }
+
     debug!("Removing worktree at {}", worktree_path);
-    run_git(&["worktree", "remove", worktree_path, "--force"], cwd).await?;
+    run_git(&["worktree", "remove", worktree_path, "--force"], cwd_ref).await?;
     Ok(())
 }
 
@@ -570,6 +595,106 @@ pub async fn count_commits_ahead<P: AsRef<Path>>(
         .parse::<usize>()
         .map_err(|e| VcsError::git_command(format!("Invalid count: {}", e)))?;
     Ok(count)
+}
+
+/// Execute the worktree teardown script if it exists and is executable.
+///
+/// Checks for `<worktree>/.wt/teardown` and executes it in the worktree directory.
+/// Sets the `ROOT_WORKTREE_PATH` environment variable to the repository root path.
+///
+/// # Arguments
+/// * `repo_root` - Path to the repository root directory
+/// * `worktree_path` - Path to the worktree directory being removed
+///
+/// # Returns
+/// Ok(()) if teardown script doesn't exist or executes successfully, Err() if teardown script fails.
+pub async fn run_worktree_teardown<P1: AsRef<Path>, P2: AsRef<Path>>(
+    repo_root: P1,
+    worktree_path: P2,
+) -> VcsResult<()> {
+    let repo_root = repo_root.as_ref();
+    let worktree_path = worktree_path.as_ref();
+    let teardown_script = worktree_path.join(".wt").join("teardown");
+
+    if !teardown_script.exists() {
+        debug!(
+            worktree = %worktree_path.display(),
+            teardown_script = %teardown_script.display(),
+            "Teardown script not found, skipping"
+        );
+        return Ok(());
+    }
+
+    if !teardown_script.is_file() {
+        debug!(
+            worktree = %worktree_path.display(),
+            teardown_script = %teardown_script.display(),
+            "Teardown path exists but is not a regular file, skipping"
+        );
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&teardown_script).map_err(|e| {
+            VcsError::git_command(format!(
+                "Failed to read teardown script metadata at {}: {}",
+                teardown_script.display(),
+                e
+            ))
+        })?;
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 {
+            debug!(
+                worktree = %worktree_path.display(),
+                teardown_script = %teardown_script.display(),
+                mode = format_args!("{:o}", mode),
+                "Teardown script is not executable, skipping"
+            );
+            return Ok(());
+        }
+    }
+
+    info!(
+        worktree = %worktree_path.display(),
+        teardown_script = %teardown_script.display(),
+        "Executing worktree teardown script"
+    );
+
+    let output = Command::new(&teardown_script)
+        .current_dir(worktree_path)
+        .env("ROOT_WORKTREE_PATH", repo_root)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| {
+            VcsError::git_command(format!(
+                "Failed to execute teardown script {}: {}",
+                teardown_script.display(),
+                e
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let exit_code = output.status.code().unwrap_or(-1);
+        return Err(VcsError::git_command(format!(
+            "Teardown script failed with exit code {} at {}\nstdout: {}\nstderr: {}",
+            exit_code,
+            teardown_script.display(),
+            stdout,
+            stderr
+        )));
+    }
+
+    info!(
+        worktree = %worktree_path.display(),
+        teardown_script = %teardown_script.display(),
+        "Worktree teardown script completed successfully"
+    );
+    Ok(())
 }
 
 /// Execute the worktree setup script if it exists.
@@ -1405,5 +1530,191 @@ mod tests {
 
         // Cleanup
         let _ = worktree_remove(temp_dir.path(), worktree_existing.to_str().unwrap()).await;
+    }
+
+    #[cfg(unix)]
+    fn set_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    async fn init_test_repo(temp_dir: &TempDir) {
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        if init.is_err() {
+            return;
+        }
+
+        let _ = Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
+        std::fs::write(temp_dir.path().join("README.md"), "test").unwrap();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+        let _ = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_worktree_remove_runs_teardown_before_removal() {
+        let temp_dir = TempDir::new().unwrap();
+        init_test_repo(&temp_dir).await;
+
+        let worktree_path = temp_dir.path().join("worktrees").join("teardown-ok");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "teardown-ok",
+            "HEAD",
+        )
+        .await
+        .unwrap();
+
+        let teardown_dir = worktree_path.join(".wt");
+        std::fs::create_dir_all(&teardown_dir).unwrap();
+        let teardown_script = teardown_dir.join("teardown");
+        std::fs::write(
+            &teardown_script,
+            "#!/bin/sh\nif [ \"$ROOT_WORKTREE_PATH\" = \"\" ]; then exit 9; fi\npwd > .teardown-cwd\nprintf 'ok' > .teardown-ran\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        set_executable(&teardown_script);
+
+        worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(!worktree_path.exists(), "worktree should be removed");
+    }
+
+    #[tokio::test]
+    async fn test_worktree_remove_blocks_on_teardown_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        init_test_repo(&temp_dir).await;
+
+        let worktree_path = temp_dir.path().join("worktrees").join("teardown-fail");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "teardown-fail",
+            "HEAD",
+        )
+        .await
+        .unwrap();
+
+        let teardown_dir = worktree_path.join(".wt");
+        std::fs::create_dir_all(&teardown_dir).unwrap();
+        let teardown_script = teardown_dir.join("teardown");
+        std::fs::write(&teardown_script, "#!/bin/sh\nprintf 'boom' 1>&2\nexit 13\n").unwrap();
+        #[cfg(unix)]
+        set_executable(&teardown_script);
+
+        let err = worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap())
+            .await
+            .unwrap_err();
+
+        match err {
+            VcsError::Command { message, .. } => {
+                assert!(message.contains("Teardown script failed"));
+            }
+            other => panic!("unexpected error type: {other:?}"),
+        }
+        assert!(worktree_path.exists(), "worktree should be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_worktree_remove_skip_teardown_option_ignores_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        init_test_repo(&temp_dir).await;
+
+        let worktree_path = temp_dir.path().join("worktrees").join("teardown-skip");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "teardown-skip",
+            "HEAD",
+        )
+        .await
+        .unwrap();
+
+        let teardown_dir = worktree_path.join(".wt");
+        std::fs::create_dir_all(&teardown_dir).unwrap();
+        let teardown_script = teardown_dir.join("teardown");
+        std::fs::write(&teardown_script, "#!/bin/sh\nexit 99\n").unwrap();
+        #[cfg(unix)]
+        set_executable(&teardown_script);
+
+        worktree_remove_with_options(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            WorktreeRemoveOptions {
+                skip_teardown: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !worktree_path.exists(),
+            "worktree should be removed with skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_worktree_remove_skips_non_executable_teardown() {
+        let temp_dir = TempDir::new().unwrap();
+        init_test_repo(&temp_dir).await;
+
+        let worktree_path = temp_dir.path().join("worktrees").join("teardown-nonexec");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "teardown-nonexec",
+            "HEAD",
+        )
+        .await
+        .unwrap();
+
+        let teardown_dir = worktree_path.join(".wt");
+        std::fs::create_dir_all(&teardown_dir).unwrap();
+        let teardown_script = teardown_dir.join("teardown");
+        std::fs::write(&teardown_script, "#!/bin/sh\nexit 77\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&teardown_script).unwrap().permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&teardown_script, permissions).unwrap();
+        }
+
+        worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(!worktree_path.exists(), "worktree should be removed");
     }
 }

@@ -186,10 +186,17 @@ pub async fn server_create_worktree(
     (StatusCode::CREATED, Json(worktree_info)).into_response()
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ServerDeleteWorktreeQuery {
+    #[serde(default)]
+    pub skip_teardown: bool,
+}
+
 /// DELETE /api/v1/projects/:id/worktrees/:branch - delete a worktree
 pub async fn server_delete_worktree(
     State(state): State<AppState>,
     Path((project_id, branch)): Path<(String, String)>,
+    Query(query): Query<ServerDeleteWorktreeQuery>,
 ) -> Response {
     // Acquire active command slot for this worktree root
     let _active_guard = match try_acquire_active_command(
@@ -242,9 +249,14 @@ pub async fn server_delete_worktree(
     }
 
     // Delete worktree
-    if let Err(e) =
-        crate::vcs::git::commands::worktree_remove(&worktree_path, worktree.path.to_str().unwrap())
-            .await
+    if let Err(e) = crate::vcs::git::commands::worktree_remove_with_options(
+        &worktree_path,
+        worktree.path.to_str().unwrap(),
+        crate::vcs::git::commands::WorktreeRemoveOptions {
+            skip_teardown: query.skip_teardown,
+        },
+    )
+    .await
     {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -60,7 +60,8 @@ pub enum TuiCommand {
     Retry,
     /// Delete a worktree by path (from worktree view)
     /// The optional String is the branch name to delete after worktree removal
-    DeleteWorktreeByPath(PathBuf, Option<String>),
+    /// bool=true means skip teardown hook explicitly for recovery
+    DeleteWorktreeByPath(PathBuf, Option<String>, bool),
     /// Resolve a deferred merge for a change
     ResolveMerge(String),
     /// Merge a worktree branch into the base branch

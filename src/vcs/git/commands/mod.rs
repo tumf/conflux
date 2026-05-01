@@ -27,7 +27,8 @@ pub use merge::{
     merge_commit_hash_by_subject_since, missing_merge_commits_since,
     presync_merge_subject_mismatches_since,
 };
+#[allow(unused_imports)]
 pub use worktree::{
-    count_commits_ahead, is_worktree, list_worktrees, run_worktree_setup, worktree_add,
-    worktree_remove,
+    count_commits_ahead, is_worktree, list_worktrees, run_worktree_setup, run_worktree_teardown,
+    worktree_add, worktree_remove, worktree_remove_with_options, WorktreeRemoveOptions,
 };

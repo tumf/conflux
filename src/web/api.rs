@@ -875,25 +875,29 @@ pub async fn delete_worktree(
     }
 
     // Delete worktree
-    commands::worktree_remove(&repo_root, worktree.path.to_str().unwrap())
-        .await
-        .map_err(|e| {
-            let duration_ms = start.elapsed().as_millis();
-            error!(
-                request_id = %request_id,
-                operation = "delete_worktree",
-                worktree_name = %worktree_name,
-                error = %e,
-                duration_ms = duration_ms,
-                "Failed to remove worktree"
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to remove worktree: {}", e),
-                }),
-            )
-        })?;
+    commands::worktree_remove_with_options(
+        &repo_root,
+        worktree.path.to_str().unwrap(),
+        commands::WorktreeRemoveOptions::default(),
+    )
+    .await
+    .map_err(|e| {
+        let duration_ms = start.elapsed().as_millis();
+        error!(
+            request_id = %request_id,
+            operation = "delete_worktree",
+            worktree_name = %worktree_name,
+            error = %e,
+            duration_ms = duration_ms,
+            "Failed to remove worktree"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to remove worktree: {}", e),
+            }),
+        )
+    })?;
 
     // Delete branch
     let _ = commands::branch_delete(&repo_root, &req.branch_name).await;

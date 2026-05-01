@@ -536,7 +536,11 @@ impl AppState {
                 self.mode = AppMode::Select;
             }
 
-            Some(TuiCommand::DeleteWorktreeByPath(path.into(), branch_name))
+            Some(TuiCommand::DeleteWorktreeByPath(
+                path.into(),
+                branch_name,
+                false,
+            ))
         } else {
             None
         }

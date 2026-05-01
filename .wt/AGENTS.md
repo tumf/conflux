@@ -54,6 +54,18 @@ When Conflux creates a git worktree, it MAY execute the repository-local `.wt/se
 - cflx MUST NOT read or execute any user-global setup script.
 - cflx MUST only consider `.wt/setup` located in the repository root.
 
+When Conflux deletes a managed git worktree, it MAY execute a worktree-local `.wt/teardown` script before deletion.
+
+- Detection path: `<worktree>/.wt/teardown`
+- Execution context: current working directory is the target worktree root
+- Environment variables:
+  - `ROOT_WORKTREE_PATH`: path to the base repository (source tree)
+- stdin: null (`/dev/null`)
+- Executable requirement: non-executable `teardown` files are skipped
+- Default behavior: teardown failure aborts worktree deletion to preserve recovery state
+- Recovery behavior: explicit skip-teardown deletion is available for manual/operator recovery
+- Convention: teams may source `.wt/state.env` from `.wt/teardown` for worktree-local cleanup state
+
 ## References
 
 - wt tool: https://github.com/tumf/wt
