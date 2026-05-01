@@ -1138,40 +1138,68 @@ impl ProposalSessionManager {
         let session_ids: Vec<String> = self.sessions.keys().cloned().collect();
 
         for id in session_ids {
-            if let Some(session) = self.sessions.remove(&id) {
-                info!(session_id = %id, "Cleaning up proposal session");
-                session.acp_client.kill().await;
-
-                if let Some(root) = repo_root {
-                    // Only remove clean worktrees
-                    let is_dirty = git::has_uncommitted_changes(&session.worktree_path)
-                        .await
-                        .map(|(has_changes, _)| has_changes)
-                        .unwrap_or(true);
-
-                    if !is_dirty {
-                        let wt_path_str = session.worktree_path.to_string_lossy().to_string();
-                        if let Err(e) = git::worktree_remove_with_options(
-                            root,
-                            &wt_path_str,
-                            git::WorktreeRemoveOptions::default(),
-                        )
-                        .await
-                        {
-                            warn!(
-                                error = %e,
-                                worktree = %session.worktree_path.display(),
-                                "Failed to remove worktree during cleanup"
-                            );
-                        }
-                    } else {
-                        info!(
-                            worktree = %session.worktree_path.display(),
-                            "Preserving dirty worktree during cleanup"
-                        );
-                    }
-                }
+            if !self.sessions.contains_key(&id) {
+                continue;
             }
+
+            info!(session_id = %id, "Cleaning up proposal session");
+
+            {
+                let session = self
+                    .sessions
+                    .get_mut(&id)
+                    .expect("session id should exist during cleanup");
+                session.acp_client.kill().await;
+            }
+
+            let should_preserve_session = if let Some(root) = repo_root {
+                let worktree_path = self
+                    .sessions
+                    .get(&id)
+                    .expect("session id should exist after ACP shutdown")
+                    .worktree_path
+                    .clone();
+
+                // Only remove clean worktrees
+                let is_dirty = git::has_uncommitted_changes(&worktree_path)
+                    .await
+                    .map(|(has_changes, _)| has_changes)
+                    .unwrap_or(true);
+
+                if !is_dirty {
+                    let wt_path_str = worktree_path.to_string_lossy().to_string();
+                    if let Err(e) = git::worktree_remove_with_options(
+                        root,
+                        &wt_path_str,
+                        git::WorktreeRemoveOptions::default(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            error = %e,
+                            worktree = %worktree_path.display(),
+                            "Failed to remove worktree during cleanup; preserving session for recovery"
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    info!(
+                        worktree = %worktree_path.display(),
+                        "Preserving dirty worktree during cleanup"
+                    );
+                    false
+                }
+            } else {
+                false
+            };
+
+            if should_preserve_session {
+                continue;
+            }
+
+            self.sessions.remove(&id);
         }
     }
 }

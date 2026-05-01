@@ -302,7 +302,7 @@ impl GitWorkspaceManager {
             )
             .await
             .map_err(|e| {
-                VcsError::Other(format!(
+                VcsError::git_command(format!(
                     "Failed to remove worktree '{}' at '{}': {}",
                     workspace_name,
                     worktree_path.display(),
@@ -665,7 +665,7 @@ impl GitWorkspaceManager {
             )
             .await
             .map_err(|e| {
-                VcsError::Other(format!(
+                VcsError::git_command(format!(
                     "Failed to remove inconsistent worktree '{}' at '{}': {}",
                     workspace_info.workspace_name,
                     workspace_info.path.display(),
