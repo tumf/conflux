@@ -99,11 +99,16 @@ enum ApplyCompletionKind {
     TasksComplete,
     /// Apply emitted explicit implementation-blocker marker.
     BlockedHandoff,
+    /// Apply emitted REJECTED.md proposal and should hand off to rejecting review.
+    RejectingHandoff,
 }
 
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
     if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
         return Some(ApplyCompletionKind::BlockedHandoff);
+    }
+    if detect_apply_rejected_handoff(workspace_path, change_id).is_some() {
+        return Some(ApplyCompletionKind::RejectingHandoff);
     }
     match check_task_progress(workspace_path, change_id) {
         Ok(progress) if is_progress_complete(&progress) => Some(ApplyCompletionKind::TasksComplete),
@@ -630,6 +635,8 @@ pub struct ApplyLoopResult {
     pub iterations: u32,
     /// Apply detected implementation-blocker handoff and stopped apply loop.
     pub blocked_handoff: Option<ApplyBlockedHandoff>,
+    /// Apply detected REJECTED.md handoff and stopped apply loop.
+    pub rejected_handoff: Option<ApplyRejectedHandoff>,
 }
 
 /// Structured metadata for apply-blocked handoff marker artifact.
@@ -637,6 +644,13 @@ pub struct ApplyLoopResult {
 pub struct ApplyBlockedHandoff {
     /// Absolute path to detected blocker marker file.
     pub blocker_path: PathBuf,
+}
+
+/// Structured metadata for apply-generated rejection proposal artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyRejectedHandoff {
+    /// Absolute path to detected rejection proposal file.
+    pub rejected_path: PathBuf,
 }
 
 fn detect_apply_blocked_handoff(
@@ -653,6 +667,21 @@ fn detect_apply_blocked_handoff(
     blocker_path
         .is_file()
         .then_some(ApplyBlockedHandoff { blocker_path })
+}
+
+fn detect_apply_rejected_handoff(
+    workspace_path: &Path,
+    change_id: &str,
+) -> Option<ApplyRejectedHandoff> {
+    let rejected_path = workspace_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("REJECTED.md");
+
+    rejected_path
+        .is_file()
+        .then_some(ApplyRejectedHandoff { rejected_path })
 }
 
 /// Execute apply iterations until tasks are complete or max iterations reached.
@@ -975,11 +1004,26 @@ where
         // another apply child or treat the empty snapshot as a stall. Tasks-
         // complete runs fall through to the normal post_apply/final-commit path.
         if completion_finalized_run
-            && matches!(completion_kind, Some(ApplyCompletionKind::BlockedHandoff))
+            && matches!(
+                completion_kind,
+                Some(ApplyCompletionKind::BlockedHandoff | ApplyCompletionKind::RejectingHandoff)
+            )
         {
             info!(
                 change_id = change_id,
-                "Apply loop exiting for rejecting review handoff after grace-driven terminate"
+                completion_kind = ?completion_kind,
+                "Apply loop exiting for non-complete handoff after grace-driven terminate"
+            );
+            break false;
+        }
+
+        // Even when the apply command exits naturally, REJECTED.md must hand off
+        // immediately to rejecting review before post_apply hooks, WIP snapshots,
+        // or stall detection can run.
+        if detect_apply_rejected_handoff(workspace_path, change_id).is_some() {
+            info!(
+                change_id = change_id,
+                "Apply loop exiting for rejecting handoff after normal apply command exit"
             );
             break false;
         }
@@ -1171,12 +1215,18 @@ where
     } else {
         detect_apply_blocked_handoff(workspace_path, change_id)
     };
+    let rejected_handoff = if apply_succeeded {
+        None
+    } else {
+        detect_apply_rejected_handoff(workspace_path, change_id)
+    };
 
     Ok(ApplyLoopResult {
         revision,
         completed: apply_succeeded,
         iterations: iteration,
         blocked_handoff,
+        rejected_handoff,
     })
 }
 
@@ -1408,6 +1458,99 @@ mod tests {
             handoff.unwrap().blocker_path,
             blocker_path,
             "detected handoff should point to APPLY_BLOCKED marker"
+        );
+    }
+
+    #[test]
+    fn test_detect_apply_completion_detects_rejected_handoff() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
+        std::fs::write(change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let completion = detect_apply_completion(workspace, "change-a");
+        assert_eq!(completion, Some(ApplyCompletionKind::RejectingHandoff));
+    }
+
+    #[test]
+    fn test_apply_blocked_and_rejected_handoffs_are_distinct() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        let blocked_marker = change_dir.join("APPLY_BLOCKED").join("marker.md");
+        std::fs::create_dir_all(blocked_marker.parent().unwrap()).unwrap();
+        std::fs::write(&blocked_marker, "# APPLY_BLOCKED\n").unwrap();
+        std::fs::write(change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let blocked = detect_apply_blocked_handoff(workspace, "change-a")
+            .expect("blocked handoff should be present");
+        let rejected = detect_apply_rejected_handoff(workspace, "change-a")
+            .expect("rejected handoff should be present");
+
+        assert_eq!(blocked.blocker_path, blocked_marker);
+        assert_eq!(rejected.rejected_path, change_dir.join("REJECTED.md"));
+        assert_ne!(
+            blocked.blocker_path, rejected.rejected_path,
+            "blocked and rejected handoff artifacts must stay distinct"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_loop_rejected_handoff_skips_empty_wip_stall() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "rejected-change";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
+        std::fs::write(change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
+
+        let config = OrchestratorConfig {
+            apply_command: Some("echo apply {change_id}".to_string()),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Auto,
+            None,
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await
+        .expect("apply loop should return rejecting handoff without stall error");
+
+        assert!(
+            !result.completed,
+            "rejected handoff must not mark apply complete"
+        );
+        assert_eq!(
+            result.iterations, 1,
+            "rejected handoff should exit before retry/stall loop"
+        );
+        assert!(result.blocked_handoff.is_none());
+        assert!(
+            result.rejected_handoff.is_some(),
+            "rejected handoff metadata must be returned"
         );
     }
 

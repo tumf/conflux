@@ -139,42 +139,25 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -1326,42 +1309,25 @@ When parallel merge verification runs after archive completion, a change that is
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -1547,42 +1513,25 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -1695,81 +1644,47 @@ Parallel execution SHALL restore a non-terminal workspace containing `openspec/c
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1894,42 +1809,25 @@ runtime は dependency blocked だった change が resolved になったこと�
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: Applied resume uses workspace-local evidence only
 
@@ -1991,42 +1889,25 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 
 ### Requirement: Parallel execution acceptance loop
 
-Parallel execution SHALL determine the next action for a workspace using only workspace-local evidence: the workspace file state, the workspace git state, and base-branch tree comparison.
+When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
 
-Out-of-worktree durable workflow state MUST NOT be required for acceptance routing, archive routing, or resume routing.
+`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
 
-When an `Applied` workspace resumes and workspace-local evidence does not prove archive handoff readiness, the runtime MUST re-run acceptance rather than trusting external durable state.
+#### Scenario: apply-generated REJECTED.md skips apply stall detection
 
-#### Scenario: applied workspace re-runs acceptance when workspace-local proof is absent
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
+- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
+- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
+- **THEN** the runtime exits the apply retry loop as a rejecting handoff
+- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
+- **AND** the next orchestration step is rejection review
 
-- **GIVEN** change `alpha` is detected as `Applied` from workspace-local git/file evidence
-- **AND** the workspace does not contain sufficient local evidence proving archive handoff readiness
-- **WHEN** the runtime resumes processing
-- **THEN** the next phase is acceptance
-- **AND** the runtime does not consult any state under `~/.local/state/cflx/` to skip directly to archive
+#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
 
-For the same workspace contents, resume routing MUST produce the same result regardless of whether out-of-worktree durable state exists, is missing, or is stale.
-
-#### Scenario: external durable state deletion does not change routing
-
-- **GIVEN** change `beta` has a workspace whose file/git state resolves to a specific next phase
-- **AND** one runtime run has pre-existing files under `~/.local/state/cflx/acceptance-state` and `~/.local/state/cflx/archive-resume-state`
-- **AND** another runtime run deletes those directories before resume
-- **WHEN** both runs evaluate resume routing for the same workspace contents
-- **THEN** both runs choose the same next phase
-- **AND** any difference in observability output does not alter workflow control
-
-`Archiving` and `Archived` resume decisions SHALL be derived from the current workspace file/git state only.
-
-External durable state MAY exist as non-authoritative observability output, but it MUST NOT cause a workspace to re-enter apply, acceptance, or archive when workspace-local evidence indicates otherwise.
-
-#### Scenario: stale external state cannot revive an archived workspace
-
-- **GIVEN** change `gamma` is detected as `Archived` from workspace-local archive completion evidence
-- **AND** stale files remain under `~/.local/state/cflx/archive-resume-state`
-- **WHEN** resume routing is performed
-- **THEN** the runtime treats the workspace as archived and hands it to merge handling
-- **AND** the stale external state does not route the workspace back into apply, acceptance, or archive
+- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
+- **WHEN** the apply loop evaluates handoff artifacts
+- **THEN** the runtime treats the change as a resumable stalled/apply hold
+- **AND** it does not route to terminal rejection review solely because an apply blocker exists
 
 ### Requirement: Archive retry observability is non-authoritative
 
