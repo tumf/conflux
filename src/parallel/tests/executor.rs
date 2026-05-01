@@ -2269,6 +2269,7 @@ fn selective_dependency_analysis_result<'a>(
     })
 }
 
+#[cfg_attr(not(feature = "heavy"), ignore)]
 #[tokio::test]
 async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_change_rejected() {
     use crate::events::ExecutionEvent;
