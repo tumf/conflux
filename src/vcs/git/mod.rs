@@ -296,7 +296,12 @@ impl GitWorkspaceManager {
         // Remove worktree
         if worktree_path.exists() {
             if let Err(e) =
-                commands::worktree_remove(&self.repo_root, worktree_path.to_str().unwrap()).await
+                commands::worktree_remove_with_options(
+                    &self.repo_root,
+                    worktree_path.to_str().unwrap(),
+                    commands::WorktreeRemoveOptions::default(),
+                )
+                .await
             {
                 warn!("Failed to remove worktree '{}': {}", workspace_name, e);
                 // Try force removal via filesystem
@@ -657,8 +662,12 @@ impl GitWorkspaceManager {
         // Remove the worktree if it exists
         if workspace_info.path.exists() {
             if let Err(e) =
-                commands::worktree_remove(&self.repo_root, workspace_info.path.to_str().unwrap())
-                    .await
+                commands::worktree_remove_with_options(
+                    &self.repo_root,
+                    workspace_info.path.to_str().unwrap(),
+                    commands::WorktreeRemoveOptions::default(),
+                )
+                .await
             {
                 warn!(
                     "Failed to remove worktree '{}': {}",

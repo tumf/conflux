@@ -906,7 +906,13 @@ impl ProposalSessionManager {
 
         // Remove worktree
         let wt_path_str = session.worktree_path.to_string_lossy().to_string();
-        if let Err(e) = git::worktree_remove(repo_root, &wt_path_str).await {
+        if let Err(e) = git::worktree_remove_with_options(
+            repo_root,
+            &wt_path_str,
+            git::WorktreeRemoveOptions::default(),
+        )
+        .await
+        {
             warn!(
                 error = %e,
                 worktree = %session.worktree_path.display(),
@@ -978,7 +984,13 @@ impl ProposalSessionManager {
 
         // Remove worktree
         let wt_path_str = session.worktree_path.to_string_lossy().to_string();
-        if let Err(e) = git::worktree_remove(repo_root, &wt_path_str).await {
+        if let Err(e) = git::worktree_remove_with_options(
+            repo_root,
+            &wt_path_str,
+            git::WorktreeRemoveOptions::default(),
+        )
+        .await
+        {
             warn!(
                 error = %e,
                 worktree = %session.worktree_path.display(),
@@ -1128,7 +1140,13 @@ impl ProposalSessionManager {
 
                     if !is_dirty {
                         let wt_path_str = session.worktree_path.to_string_lossy().to_string();
-                        if let Err(e) = git::worktree_remove(root, &wt_path_str).await {
+                        if let Err(e) = git::worktree_remove_with_options(
+                            root,
+                            &wt_path_str,
+                            git::WorktreeRemoveOptions::default(),
+                        )
+                        .await
+                        {
                             warn!(
                                 error = %e,
                                 worktree = %session.worktree_path.display(),

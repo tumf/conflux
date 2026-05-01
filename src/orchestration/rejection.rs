@@ -330,7 +330,13 @@ async fn resolve_rejection_reason(
 
 async fn cleanup_worktree(repo_root: &Path, worktree_path: &Path) {
     let worktree_path_str = worktree_path.to_string_lossy();
-    match git_commands::worktree_remove(repo_root, &worktree_path_str).await {
+    match git_commands::worktree_remove_with_options(
+        repo_root,
+        &worktree_path_str,
+        git_commands::WorktreeRemoveOptions::default(),
+    )
+    .await
+    {
         Ok(()) => {
             info!(
                 worktree = %worktree_path.display(),

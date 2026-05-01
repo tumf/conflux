@@ -235,10 +235,11 @@ pub async fn handle_tui_command(
                 id, suffix
             )));
         }
-        TuiCommand::DeleteWorktreeByPath(path, branch_name) => {
-            match crate::vcs::git::commands::worktree_remove(
+        TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
+            match crate::vcs::git::commands::worktree_remove_with_options(
                 ctx.repo_root,
                 path.to_string_lossy().as_ref(),
+                crate::vcs::git::commands::WorktreeRemoveOptions { skip_teardown },
             )
             .await
             {

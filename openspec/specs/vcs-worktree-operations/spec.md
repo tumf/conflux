@@ -80,6 +80,58 @@ WorktreeInfo struct SHALL represent git worktree metadata.
 - **THEN** worktree作成は失敗として扱われる
 - **AND** 失敗理由がログに記録される
 
+### Requirement: Worktree teardown script execution
+
+The system MUST support an optional worktree-local `.wt/teardown` script that runs before deleting a Conflux-managed Git worktree.
+
+When `<worktree-root>/.wt/teardown` exists and is executable, the system MUST execute it before `git worktree remove --force`.
+
+- Execution context MUST use cwd=`<worktree-root>`
+- `ROOT_WORKTREE_PATH` MUST be set to the repository root
+- stdin MUST be null (`/dev/null`)
+
+If teardown exits non-zero, worktree deletion MUST fail and MUST preserve the worktree for operator recovery.
+
+If teardown is missing, deletion MUST proceed normally.
+
+If teardown exists but is not executable, the system MUST skip teardown and continue deletion.
+
+The system MUST expose an explicit skip-teardown deletion option for recovery operations. When skip-teardown is enabled, the system MUST bypass teardown execution and proceed with deletion while logging that teardown was skipped.
+
+#### Scenario: Teardown runs before deletion when executable
+- **GIVEN** target worktree contains executable `.wt/teardown`
+- **WHEN** managed worktree deletion is requested
+- **THEN** `.wt/teardown` is executed before `git worktree remove --force`
+- **AND** cwd is target worktree root
+- **AND** `ROOT_WORKTREE_PATH` is set
+- **AND** stdin is null
+
+#### Scenario: Teardown failure aborts deletion
+- **GIVEN** target worktree contains executable `.wt/teardown`
+- **AND** teardown exits non-zero
+- **WHEN** managed worktree deletion is requested
+- **THEN** deletion fails
+- **AND** worktree is preserved for operator recovery
+
+#### Scenario: Missing teardown proceeds with deletion
+- **GIVEN** target worktree has no `.wt/teardown`
+- **WHEN** managed worktree deletion is requested
+- **THEN** deletion proceeds
+
+#### Scenario: Non-executable teardown is skipped
+- **GIVEN** target worktree contains non-executable `.wt/teardown`
+- **WHEN** managed worktree deletion is requested
+- **THEN** teardown is skipped
+- **AND** deletion proceeds
+
+#### Scenario: Explicit skip-teardown deletion proceeds
+- **GIVEN** target worktree contains executable `.wt/teardown` that would fail
+- **AND** deletion request enables `skip_teardown`
+- **WHEN** managed worktree deletion is requested
+- **THEN** teardown is not executed
+- **AND** deletion proceeds
+- **AND** skip behavior is logged
+
 ### Requirement: Worktree delete removes branch
 
 When deleting a worktree from the Worktrees view, the system MUST also delete the associated local branch.

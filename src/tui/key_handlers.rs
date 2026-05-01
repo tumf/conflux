@@ -385,8 +385,14 @@ pub async fn handle_plus_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
         )));
         // Don't continue - setup failure is considered an error
         // but the worktree was already created, so we should clean it up
-        if let Err(cleanup_err) =
-            crate::vcs::git::commands::worktree_remove(ctx.repo_root, worktree_path_str).await
+        if let Err(cleanup_err) = crate::vcs::git::commands::worktree_remove_with_options(
+            ctx.repo_root,
+            worktree_path_str,
+            crate::vcs::git::commands::WorktreeRemoveOptions {
+                skip_teardown: true,
+            },
+        )
+        .await
         {
             ctx.app.add_log(LogEntry::error(format!(
                 "Failed to cleanup worktree after setup failure: {}",
@@ -459,6 +465,16 @@ pub async fn handle_key_event(
             }
             (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) | (KeyCode::Esc, _) => {
                 ctx.app.cancel_worktree_action();
+            }
+            (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
+                if let Some(TuiCommand::DeleteWorktreeByPath(path, branch, _)) =
+                    ctx.app.confirm_worktree_action_delete()
+                {
+                    let _ = ctx
+                        .cmd_tx
+                        .send(TuiCommand::DeleteWorktreeByPath(path, branch, true))
+                        .await;
+                }
             }
             _ => {}
         }

@@ -875,8 +875,12 @@ pub async fn delete_worktree(
     }
 
     // Delete worktree
-    commands::worktree_remove(&repo_root, worktree.path.to_str().unwrap())
-        .await
+    commands::worktree_remove_with_options(
+        &repo_root,
+        worktree.path.to_str().unwrap(),
+        commands::WorktreeRemoveOptions::default(),
+    )
+    .await
         .map_err(|e| {
             let duration_ms = start.elapsed().as_millis();
             error!(
