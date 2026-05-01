@@ -27,17 +27,17 @@ fn post_archive_dispatch_event(
     state: &crate::orchestration::state::OrchestratorState,
     change_id: &str,
 ) -> Option<OrchestratorEvent> {
-    let reason = if state.is_resolving_active() {
-        "Resolve already active; auto-queue archived change"
-    } else {
-        "No active resolve; trigger immediate resolve attempt"
-    };
+    let has_resolve_lane_blocker = state.is_resolving_active() || state.is_rejecting_active();
 
-    Some(OrchestratorEvent::MergeDeferred {
-        change_id: change_id.to_string(),
-        reason: reason.to_string(),
-        auto_resumable: true,
-    })
+    if has_resolve_lane_blocker {
+        return Some(OrchestratorEvent::MergeDeferred {
+            change_id: change_id.to_string(),
+            reason: "Resolve lane occupied by active resolving/rejecting change; auto-queue archived change".to_string(),
+            auto_resumable: true,
+        });
+    }
+
+    None
 }
 
 async fn dispatch_event(
@@ -1317,8 +1317,8 @@ mod tests {
         crate::orchestration::state::OrchestratorState::apply_execution_event(
             &mut state,
             &ExecutionEvent::ResolveStarted {
-                change_id: "change-b".to_string(),
-                command: "resolve change-b".to_string(),
+                change_id: "change-a".to_string(),
+                command: "resolve change-a".to_string(),
             },
         );
         crate::orchestration::state::OrchestratorState::apply_execution_event(
@@ -1349,9 +1349,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_archived_no_active_resolve() {
+    fn test_tui_archived_no_active_resolve_or_rejecting() {
         use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState, WaitState};
 
         let mut state =
             OrchestratorState::with_mode(vec!["change-a".to_string()], 3, ExecutionMode::Parallel);
@@ -1362,27 +1362,107 @@ mod tests {
         );
 
         let deferred = super::post_archive_dispatch_event(&state, "change-a");
+        assert!(deferred.is_none());
+
+        let runtime = state
+            .change_runtime("change-a")
+            .expect("change-a runtime should exist");
+        assert_eq!(runtime.wait_state, WaitState::MergeWait);
+    }
+
+    #[test]
+    fn test_tui_archived_during_rejecting_emits_auto_resumable_deferred() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::vcs::WorkspaceStatus;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-a".to_string(),
+                status: WorkspaceStatus::Rejecting,
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
         assert!(matches!(
             deferred,
             Some(ExecutionEvent::MergeDeferred {
                 ref change_id,
                 auto_resumable: true,
                 ..
-            }) if change_id == "change-a"
+            }) if change_id == "change-b"
         ));
+    }
 
-        if let Some(event) = deferred {
-            crate::orchestration::state::OrchestratorState::apply_execution_event(
-                &mut state, &event,
-            );
-        }
+    #[test]
+    fn test_tui_archived_during_applying_does_not_emit_auto_resumable_deferred() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
 
-        let runtime = state
-            .change_runtime("change-a")
-            .expect("change-a runtime should exist");
-        assert_eq!(
-            runtime.wait_state,
-            crate::orchestration::state::WaitState::ResolveWait
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply change-a".to_string(),
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
+        assert!(
+            deferred.is_none(),
+            "applying blocker must not trigger resolve-pending auto dispatch"
+        );
+    }
+
+    #[test]
+    fn test_tui_archived_with_terminal_rejected_change_does_not_emit_auto_resumable_deferred() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeRejected {
+                change_id: "change-a".to_string(),
+                reason: "blocked".to_string(),
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
+        assert!(
+            deferred.is_none(),
+            "terminal rejected blocker must not trigger resolve-pending auto dispatch"
         );
     }
 

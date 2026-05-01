@@ -682,6 +682,13 @@ impl OrchestratorState {
             .any(|rt| matches!(rt.activity, ActivityState::Resolving) && !rt.is_terminal())
     }
 
+    /// Return true when any change is currently in rejecting activity.
+    pub fn is_rejecting_active(&self) -> bool {
+        self.change_runtime
+            .values()
+            .any(|rt| matches!(rt.activity, ActivityState::Rejecting) && !rt.is_terminal())
+    }
+
     /// Return change IDs that are currently waiting for scheduler-owned resolve/merge retry.
     pub fn resolve_wait_change_ids(&self) -> Vec<String> {
         self.change_runtime
@@ -1127,11 +1134,15 @@ impl OrchestratorState {
             ExecutionEvent::ChangeArchived(change_id) => {
                 self.mark_archived(change_id);
                 let mode = self.execution_mode;
-                let has_other_resolving = self.change_runtime.iter().any(|(id, runtime)| {
-                    id != change_id
-                        && matches!(runtime.activity, ActivityState::Resolving)
-                        && !runtime.is_terminal()
-                });
+                let has_other_resolve_lane_blocker =
+                    self.change_runtime.iter().any(|(id, runtime)| {
+                        id != change_id
+                            && matches!(
+                                runtime.activity,
+                                ActivityState::Resolving | ActivityState::Rejecting
+                            )
+                            && !runtime.is_terminal()
+                    });
                 let rt = self.runtime_entry(change_id);
                 rt.activity = ActivityState::Idle;
 
@@ -1146,7 +1157,7 @@ impl OrchestratorState {
                         // Parallel: archived changes defer to active resolve in the same reducer scope.
                         // If another change is resolving, keep this row in ResolveWait so it can
                         // continue automatically after the active resolve completes.
-                        rt.wait_state = if has_other_resolving {
+                        rt.wait_state = if has_other_resolve_lane_blocker {
                             WaitState::ResolveWait
                         } else {
                             WaitState::MergeWait
@@ -2556,6 +2567,57 @@ mod tests {
             "Parallel: ChangeArchived must transition to resolve pending while another change is resolving"
         );
         assert!(!state.is_terminal_change("archived"));
+    }
+
+    #[test]
+    fn test_parallel_mode_change_archived_uses_resolve_pending_when_other_change_is_rejecting() {
+        use crate::events::ExecutionEvent;
+        use crate::vcs::WorkspaceStatus;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["rejecting".to_string(), "archived".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "rejecting".to_string(),
+            workspace_name: "ws-rejecting".to_string(),
+            status: WorkspaceStatus::Rejecting,
+        });
+        assert_eq!(state.display_status("rejecting"), "rejecting");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
+        assert_eq!(
+            state.display_status("archived"),
+            "resolve pending",
+            "Parallel: ChangeArchived must transition to resolve pending while another change is rejecting"
+        );
+        assert!(!state.is_terminal_change("archived"));
+    }
+
+    #[test]
+    fn test_parallel_mode_change_archived_keeps_merge_wait_when_other_change_is_accepting() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["accepting".to_string(), "archived".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "accepting".to_string(),
+            command: "accept accepting".to_string(),
+        });
+        assert_eq!(state.display_status("accepting"), "accepting");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
+        assert_eq!(
+            state.display_status("archived"),
+            "merge wait",
+            "Parallel: accepting activity must not transition archived rows to resolve pending"
+        );
     }
 
     #[test]
