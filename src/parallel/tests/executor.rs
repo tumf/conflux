@@ -2850,6 +2850,86 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
 }
 
 #[tokio::test]
+async fn test_rejected_workspace_completion_retries_deferred_merges() {
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor
+        .resolve_wait_changes
+        .insert("blocked-change".to_string());
+
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+    let mut in_flight = HashSet::new();
+    in_flight.insert("blocked-change".to_string());
+
+    executor
+        .handle_workspace_completion(
+            WorkspaceResult {
+                change_id: "blocked-change".to_string(),
+                workspace_name: "ws-blocked-change".to_string(),
+                final_revision: None,
+                error: None,
+                rejected: Some("confirmed rejection".to_string()),
+            },
+            1,
+            &mut in_flight,
+            &merge_result_tx,
+        )
+        .await;
+
+    assert!(
+        executor.resolve_wait_changes.is_empty(),
+        "rejecting completion must trigger deferred-merge retry and clear orphaned resolve-wait entries"
+    );
+}
+
+#[tokio::test]
+async fn test_rejection_review_failure_retries_deferred_merges() {
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor
+        .resolve_wait_changes
+        .insert("blocked-change".to_string());
+
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+    let mut in_flight = HashSet::new();
+    in_flight.insert("blocked-change".to_string());
+
+    executor
+        .handle_workspace_completion(
+            WorkspaceResult {
+                change_id: "blocked-change".to_string(),
+                workspace_name: "ws-blocked-change".to_string(),
+                final_revision: None,
+                error: Some("rejecting review failed".to_string()),
+                rejected: None,
+            },
+            1,
+            &mut in_flight,
+            &merge_result_tx,
+        )
+        .await;
+
+    assert!(
+        executor.resolve_wait_changes.is_empty(),
+        "rejecting failure must trigger deferred-merge retry and clear orphaned resolve-wait entries"
+    );
+}
+
+#[tokio::test]
 async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
     use crate::parallel::MergeResult;
     use tempfile::TempDir;

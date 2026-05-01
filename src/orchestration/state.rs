@@ -2570,6 +2570,57 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_mode_change_archived_uses_resolve_pending_when_other_change_is_rejecting() {
+        use crate::events::ExecutionEvent;
+        use crate::vcs::WorkspaceStatus;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["rejecting".to_string(), "archived".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "rejecting".to_string(),
+            workspace_name: "ws-rejecting".to_string(),
+            status: WorkspaceStatus::Rejecting,
+        });
+        assert_eq!(state.display_status("rejecting"), "rejecting");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
+        assert_eq!(
+            state.display_status("archived"),
+            "resolve pending",
+            "Parallel: ChangeArchived must transition to resolve pending while another change is rejecting"
+        );
+        assert!(!state.is_terminal_change("archived"));
+    }
+
+    #[test]
+    fn test_parallel_mode_change_archived_keeps_merge_wait_when_other_change_is_accepting() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["accepting".to_string(), "archived".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "accepting".to_string(),
+            command: "accept accepting".to_string(),
+        });
+        assert_eq!(state.display_status("accepting"), "accepting");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
+        assert_eq!(
+            state.display_status("archived"),
+            "merge wait",
+            "Parallel: accepting activity must not transition archived rows to resolve pending"
+        );
+    }
+
+    #[test]
     fn test_parallel_mode_full_lifecycle() {
         use crate::events::ExecutionEvent;
 

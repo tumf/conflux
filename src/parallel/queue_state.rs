@@ -286,6 +286,10 @@ impl ParallelExecutor {
                 },
             )
             .await;
+
+            // Rejection review failure releases the rejecting lane. If any archived rows are
+            // waiting in ResolveWait due to that blocker, retry them immediately.
+            self.retry_deferred_merges().await;
         } else if let Some(reason) = &workspace_result.rejected {
             info!(
                 "Change '{}' rejected after acceptance blocker: {}",
@@ -325,6 +329,10 @@ impl ParallelExecutor {
                     );
                 }
             }
+
+            // Rejection review completion (confirm) also releases the rejecting lane;
+            // retry deferred merges so ResolveWait rows are not stranded.
+            self.retry_deferred_merges().await;
         } else {
             info!(
                 "Change '{}' completed successfully",

@@ -1370,6 +1370,102 @@ mod tests {
         assert_eq!(runtime.wait_state, WaitState::MergeWait);
     }
 
+    #[test]
+    fn test_tui_archived_during_rejecting_emits_auto_resumable_deferred() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::vcs::WorkspaceStatus;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-a".to_string(),
+                status: WorkspaceStatus::Rejecting,
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
+        assert!(matches!(
+            deferred,
+            Some(ExecutionEvent::MergeDeferred {
+                ref change_id,
+                auto_resumable: true,
+                ..
+            }) if change_id == "change-b"
+        ));
+    }
+
+    #[test]
+    fn test_tui_archived_during_applying_does_not_emit_auto_resumable_deferred() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply change-a".to_string(),
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
+        assert!(
+            deferred.is_none(),
+            "applying blocker must not trigger resolve-pending auto dispatch"
+        );
+    }
+
+    #[test]
+    fn test_tui_archived_with_terminal_rejected_change_does_not_emit_auto_resumable_deferred() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        );
+
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeRejected {
+                change_id: "change-a".to_string(),
+                reason: "blocked".to_string(),
+            },
+        );
+        crate::orchestration::state::OrchestratorState::apply_execution_event(
+            &mut state,
+            &ExecutionEvent::ChangeArchived("change-b".to_string()),
+        );
+
+        let deferred = super::post_archive_dispatch_event(&state, "change-b");
+        assert!(
+            deferred.is_none(),
+            "terminal rejected blocker must not trigger resolve-pending auto dispatch"
+        );
+    }
+
     /// Test helper behavior for rejection-like removal from pending in TUI serial mode.
     #[tokio::test]
     async fn test_tui_rejection_removes_from_pending_selection() {
