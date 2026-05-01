@@ -2270,6 +2270,129 @@ fn selective_dependency_analysis_result<'a>(
 }
 
 #[tokio::test]
+async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_change_rejected() {
+    use crate::events::ExecutionEvent;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let change_id = "change-rejected";
+    let change_dir = repo_dir.path().join("openspec").join("changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("proposal.md"),
+        "---\nchange_type: implementation\n---\n# Change\n",
+    )
+    .or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [ ] implement rejected flow\n",
+    )
+    .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Add change files"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(
+            "sh -c 'mkdir -p openspec/changes/{change_id}; printf "
+                .to_string()
+                + "\"# REJECTED\\n\\n- change_id: {change_id}\\n- reason: regression\\n\" > openspec/changes/{change_id}/REJECTED.md'",
+        ),
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: CONFIRM'".to_string()),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(128);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("unexpected error");
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    assert!(result.error.is_none(), "unexpected error: {:?}", result.error);
+    assert!(
+        result.rejected.is_some(),
+        "rejected reason should be set after apply-time rejecting confirm"
+    );
+    assert!(
+        result
+            .rejected
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Rejecting review confirmed rejection"),
+        "unexpected rejected reason: {:?}",
+        result.rejected
+    );
+
+    let mut saw_rejecting_status = false;
+    let mut saw_change_rejected = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: id,
+                status,
+                ..
+            } if id == change_id && status == WorkspaceStatus::Rejecting => {
+                saw_rejecting_status = true;
+            }
+            ExecutionEvent::ChangeRejected { change_id: id, .. } if id == change_id => {
+                saw_change_rejected = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_rejecting_status,
+        "apply-time rejected handoff must emit WorkspaceStatus::Rejecting"
+    );
+    assert!(
+        saw_change_rejected,
+        "confirmed rejecting review must emit ChangeRejected"
+    );
+}
+
+#[tokio::test]
 async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     use crate::events::ExecutionEvent;
     use crate::parallel::dynamic_queue::ReanalysisReason;
