@@ -352,42 +352,60 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         let merge_in_progress = git_commands::is_merge_in_progress(workspace_manager.repo_root())
             .await
             .map_err(OrchestratorError::from)?;
-        if !merge_in_progress {
-            let mut not_integrated_revisions: Vec<String> = Vec::new();
-            for revision in revisions {
-                let integrated =
-                    git_commands::is_ancestor(workspace_manager.repo_root(), revision, "HEAD")
-                        .await
-                        .map_err(OrchestratorError::from)?;
-                if !integrated {
-                    not_integrated_revisions.push(revision.clone());
-                }
-            }
 
-            if not_integrated_revisions.is_empty() {
-                info!(
-                    "No unresolved conflicts, no merge in progress, and all revisions are already integrated into HEAD; skipping AI resolve path for revisions: {}",
-                    revisions.join(", ")
-                );
-                send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-                for change_id in change_ids {
-                    send_event(
-                        event_tx,
-                        ParallelEvent::ResolveCompleted {
-                            change_id: change_id.to_string(),
-                            worktree_change_ids: None,
-                        },
-                    )
-                    .await;
-                }
-                return Ok(());
-            }
-
+        if merge_in_progress {
             info!(
-                "No unresolved conflicts and no merge in progress, but revisions are not integrated into HEAD yet ({}); continuing resolve path",
-                not_integrated_revisions.join(", ")
+                "No unresolved conflicts and merge is in-progress (MERGE_HEAD exists); treating as conflictless merge-ready state and skipping AI resolve path for revisions: {}",
+                revisions.join(", ")
             );
+            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+            for change_id in change_ids {
+                send_event(
+                    event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+            }
+            return Ok(());
         }
+
+        let mut not_integrated_revisions: Vec<String> = Vec::new();
+        for revision in revisions {
+            let integrated =
+                git_commands::is_ancestor(workspace_manager.repo_root(), revision, "HEAD")
+                    .await
+                    .map_err(OrchestratorError::from)?;
+            if !integrated {
+                not_integrated_revisions.push(revision.clone());
+            }
+        }
+
+        if not_integrated_revisions.is_empty() {
+            info!(
+                "No unresolved conflicts, no merge in progress, and all revisions are already integrated into HEAD; skipping AI resolve path for revisions: {}",
+                revisions.join(", ")
+            );
+            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+            for change_id in change_ids {
+                send_event(
+                    event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+            }
+            return Ok(());
+        }
+
+        info!(
+            "No unresolved conflicts and no merge in progress, but revisions are not integrated into HEAD yet ({}); continuing resolve path",
+            not_integrated_revisions.join(", ")
+        );
     }
 
     let conflict_files_str = conflict_files.join(", ");

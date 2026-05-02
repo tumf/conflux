@@ -522,24 +522,10 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         .or_fail("unexpected error");
     commit_workspace_change(&workspace_a, "change-a.txt", "A", "Apply: change-a").await;
 
-    Command::new("git")
-        .args(["checkout", "main"])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .or_fail("unexpected error");
-    Command::new("git")
-        .args([
-            "merge",
-            "--no-ff",
-            "-m",
-            "Merge change: change-a",
-            &workspace_a.name,
-        ])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .or_fail("unexpected error");
+    // Intentionally do NOT pre-merge the worktree into main here.
+    // This test must exercise the archived sequential merge handoff where
+    // git merge --no-ff --no-commit succeeds, MERGE_HEAD exists, and there are
+    // no unresolved conflicts.
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
 
