@@ -3209,6 +3209,287 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
     );
 }
 
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use crate::vcs::GitWorkspaceManager;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let temp_dir = TempDir::new().or_fail("unexpected error");
+    let repo_root = temp_dir.path();
+    let workspace_base = repo_root.join("worktrees");
+    init_git_repo(repo_root).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let mut manager = GitWorkspaceManager::new(
+        workspace_base.clone(),
+        repo_root.to_path_buf(),
+        1,
+        config.clone(),
+    );
+    let workspace = manager
+        .create_workspace("alpha", None)
+        .await
+        .or_fail("create workspace");
+    let original_change_dir = workspace.path.join("openspec/changes/alpha");
+    std::fs::create_dir_all(&original_change_dir).or_fail("create original change dir");
+    std::fs::write(original_change_dir.join("proposal.md"), "# alpha draft\n")
+        .or_fail("write original change file");
+    std::fs::create_dir_all(workspace.path.join("openspec/changes/archive/alpha"))
+        .or_fail("create archive dir");
+    std::fs::write(
+        workspace
+            .path
+            .join("openspec/changes/archive/alpha/proposal.md"),
+        "# alpha\n",
+    )
+    .or_fail("write archive file");
+    std::fs::remove_dir_all(&original_change_dir).or_fail("remove original change dir");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git add workspace archive");
+    Command::new("git")
+        .args(["commit", "-m", "Archive alpha"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git commit workspace archive");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git add worktree gitfile");
+    Command::new("git")
+        .args(["commit", "-m", "Track alpha worktree"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git commit worktree gitfile");
+
+    let hook_marker = repo_root.join("hook-count.txt");
+    let hook_command = format!("printf 'alpha\\n' >> {}", hook_marker.to_string_lossy());
+    let hooks = HookRunner::new(
+        HooksConfig {
+            on_merged: Some(HookConfigValue::Full(HookConfig {
+                command: hook_command,
+                continue_on_failure: false,
+                timeout: 5,
+                git_commit_no_verify: false,
+                max_retries: 0,
+                retry_delay_secs: 1,
+            })),
+            ..Default::default()
+        },
+        repo_root,
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Resolve in progress for another change".to_string(),
+            auto_resumable: true,
+        });
+    }
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(manager);
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.set_hooks(hooks);
+
+    match (MergeAttempt::Merged {
+        revision: "merge-rev-alpha".to_string(),
+    }) {
+        MergeAttempt::Merged { revision } => {
+            executor
+                .clear_resolve_wait_intent_for_success("alpha")
+                .await;
+            if let Some(ref hooks) = executor.hooks {
+                let hook_ctx = crate::hooks::HookContext::new(0, 0, 0, false)
+                    .with_change("alpha", 0, 0)
+                    .with_apply_count(0)
+                    .with_parallel_context(&workspace.path.to_string_lossy(), None);
+                hooks
+                    .run_hook(crate::hooks::HookType::OnMerged, &hook_ctx)
+                    .await
+                    .or_fail("on_merged hook should succeed");
+            }
+            executor
+                .mark_deferred_merge_completed_in_shared_state("alpha", &revision)
+                .await;
+            crate::parallel::events::send_event(
+                &executor.event_tx,
+                ParallelEvent::MergeCompleted {
+                    change_id: "alpha".to_string(),
+                    revision,
+                },
+            )
+            .await;
+        }
+        MergeAttempt::Deferred(deferred) => {
+            panic!("expected merge success, got deferred: {}", deferred.reason);
+        }
+    }
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(!executor.has_resolve_wait());
+    assert!(shared.read().await.resolve_wait_change_ids().is_empty());
+
+    executor.trigger_resolve_wait_retry_dispatch();
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    let hook_output = std::fs::read_to_string(&hook_marker).or_fail("read hook marker");
+    assert_eq!(
+        hook_output.lines().filter(|line| *line == "alpha").count(),
+        1,
+        "on_merged hook must run exactly once for deferred retry success"
+    );
+
+    let mut merge_completed = 0usize;
+    let mut resolve_started = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::MergeCompleted { change_id, .. }
+                if change_id == "alpha" =>
+            {
+                merge_completed += 1;
+            }
+            crate::events::ExecutionEvent::ResolveStarted { change_id, .. }
+                if change_id == "alpha" =>
+            {
+                resolve_started += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(merge_completed, 1);
+    assert_eq!(resolve_started, 0);
+}
+
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use crate::vcs::GitWorkspaceManager;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let temp_dir = TempDir::new().or_fail("unexpected error");
+    let repo_root = temp_dir.path();
+    let workspace_base = repo_root.join("worktrees");
+    init_git_repo(repo_root).await;
+
+    std::fs::create_dir_all(repo_root.join("openspec/changes/archive/alpha"))
+        .or_fail("create archive dir");
+    std::fs::write(
+        repo_root.join("openspec/changes/archive/alpha/proposal.md"),
+        "# alpha\n",
+    )
+    .or_fail("write archive file");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git add base archive");
+    Command::new("git")
+        .args(["commit", "-m", "Archive alpha on base"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git commit base archive");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let manager = GitWorkspaceManager::new(
+        workspace_base.clone(),
+        repo_root.to_path_buf(),
+        1,
+        config.clone(),
+    );
+
+    let hook_marker = repo_root.join("stale-hook-count.txt");
+    let hook_command = format!("printf 'alpha\\n' >> {}", hook_marker.to_string_lossy());
+    let hooks = HookRunner::new(
+        HooksConfig {
+            on_merged: Some(HookConfigValue::Full(HookConfig {
+                command: hook_command,
+                continue_on_failure: false,
+                timeout: 5,
+                git_commit_no_verify: false,
+                max_retries: 0,
+                retry_delay_secs: 1,
+            })),
+            ..Default::default()
+        },
+        repo_root,
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Resolve in progress for another change".to_string(),
+            auto_resumable: true,
+        });
+    }
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(manager);
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.set_hooks(hooks);
+
+    executor.retry_deferred_merges().await;
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(!executor.has_resolve_wait());
+    assert!(shared.read().await.resolve_wait_change_ids().is_empty());
+    assert!(
+        !hook_marker.exists(),
+        "stale already-merged retry must not run on_merged hook"
+    );
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::MergeStarted { .. }
+            | crate::events::ExecutionEvent::ResolveStarted { .. }
+            | crate::events::ExecutionEvent::MergeCompleted { .. } => {
+                panic!("stale already-merged retry must not emit merge/resolve event: {event:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
     use crate::events::ExecutionEvent;

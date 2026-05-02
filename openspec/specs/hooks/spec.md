@@ -3,6 +3,7 @@
 ## Purpose
 Defines the lifecycle hook system including available hooks, context variables, and execution order.
 ## Requirements
+
 ### Requirement: on_queue_add hook
 
 The orchestrator SHALL execute `on_queue_add` hook when a user dynamically adds a change to the queue (via Space key in TUI).
@@ -376,33 +377,37 @@ parallel mode での hook 実行時、`HookContext` には workspace 固有の�
 - **THEN** 環境変数 `OPENSPEC_GROUP_INDEX` に現在のグループインデックスが設定される
 
 ### Requirement: on_merged hook
-オーケストレーターはchangeがbase branchにマージされた直後に`on_merged`フックを実行しなければならない（SHALL）。
 
-`on_merged`はマージ成功時のみ1回実行され、マージ失敗時には実行しない。
+The orchestrator SHALL run `on_merged` after a change is successfully merged into the base branch and before the change transitions to terminal `Merged` status.
 
-parallelモードでは、自動マージが成功した全ての経路で`on_merged`を実行しなければならない（SHALL）。
+`on_merged` SHALL run only once for a successful merge of a given change, including immediate parallel merge success, deferred merge retry success, manual TUI resolve success, and conflictless merge-ready retry paths.
 
-#### Scenario: Parallelモードで自動マージ完了
-- **GIVEN** `hooks.on_merged`が`echo 'Merged {change_id}'`に設定されている
-- **WHEN** parallelモードでchange`change-a`がbase branchにマージされ`MergeCompleted`が発行される
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+A stale retry or repeated scheduler trigger for a change already integrated into the base branch SHALL NOT execute `on_merged` again.
 
-#### Scenario: Parallelモードでarchive直後に即時マージ成功
-- **GIVEN** `hooks.on_merged`が`echo 'Merged {change_id}'`に設定されている
-- **AND** parallelモードでchange`change-a`がarchive完了後に即時マージされる
-- **WHEN** マージが成功する
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+#### Scenario: deferred merge retry invokes on_merged once
 
-#### Scenario: TUI Worktreeの手動マージ完了
-- **GIVEN** `hooks.on_merged`が設定されている
-- **AND** worktreeブランチ`change-a`をMキーでマージする
-- **WHEN** `BranchMergeCompleted`が発行される
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+**Given**: `hooks.on_merged` is configured
+**And**: change `alpha` is in `ResolveWait` for a deferred merge retry
+**When**: the scheduler retries the merge and repository-visible merge integration succeeds
+**Then**: `on_merged` is executed once with `{change_id}=alpha`
+**And**: `MergeCompleted` is emitted only after the hook execution attempt completes
 
-#### Scenario: serial(run)でのマージ相当
-- **GIVEN** runモード（非parallel）でchange`change-a`を処理している
-- **WHEN** archiveが成功し、base branchに変更が反映済みと確認できる
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+#### Scenario: stale retry does not duplicate on_merged
+
+**Given**: change `alpha` has already been integrated into the base branch
+**And**: a stale retry trigger or stale resolve-wait entry for `alpha` is observed
+**When**: the scheduler evaluates deferred merge retries
+**Then**: it clears the stale retry intent for `alpha`
+**And**: it does not execute `on_merged` for `alpha` again
+**And**: it does not start AI conflict resolution for `alpha`
+
+#### Scenario: repeated retry trigger after success is idempotent
+
+**Given**: change `alpha` completed deferred merge retry successfully
+**And**: `on_merged` already ran for that successful merge
+**When**: a later scheduler loop synchronizes retry state and receives another retry dispatch trigger
+**Then**: `alpha` is not re-added as retryable work
+**And**: no second `on_merged` execution is emitted for `alpha`
 
 ### Requirement: CLI Hook Output Visibility
 
@@ -445,7 +450,6 @@ The orchestrator SHALL surface hook command execution and captured hook output i
 - **WHEN** `cflx run` logs the captured hook output
 - **THEN** the CLI log includes the visible prefix of the output
 - **AND** the CLI log explicitly indicates that the output was truncated
-
 
 ### Requirement: Hook configuration format
 
@@ -509,50 +513,36 @@ The detailed object form SHALL support the following fields:
 
 ### Requirement: on_merged hook
 
-オーケストレーターはchangeがbase branchにマージされた直後に`on_merged`フックを実行しなければならない（SHALL）。
+The orchestrator SHALL run `on_merged` after a change is successfully merged into the base branch and before the change transitions to terminal `Merged` status.
 
-`on_merged`はマージ成功時のみ1回実行され、マージ失敗時には実行しない。
+`on_merged` SHALL run only once for a successful merge of a given change, including immediate parallel merge success, deferred merge retry success, manual TUI resolve success, and conflictless merge-ready retry paths.
 
-parallelモードでは、自動マージが成功した全ての経路で`on_merged`を実行しなければならない（SHALL）。
+A stale retry or repeated scheduler trigger for a change already integrated into the base branch SHALL NOT execute `on_merged` again.
 
-`on_merged` フック実行前に、`.git/index.lock` ファイルの解放を待機しなければならない（SHALL）。最大待機時間は `hooks.index_lock_wait_secs`（デフォルト 10 秒）で設定可能。
+#### Scenario: deferred merge retry invokes on_merged once
 
-#### Scenario: Parallelモードで自動マージ完了
-- **GIVEN** `hooks.on_merged`が`echo 'Merged {change_id}'`に設定されている
-- **WHEN** parallelモードでchange`change-a`がbase branchにマージされ`MergeCompleted`が発行される
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+**Given**: `hooks.on_merged` is configured
+**And**: change `alpha` is in `ResolveWait` for a deferred merge retry
+**When**: the scheduler retries the merge and repository-visible merge integration succeeds
+**Then**: `on_merged` is executed once with `{change_id}=alpha`
+**And**: `MergeCompleted` is emitted only after the hook execution attempt completes
 
-#### Scenario: Parallelモードでarchive直後に即時マージ成功
-- **GIVEN** `hooks.on_merged`が`echo 'Merged {change_id}'`に設定されている
-- **AND** parallelモードでchange`change-a`がarchive完了後に即時マージされる
-- **WHEN** マージが成功する
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+#### Scenario: stale retry does not duplicate on_merged
 
-#### Scenario: TUI Worktreeの手動マージ完了
-- **GIVEN** `hooks.on_merged`が設定されている
-- **AND** worktreeブランチ`change-a`をMキーでマージする
-- **WHEN** `BranchMergeCompleted`が発行される
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+**Given**: change `alpha` has already been integrated into the base branch
+**And**: a stale retry trigger or stale resolve-wait entry for `alpha` is observed
+**When**: the scheduler evaluates deferred merge retries
+**Then**: it clears the stale retry intent for `alpha`
+**And**: it does not execute `on_merged` for `alpha` again
+**And**: it does not start AI conflict resolution for `alpha`
 
-#### Scenario: serial(run)でのマージ相当
-- **GIVEN** runモード（非parallel）でchange`change-a`を処理している
-- **WHEN** archiveが成功し、base branchに変更が反映済みと確認できる
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+#### Scenario: repeated retry trigger after success is idempotent
 
-#### Scenario: index.lock 待機後にフック実行
-
-- **GIVEN** `hooks.on_merged` が設定されている
-- **AND** `.git/index.lock` ファイルが存在する
-- **WHEN** `on_merged` フックが実行される
-- **THEN** オーケストレーターは `.git/index.lock` の解放を最大 `index_lock_wait_secs` 秒（デフォルト 10）待機する
-- **AND** 解放後にフックコマンドを実行する
-
-#### Scenario: index.lock 待機タイムアウト
-
-- **GIVEN** `hooks.on_merged` が設定されている
-- **AND** `.git/index.lock` ファイルが `index_lock_wait_secs` 秒を超えて存在し続ける
-- **WHEN** `on_merged` フックが実行される
-- **THEN** オーケストレーターは警告ログを出力してフックコマンドの実行を試行する
+**Given**: change `alpha` completed deferred merge retry successfully
+**And**: `on_merged` already ran for that successful merge
+**When**: a later scheduler loop synchronizes retry state and receives another retry dispatch trigger
+**Then**: `alpha` is not re-added as retryable work
+**And**: no second `on_merged` execution is emitted for `alpha`
 
 ### Requirement: Hook execution working directory
 
@@ -574,59 +564,35 @@ parallelモードでは、自動マージが成功した全ての経路で`on_me
 - **WHEN** `on_merged` フックが実行される
 - **THEN** コマンドはリポジトリルート `/path/to/repo` で実行される
 
-
 ### Requirement: on_merged hook
 
-オーケストレーターはchangeがbase branchにマージされた直後、mergedステータスへ遷移する直前に`on_merged`フックを実行しなければならない（SHALL）。
+The orchestrator SHALL run `on_merged` after a change is successfully merged into the base branch and before the change transitions to terminal `Merged` status.
 
-`on_merged`はマージ成功時のみ1回実行され、マージ失敗時には実行しない。
+`on_merged` SHALL run only once for a successful merge of a given change, including immediate parallel merge success, deferred merge retry success, manual TUI resolve success, and conflictless merge-ready retry paths.
 
-parallelモードでは、自動マージが成功した全ての経路で`on_merged`を実行しなければならない（SHALL）。
+A stale retry or repeated scheduler trigger for a change already integrated into the base branch SHALL NOT execute `on_merged` again.
 
-TUI の ResolveMerge（遅延マージ解決）成功時にも `on_merged` を実行しなければならない（SHALL）。`ResolveCompleted` イベント送信前にフックを実行し、フック完了後にステータスを merged に遷移させる。
+#### Scenario: deferred merge retry invokes on_merged once
 
-`on_merged` フック実行前に、`.git/index.lock` ファイルの解放を待機しなければならない（SHALL）。最大待機時間は `hooks.index_lock_wait_secs`（デフォルト 10 秒）で設定可能。
+**Given**: `hooks.on_merged` is configured
+**And**: change `alpha` is in `ResolveWait` for a deferred merge retry
+**When**: the scheduler retries the merge and repository-visible merge integration succeeds
+**Then**: `on_merged` is executed once with `{change_id}=alpha`
+**And**: `MergeCompleted` is emitted only after the hook execution attempt completes
 
-#### Scenario: Parallelモードで自動マージ完了
-- **GIVEN** `hooks.on_merged`が`echo 'Merged {change_id}'`に設定されている
-- **WHEN** parallelモードでchange`change-a`がbase branchにマージされ`MergeCompleted`が発行される
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+#### Scenario: stale retry does not duplicate on_merged
 
-#### Scenario: Parallelモードでarchive直後に即時マージ成功
-- **GIVEN** `hooks.on_merged`が`echo 'Merged {change_id}'`に設定されている
-- **AND** parallelモードでchange`change-a`がarchive完了後に即時マージされる
-- **WHEN** マージが成功する
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+**Given**: change `alpha` has already been integrated into the base branch
+**And**: a stale retry trigger or stale resolve-wait entry for `alpha` is observed
+**When**: the scheduler evaluates deferred merge retries
+**Then**: it clears the stale retry intent for `alpha`
+**And**: it does not execute `on_merged` for `alpha` again
+**And**: it does not start AI conflict resolution for `alpha`
 
-#### Scenario: TUI Worktreeの手動マージ完了
-- **GIVEN** `hooks.on_merged`が設定されている
-- **AND** worktreeブランチ`change-a`をMキーでマージする
-- **WHEN** `BranchMergeCompleted`が発行される
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
+#### Scenario: repeated retry trigger after success is idempotent
 
-#### Scenario: TUI ResolveMerge完了
-- **GIVEN** `hooks.on_merged`が設定されている
-- **AND** change`change-a`の遅延マージ解決（ResolveMerge）が成功する
-- **WHEN** `ResolveCompleted`が発行される前
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
-- **AND** `on_merged`の実行完了後に`ResolveCompleted`イベントが送信される
-
-#### Scenario: serial(run)でのマージ相当
-- **GIVEN** runモード（非parallel）でchange`change-a`を処理している
-- **WHEN** archiveが成功し、base branchに変更が反映済みと確認できる
-- **THEN** `on_merged`が`{change_id}=change-a`で実行される
-
-#### Scenario: index.lock 待機後にフック実行
-
-- **GIVEN** `hooks.on_merged` が設定されている
-- **AND** `.git/index.lock` ファイルが存在する
-- **WHEN** `on_merged` フックが実行される
-- **THEN** オーケストレーターは `.git/index.lock` の解放を最大 `index_lock_wait_secs` 秒（デフォルト 10）待機する
-- **AND** 解放後にフックコマンドを実行する
-
-#### Scenario: index.lock 待機タイムアウト
-
-- **GIVEN** `hooks.on_merged` が設定されている
-- **AND** `.git/index.lock` ファイルが `index_lock_wait_secs` 秒を超えて存在し続ける
-- **WHEN** `on_merged` フックが実行される
-- **THEN** オーケストレーターは警告ログを出力してフックコマンドの実行を試行する
+**Given**: change `alpha` completed deferred merge retry successfully
+**And**: `on_merged` already ran for that successful merge
+**When**: a later scheduler loop synchronizes retry state and receives another retry dispatch trigger
+**Then**: `alpha` is not re-added as retryable work
+**And**: no second `on_merged` execution is emitted for `alpha`
