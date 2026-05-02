@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Incomplete apply does not get success-equivalent terminate treatment
 
