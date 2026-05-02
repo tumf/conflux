@@ -342,11 +342,37 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
     let conflict_files = detect_conflicts(workspace_manager).await?;
-    let conflict_files_str = if conflict_files.is_empty() {
-        "(none)".to_string()
-    } else {
-        conflict_files.join(", ")
-    };
+
+    if conflict_files.is_empty()
+        && matches!(
+            workspace_manager.backend_type(),
+            VcsBackend::Git | VcsBackend::Auto
+        )
+    {
+        let merge_in_progress = git_commands::is_merge_in_progress(workspace_manager.repo_root())
+            .await
+            .map_err(OrchestratorError::from)?;
+        if !merge_in_progress {
+            info!(
+                "No unresolved conflicts and no merge in progress; skipping AI resolve path for revisions: {}",
+                revisions.join(", ")
+            );
+            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+            for change_id in change_ids {
+                send_event(
+                    event_tx,
+                    ParallelEvent::ResolveCompleted {
+                        change_id: change_id.to_string(),
+                        worktree_change_ids: None,
+                    },
+                )
+                .await;
+            }
+            return Ok(());
+        }
+    }
+
+    let conflict_files_str = conflict_files.join(", ");
 
     let vcs_status = get_vcs_status(workspace_manager).await.unwrap_or_default();
     let vcs_log = get_vcs_log_for_revisions(workspace_manager, revisions)
@@ -769,12 +795,21 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                             .map_err(OrchestratorError::from)?;
 
                     if !includes_presync_base {
-                        let short = &pre_merge_base[..8.min(pre_merge_base.len())];
-                        presync_missing_reason = Some(format!(
-                            "Worktree branch '{}' does not include pre-merge base '{}' for change_id '{}' (pre-sync may have been skipped); retrying resolve",
-                            revision, short, change_id
-                        ));
-                        break;
+                        let already_merged = git_commands::is_ancestor(repo_root, revision, "HEAD")
+                            .await
+                            .map_err(OrchestratorError::from)?;
+                        if !already_merged {
+                            let short = &pre_merge_base[..8.min(pre_merge_base.len())];
+                            presync_missing_reason = Some(format!(
+                                "Worktree branch '{}' does not include pre-merge base '{}' for change_id '{}' (pre-sync may have been skipped); retrying resolve",
+                                revision, short, change_id
+                            ));
+                            break;
+                        }
+                        info!(
+                            "Skipping pre-sync base ancestry retry for '{}' because branch is already integrated into HEAD",
+                            revision
+                        );
                     }
 
                     let (Some(worktree_path), Some(worktree_base_revision)) = (
