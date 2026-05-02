@@ -17,3 +17,8 @@
 ## Future Work
 
 - Manual reproduction in a real long-running TUI session can be used as extra confidence, but the proposal must be accepted based on repository-verifiable tests and logs, not manual observation alone.
+
+## Acceptance #1 Failure Follow-up
+
+- [ ] Task 2 / explicit completion condition is not repository-verified at the scheduler-loop boundary: `src/parallel/tests/executor.rs:3206` calls `reconcile_queued_candidates_from_shared_state()` directly and only asserts local candidate insertion, while `openspec/changes/fix-queued-analysis-reconciliation/tasks.md:5` and `proposal.md:60` require a scheduler-level test that starts with reducer queued intent plus an empty scheduler-local queue and observes `AnalysisStarted` or analyzer invocation through `execute_with_order_based_reanalysis()`. Add an integration test that exercises the real scheduler loop without relying on a dynamic queue notification.
+- [ ] The real scheduler loop does not emit the required `no_available_slots` diagnostic: `src/parallel/orchestration.rs:182-206` computes `available_slots` and skips `perform_reanalysis_and_dispatch()` entirely when it is `0`, so `emit_no_analysis_diagnostic(..., "no_available_slots")` in `src/parallel/queue_state.rs:895-910` is never reached in that real path. Move/duplicate diagnostic emission into the scheduler-loop no-slot branch and add a loop-level test; the current test at `src/parallel/tests/executor.rs:3301` calls `perform_reanalysis_and_dispatch()` directly and does not cover the actual skip branch.

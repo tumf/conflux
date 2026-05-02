@@ -69,8 +69,19 @@ impl ParallelExecutor {
             + Sync,
     {
         if changes.is_empty() {
-            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
-            return Ok(());
+            let reducer_has_queued_intent = self
+                .shared_orchestrator_state
+                .as_ref()
+                .and_then(|state| state.try_read().ok())
+                .map(|state| !state.queued_change_ids().is_empty())
+                .unwrap_or(false);
+            if !reducer_has_queued_intent {
+                send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+                return Ok(());
+            }
+            info!(
+                "Starting scheduler loop with reducer-visible queued intent and empty local queue"
+            );
         }
 
         info!(
@@ -202,6 +213,14 @@ impl ParallelExecutor {
                     if should_break {
                         break;
                     }
+                } else {
+                    self.emit_no_analysis_diagnostic(
+                        &queued,
+                        &in_flight,
+                        max_parallelism,
+                        "no_available_slots",
+                    )
+                    .await;
                 }
             }
 

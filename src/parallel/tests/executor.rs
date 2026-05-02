@@ -3203,14 +3203,16 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
 }
 
 #[tokio::test]
-async fn test_scheduler_reconciles_reducer_queued_intent_into_local_candidates() {
+async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
+    use crate::events::ExecutionEvent;
     use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{mpsc, RwLock};
 
     let config = create_test_config();
     let repo_root = PathBuf::from(".");
-    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
 
     let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
     if all_changes.is_empty() {
@@ -3225,26 +3227,27 @@ async fn test_scheduler_reconciles_reducer_queued_intent_into_local_candidates()
     )));
     {
         let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+        guard.apply_command(ReducerCommand::AddToQueue(selected));
     }
     executor.set_shared_orchestrator_state(shared);
 
-    let mut queued = Vec::new();
-    let in_flight = HashSet::new();
-    let added = executor
-        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
-        .await;
+    executor
+        .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
+        .await
+        .or_fail("unexpected error");
 
-    assert_eq!(
-        added, 1,
-        "reconciliation should add reducer-queued candidates"
+    let mut saw_analysis_started = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::AnalysisStarted { .. } = event {
+            saw_analysis_started = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_analysis_started,
+        "scheduler loop should start analysis from reducer-queued intent even when initial local queue is empty"
     );
-    assert_eq!(
-        queued.len(),
-        1,
-        "local queue should receive reducer candidate"
-    );
-    assert_eq!(queued[0].id, selected);
 }
 
 #[tokio::test]
