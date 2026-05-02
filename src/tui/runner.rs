@@ -9,7 +9,7 @@ use crate::vcs::{GitWorkspaceManager, WorkspaceManager};
 use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
 use ratatui::DefaultTerminal;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,6 +55,27 @@ pub async fn run_tui(
 ///
 /// When `remote_client` is `Some`, a background task subscribes to the WebSocket
 /// endpoint of the remote server and forwards state updates into the TUI event channel.
+fn is_refresh_root_usable(repo_root: &Path) -> bool {
+    repo_root.is_dir()
+}
+
+fn should_skip_local_refresh(repo_root: &Path, stale_refresh_root_warned: &mut bool) -> bool {
+    let refresh_root_usable = is_refresh_root_usable(repo_root);
+    if !refresh_root_usable {
+        if !*stale_refresh_root_warned {
+            *stale_refresh_root_warned = true;
+            warn!(
+                repo_root = %repo_root.display(),
+                "Skipping local TUI auto-refresh: stale or missing refresh root"
+            );
+        }
+        return true;
+    }
+
+    *stale_refresh_root_warned = false;
+    false
+}
+
 pub async fn run_tui_with_remote(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
@@ -501,6 +522,7 @@ async fn run_tui_loop(
             refresh_config.get_max_concurrent_workspaces(),
             refresh_config,
         );
+        let mut stale_refresh_root_warned = false;
         let mut interval = tokio::time::interval(Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS));
         loop {
             tokio::select! {
@@ -508,6 +530,13 @@ async fn run_tui_loop(
                     break;
                 }
                 _ = interval.tick() => {
+                    if should_skip_local_refresh(
+                        &refresh_repo_root,
+                        &mut stale_refresh_root_warned,
+                    ) {
+                        continue;
+                    }
+
                     match openspec::list_changes_native() {
                         Ok(mut changes) => {
                             let committed_change_ids: HashSet<String> =
@@ -864,4 +893,41 @@ async fn run_tui_loop(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_refresh_root_usable;
+
+    #[test]
+    fn refresh_root_usable_for_existing_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        assert!(is_refresh_root_usable(temp_dir.path()));
+    }
+
+    #[test]
+    fn refresh_root_not_usable_for_missing_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let missing_path = temp_dir.path().join("missing-root");
+        assert!(!is_refresh_root_usable(&missing_path));
+    }
+
+    #[test]
+    fn stale_refresh_root_sets_warned_once_and_resets_when_root_recovers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let missing_path = temp_dir.path().join("missing-root");
+        let mut warned = false;
+
+        assert!(super::should_skip_local_refresh(&missing_path, &mut warned));
+        assert!(warned, "first stale root check should set warned flag");
+
+        assert!(super::should_skip_local_refresh(&missing_path, &mut warned));
+        assert!(warned, "second stale root check keeps warned flag set");
+
+        assert!(!super::should_skip_local_refresh(
+            temp_dir.path(),
+            &mut warned
+        ));
+        assert!(!warned, "usable root should reset warned flag");
+    }
 }
