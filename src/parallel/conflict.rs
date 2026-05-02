@@ -354,10 +354,22 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             .map_err(OrchestratorError::from)?;
 
         if merge_in_progress {
+            let merge_subject = if change_ids.len() == 1 {
+                format!("Merge change: {}", change_ids[0])
+            } else {
+                format!("Merge changes: {}", change_ids.join(", "))
+            };
             info!(
-                "No unresolved conflicts and merge is in-progress (MERGE_HEAD exists); treating as conflictless merge-ready state and skipping AI resolve path for revisions: {}",
+                "No unresolved conflicts and merge is in-progress (MERGE_HEAD exists); committing conflictless merge-ready state with subject '{}' and skipping AI resolve path for revisions: {}",
+                merge_subject,
                 revisions.join(", ")
             );
+            git_commands::run_git(
+                &["commit", "-m", merge_subject.as_str()],
+                workspace_manager.repo_root(),
+            )
+            .await
+            .map_err(OrchestratorError::from)?;
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
             for change_id in change_ids {
                 send_event(
