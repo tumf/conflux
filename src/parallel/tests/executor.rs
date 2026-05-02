@@ -1204,24 +1204,17 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         .or_fail("unexpected error");
 
     let resolver_script = repo_root.join("merge-resolver.sh");
-    let script_contents = format!(
-        "#!/bin/sh\nset -e\nROOT=\"$(pwd)\"\n\
-            cd \"{}\"\n\
-            git checkout {}\n\
-            if ! git merge --no-ff --no-commit main; then\n\
-              git checkout --ours conflict.txt\n\
-              git add -A\n\
-              git commit -m 'Pre-sync base into change-a'\n\
-            else\n\
-              git commit -m 'Pre-sync base into change-a'\n\
-            fi\n\
-            cd \"$ROOT\"\n\
-            git checkout main\n\
-            git merge --no-ff -m 'Merge change: change-a' {}\n",
-        workspace_a.path.to_string_lossy(),
-        workspace_a.name,
-        workspace_a.name
-    );
+    let script_contents = "#!/bin/sh
+set -e
+if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  git checkout --ours conflict.txt
+  git add -A
+  git commit -m 'Merge change: change-a'
+  exit 0
+fi
+exit 1
+"
+    .to_string();
     std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
 
     let (event_tx, mut event_rx) = mpsc::channel(64);

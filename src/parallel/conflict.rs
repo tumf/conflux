@@ -353,22 +353,40 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             .await
             .map_err(OrchestratorError::from)?;
         if !merge_in_progress {
-            info!(
-                "No unresolved conflicts and no merge in progress; skipping AI resolve path for revisions: {}",
-                revisions.join(", ")
-            );
-            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-            for change_id in change_ids {
-                send_event(
-                    event_tx,
-                    ParallelEvent::ResolveCompleted {
-                        change_id: change_id.to_string(),
-                        worktree_change_ids: None,
-                    },
-                )
-                .await;
+            let mut not_integrated_revisions: Vec<String> = Vec::new();
+            for revision in revisions {
+                let integrated =
+                    git_commands::is_ancestor(workspace_manager.repo_root(), revision, "HEAD")
+                        .await
+                        .map_err(OrchestratorError::from)?;
+                if !integrated {
+                    not_integrated_revisions.push(revision.clone());
+                }
             }
-            return Ok(());
+
+            if not_integrated_revisions.is_empty() {
+                info!(
+                    "No unresolved conflicts, no merge in progress, and all revisions are already integrated into HEAD; skipping AI resolve path for revisions: {}",
+                    revisions.join(", ")
+                );
+                send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+                for change_id in change_ids {
+                    send_event(
+                        event_tx,
+                        ParallelEvent::ResolveCompleted {
+                            change_id: change_id.to_string(),
+                            worktree_change_ids: None,
+                        },
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+
+            info!(
+                "No unresolved conflicts and no merge in progress, but revisions are not integrated into HEAD yet ({}); continuing resolve path",
+                not_integrated_revisions.join(", ")
+            );
         }
     }
 
