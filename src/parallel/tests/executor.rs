@@ -3355,6 +3355,47 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
 }
 
 /// Test that the has_resolve_wait helper correctly tracks ResolveWait state.
+#[tokio::test]
+async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
+    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        crate::orchestration::state::ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+    }
+
+    executor.shared_orchestrator_state = Some(shared.clone());
+    executor.resolve_wait_changes.clear();
+
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(
+        executor.resolve_wait_changes.contains("change-a"),
+        "scheduler must mirror reducer-owned ResolveWait intent before idle/drained checks"
+    );
+
+    let should_exit = executor.should_exit_when_idle(true, true, true);
+    assert!(
+        !should_exit,
+        "scheduler must not report drained while shared reducer ResolveWait intent exists"
+    );
+}
+
 #[test]
 fn test_resolve_wait_helper_tracks_state() {
     let config = create_test_config();

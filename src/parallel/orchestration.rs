@@ -148,6 +148,10 @@ impl ParallelExecutor {
             )
             .await;
 
+            // Step 2: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
+            // This keeps manual resolve dispatch reducer-owned while making scheduler work detection truthful.
+            self.sync_resolve_wait_from_shared_state_nonblocking();
+
             // Step 2: Re-analysis decision is derived from scheduler state.
             let work_drained = queued.is_empty()
                 && in_flight.is_empty()

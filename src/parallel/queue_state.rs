@@ -44,6 +44,14 @@ impl ParallelExecutor {
             .is_some_and(|token| token.is_cancelled())
     }
 
+    pub(super) fn sync_resolve_wait_from_shared_state_nonblocking(&mut self) {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            if let Ok(guard) = shared.try_read() {
+                self.resolve_wait_changes = guard.resolve_wait_change_ids().into_iter().collect();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn has_resolve_wait(&self) -> bool {
         if let Some(shared) = &self.shared_orchestrator_state {
