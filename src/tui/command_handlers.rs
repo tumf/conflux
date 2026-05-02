@@ -27,6 +27,7 @@ pub struct TuiCommandContext<'a> {
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub dynamic_queue: &'a DynamicQueue,
     pub remote_client: Option<crate::remote::RemoteClient>,
+    pub orchestrator_running: bool,
     #[cfg(feature = "web-monitoring")]
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
 }
@@ -567,16 +568,367 @@ pub async fn handle_tui_command(
                 .await
                 .apply_command(ReducerCommand::ResolveMerge(id.clone()));
 
-            // Scheduler-owned execution model:
-            // - command handler MUST NOT execute resolve_deferred_merge directly
-            // - wake scheduler so normal loop can pick up retry intent and queued work together
-            ctx.dynamic_queue.notify_scheduler();
-            ctx.app.add_log(LogEntry::info(format!(
-                "Scheduled merge-wait retry intent for '{}'; execution will be started by scheduler",
-                id
-            )));
+            if ctx.orchestrator_running {
+                // Scheduler-owned execution model when scheduler is already alive:
+                // wake scheduler so normal loop can pick up retry intent and queued work together.
+                ctx.dynamic_queue.notify_scheduler();
+                ctx.app.add_log(LogEntry::info(format!(
+                    "Scheduled merge-wait retry intent for '{}'; notified existing scheduler",
+                    id
+                )));
+            } else {
+                // Scheduler not alive: spawn a scheduler-owned run to consume reducer-owned ResolveWait.
+                graceful_stop_flag.store(false, Ordering::SeqCst);
+                let orch_tx = ctx.tx.clone();
+                let orch_config = ctx.config.clone();
+                let orch_cancel = CancellationToken::new();
+                let orch_dynamic_queue = ctx.dynamic_queue.clone();
+                let orch_graceful_stop = graceful_stop_flag.clone();
+                let orch_shared_state = shared_state.clone();
+                let orch_manual_resolve = manual_resolve_counter.clone();
+                *orchestrator_cancel = Some(orch_cancel.clone());
+
+                #[cfg(feature = "web-monitoring")]
+                let orch_web_state = ctx.web_state.clone();
+
+                let handle = tokio::spawn(async move {
+                    #[cfg(feature = "web-monitoring")]
+                    let result = run_orchestrator_parallel(
+                        Vec::new(),
+                        orch_config,
+                        orch_tx,
+                        orch_cancel,
+                        orch_dynamic_queue,
+                        orch_graceful_stop,
+                        orch_shared_state,
+                        orch_manual_resolve,
+                        orch_web_state,
+                    )
+                    .await;
+
+                    #[cfg(not(feature = "web-monitoring"))]
+                    let result = run_orchestrator_parallel(
+                        Vec::new(),
+                        orch_config,
+                        orch_tx,
+                        orch_cancel,
+                        orch_dynamic_queue,
+                        orch_graceful_stop,
+                        orch_shared_state,
+                        orch_manual_resolve,
+                    )
+                    .await;
+
+                    result
+                });
+
+                ctx.app.add_log(LogEntry::info(format!(
+                    "Scheduled merge-wait retry intent for '{}'; started scheduler for manual resolve",
+                    id
+                )));
+                return Ok(Some(handle));
+            }
         }
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openspec::{Change, ProposalMetadata};
+    use crate::orchestration::state::OrchestratorState;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use tokio::sync::RwLock;
+
+    fn create_test_change(id: &str) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }
+    }
+
+    fn create_test_config() -> OrchestratorConfig {
+        OrchestratorConfig::default()
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_starts_parallel_scheduler_when_idle() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: false,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle = handle_tui_command(
+            TuiCommand::ResolveMerge("change-a".to_string()),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("resolve merge command should succeed");
+
+        assert!(
+            handle.is_some(),
+            "idle scheduler must spawn a new orchestrator task"
+        );
+        assert!(
+            orchestrator_cancel.is_some(),
+            "spawned scheduler must install cancellation token"
+        );
+        assert!(
+            ctx.app.logs.iter().any(|entry| entry
+                .message
+                .contains("started scheduler for manual resolve")),
+            "log must report scheduler startup"
+        );
+        assert_eq!(
+            shared_state.read().await.display_status("change-a"),
+            "resolve pending",
+            "ResolveMerge reducer intent must move change to resolve pending"
+        );
+
+        if let Some(join) = handle {
+            join.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_notifies_live_scheduler_without_duplicate_spawn() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle = handle_tui_command(
+            TuiCommand::ResolveMerge("change-a".to_string()),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("resolve merge command should succeed");
+
+        assert!(
+            handle.is_none(),
+            "live scheduler path must not spawn a duplicate orchestrator task"
+        );
+        assert!(
+            orchestrator_cancel.is_none(),
+            "live scheduler notification path must not replace cancel token"
+        );
+        assert!(
+            ctx.app
+                .logs
+                .iter()
+                .any(|entry| entry.message.contains("notified existing scheduler")),
+            "log must report scheduler notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_logs_scheduler_start_or_notify_truthfully() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+
+        let mut app_idle = AppState::new(vec![create_test_change("change-a")]);
+        let mut cancel_idle: Option<CancellationToken> = None;
+        let mut idle_ctx = TuiCommandContext {
+            app: &mut app_idle,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: false,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let idle_handle = handle_tui_command(
+            TuiCommand::ResolveMerge("change-a".to_string()),
+            &mut idle_ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut cancel_idle,
+        )
+        .await
+        .expect("idle resolve merge should succeed");
+
+        assert!(idle_ctx.app.logs.iter().any(|entry| entry
+            .message
+            .contains("started scheduler for manual resolve")));
+
+        if let Some(join) = idle_handle {
+            join.abort();
+        }
+
+        let mut app_live = AppState::new(vec![create_test_change("change-a")]);
+        let mut cancel_live: Option<CancellationToken> = None;
+        let mut live_ctx = TuiCommandContext {
+            app: &mut app_live,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let live_handle = handle_tui_command(
+            TuiCommand::ResolveMerge("change-a".to_string()),
+            &mut live_ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut cancel_live,
+        )
+        .await
+        .expect("live resolve merge should succeed");
+
+        assert!(live_handle.is_none());
+        assert!(live_ctx
+            .app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("notified existing scheduler")));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_scheduler_liveness_none_finished_live() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+
+        // none/finished = idle path => scheduler spawn
+        for running in [false, false] {
+            let mut app = AppState::new(vec![create_test_change("change-a")]);
+            let mut orchestrator_cancel: Option<CancellationToken> = None;
+            let mut ctx = TuiCommandContext {
+                app: &mut app,
+                repo_root: Path::new("."),
+                config: &config,
+                tx: &tx,
+                dynamic_queue: &dynamic_queue,
+                remote_client: None,
+                orchestrator_running: running,
+                #[cfg(feature = "web-monitoring")]
+                web_state: &None,
+            };
+
+            let handle = handle_tui_command(
+                TuiCommand::ResolveMerge("change-a".to_string()),
+                &mut ctx,
+                &graceful_stop_flag,
+                &shared_state,
+                &manual_resolve_counter,
+                &mut orchestrator_cancel,
+            )
+            .await
+            .expect("resolve merge should succeed");
+
+            assert!(
+                handle.is_some(),
+                "non-live scheduler state must spawn scheduler"
+            );
+            if let Some(join) = handle {
+                join.abort();
+            }
+        }
+
+        // live = notification-only path => no spawn
+        let mut app_live = AppState::new(vec![create_test_change("change-a")]);
+        let mut orchestrator_cancel_live: Option<CancellationToken> = None;
+        let mut ctx_live = TuiCommandContext {
+            app: &mut app_live,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle_live = handle_tui_command(
+            TuiCommand::ResolveMerge("change-a".to_string()),
+            &mut ctx_live,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel_live,
+        )
+        .await
+        .expect("resolve merge should succeed");
+
+        assert!(
+            handle_live.is_none(),
+            "live scheduler state must not spawn scheduler"
+        );
+    }
 }
