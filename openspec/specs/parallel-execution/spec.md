@@ -5,6 +5,7 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 ## Requirements
 
 ### Requirement: Shared Parallel Orchestration Service
+
 システムはCLIとTUIの並列実行を扱う統一的な`ParallelRunService`を提供しなければならない（SHALL）。
 
 サービスはイベント通知のためのコールバック機構を受け取り、TUIへ送るイベントは共有状態の更新より先に送信しなければならない（MUST）。これによりUI更新が共有状態のロック待ちで遅延しない。
@@ -17,28 +18,23 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
-#### Scenario: CLI uses ParallelRunService
-- **WHEN** the CLI runs in parallel mode (`--parallel` flag)
-- **THEN** the CLI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be logged to stdout via the callback mechanism
+When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
 
-#### Scenario: TUI uses ParallelRunService
-- **WHEN** the TUI runs in parallel mode
-- **THEN** the TUI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be forwarded to the TUI event channel via the callback mechanism
-- **AND** event forwarding happens before shared state updates so Accepting can render promptly
+#### Scenario: empty active changes with resolve wait enters scheduler retry
 
-#### Scenario: TUI event forwarding precedes shared state update
-- **GIVEN** `ParallelEvent::AcceptanceStarted` is processed by the forwarder
-- **WHEN** the event is forwarded to the TUI
-- **THEN** the TUI event channel receives the event before the shared state write lock is acquired
-- **AND** the change status can transition to `Accepting` while acceptance is running
+**Given**: `ParallelRunService` is invoked with an empty active change list from a loop-based frontend
+**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
+**When**: parallel run startup evaluates committed active changes
+**Then**: the service does not return solely because the active change list is empty
+**And**: the executor synchronizes `ResolveWait` from shared state
+**And**: scheduler-owned merge retry dispatch is attempted for `alpha`
 
-#### Scenario: Parallel mode requires git repository
-- **WHEN** parallel execution is requested
-- **AND** a `.git` directory does not exist
-- **THEN** `ParallelRunService` SHALL return an error indicating a git repository is required
-- **AND** no parallel execution is started
+#### Scenario: normal committed-change filtering still applies to active changes
+
+**Given**: `ParallelRunService` is invoked with active changes to apply
+**When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
+**Then**: that active change is skipped with the existing warning/rejection events
+**And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1380,33 +1376,26 @@ When apply execution records a rejection proposal by generating `openspec/change
 - Change grouping by dependencies
 - ParallelExecutor coordination
 - Archiving of completed changes
-- Rejection of blocked changes (acceptance Blocked → rejection flow)
 
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
-Acceptance が `Blocked` を返した場合、ParallelRunService は rejection フロー（`REJECTED.md` 生成 → `REJECTED.md` のみを base にコミット → worktree 削除）を実行し、`WorkspaceResult` で `error: None, rejected: Some(reason)` を返さなければならない（SHALL）。
+When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
 
-#### Scenario: CLI uses ParallelRunService
+#### Scenario: empty active changes with resolve wait enters scheduler retry
 
-- **WHEN** the CLI runs in parallel mode (`--parallel` flag)
-- **THEN** the CLI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be logged to stdout via the callback mechanism
+**Given**: `ParallelRunService` is invoked with an empty active change list from a loop-based frontend
+**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
+**When**: parallel run startup evaluates committed active changes
+**Then**: the service does not return solely because the active change list is empty
+**And**: the executor synchronizes `ResolveWait` from shared state
+**And**: scheduler-owned merge retry dispatch is attempted for `alpha`
 
-#### Scenario: TUI uses ParallelRunService
+#### Scenario: normal committed-change filtering still applies to active changes
 
-- **WHEN** the TUI runs in parallel mode
-- **THEN** the TUI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be forwarded to the TUI event channel via the callback mechanism
-- **AND** event forwarding happens before shared state updates so Accepting can render promptly
-
-#### Scenario: Acceptance Blocked triggers rejection flow in parallel mode
-
-- **GIVEN** a change is executing in parallel mode
-- **WHEN** acceptance returns `Blocked`
-- **THEN** the rejection flow SHALL execute within the worktree context
-- **AND** the worktree SHALL be deleted after rejection completes
-- **AND** `WorkspaceResult.rejected` SHALL contain the rejection reason
-- **AND** `WorkspaceResult.error` SHALL be `None`
+**Given**: `ParallelRunService` is invoked with active changes to apply
+**When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
+**Then**: that active change is skipped with the existing warning/rejection events
+**And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
