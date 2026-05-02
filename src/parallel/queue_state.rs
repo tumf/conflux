@@ -471,6 +471,15 @@ impl ParallelExecutor {
         let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
 
         for change_id in deferred {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Log(LogEntry::info(format!(
+                    "ResolveWait retry dispatch started for '{}'",
+                    change_id
+                ))),
+            )
+            .await;
+
             // Locate the preserved workspace for this change.
             let workspace_info = match self
                 .workspace_manager

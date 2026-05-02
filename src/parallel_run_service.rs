@@ -713,6 +713,17 @@ mod tests {
         }
     }
 
+    fn create_test_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            apply_command: Some("echo apply {change_id}".to_string()),
+            archive_command: Some("echo archive {change_id}".to_string()),
+            analyze_command: Some("echo analyze".to_string()),
+            acceptance_command: Some("echo acceptance".to_string()),
+            resolve_command: Some("echo resolve".to_string()),
+            ..Default::default()
+        }
+    }
+
     async fn init_git_repo(temp_dir: &TempDir) -> bool {
         let init_result = Command::new("git")
             .args(["init"])
@@ -767,8 +778,7 @@ mod tests {
         std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
         std::fs::write(base_dir.join("change-b/proposal.md"), "test").unwrap();
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = vec![
             create_test_change("change-a", vec![]),
             create_test_change("change-b", vec![]),
@@ -815,8 +825,7 @@ mod tests {
         // Add uncommitted file to change-a
         std::fs::write(base_dir.join("change-a/tasks.md"), "new task").unwrap();
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = vec![
             create_test_change("change-a", vec![]),
             create_test_change("change-b", vec![]),
@@ -860,8 +869,7 @@ mod tests {
         std::fs::create_dir_all(base_dir.join("change-b")).unwrap();
         std::fs::write(base_dir.join("change-b/proposal.md"), "test").unwrap();
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = vec![
             create_test_change("change-a", vec![]),
             create_test_change("change-b", vec![]),
@@ -931,8 +939,7 @@ mod tests {
             std::fs::write(base_dir.join(id).join("proposal.md"), "test").unwrap();
         }
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = vec![
             create_test_change("change-a", vec![]),
             create_test_change("change-b", vec![]),
@@ -981,8 +988,7 @@ mod tests {
             return;
         }
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = Vec::new();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
 
@@ -1008,8 +1014,7 @@ mod tests {
             return;
         }
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = Vec::new();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
 
@@ -1021,6 +1026,58 @@ mod tests {
         assert!(
             result.is_none(),
             "empty startup without reducer-owned ResolveWait must remain a safe no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_based_empty_resolve_wait_shared_state_enters_scheduler_path() {
+        use crate::orchestration::state::{
+            ExecutionMode, OrchestratorState, ReducerCommand, WorkspaceObservation,
+        };
+        use crate::parallel::ParallelExecutor;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+        let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["alpha".to_string()],
+            3,
+            ExecutionMode::Parallel,
+        )));
+        {
+            let mut state = shared.write().await;
+            state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);
+            state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+        }
+
+        let mut executor = ParallelExecutor::new(
+            temp_dir.path().to_path_buf(),
+            create_test_config(),
+            Some(event_tx.clone()),
+        );
+        executor.set_shared_orchestrator_state(shared.clone());
+
+        service
+            .run_parallel_order_based_with_executor(executor, Vec::new(), event_tx.clone())
+            .await
+            .expect("empty ResolveWait scheduler path should run");
+
+        drop(event_tx);
+        let mut rejected_empty_start = false;
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, ParallelEvent::ParallelStartRejected { .. }) {
+                rejected_empty_start = true;
+            }
+        }
+        assert!(
+            !rejected_empty_start,
+            "empty ResolveWait startup must not be treated as a zero-change start rejection"
         );
     }
 
@@ -1053,8 +1110,7 @@ mod tests {
             std::fs::write(base_dir.join(id).join("proposal.md"), "test").unwrap();
         }
 
-        let service =
-            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let changes = vec![
             create_test_change("change-a", vec![]),
             create_test_change("change-b", vec![]),

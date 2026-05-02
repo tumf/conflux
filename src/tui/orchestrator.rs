@@ -57,6 +57,44 @@ async fn dispatch_event(
     }
 }
 
+async fn initialize_parallel_shared_state(
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    change_ids: &[String],
+    max_iterations: u32,
+) -> bool {
+    let mut state = shared_state.write().await;
+    let resolve_wait_ids = state.resolve_wait_change_ids();
+    let preserve_manual_resolve_startup = change_ids.is_empty() && !resolve_wait_ids.is_empty();
+
+    if preserve_manual_resolve_startup {
+        tracing::info!(
+            resolve_wait_ids = ?resolve_wait_ids,
+            "Preserving reducer-owned ResolveWait during empty manual resolve scheduler startup"
+        );
+        // Do not replace the reducer state here: TuiCommand::ResolveMerge just recorded
+        // scheduler-owned ResolveWait intent, and ParallelRunService must observe it via
+        // executor.has_resolve_wait() to avoid a zero-change no-op. Only switch the mode so
+        // any subsequent execution events use parallel semantics.
+        state.set_execution_mode(crate::orchestration::state::ExecutionMode::Parallel);
+        true
+    } else {
+        *state = crate::orchestration::state::OrchestratorState::with_mode(
+            change_ids.to_vec(),
+            max_iterations,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        );
+        // Re-apply queue intent for each selected change so that the initial
+        // ChangesRefreshed display sync (apply_display_statuses_from_reducer) does
+        // not regress these rows from Queued back to NotQueued before analysis starts.
+        for id in change_ids {
+            state.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                id.clone(),
+            ));
+        }
+        false
+    }
+}
+
 /// Run the orchestrator for selected changes
 /// Uses streaming output to send log entries in real-time
 /// Supports cancellation via CancellationToken for graceful shutdown
@@ -957,24 +995,7 @@ pub async fn run_orchestrator_parallel(
     // Check if Git is available for parallel execution
     service.check_vcs_available().await?;
 
-    // Set execution mode to Parallel in shared state
-    {
-        let change_ids_vec: Vec<String> = change_ids.clone();
-        let mut state = shared_state.write().await;
-        *state = crate::orchestration::state::OrchestratorState::with_mode(
-            change_ids_vec.clone(),
-            config.get_max_iterations(),
-            crate::orchestration::state::ExecutionMode::Parallel,
-        );
-        // Re-apply queue intent for each selected change so that the initial
-        // ChangesRefreshed display sync (apply_display_statuses_from_reducer) does
-        // not regress these rows from Queued back to NotQueued before analysis starts.
-        for id in &change_ids_vec {
-            state.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
-                id.clone(),
-            ));
-        }
-    }
+    initialize_parallel_shared_state(&shared_state, &change_ids, config.get_max_iterations()).await;
 
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
@@ -1280,6 +1301,82 @@ mod tests {
         // If archive exists, the archive is considered successful
         let archive_ok = archive_path.exists();
         assert!(archive_ok);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_startup_preserves_empty_manual_resolve_wait_state() {
+        use crate::orchestration::state::{
+            ExecutionMode, OrchestratorState, ReducerCommand, WorkspaceObservation,
+        };
+
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 3, ExecutionMode::Serial),
+        ));
+        {
+            let mut state = shared_state.write().await;
+            state.apply_observation("alpha", WorkspaceObservation::WorkspaceArchived);
+            state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+        }
+
+        let preserved = super::initialize_parallel_shared_state(&shared_state, &[], 7).await;
+
+        let state = shared_state.read().await;
+        assert!(
+            preserved,
+            "empty ResolveWait startup should skip replacement"
+        );
+        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
+        assert_eq!(state.display_status("alpha"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_parallel_startup_resets_selected_run_and_drops_stale_resolve_wait() {
+        use crate::orchestration::state::{
+            ExecutionMode, OrchestratorState, ReducerCommand, WorkspaceObservation,
+        };
+
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            OrchestratorState::with_mode(vec!["stale".to_string()], 3, ExecutionMode::Parallel),
+        ));
+        {
+            let mut state = shared_state.write().await;
+            state.apply_observation("stale", WorkspaceObservation::WorkspaceArchived);
+            state.apply_command(ReducerCommand::ResolveMerge("stale".to_string()));
+        }
+
+        let selected = vec!["fresh".to_string()];
+        let preserved = super::initialize_parallel_shared_state(&shared_state, &selected, 7).await;
+
+        let state = shared_state.read().await;
+        assert!(!preserved, "selected startup must create a fresh run state");
+        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
+        assert_eq!(state.display_status("fresh"), "queued");
+        assert_eq!(state.display_status("stale"), "not queued");
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert!(state.pending_changes().contains("fresh"));
+        assert!(!state.pending_changes().contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn test_parallel_startup_empty_without_resolve_wait_resets_to_noop_state() {
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+
+        let shared_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            OrchestratorState::with_mode(vec!["old".to_string()], 3, ExecutionMode::Parallel),
+        ));
+
+        let preserved = super::initialize_parallel_shared_state(&shared_state, &[], 7).await;
+
+        let state = shared_state.read().await;
+        assert!(
+            !preserved,
+            "empty startup without ResolveWait remains ordinary no-op"
+        );
+        assert_eq!(state.execution_mode(), ExecutionMode::Parallel);
+        assert!(state.pending_changes().is_empty());
+        assert_eq!(state.display_status("old"), "not queued");
+        assert!(state.resolve_wait_change_ids().is_empty());
     }
 
     #[tokio::test]
