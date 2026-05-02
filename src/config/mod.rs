@@ -205,6 +205,105 @@ mod tests {
         let stall = config.get_stall_detection();
         assert!(!stall.enabled);
         assert_eq!(stall.threshold, 5);
+        assert_eq!(stall.apply_escalation_after_empty_wip, None);
+        assert_eq!(stall.apply_escalation_max_uses_per_stall, None);
+    }
+
+    #[test]
+    fn test_parse_apply_escalation_and_diagnose_config() {
+        let jsonc = r#"{
+            "apply_command": "apply {change_id}",
+            "apply_escalation_command": "apply-deep {change_id} {prompt}",
+            "apply_stall_diagnose_command": "diagnose {change_id} {prompt}",
+            "archive_command": "archive {change_id}",
+            "analyze_command": "analyze {prompt}",
+            "acceptance_command": "accept {change_id}",
+            "resolve_command": "resolve {prompt}",
+            "stall_detection": {
+                "enabled": true,
+                "threshold": 5,
+                "apply_escalation_after_empty_wip": 3,
+                "apply_escalation_max_uses_per_stall": 2
+            }
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(
+            config.get_apply_escalation_command(),
+            Some("apply-deep {change_id} {prompt}")
+        );
+        assert_eq!(
+            config.get_apply_stall_diagnose_command(),
+            Some("diagnose {change_id} {prompt}")
+        );
+        let stall = config.get_stall_detection();
+        assert_eq!(stall.apply_escalation_after_empty_wip, Some(3));
+        assert_eq!(stall.apply_escalation_max_uses_per_stall, Some(2));
+        assert!(stall.apply_escalation_policy_enabled());
+        assert!(config.validate_required_commands().is_ok());
+    }
+
+    #[test]
+    fn test_apply_escalation_boundary_validation_rejects_start_at_threshold() {
+        let mut config = complete_required_command_config();
+        config.stall_detection = Some(StallDetectionConfig {
+            enabled: true,
+            threshold: 5,
+            apply_escalation_after_empty_wip: Some(5),
+            apply_escalation_max_uses_per_stall: Some(1),
+        });
+
+        let result = config.validate_required_commands();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("apply_escalation_after_empty_wip"));
+    }
+
+    #[test]
+    fn test_apply_escalation_max_uses_validation_rejects_zero() {
+        let mut config = complete_required_command_config();
+        config.stall_detection = Some(StallDetectionConfig {
+            enabled: true,
+            threshold: 5,
+            apply_escalation_after_empty_wip: Some(3),
+            apply_escalation_max_uses_per_stall: Some(0),
+        });
+
+        let result = config.validate_required_commands();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("apply_escalation_max_uses_per_stall"));
+    }
+
+    #[test]
+    fn test_missing_optional_apply_escalation_commands_are_silent_noop_config() {
+        let mut config = complete_required_command_config();
+        config.stall_detection = Some(StallDetectionConfig {
+            enabled: true,
+            threshold: 5,
+            apply_escalation_after_empty_wip: Some(3),
+            apply_escalation_max_uses_per_stall: Some(2),
+        });
+
+        assert!(config.apply_escalation_command.is_none());
+        assert!(config.apply_stall_diagnose_command.is_none());
+        assert_eq!(config.get_apply_escalation_command(), None);
+        assert_eq!(config.get_apply_stall_diagnose_command(), None);
+        assert!(config.validate_required_commands().is_ok());
+    }
+
+    fn complete_required_command_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            apply_command: Some("apply {change_id}".to_string()),
+            archive_command: Some("archive {change_id}".to_string()),
+            analyze_command: Some("analyze {prompt}".to_string()),
+            acceptance_command: Some("accept {change_id}".to_string()),
+            resolve_command: Some("resolve {prompt}".to_string()),
+            ..Default::default()
+        }
     }
 
     #[test]

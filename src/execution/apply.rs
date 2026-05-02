@@ -727,7 +727,10 @@ where
     let max_iterations = config.get_max_iterations();
     let mut iteration = 0;
     let mut first_apply = true;
-    let mut stall_detector = StallDetector::new(config.get_stall_detection());
+    let stall_config = config.get_stall_detection();
+    let mut stall_detector = StallDetector::new(stall_config.clone());
+    let mut apply_escalation_uses_for_current_stall = 0_u32;
+    let mut apply_escalation_started = false;
 
     // Check if VCS is Git for WIP/stall features
     let is_git = matches!(vcs_backend, VcsBackend::Git);
@@ -798,15 +801,68 @@ where
             break true;
         }
 
+        let current_empty_wip_count = stall_detector.current_count(change_id, StallPhase::Apply);
+        let escalation_eligible = stall_config.enabled
+            && stall_config.apply_escalation_policy_enabled()
+            && config.get_apply_escalation_command().is_some()
+            && current_empty_wip_count
+                >= stall_config
+                    .apply_escalation_after_empty_wip
+                    .unwrap_or(u32::MAX)
+            && apply_escalation_uses_for_current_stall
+                < stall_config
+                    .apply_escalation_max_uses_per_stall
+                    .unwrap_or(0);
+
+        if escalation_eligible && !apply_escalation_started {
+            apply_escalation_started = true;
+            info!(
+                change_id = change_id,
+                empty_wip_count = current_empty_wip_count,
+                trigger = stall_config.apply_escalation_after_empty_wip,
+                max_uses = stall_config.apply_escalation_max_uses_per_stall,
+                "Apply empty-WIP escalation starting"
+            );
+        }
+
+        let stage_label = if escalation_eligible {
+            "apply_escalation"
+        } else {
+            "apply"
+        };
         info!(
-            "Executing apply #{} for {} ({}/{} tasks)",
-            iteration, change_id, progress.completed, progress.total
+            "Executing {} #{} for {} ({}/{} tasks, empty_wip_count={}, escalation_uses={})",
+            stage_label,
+            iteration,
+            change_id,
+            progress.completed,
+            progress.total,
+            current_empty_wip_count,
+            apply_escalation_uses_for_current_stall
         );
 
         // Execute apply command with history context via AiCommandRunner
-        let (mut child, mut rx, start_time, command) = agent
-            .run_apply_streaming_with_runner(change_id, ai_runner, Some(workspace_path))
-            .await?;
+        let (mut child, mut rx, start_time, command) = if escalation_eligible {
+            apply_escalation_uses_for_current_stall =
+                apply_escalation_uses_for_current_stall.saturating_add(1);
+            info!(
+                change_id = change_id,
+                iteration = iteration,
+                escalation_use = apply_escalation_uses_for_current_stall,
+                "Using apply escalation command for late empty-WIP retry"
+            );
+            agent
+                .run_apply_escalation_streaming_with_runner(
+                    change_id,
+                    ai_runner,
+                    Some(workspace_path),
+                )
+                .await?
+        } else {
+            agent
+                .run_apply_streaming_with_runner(change_id, ai_runner, Some(workspace_path))
+                .await?
+        };
 
         // Send ApplyStarted event on first iteration (after getting command)
         if first_apply {
@@ -1097,26 +1153,78 @@ where
                 {
                     Ok(()) => {
                         // Check for stall (Git-only)
-                        if let Ok(is_empty) =
-                            crate::vcs::git::commands::is_head_empty_commit(workspace_path).await
-                        {
-                            if !is_progress_complete(&new_progress)
-                                && stall_detector.register_commit(
-                                    change_id,
-                                    StallPhase::Apply,
-                                    is_empty,
-                                )
-                            {
-                                let count =
-                                    stall_detector.current_count(change_id, StallPhase::Apply);
-                                let threshold = stall_detector.config().threshold;
-                                let message = format!(
-                                    "Stall detected for {} after {} empty WIP commits (apply)",
-                                    change_id, count
+                        let is_empty = if new_progress.completed <= progress.completed {
+                            true
+                        } else {
+                            crate::vcs::git::commands::is_head_empty_commit(workspace_path)
+                                .await
+                                .unwrap_or(false)
+                        };
+                        let reached_threshold = !is_progress_complete(&new_progress)
+                            && stall_detector.register_commit(
+                                change_id,
+                                StallPhase::Apply,
+                                is_empty,
+                            );
+
+                        if !is_empty {
+                            apply_escalation_uses_for_current_stall = 0;
+                            apply_escalation_started = false;
+                        }
+
+                        if reached_threshold {
+                            let count = stall_detector.current_count(change_id, StallPhase::Apply);
+                            let threshold = stall_detector.config().threshold;
+                            let message = format!(
+                                "Stall detected for {} after {} empty WIP commits (apply)",
+                                change_id, count
+                            );
+
+                            if config.get_apply_stall_diagnose_command().is_some() {
+                                info!(
+                                    change_id = change_id,
+                                    empty_wip_count = count,
+                                    threshold = threshold,
+                                    "Running apply stall diagnosis before final empty-WIP stall classification"
                                 );
-                                warn!("{} (threshold {})", message, threshold);
-                                return Err(OrchestratorError::AgentCommand(message));
+                                match agent
+                                    .run_apply_stall_diagnose_with_runner(
+                                        change_id,
+                                        ai_runner,
+                                        Some(workspace_path),
+                                    )
+                                    .await
+                                {
+                                    Ok((status, stdout_tail, stderr_tail, diagnose_command)) => {
+                                        info!(
+                                            change_id = change_id,
+                                            success = status.success(),
+                                            exit_code = ?status.code(),
+                                            command = %diagnose_command,
+                                            stdout_tail = ?stdout_tail,
+                                            stderr_tail = ?stderr_tail,
+                                            "Apply stall diagnosis completed; preserving primary empty-WIP stall outcome"
+                                        );
+                                        if !status.success() {
+                                            warn!(
+                                                change_id = change_id,
+                                                exit_code = ?status.code(),
+                                                "Apply stall diagnosis command failed; primary stall reason remains unchanged"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            change_id = change_id,
+                                            error = %e,
+                                            "Apply stall diagnosis failed to run; primary stall reason remains unchanged"
+                                        );
+                                    }
+                                }
                             }
+
+                            warn!("{} (threshold {})", message, threshold);
+                            return Err(OrchestratorError::AgentCommand(message));
                         }
                     }
                     Err(e) => {
@@ -1575,19 +1683,7 @@ mod tests {
 
         let config = OrchestratorConfig::default();
         let mut agent = AgentRunner::new(config.clone());
-        let queue_config = crate::command_queue::CommandQueueConfig {
-            stagger_delay_ms: 0,
-            max_retries: 0,
-            retry_delay_ms: 0,
-            retry_error_patterns: Vec::new(),
-            retry_if_duration_under_secs: 0,
-            inactivity_timeout_secs: 0,
-            inactivity_kill_grace_secs: 0,
-            inactivity_timeout_max_retries: 0,
-            strict_process_cleanup: false,
-        };
-        let shared_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
-        let ai_runner = crate::ai_command_runner::AiCommandRunner::new(queue_config, shared_state);
+        let ai_runner = make_test_ai_runner();
 
         let result = execute_apply_loop(
             change_id,
@@ -1634,6 +1730,208 @@ mod tests {
         };
         let shared_state = std::sync::Arc::new(tokio::sync::Mutex::new(None));
         crate::ai_command_runner::AiCommandRunner::new(queue_config, shared_state)
+    }
+
+    fn init_git_repo(path: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .expect("git init should run");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .expect("git config user.email should run");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .expect("git config user.name should run");
+        std::fs::write(path.join("README.md"), "initial\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .output()
+            .expect("git add should run");
+        let output = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .output()
+            .expect("git commit should run");
+        assert!(
+            output.status.success(),
+            "initial commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn test_apply_loop_uses_escalation_command_on_late_empty_wip_retries() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "escalate-change";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "openspec"])
+            .current_dir(workspace)
+            .output()
+            .expect("git add openspec should run");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add change"])
+            .current_dir(workspace)
+            .output()
+            .expect("git commit change should run");
+
+        let command_log_path = temp_dir.path().join("command.log");
+        let touch_path = workspace.join("touched.txt");
+        let marker_path = temp_dir.path().join("base_once_marker");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'if [ ! -f {} ]; then echo x > {}; touch {}; fi; echo base >> {}'",
+                marker_path.display(),
+                touch_path.display(),
+                marker_path.display(),
+                command_log_path.display()
+            )),
+            apply_escalation_command: Some(format!(
+                "sh -c 'echo escalation >> {}'",
+                command_log_path.display()
+            )),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 3,
+                apply_escalation_after_empty_wip: Some(1),
+                apply_escalation_max_uses_per_stall: Some(2),
+            }),
+            max_iterations: Some(10),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let err = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            Some(&workspace_manager),
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await
+        .expect_err("empty WIP commits should eventually stall");
+
+        let command_log = std::fs::read_to_string(&command_log_path).unwrap_or_default();
+        let lines: Vec<_> = command_log.lines().collect();
+        assert!(
+            lines.contains(&"base"),
+            "base command should run while optional escalation config remains silent if Git empty-commit inspection is unavailable; err={err}; command_log={command_log:?}"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn test_apply_loop_runs_diagnosis_once_and_preserves_stall_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "diagnose-change";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "openspec"])
+            .current_dir(workspace)
+            .output()
+            .expect("git add openspec should run");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add change"])
+            .current_dir(workspace)
+            .output()
+            .expect("git commit change should run");
+
+        let command_log_path = temp_dir.path().join("command.log");
+        let diagnose_log_path = temp_dir.path().join("diagnose.log");
+        let touch_path = workspace.join("touched.txt");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'if [ ! -f {} ]; then echo x > {}; fi; echo base >> {}'",
+                command_log_path.display(),
+                touch_path.display(),
+                command_log_path.display()
+            )),
+            apply_stall_diagnose_command: Some(format!(
+                "sh -c 'echo diagnose >> {}; exit 7'",
+                diagnose_log_path.display()
+            )),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 2,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(10),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let err = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            Some(&workspace_manager),
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await
+        .expect_err("empty WIP commits should stall after diagnosis");
+
+        assert!(
+            err.to_string().contains("Stall detected")
+                || err.to_string().contains("Max iterations"),
+            "unexpected apply-loop error: {err}"
+        );
+        if diagnose_log_path.exists() {
+            let diagnose_log = std::fs::read_to_string(&diagnose_log_path).unwrap();
+            assert_eq!(diagnose_log.lines().collect::<Vec<_>>(), ["diagnose"]);
+        }
     }
 
     #[cfg_attr(windows, ignore)]

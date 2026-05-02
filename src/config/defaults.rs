@@ -82,6 +82,14 @@ pub const DEFAULT_STALL_DETECTION_ENABLED: bool = true;
 /// Default threshold for consecutive empty WIP commits before stalling
 pub const DEFAULT_STALL_DETECTION_THRESHOLD: u32 = 5;
 
+/// Default empty-WIP count at which apply escalation becomes eligible.
+/// Defaults to no escalation policy unless explicitly configured.
+pub const DEFAULT_APPLY_ESCALATION_AFTER_EMPTY_WIP: Option<u32> = None;
+
+/// Default maximum number of escalation command uses per empty-WIP stall sequence.
+/// Defaults to no escalation policy unless explicitly configured.
+pub const DEFAULT_APPLY_ESCALATION_MAX_USES_PER_STALL: Option<u32> = None;
+
 /// Default delay between command executions (milliseconds)
 pub const DEFAULT_STAGGER_DELAY_MS: u64 = 2000;
 

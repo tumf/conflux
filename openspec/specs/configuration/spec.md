@@ -3,62 +3,63 @@
 ## Purpose
 Defines the configuration file format, agent command templates, and settings for the orchestrator.
 ## Requirements
+
 ### Requirement: エージェントコマンドの設定ファイル
 
-オーケストレーターは JSONC 形式の設定ファイルを通じてエージェントコマンドを設定できなければならない (MUST)。
+オーケストレーターは JSONC 形式の設定ファイルを通じてエージェントコマンドを設定できなければならない（MUST）。
 
-設定可能なコマンドは以下の種類とする:
+設定可能なコマンドには、通常の apply 用 `apply_command` に加えて、late empty-WIP retry 用の optional `apply_escalation_command` と、final empty-WIP stall 診断用の optional `apply_stall_diagnose_command` を含めてもよい（MAY）。
 
-1. `apply_command` - 変更の適用コマンド
-2. `archive_command` - 変更のアーカイブコマンド
-3. `analyze_command` - 依存関係分析コマンド
-4. `resolve_command` - Git マージの完了（merge/add/commit）や競合解消に使用するコマンド
-5. `hooks` - 段階フックコマンド
-6. `propose_command` - （後方互換のため残り得る）提案作成コマンド
-7. `worktree_command` - TUIの `+` から起動される worktree 上の提案作成コマンド
+`apply_escalation_command` は通常 apply の代替コマンドとして扱われ、runtime が escalation 条件を満たした retry にのみ使用しなければならない（MUST）。未設定の場合、runtime は escalation phase で静かに通常 `apply_command` の挙動を継続しなければならない（MUST）。
 
-`apply_command`/`archive_command`/`analyze_command`/`acceptance_command`/`resolve_command` は、設定のマージ結果に必ず存在しなければならない (MUST)。未設定のまま実行に移ろうとした場合、設定エラーとして失敗しなければならない (MUST)。
+`apply_stall_diagnose_command` は final empty-WIP stall の直前診断にのみ使用されなければならない（MUST）。未設定の場合、runtime は診断 phase を静かにスキップして従来の final stall へ進まなければならない（MUST）。
 
-#### Scenario: worktree_command を設定できる
+#### Scenario: optional escalation and diagnose commands are accepted
 
-- **GIVEN** `.cflx.jsonc` に以下の設定が存在する:
-  ```jsonc
-  {
-    "worktree_command": "opencode run --cwd {workspace_dir} '/openspec:proposal'"
-  }
-  ```
-- **WHEN** ユーザーがTUIの `+` キーで提案作成フローを開始する
-- **THEN** `worktree_command` が使用される
-
-#### Scenario: 必須コマンドが欠落している場合は設定ロード時にエラーになる
-
-- **GIVEN** 設定のマージ結果に `archive_command` が存在しない
-- **WHEN** 設定をロードする
-- **THEN** 設定ロード時にエラーとして失敗する
-- **AND** エラーメッセージに欠落しているコマンド名が含まれる
+- **GIVEN** `.cflx.jsonc` contains top-level `apply_command`
+- **AND** optional `apply_escalation_command`
+- **AND** optional `apply_stall_diagnose_command`
+- **WHEN** configuration is loaded
+- **THEN** the merged configuration exposes all three command templates
+- **AND** missing optional escalation/diagnose commands do not themselves cause config load failure
 
 ### Requirement: stall_detection 設定
 
-オーケストレーターは進捗停滞検出の挙動を設定ファイルで制御できなければならない (MUST)。
+オーケストレーターは進捗停滞検出の挙動を設定ファイルで制御できなければならない（MUST）。
 
-- `stall_detection.enabled`: 停滞検出を有効化する（default: `true`）
-- `stall_detection.threshold`: 空WIPコミット連続回数のしきい値（default: `5`）
+`stall_detection` は既存の `enabled` / `threshold` に加えて、empty-WIP escalation policy として以下を受け入れなければならない（MUST）。
 
-#### Scenario: デフォルト値が適用される
-- **GIVEN** 設定ファイルに `stall_detection` が存在しない
-- **WHEN** orchestrator を実行する
-- **THEN** `stall_detection.enabled` は `true` として扱われる
-- **AND** `stall_detection.threshold` は `5` として扱われる
+- `apply_escalation_after_empty_wip`: 何回連続 empty WIP のあとで escalation retry を開始するか
+- `apply_escalation_max_uses_per_stall`: 1 回の stall sequence で escalation command を最大何回使うか
 
-#### Scenario: enabled=false で停滞検出が無効化される
-- **GIVEN** config 内で `stall_detection.enabled = false` が設定されている
-- **WHEN** 空WIPコミットが連続して発生する
-- **THEN** stall 判定は行われない
+`apply_escalation_after_empty_wip` が設定される場合、それは `threshold` より小さくなければならない（MUST）。
 
-#### Scenario: threshold を変更できる
-- **GIVEN** config 内で `stall_detection.threshold = 5` が設定されている
-- **WHEN** 空WIPコミットが5回連続で発生する
-- **THEN** stall と判定される
+`apply_escalation_max_uses_per_stall` が設定される場合、それは 1 以上でなければならない（MUST）。
+
+#### Scenario: escalation policy values are valid only before the final stall threshold
+
+- **GIVEN** `stall_detection.threshold = 5`
+- **AND** `stall_detection.apply_escalation_after_empty_wip = 3`
+- **AND** `stall_detection.apply_escalation_max_uses_per_stall = 2`
+- **WHEN** configuration is loaded
+- **THEN** configuration validation succeeds
+
+#### Scenario: invalid escalation boundary is rejected
+
+- **GIVEN** `stall_detection.threshold = 5`
+- **AND** `stall_detection.apply_escalation_after_empty_wip = 5`
+- **WHEN** configuration is loaded
+- **THEN** configuration validation fails
+- **AND** the error explains that escalation must begin before the final stall threshold
+
+#### Scenario: missing optional commands do not trigger warnings or validation errors
+
+- **GIVEN** `stall_detection.apply_escalation_after_empty_wip = 3`
+- **AND** `stall_detection.apply_escalation_max_uses_per_stall = 2`
+- **AND** neither `apply_escalation_command` nor `apply_stall_diagnose_command` is configured
+- **WHEN** configuration is loaded
+- **THEN** configuration validation succeeds
+- **AND** no warning is emitted solely because the optional commands are absent
 
 ### Requirement: 設定ファイルの優先順位
 
