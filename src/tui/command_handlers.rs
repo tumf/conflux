@@ -664,10 +664,18 @@ mod tests {
         let dynamic_queue = DynamicQueue::new();
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         let config = create_test_config();
-        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
             vec!["change-a".to_string()],
             10,
+            crate::orchestration::state::ExecutionMode::Parallel,
         )));
+        {
+            let mut guard = shared_state.write().await;
+            guard.apply_observation(
+                "change-a",
+                crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+            );
+        }
         let graceful_stop_flag = Arc::new(AtomicBool::new(false));
         let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
         let mut orchestrator_cancel: Option<CancellationToken> = None;
