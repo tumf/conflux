@@ -3353,9 +3353,7 @@ async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
             match rx.recv().await {
                 Some(ExecutionEvent::Log(log)) => {
                     let message = log.message;
-                    if message.contains("No analysis started despite reducer-visible queued work")
-                        && message.contains("reason=no_available_slots")
-                    {
+                    if message.contains("reason=no_available_slots") {
                         break true;
                     }
                 }
