@@ -1973,27 +1973,30 @@ When archive is retried, resumed, or fails terminally, the runtime SHALL expose 
 
 ### Requirement: Acceptance blocker input compatibility is distinct from lifecycle display taxonomy
 
-When acceptance detects an implementation blocker, the user-facing lifecycle display SHALL expose that observation as `stalled` rather than reusing dependency `blocked` terminology.
+When acceptance detects an implementation blocker, the system SHALL NOT expose that observation as `gated` in user-facing lifecycle or display taxonomy. The runtime SHALL treat the condition as a non-terminal stalled/review hold while preserving reason metadata such as `acceptance-gated` when the cause must be distinguished from dependency `blocked`.
 
-The machine-readable acceptance verdict parser SHALL continue to accept `pass`, `fail`, `continue`, and compatibility input `gated`.
+The canonical machine-readable acceptance verdict parser MAY continue to accept `gated` input for compatibility. During migration, runtimes MAY continue to accept legacy `blocked` acceptance verdict input for backward compatibility. Newly authored lifecycle/status surfaces, operator-facing docs, and UI tests MUST NOT require `gated` as a display status.
 
-During migration, runtimes MAY continue to accept legacy `blocked` acceptance verdict input for backward compatibility.
+If acceptance follow-up later routes the change into a resumable hold, that hold SHALL use `stalled` terminology rather than dependency `blocked` or display `gated`.
 
-Canonical spec prose MAY describe the parser-side compatibility token as `acceptance-gated` when it must be distinguished from `dependency-blocked` in architecture, reducer, or migration guidance.
-
-If acceptance follow-up routes the change into a resumable hold, that hold SHALL use `stalled` terminology rather than dependency `blocked`.
-
-#### Scenario: acceptance blocker verdict maps to stalled lifecycle display
+#### Scenario: canonical acceptance blocker displays as stalled
 - **GIVEN** acceptance detects an implementation blocker for change `change-a`
-- **WHEN** the acceptance command emits a compatibility verdict (`gated` or legacy `blocked`)
-- **THEN** the runtime interprets it as an acceptance gate observation
-- **AND** user-facing lifecycle display remains `stalled`
+- **WHEN** the runtime exposes the lifecycle/display status
+- **THEN** the displayed status is `stalled`
+- **AND** new prompts and tests do not require `gated` as a lifecycle/display term
+- **AND** dependency wait remains the only `blocked` display meaning
+
+#### Scenario: gated verdict input remains parser-compatible during migration
+- **GIVEN** an acceptance integration emits `gated`
+- **WHEN** a compatibility-aware runtime parses that verdict
+- **THEN** the runtime interprets it as an acceptance blocker observation
+- **AND** the user-facing lifecycle taxonomy describes the paused condition as `stalled`, not `gated`
 
 #### Scenario: legacy blocked acceptance verdict remains backward compatible during migration
 - **GIVEN** an older acceptance integration still emits `blocked`
 - **WHEN** a compatibility-aware runtime parses that verdict
-- **THEN** the runtime still interprets it as an acceptance gate observation
-- **AND** user-facing lifecycle taxonomy continues to describe the condition as `stalled`
+- **THEN** the runtime still interprets it as an acceptance blocker observation
+- **AND** canonical user-facing taxonomy describes the paused condition as `stalled`
 
 ### Requirement: archived dependency references have explicit scheduler and validation semantics
 
