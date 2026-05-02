@@ -24,7 +24,9 @@ apply/archive/resolveのAIエージェントコマンドは、`{change_id}`、`{
 hookコマンドは、実行前にコマンド文字列をTUI Logs Viewへ表示しなければならない（MUST）。
 hookコマンドのstdout/stderrは取得可能な範囲でTUI Logs Viewへ表示しなければならない（MUST）。
 
-**変更**: TUI Logs Viewに表示されるすべてのログエントリーは、常にデバッグログファイルにも出力されなければならない（MUST）。出力先は `XDG_STATE_HOME` が設定されていれば `XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`、未設定時は `~/.local/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` とする（MUST）。ログは日付単位で分割し、`project_slug` ごとに最新7日分のみ保持しなければならない（MUST）。
+TUI Logs Viewに表示されるすべてのログエントリーは、常にデバッグログファイルにも出力されなければならない（MUST）。出力先は `XDG_STATE_HOME` が設定されていれば `XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`、未設定時は `~/.local/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` とする（MUST）。ログは日付単位で分割し、`project_slug` ごとに最新7日分のみ保持しなければならない（MUST）。
+
+ただし、scheduler loop 等から発生する同一状態・同一理由の診断ログは、user-visible TUI Logs View で連続して同一内容が大量表示されないよう、dedupe、rate-limit、または summary 化してよい（MAY）。この抑制は観測性のためだけに使われ、workflow-control input として使ってはならない（MUST NOT）。
 
 #### Scenario: hook実行のコマンドと出力がLogs Viewに表示される
 - **GIVEN** `hooks.pre_apply` が `echo 'hello'` に設定されている
@@ -83,6 +85,13 @@ hookコマンドのstdout/stderrは取得可能な範囲でTUI Logs Viewへ表�
 - **WHEN** オーケストレーターを起動する
 - **THEN** 最新7日分のログのみが保持される
 - **AND** 当日分は `<YYYY-MM-DD>.log` に追記される
+
+#### Scenario: repetitive scheduler diagnostics are bounded in TUI logs
+- **GIVEN** a scheduler diagnostic has the same change id, reason, and message across repeated loop iterations
+- **WHEN** the diagnostic is emitted repeatedly without any relevant state change
+- **THEN** the TUI Logs View does not show an unbounded sequence of identical entries
+- **AND** the diagnostic remains available at least once or through a summary/rate-limited entry
+- **AND** suppression state is not used to decide scheduling, resume routing, acceptance, archive, or next-action behavior
 
 ### Requirement: REQ-OBS-002 Appropriate Log Level Classification
 
