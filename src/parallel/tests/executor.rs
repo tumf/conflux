@@ -3338,7 +3338,9 @@ async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
         guard.apply_command(ReducerCommand::AddToQueue(selected));
     }
     executor.set_shared_orchestrator_state(shared);
-    let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
+    // Saturate all execution capacity via resolve slots so scheduler emits
+    // the no_available_slots diagnostic before any analysis can start.
+    let manual_resolve_counter = Arc::new(AtomicUsize::new(usize::MAX));
     executor.set_manual_resolve_counter(manual_resolve_counter);
 
     let mut running_executor = executor;
