@@ -10,3 +10,7 @@
 ## Future Work
 
 - A later cleanup may remove acceptance `gated` verdict compatibility entirely after all bundled prompts, skills, and external integrations have migrated away from producing it.
+
+## Acceptance #1 Failure Follow-up
+- [x] docs/openapi.yaml:312-319 still documents queue_status as including "gated" in the canonical display taxonomy. Remove gated from the OpenAPI queue_status description (and regenerate/update any source that produces this file if applicable) so Web/API documentation no longer exposes gated as a lifecycle/display status.
+- [x] openspec/specs/agent-prompts/spec.md:226 still says rejecting review distinguishes reject from a gated hold, which is operator-facing lifecycle wording. Reword the canonical prompt spec to distinguish terminal reject from a stalled hold / acceptance blocker compatibility verdict without describing a lifecycle hold as gated (verification: integration - `rg -n "gated hold|stalled hold" openspec/specs/agent-prompts/spec.md` shows the requirement line uses `stalled hold` wording, not `gated hold`).

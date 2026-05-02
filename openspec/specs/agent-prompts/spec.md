@@ -223,7 +223,7 @@ acceptance は以下を満たさなければならない（MUST）。
 - repo 内編集・テスト更新・spec/tasks/proposal 修正など、AI がこの repository 内の変更だけで自律的に解決できる問題は `FAIL` として返さなければならない（MUST）。
 - 人判断待ち、repo 外の設定変更、外部依存の解消待ち、追加情報待ち、または apply を再実行しても repository 変更だけでは解決不能な blocker は `GATED` として返さなければならない（MUST）。
 - `GATED` を返さず `FAIL` を返した場合、その finding は apply へ戻って repository 作業を行うことで解消可能であることを意味しなければならない（MUST）。
-- apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を gated hold のまま保留するか」を区別できなければならない
+- apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を stalled hold のまま保留するか」を区別できなければならない
 - 互換期間中に旧 `blocked` acceptance verdict を runtime が受理できることを前提に、`gated` は parser compatibility term として扱い、operator-facing lifecycle taxonomy には使わない（MUST）
 
 #### Scenario: acceptance may emit gated compatibility verdict for a valid implementation blocker
