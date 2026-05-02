@@ -27,6 +27,7 @@ pub struct TuiCommandContext<'a> {
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub dynamic_queue: &'a DynamicQueue,
     pub remote_client: Option<crate::remote::RemoteClient>,
+    pub orchestrator_running: bool,
     #[cfg(feature = "web-monitoring")]
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
 }
@@ -567,14 +568,66 @@ pub async fn handle_tui_command(
                 .await
                 .apply_command(ReducerCommand::ResolveMerge(id.clone()));
 
-            // Scheduler-owned execution model:
-            // - command handler MUST NOT execute resolve_deferred_merge directly
-            // - wake scheduler so normal loop can pick up retry intent and queued work together
-            ctx.dynamic_queue.notify_scheduler();
-            ctx.app.add_log(LogEntry::info(format!(
-                "Scheduled merge-wait retry intent for '{}'; execution will be started by scheduler",
-                id
-            )));
+            if ctx.orchestrator_running {
+                // Scheduler-owned execution model when scheduler is already alive:
+                // wake scheduler so normal loop can pick up retry intent and queued work together.
+                ctx.dynamic_queue.notify_scheduler();
+                ctx.app.add_log(LogEntry::info(format!(
+                    "Scheduled merge-wait retry intent for '{}'; notified existing scheduler",
+                    id
+                )));
+            } else {
+                // Scheduler not alive: spawn a scheduler-owned run to consume reducer-owned ResolveWait.
+                graceful_stop_flag.store(false, Ordering::SeqCst);
+                let orch_tx = ctx.tx.clone();
+                let orch_config = ctx.config.clone();
+                let orch_cancel = CancellationToken::new();
+                let orch_dynamic_queue = ctx.dynamic_queue.clone();
+                let orch_graceful_stop = graceful_stop_flag.clone();
+                let orch_shared_state = shared_state.clone();
+                let orch_manual_resolve = manual_resolve_counter.clone();
+                *orchestrator_cancel = Some(orch_cancel.clone());
+
+                #[cfg(feature = "web-monitoring")]
+                let orch_web_state = ctx.web_state.clone();
+
+                let handle = tokio::spawn(async move {
+                    #[cfg(feature = "web-monitoring")]
+                    let result = run_orchestrator_parallel(
+                        Vec::new(),
+                        orch_config,
+                        orch_tx,
+                        orch_cancel,
+                        orch_dynamic_queue,
+                        orch_graceful_stop,
+                        orch_shared_state,
+                        orch_manual_resolve,
+                        orch_web_state,
+                    )
+                    .await;
+
+                    #[cfg(not(feature = "web-monitoring"))]
+                    let result = run_orchestrator_parallel(
+                        Vec::new(),
+                        orch_config,
+                        orch_tx,
+                        orch_cancel,
+                        orch_dynamic_queue,
+                        orch_graceful_stop,
+                        orch_shared_state,
+                        orch_manual_resolve,
+                    )
+                    .await;
+
+                    result
+                });
+
+                ctx.app.add_log(LogEntry::info(format!(
+                    "Scheduled merge-wait retry intent for '{}'; started scheduler for manual resolve",
+                    id
+                )));
+                return Ok(Some(handle));
+            }
         }
     }
 

@@ -811,6 +811,9 @@ async fn run_tui_loop(
                 tx: &tx,
                 dynamic_queue: &dynamic_queue,
                 remote_client: remote_client_actions.clone(),
+                orchestrator_running: orchestrator_handle
+                    .as_ref()
+                    .is_some_and(|handle| !handle.is_finished()),
                 #[cfg(feature = "web-monitoring")]
                 web_state: &web_state,
             };
