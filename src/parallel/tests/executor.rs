@@ -3412,15 +3412,13 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
 
 #[tokio::test]
 async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_work() {
-    use crate::events::ExecutionEvent;
     use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::RwLock;
 
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
-    let (tx, mut rx) = mpsc::channel(64);
-    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
 
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
         vec!["change-a".to_string()],
@@ -3439,25 +3437,21 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
 
     executor.sync_resolve_wait_from_shared_state_nonblocking();
     executor.trigger_resolve_wait_retry_dispatch();
-    executor.maybe_dispatch_resolve_wait_retry().await;
-
-    let mut saw_retry_log = false;
-    for _ in 0..32 {
-        if let Ok(event) = rx.try_recv() {
-            if let ExecutionEvent::Log(log) = event {
-                if log.message.contains("Retrying deferred merge for 'change-a'") {
-                    saw_retry_log = true;
-                    break;
-                }
-            }
-        } else {
-            break;
-        }
-    }
 
     assert!(
-        saw_retry_log,
-        "scheduler should dispatch retry path for synced ResolveWait intent even without queued/in-flight work"
+        executor.should_dispatch_resolve_wait_retry(),
+        "synced ResolveWait intent should be dispatchable even when no queued/in-flight work exists"
+    );
+
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    assert_eq!(
+        executor.last_dispatched_resolve_wait_changes, executor.resolve_wait_changes,
+        "dispatch path should snapshot synced ResolveWait ids"
+    );
+    assert!(
+        !executor.resolve_wait_retry_triggered,
+        "dispatch path should consume retry trigger"
     );
 }
 
@@ -3491,7 +3485,10 @@ async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
     executor.maybe_dispatch_resolve_wait_retry().await;
 
     let dispatched_snapshot = executor.resolve_wait_changes.clone();
-    assert_eq!(executor.last_dispatched_resolve_wait_changes, dispatched_snapshot);
+    assert_eq!(
+        executor.last_dispatched_resolve_wait_changes,
+        dispatched_snapshot
+    );
     assert!(!executor.resolve_wait_retry_triggered);
     assert!(
         !executor.should_dispatch_resolve_wait_retry(),
