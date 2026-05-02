@@ -37,8 +37,8 @@ Validation rules:
 
 - if `apply_escalation_after_empty_wip` is set, it MUST be `< threshold`
 - if `apply_escalation_max_uses_per_stall` is set, it MUST be `>= 1`
-- if an escalation policy is configured without `apply_escalation_command`, config validation should fail rather than silently degrade
-- `apply_stall_diagnose_command` remains optional; if absent, final stall follows the current path
+- `apply_escalation_command` is fully optional; if absent, escalation policy becomes a silent no-op and the runtime keeps using `apply_command`
+- `apply_stall_diagnose_command` is fully optional; if absent, final stall follows the current path with no extra warning
 
 ## Runtime Flow
 
@@ -46,10 +46,10 @@ For each change/run, the apply loop already tracks empty-WIP commits. Extend tha
 
 1. run normal `apply_command`
 2. if a non-empty WIP commit occurs, reset the empty-WIP streak and escalation usage counter
-3. if the empty-WIP streak reaches `apply_escalation_after_empty_wip`, switch subsequent eligible retries to `apply_escalation_command`
+3. if the empty-WIP streak reaches `apply_escalation_after_empty_wip` and `apply_escalation_command` is configured, switch subsequent eligible retries to `apply_escalation_command`
 4. each escalation retry increments `escalation_uses_for_current_stall`
-5. once the empty-WIP threshold is reached and no more escalation retries remain, run `apply_stall_diagnose_command` exactly once
-6. after diagnosis completes (or fails), emit the existing empty-WIP stall outcome
+5. once the empty-WIP threshold is reached and no more escalation retries remain, run `apply_stall_diagnose_command` exactly once if it is configured
+6. after diagnosis completes (or fails), or immediately if no diagnose command is configured, emit the existing empty-WIP stall outcome
 
 This produces a single bounded sequence:
 

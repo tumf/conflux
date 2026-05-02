@@ -6,9 +6,9 @@
 
 設定可能なコマンドには、通常の apply 用 `apply_command` に加えて、late empty-WIP retry 用の optional `apply_escalation_command` と、final empty-WIP stall 診断用の optional `apply_stall_diagnose_command` を含めてもよい（MAY）。
 
-`apply_escalation_command` は通常 apply の代替コマンドとして扱われ、runtime が escalation 条件を満たした retry にのみ使用しなければならない（MUST）。
+`apply_escalation_command` は通常 apply の代替コマンドとして扱われ、runtime が escalation 条件を満たした retry にのみ使用しなければならない（MUST）。未設定の場合、runtime は escalation phase で静かに通常 `apply_command` の挙動を継続しなければならない（MUST）。
 
-`apply_stall_diagnose_command` は final empty-WIP stall の直前診断にのみ使用されなければならない（MUST）。
+`apply_stall_diagnose_command` は final empty-WIP stall の直前診断にのみ使用されなければならない（MUST）。未設定の場合、runtime は診断 phase を静かにスキップして従来の final stall へ進まなければならない（MUST）。
 
 #### Scenario: optional escalation and diagnose commands are accepted
 
@@ -47,3 +47,12 @@
 - **WHEN** configuration is loaded
 - **THEN** configuration validation fails
 - **AND** the error explains that escalation must begin before the final stall threshold
+
+#### Scenario: missing optional commands do not trigger warnings or validation errors
+
+- **GIVEN** `stall_detection.apply_escalation_after_empty_wip = 3`
+- **AND** `stall_detection.apply_escalation_max_uses_per_stall = 2`
+- **AND** neither `apply_escalation_command` nor `apply_stall_diagnose_command` is configured
+- **WHEN** configuration is loaded
+- **THEN** configuration validation succeeds
+- **AND** no warning is emitted solely because the optional commands are absent

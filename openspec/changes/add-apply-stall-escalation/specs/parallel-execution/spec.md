@@ -42,7 +42,9 @@ Escalation usage MUST be bounded by configuration and MUST remain runtime-epheme
 
 ### Requirement: Stall diagnosis runs once before final empty-WIP stall
 
-When the final empty-WIP stall threshold is reached after escalation opportunities are exhausted, the runtime SHALL execute a dedicated stall diagnosis command once before returning the final stall outcome.
+When the final empty-WIP stall threshold is reached after escalation opportunities are exhausted, the runtime SHALL execute a dedicated stall diagnosis command once before returning the final stall outcome when `apply_stall_diagnose_command` is configured.
+
+If `apply_stall_diagnose_command` is not configured, the runtime SHALL silently skip diagnosis and proceed with the existing final stall behavior.
 
 Diagnosis output is supplemental evidence only and MUST NOT replace the primary empty-WIP stall reason.
 
@@ -70,3 +72,22 @@ Diagnosis output is supplemental evidence only and MUST NOT replace the primary 
 - **WHEN** consecutive empty WIP commits reach the final threshold
 - **THEN** the runtime behaves exactly as before this change
 - **AND** no escalation or diagnosis command is attempted
+- **AND** no extra warning is emitted solely because the optional commands are unset
+
+#### Scenario: missing escalation command silently falls back to normal apply
+
+- **GIVEN** `stall_detection.apply_escalation_after_empty_wip = 3`
+- **AND** `stall_detection.apply_escalation_max_uses_per_stall = 2`
+- **AND** `apply_escalation_command` is not configured
+- **WHEN** a change reaches the escalation boundary during consecutive empty-WIP retries
+- **THEN** the runtime continues using normal `apply_command`
+- **AND** it does not emit a warning solely for the missing escalation command
+
+#### Scenario: missing diagnose command silently falls back to direct final stall
+
+- **GIVEN** a change reaches final empty-WIP stall classification
+- **AND** `apply_stall_diagnose_command` is not configured
+- **WHEN** the runtime finalizes the stall
+- **THEN** it skips the diagnose phase
+- **AND** it emits the same final stall outcome as the legacy flow
+- **AND** it does not emit a warning solely for the missing diagnose command

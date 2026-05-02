@@ -27,7 +27,7 @@ references:
 ## Requested Artifact
 
 - implementation proposal to add a configurable apply escalation command and a dedicated stall diagnosis command before empty-WIP stall is finalized
-- preserve current command-template architecture and strict config validation behavior
+- preserve current command-template architecture while treating the new commands as fully optional silent fallbacks
 - keep escalation/diagnosis as observability and execution policy only, not durable workflow-control state
 
 ## Problem
@@ -48,18 +48,18 @@ Add an adaptive pre-stall recovery path for empty-WIP apply retries:
 
 - Operators can configure an optional `apply_escalation_command` and an optional `apply_stall_diagnose_command` without breaking existing command-template behavior.
 - Operators can configure the empty-WIP retry point at which escalation begins and how many escalation attempts may be used before stall finalization.
-- When consecutive empty WIP commits reach the configured escalation boundary, the runtime switches subsequent apply retries to `apply_escalation_command` instead of the base `apply_command`.
-- When escalation attempts are exhausted and the empty-WIP threshold is reached, the runtime executes `apply_stall_diagnose_command` exactly once before returning the final stall error/outcome.
+- When consecutive empty WIP commits reach the configured escalation boundary and `apply_escalation_command` is configured, the runtime switches subsequent apply retries to `apply_escalation_command` instead of the base `apply_command`.
+- When escalation attempts are exhausted, the empty-WIP threshold is reached, and `apply_stall_diagnose_command` is configured, the runtime executes that diagnose command exactly once before returning the final stall error/outcome.
 - Diagnosis failure never hides or replaces the underlying stall reason; the final stall outcome still reports the empty-WIP stall as the primary failure.
-- If escalation/diagnosis commands are unset, the runtime preserves current behavior.
+- If either new command is unset, the runtime silently preserves current behavior for that phase with no warning or validation error.
 - The change does not introduce out-of-worktree durable workflow-control state and remains consistent with `openspec/CONSTITUTION.md`.
 
 ## Explicit Completion Conditions
 
 - `src/config/types.rs` and related config validation/defaults accept the new command keys and escalation policy knobs, including validation that escalation can only begin before the final stall threshold.
-- `src/execution/apply.rs` (or the canonical apply-loop owner) records consecutive empty-WIP counts, swaps to `apply_escalation_command` at the configured boundary, and caps escalation usage per stall sequence.
-- The runtime executes `apply_stall_diagnose_command` once immediately before final empty-WIP stall classification and records the diagnostic result as follow-up evidence/logging without overwriting the primary stall cause.
-- Regression tests prove: default behavior is unchanged when new config is absent; escalation replaces apply on the configured late retries; diagnosis runs once on final stall; diagnosis failure still preserves the original stall outcome.
+- `src/execution/apply.rs` (or the canonical apply-loop owner) records consecutive empty-WIP counts, swaps to `apply_escalation_command` at the configured boundary only when that command is configured, and caps escalation usage per stall sequence.
+- The runtime executes `apply_stall_diagnose_command` once immediately before final empty-WIP stall classification only when that command is configured, and records the diagnostic result as follow-up evidence/logging without overwriting the primary stall cause.
+- Regression tests prove: default behavior is unchanged when new config is absent; missing escalation/diagnose commands silently preserve the existing flow without warnings; configured escalation replaces apply on the configured late retries; configured diagnosis runs once on final stall; diagnosis failure still preserves the original stall outcome.
 - `cflx openspec validate add-apply-stall-escalation --strict --evidence warn` passes.
 
 ## Out of Scope
