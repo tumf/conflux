@@ -700,6 +700,17 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Clear reducer-owned resolve retry intent for a change after repository-visible
+    /// merge success or stale already-merged detection.
+    pub fn clear_resolve_wait_intent(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        if matches!(rt.wait_state, WaitState::ResolveWait) {
+            rt.wait_state = WaitState::None;
+            rt.clear_blocked_metadata();
+        }
+        self.resolve_wait_queue.retain(|id| id != change_id);
+    }
+
     /// Return change IDs that still carry queued intent and are not terminal.
     ///
     /// Scheduler reconciliation uses this as reducer-visible source of truth for
@@ -2246,6 +2257,53 @@ mod tests {
     // (ResolveMerge command → ResolveWait), resolve succeeded, but the row was
     // previously stuck at "resolve pending" because ResolveCompleted was not
     // applied to the shared reducer before the next ChangesRefreshed.
+
+    #[test]
+    fn test_merge_completed_clears_resolve_wait_intent() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Resolve in progress for another change".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
+
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev-alpha".to_string(),
+        });
+
+        assert_eq!(state.display_status("alpha"), "merged");
+        assert!(
+            state.resolve_wait_change_ids().is_empty(),
+            "MergeCompleted must clear reducer-owned ResolveWait retry intent"
+        );
+    }
+
+    #[test]
+    fn test_clear_resolve_wait_intent_removes_retry_without_terminal_transition() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Resolve in progress for another change".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
+
+        state.clear_resolve_wait_intent("alpha");
+
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert_eq!(state.display_status("alpha"), "not queued");
+        assert!(!state.is_terminal_change("alpha"));
+    }
 
     #[test]
     fn test_resolve_completed_clears_resolve_wait_and_survives_refresh() {
