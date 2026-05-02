@@ -368,6 +368,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -672,6 +674,8 @@ async fn test_merge_uses_resolve_command_with_change_ids() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -855,6 +859,8 @@ async fn test_merge_allows_non_merge_head_after_merges() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1007,6 +1013,8 @@ async fn test_merge_retries_when_merge_left_in_progress() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     let revisions = vec![workspace_a.name];
@@ -1191,6 +1199,8 @@ async fn test_merge_retries_when_merge_commit_missing() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1389,6 +1399,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1593,6 +1605,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
         shared_orchestrator_state: None,
+        last_dispatched_resolve_wait_changes: HashSet::new(),
+        resolve_wait_retry_triggered: false,
     };
 
     let revisions = vec![workspace_a.name];
@@ -3393,6 +3407,92 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
     assert!(
         !should_exit,
         "scheduler must not report drained while shared reducer ResolveWait intent exists"
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_work() {
+    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        crate::orchestration::state::ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.trigger_resolve_wait_retry_dispatch();
+
+    assert!(
+        executor.should_dispatch_resolve_wait_retry(),
+        "synced ResolveWait intent should be dispatchable even when no queued/in-flight work exists"
+    );
+
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    assert_eq!(
+        executor.last_dispatched_resolve_wait_changes, executor.resolve_wait_changes,
+        "dispatch path should snapshot synced ResolveWait ids"
+    );
+    assert!(
+        !executor.resolve_wait_retry_triggered,
+        "dispatch path should consume retry trigger"
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
+    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        crate::orchestration::state::ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.trigger_resolve_wait_retry_dispatch();
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    let dispatched_snapshot = executor.resolve_wait_changes.clone();
+    assert_eq!(
+        executor.last_dispatched_resolve_wait_changes,
+        dispatched_snapshot
+    );
+    assert!(!executor.resolve_wait_retry_triggered);
+    assert!(
+        !executor.should_dispatch_resolve_wait_retry(),
+        "unchanged resolve-wait intent must not be retried again without a new trigger"
     );
 }
 

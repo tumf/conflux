@@ -52,6 +52,29 @@ impl ParallelExecutor {
         }
     }
 
+    pub(super) fn trigger_resolve_wait_retry_dispatch(&mut self) {
+        self.resolve_wait_retry_triggered = true;
+    }
+
+    pub(super) fn should_dispatch_resolve_wait_retry(&self) -> bool {
+        if self.resolve_wait_changes.is_empty() {
+            return false;
+        }
+
+        self.resolve_wait_retry_triggered
+            || self.last_dispatched_resolve_wait_changes != self.resolve_wait_changes
+    }
+
+    pub(super) async fn maybe_dispatch_resolve_wait_retry(&mut self) {
+        if !self.should_dispatch_resolve_wait_retry() {
+            return;
+        }
+
+        self.retry_deferred_merges().await;
+        self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
+        self.resolve_wait_retry_triggered = false;
+    }
+
     #[cfg(test)]
     pub(super) fn has_resolve_wait(&self) -> bool {
         if let Some(shared) = &self.shared_orchestrator_state {

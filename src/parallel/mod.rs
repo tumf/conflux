@@ -144,6 +144,10 @@ pub struct ParallelExecutor {
     scheduler_lifetime: SchedulerLifetime,
     /// Optional reducer shared state used for scheduler-owned resolve/merge retry intent.
     shared_orchestrator_state: Option<Arc<RwLock<OrchestratorState>>>,
+    /// Last resolve-wait snapshot that was dispatched via scheduler retry.
+    last_dispatched_resolve_wait_changes: HashSet<String>,
+    /// One-shot flag to allow retry dispatch on explicit wake/completion triggers.
+    resolve_wait_retry_triggered: bool,
 }
 
 #[cfg(test)]

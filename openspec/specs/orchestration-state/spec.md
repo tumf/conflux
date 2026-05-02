@@ -55,7 +55,9 @@ The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned sched
 
 `ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. A manual `ResolveMerge` request MUST therefore create scheduler-visible work even when no apply/archive tasks are queued or in flight.
+The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. Observing the intent is not sufficient: when the scheduler is woken for a manual resolve request, it MUST dispatch the scheduler-owned retry path for eligible `ResolveWait` changes even when no apply/archive work is queued or in flight.
+
+The scheduler MUST NOT continuously retry unchanged `ResolveWait` intent on every idle timer tick when retry remains blocked. Further retry attempts for unchanged blocked intent SHOULD be triggered by explicit scheduler wake-up, merge completion, resolve completion, rejection completion, queue changes, or a state transition that could make the retry newly eligible.
 
 Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
@@ -76,13 +78,21 @@ Canonical rule: ownership is split as **intent in reducer**, **execution in sche
 - **THEN** the scheduler starts the retry for `alpha`
 - **AND** execution ownership remains in the normal scheduler lifecycle
 
-#### Scenario: manual resolve intent prevents false scheduler drain
+#### Scenario: manual resolve notification dispatches retry without queued apply work
 
 - **GIVEN** no apply/archive work is queued or in flight
-- **AND** shared orchestration state contains `ResolveWait` intent for change `alpha`
-- **WHEN** the parallel scheduler evaluates whether all work is complete
-- **THEN** the scheduler does not exit or sleep as though no work exists before observing the intent
-- **AND** `alpha` remains eligible for scheduler-owned merge / resolve retry
+- **AND** change `alpha` is in `MergeWait`
+- **WHEN** the user presses `M` for `alpha`
+- **THEN** the TUI records reducer-owned `ResolveWait` intent and wakes the scheduler
+- **AND** the scheduler attempts merge / resolve retry for `alpha` through the normal scheduler-owned retry path
+- **AND** `alpha` does not remain indefinitely in `resolve pending` solely because there was no queued apply/archive work
+
+#### Scenario: unchanged blocked retry intent does not busy loop
+
+- **GIVEN** change `alpha` is in `ResolveWait`
+- **AND** a scheduler-owned retry attempt reports that `alpha` is still blocked and remains in `ResolveWait`
+- **WHEN** no merge, resolve, rejection, queue, or explicit scheduler wake-up trigger occurs
+- **THEN** the scheduler does not retry `alpha` continuously on every idle timer tick
 
 #### Scenario: retry completion clears shared intent without TUI-local lane
 
@@ -147,7 +157,9 @@ The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned sched
 
 `ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. A manual `ResolveMerge` request MUST therefore create scheduler-visible work even when no apply/archive tasks are queued or in flight.
+The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. Observing the intent is not sufficient: when the scheduler is woken for a manual resolve request, it MUST dispatch the scheduler-owned retry path for eligible `ResolveWait` changes even when no apply/archive work is queued or in flight.
+
+The scheduler MUST NOT continuously retry unchanged `ResolveWait` intent on every idle timer tick when retry remains blocked. Further retry attempts for unchanged blocked intent SHOULD be triggered by explicit scheduler wake-up, merge completion, resolve completion, rejection completion, queue changes, or a state transition that could make the retry newly eligible.
 
 Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
@@ -168,13 +180,21 @@ Canonical rule: ownership is split as **intent in reducer**, **execution in sche
 - **THEN** the scheduler starts the retry for `alpha`
 - **AND** execution ownership remains in the normal scheduler lifecycle
 
-#### Scenario: manual resolve intent prevents false scheduler drain
+#### Scenario: manual resolve notification dispatches retry without queued apply work
 
 - **GIVEN** no apply/archive work is queued or in flight
-- **AND** shared orchestration state contains `ResolveWait` intent for change `alpha`
-- **WHEN** the parallel scheduler evaluates whether all work is complete
-- **THEN** the scheduler does not exit or sleep as though no work exists before observing the intent
-- **AND** `alpha` remains eligible for scheduler-owned merge / resolve retry
+- **AND** change `alpha` is in `MergeWait`
+- **WHEN** the user presses `M` for `alpha`
+- **THEN** the TUI records reducer-owned `ResolveWait` intent and wakes the scheduler
+- **AND** the scheduler attempts merge / resolve retry for `alpha` through the normal scheduler-owned retry path
+- **AND** `alpha` does not remain indefinitely in `resolve pending` solely because there was no queued apply/archive work
+
+#### Scenario: unchanged blocked retry intent does not busy loop
+
+- **GIVEN** change `alpha` is in `ResolveWait`
+- **AND** a scheduler-owned retry attempt reports that `alpha` is still blocked and remains in `ResolveWait`
+- **WHEN** no merge, resolve, rejection, queue, or explicit scheduler wake-up trigger occurs
+- **THEN** the scheduler does not retry `alpha` continuously on every idle timer tick
 
 #### Scenario: retry completion clears shared intent without TUI-local lane
 
@@ -318,7 +338,9 @@ The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned sched
 
 `ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. A manual `ResolveMerge` request MUST therefore create scheduler-visible work even when no apply/archive tasks are queued or in flight.
+The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. Observing the intent is not sufficient: when the scheduler is woken for a manual resolve request, it MUST dispatch the scheduler-owned retry path for eligible `ResolveWait` changes even when no apply/archive work is queued or in flight.
+
+The scheduler MUST NOT continuously retry unchanged `ResolveWait` intent on every idle timer tick when retry remains blocked. Further retry attempts for unchanged blocked intent SHOULD be triggered by explicit scheduler wake-up, merge completion, resolve completion, rejection completion, queue changes, or a state transition that could make the retry newly eligible.
 
 Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
@@ -339,13 +361,21 @@ Canonical rule: ownership is split as **intent in reducer**, **execution in sche
 - **THEN** the scheduler starts the retry for `alpha`
 - **AND** execution ownership remains in the normal scheduler lifecycle
 
-#### Scenario: manual resolve intent prevents false scheduler drain
+#### Scenario: manual resolve notification dispatches retry without queued apply work
 
 - **GIVEN** no apply/archive work is queued or in flight
-- **AND** shared orchestration state contains `ResolveWait` intent for change `alpha`
-- **WHEN** the parallel scheduler evaluates whether all work is complete
-- **THEN** the scheduler does not exit or sleep as though no work exists before observing the intent
-- **AND** `alpha` remains eligible for scheduler-owned merge / resolve retry
+- **AND** change `alpha` is in `MergeWait`
+- **WHEN** the user presses `M` for `alpha`
+- **THEN** the TUI records reducer-owned `ResolveWait` intent and wakes the scheduler
+- **AND** the scheduler attempts merge / resolve retry for `alpha` through the normal scheduler-owned retry path
+- **AND** `alpha` does not remain indefinitely in `resolve pending` solely because there was no queued apply/archive work
+
+#### Scenario: unchanged blocked retry intent does not busy loop
+
+- **GIVEN** change `alpha` is in `ResolveWait`
+- **AND** a scheduler-owned retry attempt reports that `alpha` is still blocked and remains in `ResolveWait`
+- **WHEN** no merge, resolve, rejection, queue, or explicit scheduler wake-up trigger occurs
+- **THEN** the scheduler does not retry `alpha` continuously on every idle timer tick
 
 #### Scenario: retry completion clears shared intent without TUI-local lane
 
@@ -860,7 +890,9 @@ The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned sched
 
 `ResolveWait` SHALL remain reducer-owned queued resolve intent. User-triggered retry intent for a `MergeWait` change MUST be recorded in shared orchestration state before execution begins, and the actual merge / resolve retry MUST be started by the normal scheduler path that consumes that shared intent.
 
-The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. A manual `ResolveMerge` request MUST therefore create scheduler-visible work even when no apply/archive tasks are queued or in flight.
+The scheduler MUST observe reducer-owned `ResolveWait` intent before concluding that all work is drained, before exiting a finite scheduler loop, or before sleeping as an idle persistent scheduler. Observing the intent is not sufficient: when the scheduler is woken for a manual resolve request, it MUST dispatch the scheduler-owned retry path for eligible `ResolveWait` changes even when no apply/archive work is queued or in flight.
+
+The scheduler MUST NOT continuously retry unchanged `ResolveWait` intent on every idle timer tick when retry remains blocked. Further retry attempts for unchanged blocked intent SHOULD be triggered by explicit scheduler wake-up, merge completion, resolve completion, rejection completion, queue changes, or a state transition that could make the retry newly eligible.
 
 Manual resolve lifecycle updates that complete, fail, cancel, or clear queued resolve intent MUST be applied to the shared orchestration reducer as scheduler-owned lifecycle transitions. Later refresh-driven reconciliation MUST NOT depend on a separate TUI-local execution lane to infer those transitions.
 
@@ -881,13 +913,21 @@ Canonical rule: ownership is split as **intent in reducer**, **execution in sche
 - **THEN** the scheduler starts the retry for `alpha`
 - **AND** execution ownership remains in the normal scheduler lifecycle
 
-#### Scenario: manual resolve intent prevents false scheduler drain
+#### Scenario: manual resolve notification dispatches retry without queued apply work
 
 - **GIVEN** no apply/archive work is queued or in flight
-- **AND** shared orchestration state contains `ResolveWait` intent for change `alpha`
-- **WHEN** the parallel scheduler evaluates whether all work is complete
-- **THEN** the scheduler does not exit or sleep as though no work exists before observing the intent
-- **AND** `alpha` remains eligible for scheduler-owned merge / resolve retry
+- **AND** change `alpha` is in `MergeWait`
+- **WHEN** the user presses `M` for `alpha`
+- **THEN** the TUI records reducer-owned `ResolveWait` intent and wakes the scheduler
+- **AND** the scheduler attempts merge / resolve retry for `alpha` through the normal scheduler-owned retry path
+- **AND** `alpha` does not remain indefinitely in `resolve pending` solely because there was no queued apply/archive work
+
+#### Scenario: unchanged blocked retry intent does not busy loop
+
+- **GIVEN** change `alpha` is in `ResolveWait`
+- **AND** a scheduler-owned retry attempt reports that `alpha` is still blocked and remains in `ResolveWait`
+- **WHEN** no merge, resolve, rejection, queue, or explicit scheduler wake-up trigger occurs
+- **THEN** the scheduler does not retry `alpha` continuously on every idle timer tick
 
 #### Scenario: retry completion clears shared intent without TUI-local lane
 
