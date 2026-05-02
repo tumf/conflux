@@ -148,6 +148,10 @@ pub struct ParallelExecutor {
     last_dispatched_resolve_wait_changes: HashSet<String>,
     /// One-shot flag to allow retry dispatch on explicit wake/completion triggers.
     resolve_wait_retry_triggered: bool,
+    /// Runtime-only observability dedupe for queue reconciliation diagnostics.
+    ///
+    /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
+    queue_reconciliation_diagnostics_seen: HashSet<(String, String)>,
 }
 
 #[cfg(test)]

@@ -13,6 +13,12 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueReconciliationDiagnosticLevel {
+    Info,
+    Warn,
+}
+
 use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::dynamic_queue::ReanalysisReason;
@@ -777,6 +783,43 @@ impl ParallelExecutor {
         }
     }
 
+    pub(super) fn should_emit_queue_reconciliation_diagnostic(
+        &mut self,
+        change_id: &str,
+        reason: &str,
+    ) -> bool {
+        self.queue_reconciliation_diagnostics_seen
+            .insert((change_id.to_string(), reason.to_string()))
+    }
+
+    async fn emit_queue_reconciliation_diagnostic(
+        &mut self,
+        level: QueueReconciliationDiagnosticLevel,
+        change_id: &str,
+        reason: &str,
+    ) {
+        if !self.should_emit_queue_reconciliation_diagnostic(change_id, reason) {
+            debug!(
+                change_id,
+                reason, "Suppressing repeated queue reconciliation diagnostic"
+            );
+            return;
+        }
+
+        let message = match level {
+            QueueReconciliationDiagnosticLevel::Info => LogEntry::info(format!(
+                "Queue reconciliation deferred for '{}': {}",
+                change_id, reason
+            )),
+            QueueReconciliationDiagnosticLevel::Warn => LogEntry::warn(format!(
+                "Queue reconciliation pending for '{}': {}",
+                change_id, reason
+            )),
+        };
+
+        send_event(&self.event_tx, ParallelEvent::Log(message)).await;
+    }
+
     pub(super) async fn reconcile_queued_candidates_from_shared_state(
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
@@ -830,12 +873,10 @@ impl ParallelExecutor {
                 continue;
             }
             if in_flight.contains(&queued_id) || reducer_active_set.contains(&queued_id) {
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Log(LogEntry::info(format!(
-                        "Queue reconciliation deferred for '{}': already_active",
-                        queued_id
-                    ))),
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    &queued_id,
+                    "already_active",
                 )
                 .await;
                 continue;
@@ -855,12 +896,10 @@ impl ParallelExecutor {
                         "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
                         queued_id
                     );
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Log(LogEntry::warn(format!(
-                            "Queue reconciliation pending for '{}': candidate_not_found",
-                            queued_id
-                        ))),
+                    self.emit_queue_reconciliation_diagnostic(
+                        QueueReconciliationDiagnosticLevel::Warn,
+                        &queued_id,
+                        "candidate_not_found",
                     )
                     .await;
                 }

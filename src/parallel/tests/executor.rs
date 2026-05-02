@@ -370,6 +370,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -483,6 +484,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -587,6 +589,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -740,6 +743,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -948,6 +952,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1148,6 +1153,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1354,6 +1360,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -3588,6 +3595,126 @@ async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state(
     );
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].id, selected);
+}
+
+#[tokio::test]
+async fn test_queue_reconciliation_diagnostic_dedupe_state_is_keyed_by_change_and_reason() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-a", "already_active"));
+    assert!(!executor.should_emit_queue_reconciliation_diagnostic("change-a", "already_active"));
+    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-a", "candidate_not_found"));
+    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-b", "already_active"));
+}
+
+#[tokio::test]
+async fn test_scheduler_reconciliation_active_diagnostic_is_bounded() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::from([selected.clone()]);
+
+    for _ in 0..3 {
+        let added = executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await;
+        assert_eq!(added, 0);
+    }
+
+    let mut already_active_logs = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.message.contains("Queue reconciliation deferred")
+                && log.message.contains("already_active")
+            {
+                already_active_logs += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        already_active_logs, 1,
+        "repeated active/in-flight reconciliation should emit one bounded diagnostic"
+    );
+    assert!(queued.is_empty());
+}
+
+#[tokio::test]
+async fn test_scheduler_reconciliation_missing_candidate_diagnostic_is_observable_but_bounded() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+    let missing_id = "missing-candidate-for-reconciliation-test".to_string();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![missing_id.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(missing_id.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+
+    for _ in 0..3 {
+        let added = executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+            .await;
+        assert_eq!(added, 0);
+    }
+
+    let mut candidate_not_found_logs = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.message.contains("Queue reconciliation pending")
+                && log.message.contains("candidate_not_found")
+            {
+                candidate_not_found_logs += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        candidate_not_found_logs, 1,
+        "missing candidate diagnostics should remain observable but bounded"
+    );
+    assert!(queued.is_empty());
 }
 
 #[tokio::test]
