@@ -25,4 +25,4 @@
 
 ## Acceptance #2 Failure Follow-up
 
-- [x] Repository-verified loop-level coverage for `no_available_slots` is now in place: `src/parallel/tests/executor.rs` updates `test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable` to run the scheduler loop path (`execute_with_order_based_reanalysis()`), saturates analysis capacity via `manual_resolve_counter`, and asserts the emitted diagnostic includes `reason=no_available_slots` from the scheduler-loop skip branch.
+- [x] Repository-verified loop-level coverage for `no_available_slots` is now in place: `src/parallel/tests/executor.rs` updates `test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable` to run the scheduler loop path (`execute_with_order_based_reanalysis()`), saturates analysis capacity via `manual_resolve_counter`, and asserts the emitted diagnostic includes `reason=no_available_slots` from the scheduler-loop skip branch. (verification: integration - `cargo test parallel::tests::executor::test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable -- --exact`)

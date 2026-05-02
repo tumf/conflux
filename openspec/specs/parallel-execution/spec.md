@@ -1055,21 +1055,30 @@ worktreeのtasks.mdから進捗を取得できない場合、archive/resolving�
 - **THEN** システムはバッチ完了を待たずに次の change を選定する
 
 ### Requirement: Re-analysis triggers and non-blocking scheduler
+
 re-analysis は apply/acceptance/archive/resolve の in-flight が存在していても開始できなければならない（MUST）。
 
 re-analysis ループは dispatch の完了待ちでブロックされてはならない（MUST NOT）。
 
-re-analysis の起動トリガは、キュー通知・デバウンスタイマー・in-flight 完了のいずれでもよい（MUST）。
+re-analysis の起動トリガは、キュー通知・デバウンスタイマー・in-flight 完了・reducer-visible queued intent reconciliation のいずれでもよい（MUST）。
 
 利用可能スロットが 0 の場合、システムは re-analysis を実行せず、空きができた時点で re-analysis を再評価しなければならない（MUST）。
 
-スケジューラの実装は、再分析・ディスパッチ選定・完了処理の責務をヘルパー関数に分割してもよい（MAY）。ただし、非ブロッキング性と起動条件の挙動は維持しなければならない（MUST）。
+スケジューラは reducer-visible queued work が存在するのに re-analysis を開始しない場合、その理由を観測可能なログまたはイベントとして出力しなければならない（SHALL）。
 
 #### Scenario: キュー変化でre-analysisが起動する
 - **GIVEN** apply 実行中の change が存在する
 - **AND** queued に新しい change が追加される
 - **WHEN** 並列実行が re-analysis を評価する
 - **THEN** apply 完了を待たずに re-analysis が開始される
+
+#### Scenario: reducer queued intentでre-analysisが起動する
+- **GIVEN** reducer state に queued intent を持つ change が存在する
+- **AND** scheduler-local queued list にはその change が存在しない
+- **AND** 利用可能なスロットが1以上である
+- **WHEN** 並列実行が re-analysis を評価する
+- **THEN** scheduler は reducer-visible queued intent を analysis candidate に取り込む
+- **AND** dynamic queue notification だけに依存せず re-analysis を開始する
 
 #### Scenario: in-flight 完了でre-analysisが再開する
 - **GIVEN** apply/acceptance/archive/resolve の in-flight が存在する
@@ -1089,6 +1098,7 @@ re-analysis の起動トリガは、キュー通知・デバウンスタイマ�
 - **WHEN** 並列実行が re-analysis を評価する
 - **THEN** re-analysis は実行されない
 - **AND** スロットが空いた時点で re-analysis が再評価される
+- **AND** no available slots の理由がログまたはイベントで観測できる
 
 ### Requirement: In-flight tracking and slot-based dispatch
 
@@ -1121,13 +1131,16 @@ re-analysis の `order` は依存関係の制約として扱い、依存解決�
 - **AND** queued の change はスロットが空くまで dispatch されない
 
 ### Requirement: Queue ingestion and analysis targeting
+
 並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
 
 キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
 
-queued の change が空の場合、analysis を実行してはならない（MUST）。
+scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
 
-実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。
+queued の change が空の場合、analysis を実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconcile を試みなければならない（MUST）。
+
+実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
@@ -1137,14 +1150,41 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **WHEN** 並列実行が analysis を開始する
 - **THEN** analysis 対象は queued の change のみになる
 
+#### Scenario: reducer queued intent が scheduler-local queued に反映される
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** `beta` is not terminal
+- **AND** `beta` is not active or in-flight
+- **AND** `beta` can be loaded from active OpenSpec changes
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler reconciles queued candidates before analysis
+- **THEN** `beta` is added to scheduler-local queued candidates
+- **AND** the next analysis includes `beta`
+
+#### Scenario: dynamic queue notification miss is recoverable
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** the dynamic queue notification for `beta` was missed or already popped
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler loop next reconciles queued candidates
+- **THEN** `beta` is still eligible for analysis through reducer-visible queued intent
+- **AND** `beta` does not remain indefinitely queued without analysis solely because the notification was missed
+
+#### Scenario: candidate load failure is observable and retried
+- **GIVEN** dynamic queue ingestion sees queued change id `beta`
+- **AND** active OpenSpec change loading does not currently return `beta`
+- **WHEN** scheduler ingestion skips `beta`
+- **THEN** the skip reason is logged or emitted as candidate not found
+- **AND** if reducer-visible queued intent for `beta` remains and `beta` later becomes loadable, reconciliation can add `beta` to analysis candidates
+
 #### Scenario: queuedが空ならanalysisを実行しない
 - **GIVEN** queued の change が存在しない
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行が analysis を開始しようとする
 - **THEN** analysis を実行しない
 
 #### Scenario: 実行中とqueuedが空なら終了する
 - **GIVEN** 実行中の change が存在しない
 - **AND** queued の change も空である
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行ループが次の analysis を開始しようとする
 - **THEN** analysis を実行しない
 - **AND** オーケストレーションは完了状態になる
@@ -1551,15 +1591,16 @@ When a reused worktree is not archive-complete:
 - **AND** archive is not selected as the first resumed non-terminal step
 
 ### Requirement: Queue ingestion and analysis targeting
+
 並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
 
 キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
 
-queued の change が空の場合、analysis を実行してはならない（MUST）。
+scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
 
-CLI の `run` サブコマンドでは、実行中の change が存在せず queued の change も空である場合、オーケストレーションは完了状態にならなければならない（MUST）。
+queued の change が空の場合、analysis を実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconcile を試みなければならない（MUST）。
 
-通常の cflx ループ型実行では、ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
+実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
@@ -1569,36 +1610,44 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **WHEN** 並列実行が analysis を開始する
 - **THEN** analysis 対象は queued の change のみになる
 
+#### Scenario: reducer queued intent が scheduler-local queued に反映される
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** `beta` is not terminal
+- **AND** `beta` is not active or in-flight
+- **AND** `beta` can be loaded from active OpenSpec changes
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler reconciles queued candidates before analysis
+- **THEN** `beta` is added to scheduler-local queued candidates
+- **AND** the next analysis includes `beta`
+
+#### Scenario: dynamic queue notification miss is recoverable
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** the dynamic queue notification for `beta` was missed or already popped
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler loop next reconciles queued candidates
+- **THEN** `beta` is still eligible for analysis through reducer-visible queued intent
+- **AND** `beta` does not remain indefinitely queued without analysis solely because the notification was missed
+
+#### Scenario: candidate load failure is observable and retried
+- **GIVEN** dynamic queue ingestion sees queued change id `beta`
+- **AND** active OpenSpec change loading does not currently return `beta`
+- **WHEN** scheduler ingestion skips `beta`
+- **THEN** the skip reason is logged or emitted as candidate not found
+- **AND** if reducer-visible queued intent for `beta` remains and `beta` later becomes loadable, reconciliation can add `beta` to analysis candidates
+
 #### Scenario: queuedが空ならanalysisを実行しない
 - **GIVEN** queued の change が存在しない
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行が analysis を開始しようとする
 - **THEN** analysis を実行しない
 
-#### Scenario: CLI run は空キューで終了する
-- **GIVEN** CLI の `run` サブコマンドで並列実行している
-- **AND** 実行中の change が存在しない
+#### Scenario: 実行中とqueuedが空なら終了する
+- **GIVEN** 実行中の change が存在しない
 - **AND** queued の change も空である
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行ループが次の analysis を開始しようとする
 - **THEN** analysis を実行しない
 - **AND** オーケストレーションは完了状態になる
-
-#### Scenario: 通常の cflx 実行は空キューでも待機を継続する
-- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
-- **AND** ユーザが停止していない
-- **AND** 実行中の change が存在しない
-- **AND** queued の change も空である
-- **WHEN** 並列実行ループが次の analysis を開始しようとする
-- **THEN** analysis を実行しない
-- **AND** オーケストレーション実行ループは終了しない
-- **AND** 新しく queued になった change を待機する
-
-#### Scenario: 通常の cflx 実行の idle待機中のqueued追加でanalysisが再開する
-- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
-- **AND** ユーザが停止していない
-- **AND** 並列実行ループが queued 0 件・実行中 0 件で待機中である
-- **WHEN** change が queued に追加される
-- **THEN** 実行ループは queue 通知を受け取る
-- **AND** analysis を再評価する
 
 #### Scenario: queued外のchangeはanalysis対象から除外される
 - **GIVEN** queued に含まれない change が存在する
