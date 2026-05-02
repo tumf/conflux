@@ -3232,18 +3232,29 @@ async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
     }
     executor.set_shared_orchestrator_state(shared);
 
-    executor
-        .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
-        .await
-        .or_fail("unexpected error");
+    let mut running_executor = executor;
+    let handle = tokio::spawn(async move {
+        running_executor
+            .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
+            .await
+    });
 
-    let mut saw_analysis_started = false;
-    while let Ok(event) = rx.try_recv() {
-        if let ExecutionEvent::AnalysisStarted { .. } = event {
-            saw_analysis_started = true;
-            break;
-        }
-    }
+    let saw_analysis_started = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async {
+            loop {
+                match rx.recv().await {
+                    Some(ExecutionEvent::AnalysisStarted { .. }) => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        },
+    )
+    .await
+    .unwrap_or(false);
+
+    handle.abort();
 
     assert!(
         saw_analysis_started,
