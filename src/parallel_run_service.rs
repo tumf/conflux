@@ -1043,6 +1043,12 @@ mod tests {
             return;
         }
 
+        let _ = Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "initial commit"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await;
+
         let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
         let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
