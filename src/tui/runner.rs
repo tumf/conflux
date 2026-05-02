@@ -76,6 +76,10 @@ fn should_skip_local_refresh(repo_root: &Path, stale_refresh_root_warned: &mut b
     false
 }
 
+fn should_bypass_local_refresh(is_remote_mode: bool) -> bool {
+    is_remote_mode
+}
+
 pub async fn run_tui_with_remote(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
@@ -512,7 +516,7 @@ async fn run_tui_loop(
     let refresh_config = config.clone();
     let refresh_handle = tokio::spawn(async move {
         // Skip local refresh entirely in remote mode; WS task handles updates.
-        if is_remote_mode {
+        if should_bypass_local_refresh(is_remote_mode) {
             return;
         }
 
@@ -929,5 +933,26 @@ mod tests {
             &mut warned
         ));
         assert!(!warned, "usable root should reset warned flag");
+    }
+
+    #[test]
+    fn local_refresh_not_skipped_for_existing_root() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut warned = false;
+
+        assert!(!super::should_skip_local_refresh(
+            temp_dir.path(),
+            &mut warned
+        ));
+        assert!(
+            !warned,
+            "existing root should not trigger stale warning suppression"
+        );
+    }
+
+    #[test]
+    fn remote_mode_bypasses_local_refresh_path() {
+        assert!(super::should_bypass_local_refresh(true));
+        assert!(!super::should_bypass_local_refresh(false));
     }
 }

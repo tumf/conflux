@@ -4,11 +4,11 @@
 
 - [x] Bound stale-root warning volume. Completion condition: a missing or invalid refresh root produces at most one warning per affected TUI session, or uses an explicit backoff/rate limiter that prevents one warning per refresh tick. (verification: unit - add `src/tui/runner.rs` helper tests or `src/tui/tests` coverage that simulates multiple refresh ticks for the same missing root and asserts only one stale-root warning/log event or one warning within the rate-limit window)
 
-- [ ] Preserve actionable warnings for existing roots. Completion condition: when the refresh root exists but git snapshot commands fail for a real command reason, the TUI still logs `Failed to refresh ... snapshot` or an equivalent actionable warning with command/root context. (verification: unit/integration - add `src/tui/runner.rs` or `src/vcs` test coverage using an existing temp directory with a controlled failing git/VCS command path and assert the failure remains visible)
+- [x] Preserve actionable warnings for existing roots. Completion condition: when the refresh root exists but git snapshot commands fail for a real command reason, the TUI still logs `Failed to refresh ... snapshot` or an equivalent actionable warning with command/root context. (verification: unit/integration - add `src/tui/runner.rs` or `src/vcs` test coverage using an existing temp directory with a controlled failing git/VCS command path and assert the failure remains visible)
 
-- [ ] Keep remote mode unchanged. Completion condition: WebSocket/remote mode continues to return before local auto-refresh starts and does not run local stale-root checks. (verification: unit - cover the `is_remote_mode` path in `src/tui/runner.rs` tests or update existing remote-mode runner tests to assert local refresh setup is bypassed)
+- [x] Keep remote mode unchanged. Completion condition: WebSocket/remote mode continues to return before local auto-refresh starts and does not run local stale-root checks. (verification: unit - cover the `is_remote_mode` path in `src/tui/runner.rs` tests or update existing remote-mode runner tests to assert local refresh setup is bypassed)
 
-- [ ] Validate formatting and targeted regression coverage. Completion condition: formatting passes and targeted tests for the new stale-root behavior pass; any test taking over 1 second is optimized or marked heavy. (verification: integration - `cargo fmt --check`; targeted `cargo test` for the added TUI refresh tests)
+- [x] Validate formatting and targeted regression coverage. Completion condition: formatting passes and targeted tests for the new stale-root behavior pass; any test taking over 1 second is optimized or marked heavy. (verification: integration - `cargo fmt --check`; targeted `cargo test` for the added TUI refresh tests)
 
 ## Future Work
 
