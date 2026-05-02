@@ -1,0 +1,11 @@
+## Implementation Tasks
+
+- [x] Add queue reconciliation diagnostic dedupe/rate-limit state to the scheduler or queue-state layer. Completion condition: repeated `(change_id, reason)` diagnostics can be suppressed without changing queue insertion decisions in `src/parallel/queue_state.rs`. (verification: unit - added `test_queue_reconciliation_diagnostic_dedupe_state_is_keyed_by_change_and_reason`; ran `cargo test queue_reconciliation_diagnostic_dedupe_state_is_keyed_by_change_and_reason`)
+- [x] Route `already_active` queue reconciliation diagnostics through the bounded logging path. Completion condition: stable active/in-flight queued intent no longer emits a TUI-visible `already_active` log on every scheduler loop. (verification: integration - added and ran `cargo test scheduler_reconciliation`, including `test_scheduler_reconciliation_active_diagnostic_is_bounded`)
+- [x] Keep actionable queue reconciliation diagnostics observable while bounding duplicates. Completion condition: `candidate_not_found` or equivalent candidate-load failure still emits at least one user-visible diagnostic, but identical repeated observations are deduplicated or rate-limited. (verification: integration - added and ran `cargo test scheduler_reconciliation`, including `test_scheduler_reconciliation_missing_candidate_diagnostic_is_observable_but_bounded`)
+- [x] Preserve scheduler reconciliation semantics. Completion condition: active/in-flight changes are not added to scheduler-local `queued`, and the same reducer-queued change is added after active/in-flight state clears. (verification: integration - ran `cargo test scheduler_reconciliation`; existing `test_scheduler_reconciliation_recovers_when_change_leaves_active_state` passes)
+- [x] Verify proposal and repository checks. Completion condition: OpenSpec validation and targeted Rust verification pass. (verification: manual - ran `cflx openspec validate fix-queue-reconciliation-log-spam --strict --evidence warn`, `cargo fmt --all -- --check`, and `cargo test scheduler_reconciliation`)
+
+## Future Work
+
+- Consider applying the same bounded diagnostic pattern to other scheduler loop logs only if they show comparable TUI flooding in real runs.
