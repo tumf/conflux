@@ -3203,6 +3203,178 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
 }
 
 #[tokio::test]
+async fn test_scheduler_reconciles_reducer_queued_intent_into_local_candidates() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        added, 1,
+        "reconciliation should add reducer-queued candidates"
+    );
+    assert_eq!(
+        queued.len(),
+        1,
+        "local queue should receive reducer candidate"
+    );
+    assert_eq!(queued[0].id, selected);
+}
+
+#[tokio::test]
+async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::from([selected.clone()]);
+
+    let added_while_active = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(
+        added_while_active, 0,
+        "active/in-flight change should not be duplicated into local queue"
+    );
+    assert!(queued.is_empty());
+
+    let added_after_release = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+    assert_eq!(
+        added_after_release, 1,
+        "same reducer-queued change should be recoverable after active state clears"
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, selected);
+}
+
+#[tokio::test]
+async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("queued-without-slot")];
+    let mut in_flight = HashSet::from(["already-running".to_string()]);
+
+    let (_should_break, _iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            2,
+            ReanalysisReason::QueueNotification,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    let mut saw_diagnostic = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            let message = log.message;
+            if message.contains("No analysis started despite reducer-visible queued work")
+                && message.contains("reason=no_available_slots")
+            {
+                saw_diagnostic = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_diagnostic,
+        "scheduler should emit diagnostic when reducer-visible queued work cannot start analysis"
+    );
+}
+
+#[tokio::test]
 async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
     use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;

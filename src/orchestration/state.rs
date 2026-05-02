@@ -725,7 +725,13 @@ impl OrchestratorState {
     pub fn active_change_ids(&self) -> Vec<String> {
         self.change_runtime
             .iter()
-            .filter_map(|(id, rt)| if rt.is_active() { Some(id.clone()) } else { None })
+            .filter_map(|(id, rt)| {
+                if rt.is_active() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 

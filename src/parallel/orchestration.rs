@@ -153,7 +153,15 @@ impl ParallelExecutor {
             self.sync_resolve_wait_from_shared_state_nonblocking();
             self.maybe_dispatch_resolve_wait_retry().await;
 
-            // Step 2: Re-analysis decision is derived from scheduler state.
+            // Step 2: Reconcile reducer-visible queue intent into scheduler-local candidates.
+            let reconciled = self
+                .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+                .await;
+            if reconciled > 0 {
+                reanalysis_reason = ReanalysisReason::QueueNotification;
+            }
+
+            // Step 3: Re-analysis decision is derived from scheduler state.
             let work_drained = queued.is_empty()
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
