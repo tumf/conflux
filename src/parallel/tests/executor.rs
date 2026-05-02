@@ -3213,6 +3213,7 @@ async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
     let repo_root = PathBuf::from(".");
     let (tx, mut rx) = mpsc::channel(64);
     let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+    executor.scheduler_lifetime = SchedulerLifetime::Finite;
 
     let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
     if all_changes.is_empty() {
