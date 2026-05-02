@@ -79,6 +79,7 @@ mod tests {
         StallDetectionConfig {
             enabled: true,
             threshold,
+            ..Default::default()
         }
     }
 
@@ -110,6 +111,7 @@ mod tests {
         let config = StallDetectionConfig {
             enabled: false,
             threshold: 2,
+            ..Default::default()
         };
         let mut detector = StallDetector::new(config);
 

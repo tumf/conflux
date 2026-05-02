@@ -74,6 +74,14 @@ pub struct StallDetectionConfig {
     /// Consecutive empty commit threshold before stalling.
     #[serde(default = "default_stall_detection_threshold")]
     pub threshold: u32,
+    /// Empty-WIP count after which apply retries may switch to escalation.
+    /// When unset, apply escalation is disabled even if an escalation command is configured.
+    #[serde(default)]
+    pub apply_escalation_after_empty_wip: Option<u32>,
+    /// Maximum number of escalation command uses per empty-WIP stall sequence.
+    /// When unset, apply escalation is disabled even if an escalation command is configured.
+    #[serde(default)]
+    pub apply_escalation_max_uses_per_stall: Option<u32>,
 }
 
 impl Default for StallDetectionConfig {
@@ -81,7 +89,38 @@ impl Default for StallDetectionConfig {
         Self {
             enabled: DEFAULT_STALL_DETECTION_ENABLED,
             threshold: DEFAULT_STALL_DETECTION_THRESHOLD,
+            apply_escalation_after_empty_wip: DEFAULT_APPLY_ESCALATION_AFTER_EMPTY_WIP,
+            apply_escalation_max_uses_per_stall: DEFAULT_APPLY_ESCALATION_MAX_USES_PER_STALL,
         }
+    }
+}
+
+impl StallDetectionConfig {
+    /// Validate empty-WIP stall and escalation policy boundaries.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(after) = self.apply_escalation_after_empty_wip {
+            if after >= self.threshold {
+                return Err(OrchestratorError::ConfigLoad(format!(
+                    "stall_detection.apply_escalation_after_empty_wip ({after}) must be less than stall_detection.threshold ({})",
+                    self.threshold
+                )));
+            }
+        }
+
+        if matches!(self.apply_escalation_max_uses_per_stall, Some(0)) {
+            return Err(OrchestratorError::ConfigLoad(
+                "stall_detection.apply_escalation_max_uses_per_stall must be at least 1 when set"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Return true when both escalation policy knobs make escalation eligible.
+    pub fn apply_escalation_policy_enabled(&self) -> bool {
+        self.apply_escalation_after_empty_wip.is_some()
+            && self.apply_escalation_max_uses_per_stall.is_some()
     }
 }
 
@@ -121,6 +160,16 @@ pub struct OrchestratorConfig {
     /// Supports `{change_id}` placeholder.
     #[serde(default)]
     pub apply_command: Option<String>,
+
+    /// Optional command template for late empty-WIP apply retries.
+    /// Supports `{change_id}` and `{prompt}` placeholders. When absent, escalation is a silent no-op.
+    #[serde(default)]
+    pub apply_escalation_command: Option<String>,
+
+    /// Optional command template for diagnosing final empty-WIP apply stalls.
+    /// Supports `{change_id}` and `{prompt}` placeholders. When absent, diagnosis is a silent no-op.
+    #[serde(default)]
+    pub apply_stall_diagnose_command: Option<String>,
 
     /// Command template for archiving changes.
     /// Supports `{change_id}` placeholder.
@@ -595,6 +644,12 @@ impl OrchestratorConfig {
         if other.apply_command.is_some() {
             self.apply_command = other.apply_command;
         }
+        if other.apply_escalation_command.is_some() {
+            self.apply_escalation_command = other.apply_escalation_command;
+        }
+        if other.apply_stall_diagnose_command.is_some() {
+            self.apply_stall_diagnose_command = other.apply_stall_diagnose_command;
+        }
         if other.archive_command.is_some() {
             self.archive_command = other.archive_command;
         }
@@ -746,6 +801,16 @@ impl OrchestratorConfig {
         self.apply_command
             .as_deref()
             .ok_or_else(|| OrchestratorError::ConfigLoad("Missing required config: apply_command. Please set it in .cflx.jsonc or global config.".to_string()))
+    }
+
+    /// Get the optional apply escalation command template.
+    pub fn get_apply_escalation_command(&self) -> Option<&str> {
+        self.apply_escalation_command.as_deref()
+    }
+
+    /// Get the optional apply stall diagnosis command template.
+    pub fn get_apply_stall_diagnose_command(&self) -> Option<&str> {
+        self.apply_stall_diagnose_command.as_deref()
     }
 
     /// Get the archive command (required, returns error if not set)
@@ -958,6 +1023,8 @@ impl OrchestratorConfig {
     /// Validate that all required commands are present in the merged configuration.
     /// Required commands: apply_command, archive_command, analyze_command, acceptance_command, resolve_command
     pub fn validate_required_commands(&self) -> Result<()> {
+        self.get_stall_detection().validate()?;
+
         let mut missing = Vec::new();
 
         if self.apply_command.is_none() {

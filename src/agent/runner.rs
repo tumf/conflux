@@ -48,6 +48,17 @@ fn expand_command_with_prompt(template: &str, change_id: Option<&str>, prompt: &
     OrchestratorConfig::expand_prompt(&command, prompt)
 }
 
+fn tail_lines(lines: Vec<String>, max_lines: usize) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.len() > max_lines {
+        Some(lines[lines.len() - max_lines..].join("\n"))
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 /// Keep legacy/test-only entrypoints reachable for strict dead_code linting.
 ///
 /// These symbols are intentionally retained for compatibility boundaries and
@@ -218,6 +229,50 @@ impl AgentRunner {
         Ok((child, rx, start))
     }
 
+    async fn run_apply_template_streaming_with_runner(
+        &mut self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+        cwd: Option<&Path>,
+        template: &str,
+        stage_label: &'static str,
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
+        let start = Instant::now();
+        // Get acceptance tail first (requires &mut self)
+        let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
+
+        // Then get immutable data
+        let user_prompt = self.config.get_apply_prompt();
+        let history_context = self.apply_history.format_context(change_id);
+
+        // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
+        let full_prompt =
+            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
+
+        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
+        info!(
+            module = module_path!(),
+            change_id = change_id,
+            stage = stage_label,
+            "Running apply-stage command via AiCommandRunner: {}",
+            command
+        );
+
+        // Execute via AiCommandRunner (with shared stagger state)
+        let (child, ai_rx) = ai_runner
+            .execute_streaming_with_retry(&command, cwd, Some(stage_label), Some(change_id))
+            .await?;
+
+        let rx = bridge_ai_output_channel(ai_rx);
+
+        Ok((child, rx, start, command))
+    }
+
     /// Run apply command using AiCommandRunner with streaming output.
     /// This ensures apply commands share stagger state with acceptance/archive/resolve.
     /// Returns a child process handle, a receiver for output lines, a start time, and the command string.
@@ -239,33 +294,40 @@ impl AgentRunner {
         Instant,
         String,
     )> {
-        let start = Instant::now();
-        // Get acceptance tail first (requires &mut self)
-        let acceptance_tail = self.get_acceptance_tail_context_for_apply(change_id);
+        let template = self.config.get_apply_command()?.to_string();
+        self.run_apply_template_streaming_with_runner(change_id, ai_runner, cwd, &template, "apply")
+            .await
+    }
 
-        // Then get immutable data
-        let template = self.config.get_apply_command()?;
-        let user_prompt = self.config.get_apply_prompt();
-        let history_context = self.apply_history.format_context(change_id);
-
-        // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt =
-            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
-
-        let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
-        info!(
-            module = module_path!(),
-            "Running apply command via AiCommandRunner: {}", command
-        );
-
-        // Execute via AiCommandRunner (with shared stagger state)
-        let (child, ai_rx) = ai_runner
-            .execute_streaming_with_retry(&command, cwd, Some("apply"), Some(change_id))
-            .await?;
-
-        let rx = bridge_ai_output_channel(ai_rx);
-
-        Ok((child, rx, start, command))
+    /// Run optional apply escalation command using the normal apply prompt/history context.
+    pub async fn run_apply_escalation_streaming_with_runner(
+        &mut self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+        cwd: Option<&Path>,
+    ) -> Result<(
+        StreamingChildHandle,
+        mpsc::Receiver<OutputLine>,
+        Instant,
+        String,
+    )> {
+        let template = self
+            .config
+            .get_apply_escalation_command()
+            .ok_or_else(|| {
+                OrchestratorError::ConfigLoad(
+                    "Missing optional config: apply_escalation_command".to_string(),
+                )
+            })?
+            .to_string();
+        self.run_apply_template_streaming_with_runner(
+            change_id,
+            ai_runner,
+            cwd,
+            &template,
+            "apply_escalation",
+        )
+        .await
     }
 
     /// Record an apply attempt after streaming execution completes.
@@ -375,6 +437,55 @@ impl AgentRunner {
         let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx, start, command))
+    }
+
+    /// Run optional apply stall diagnosis command and collect its output.
+    /// Diagnosis uses the normal apply prompt/history context but is intentionally
+    /// not recorded as an apply attempt so it cannot affect retry routing semantics.
+    pub async fn run_apply_stall_diagnose_with_runner(
+        &mut self,
+        change_id: &str,
+        ai_runner: &crate::ai_command_runner::AiCommandRunner,
+        cwd: Option<&Path>,
+    ) -> Result<(ExitStatus, Option<String>, Option<String>, String)> {
+        let template = self
+            .config
+            .get_apply_stall_diagnose_command()
+            .ok_or_else(|| {
+                OrchestratorError::ConfigLoad(
+                    "Missing optional config: apply_stall_diagnose_command".to_string(),
+                )
+            })?
+            .to_string();
+        let (mut child, mut output_rx, _start, command) = self
+            .run_apply_template_streaming_with_runner(
+                change_id,
+                ai_runner,
+                cwd,
+                &template,
+                "apply_stall_diagnose",
+            )
+            .await?;
+
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+        while let Some(line) = output_rx.recv().await {
+            match line {
+                OutputLine::Stdout(s) => stdout_lines.push(s),
+                OutputLine::Stderr(s) => stderr_lines.push(s),
+            }
+        }
+
+        let status = child.wait().await.map_err(|e| {
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for apply stall diagnosis for '{}': {}",
+                change_id, e
+            ))
+        })?;
+
+        let stdout_tail = tail_lines(stdout_lines, 20);
+        let stderr_tail = tail_lines(stderr_lines, 20);
+        Ok((status, stdout_tail, stderr_tail, command))
     }
 
     /// Run apply command for the given change ID (blocking, no streaming)
