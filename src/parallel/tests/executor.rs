@@ -3313,29 +3313,24 @@ async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state(
 async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
     use crate::events::ExecutionEvent;
     use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use crate::parallel::dynamic_queue::ReanalysisReason;
-    use crate::parallel::WorkspaceResult;
-    use crate::vcs::VcsBackend;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
-    use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock, Semaphore};
-    use tokio::task::JoinSet;
-
-    let repo_dir = TempDir::new().or_fail("unexpected error");
-    init_git_repo(repo_dir.path()).await;
+    use tokio::sync::{mpsc, RwLock};
 
     let config = create_test_config();
-    let (tx, mut rx) = mpsc::channel(32);
-    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(PathBuf::from("."), config, Some(tx));
+    executor.scheduler_lifetime = SchedulerLifetime::Finite;
 
     let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
     if all_changes.is_empty() {
         return;
     }
+
     let selected = all_changes[0].id.clone();
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
         vec![selected.clone()],
-        3,
+        1,
         ExecutionMode::Parallel,
     )));
     {
@@ -3343,46 +3338,40 @@ async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
         guard.apply_command(ReducerCommand::AddToQueue(selected));
     }
     executor.set_shared_orchestrator_state(shared);
+    let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
+    executor.set_manual_resolve_counter(manual_resolve_counter);
 
-    let semaphore = Arc::new(Semaphore::new(1));
-    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
-    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
-        VcsBackend::Git,
-        repo_dir.path().to_path_buf(),
-    );
-    let mut queued = vec![make_test_change("queued-without-slot")];
-    let mut in_flight = HashSet::from(["already-running".to_string()]);
+    let mut running_executor = executor;
+    let handle = tokio::spawn(async move {
+        running_executor
+            .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
+            .await
+    });
 
-    let (_should_break, _iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            2,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
-            semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
-        .await
-        .or_fail("unexpected error");
-
-    let mut saw_diagnostic = false;
-    while let Ok(event) = rx.try_recv() {
-        if let ExecutionEvent::Log(log) = event {
-            let message = log.message;
-            if message.contains("No analysis started despite reducer-visible queued work")
-                && message.contains("reason=no_available_slots")
-            {
-                saw_diagnostic = true;
+    let saw_diagnostic = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match rx.recv().await {
+                Some(ExecutionEvent::Log(log)) => {
+                    let message = log.message;
+                    if message.contains("No analysis started despite reducer-visible queued work")
+                        && message.contains("reason=no_available_slots")
+                    {
+                        break true;
+                    }
+                }
+                Some(_) => continue,
+                None => break false,
             }
         }
-    }
+    })
+    .await
+    .unwrap_or(false);
+
+    handle.abort();
 
     assert!(
         saw_diagnostic,
-        "scheduler should emit diagnostic when reducer-visible queued work cannot start analysis"
+        "scheduler loop should emit no_available_slots diagnostic when queued intent exists but slots are saturated"
     );
 }
 

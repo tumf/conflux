@@ -22,3 +22,7 @@
 
 - [x] Task 2 / explicit completion condition is now repository-verified at the scheduler-loop boundary: `src/parallel/tests/executor.rs` includes `test_scheduler_loop_reanalysis_with_reducer_queued_intent`, which starts from reducer queued intent with an empty scheduler-local queue, runs `execute_with_order_based_reanalysis()`, and asserts `AnalysisStarted` is observed without relying on dynamic queue notification.
 - [x] The real scheduler loop now emits the required `no_available_slots` diagnostic: `src/parallel/orchestration.rs` emits `emit_no_analysis_diagnostic(..., "no_available_slots")` in the scheduler-loop no-slot branch, and `src/parallel/tests/executor.rs` verifies this behavior in `test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable` at loop level.
+
+## Acceptance #2 Failure Follow-up
+
+- [ ] The `no_available_slots` diagnostic fix is implemented in the real scheduler loop but still lacks repository-verified loop-level coverage: `src/parallel/orchestration.rs:193-224` now emits `emit_no_analysis_diagnostic(..., "no_available_slots")` when `available_slots == 0`, but `src/parallel/tests/executor.rs:3313-3369` still tests only the direct `perform_reanalysis_and_dispatch()` helper path. Add or adjust a test that runs `execute_with_order_based_reanalysis()` with reducer-visible queued intent, an empty/local reconciled queue, and a saturated slot/in-flight state, then asserts the `reason=no_available_slots` diagnostic is observed from the scheduler loop skip branch.
