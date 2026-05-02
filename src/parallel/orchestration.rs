@@ -151,6 +151,7 @@ impl ParallelExecutor {
             // Step 2: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
             // This keeps manual resolve dispatch reducer-owned while making scheduler work detection truthful.
             self.sync_resolve_wait_from_shared_state_nonblocking();
+            self.maybe_dispatch_resolve_wait_retry().await;
 
             // Step 2: Re-analysis decision is derived from scheduler state.
             let work_drained = queued.is_empty()
@@ -230,6 +231,7 @@ impl ParallelExecutor {
                             } else {
                                 ReanalysisReason::Completion
                             };
+                            self.trigger_resolve_wait_retry_dispatch();
                         }
                         Err(e) => {
                             error!("Task panicked: {:?}", e);
@@ -240,6 +242,7 @@ impl ParallelExecutor {
                 // Background merge completion: merge+cleanup finished asynchronously
                 Some(merge_result) = merge_result_rx.recv() => {
                     self.handle_merge_result(merge_result).await;
+                    self.trigger_resolve_wait_retry_dispatch();
                     reanalysis_reason = ReanalysisReason::ResolveCompletion;
                 }
 
@@ -253,6 +256,7 @@ impl ParallelExecutor {
                     }
                 } => {
                     info!("Queue notification received, will check queue on next iteration");
+                    self.trigger_resolve_wait_retry_dispatch();
                     // Queue check happens at loop start
                 }
 

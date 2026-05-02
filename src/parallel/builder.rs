@@ -162,6 +162,8 @@ impl ParallelExecutor {
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             scheduler_lifetime: SchedulerLifetime::Finite,
             shared_orchestrator_state: None,
+            last_dispatched_resolve_wait_changes: HashSet::new(),
+            resolve_wait_retry_triggered: false,
         }
     }
 
