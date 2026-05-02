@@ -1002,6 +1002,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prepare_parallel_execution_empty_parallel_without_resolve_wait_is_noop() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = Vec::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        let result = service
+            .prepare_parallel_execution(changes, &event_tx, false)
+            .await
+            .expect("prepare_parallel_execution");
+
+        assert!(
+            result.is_none(),
+            "empty startup without reducer-owned ResolveWait must remain a safe no-op"
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_parallel_all_rejected_forwards_event_to_callback() {
         let temp_dir = TempDir::new().expect("tempdir");
         if !init_git_repo(&temp_dir).await {
