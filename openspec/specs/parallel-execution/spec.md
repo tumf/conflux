@@ -11,6 +11,7 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 サービスはイベント通知のためのコールバック機構を受け取り、TUIへ送るイベントは共有状態の更新より先に送信しなければならない（MUST）。これによりUI更新が共有状態のロック待ちで遅延しない。
 
 サービスは以下をカプセル化すること：
+
 - Git availability checking
 - Change grouping by dependencies
 - ParallelExecutor coordination
@@ -19,6 +20,8 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
 When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
+
+The loop-based frontend startup path SHALL preserve reducer-owned `ResolveWait` before calling into `ParallelRunService`; otherwise the service cannot distinguish an intentional empty retry run from a true no-op.
 
 #### Scenario: empty active changes with resolve wait enters scheduler retry
 
@@ -29,12 +32,27 @@ When invoked by a loop-based frontend with no active changes but with reducer-ow
 **And**: the executor synchronizes `ResolveWait` from shared state
 **And**: scheduler-owned merge retry dispatch is attempted for `alpha`
 
+#### Scenario: frontend preserves resolve wait before service invocation
+
+**Given**: a loop-based frontend is about to invoke `ParallelRunService` with an empty active change list for manual resolve
+**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
+**When**: the frontend performs run startup initialization
+**Then**: it preserves the shared reducer state containing `alpha`
+**And**: `ParallelRunService` receives an executor whose `has_resolve_wait()` returns true
+
 #### Scenario: normal committed-change filtering still applies to active changes
 
 **Given**: `ParallelRunService` is invoked with active changes to apply
 **When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
 **Then**: that active change is skipped with the existing warning/rejection events
 **And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
+
+#### Scenario: true empty run remains no-op
+
+**Given**: `ParallelRunService` is invoked with an empty active change list
+**And**: the shared orchestrator state has no `ResolveWait` work
+**When**: startup evaluates work availability
+**Then**: the service returns without dispatching apply, merge retry, or resolve work
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1372,6 +1390,7 @@ When apply execution records a rejection proposal by generating `openspec/change
 サービスはイベント通知のためのコールバック機構を受け取り、TUIへ送るイベントは共有状態の更新より先に送信しなければならない（MUST）。これによりUI更新が共有状態のロック待ちで遅延しない。
 
 サービスは以下をカプセル化すること：
+
 - Git availability checking
 - Change grouping by dependencies
 - ParallelExecutor coordination
@@ -1380,6 +1399,8 @@ When apply execution records a rejection proposal by generating `openspec/change
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
 When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
+
+The loop-based frontend startup path SHALL preserve reducer-owned `ResolveWait` before calling into `ParallelRunService`; otherwise the service cannot distinguish an intentional empty retry run from a true no-op.
 
 #### Scenario: empty active changes with resolve wait enters scheduler retry
 
@@ -1390,12 +1411,27 @@ When invoked by a loop-based frontend with no active changes but with reducer-ow
 **And**: the executor synchronizes `ResolveWait` from shared state
 **And**: scheduler-owned merge retry dispatch is attempted for `alpha`
 
+#### Scenario: frontend preserves resolve wait before service invocation
+
+**Given**: a loop-based frontend is about to invoke `ParallelRunService` with an empty active change list for manual resolve
+**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
+**When**: the frontend performs run startup initialization
+**Then**: it preserves the shared reducer state containing `alpha`
+**And**: `ParallelRunService` receives an executor whose `has_resolve_wait()` returns true
+
 #### Scenario: normal committed-change filtering still applies to active changes
 
 **Given**: `ParallelRunService` is invoked with active changes to apply
 **When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
 **Then**: that active change is skipped with the existing warning/rejection events
 **And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
+
+#### Scenario: true empty run remains no-op
+
+**Given**: `ParallelRunService` is invoked with an empty active change list
+**And**: the shared orchestrator state has no `ResolveWait` work
+**When**: startup evaluates work availability
+**Then**: the service returns without dispatching apply, merge retry, or resolve work
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
