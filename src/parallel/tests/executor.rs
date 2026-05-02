@@ -3239,18 +3239,15 @@ async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
             .await
     });
 
-    let saw_analysis_started = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        async {
-            loop {
-                match rx.recv().await {
-                    Some(ExecutionEvent::AnalysisStarted { .. }) => break true,
-                    Some(_) => continue,
-                    None => break false,
-                }
+    let saw_analysis_started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match rx.recv().await {
+                Some(ExecutionEvent::AnalysisStarted { .. }) => break true,
+                Some(_) => continue,
+                None => break false,
             }
-        },
-    )
+        }
+    })
     .await
     .unwrap_or(false);
 
