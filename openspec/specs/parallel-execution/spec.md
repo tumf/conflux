@@ -5,6 +5,7 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 ## Requirements
 
 ### Requirement: Shared Parallel Orchestration Service
+
 システムはCLIとTUIの並列実行を扱う統一的な`ParallelRunService`を提供しなければならない（SHALL）。
 
 サービスはイベント通知のためのコールバック機構を受け取り、TUIへ送るイベントは共有状態の更新より先に送信しなければならない（MUST）。これによりUI更新が共有状態のロック待ちで遅延しない。
@@ -17,28 +18,23 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
-#### Scenario: CLI uses ParallelRunService
-- **WHEN** the CLI runs in parallel mode (`--parallel` flag)
-- **THEN** the CLI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be logged to stdout via the callback mechanism
+When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
 
-#### Scenario: TUI uses ParallelRunService
-- **WHEN** the TUI runs in parallel mode
-- **THEN** the TUI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be forwarded to the TUI event channel via the callback mechanism
-- **AND** event forwarding happens before shared state updates so Accepting can render promptly
+#### Scenario: empty active changes with resolve wait enters scheduler retry
 
-#### Scenario: TUI event forwarding precedes shared state update
-- **GIVEN** `ParallelEvent::AcceptanceStarted` is processed by the forwarder
-- **WHEN** the event is forwarded to the TUI
-- **THEN** the TUI event channel receives the event before the shared state write lock is acquired
-- **AND** the change status can transition to `Accepting` while acceptance is running
+**Given**: `ParallelRunService` is invoked with an empty active change list from a loop-based frontend
+**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
+**When**: parallel run startup evaluates committed active changes
+**Then**: the service does not return solely because the active change list is empty
+**And**: the executor synchronizes `ResolveWait` from shared state
+**And**: scheduler-owned merge retry dispatch is attempted for `alpha`
 
-#### Scenario: Parallel mode requires git repository
-- **WHEN** parallel execution is requested
-- **AND** a `.git` directory does not exist
-- **THEN** `ParallelRunService` SHALL return an error indicating a git repository is required
-- **AND** no parallel execution is started
+#### Scenario: normal committed-change filtering still applies to active changes
+
+**Given**: `ParallelRunService` is invoked with active changes to apply
+**When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
+**Then**: that active change is skipped with the existing warning/rejection events
+**And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1055,21 +1051,30 @@ worktreeのtasks.mdから進捗を取得できない場合、archive/resolving�
 - **THEN** システムはバッチ完了を待たずに次の change を選定する
 
 ### Requirement: Re-analysis triggers and non-blocking scheduler
+
 re-analysis は apply/acceptance/archive/resolve の in-flight が存在していても開始できなければならない（MUST）。
 
 re-analysis ループは dispatch の完了待ちでブロックされてはならない（MUST NOT）。
 
-re-analysis の起動トリガは、キュー通知・デバウンスタイマー・in-flight 完了のいずれでもよい（MUST）。
+re-analysis の起動トリガは、キュー通知・デバウンスタイマー・in-flight 完了・reducer-visible queued intent reconciliation のいずれでもよい（MUST）。
 
 利用可能スロットが 0 の場合、システムは re-analysis を実行せず、空きができた時点で re-analysis を再評価しなければならない（MUST）。
 
-スケジューラの実装は、再分析・ディスパッチ選定・完了処理の責務をヘルパー関数に分割してもよい（MAY）。ただし、非ブロッキング性と起動条件の挙動は維持しなければならない（MUST）。
+スケジューラは reducer-visible queued work が存在するのに re-analysis を開始しない場合、その理由を観測可能なログまたはイベントとして出力しなければならない（SHALL）。
 
 #### Scenario: キュー変化でre-analysisが起動する
 - **GIVEN** apply 実行中の change が存在する
 - **AND** queued に新しい change が追加される
 - **WHEN** 並列実行が re-analysis を評価する
 - **THEN** apply 完了を待たずに re-analysis が開始される
+
+#### Scenario: reducer queued intentでre-analysisが起動する
+- **GIVEN** reducer state に queued intent を持つ change が存在する
+- **AND** scheduler-local queued list にはその change が存在しない
+- **AND** 利用可能なスロットが1以上である
+- **WHEN** 並列実行が re-analysis を評価する
+- **THEN** scheduler は reducer-visible queued intent を analysis candidate に取り込む
+- **AND** dynamic queue notification だけに依存せず re-analysis を開始する
 
 #### Scenario: in-flight 完了でre-analysisが再開する
 - **GIVEN** apply/acceptance/archive/resolve の in-flight が存在する
@@ -1089,6 +1094,7 @@ re-analysis の起動トリガは、キュー通知・デバウンスタイマ�
 - **WHEN** 並列実行が re-analysis を評価する
 - **THEN** re-analysis は実行されない
 - **AND** スロットが空いた時点で re-analysis が再評価される
+- **AND** no available slots の理由がログまたはイベントで観測できる
 
 ### Requirement: In-flight tracking and slot-based dispatch
 
@@ -1121,13 +1127,16 @@ re-analysis の `order` は依存関係の制約として扱い、依存解決�
 - **AND** queued の change はスロットが空くまで dispatch されない
 
 ### Requirement: Queue ingestion and analysis targeting
+
 並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
 
 キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
 
-queued の change が空の場合、analysis を実行してはならない（MUST）。
+scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
 
-実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。
+queued の change が空の場合、analysis を実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconcile を試みなければならない（MUST）。
+
+実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
@@ -1137,14 +1146,41 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **WHEN** 並列実行が analysis を開始する
 - **THEN** analysis 対象は queued の change のみになる
 
+#### Scenario: reducer queued intent が scheduler-local queued に反映される
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** `beta` is not terminal
+- **AND** `beta` is not active or in-flight
+- **AND** `beta` can be loaded from active OpenSpec changes
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler reconciles queued candidates before analysis
+- **THEN** `beta` is added to scheduler-local queued candidates
+- **AND** the next analysis includes `beta`
+
+#### Scenario: dynamic queue notification miss is recoverable
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** the dynamic queue notification for `beta` was missed or already popped
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler loop next reconciles queued candidates
+- **THEN** `beta` is still eligible for analysis through reducer-visible queued intent
+- **AND** `beta` does not remain indefinitely queued without analysis solely because the notification was missed
+
+#### Scenario: candidate load failure is observable and retried
+- **GIVEN** dynamic queue ingestion sees queued change id `beta`
+- **AND** active OpenSpec change loading does not currently return `beta`
+- **WHEN** scheduler ingestion skips `beta`
+- **THEN** the skip reason is logged or emitted as candidate not found
+- **AND** if reducer-visible queued intent for `beta` remains and `beta` later becomes loadable, reconciliation can add `beta` to analysis candidates
+
 #### Scenario: queuedが空ならanalysisを実行しない
 - **GIVEN** queued の change が存在しない
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行が analysis を開始しようとする
 - **THEN** analysis を実行しない
 
 #### Scenario: 実行中とqueuedが空なら終了する
 - **GIVEN** 実行中の change が存在しない
 - **AND** queued の change も空である
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行ループが次の analysis を開始しようとする
 - **THEN** analysis を実行しない
 - **AND** オーケストレーションは完了状態になる
@@ -1340,33 +1376,26 @@ When apply execution records a rejection proposal by generating `openspec/change
 - Change grouping by dependencies
 - ParallelExecutor coordination
 - Archiving of completed changes
-- Rejection of blocked changes (acceptance Blocked → rejection flow)
 
 ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
 
-Acceptance が `Blocked` を返した場合、ParallelRunService は rejection フロー（`REJECTED.md` 生成 → `REJECTED.md` のみを base にコミット → worktree 削除）を実行し、`WorkspaceResult` で `error: None, rejected: Some(reason)` を返さなければならない（SHALL）。
+When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
 
-#### Scenario: CLI uses ParallelRunService
+#### Scenario: empty active changes with resolve wait enters scheduler retry
 
-- **WHEN** the CLI runs in parallel mode (`--parallel` flag)
-- **THEN** the CLI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be logged to stdout via the callback mechanism
+**Given**: `ParallelRunService` is invoked with an empty active change list from a loop-based frontend
+**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
+**When**: parallel run startup evaluates committed active changes
+**Then**: the service does not return solely because the active change list is empty
+**And**: the executor synchronizes `ResolveWait` from shared state
+**And**: scheduler-owned merge retry dispatch is attempted for `alpha`
 
-#### Scenario: TUI uses ParallelRunService
+#### Scenario: normal committed-change filtering still applies to active changes
 
-- **WHEN** the TUI runs in parallel mode
-- **THEN** the TUI SHALL use `ParallelRunService` to execute changes
-- **AND** events SHALL be forwarded to the TUI event channel via the callback mechanism
-- **AND** event forwarding happens before shared state updates so Accepting can render promptly
-
-#### Scenario: Acceptance Blocked triggers rejection flow in parallel mode
-
-- **GIVEN** a change is executing in parallel mode
-- **WHEN** acceptance returns `Blocked`
-- **THEN** the rejection flow SHALL execute within the worktree context
-- **AND** the worktree SHALL be deleted after rejection completes
-- **AND** `WorkspaceResult.rejected` SHALL contain the rejection reason
-- **AND** `WorkspaceResult.error` SHALL be `None`
+**Given**: `ParallelRunService` is invoked with active changes to apply
+**When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
+**Then**: that active change is skipped with the existing warning/rejection events
+**And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
@@ -1551,15 +1580,16 @@ When a reused worktree is not archive-complete:
 - **AND** archive is not selected as the first resumed non-terminal step
 
 ### Requirement: Queue ingestion and analysis targeting
+
 並列実行の analysis は queued の change のみを対象にしなければならない（MUST）。
 
 キューに追加された change は analysis 実行前に queued 集合へ反映されなければならない（MUST）。
 
-queued の change が空の場合、analysis を実行してはならない（MUST）。
+scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
 
-CLI の `run` サブコマンドでは、実行中の change が存在せず queued の change も空である場合、オーケストレーションは完了状態にならなければならない（MUST）。
+queued の change が空の場合、analysis を実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconcile を試みなければならない（MUST）。
 
-通常の cflx ループ型実行では、ユーザが停止していない限り、実行中の change が存在せず queued の change も空であっても、オーケストレーション実行ループは終了してはならない（MUST NOT）。この状態では実行ループは待機を継続し、以後 queued になった change を検知したら analysis を再評価しなければならない（MUST）。
+実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
@@ -1569,36 +1599,44 @@ queued に含まれない change（例: merged 済み change、実行済み chan
 - **WHEN** 並列実行が analysis を開始する
 - **THEN** analysis 対象は queued の change のみになる
 
+#### Scenario: reducer queued intent が scheduler-local queued に反映される
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** `beta` is not terminal
+- **AND** `beta` is not active or in-flight
+- **AND** `beta` can be loaded from active OpenSpec changes
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler reconciles queued candidates before analysis
+- **THEN** `beta` is added to scheduler-local queued candidates
+- **AND** the next analysis includes `beta`
+
+#### Scenario: dynamic queue notification miss is recoverable
+- **GIVEN** change `beta` has reducer-visible queued intent
+- **AND** the dynamic queue notification for `beta` was missed or already popped
+- **AND** scheduler-local queued list does not contain `beta`
+- **WHEN** the scheduler loop next reconciles queued candidates
+- **THEN** `beta` is still eligible for analysis through reducer-visible queued intent
+- **AND** `beta` does not remain indefinitely queued without analysis solely because the notification was missed
+
+#### Scenario: candidate load failure is observable and retried
+- **GIVEN** dynamic queue ingestion sees queued change id `beta`
+- **AND** active OpenSpec change loading does not currently return `beta`
+- **WHEN** scheduler ingestion skips `beta`
+- **THEN** the skip reason is logged or emitted as candidate not found
+- **AND** if reducer-visible queued intent for `beta` remains and `beta` later becomes loadable, reconciliation can add `beta` to analysis candidates
+
 #### Scenario: queuedが空ならanalysisを実行しない
 - **GIVEN** queued の change が存在しない
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行が analysis を開始しようとする
 - **THEN** analysis を実行しない
 
-#### Scenario: CLI run は空キューで終了する
-- **GIVEN** CLI の `run` サブコマンドで並列実行している
-- **AND** 実行中の change が存在しない
+#### Scenario: 実行中とqueuedが空なら終了する
+- **GIVEN** 実行中の change が存在しない
 - **AND** queued の change も空である
+- **AND** reducer-visible queued intent も存在しない
 - **WHEN** 並列実行ループが次の analysis を開始しようとする
 - **THEN** analysis を実行しない
 - **AND** オーケストレーションは完了状態になる
-
-#### Scenario: 通常の cflx 実行は空キューでも待機を継続する
-- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
-- **AND** ユーザが停止していない
-- **AND** 実行中の change が存在しない
-- **AND** queued の change も空である
-- **WHEN** 並列実行ループが次の analysis を開始しようとする
-- **THEN** analysis を実行しない
-- **AND** オーケストレーション実行ループは終了しない
-- **AND** 新しく queued になった change を待機する
-
-#### Scenario: 通常の cflx 実行の idle待機中のqueued追加でanalysisが再開する
-- **GIVEN** `run` サブコマンド以外の通常の cflx ループ型実行である
-- **AND** ユーザが停止していない
-- **AND** 並列実行ループが queued 0 件・実行中 0 件で待機中である
-- **WHEN** change が queued に追加される
-- **THEN** 実行ループは queue 通知を受け取る
-- **AND** analysis を再評価する
 
 #### Scenario: queued外のchangeはanalysis対象から除外される
 - **GIVEN** queued に含まれない change が存在する

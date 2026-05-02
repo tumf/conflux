@@ -262,6 +262,7 @@ impl ParallelRunService {
         &self,
         changes: Vec<Change>,
         event_tx: &mpsc::Sender<ParallelEvent>,
+        allow_empty_when_resolve_wait: bool,
     ) -> Result<Option<Vec<Change>>> {
         let (changes, skipped) = self.filter_committed_changes(changes).await?;
 
@@ -289,6 +290,12 @@ impl ParallelRunService {
         }
 
         if changes.is_empty() {
+            if allow_empty_when_resolve_wait {
+                info!(
+                    "No committed changes available, but scheduler-owned ResolveWait retry is present; continuing with empty queue"
+                );
+                return Ok(Some(changes));
+            }
             info!("No committed changes available for parallel execution");
             return Ok(None);
         }
@@ -317,7 +324,10 @@ impl ParallelRunService {
         let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
 
         // Prepare changes using the common helper (sends warning event if needed)
-        let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
+        let changes = match self
+            .prepare_parallel_execution(changes, &event_tx, false)
+            .await?
+        {
             Some(changes) => changes,
             None => {
                 // All changes were rejected before execution started.
@@ -455,7 +465,11 @@ impl ParallelRunService {
         event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
         // Prepare changes using the common helper (sends warning event if needed)
-        let changes = match self.prepare_parallel_execution(changes, &event_tx).await? {
+        let allow_empty_when_resolve_wait = changes.is_empty() && executor.has_resolve_wait();
+        let changes = match self
+            .prepare_parallel_execution(changes, &event_tx, allow_empty_when_resolve_wait)
+            .await?
+        {
             Some(changes) => changes,
             None => return Ok(()),
         };
@@ -856,7 +870,7 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
 
         let result = service
-            .prepare_parallel_execution(changes, &event_tx)
+            .prepare_parallel_execution(changes, &event_tx, false)
             .await
             .expect("prepare_parallel_execution");
 
@@ -927,7 +941,7 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
 
         let result = service
-            .prepare_parallel_execution(changes, &event_tx)
+            .prepare_parallel_execution(changes, &event_tx, false)
             .await
             .expect("prepare_parallel_execution");
 
@@ -960,6 +974,56 @@ mod tests {
     ///
     /// Before the fix, `run_parallel` returned `Ok(())` immediately after
     /// `prepare_parallel_execution` returned `None`, silently dropping the buffered events.
+    #[tokio::test]
+    async fn test_prepare_parallel_execution_allows_empty_when_resolve_wait_requested() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = Vec::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        let result = service
+            .prepare_parallel_execution(changes, &event_tx, true)
+            .await
+            .expect("prepare_parallel_execution");
+
+        assert!(
+            result.is_some(),
+            "empty startup should continue when reducer-owned ResolveWait exists"
+        );
+        assert!(
+            result.expect("checked is_some").is_empty(),
+            "no committed changes should still produce an empty queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_parallel_execution_empty_parallel_without_resolve_wait_is_noop() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        if !init_git_repo(&temp_dir).await {
+            return;
+        }
+
+        let service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let changes = Vec::new();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        let result = service
+            .prepare_parallel_execution(changes, &event_tx, false)
+            .await
+            .expect("prepare_parallel_execution");
+
+        assert!(
+            result.is_none(),
+            "empty startup without reducer-owned ResolveWait must remain a safe no-op"
+        );
+    }
+
     #[tokio::test]
     async fn test_run_parallel_all_rejected_forwards_event_to_callback() {
         let temp_dir = TempDir::new().expect("tempdir");

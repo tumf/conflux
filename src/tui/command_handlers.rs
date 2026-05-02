@@ -664,10 +664,18 @@ mod tests {
         let dynamic_queue = DynamicQueue::new();
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         let config = create_test_config();
-        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
             vec!["change-a".to_string()],
             10,
+            crate::orchestration::state::ExecutionMode::Parallel,
         )));
+        {
+            let mut guard = shared_state.write().await;
+            guard.apply_observation(
+                "change-a",
+                crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+            );
+        }
         let graceful_stop_flag = Arc::new(AtomicBool::new(false));
         let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
         let mut orchestrator_cancel: Option<CancellationToken> = None;
@@ -850,6 +858,71 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("notified existing scheduler")));
+    }
+
+    #[tokio::test]
+    async fn test_add_to_queue_updates_reducer_intent_even_if_dynamic_queue_already_contains_id() {
+        use crate::orchestration::state::ReducerCommand;
+
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+
+        // Pre-populate dynamic queue so AddToQueue push path returns false (already present).
+        dynamic_queue.push("change-a".to_string()).await;
+
+        {
+            // Clear reducer intent first to ensure command handler is the source of re-queue intent.
+            let mut guard = shared_state.write().await;
+            guard.apply_command(ReducerCommand::RemoveFromQueue("change-a".to_string()));
+            assert_eq!(guard.display_status("change-a"), "not queued");
+        }
+
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle = handle_tui_command(
+            TuiCommand::AddToQueue("change-a".to_string()),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("add-to-queue command should succeed");
+
+        assert!(
+            handle.is_none(),
+            "queue command should not spawn orchestrator"
+        );
+        assert_eq!(
+            shared_state.read().await.display_status("change-a"),
+            "queued",
+            "reducer queue intent must be queued even when dynamic queue push is duplicate"
+        );
+        assert!(ctx
+            .app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Already in dynamic queue: change-a")));
     }
 
     #[tokio::test]
