@@ -3175,11 +3175,12 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
 async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_work() {
     use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
+    use tokio::sync::{mpsc, RwLock};
 
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
-    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    let (tx, mut rx) = mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
 
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
         vec!["change-a".to_string()],
@@ -3205,6 +3206,28 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
     );
 
     executor.maybe_dispatch_resolve_wait_retry().await;
+
+    let saw_retry_event = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        loop {
+            match rx.recv().await {
+                Some(crate::events::ExecutionEvent::Log(log))
+                    if log
+                        .message
+                        .contains("ResolveWait retry dispatch started for 'change-a'") =>
+                {
+                    break true;
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        saw_retry_event,
+        "manual startup path must reach retry dispatch instead of stopping as a zero-change no-op"
+    );
 
     assert_eq!(
         executor.last_dispatched_resolve_wait_changes, executor.resolve_wait_changes,

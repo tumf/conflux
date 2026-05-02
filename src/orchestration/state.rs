@@ -1407,6 +1407,15 @@ impl OrchestratorState {
     pub fn execution_mode(&self) -> ExecutionMode {
         self.execution_mode
     }
+
+    /// Set the execution mode without replacing reducer-owned runtime state.
+    ///
+    /// This is used by scheduler startup paths that need to preserve existing
+    /// reducer intent (for example manual ResolveWait work) while ensuring
+    /// subsequent execution events are interpreted with the correct mode.
+    pub fn set_execution_mode(&mut self, execution_mode: ExecutionMode) {
+        self.execution_mode = execution_mode;
+    }
 }
 
 #[cfg(test)]

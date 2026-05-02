@@ -59,6 +59,8 @@ Post-merge verification for this path SHALL accept repository-visible merge succ
 
 When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
 
+A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+
 #### Scenario: Conflictless archived merge does not emit resolve command
 
 **Given**: change `alpha` is archived and reaches scheduler-owned merge retry
@@ -68,6 +70,15 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
 **And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
 **And**: it SHALL continue through the normal merge completion path
+
+#### Scenario: empty startup does not reset resolve wait before executor sync
+
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the TUI starts a scheduler-owned run with no active changes selected
+**When**: parallel orchestrator startup initializes execution state
+**Then**: it preserves the existing reducer runtime entry for `alpha`
+**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
+**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
 
 #### Scenario: Successful merge commit is not retried for false pre-sync negative
 
@@ -100,6 +111,14 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **When**: deferred merge retry processing evaluates `alpha`
 **Then**: the stale retry entry is removed
 **And**: no merge command, resolve command, or merge hook is executed for `alpha`
+
+#### Scenario: no resolve wait empty startup is still no work
+
+**Given**: the scheduler starts with an empty active change list
+**And**: the shared reducer contains no `ResolveWait` entries
+**When**: startup evaluates whether there is scheduler-owned work
+**Then**: it may complete as a no-op
+**And**: it MUST NOT fabricate resolve, merge, or apply work
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
@@ -161,6 +180,8 @@ Post-merge verification for this path SHALL accept repository-visible merge succ
 
 When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
 
+A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+
 #### Scenario: Conflictless archived merge does not emit resolve command
 
 **Given**: change `alpha` is archived and reaches scheduler-owned merge retry
@@ -170,6 +191,15 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
 **And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
 **And**: it SHALL continue through the normal merge completion path
+
+#### Scenario: empty startup does not reset resolve wait before executor sync
+
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the TUI starts a scheduler-owned run with no active changes selected
+**When**: parallel orchestrator startup initializes execution state
+**Then**: it preserves the existing reducer runtime entry for `alpha`
+**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
+**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
 
 #### Scenario: Successful merge commit is not retried for false pre-sync negative
 
@@ -202,6 +232,14 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **When**: deferred merge retry processing evaluates `alpha`
 **Then**: the stale retry entry is removed
 **And**: no merge command, resolve command, or merge hook is executed for `alpha`
+
+#### Scenario: no resolve wait empty startup is still no work
+
+**Given**: the scheduler starts with an empty active change list
+**And**: the shared reducer contains no `ResolveWait` entries
+**When**: startup evaluates whether there is scheduler-owned work
+**Then**: it may complete as a no-op
+**And**: it MUST NOT fabricate resolve, merge, or apply work
 
 ### Requirement: merge-deferred-reducer-sync
 
@@ -342,6 +380,8 @@ Post-merge verification for this path SHALL accept repository-visible merge succ
 
 When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
 
+A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+
 #### Scenario: Conflictless archived merge does not emit resolve command
 
 **Given**: change `alpha` is archived and reaches scheduler-owned merge retry
@@ -351,6 +391,15 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
 **And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
 **And**: it SHALL continue through the normal merge completion path
+
+#### Scenario: empty startup does not reset resolve wait before executor sync
+
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the TUI starts a scheduler-owned run with no active changes selected
+**When**: parallel orchestrator startup initializes execution state
+**Then**: it preserves the existing reducer runtime entry for `alpha`
+**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
+**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
 
 #### Scenario: Successful merge commit is not retried for false pre-sync negative
 
@@ -383,6 +432,14 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **When**: deferred merge retry processing evaluates `alpha`
 **Then**: the stale retry entry is removed
 **And**: no merge command, resolve command, or merge hook is executed for `alpha`
+
+#### Scenario: no resolve wait empty startup is still no work
+
+**Given**: the scheduler starts with an empty active change list
+**And**: the shared reducer contains no `ResolveWait` entries
+**When**: startup evaluates whether there is scheduler-owned work
+**Then**: it may complete as a no-op
+**And**: it MUST NOT fabricate resolve, merge, or apply work
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -924,6 +981,8 @@ Post-merge verification for this path SHALL accept repository-visible merge succ
 
 When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
 
+A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+
 #### Scenario: Conflictless archived merge does not emit resolve command
 
 **Given**: change `alpha` is archived and reaches scheduler-owned merge retry
@@ -933,6 +992,15 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
 **And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
 **And**: it SHALL continue through the normal merge completion path
+
+#### Scenario: empty startup does not reset resolve wait before executor sync
+
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the TUI starts a scheduler-owned run with no active changes selected
+**When**: parallel orchestrator startup initializes execution state
+**Then**: it preserves the existing reducer runtime entry for `alpha`
+**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
+**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
 
 #### Scenario: Successful merge commit is not retried for false pre-sync negative
 
@@ -965,3 +1033,17 @@ When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove tha
 **When**: deferred merge retry processing evaluates `alpha`
 **Then**: the stale retry entry is removed
 **And**: no merge command, resolve command, or merge hook is executed for `alpha`
+
+#### Scenario: resolve wait is synchronized before drained exit
+
+**Given**: shared reducer state contains one or more `ResolveWait` changes
+**When**: the scheduler loop begins an iteration
+**Then**: it synchronizes those IDs into executor retry state before checking whether queued, in-flight, resolve-wait, manual-resolve, and pending-merge work are all empty
+
+#### Scenario: no resolve wait empty startup is still no work
+
+**Given**: the scheduler starts with an empty active change list
+**And**: the shared reducer contains no `ResolveWait` entries
+**When**: startup evaluates whether there is scheduler-owned work
+**Then**: it may complete as a no-op
+**And**: it MUST NOT fabricate resolve, merge, or apply work

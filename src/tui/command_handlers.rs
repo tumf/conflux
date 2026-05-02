@@ -717,11 +717,19 @@ mod tests {
                 .contains("started scheduler for manual resolve")),
             "log must report scheduler startup"
         );
-        assert_eq!(
-            shared_state.read().await.display_status("change-a"),
-            "resolve pending",
-            "ResolveMerge reducer intent must move change to resolve pending"
-        );
+        {
+            let state = shared_state.read().await;
+            assert_eq!(
+                state.display_status("change-a"),
+                "resolve pending",
+                "ResolveMerge reducer intent must move change to resolve pending"
+            );
+            assert_eq!(
+                state.resolve_wait_change_ids(),
+                vec!["change-a".to_string()],
+                "idle handoff must leave reducer-owned ResolveWait visible to scheduler startup"
+            );
+        }
 
         if let Some(join) = handle {
             join.abort();

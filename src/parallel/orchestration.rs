@@ -69,19 +69,30 @@ impl ParallelExecutor {
             + Sync,
     {
         if changes.is_empty() {
-            let reducer_has_queued_intent = self
+            let (reducer_has_queued_intent, reducer_has_resolve_wait) = self
                 .shared_orchestrator_state
                 .as_ref()
                 .and_then(|state| state.try_read().ok())
-                .map(|state| !state.queued_change_ids().is_empty())
-                .unwrap_or(false);
-            if !reducer_has_queued_intent {
+                .map(|state| {
+                    (
+                        !state.queued_change_ids().is_empty(),
+                        !state.resolve_wait_change_ids().is_empty(),
+                    )
+                })
+                .unwrap_or((false, false));
+            if !reducer_has_queued_intent && !reducer_has_resolve_wait {
                 send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
                 return Ok(());
             }
-            info!(
-                "Starting scheduler loop with reducer-visible queued intent and empty local queue"
-            );
+            if reducer_has_resolve_wait {
+                info!(
+                    "Starting scheduler loop with reducer-visible ResolveWait retry intent and empty local queue"
+                );
+            } else {
+                info!(
+                    "Starting scheduler loop with reducer-visible queued intent and empty local queue"
+                );
+            }
         }
 
         info!(
