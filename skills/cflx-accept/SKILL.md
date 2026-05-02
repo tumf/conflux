@@ -103,7 +103,7 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
 - `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` is allowed only when a valid `Implementation Blocker #<n>` exists with concrete evidence and unblock actions
-- Legacy `blocked` acceptance verdict is input compatibility only; new output MUST use `gated`
+- Legacy `blocked` acceptance verdict is input compatibility; `gated` is also compatibility/protocol terminology and MUST NOT be treated as operator-facing lifecycle taxonomy
 - FAIL vs GATED rubric:
   - `FAIL`: repository-only autonomous work (code/tests/spec/tasks/docs in this repo) can resolve the issue.
   - `GATED`: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, or missing upstream constraint resolution).

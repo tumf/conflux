@@ -6,13 +6,12 @@ Provide a single, reducer-owned model for tracking the runtime lifecycle of each
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
+The runtime state MUST distinguish blocker-adjacent concerns without exposing a separate `gated` lifecycle/display status:
 
 - dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
-- apply/rejecting resumable hold (`stalled`)
-- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
+- non-terminal resumable or review-required hold (`stalled`), including apply, rejecting-review, and acceptance-gate holds
 
-Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
+Derived display status exposed from reducer-owned runtime state SHALL preserve the distinction between dependency waits, resumable holds, and terminal rejection without using `gated` as a user-facing status.
 
 #### Scenario: dependency wait remains blocked
 - **GIVEN** a change is queued for execution
@@ -30,12 +29,13 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **AND** the derived display status is `stalled`
 - **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: acceptance gate is exposed separately
+#### Scenario: acceptance gate is exposed as stalled
 - **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
 - **WHEN** reducer-owned state or its derived event/status surface exposes that observation
-- **THEN** the displayed wording is `gated`
-- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
-- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
+- **THEN** the displayed wording is `stalled`
+- **AND** blocker metadata identifies the reason as an acceptance/review hold such as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and terminal `rejected`
+- **AND** no user-facing lifecycle/display status is `gated`
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -245,13 +245,12 @@ Manual/user resolve intent for an existing `MergeWait` row remains valid and may
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
+The runtime state MUST distinguish blocker-adjacent concerns without exposing a separate `gated` lifecycle/display status:
 
 - dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
-- apply/rejecting resumable hold (`stalled`)
-- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
+- non-terminal resumable or review-required hold (`stalled`), including apply, rejecting-review, and acceptance-gate holds
 
-Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
+Derived display status exposed from reducer-owned runtime state SHALL preserve the distinction between dependency waits, resumable holds, and terminal rejection without using `gated` as a user-facing status.
 
 #### Scenario: dependency wait remains blocked
 - **GIVEN** a change is queued for execution
@@ -269,12 +268,13 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **AND** the derived display status is `stalled`
 - **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: acceptance gate is exposed separately
+#### Scenario: acceptance gate is exposed as stalled
 - **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
 - **WHEN** reducer-owned state or its derived event/status surface exposes that observation
-- **THEN** the displayed wording is `gated`
-- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
-- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
+- **THEN** the displayed wording is `stalled`
+- **AND** blocker metadata identifies the reason as an acceptance/review hold such as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and terminal `rejected`
+- **AND** no user-facing lifecycle/display status is `gated`
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -302,13 +302,12 @@ Reducer-owned `ResolveWait` SHALL be considered schedulable work even when there
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
+The runtime state MUST distinguish blocker-adjacent concerns without exposing a separate `gated` lifecycle/display status:
 
 - dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
-- apply/rejecting resumable hold (`stalled`)
-- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
+- non-terminal resumable or review-required hold (`stalled`), including apply, rejecting-review, and acceptance-gate holds
 
-Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
+Derived display status exposed from reducer-owned runtime state SHALL preserve the distinction between dependency waits, resumable holds, and terminal rejection without using `gated` as a user-facing status.
 
 #### Scenario: dependency wait remains blocked
 - **GIVEN** a change is queued for execution
@@ -326,12 +325,13 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **AND** the derived display status is `stalled`
 - **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: acceptance gate is exposed separately
+#### Scenario: acceptance gate is exposed as stalled
 - **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
 - **WHEN** reducer-owned state or its derived event/status surface exposes that observation
-- **THEN** the displayed wording is `gated`
-- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
-- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
+- **THEN** the displayed wording is `stalled`
+- **AND** blocker metadata identifies the reason as an acceptance/review hold such as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and terminal `rejected`
+- **AND** no user-facing lifecycle/display status is `gated`
 
 ### Requirement: Rejection Flow Execution
 
@@ -540,13 +540,12 @@ The operation MUST NOT convert permanent terminal changes such as `Archived`, `M
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
+The runtime state MUST distinguish blocker-adjacent concerns without exposing a separate `gated` lifecycle/display status:
 
 - dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
-- apply/rejecting resumable hold (`stalled`)
-- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
+- non-terminal resumable or review-required hold (`stalled`), including apply, rejecting-review, and acceptance-gate holds
 
-Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
+Derived display status exposed from reducer-owned runtime state SHALL preserve the distinction between dependency waits, resumable holds, and terminal rejection without using `gated` as a user-facing status.
 
 #### Scenario: dependency wait remains blocked
 - **GIVEN** a change is queued for execution
@@ -564,16 +563,19 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **AND** the derived display status is `stalled`
 - **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: acceptance gate is exposed separately
+#### Scenario: acceptance gate is exposed as stalled
 - **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
 - **WHEN** reducer-owned state or its derived event/status surface exposes that observation
-- **THEN** the displayed wording is `gated`
-- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
-- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
+- **THEN** the displayed wording is `stalled`
+- **AND** blocker metadata identifies the reason as an acceptance/review hold such as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and terminal `rejected`
+- **AND** no user-facing lifecycle/display status is `gated`
 
 ### Requirement: Rejected terminal state remains distinct from errors
 
 The terminal result MUST include `Rejected` as a permanent terminal state distinct from `Error`. A rejected change is one where rejecting review has confirmed the specification is unimplementable or otherwise out of scope for completion, requiring a rollback to the base branch with a documented reason.
+
+Acceptance-gate and rejecting-review holds that are not confirmed as rejected MUST remain non-terminal and display as `stalled` when execution is paused for intervention.
 
 #### Scenario: rejecting-confirmed change becomes rejected terminal state
 
@@ -582,6 +584,14 @@ The terminal result MUST include `Rejected` as a permanent terminal state distin
 - **WHEN** the reducer applies the terminal rejection event
 - **THEN** the terminal result becomes `Rejected`
 - **AND** the derived display status is `rejected`
+
+#### Scenario: unconfirmed acceptance hold remains stalled
+
+- **GIVEN** acceptance reports an implementation blocker
+- **AND** rejecting review has not confirmed terminal rejection
+- **WHEN** the reducer exposes the paused lifecycle state
+- **THEN** the terminal result remains `None`
+- **AND** the derived display status is `stalled`
 
 ### Requirement: Rejection proposal dismissal returns to apply with recovery tasks
 
@@ -601,13 +611,12 @@ Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
+The runtime state MUST distinguish blocker-adjacent concerns without exposing a separate `gated` lifecycle/display status:
 
 - dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
-- apply/rejecting resumable hold (`stalled`)
-- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
+- non-terminal resumable or review-required hold (`stalled`), including apply, rejecting-review, and acceptance-gate holds
 
-Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
+Derived display status exposed from reducer-owned runtime state SHALL preserve the distinction between dependency waits, resumable holds, and terminal rejection without using `gated` as a user-facing status.
 
 #### Scenario: dependency wait remains blocked
 - **GIVEN** a change is queued for execution
@@ -625,12 +634,13 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **AND** the derived display status is `stalled`
 - **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: acceptance gate is exposed separately
+#### Scenario: acceptance gate is exposed as stalled
 - **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
 - **WHEN** reducer-owned state or its derived event/status surface exposes that observation
-- **THEN** the displayed wording is `gated`
-- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
-- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
+- **THEN** the displayed wording is `stalled`
+- **AND** blocker metadata identifies the reason as an acceptance/review hold such as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and terminal `rejected`
+- **AND** no user-facing lifecycle/display status is `gated`
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -646,13 +656,12 @@ Workspace observations SHALL NOT regress a change from terminal `Merged` back to
 
 ### Requirement: Reducer-Owned Change Runtime State
 
-The runtime state MUST distinguish at least the following blocker-adjacent concerns without collapsing them into a single `blocked` label:
+The runtime state MUST distinguish blocker-adjacent concerns without exposing a separate `gated` lifecycle/display status:
 
 - dependency wait reason (`blocked`, canonical concept: `dependency-blocked`)
-- apply/rejecting resumable hold (`stalled`)
-- acceptance gate observation (`gated`, canonical concept: `acceptance-gated`)
+- non-terminal resumable or review-required hold (`stalled`), including apply, rejecting-review, and acceptance-gate holds
 
-Derived display status exposed from reducer-owned runtime state SHALL preserve this distinction for consumers.
+Derived display status exposed from reducer-owned runtime state SHALL preserve the distinction between dependency waits, resumable holds, and terminal rejection without using `gated` as a user-facing status.
 
 #### Scenario: dependency wait remains blocked
 - **GIVEN** a change is queued for execution
@@ -670,12 +679,13 @@ Derived display status exposed from reducer-owned runtime state SHALL preserve t
 - **AND** the derived display status is `stalled`
 - **AND** the reducer does not reuse dependency `blocked` for this hold
 
-#### Scenario: acceptance gate is exposed separately
+#### Scenario: acceptance gate is exposed as stalled
 - **GIVEN** acceptance reports a blocker observation before the next lifecycle step is chosen
 - **WHEN** reducer-owned state or its derived event/status surface exposes that observation
-- **THEN** the displayed wording is `gated`
-- **AND** the canonical taxonomy identifies the observation as `acceptance-gated`
-- **AND** the observation is distinguishable from dependency `blocked` and apply `stalled`
+- **THEN** the displayed wording is `stalled`
+- **AND** blocker metadata identifies the reason as an acceptance/review hold such as `acceptance-gated`
+- **AND** the observation is distinguishable from dependency `blocked` and terminal `rejected`
+- **AND** no user-facing lifecycle/display status is `gated`
 
 ### Requirement: WebSocket change status consistency with TUI
 

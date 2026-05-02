@@ -6,16 +6,17 @@ Core（Reducer + オーケストレーションループ）とフロントエン
 
 ### Requirement: Core / Frontend 状態所有の境界
 
-Core が所有する display status の正規ソースは、dependency wait の `blocked`（canonical concept: `dependency-blocked`）、apply/rejecting resumable hold の `stalled`、acceptance gate observation の `gated`（canonical concept: `acceptance-gated`）を区別しなければならない（MUST）。
+Core が所有する display status の正規ソースは、dependency wait の `blocked`（canonical concept: `dependency-blocked`）と、apply/rejecting/acceptance hold を含む `stalled` を区別しなければならない（MUST）。
+
+acceptance gate observation は `acceptance-gated` メタデータとして保持してよいが、display status として `gated` を露出してはならない（MUST NOT）。
 
 Frontend はこれらを独自の lifecycle copy や render-time simplification によって単一の `blocked` へ collapse してはならない（MUST NOT）。
 
-#### Scenario: Frontend keeps blocked, stalled, and gated distinct
-- **GIVEN** Core が 3 種類の blocker-adjacent display status を提供している
+#### Scenario: Frontend keeps blocked and stalled distinct
+- **GIVEN** Core が blocker-adjacent display status を提供している
 - **WHEN** TUI または Web UI が change row / API payload / status badge を描画する
 - **THEN** dependency wait は `blocked` として表示される
-- **AND** apply-side resumable hold は `stalled` として表示される
-- **AND** acceptance gate observation は `gated` として表示または配信される
+- **AND** apply-side または acceptance-side の resumable hold は `stalled` として表示される
 - **AND** Frontend はそれらを単一の `blocked` 値へ変換しない
 
 ### Requirement: EventSink トレイトによるフロントエンド抽象化

@@ -92,7 +92,8 @@ Rules for the JSON verdict:
 - The `acceptance` field value MUST be one of `pass`, `fail`, `continue`,
   `gated` (case-insensitive, but lowercase is preferred).
 - Legacy compatibility: runtime parser MAY still accept legacy `blocked` as
-  backward-compatible input, but agents MUST emit canonical `gated`.
+  backward-compatible input. `gated` is a compatibility verdict term and MUST
+  NOT be treated as operator-facing lifecycle taxonomy.
 - For FAIL, `findings` MUST be an array of strings where each entry is a
   concrete, actionable finding (file path + function/line when applicable).
 - Do NOT wrap the JSON verdict in code fences, markdown, or prose.

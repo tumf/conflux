@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Acceptance gating terminology is distinct from dependency blocked
+### Requirement: Acceptance blocker input compatibility is distinct from lifecycle display taxonomy
 
 When acceptance detects an implementation blocker, the system SHALL NOT expose that observation as `gated` in user-facing lifecycle or display taxonomy. The runtime SHALL treat the condition as a non-terminal stalled/review hold while preserving reason metadata such as `acceptance-gated` when the cause must be distinguished from dependency `blocked`.
 

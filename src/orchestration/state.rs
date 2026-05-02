@@ -121,10 +121,9 @@ pub enum WaitState {
     ResolveWait,
     /// Waiting because a dependency has not yet completed.
     DependencyBlocked,
-    /// Waiting because apply/rejecting reported a resumable hold.
+    /// Waiting because apply/rejecting reported a resumable hold,
+    /// including acceptance gate observations before follow-up routing.
     Stalled,
-    /// Waiting because acceptance observed a gate before follow-up routing.
-    AcceptanceGated,
 }
 
 /// Additional metadata preserved while a change is blocked.
@@ -242,7 +241,7 @@ impl ChangeRuntimeState {
 
     /// Derive the display status string used by TUI and Web.
     ///
-    /// Returns one of: "not queued", "queued", "blocked", "stalled", "gated", "applying",
+    /// Returns one of: "not queued", "queued", "blocked", "stalled", "applying",
     /// "accepting", "rejecting", "archiving", "resolving", "merge wait", "resolve pending",
     /// "archived", "merged", "error", "stopped".
     pub fn display_status(&self) -> &'static str {
@@ -270,7 +269,6 @@ impl ChangeRuntimeState {
             WaitState::ResolveWait => return "resolve pending",
             WaitState::DependencyBlocked => return "blocked",
             WaitState::Stalled => return "stalled",
-            WaitState::AcceptanceGated => return "gated",
             WaitState::None => {}
         }
         // Queue intent.
@@ -288,7 +286,6 @@ impl ChangeRuntimeState {
             "queued" => ratatui::style::Color::Yellow,
             "blocked" => ratatui::style::Color::Gray,
             "stalled" => ratatui::style::Color::LightYellow,
-            "gated" => ratatui::style::Color::LightRed,
             "applying" => ratatui::style::Color::Cyan,
             "accepting" => ratatui::style::Color::LightGreen,
             "rejecting" => ratatui::style::Color::LightYellow,
@@ -1308,7 +1305,7 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::AcceptanceGated;
+                    rt.wait_state = WaitState::Stalled;
                     rt.terminal = TerminalState::None;
                     rt.set_blocked_metadata(
                         "acceptance-gated",
