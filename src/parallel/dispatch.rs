@@ -876,7 +876,7 @@ impl ParallelExecutor {
                                 .await;
                             let _ = tx
                                 .send(ParallelEvent::Log(
-                                    LogEntry::warn("Rejecting review returned BLOCK; cleared rejection proposal and preserved blocked workspace")
+                                    LogEntry::warn("Rejecting review returned BLOCK; cleared rejection proposal and preserved stalled workspace")
                                         .with_change_id(&change_id)
                                         .with_operation("rejecting"),
                                 ))
@@ -1228,7 +1228,7 @@ impl ParallelExecutor {
                                         .await;
                                     let _ = tx
                                         .send(ParallelEvent::Log(
-                                            LogEntry::warn("Rejecting review returned BLOCK; cleared rejection proposal and preserved blocked workspace")
+                                            LogEntry::warn("Rejecting review returned BLOCK; cleared rejection proposal and preserved stalled workspace")
                                                 .with_change_id(&change_id)
                                                 .with_operation("rejecting"),
                                         ))

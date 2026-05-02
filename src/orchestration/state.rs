@@ -121,10 +121,9 @@ pub enum WaitState {
     ResolveWait,
     /// Waiting because a dependency has not yet completed.
     DependencyBlocked,
-    /// Waiting because apply/rejecting reported a resumable hold.
+    /// Waiting because apply/rejecting reported a resumable hold,
+    /// including acceptance gate observations before follow-up routing.
     Stalled,
-    /// Waiting because acceptance observed a gate before follow-up routing.
-    AcceptanceGated,
 }
 
 /// Additional metadata preserved while a change is blocked.
@@ -270,7 +269,6 @@ impl ChangeRuntimeState {
             WaitState::ResolveWait => return "resolve pending",
             WaitState::DependencyBlocked => return "blocked",
             WaitState::Stalled => return "stalled",
-            WaitState::AcceptanceGated => return "stalled",
             WaitState::None => {}
         }
         // Queue intent.
@@ -1275,7 +1273,7 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::AcceptanceGated;
+                    rt.wait_state = WaitState::Stalled;
                     rt.terminal = TerminalState::None;
                     rt.set_blocked_metadata(
                         "acceptance-gated",

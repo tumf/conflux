@@ -176,7 +176,7 @@ formatting.
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}` (findings mirrors the FINDINGS section)
 - CONTINUE: `{"acceptance":"continue"}`
-- GATED:    `{"acceptance":"gated"}`
+- GATED (compatibility/protocol term): `{"acceptance":"gated"}`
 
 **Fallback (backward-compatible)** — legacy standalone plain-text markers:
 

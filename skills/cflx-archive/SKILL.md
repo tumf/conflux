@@ -32,7 +32,7 @@ following contract:
   supported so older runs continue to hand off, but JSON wins when both are
   present.
 - **Legacy compatibility**: runtimes MAY still accept legacy `blocked` acceptance
-  verdict input during migration, but canonical output remains `gated`.
+  verdict input during migration; `gated` remains compatibility/protocol wording, not operator-facing lifecycle taxonomy.
 
 Archive MUST NOT redefine or relax this contract. When the upstream
 acceptance verdict is ambiguous (missing JSON, malformed legacy marker), the
