@@ -75,8 +75,7 @@ impl ParallelExecutor {
         self.resolve_wait_retry_triggered = false;
     }
 
-    #[cfg(test)]
-    pub(super) fn has_resolve_wait(&self) -> bool {
+    pub(crate) fn has_resolve_wait(&self) -> bool {
         if let Some(shared) = &self.shared_orchestrator_state {
             if let Ok(guard) = shared.try_read() {
                 return !guard.resolve_wait_change_ids().is_empty();

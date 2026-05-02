@@ -57,31 +57,21 @@ When the scheduler retries an archived Git merge and the merge path reaches a no
 
 Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+Reducer-owned `ResolveWait` SHALL be considered schedulable work even when there are no queued active changes. Scheduler startup and idle/drained checks MUST include this reducer-owned work before deciding that a run has no work.
 
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation succeeds without unresolved conflicts
-- **AND** conflict detection returns no conflict files
-- **WHEN** the runtime evaluates whether to start conflict resolution
-- **THEN** it SHALL NOT emit `ResolveStarted` for `alpha`
-- **AND** it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-- **AND** it SHALL continue through the normal merge completion path
+#### Scenario: reducer-owned resolve wait survives empty startup
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the scheduler starts with an empty active change list
+**When**: the scheduler evaluates whether work is drained
+**Then**: it treats `alpha` as pending scheduler-owned retry work
+**And**: it does not emit only a zero-change completion without attempting the retry
 
-- **GIVEN** change `alpha` is archived and merged into the target branch by a valid merge commit
-- **AND** the archived source branch tip itself no longer proves inclusion of the pre-merge base
-- **WHEN** post-merge verification runs
-- **THEN** the runtime SHALL accept the merged outcome from repository-visible merge evidence
-- **AND** it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: resolve wait is synchronized before drained exit
 
-#### Scenario: True conflict still enters resolve path
-
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation leaves unresolved conflicts
-- **WHEN** the runtime evaluates conflict resolution
-- **THEN** it SHALL emit `ResolveStarted` for `alpha`
-- **AND** the resolve prompt SHALL include non-empty conflict evidence
+**Given**: shared reducer state contains one or more `ResolveWait` changes
+**When**: the scheduler loop begins an iteration
+**Then**: it synchronizes those IDs into executor retry state before checking whether queued, in-flight, resolve-wait, manual-resolve, and pending-merge work are all empty
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
@@ -141,31 +131,21 @@ When the scheduler retries an archived Git merge and the merge path reaches a no
 
 Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+Reducer-owned `ResolveWait` SHALL be considered schedulable work even when there are no queued active changes. Scheduler startup and idle/drained checks MUST include this reducer-owned work before deciding that a run has no work.
 
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation succeeds without unresolved conflicts
-- **AND** conflict detection returns no conflict files
-- **WHEN** the runtime evaluates whether to start conflict resolution
-- **THEN** it SHALL NOT emit `ResolveStarted` for `alpha`
-- **AND** it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-- **AND** it SHALL continue through the normal merge completion path
+#### Scenario: reducer-owned resolve wait survives empty startup
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the scheduler starts with an empty active change list
+**When**: the scheduler evaluates whether work is drained
+**Then**: it treats `alpha` as pending scheduler-owned retry work
+**And**: it does not emit only a zero-change completion without attempting the retry
 
-- **GIVEN** change `alpha` is archived and merged into the target branch by a valid merge commit
-- **AND** the archived source branch tip itself no longer proves inclusion of the pre-merge base
-- **WHEN** post-merge verification runs
-- **THEN** the runtime SHALL accept the merged outcome from repository-visible merge evidence
-- **AND** it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: resolve wait is synchronized before drained exit
 
-#### Scenario: True conflict still enters resolve path
-
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation leaves unresolved conflicts
-- **WHEN** the runtime evaluates conflict resolution
-- **THEN** it SHALL emit `ResolveStarted` for `alpha`
-- **AND** the resolve prompt SHALL include non-empty conflict evidence
+**Given**: shared reducer state contains one or more `ResolveWait` changes
+**When**: the scheduler loop begins an iteration
+**Then**: it synchronizes those IDs into executor retry state before checking whether queued, in-flight, resolve-wait, manual-resolve, and pending-merge work are all empty
 
 ### Requirement: merge-deferred-reducer-sync
 
@@ -304,31 +284,21 @@ When the scheduler retries an archived Git merge and the merge path reaches a no
 
 Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+Reducer-owned `ResolveWait` SHALL be considered schedulable work even when there are no queued active changes. Scheduler startup and idle/drained checks MUST include this reducer-owned work before deciding that a run has no work.
 
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation succeeds without unresolved conflicts
-- **AND** conflict detection returns no conflict files
-- **WHEN** the runtime evaluates whether to start conflict resolution
-- **THEN** it SHALL NOT emit `ResolveStarted` for `alpha`
-- **AND** it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-- **AND** it SHALL continue through the normal merge completion path
+#### Scenario: reducer-owned resolve wait survives empty startup
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the scheduler starts with an empty active change list
+**When**: the scheduler evaluates whether work is drained
+**Then**: it treats `alpha` as pending scheduler-owned retry work
+**And**: it does not emit only a zero-change completion without attempting the retry
 
-- **GIVEN** change `alpha` is archived and merged into the target branch by a valid merge commit
-- **AND** the archived source branch tip itself no longer proves inclusion of the pre-merge base
-- **WHEN** post-merge verification runs
-- **THEN** the runtime SHALL accept the merged outcome from repository-visible merge evidence
-- **AND** it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: resolve wait is synchronized before drained exit
 
-#### Scenario: True conflict still enters resolve path
-
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation leaves unresolved conflicts
-- **WHEN** the runtime evaluates conflict resolution
-- **THEN** it SHALL emit `ResolveStarted` for `alpha`
-- **AND** the resolve prompt SHALL include non-empty conflict evidence
+**Given**: shared reducer state contains one or more `ResolveWait` changes
+**When**: the scheduler loop begins an iteration
+**Then**: it synchronizes those IDs into executor retry state before checking whether queued, in-flight, resolve-wait, manual-resolve, and pending-merge work are all empty
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -838,28 +808,18 @@ When the scheduler retries an archived Git merge and the merge path reaches a no
 
 Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+Reducer-owned `ResolveWait` SHALL be considered schedulable work even when there are no queued active changes. Scheduler startup and idle/drained checks MUST include this reducer-owned work before deciding that a run has no work.
 
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation succeeds without unresolved conflicts
-- **AND** conflict detection returns no conflict files
-- **WHEN** the runtime evaluates whether to start conflict resolution
-- **THEN** it SHALL NOT emit `ResolveStarted` for `alpha`
-- **AND** it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-- **AND** it SHALL continue through the normal merge completion path
+#### Scenario: reducer-owned resolve wait survives empty startup
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
+**And**: the scheduler starts with an empty active change list
+**When**: the scheduler evaluates whether work is drained
+**Then**: it treats `alpha` as pending scheduler-owned retry work
+**And**: it does not emit only a zero-change completion without attempting the retry
 
-- **GIVEN** change `alpha` is archived and merged into the target branch by a valid merge commit
-- **AND** the archived source branch tip itself no longer proves inclusion of the pre-merge base
-- **WHEN** post-merge verification runs
-- **THEN** the runtime SHALL accept the merged outcome from repository-visible merge evidence
-- **AND** it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: resolve wait is synchronized before drained exit
 
-#### Scenario: True conflict still enters resolve path
-
-- **GIVEN** change `alpha` is archived and reaches scheduler-owned merge retry
-- **AND** the target branch merge preparation leaves unresolved conflicts
-- **WHEN** the runtime evaluates conflict resolution
-- **THEN** it SHALL emit `ResolveStarted` for `alpha`
-- **AND** the resolve prompt SHALL include non-empty conflict evidence
+**Given**: shared reducer state contains one or more `ResolveWait` changes
+**When**: the scheduler loop begins an iteration
+**Then**: it synchronizes those IDs into executor retry state before checking whether queued, in-flight, resolve-wait, manual-resolve, and pending-merge work are all empty
