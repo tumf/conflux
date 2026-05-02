@@ -371,6 +371,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -485,6 +486,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -590,6 +592,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -744,6 +747,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -953,6 +957,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1154,6 +1159,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1361,6 +1367,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -3758,28 +3765,29 @@ async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
             .await
     });
 
-    let saw_diagnostic = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let diagnostic_count = tokio::time::timeout(std::time::Duration::from_millis(1200), async {
+        let mut count = 0usize;
         loop {
             match rx.recv().await {
                 Some(ExecutionEvent::Log(log)) => {
                     let message = log.message;
                     if message.contains("reason=no_available_slots") {
-                        break true;
+                        count += 1;
                     }
                 }
                 Some(_) => continue,
-                None => break false,
+                None => break count,
             }
         }
     })
     .await
-    .unwrap_or(false);
+    .unwrap_or(1);
 
     handle.abort();
 
-    assert!(
-        saw_diagnostic,
-        "scheduler loop should emit no_available_slots diagnostic when queued intent exists but slots are saturated"
+    assert_eq!(
+        diagnostic_count, 1,
+        "scheduler loop should emit no_available_slots diagnostic once while queued intent remains unchanged"
     );
 }
 

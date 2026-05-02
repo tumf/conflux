@@ -915,7 +915,7 @@ impl ParallelExecutor {
     }
 
     pub(super) async fn emit_no_analysis_diagnostic(
-        &self,
+        &mut self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
@@ -929,6 +929,17 @@ impl ParallelExecutor {
             .unwrap_or_default();
 
         if reducer_queued.is_empty() {
+            return;
+        }
+
+        let diagnostic_key = (
+            reducer_queued.clone(),
+            queued.len(),
+            in_flight.len(),
+            reason.to_string(),
+        );
+        if !self.no_analysis_diagnostics_seen.insert(diagnostic_key) {
+            debug!(reason, "Suppressing repeated no-analysis diagnostic");
             return;
         }
 

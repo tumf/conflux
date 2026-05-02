@@ -152,6 +152,7 @@ pub struct ParallelExecutor {
     ///
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
     queue_reconciliation_diagnostics_seen: HashSet<(String, String)>,
+    no_analysis_diagnostics_seen: HashSet<(Vec<String>, usize, usize, String)>,
 }
 
 #[cfg(test)]
