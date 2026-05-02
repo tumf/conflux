@@ -69,8 +69,19 @@ impl ParallelExecutor {
             + Sync,
     {
         if changes.is_empty() {
-            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
-            return Ok(());
+            let reducer_has_queued_intent = self
+                .shared_orchestrator_state
+                .as_ref()
+                .and_then(|state| state.try_read().ok())
+                .map(|state| !state.queued_change_ids().is_empty())
+                .unwrap_or(false);
+            if !reducer_has_queued_intent {
+                send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+                return Ok(());
+            }
+            info!(
+                "Starting scheduler loop with reducer-visible queued intent and empty local queue"
+            );
         }
 
         info!(
@@ -153,7 +164,15 @@ impl ParallelExecutor {
             self.sync_resolve_wait_from_shared_state_nonblocking();
             self.maybe_dispatch_resolve_wait_retry().await;
 
-            // Step 2: Re-analysis decision is derived from scheduler state.
+            // Step 2: Reconcile reducer-visible queue intent into scheduler-local candidates.
+            let reconciled = self
+                .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+                .await;
+            if reconciled > 0 {
+                reanalysis_reason = ReanalysisReason::QueueNotification;
+            }
+
+            // Step 3: Re-analysis decision is derived from scheduler state.
             let work_drained = queued.is_empty()
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
@@ -194,6 +213,14 @@ impl ParallelExecutor {
                     if should_break {
                         break;
                     }
+                } else {
+                    self.emit_no_analysis_diagnostic(
+                        &queued,
+                        &in_flight,
+                        max_parallelism,
+                        "no_available_slots",
+                    )
+                    .await;
                 }
             }
 

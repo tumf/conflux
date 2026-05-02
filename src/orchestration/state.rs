@@ -703,6 +703,38 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Return change IDs that still carry queued intent and are not terminal.
+    ///
+    /// Scheduler reconciliation uses this as reducer-visible source of truth for
+    /// queue intent, then intersects with loadable OpenSpec changes and runtime
+    /// active-state checks before dispatch/analysis.
+    pub fn queued_change_ids(&self) -> Vec<String> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| {
+                if matches!(rt.queue_intent, QueueIntent::Queued) && !rt.is_terminal() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Return change IDs currently considered active by reducer runtime state.
+    pub fn active_change_ids(&self) -> Vec<String> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| {
+                if rt.is_active() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Return a snapshot of display status strings for all known changes.
     /// Used by the TUI to sync `ChangeState.queue_status` from the reducer.
     pub fn all_display_statuses(&self) -> HashMap<String, &'static str> {

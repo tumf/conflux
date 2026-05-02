@@ -7,12 +7,11 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Semaphore};
-use tokio::task::JoinSet;
-use tracing::{error, info, warn};
-
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
+use tokio::sync::{mpsc, Semaphore};
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, warn};
 
 use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
@@ -657,6 +656,14 @@ impl ParallelExecutor {
                                     "Dynamically added change '{}' not found in openspec",
                                     dynamic_id
                                 );
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(LogEntry::warn(format!(
+                                        "Queue reconciliation pending for '{}': candidate_not_found",
+                                        dynamic_id
+                                    ))),
+                                )
+                                .await;
                             }
                         }
                         Err(e) => {
@@ -664,8 +671,26 @@ impl ParallelExecutor {
                                 "Failed to load dynamically added change '{}': {}",
                                 dynamic_id, e
                             );
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(LogEntry::warn(format!(
+                                    "Queue reconciliation pending for '{}': candidate_load_failed ({})",
+                                    dynamic_id, e
+                                ))),
+                            )
+                            .await;
                         }
                     }
+                } else if in_flight.contains(&dynamic_id) {
+                    debug!(
+                        "Ignoring dynamic queue entry '{}' because it is already in-flight",
+                        dynamic_id
+                    );
+                } else {
+                    debug!(
+                        "Ignoring dynamic queue entry '{}' because it is already queued",
+                        dynamic_id
+                    );
                 }
             }
 
@@ -680,6 +705,136 @@ impl ParallelExecutor {
         } else {
             false
         }
+    }
+
+    pub(super) async fn reconcile_queued_candidates_from_shared_state(
+        &mut self,
+        queued: &mut Vec<crate::openspec::Change>,
+        in_flight: &HashSet<String>,
+    ) -> usize {
+        let Some(shared_state) = &self.shared_orchestrator_state else {
+            return 0;
+        };
+
+        let (queued_intent_ids, active_ids_from_reducer) = match shared_state.try_read() {
+            Ok(state) => (state.queued_change_ids(), state.active_change_ids()),
+            Err(_) => return 0,
+        };
+
+        if queued_intent_ids.is_empty() {
+            return 0;
+        }
+
+        let reducer_active_set: std::collections::HashSet<String> =
+            active_ids_from_reducer.into_iter().collect();
+
+        let mut known_changes = match crate::openspec::list_changes_native() {
+            Ok(changes) => changes,
+            Err(e) => {
+                warn!(
+                    "Failed to load OpenSpec changes during queue reconciliation: {}",
+                    e
+                );
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn(format!(
+                        "Queue reconciliation skipped: failed_to_load_changes ({})",
+                        e
+                    ))),
+                )
+                .await;
+                return 0;
+            }
+        };
+
+        let mut known_by_id: std::collections::HashMap<String, crate::openspec::Change> =
+            known_changes
+                .drain(..)
+                .map(|change| (change.id.clone(), change))
+                .collect();
+
+        let mut added = 0usize;
+
+        for queued_id in queued_intent_ids {
+            if queued.iter().any(|change| change.id == queued_id) {
+                continue;
+            }
+            if in_flight.contains(&queued_id) || reducer_active_set.contains(&queued_id) {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::info(format!(
+                        "Queue reconciliation deferred for '{}': already_active",
+                        queued_id
+                    ))),
+                )
+                .await;
+                continue;
+            }
+
+            match known_by_id.remove(&queued_id) {
+                Some(change) => {
+                    info!(
+                        "Queue reconciliation adding reducer-queued change candidate: {}",
+                        queued_id
+                    );
+                    queued.push(change);
+                    added += 1;
+                }
+                None => {
+                    warn!(
+                        "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
+                        queued_id
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(LogEntry::warn(format!(
+                            "Queue reconciliation pending for '{}': candidate_not_found",
+                            queued_id
+                        ))),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        if added > 0 {
+            let mut last_change = self.last_queue_change_at.lock().await;
+            *last_change = Some(std::time::Instant::now());
+        }
+
+        added
+    }
+
+    pub(super) async fn emit_no_analysis_diagnostic(
+        &self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        reason: &str,
+    ) {
+        let reducer_queued = self
+            .shared_orchestrator_state
+            .as_ref()
+            .and_then(|state| state.try_read().ok())
+            .map(|state| state.queued_change_ids())
+            .unwrap_or_default();
+
+        if reducer_queued.is_empty() {
+            return;
+        }
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::Log(LogEntry::info(format!(
+                "No analysis started despite reducer-visible queued work: reason={}, reducer_queued={:?}, local_queued={}, in_flight={}, max_parallelism={}",
+                reason,
+                reducer_queued,
+                queued.len(),
+                in_flight.len(),
+                max_parallelism
+            ))),
+        )
+        .await;
     }
 
     /// Perform reanalysis and dispatch changes if conditions are met.
@@ -744,6 +899,13 @@ impl ParallelExecutor {
                 in_flight.len(),
                 queued.len()
             );
+            self.emit_no_analysis_diagnostic(
+                queued,
+                in_flight,
+                max_parallelism,
+                "no_available_slots",
+            )
+            .await;
             // Re-analysis stays state-driven and will resume once slots free up.
             return Ok((false, iteration));
         }
@@ -770,6 +932,8 @@ impl ParallelExecutor {
         if !should_analyze {
             // Debounce active, wait for timer or queue notification
             info!("Debounce active, waiting for timer or queue notification");
+            self.emit_no_analysis_diagnostic(queued, in_flight, max_parallelism, "debounce_active")
+                .await;
             return Ok((false, iteration));
         }
 
@@ -789,6 +953,13 @@ impl ParallelExecutor {
 
         if queued.is_empty() {
             info!("All queued changes skipped due to failed dependencies");
+            self.emit_no_analysis_diagnostic(
+                queued,
+                in_flight,
+                max_parallelism,
+                "local_queue_empty_after_reconciliation",
+            )
+            .await;
             if in_flight.is_empty() {
                 return Ok((true, iteration)); // Should break
             } else {

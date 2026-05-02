@@ -3203,6 +3203,179 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
 }
 
 #[tokio::test]
+async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+    executor.scheduler_lifetime = SchedulerLifetime::Finite;
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut running_executor = executor;
+    let handle = tokio::spawn(async move {
+        running_executor
+            .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
+            .await
+    });
+
+    let saw_analysis_started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match rx.recv().await {
+                Some(ExecutionEvent::AnalysisStarted { .. }) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    handle.abort();
+
+    assert!(
+        saw_analysis_started,
+        "scheduler loop should start analysis from reducer-queued intent even when initial local queue is empty"
+    );
+}
+
+#[tokio::test]
+async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::from([selected.clone()]);
+
+    let added_while_active = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(
+        added_while_active, 0,
+        "active/in-flight change should not be duplicated into local queue"
+    );
+    assert!(queued.is_empty());
+
+    let added_after_release = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+    assert_eq!(
+        added_after_release, 1,
+        "same reducer-queued change should be recoverable after active state clears"
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, selected);
+}
+
+#[tokio::test]
+async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    let config = create_test_config();
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(PathBuf::from("."), config, Some(tx));
+    executor.scheduler_lifetime = SchedulerLifetime::Finite;
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected));
+    }
+    executor.set_shared_orchestrator_state(shared);
+    // Saturate all execution capacity via resolve slots so scheduler emits
+    // the no_available_slots diagnostic before any analysis can start.
+    let manual_resolve_counter = Arc::new(AtomicUsize::new(usize::MAX));
+    executor.set_manual_resolve_counter(manual_resolve_counter);
+
+    let mut running_executor = executor;
+    let handle = tokio::spawn(async move {
+        running_executor
+            .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
+            .await
+    });
+
+    let saw_diagnostic = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match rx.recv().await {
+                Some(ExecutionEvent::Log(log)) => {
+                    let message = log.message;
+                    if message.contains("reason=no_available_slots") {
+                        break true;
+                    }
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    handle.abort();
+
+    assert!(
+        saw_diagnostic,
+        "scheduler loop should emit no_available_slots diagnostic when queued intent exists but slots are saturated"
+    );
+}
+
+#[tokio::test]
 async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
     use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
