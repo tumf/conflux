@@ -8,10 +8,16 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::error::{OrchestratorError, Result};
-use crate::events::LogEntry;
+use crate::events::{ExecutionEvent, LogEntry};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueReconciliationDiagnosticLevel {
+    Info,
+    Warn,
+}
 
 use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
@@ -48,6 +54,29 @@ impl ParallelExecutor {
             if let Ok(guard) = shared.try_read() {
                 self.resolve_wait_changes = guard.resolve_wait_change_ids().into_iter().collect();
             }
+        }
+    }
+
+    pub(super) async fn clear_resolve_wait_intent_for_success(&mut self, change_id: &str) {
+        self.resolve_wait_changes.remove(change_id);
+        self.last_dispatched_resolve_wait_changes.remove(change_id);
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut guard = shared.write().await;
+            guard.clear_resolve_wait_intent(change_id);
+        }
+    }
+
+    pub(super) async fn mark_deferred_merge_completed_in_shared_state(
+        &mut self,
+        change_id: &str,
+        revision: &str,
+    ) {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut guard = shared.write().await;
+            guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+                change_id: change_id.to_string(),
+                revision: revision.to_string(),
+            });
         }
     }
 
@@ -115,6 +144,41 @@ impl ParallelExecutor {
                     dep_id, e
                 );
                 Ok(false)
+            }
+        }
+    }
+
+    async fn is_change_already_merged_to_base(&self, change_id: &str) -> bool {
+        let original_branch = match self
+            .workspace_manager
+            .ensure_original_branch_initialized()
+            .await
+        {
+            Ok(branch) => branch,
+            Err(error) => {
+                warn!(
+                    "Failed to determine base branch before stale deferred retry check for '{}': {}",
+                    change_id, error
+                );
+                return false;
+            }
+        };
+
+        match crate::execution::state::is_merged_to_base(
+            change_id,
+            &self.repo_root,
+            &original_branch,
+        )
+        .await
+        {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                warn!(
+                    "Failed to check whether deferred retry '{}' is already merged to base: {}",
+                    change_id, error
+                );
+                false
             }
         }
     }
@@ -471,6 +535,15 @@ impl ParallelExecutor {
         let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
 
         for change_id in deferred {
+            if self.is_change_already_merged_to_base(&change_id).await {
+                info!(
+                    "Skipping stale deferred merge retry for '{}' because it is already merged to base",
+                    change_id
+                );
+                self.clear_resolve_wait_intent_for_success(&change_id).await;
+                continue;
+            }
+
             // Locate the preserved workspace for this change.
             let workspace_info = match self
                 .workspace_manager
@@ -484,7 +557,7 @@ impl ParallelExecutor {
                         change_id
                     );
                     // Remove from deferred set; the workspace is gone, nothing to retry.
-                    self.resolve_wait_changes.remove(&change_id);
+                    self.clear_resolve_wait_intent_for_success(&change_id).await;
                     continue;
                 }
                 Err(e) => {
@@ -511,7 +584,7 @@ impl ParallelExecutor {
             {
                 Ok(super::merge::MergeAttempt::Merged { revision }) => {
                     info!("Deferred merge succeeded for '{}' on retry", change_id);
-                    self.resolve_wait_changes.remove(&change_id);
+                    self.clear_resolve_wait_intent_for_success(&change_id).await;
 
                     // Run on_merged hook before merged status transition (MergeCompleted event).
                     if let Some(ref hooks) = self.hooks {
@@ -543,12 +616,15 @@ impl ParallelExecutor {
                         }
                     }
 
+                    self.mark_deferred_merge_completed_in_shared_state(&change_id, &revision)
+                        .await;
+
                     // Send MergeCompleted after on_merged hook (triggers merged status transition)
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeCompleted {
                             change_id: change_id.clone(),
-                            revision,
+                            revision: revision.clone(),
                         },
                     )
                     .await;
@@ -707,6 +783,43 @@ impl ParallelExecutor {
         }
     }
 
+    pub(super) fn should_emit_queue_reconciliation_diagnostic(
+        &mut self,
+        change_id: &str,
+        reason: &str,
+    ) -> bool {
+        self.queue_reconciliation_diagnostics_seen
+            .insert((change_id.to_string(), reason.to_string()))
+    }
+
+    async fn emit_queue_reconciliation_diagnostic(
+        &mut self,
+        level: QueueReconciliationDiagnosticLevel,
+        change_id: &str,
+        reason: &str,
+    ) {
+        if !self.should_emit_queue_reconciliation_diagnostic(change_id, reason) {
+            debug!(
+                change_id,
+                reason, "Suppressing repeated queue reconciliation diagnostic"
+            );
+            return;
+        }
+
+        let message = match level {
+            QueueReconciliationDiagnosticLevel::Info => LogEntry::info(format!(
+                "Queue reconciliation deferred for '{}': {}",
+                change_id, reason
+            )),
+            QueueReconciliationDiagnosticLevel::Warn => LogEntry::warn(format!(
+                "Queue reconciliation pending for '{}': {}",
+                change_id, reason
+            )),
+        };
+
+        send_event(&self.event_tx, ParallelEvent::Log(message)).await;
+    }
+
     pub(super) async fn reconcile_queued_candidates_from_shared_state(
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
@@ -760,12 +873,10 @@ impl ParallelExecutor {
                 continue;
             }
             if in_flight.contains(&queued_id) || reducer_active_set.contains(&queued_id) {
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Log(LogEntry::info(format!(
-                        "Queue reconciliation deferred for '{}': already_active",
-                        queued_id
-                    ))),
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    &queued_id,
+                    "already_active",
                 )
                 .await;
                 continue;
@@ -785,12 +896,10 @@ impl ParallelExecutor {
                         "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
                         queued_id
                     );
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Log(LogEntry::warn(format!(
-                            "Queue reconciliation pending for '{}': candidate_not_found",
-                            queued_id
-                        ))),
+                    self.emit_queue_reconciliation_diagnostic(
+                        QueueReconciliationDiagnosticLevel::Warn,
+                        &queued_id,
+                        "candidate_not_found",
                     )
                     .await;
                 }
@@ -806,7 +915,7 @@ impl ParallelExecutor {
     }
 
     pub(super) async fn emit_no_analysis_diagnostic(
-        &self,
+        &mut self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
@@ -820,6 +929,17 @@ impl ParallelExecutor {
             .unwrap_or_default();
 
         if reducer_queued.is_empty() {
+            return;
+        }
+
+        let diagnostic_key = (
+            reducer_queued.clone(),
+            queued.len(),
+            in_flight.len(),
+            reason.to_string(),
+        );
+        if !self.no_analysis_diagnostics_seen.insert(diagnostic_key) {
+            debug!(reason, "Suppressing repeated no-analysis diagnostic");
             return;
         }
 

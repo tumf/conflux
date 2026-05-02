@@ -164,6 +164,8 @@ impl ParallelExecutor {
             shared_orchestrator_state: None,
             last_dispatched_resolve_wait_changes: HashSet::new(),
             resolve_wait_retry_triggered: false,
+            queue_reconciliation_diagnostics_seen: HashSet::new(),
+            no_analysis_diagnostics_seen: HashSet::new(),
         }
     }
 

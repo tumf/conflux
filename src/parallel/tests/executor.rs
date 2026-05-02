@@ -370,6 +370,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -483,6 +485,8 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -587,6 +591,8 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -740,6 +746,8 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -948,6 +956,8 @@ async fn test_merge_retries_when_merge_commit_missing() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1148,6 +1158,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1354,6 +1366,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        queue_reconciliation_diagnostics_seen: HashSet::new(),
+        no_analysis_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -3202,6 +3216,287 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
     );
 }
 
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use crate::vcs::GitWorkspaceManager;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let temp_dir = TempDir::new().or_fail("unexpected error");
+    let repo_root = temp_dir.path();
+    let workspace_base = repo_root.join("worktrees");
+    init_git_repo(repo_root).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let mut manager = GitWorkspaceManager::new(
+        workspace_base.clone(),
+        repo_root.to_path_buf(),
+        1,
+        config.clone(),
+    );
+    let workspace = manager
+        .create_workspace("alpha", None)
+        .await
+        .or_fail("create workspace");
+    let original_change_dir = workspace.path.join("openspec/changes/alpha");
+    std::fs::create_dir_all(&original_change_dir).or_fail("create original change dir");
+    std::fs::write(original_change_dir.join("proposal.md"), "# alpha draft\n")
+        .or_fail("write original change file");
+    std::fs::create_dir_all(workspace.path.join("openspec/changes/archive/alpha"))
+        .or_fail("create archive dir");
+    std::fs::write(
+        workspace
+            .path
+            .join("openspec/changes/archive/alpha/proposal.md"),
+        "# alpha\n",
+    )
+    .or_fail("write archive file");
+    std::fs::remove_dir_all(&original_change_dir).or_fail("remove original change dir");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git add workspace archive");
+    Command::new("git")
+        .args(["commit", "-m", "Archive alpha"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git commit workspace archive");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git add worktree gitfile");
+    Command::new("git")
+        .args(["commit", "-m", "Track alpha worktree"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git commit worktree gitfile");
+
+    let hook_marker = repo_root.join("hook-count.txt");
+    let hook_command = format!("printf 'alpha\\n' >> {}", hook_marker.to_string_lossy());
+    let hooks = HookRunner::new(
+        HooksConfig {
+            on_merged: Some(HookConfigValue::Full(HookConfig {
+                command: hook_command,
+                continue_on_failure: false,
+                timeout: 5,
+                git_commit_no_verify: false,
+                max_retries: 0,
+                retry_delay_secs: 1,
+            })),
+            ..Default::default()
+        },
+        repo_root,
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Resolve in progress for another change".to_string(),
+            auto_resumable: true,
+        });
+    }
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(manager);
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.set_hooks(hooks);
+
+    match (MergeAttempt::Merged {
+        revision: "merge-rev-alpha".to_string(),
+    }) {
+        MergeAttempt::Merged { revision } => {
+            executor
+                .clear_resolve_wait_intent_for_success("alpha")
+                .await;
+            if let Some(ref hooks) = executor.hooks {
+                let hook_ctx = crate::hooks::HookContext::new(0, 0, 0, false)
+                    .with_change("alpha", 0, 0)
+                    .with_apply_count(0)
+                    .with_parallel_context(&workspace.path.to_string_lossy(), None);
+                hooks
+                    .run_hook(crate::hooks::HookType::OnMerged, &hook_ctx)
+                    .await
+                    .or_fail("on_merged hook should succeed");
+            }
+            executor
+                .mark_deferred_merge_completed_in_shared_state("alpha", &revision)
+                .await;
+            crate::parallel::events::send_event(
+                &executor.event_tx,
+                ParallelEvent::MergeCompleted {
+                    change_id: "alpha".to_string(),
+                    revision,
+                },
+            )
+            .await;
+        }
+        MergeAttempt::Deferred(deferred) => {
+            panic!("expected merge success, got deferred: {}", deferred.reason);
+        }
+    }
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(!executor.has_resolve_wait());
+    assert!(shared.read().await.resolve_wait_change_ids().is_empty());
+
+    executor.trigger_resolve_wait_retry_dispatch();
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    let hook_output = std::fs::read_to_string(&hook_marker).or_fail("read hook marker");
+    assert_eq!(
+        hook_output.lines().filter(|line| *line == "alpha").count(),
+        1,
+        "on_merged hook must run exactly once for deferred retry success"
+    );
+
+    let mut merge_completed = 0usize;
+    let mut resolve_started = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::MergeCompleted { change_id, .. }
+                if change_id == "alpha" =>
+            {
+                merge_completed += 1;
+            }
+            crate::events::ExecutionEvent::ResolveStarted { change_id, .. }
+                if change_id == "alpha" =>
+            {
+                resolve_started += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(merge_completed, 1);
+    assert_eq!(resolve_started, 0);
+}
+
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use crate::vcs::GitWorkspaceManager;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let temp_dir = TempDir::new().or_fail("unexpected error");
+    let repo_root = temp_dir.path();
+    let workspace_base = repo_root.join("worktrees");
+    init_git_repo(repo_root).await;
+
+    std::fs::create_dir_all(repo_root.join("openspec/changes/archive/alpha"))
+        .or_fail("create archive dir");
+    std::fs::write(
+        repo_root.join("openspec/changes/archive/alpha/proposal.md"),
+        "# alpha\n",
+    )
+    .or_fail("write archive file");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git add base archive");
+    Command::new("git")
+        .args(["commit", "-m", "Archive alpha on base"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("git commit base archive");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let manager = GitWorkspaceManager::new(
+        workspace_base.clone(),
+        repo_root.to_path_buf(),
+        1,
+        config.clone(),
+    );
+
+    let hook_marker = repo_root.join("stale-hook-count.txt");
+    let hook_command = format!("printf 'alpha\\n' >> {}", hook_marker.to_string_lossy());
+    let hooks = HookRunner::new(
+        HooksConfig {
+            on_merged: Some(HookConfigValue::Full(HookConfig {
+                command: hook_command,
+                continue_on_failure: false,
+                timeout: 5,
+                git_commit_no_verify: false,
+                max_retries: 0,
+                retry_delay_secs: 1,
+            })),
+            ..Default::default()
+        },
+        repo_root,
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Resolve in progress for another change".to_string(),
+            auto_resumable: true,
+        });
+    }
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(manager);
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.set_hooks(hooks);
+
+    executor.retry_deferred_merges().await;
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(!executor.has_resolve_wait());
+    assert!(shared.read().await.resolve_wait_change_ids().is_empty());
+    assert!(
+        !hook_marker.exists(),
+        "stale already-merged retry must not run on_merged hook"
+    );
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::MergeStarted { .. }
+            | crate::events::ExecutionEvent::ResolveStarted { .. }
+            | crate::events::ExecutionEvent::MergeCompleted { .. } => {
+                panic!("stale already-merged retry must not emit merge/resolve event: {event:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
     use crate::events::ExecutionEvent;
@@ -3310,6 +3605,126 @@ async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state(
 }
 
 #[tokio::test]
+async fn test_queue_reconciliation_diagnostic_dedupe_state_is_keyed_by_change_and_reason() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-a", "already_active"));
+    assert!(!executor.should_emit_queue_reconciliation_diagnostic("change-a", "already_active"));
+    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-a", "candidate_not_found"));
+    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-b", "already_active"));
+}
+
+#[tokio::test]
+async fn test_scheduler_reconciliation_active_diagnostic_is_bounded() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::from([selected.clone()]);
+
+    for _ in 0..3 {
+        let added = executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await;
+        assert_eq!(added, 0);
+    }
+
+    let mut already_active_logs = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.message.contains("Queue reconciliation deferred")
+                && log.message.contains("already_active")
+            {
+                already_active_logs += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        already_active_logs, 1,
+        "repeated active/in-flight reconciliation should emit one bounded diagnostic"
+    );
+    assert!(queued.is_empty());
+}
+
+#[tokio::test]
+async fn test_scheduler_reconciliation_missing_candidate_diagnostic_is_observable_but_bounded() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+    let missing_id = "missing-candidate-for-reconciliation-test".to_string();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![missing_id.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(missing_id.clone()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+
+    for _ in 0..3 {
+        let added = executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+            .await;
+        assert_eq!(added, 0);
+    }
+
+    let mut candidate_not_found_logs = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.message.contains("Queue reconciliation pending")
+                && log.message.contains("candidate_not_found")
+            {
+                candidate_not_found_logs += 1;
+            }
+        }
+    }
+
+    assert_eq!(
+        candidate_not_found_logs, 1,
+        "missing candidate diagnostics should remain observable but bounded"
+    );
+    assert!(queued.is_empty());
+}
+
+#[tokio::test]
 async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
     use crate::events::ExecutionEvent;
     use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
@@ -3350,28 +3765,29 @@ async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
             .await
     });
 
-    let saw_diagnostic = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    let diagnostic_count = tokio::time::timeout(std::time::Duration::from_millis(1200), async {
+        let mut count = 0usize;
         loop {
             match rx.recv().await {
                 Some(ExecutionEvent::Log(log)) => {
                     let message = log.message;
                     if message.contains("reason=no_available_slots") {
-                        break true;
+                        count += 1;
                     }
                 }
                 Some(_) => continue,
-                None => break false,
+                None => break count,
             }
         }
     })
     .await
-    .unwrap_or(false);
+    .unwrap_or(1);
 
     handle.abort();
 
-    assert!(
-        saw_diagnostic,
-        "scheduler loop should emit no_available_slots diagnostic when queued intent exists but slots are saturated"
+    assert_eq!(
+        diagnostic_count, 1,
+        "scheduler loop should emit no_available_slots diagnostic once while queued intent remains unchanged"
     );
 }
 
