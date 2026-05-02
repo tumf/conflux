@@ -18,3 +18,7 @@
 
 - Consider a clearer public API name for manual resolve retry startup if the minimal fix uses a special-case branch inside `run_parallel_order_based_with_executor`.
 - Consider improving TUI logs so `resolve pending` startup distinguishes between no reducer intent, missing preserved workspace, dirty base, and actual resolver execution.
+
+## Acceptance #1 Failure Follow-up
+- [x] `openspec/changes/fix-manual-resolve-empty-scheduler/tasks.md:3-15` の完了チェックを実装実態に合わせて更新してください。現在は empty-startup fix が未達成なのに全タスク完了扱いで、`openspec/CONSTITUTION.md:31-35` の Truthful completion に反しています。
+- [x] `src/parallel_run_service.rs:261-296` と `src/parallel_run_service.rs:451-461` が未修正で、`src/tui/command_handlers.rs:580-620` からの `run_orchestrator_parallel(Vec::new(), ...)` は空 `changes` で `prepare_parallel_execution()` により即終了します。shared reducer に `ResolveWait` があっても `src/parallel/orchestration.rs:151-155` の retry dispatch へ到達するよう修正してください。
