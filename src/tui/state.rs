@@ -2050,6 +2050,24 @@ mod tests {
             .any(|log| log.message.contains("Marked for execution: test-change")));
     }
 
+    #[test]
+    fn test_apply_display_statuses_from_reducer_updates_error_row_to_merged() {
+        let changes = vec![create_test_change("test-change", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].set_error_message_cache("previous failure".to_string());
+        app.changes[0].selected = true;
+        assert_eq!(app.changes[0].display_status_cache, "error");
+
+        let display_map = HashMap::from([("test-change".to_string(), "merged")]);
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert!(
+            app.changes[0].selected,
+            "only rejected rows should be forcibly deselected during reducer sync"
+        );
+    }
+
     // Iteration guard tests
 
     #[test]
