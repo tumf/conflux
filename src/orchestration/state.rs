@@ -218,6 +218,16 @@ impl ChangeRuntimeState {
         !matches!(self.terminal, TerminalState::None)
     }
 
+    /// Check whether a repository-visible success event may replace the current terminal state.
+    ///
+    /// Recoverable execution errors are terminal for retry/slot accounting, but later
+    /// same-change archive/merge/resolve success events are more authoritative for current
+    /// display state. Final outcomes such as rejected, already merged, archived, or stopped
+    /// remain immutable.
+    fn can_success_supersede_terminal(&self) -> bool {
+        matches!(self.terminal, TerminalState::None | TerminalState::Error(_))
+    }
+
     /// Verify invariants. Returns `false` if an invalid combination is detected.
     ///
     /// Forbidden combinations:
@@ -1184,24 +1194,28 @@ impl OrchestratorState {
                             && !runtime.is_terminal()
                     });
                 let rt = self.runtime_entry(change_id);
-                rt.activity = ActivityState::Idle;
+                if rt.can_success_supersede_terminal() {
+                    rt.activity = ActivityState::Idle;
+                    rt.terminal = TerminalState::None;
+                    rt.clear_blocked_metadata();
 
-                match mode {
-                    ExecutionMode::Serial => {
-                        // Serial: archive is terminal.
-                        rt.terminal = TerminalState::Archived;
-                        rt.wait_state = WaitState::None;
-                        rt.queue_intent = QueueIntent::NotQueued;
-                    }
-                    ExecutionMode::Parallel => {
-                        // Parallel: archived changes defer to active resolve in the same reducer scope.
-                        // If another change is resolving, keep this row in ResolveWait so it can
-                        // continue automatically after the active resolve completes.
-                        rt.wait_state = if has_other_resolve_lane_blocker {
-                            WaitState::ResolveWait
-                        } else {
-                            WaitState::MergeWait
-                        };
+                    match mode {
+                        ExecutionMode::Serial => {
+                            // Serial: archive is terminal.
+                            rt.terminal = TerminalState::Archived;
+                            rt.wait_state = WaitState::None;
+                            rt.queue_intent = QueueIntent::NotQueued;
+                        }
+                        ExecutionMode::Parallel => {
+                            // Parallel: archived changes defer to active resolve in the same reducer scope.
+                            // If another change is resolving, keep this row in ResolveWait so it can
+                            // continue automatically after the active resolve completes.
+                            rt.wait_state = if has_other_resolve_lane_blocker {
+                                WaitState::ResolveWait
+                            } else {
+                                WaitState::MergeWait
+                            };
+                        }
                     }
                 }
             }
@@ -1239,11 +1253,12 @@ impl OrchestratorState {
             }
             ExecutionEvent::MergeCompleted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
+                if rt.can_success_supersede_terminal() {
                     rt.terminal = TerminalState::Merged;
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::None;
                     rt.queue_intent = QueueIntent::NotQueued;
+                    rt.clear_blocked_metadata();
                     // Remove from resolve queue if present.
                     self.resolve_wait_queue.retain(|id| id != change_id);
                 }
@@ -1257,9 +1272,10 @@ impl OrchestratorState {
             }
             ExecutionEvent::ResolveCompleted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal()
+                if rt.can_success_supersede_terminal()
                     && !rt.dequeued
-                    && (matches!(rt.activity, ActivityState::Resolving)
+                    && (matches!(rt.terminal, TerminalState::Error(_))
+                        || matches!(rt.activity, ActivityState::Resolving)
                         || matches!(rt.wait_state, WaitState::ResolveWait))
                 {
                     rt.activity = ActivityState::Idle;
@@ -2638,6 +2654,107 @@ mod tests {
             "Parallel: MergeCompleted must transition to merged terminal"
         );
         assert!(state.is_terminal_change("c"));
+    }
+
+    #[test]
+    fn test_parallel_mode_archive_success_clears_prior_acceptance_error() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
+            change_id: "alpha".to_string(),
+            error: "transient acceptance failure".to_string(),
+        });
+        assert_eq!(state.display_status("alpha"), "error");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("alpha".to_string()));
+
+        assert_eq!(
+            state.display_status("alpha"),
+            "merge wait",
+            "same-change archive success must supersede a recoverable acceptance error"
+        );
+        assert!(!state.is_terminal_change("alpha"));
+    }
+
+    #[test]
+    fn test_parallel_mode_acceptance_error_archive_then_merge_finishes_merged() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["add-skill-secret-ingestion".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::AcceptanceFailed {
+            change_id: "add-skill-secret-ingestion".to_string(),
+            error: "acceptance failed before fix".to_string(),
+        });
+        assert_eq!(state.display_status("add-skill-secret-ingestion"), "error");
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived(
+            "add-skill-secret-ingestion".to_string(),
+        ));
+        assert_ne!(state.display_status("add-skill-secret-ingestion"), "error");
+
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "add-skill-secret-ingestion".to_string(),
+            revision: "merge-rev".to_string(),
+        });
+
+        assert_eq!(state.display_status("add-skill-secret-ingestion"), "merged");
+        assert!(state.is_terminal_change("add-skill-secret-ingestion"));
+    }
+
+    #[test]
+    fn test_merge_and_resolve_success_clear_prior_processing_error_but_not_rejected() {
+        use crate::events::ExecutionEvent;
+
+        let mut merge_state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+        merge_state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "recoverable process failure".to_string(),
+        });
+        assert_eq!(merge_state.display_status("alpha"), "error");
+        merge_state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "merge-rev".to_string(),
+        });
+        assert_eq!(merge_state.display_status("alpha"), "merged");
+
+        let mut resolve_state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+        resolve_state.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "recoverable process failure".to_string(),
+        });
+        assert_eq!(resolve_state.display_status("alpha"), "error");
+        resolve_state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "alpha".to_string(),
+            worktree_change_ids: None,
+        });
+        assert_eq!(resolve_state.display_status("alpha"), "merged");
+
+        let mut rejected_state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+        rejected_state.apply_execution_event(&ExecutionEvent::ChangeRejected {
+            change_id: "alpha".to_string(),
+            reason: "final rejection".to_string(),
+        });
+        rejected_state.apply_execution_event(&ExecutionEvent::ChangeArchived("alpha".to_string()));
+        rejected_state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "stale-merge-rev".to_string(),
+        });
+        rejected_state.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "alpha".to_string(),
+            worktree_change_ids: None,
+        });
+        assert_eq!(rejected_state.display_status("alpha"), "rejected");
     }
 
     #[test]

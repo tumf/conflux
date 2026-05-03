@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Execution Events Maintain Truthful Terminal State
+### Requirement: Reducer-Owned Change Runtime State
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, or resolve success events.
 
