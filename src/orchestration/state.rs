@@ -1246,8 +1246,12 @@ impl OrchestratorState {
                             self.resolve_wait_queue.push(change_id.clone());
                         }
                     } else {
-                        // Manual intervention required.
+                        // Manual intervention required: the change must remain visible
+                        // as merge-wait only, not as ordinary queued work. The explicit
+                        // ResolveMerge command is the authoritative retry signal.
                         rt.wait_state = WaitState::MergeWait;
+                        rt.queue_intent = QueueIntent::NotQueued;
+                        self.resolve_wait_queue.retain(|id| id != change_id);
                     }
                 }
             }
@@ -2230,6 +2234,106 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 4.3: parallel merge events drive reducer wait states
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manual_merge_deferred_clears_normal_queue_intent() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert_eq!(state.queued_change_ids(), vec!["c".to_string()]);
+
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+
+        assert_eq!(state.display_status("c"), "merge wait");
+        assert!(
+            state.queued_change_ids().is_empty(),
+            "manual merge deferral must consume ordinary queue intent"
+        );
+        assert!(
+            state.resolve_wait_change_ids().is_empty(),
+            "manual merge deferral must not remain scheduler-owned resolve retry intent"
+        );
+    }
+
+    #[test]
+    fn test_manual_merge_deferred_clears_existing_resolve_wait_queue_membership() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "another merge is in progress".to_string(),
+            auto_resumable: true,
+        });
+        assert_eq!(state.display_status("c"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["c".to_string()]);
+
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+
+        assert_eq!(state.display_status("c"), "merge wait");
+        assert!(state.queued_change_ids().is_empty());
+        assert!(state.resolve_wait_change_ids().is_empty());
+    }
+
+    #[test]
+    fn test_manual_merge_deferred_resolve_merge_explicit_retry_sets_resolve_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(state.display_status("c"), "merge wait");
+        assert!(state.queued_change_ids().is_empty());
+
+        let outcome = state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
+
+        assert!(matches!(outcome, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["c".to_string()]);
+        assert!(
+            state.queued_change_ids().is_empty(),
+            "explicit merge retry must use resolve-wait intent, not normal queue intent"
+        );
+    }
+
+    #[test]
+    fn test_auto_resumable_merge_deferred_keeps_scheduler_retry_intent() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "another merge is in progress".to_string(),
+            auto_resumable: true,
+        });
+
+        assert_eq!(state.display_status("c"), "resolve pending");
+        assert_eq!(state.queued_change_ids(), vec!["c".to_string()]);
+        assert_eq!(state.resolve_wait_change_ids(), vec!["c".to_string()]);
+    }
 
     #[test]
     fn test_parallel_merge_events_drive_reducer_wait_states() {
