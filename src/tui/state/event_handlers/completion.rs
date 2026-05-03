@@ -66,7 +66,9 @@ impl AppState {
         worktree_change_ids: Option<HashSet<String>>,
     ) -> Option<TuiCommand> {
         self.is_resolving = false;
+        let mut already_merged = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            already_merged = change.display_status_cache == "merged";
             change.set_display_status_cache("merged");
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
@@ -84,10 +86,12 @@ impl AppState {
         if let Some(ids) = worktree_change_ids {
             self.apply_worktree_status(&ids);
         }
-        self.add_log(LogEntry::success(format!(
-            "Merge resolved for '{}'",
-            change_id
-        )));
+        if !already_merged {
+            self.add_log(LogEntry::success(format!(
+                "Merge resolved for '{}'",
+                change_id
+            )));
+        }
 
         if let Some(next_change_id) = self.pop_from_resolve_queue() {
             self.add_log(LogEntry::info(format!(

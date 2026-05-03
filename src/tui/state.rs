@@ -2233,6 +2233,21 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_completed_does_not_log_duplicate_after_merge_completed() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].display_status_cache = "merged".to_string();
+
+        let cmd = app.handle_resolve_completed("change-a".to_string(), None);
+
+        assert!(cmd.is_none());
+        assert!(!app
+            .logs
+            .iter()
+            .any(|log| log.message == "Merge resolved for 'change-a'"));
+    }
+
+    #[test]
     fn test_resolve_merge_queues_when_resolving() {
         let changes = vec![
             create_test_change("change-a", 0, 1),
