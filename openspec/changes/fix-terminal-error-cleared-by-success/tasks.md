@@ -1,0 +1,11 @@
+## Implementation Tasks
+
+- [ ] Allow same-change archive success to clear prior recoverable error state. Completion condition: `src/orchestration/state.rs` `ChangeArchived` handling no longer leaves a change in `TerminalState::Error` when the same change later archives successfully, while preserving rejected terminal behavior. (verification: unit - add/update `src/orchestration/state.rs` tests and run exact `cargo test` filter for the new archive-after-error test)
+- [ ] Allow same-change merge/resolve success to clear prior recoverable error state. Completion condition: `MergeCompleted` and `ResolveCompleted` for the same change can transition from prior `TerminalState::Error` to `Merged`, without resurrecting already rejected changes. (verification: unit - add/update `src/orchestration/state.rs` tests for `AcceptanceFailed -> ChangeArchived -> MergeCompleted` and rejected-not-overwritten cases; run exact `cargo test` filters)
+- [ ] Ensure TUI display sync can leave error state after reducer success. Completion condition: `src/tui/state.rs::apply_display_statuses_from_reducer` or adjacent tests prove a row with `display_status_cache == "error"` updates to `"merged"` when reducer display status becomes merged. (verification: unit - add/update `src/tui/state.rs` test and run exact `cargo test` filter)
+- [ ] Verify the observed dbot sequence is represented as regression coverage. Completion condition: a test models `AcceptanceFailed` followed by successful archive and merge for `add-skill-secret-ingestion`-like sequence and asserts final current status is not `error`. (verification: integration - targeted Rust test in `src/orchestration/state.rs` or adjacent reducer/TUI test module references the event sequence and runs via exact `cargo test` filter)
+- [ ] Run proposal and repository verification. Completion condition: OpenSpec validation passes and targeted Rust tests covering terminal error clearing pass. (verification: manual - run `cflx openspec validate fix-terminal-error-cleared-by-success --strict --evidence warn`, `cargo fmt --all -- --check`, and targeted `cargo test` filters)
+
+## Future Work
+
+- Consider retaining last recoverable error in a history panel while keeping current row status truthful after success.
