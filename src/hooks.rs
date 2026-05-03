@@ -2001,6 +2001,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_project_release_hook_config_skips_git_commit_verification() {
+        let config = HooksConfig {
+            on_merged: Some(HookConfigValue::Full(HookConfig {
+                command: "make bump-patch".to_string(),
+                continue_on_failure: false,
+                timeout: 600,
+                git_commit_no_verify: true,
+                max_retries: 0,
+                retry_delay_secs: 5,
+            })),
+            ..Default::default()
+        };
+
+        let hook = config.get(HookType::OnMerged).unwrap();
+        assert_eq!(hook.command, "make bump-patch");
+        assert_eq!(hook.timeout, 600);
+        assert!(hook.git_commit_no_verify);
+        assert_eq!(hook.max_retries, 0);
+    }
+
+    #[tokio::test]
     async fn test_index_lock_wait_no_lock_file() {
         // When no .git/index.lock exists, wait returns immediately
         let tmp_dir = tempfile::tempdir().unwrap();

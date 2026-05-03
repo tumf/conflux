@@ -68,8 +68,13 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
 		exit 0
 	fi
 
+	COMMIT_ARGS=(-m "chore(release): release v${NEW_VERSION}")
+	if [[ "${OPENSPEC_GIT_COMMIT_NO_VERIFY:-false}" == "true" ]]; then
+		COMMIT_ARGS=(--no-verify "${COMMIT_ARGS[@]}")
+	fi
+
 	git add -A
-	git commit -m "chore(release): release v${NEW_VERSION}"
+	git commit "${COMMIT_ARGS[@]}"
 	git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
 	git push origin "$CURRENT_BRANCH" --follow-tags
 	exit 0

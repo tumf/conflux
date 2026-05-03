@@ -14,9 +14,10 @@
         //"on_merged": "make bump-patch && make index"
         "on_merged": {
             "command": "make bump-patch",
-            "timeout": 120,
+            "timeout": 600,
             "continue_on_failure": false,
-            "max_retries": 2,
+            "git_commit_no_verify": true,
+            "max_retries": 0,
             "retry_delay_secs": 5,
         },
     },
