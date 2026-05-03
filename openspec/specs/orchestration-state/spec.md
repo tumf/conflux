@@ -56,72 +56,45 @@ Workspace observations SHALL NOT regress a change from terminal `Merged` back to
 
 The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-When the scheduler retries an archived Git merge and the merge path reaches a normal merge-ready state without unresolved conflicts, the runtime SHALL complete that merge through the normal merge/verification path and SHALL NOT start AI conflict resolution solely because the retry entered the resolve-capable code path.
+When a merge attempt is deferred because it is auto-resumable, such as another merge or resolve lane currently occupying merge capacity, the reducer SHALL represent the change as `ResolveWait` and keep it eligible for scheduler-owned retry.
 
-Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
+When a merge attempt is deferred because manual user action is required, such as a dirty base working tree with uncommitted changes, the reducer SHALL represent the change as `MergeWait` and SHALL remove normal queue intent for that change. Manual merge deferral MUST NOT cause scheduler queue reconciliation to re-dispatch the archived workspace as ordinary queued work.
 
-When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
+An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+#### Scenario: manual dirty-base deferral clears normal queue intent
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+**Given**: change `alpha` has already archived in parallel mode
+**And**: `alpha` still has normal queued intent from an earlier dispatch
+**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
+**Then**: `alpha` SHALL display as `merge wait`
+**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
+**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
 
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation succeeds without unresolved conflicts
-**And**: conflict detection returns no conflict files
-**When**: the runtime evaluates whether to start conflict resolution
-**Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
-**And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-**And**: it SHALL continue through the normal merge completion path
+#### Scenario: manual merge-wait change is not re-added by queue reconciliation
 
-#### Scenario: empty startup does not reset resolve wait before executor sync
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the archived workspace for `alpha` is still present
+**When**: scheduler queue reconciliation reads reducer-owned queued candidates
+**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
+**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
 
-**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
-**And**: the TUI starts a scheduler-owned run with no active changes selected
-**When**: parallel orchestrator startup initializes execution state
-**Then**: it preserves the existing reducer runtime entry for `alpha`
-**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
-**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
+#### Scenario: explicit retry after manual deferral enters resolve wait
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the user has resolved the manual blocker outside Conflux
+**When**: the user requests merge retry for `alpha` through `ResolveMerge`
+**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
+**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
+**And**: scheduler-owned merge retry may attempt the archived workspace merge
 
-**Given**: change `alpha` is archived and merged into the target branch by a valid merge commit
-**And**: the archived source branch tip itself no longer proves inclusion of the pre-merge base
-**When**: post-merge verification runs
-**Then**: the runtime SHALL accept the merged outcome from repository-visible merge evidence
-**And**: it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: auto-resumable deferral remains scheduler retry intent
 
-#### Scenario: True conflict still enters resolve path
-
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation leaves unresolved conflicts
-**When**: the runtime evaluates conflict resolution
-**Then**: it SHALL emit `ResolveStarted` for `alpha`
-**And**: the resolve prompt SHALL include non-empty conflict evidence
-
-#### Scenario: successful deferred retry clears retry intent
-
-**Given**: change `alpha` is in reducer-owned resolve-wait retry intent
-**And**: the scheduler retries and completes the merge successfully
-**When**: scheduler-local retry state is synchronized from reducer-owned state again
-**Then**: `alpha` is not returned as a resolve-wait retry candidate
-**And**: the scheduler does not attempt another merge for `alpha`
-
-#### Scenario: stale retry for merged change is consumed without side effects
-
-**Given**: change `alpha` is already repository-visible as merged into the base branch
-**And**: stale in-memory retry state still contains `alpha`
-**When**: deferred merge retry processing evaluates `alpha`
-**Then**: the stale retry entry is removed
-**And**: no merge command, resolve command, or merge hook is executed for `alpha`
-
-#### Scenario: no resolve wait empty startup is still no work
-
-**Given**: the scheduler starts with an empty active change list
-**And**: the shared reducer contains no `ResolveWait` entries
-**When**: startup evaluates whether there is scheduler-owned work
-**Then**: it may complete as a no-op
-**And**: it MUST NOT fabricate resolve, merge, or apply work
+**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
+**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
+**Then**: `beta` SHALL display as `resolve pending`
+**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
+**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
@@ -177,72 +150,45 @@ This resume-time archive-complete transition MUST preserve the user-visible merg
 
 The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-When the scheduler retries an archived Git merge and the merge path reaches a normal merge-ready state without unresolved conflicts, the runtime SHALL complete that merge through the normal merge/verification path and SHALL NOT start AI conflict resolution solely because the retry entered the resolve-capable code path.
+When a merge attempt is deferred because it is auto-resumable, such as another merge or resolve lane currently occupying merge capacity, the reducer SHALL represent the change as `ResolveWait` and keep it eligible for scheduler-owned retry.
 
-Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
+When a merge attempt is deferred because manual user action is required, such as a dirty base working tree with uncommitted changes, the reducer SHALL represent the change as `MergeWait` and SHALL remove normal queue intent for that change. Manual merge deferral MUST NOT cause scheduler queue reconciliation to re-dispatch the archived workspace as ordinary queued work.
 
-When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
+An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+#### Scenario: manual dirty-base deferral clears normal queue intent
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+**Given**: change `alpha` has already archived in parallel mode
+**And**: `alpha` still has normal queued intent from an earlier dispatch
+**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
+**Then**: `alpha` SHALL display as `merge wait`
+**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
+**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
 
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation succeeds without unresolved conflicts
-**And**: conflict detection returns no conflict files
-**When**: the runtime evaluates whether to start conflict resolution
-**Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
-**And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-**And**: it SHALL continue through the normal merge completion path
+#### Scenario: manual merge-wait change is not re-added by queue reconciliation
 
-#### Scenario: empty startup does not reset resolve wait before executor sync
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the archived workspace for `alpha` is still present
+**When**: scheduler queue reconciliation reads reducer-owned queued candidates
+**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
+**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
 
-**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
-**And**: the TUI starts a scheduler-owned run with no active changes selected
-**When**: parallel orchestrator startup initializes execution state
-**Then**: it preserves the existing reducer runtime entry for `alpha`
-**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
-**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
+#### Scenario: explicit retry after manual deferral enters resolve wait
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the user has resolved the manual blocker outside Conflux
+**When**: the user requests merge retry for `alpha` through `ResolveMerge`
+**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
+**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
+**And**: scheduler-owned merge retry may attempt the archived workspace merge
 
-**Given**: change `alpha` is archived and merged into the target branch by a valid merge commit
-**And**: the archived source branch tip itself no longer proves inclusion of the pre-merge base
-**When**: post-merge verification runs
-**Then**: the runtime SHALL accept the merged outcome from repository-visible merge evidence
-**And**: it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: auto-resumable deferral remains scheduler retry intent
 
-#### Scenario: True conflict still enters resolve path
-
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation leaves unresolved conflicts
-**When**: the runtime evaluates conflict resolution
-**Then**: it SHALL emit `ResolveStarted` for `alpha`
-**And**: the resolve prompt SHALL include non-empty conflict evidence
-
-#### Scenario: successful deferred retry clears retry intent
-
-**Given**: change `alpha` is in reducer-owned resolve-wait retry intent
-**And**: the scheduler retries and completes the merge successfully
-**When**: scheduler-local retry state is synchronized from reducer-owned state again
-**Then**: `alpha` is not returned as a resolve-wait retry candidate
-**And**: the scheduler does not attempt another merge for `alpha`
-
-#### Scenario: stale retry for merged change is consumed without side effects
-
-**Given**: change `alpha` is already repository-visible as merged into the base branch
-**And**: stale in-memory retry state still contains `alpha`
-**When**: deferred merge retry processing evaluates `alpha`
-**Then**: the stale retry entry is removed
-**And**: no merge command, resolve command, or merge hook is executed for `alpha`
-
-#### Scenario: no resolve wait empty startup is still no work
-
-**Given**: the scheduler starts with an empty active change list
-**And**: the shared reducer contains no `ResolveWait` entries
-**When**: startup evaluates whether there is scheduler-owned work
-**Then**: it may complete as a no-op
-**And**: it MUST NOT fabricate resolve, merge, or apply work
+**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
+**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
+**Then**: `beta` SHALL display as `resolve pending`
+**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
+**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
 
 ### Requirement: merge-deferred-reducer-sync
 
@@ -380,72 +326,45 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 
 The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-When the scheduler retries an archived Git merge and the merge path reaches a normal merge-ready state without unresolved conflicts, the runtime SHALL complete that merge through the normal merge/verification path and SHALL NOT start AI conflict resolution solely because the retry entered the resolve-capable code path.
+When a merge attempt is deferred because it is auto-resumable, such as another merge or resolve lane currently occupying merge capacity, the reducer SHALL represent the change as `ResolveWait` and keep it eligible for scheduler-owned retry.
 
-Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
+When a merge attempt is deferred because manual user action is required, such as a dirty base working tree with uncommitted changes, the reducer SHALL represent the change as `MergeWait` and SHALL remove normal queue intent for that change. Manual merge deferral MUST NOT cause scheduler queue reconciliation to re-dispatch the archived workspace as ordinary queued work.
 
-When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
+An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+#### Scenario: manual dirty-base deferral clears normal queue intent
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+**Given**: change `alpha` has already archived in parallel mode
+**And**: `alpha` still has normal queued intent from an earlier dispatch
+**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
+**Then**: `alpha` SHALL display as `merge wait`
+**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
+**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
 
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation succeeds without unresolved conflicts
-**And**: conflict detection returns no conflict files
-**When**: the runtime evaluates whether to start conflict resolution
-**Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
-**And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-**And**: it SHALL continue through the normal merge completion path
+#### Scenario: manual merge-wait change is not re-added by queue reconciliation
 
-#### Scenario: empty startup does not reset resolve wait before executor sync
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the archived workspace for `alpha` is still present
+**When**: scheduler queue reconciliation reads reducer-owned queued candidates
+**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
+**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
 
-**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
-**And**: the TUI starts a scheduler-owned run with no active changes selected
-**When**: parallel orchestrator startup initializes execution state
-**Then**: it preserves the existing reducer runtime entry for `alpha`
-**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
-**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
+#### Scenario: explicit retry after manual deferral enters resolve wait
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the user has resolved the manual blocker outside Conflux
+**When**: the user requests merge retry for `alpha` through `ResolveMerge`
+**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
+**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
+**And**: scheduler-owned merge retry may attempt the archived workspace merge
 
-**Given**: change `alpha` is archived and merged into the target branch by a valid merge commit
-**And**: the archived source branch tip itself no longer proves inclusion of the pre-merge base
-**When**: post-merge verification runs
-**Then**: the runtime SHALL accept the merged outcome from repository-visible merge evidence
-**And**: it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: auto-resumable deferral remains scheduler retry intent
 
-#### Scenario: True conflict still enters resolve path
-
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation leaves unresolved conflicts
-**When**: the runtime evaluates conflict resolution
-**Then**: it SHALL emit `ResolveStarted` for `alpha`
-**And**: the resolve prompt SHALL include non-empty conflict evidence
-
-#### Scenario: successful deferred retry clears retry intent
-
-**Given**: change `alpha` is in reducer-owned resolve-wait retry intent
-**And**: the scheduler retries and completes the merge successfully
-**When**: scheduler-local retry state is synchronized from reducer-owned state again
-**Then**: `alpha` is not returned as a resolve-wait retry candidate
-**And**: the scheduler does not attempt another merge for `alpha`
-
-#### Scenario: stale retry for merged change is consumed without side effects
-
-**Given**: change `alpha` is already repository-visible as merged into the base branch
-**And**: stale in-memory retry state still contains `alpha`
-**When**: deferred merge retry processing evaluates `alpha`
-**Then**: the stale retry entry is removed
-**And**: no merge command, resolve command, or merge hook is executed for `alpha`
-
-#### Scenario: no resolve wait empty startup is still no work
-
-**Given**: the scheduler starts with an empty active change list
-**And**: the shared reducer contains no `ResolveWait` entries
-**When**: startup evaluates whether there is scheduler-owned work
-**Then**: it may complete as a no-op
-**And**: it MUST NOT fabricate resolve, merge, or apply work
+**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
+**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
+**Then**: `beta` SHALL display as `resolve pending`
+**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
+**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -993,75 +912,42 @@ This execution-mark clear applies only to the rejected change. It MUST NOT clear
 
 The system SHALL treat `ResolveMerge` / `MergeWait` retry as reducer-owned scheduler intent, not as a TUI-local direct execution operation.
 
-When the scheduler retries an archived Git merge and the merge path reaches a normal merge-ready state without unresolved conflicts, the runtime SHALL complete that merge through the normal merge/verification path and SHALL NOT start AI conflict resolution solely because the retry entered the resolve-capable code path.
+When a merge attempt is deferred because it is auto-resumable, such as another merge or resolve lane currently occupying merge capacity, the reducer SHALL represent the change as `ResolveWait` and keep it eligible for scheduler-owned retry.
 
-Post-merge verification for this path SHALL accept repository-visible merge success without requiring the archived source branch tip to continue containing the pre-merge base after the merge commit has already integrated the change into the target branch.
+When a merge attempt is deferred because manual user action is required, such as a dirty base working tree with uncommitted changes, the reducer SHALL represent the change as `MergeWait` and SHALL remove normal queue intent for that change. Manual merge deferral MUST NOT cause scheduler queue reconciliation to re-dispatch the archived workspace as ordinary queued work.
 
-When a reducer-owned deferred merge retry succeeds, the runtime SHALL remove that change from retry intent before a later scheduler sync can reintroduce it. Successful merge completion SHALL be idempotent with respect to repeated retry triggers for the same change.
+An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-A scheduler startup invoked with an empty active change list MUST NOT clear existing reducer-owned `ResolveWait` entries before the executor has synchronized them.
+#### Scenario: manual dirty-base deferral clears normal queue intent
 
-#### Scenario: Conflictless archived merge does not emit resolve command
+**Given**: change `alpha` has already archived in parallel mode
+**And**: `alpha` still has normal queued intent from an earlier dispatch
+**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
+**Then**: `alpha` SHALL display as `merge wait`
+**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
+**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
 
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation succeeds without unresolved conflicts
-**And**: conflict detection returns no conflict files
-**When**: the runtime evaluates whether to start conflict resolution
-**Then**: it SHALL NOT emit `ResolveStarted` for `alpha`
-**And**: it SHALL NOT build a conflict-oriented resolve prompt for `alpha`
-**And**: it SHALL continue through the normal merge completion path
+#### Scenario: manual merge-wait change is not re-added by queue reconciliation
 
-#### Scenario: empty startup does not reset resolve wait before executor sync
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the archived workspace for `alpha` is still present
+**When**: scheduler queue reconciliation reads reducer-owned queued candidates
+**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
+**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
 
-**Given**: change `alpha` is stored in the shared reducer as `ResolveWait`
-**And**: the TUI starts a scheduler-owned run with no active changes selected
-**When**: parallel orchestrator startup initializes execution state
-**Then**: it preserves the existing reducer runtime entry for `alpha`
-**And**: `resolve_wait_change_ids()` still contains `alpha` when the `ParallelExecutor` is created
-**And**: `ParallelRunService` can treat the empty active list as schedulable retry work
+#### Scenario: explicit retry after manual deferral enters resolve wait
 
-#### Scenario: Successful merge commit is not retried for false pre-sync negative
+**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
+**And**: the user has resolved the manual blocker outside Conflux
+**When**: the user requests merge retry for `alpha` through `ResolveMerge`
+**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
+**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
+**And**: scheduler-owned merge retry may attempt the archived workspace merge
 
-**Given**: change `alpha` is archived and merged into the target branch by a valid merge commit
-**And**: the archived source branch tip itself no longer proves inclusion of the pre-merge base
-**When**: post-merge verification runs
-**Then**: the runtime SHALL accept the merged outcome from repository-visible merge evidence
-**And**: it SHALL NOT retry resolve solely because the source branch tip does not include the pre-merge base
+#### Scenario: auto-resumable deferral remains scheduler retry intent
 
-#### Scenario: True conflict still enters resolve path
-
-**Given**: change `alpha` is archived and reaches scheduler-owned merge retry
-**And**: the target branch merge preparation leaves unresolved conflicts
-**When**: the runtime evaluates conflict resolution
-**Then**: it SHALL emit `ResolveStarted` for `alpha`
-**And**: the resolve prompt SHALL include non-empty conflict evidence
-
-#### Scenario: successful deferred retry clears retry intent
-
-**Given**: change `alpha` is in reducer-owned resolve-wait retry intent
-**And**: the scheduler retries and completes the merge successfully
-**When**: scheduler-local retry state is synchronized from reducer-owned state again
-**Then**: `alpha` is not returned as a resolve-wait retry candidate
-**And**: the scheduler does not attempt another merge for `alpha`
-
-#### Scenario: stale retry for merged change is consumed without side effects
-
-**Given**: change `alpha` is already repository-visible as merged into the base branch
-**And**: stale in-memory retry state still contains `alpha`
-**When**: deferred merge retry processing evaluates `alpha`
-**Then**: the stale retry entry is removed
-**And**: no merge command, resolve command, or merge hook is executed for `alpha`
-
-#### Scenario: resolve wait is synchronized before drained exit
-
-**Given**: shared reducer state contains one or more `ResolveWait` changes
-**When**: the scheduler loop begins an iteration
-**Then**: it synchronizes those IDs into executor retry state before checking whether queued, in-flight, resolve-wait, manual-resolve, and pending-merge work are all empty
-
-#### Scenario: no resolve wait empty startup is still no work
-
-**Given**: the scheduler starts with an empty active change list
-**And**: the shared reducer contains no `ResolveWait` entries
-**When**: startup evaluates whether there is scheduler-owned work
-**Then**: it may complete as a no-op
-**And**: it MUST NOT fabricate resolve, merge, or apply work
+**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
+**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
+**Then**: `beta` SHALL display as `resolve pending`
+**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
+**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes

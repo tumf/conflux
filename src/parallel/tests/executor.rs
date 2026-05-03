@@ -3628,6 +3628,57 @@ async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state(
 }
 
 #[tokio::test]
+async fn test_scheduler_reconciliation_does_not_requeue_manual_merge_deferred_change() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from(".");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
+    if all_changes.is_empty() {
+        return;
+    }
+
+    let selected = all_changes[0].id.clone();
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![selected.clone()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
+        assert_eq!(guard.queued_change_ids(), vec![selected.clone()]);
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: selected.clone(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        assert_eq!(guard.display_status(&selected), "merge wait");
+        assert!(
+            guard.queued_change_ids().is_empty(),
+            "manual merge deferral must clear reducer-visible ordinary queue intent before scheduler reconciliation"
+        );
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(added, 0);
+    assert!(
+        queued.is_empty(),
+        "manual merge-deferred archived change must not be reintroduced as an ordinary queued candidate"
+    );
+}
+
+#[tokio::test]
 async fn test_queue_reconciliation_diagnostic_dedupe_state_is_keyed_by_change_and_reason() {
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
