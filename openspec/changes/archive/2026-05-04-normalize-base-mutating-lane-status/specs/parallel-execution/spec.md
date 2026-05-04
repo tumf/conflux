@@ -34,7 +34,7 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 **Then**: the change remains in manual merge wait handling (`MergeWait`)
 **And**: it is not classified as auto-resumable
 
-### Requirement: Parallel rejecting lane dispatch
+### Requirement: Parallel rejecting resume semantics
 
 Parallel execution SHALL route rejection-review handoff through the same single base-mutating lane used by merge/resolve operations. A change that needs rejection review may enter active `Rejecting` only when no other non-terminal change is actively `Resolving` or `Rejecting`.
 

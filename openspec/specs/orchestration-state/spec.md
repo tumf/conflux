@@ -208,79 +208,38 @@ TUI runner の `apply_to_reducer` 条件に `MergeDeferred` イベントを含�
 
 ### Requirement: post-archive-merge-dispatch
 
-When a change is archived in parallel mode, Conflux SHALL classify the post-archive state from current reducer, workspace, and git facts using a single decision table:
+The system SHALL treat rejection-review wait as reducer-owned scheduler intent, not as TUI-local display state and not as merge/resolve retry intent.
 
-1. If another merge/resolve lane is actively occupied, the archived change SHALL enter `ResolveWait` and display `resolve pending`.
-2. If merge readiness or merge attempt finds a concrete manual blocker, the archived change SHALL enter `MergeWait` and display `merge wait` with a deferral reason.
-3. Otherwise, the archived change SHALL enter active merge handling, display `resolving` while merge handling is active, and display `merged` after merge completion.
+When a rejection review is ready to run but the base-mutating lane is occupied by another active `Resolving` or `Rejecting` change, the reducer SHALL represent the waiting change as `RejectWait` and keep it eligible for scheduler-owned automatic retry. The derived display status SHALL be `reject pending`.
 
-Automatic `ResolveWait` / `resolve pending` MUST NOT be created solely because another change is `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, terminal `Merged`, terminal `Error`, `Stalled`, `Gated`, `Blocked`, `Queued`, `MergeWait`, or absent.
+`RejectWait` MUST be distinct from `ResolveWait` so the scheduler can start rejection review, not merge/resolve retry, after the lane clears.
 
-Stable `MergeWait` after archive completion MUST be caused by a concrete manual merge deferral, such as `MergeDeferred(auto_resumable=false)`, or by explicit user retry state. Archive completion with no active blocker MUST NOT by itself settle the change into `MergeWait` instead of attempting merge.
+#### Scenario: rejection review waits behind resolving
 
-Manual/user resolve intent for an existing `MergeWait` row remains valid and may still transition that row to `ResolveWait` through the reducer-owned `ResolveMerge` command.
+**Given**: Change A is actively `Resolving`
+**And**: Change B produced `openspec/changes/<change_id>/REJECTED.md` and needs dedicated rejecting review
+**When**: the scheduler handles B's rejection-review handoff
+**Then**: B transitions to `RejectWait`
+**And**: B's derived display status is `reject pending`
+**And**: B is returned by reducer-owned reject-wait retry membership
+**And**: B is not returned by reducer-owned resolve-wait retry membership
 
-#### Scenario: active merge lane enters resolve pending
+#### Scenario: reject pending promotes to rejecting after lane clears
 
-**Given**: Change A is actively merging or resolving
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B transitions to `ResolveWait`
-**And**: B's derived display status is `resolve pending`
-**And**: B is eligible for automatic retry after A's merge/resolve lane clears
+**Given**: Change B is in `RejectWait`
+**And**: the active base-mutating lane occupant completes or fails and no other lane occupant remains
+**When**: scheduler-owned pending lane retry is evaluated
+**Then**: B transitions from `RejectWait` to active `Rejecting`
+**And**: B's derived display status becomes `rejecting`
+**And**: no other change is active in `Resolving` or `Rejecting`
 
-#### Scenario: active rejecting blocker remains auto-resumable
+#### Scenario: rejection review completion clears reject wait intent
 
-**Given**: Change A is in active `Rejecting` state
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B transitions to `ResolveWait`
-**And**: B's derived display status is `resolve pending`
-**And**: B is eligible for automatic retry after A's rejection review completes or fails
-
-#### Scenario: manual blocker enters merge wait
-
-**Given**: no other merge/resolve lane is actively occupied
-**And**: Change B has just been archived in parallel mode
-**And**: merge readiness or merge attempt detects a manual blocker such as a dirty base working tree, dirty archive workspace, incomplete archive verification, or missing archive evidence
-**When**: the merge path emits `MergeDeferred(auto_resumable=false)`
-**Then**: B SHALL display as `merge wait`
-**And**: B SHALL NOT be returned as normal queued work by scheduler queue reconciliation
-**And**: B SHALL require explicit `ResolveMerge` retry after the blocker is resolved
-
-#### Scenario: no blocker enters resolving then merged
-
-**Given**: no other merge/resolve lane is actively occupied
-**And**: Change B has just been archived in parallel mode
-**And**: merge readiness finds no manual blocker
-**When**: post-archive merge handling runs
-**Then**: B SHALL display as `resolving` while merge handling is active
-**And**: Conflux SHALL emit merge completion for B without requiring the user to press `M`
-**And**: B's derived display status SHALL become `merged`
-
-#### Scenario: applying does not create resolve pending
-
-**Given**: Change A is in active `Applying` state
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B does not transition to `ResolveWait` because of A
-**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
-
-#### Scenario: accepting does not create resolve pending
-
-**Given**: Change A is in active `Accepting` state
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B does not transition to `ResolveWait` because of A
-**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
-
-#### Scenario: terminal rejected change does not create resolve pending
-
-**Given**: Change A is terminal `Rejected`
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B does not transition to `ResolveWait` because of A
-**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+**Given**: Change B previously entered `RejectWait`
+**And**: B later starts and completes rejection review
+**When**: the reducer processes `RejectionReviewCompleted` or `RejectionReviewFailed` for B
+**Then**: B is no longer returned by reject-wait retry membership
+**And**: B does not regress to `reject pending` on later refresh
 
 ### Requirement: OrchestratorState が唯一のループ状態ソースである
 `OrchestratorState` はオーケストレーションループの状態（apply 回数、pending/archived/completed 変更セット、イテレーション番号、current change ID）の唯一の正規ソースでなければならない（MUST）。
@@ -829,79 +788,38 @@ The scheduler SHALL reconcile reducer-visible queued intent into its scheduler-l
 
 ### Requirement: post-archive-merge-dispatch
 
-When a change is archived in parallel mode, Conflux SHALL classify the post-archive state from current reducer, workspace, and git facts using a single decision table:
+The system SHALL treat rejection-review wait as reducer-owned scheduler intent, not as TUI-local display state and not as merge/resolve retry intent.
 
-1. If another merge/resolve lane is actively occupied, the archived change SHALL enter `ResolveWait` and display `resolve pending`.
-2. If merge readiness or merge attempt finds a concrete manual blocker, the archived change SHALL enter `MergeWait` and display `merge wait` with a deferral reason.
-3. Otherwise, the archived change SHALL enter active merge handling, display `resolving` while merge handling is active, and display `merged` after merge completion.
+When a rejection review is ready to run but the base-mutating lane is occupied by another active `Resolving` or `Rejecting` change, the reducer SHALL represent the waiting change as `RejectWait` and keep it eligible for scheduler-owned automatic retry. The derived display status SHALL be `reject pending`.
 
-Automatic `ResolveWait` / `resolve pending` MUST NOT be created solely because another change is `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, terminal `Merged`, terminal `Error`, `Stalled`, `Gated`, `Blocked`, `Queued`, `MergeWait`, or absent.
+`RejectWait` MUST be distinct from `ResolveWait` so the scheduler can start rejection review, not merge/resolve retry, after the lane clears.
 
-Stable `MergeWait` after archive completion MUST be caused by a concrete manual merge deferral, such as `MergeDeferred(auto_resumable=false)`, or by explicit user retry state. Archive completion with no active blocker MUST NOT by itself settle the change into `MergeWait` instead of attempting merge.
+#### Scenario: rejection review waits behind resolving
 
-Manual/user resolve intent for an existing `MergeWait` row remains valid and may still transition that row to `ResolveWait` through the reducer-owned `ResolveMerge` command.
+**Given**: Change A is actively `Resolving`
+**And**: Change B produced `openspec/changes/<change_id>/REJECTED.md` and needs dedicated rejecting review
+**When**: the scheduler handles B's rejection-review handoff
+**Then**: B transitions to `RejectWait`
+**And**: B's derived display status is `reject pending`
+**And**: B is returned by reducer-owned reject-wait retry membership
+**And**: B is not returned by reducer-owned resolve-wait retry membership
 
-#### Scenario: active merge lane enters resolve pending
+#### Scenario: reject pending promotes to rejecting after lane clears
 
-**Given**: Change A is actively merging or resolving
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B transitions to `ResolveWait`
-**And**: B's derived display status is `resolve pending`
-**And**: B is eligible for automatic retry after A's merge/resolve lane clears
+**Given**: Change B is in `RejectWait`
+**And**: the active base-mutating lane occupant completes or fails and no other lane occupant remains
+**When**: scheduler-owned pending lane retry is evaluated
+**Then**: B transitions from `RejectWait` to active `Rejecting`
+**And**: B's derived display status becomes `rejecting`
+**And**: no other change is active in `Resolving` or `Rejecting`
 
-#### Scenario: active rejecting blocker remains auto-resumable
+#### Scenario: rejection review completion clears reject wait intent
 
-**Given**: Change A is in active `Rejecting` state
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B transitions to `ResolveWait`
-**And**: B's derived display status is `resolve pending`
-**And**: B is eligible for automatic retry after A's rejection review completes or fails
-
-#### Scenario: manual blocker enters merge wait
-
-**Given**: no other merge/resolve lane is actively occupied
-**And**: Change B has just been archived in parallel mode
-**And**: merge readiness or merge attempt detects a manual blocker such as a dirty base working tree, dirty archive workspace, incomplete archive verification, or missing archive evidence
-**When**: the merge path emits `MergeDeferred(auto_resumable=false)`
-**Then**: B SHALL display as `merge wait`
-**And**: B SHALL NOT be returned as normal queued work by scheduler queue reconciliation
-**And**: B SHALL require explicit `ResolveMerge` retry after the blocker is resolved
-
-#### Scenario: no blocker enters resolving then merged
-
-**Given**: no other merge/resolve lane is actively occupied
-**And**: Change B has just been archived in parallel mode
-**And**: merge readiness finds no manual blocker
-**When**: post-archive merge handling runs
-**Then**: B SHALL display as `resolving` while merge handling is active
-**And**: Conflux SHALL emit merge completion for B without requiring the user to press `M`
-**And**: B's derived display status SHALL become `merged`
-
-#### Scenario: applying does not create resolve pending
-
-**Given**: Change A is in active `Applying` state
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B does not transition to `ResolveWait` because of A
-**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
-
-#### Scenario: accepting does not create resolve pending
-
-**Given**: Change A is in active `Accepting` state
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B does not transition to `ResolveWait` because of A
-**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
-
-#### Scenario: terminal rejected change does not create resolve pending
-
-**Given**: Change A is terminal `Rejected`
-**And**: Change B has just been archived in parallel mode
-**When**: post-archive dispatch is evaluated for B
-**Then**: B does not transition to `ResolveWait` because of A
-**And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
+**Given**: Change B previously entered `RejectWait`
+**And**: B later starts and completes rejection review
+**When**: the reducer processes `RejectionReviewCompleted` or `RejectionReviewFailed` for B
+**Then**: B is no longer returned by reject-wait retry membership
+**And**: B does not regress to `reject pending` on later refresh
 
 ### Requirement: Rejected Change Exclusion from Change Listing
 

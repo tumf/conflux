@@ -462,6 +462,9 @@ impl ParallelExecutor {
         // Add to in-flight set
         in_flight.insert(change_id.clone());
 
+        let shared_orchestrator_state = self.shared_orchestrator_state.clone();
+        let dynamic_queue_for_requeue = self.dynamic_queue.clone();
+
         // Prepare context for spawned task
         let apply_command = self.apply_command.clone();
         let archive_command = self.archive_command.clone();
@@ -726,6 +729,17 @@ impl ParallelExecutor {
             // acceptance FAIL/command error path re-enters apply on the next cycle.
             // Rejecting resumes are handled as an immediate rejection review branch.
             if matches!(resume_action, ResumeAction::Rejecting) {
+                let rejection_review_deferred = if let Some(shared) = &shared_orchestrator_state {
+                    let mut guard = shared.write().await;
+                    guard.mark_reject_wait(&change_id);
+                    guard
+                        .reject_wait_change_ids()
+                        .iter()
+                        .any(|id| id == &change_id)
+                } else {
+                    false
+                };
+
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(ParallelEvent::WorkspaceStatusUpdated {
@@ -734,6 +748,31 @@ impl ParallelExecutor {
                             status: WorkspaceStatus::Rejecting,
                         })
                         .await;
+                }
+
+                if rejection_review_deferred {
+                    if let Some(queue) = &dynamic_queue_for_requeue {
+                        queue.push(change_id.clone()).await;
+                    }
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::info(
+                                    "Rejecting resume deferred because the base-mutating lane is occupied; status=reject pending",
+                                )
+                                .with_change_id(&change_id)
+                                .with_operation("rejecting"),
+                            ))
+                            .await;
+                    }
+                    cancel_monitor.abort();
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: None,
+                        rejected: None,
+                    };
                 }
 
                 match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {
@@ -1082,6 +1121,17 @@ impl ParallelExecutor {
                         rejected_path = %handoff.rejected_path.display(),
                         "Apply emitted rejection proposal; entering rejecting review flow"
                     );
+                    let rejection_review_deferred = if let Some(shared) = &shared_orchestrator_state {
+                        let mut guard = shared.write().await;
+                        guard.mark_reject_wait(&change_id);
+                        guard
+                            .reject_wait_change_ids()
+                            .iter()
+                            .any(|id| id == &change_id)
+                    } else {
+                        false
+                    };
+
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::WorkspaceStatusUpdated {
@@ -1100,6 +1150,31 @@ impl ParallelExecutor {
                                 .with_operation("apply"),
                             ))
                             .await;
+                    }
+
+                    if rejection_review_deferred {
+                        if let Some(queue) = &dynamic_queue_for_requeue {
+                            queue.push(change_id.clone()).await;
+                        }
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::info(
+                                        "Rejection review handoff deferred because the base-mutating lane is occupied; status=reject pending",
+                                    )
+                                    .with_change_id(&change_id)
+                                    .with_operation("apply"),
+                                ))
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None,
+                            rejected: None,
+                        };
                     }
 
                     match run_rejection_review(&change_id, &workspace.path, &config, &ai_runner).await {

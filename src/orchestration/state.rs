@@ -119,6 +119,8 @@ pub enum WaitState {
     MergeWait,
     /// Waiting for a resolve sub-task to start (queued resolve intent).
     ResolveWait,
+    /// Waiting for rejection review to start once the base-mutating lane is free.
+    RejectWait,
     /// Waiting because a dependency has not yet completed.
     DependencyBlocked,
     /// Waiting because apply/rejecting reported a resumable hold,
@@ -240,9 +242,14 @@ impl ChangeRuntimeState {
         if self.is_terminal() && self.is_active() {
             return false;
         }
-        // ResolveWait and Resolving cannot coexist.
+        // Base-lane wait states and matching active lane occupancy cannot coexist.
         if matches!(self.wait_state, WaitState::ResolveWait)
             && matches!(self.activity, ActivityState::Resolving)
+        {
+            return false;
+        }
+        if matches!(self.wait_state, WaitState::RejectWait)
+            && matches!(self.activity, ActivityState::Rejecting)
         {
             return false;
         }
@@ -253,7 +260,7 @@ impl ChangeRuntimeState {
     ///
     /// Returns one of: "not queued", "queued", "blocked", "stalled", "applying",
     /// "accepting", "rejecting", "archiving", "resolving", "merge wait", "resolve pending",
-    /// "archived", "merged", "error", "stopped".
+    /// "reject pending", "archived", "merged", "error", "stopped".
     pub fn display_status(&self) -> &'static str {
         // Terminal states take precedence.
         match &self.terminal {
@@ -277,6 +284,7 @@ impl ChangeRuntimeState {
         match self.wait_state {
             WaitState::MergeWait => return "merge wait",
             WaitState::ResolveWait => return "resolve pending",
+            WaitState::RejectWait => return "reject pending",
             WaitState::DependencyBlocked => return "blocked",
             WaitState::Stalled => return "stalled",
             WaitState::None => {}
@@ -306,6 +314,7 @@ impl ChangeRuntimeState {
             "merge wait" => ratatui::style::Color::LightMagenta,
             "resolving" => ratatui::style::Color::LightCyan,
             "resolve pending" => ratatui::style::Color::Magenta,
+            "reject pending" => ratatui::style::Color::LightMagenta,
             "error" => ratatui::style::Color::Red,
             "stopped" => ratatui::style::Color::DarkGray,
             _ => ratatui::style::Color::DarkGray,
@@ -424,6 +433,9 @@ pub struct OrchestratorState {
     /// Reducer-owned resolve-wait queue (FIFO list of change_ids awaiting resolve).
     resolve_wait_queue: Vec<String>,
 
+    /// Reducer-owned reject-wait queue (FIFO list of change_ids awaiting rejection review).
+    reject_wait_queue: Vec<String>,
+
     /// Execution mode: Serial or Parallel.
     /// Determines how `ChangeArchived` events are handled.
     execution_mode: ExecutionMode,
@@ -468,6 +480,7 @@ impl OrchestratorState {
             current_change_id: None,
             change_runtime,
             resolve_wait_queue: Vec::new(),
+            reject_wait_queue: Vec::new(),
             execution_mode,
         }
     }
@@ -708,6 +721,45 @@ impl OrchestratorState {
         })
     }
 
+    /// Return the non-terminal change that occupies the base-mutating lane, if any.
+    pub fn base_mutating_lane_occupant(&self) -> Option<String> {
+        self.change_runtime.iter().find_map(|(id, rt)| {
+            if matches!(
+                rt.activity,
+                ActivityState::Resolving | ActivityState::Rejecting
+            ) && !rt.is_terminal()
+            {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Return true if the single base-mutating lane is currently occupied.
+    pub fn is_base_mutating_lane_occupied(&self) -> bool {
+        self.base_mutating_lane_occupant().is_some()
+    }
+
+    /// Verify global reducer invariants that span multiple changes.
+    pub fn global_invariants_hold(&self) -> bool {
+        let lane_occupants = self
+            .change_runtime
+            .values()
+            .filter(|rt| {
+                matches!(
+                    rt.activity,
+                    ActivityState::Resolving | ActivityState::Rejecting
+                ) && !rt.is_terminal()
+            })
+            .count();
+        lane_occupants <= 1
+            && self
+                .change_runtime
+                .values()
+                .all(ChangeRuntimeState::invariants_hold)
+    }
+
     /// Return change IDs that are currently waiting for scheduler-owned resolve/merge retry.
     pub fn resolve_wait_change_ids(&self) -> Vec<String> {
         self.change_runtime
@@ -731,6 +783,90 @@ impl OrchestratorState {
             rt.clear_blocked_metadata();
         }
         self.resolve_wait_queue.retain(|id| id != change_id);
+    }
+
+    /// Return change IDs that are currently waiting for scheduler-owned rejection review.
+    pub fn reject_wait_change_ids(&self) -> Vec<String> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| {
+                if matches!(rt.wait_state, WaitState::RejectWait) && !rt.is_terminal() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Mark a change as waiting for rejection review after a rejection proposal handoff.
+    pub fn mark_reject_wait(&mut self, change_id: &str) {
+        let lane_blocked = self.has_other_post_archive_lane_blocker(change_id);
+        let rt = self.runtime_entry(change_id);
+        if rt.is_terminal() || rt.dequeued {
+            return;
+        }
+        rt.activity = if lane_blocked {
+            ActivityState::Idle
+        } else {
+            ActivityState::Rejecting
+        };
+        rt.wait_state = if lane_blocked {
+            WaitState::RejectWait
+        } else {
+            WaitState::None
+        };
+        rt.clear_blocked_metadata();
+        self.resolve_wait_queue.retain(|id| id != change_id);
+        if lane_blocked {
+            if !self.reject_wait_queue.iter().any(|id| id == change_id) {
+                self.reject_wait_queue.push(change_id.to_string());
+            }
+        } else {
+            self.reject_wait_queue.retain(|id| id != change_id);
+        }
+    }
+
+    /// Clear reducer-owned rejection-review wait intent.
+    pub fn clear_reject_wait_intent(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        if matches!(rt.wait_state, WaitState::RejectWait) {
+            rt.wait_state = WaitState::None;
+            rt.clear_blocked_metadata();
+        }
+        self.reject_wait_queue.retain(|id| id != change_id);
+    }
+
+    /// Promote exactly one pending base-mutating operation when the lane is free.
+    /// Resolve waits take priority over reject waits to preserve existing merge retry semantics.
+    pub fn promote_next_base_mutating_lane_waiter(&mut self) -> Option<(String, WaitState)> {
+        if self.is_base_mutating_lane_occupied() {
+            return None;
+        }
+
+        while let Some(change_id) = self.resolve_wait_queue.first().cloned() {
+            self.resolve_wait_queue.remove(0);
+            let rt = self.runtime_entry(&change_id);
+            if !rt.is_terminal() && matches!(rt.wait_state, WaitState::ResolveWait) {
+                rt.wait_state = WaitState::None;
+                rt.activity = ActivityState::Resolving;
+                rt.clear_blocked_metadata();
+                return Some((change_id, WaitState::ResolveWait));
+            }
+        }
+
+        while let Some(change_id) = self.reject_wait_queue.first().cloned() {
+            self.reject_wait_queue.remove(0);
+            let rt = self.runtime_entry(&change_id);
+            if !rt.is_terminal() && matches!(rt.wait_state, WaitState::RejectWait) {
+                rt.wait_state = WaitState::None;
+                rt.activity = ActivityState::Rejecting;
+                rt.clear_blocked_metadata();
+                return Some((change_id, WaitState::RejectWait));
+            }
+        }
+
+        None
     }
 
     /// Return change IDs that still carry queued intent and are not terminal.
@@ -874,6 +1010,8 @@ impl OrchestratorState {
                     rt.wait_state = WaitState::None;
                     rt.clear_blocked_metadata();
                 }
+                self.resolve_wait_queue.retain(|id| id != &change_id);
+                self.reject_wait_queue.retain(|id| id != &change_id);
                 self.add_dynamic_change(change_id.clone());
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
                     change_id,
@@ -894,9 +1032,21 @@ impl OrchestratorState {
             ReducerCommand::ResolveMerge(change_id) => {
                 let rt = self.runtime_entry(&change_id);
                 if !matches!(rt.wait_state, WaitState::MergeWait | WaitState::ResolveWait) {
-                    return ReduceOutcome::NoOp;
+                    // TUI/manual resolve commands are already gated by the visible
+                    // `merge wait` row. If the shared reducer missed that local UI
+                    // milestone, accept the operator intent and record ResolveWait
+                    // rather than letting the next reducer sync regress the row to
+                    // `not queued`.
+                    if matches!(rt.activity, ActivityState::Idle)
+                        && matches!(rt.terminal, TerminalState::None)
+                    {
+                        rt.wait_state = WaitState::MergeWait;
+                    } else {
+                        return ReduceOutcome::NoOp;
+                    }
                 }
                 rt.wait_state = WaitState::ResolveWait;
+                self.reject_wait_queue.retain(|id| id != &change_id);
                 if !self.resolve_wait_queue.contains(&change_id) {
                     self.resolve_wait_queue.push(change_id.clone());
                 }
@@ -919,6 +1069,8 @@ impl OrchestratorState {
                 rt.clear_blocked_metadata();
                 rt.queue_intent = QueueIntent::NotQueued;
                 rt.dequeued = true;
+                self.resolve_wait_queue.retain(|id| id != &change_id);
+                self.reject_wait_queue.retain(|id| id != &change_id);
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
                     change_id,
                     intent: QueueIntent::NotQueued,
@@ -934,6 +1086,8 @@ impl OrchestratorState {
                 rt.wait_state = WaitState::None;
                 rt.clear_blocked_metadata();
                 rt.queue_intent = QueueIntent::NotQueued;
+                self.resolve_wait_queue.retain(|id| id != &change_id);
+                self.reject_wait_queue.retain(|id| id != &change_id);
                 ReduceOutcome::Changed(ReducerEffect::TerminalStateSet {
                     change_id,
                     terminal: TerminalState::Stopped,
@@ -1057,6 +1211,8 @@ impl OrchestratorState {
                     rt.wait_state = WaitState::None;
                     rt.clear_blocked_metadata();
                 }
+                self.resolve_wait_queue.retain(|id| id != change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
             }
 
             // Acceptance events
@@ -1078,9 +1234,12 @@ impl OrchestratorState {
                     rt.terminal = TerminalState::Error(error.clone());
                     rt.activity = ActivityState::Idle;
                 }
+                self.resolve_wait_queue.retain(|id| id != change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
             }
             ExecutionEvent::ChangeRejected { change_id, reason } => {
                 self.remove_from_pending(change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() {
                     rt.terminal = TerminalState::Rejected(reason.clone());
@@ -1096,6 +1255,7 @@ impl OrchestratorState {
                 if should_mark_pending_removed {
                     self.remove_from_pending(change_id);
                 }
+                self.reject_wait_queue.retain(|id| id != change_id);
 
                 let rt = self.runtime_entry(change_id);
                 if rt.is_terminal() || rt.dequeued {
@@ -1131,6 +1291,7 @@ impl OrchestratorState {
             }
             ExecutionEvent::RejectionReviewFailed { change_id, error } => {
                 self.remove_from_pending(change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Idle;
@@ -1145,35 +1306,66 @@ impl OrchestratorState {
                 workspace_name: _,
                 status,
             } => {
-                let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() && !rt.dequeued {
-                    match status {
-                        crate::vcs::WorkspaceStatus::Applying => {
-                            rt.activity = ActivityState::Applying;
-                        }
-                        crate::vcs::WorkspaceStatus::Accepting => {
-                            rt.activity = ActivityState::Accepting;
-                        }
-                        crate::vcs::WorkspaceStatus::Blocked => {
-                            rt.activity = ActivityState::Idle;
-                            rt.wait_state = WaitState::Stalled;
-                            rt.set_blocked_metadata(
-                                "apply reported recoverable blocker; workspace remains stalled",
-                                "resolve implementation blocker section and pending unblock tasks before explicit retry",
-                                "existing worktree and WIP context are preserved while stalled",
-                            );
-                        }
-                        crate::vcs::WorkspaceStatus::Rejecting => {
-                            rt.activity = ActivityState::Rejecting;
-                        }
-                        crate::vcs::WorkspaceStatus::Archiving => {
-                            rt.activity = ActivityState::Archiving;
-                        }
-                        crate::vcs::WorkspaceStatus::Resolving => {
-                            rt.activity = ActivityState::Resolving;
-                        }
-                        _ => {}
+                if !self
+                    .change_runtime
+                    .get(change_id)
+                    .is_some_and(|rt| !rt.is_terminal() && !rt.dequeued)
+                {
+                    return;
+                }
+                match status {
+                    crate::vcs::WorkspaceStatus::Blocked
+                        if self.stalled_change_ids.contains(change_id) =>
+                    {
+                        let rt = self.runtime_entry(change_id);
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::Stalled;
+                        rt.terminal = TerminalState::None;
+                        rt.set_blocked_metadata(
+                            "serial change stalled with recoverable blocker",
+                            "resolve blocker evidence and retry explicitly",
+                            "serial workflow state is preserved in the workspace",
+                        );
                     }
+                    crate::vcs::WorkspaceStatus::Rejecting => {
+                        self.mark_reject_wait(change_id);
+                    }
+                    crate::vcs::WorkspaceStatus::Applying => {
+                        self.runtime_entry(change_id).activity = ActivityState::Applying;
+                    }
+                    crate::vcs::WorkspaceStatus::Accepting => {
+                        self.runtime_entry(change_id).activity = ActivityState::Accepting;
+                    }
+                    crate::vcs::WorkspaceStatus::Blocked => {
+                        let rt = self.runtime_entry(change_id);
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::Stalled;
+                        rt.set_blocked_metadata(
+                            "apply reported recoverable blocker; workspace remains stalled",
+                            "resolve implementation blocker section and pending unblock tasks before explicit retry",
+                            "existing worktree and WIP context are preserved while stalled",
+                        );
+                    }
+                    crate::vcs::WorkspaceStatus::Archiving => {
+                        self.runtime_entry(change_id).activity = ActivityState::Archiving;
+                    }
+                    crate::vcs::WorkspaceStatus::Resolving => {
+                        let has_other_lane_blocker =
+                            self.has_other_post_archive_lane_blocker(change_id);
+                        let rt = self.runtime_entry(change_id);
+                        if has_other_lane_blocker {
+                            rt.activity = ActivityState::Idle;
+                            rt.wait_state = WaitState::ResolveWait;
+                            if !self.resolve_wait_queue.iter().any(|id| id == change_id) {
+                                self.resolve_wait_queue.push(change_id.clone());
+                            }
+                        } else {
+                            rt.activity = ActivityState::Resolving;
+                            rt.wait_state = WaitState::None;
+                            self.resolve_wait_queue.retain(|id| id != change_id);
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -1251,6 +1443,8 @@ impl OrchestratorState {
                     rt.terminal = TerminalState::Error(error.clone());
                     rt.activity = ActivityState::Idle;
                 }
+                self.resolve_wait_queue.retain(|id| id != change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
             }
 
             // Merge / resolve events (parallel mode)
@@ -1293,8 +1487,9 @@ impl OrchestratorState {
                     rt.wait_state = WaitState::None;
                     rt.queue_intent = QueueIntent::NotQueued;
                     rt.clear_blocked_metadata();
-                    // Remove from resolve queue if present.
+                    // Remove from base-lane wait queues if present.
                     self.resolve_wait_queue.retain(|id| id != change_id);
+                    self.reject_wait_queue.retain(|id| id != change_id);
                 }
             }
             ExecutionEvent::ResolveStarted { change_id, .. } => {
@@ -1322,6 +1517,7 @@ impl OrchestratorState {
                     rt.clear_blocked_metadata();
                 }
                 self.resolve_wait_queue.retain(|id| id != change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
             }
             ExecutionEvent::ResolveFailed { change_id, .. } => {
                 // Resolve failure does NOT regress a terminal state.
@@ -1393,6 +1589,7 @@ impl OrchestratorState {
                 rt.queue_intent = QueueIntent::NotQueued;
                 rt.dequeued = true;
                 self.resolve_wait_queue.retain(|id| id != change_id);
+                self.reject_wait_queue.retain(|id| id != change_id);
             }
 
             // Dynamic queue support
@@ -1687,6 +1884,14 @@ mod tests {
             ..Default::default()
         };
         assert!(in_flight_rejecting.invariants_hold());
+
+        // Invalid: RejectWait + Rejecting.
+        let invalid3 = ChangeRuntimeState {
+            wait_state: WaitState::RejectWait,
+            activity: ActivityState::Rejecting,
+            ..Default::default()
+        };
+        assert!(!invalid3.invariants_hold());
     }
 
     // -----------------------------------------------------------------------
@@ -1744,6 +1949,10 @@ mod tests {
 
         rt.wait_state = WaitState::ResolveWait;
         assert_eq!(rt.display_color(), ratatui::style::Color::Magenta);
+
+        rt.wait_state = WaitState::RejectWait;
+        assert_eq!(rt.display_status(), "reject pending");
+        assert_eq!(rt.display_color(), ratatui::style::Color::LightMagenta);
 
         rt.wait_state = WaitState::None;
         rt.terminal = TerminalState::Archived;
@@ -1868,6 +2077,64 @@ mod tests {
         let outcome8 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(matches!(outcome8, ReduceOutcome::Changed(_)));
         assert_eq!(state.display_status("c"), "queued");
+    }
+
+    #[test]
+    fn test_base_mutating_lane_is_single_occupant_across_resolving_and_rejecting() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["a".to_string(), "b".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
+        assert_eq!(state.display_status("a"), "resolving");
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "b".to_string(),
+            workspace_name: "ws-b".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+
+        assert_eq!(state.display_status("b"), "reject pending");
+        assert_eq!(state.reject_wait_change_ids(), vec!["b".to_string()]);
+        assert!(state.has_other_post_archive_lane_blocker("b"));
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn test_reject_wait_queue_membership_and_clear_on_start_completion() {
+        use crate::events::{ExecutionEvent, RejectionOutcome};
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["a".to_string(), "b".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
+        state.mark_reject_wait("b");
+
+        assert_eq!(state.display_status("b"), "reject pending");
+        assert_eq!(state.reject_wait_change_ids(), vec!["b".to_string()]);
+
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "a".to_string(),
+            revision: "rev".to_string(),
+        });
+        let promoted = state.promote_next_base_mutating_lane_waiter();
+        assert_eq!(promoted, Some(("b".to_string(), WaitState::RejectWait)));
+        assert_eq!(state.display_status("b"), "rejecting");
+        assert!(state.reject_wait_change_ids().is_empty());
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "b".to_string(),
+            outcome: RejectionOutcome::Confirm,
+        });
+        assert_eq!(state.display_status("b"), "rejected");
+        assert!(state.reject_wait_change_ids().is_empty());
+        assert!(state.global_invariants_hold());
     }
 
     // -----------------------------------------------------------------------
@@ -2006,6 +2273,7 @@ mod tests {
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Resume path can start from an archived workspace that re-entered rejecting review.
+        state.runtime_entry("c").wait_state = WaitState::MergeWait;
         state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
         assert_eq!(state.display_status("c"), "merge wait");
 
@@ -2030,6 +2298,7 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
+        state.runtime_entry("c").wait_state = WaitState::MergeWait;
         state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
         assert_eq!(state.display_status("c"), "merge wait");
 
@@ -2056,7 +2325,8 @@ mod tests {
     fn test_apply_observation_reconcile_merge_wait() {
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // WorkspaceArchived → transitions to MergeWait.
+        // WorkspaceArchived preserves an already-established concrete MergeWait.
+        state.runtime_entry("c").wait_state = WaitState::MergeWait;
         state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
         assert_eq!(state.display_status("c"), "merge wait");
 
@@ -2086,7 +2356,9 @@ mod tests {
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // Simulate a ChangesRefreshed with c in merge_wait_ids.
+        // Simulate a ChangesRefreshed with c in merge_wait_ids after a concrete manual
+        // MergeDeferred(auto_resumable=false) had already established MergeWait.
+        state.runtime_entry("c").wait_state = WaitState::MergeWait;
         let mut merge_wait_ids = HashSet::new();
         merge_wait_ids.insert("c".to_string());
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
@@ -2175,6 +2447,7 @@ mod tests {
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
         // Put into MergeWait.
+        state.runtime_entry("c").wait_state = WaitState::MergeWait;
         state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
         assert_eq!(state.display_status("c"), "merge wait");
 
@@ -2201,7 +2474,8 @@ mod tests {
     fn test_workspace_archived_recovers_merge_wait() {
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
 
-        // WorkspaceArchived observation → MergeWait.
+        // WorkspaceArchived observation preserves concrete MergeWait evidence.
+        state.runtime_entry("c").wait_state = WaitState::MergeWait;
         state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
         assert_eq!(state.display_status("c"), "merge wait");
         assert!(
@@ -2228,24 +2502,12 @@ mod tests {
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert_eq!(state.display_status("c"), "queued");
 
-        // Simulate a refresh that tries to set MergeWait on "c".
-        // Since "c" is actively queued (not in a MergeWait-worthy state),
-        // apply_observation should NOT overwrite the queued state.
-        // (WorkspaceArchived only sets MergeWait if not already in a wait/terminal state.)
+        // A bare archived workspace observation is only a milestone and must not
+        // create MergeWait without concrete MergeDeferred(auto_resumable=false) evidence.
         state.apply_observation("c", WorkspaceObservation::WorkspaceArchived);
+        assert_eq!(state.display_status("c"), "queued");
 
-        // Still queued because active wait/queue intent is not MergeWait-eligible.
-        // Note: apply_observation sets MergeWait if not already in a wait state.
-        // However, "queued" means QueueIntent::Queued, not a WaitState.
-        // The reconcile only touches wait_state, not queue_intent.
-        // So wait_state gets set to MergeWait, but display_status returns "merge wait"
-        // only if there's no active activity. Let's verify the correct behavior:
-        // - Queue intent: Queued
-        // - Activity: Idle
-        // - WaitState: set to MergeWait by observation
-        // - Display precedence: terminal > activity > wait > queue_intent
-        // So if WaitState=MergeWait, display shows "merge wait".
-        // The test verifies that WorktreeNotAhead clears it back.
+        // WorktreeNotAhead remains idempotent when no MergeWait exists.
         let mut not_ahead = HashSet::new();
         not_ahead.insert("c".to_string());
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
@@ -2259,6 +2521,114 @@ mod tests {
         });
         // After clearing MergeWait, the queue intent (Queued) is visible again.
         assert_eq!(state.display_status("c"), "queued");
+    }
+
+    #[test]
+    fn test_base_mutating_lane_exclusivity_and_wait_membership() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec![
+                "resolving-a".to_string(),
+                "rejecting-b".to_string(),
+                "archive-c".to_string(),
+            ],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "resolving-a".to_string(),
+            workspace_name: "ws-a".to_string(),
+            status: crate::vcs::WorkspaceStatus::Resolving,
+        });
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "rejecting-b".to_string(),
+            workspace_name: "ws-b".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+
+        assert_eq!(state.display_status("resolving-a"), "resolving");
+        assert_eq!(state.display_status("rejecting-b"), "reject pending");
+        assert_eq!(
+            state.reject_wait_change_ids(),
+            vec!["rejecting-b".to_string()]
+        );
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert!(state.has_other_post_archive_lane_blocker("archive-c"));
+        assert!(state.global_invariants_hold());
+
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archive-c".to_string()));
+        assert_eq!(state.display_status("archive-c"), "resolve pending");
+        assert_eq!(
+            state.resolve_wait_change_ids(),
+            vec!["archive-c".to_string()]
+        );
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn test_reject_wait_clear_and_deterministic_single_promotion() {
+        use crate::events::{ExecutionEvent, RejectionOutcome};
+
+        let mut state = OrchestratorState::with_mode(
+            vec![
+                "lane-a".to_string(),
+                "resolve-b".to_string(),
+                "reject-c".to_string(),
+            ],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "lane-a".to_string(),
+            workspace_name: "ws-a".to_string(),
+            status: crate::vcs::WorkspaceStatus::Resolving,
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("resolve-b".to_string()));
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "reject-c".to_string(),
+            workspace_name: "ws-c".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+
+        assert_eq!(state.display_status("resolve-b"), "resolve pending");
+        assert_eq!(state.display_status("reject-c"), "reject pending");
+
+        state.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "lane-a".to_string(),
+            error: "manual blocker".to_string(),
+        });
+        let promoted = state.promote_next_base_mutating_lane_waiter();
+        assert_eq!(
+            promoted,
+            Some(("resolve-b".to_string(), WaitState::ResolveWait))
+        );
+        assert_eq!(state.display_status("resolve-b"), "resolving");
+        assert_eq!(state.display_status("reject-c"), "reject pending");
+        assert!(state.global_invariants_hold());
+
+        assert_eq!(state.promote_next_base_mutating_lane_waiter(), None);
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "resolve-b".to_string(),
+            revision: "rev-b".to_string(),
+        });
+        let promoted = state.promote_next_base_mutating_lane_waiter();
+        assert_eq!(
+            promoted,
+            Some(("reject-c".to_string(), WaitState::RejectWait))
+        );
+        assert_eq!(state.display_status("reject-c"), "rejecting");
+        assert!(state.reject_wait_change_ids().is_empty());
+        assert!(state.global_invariants_hold());
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "reject-c".to_string(),
+            outcome: RejectionOutcome::Resume,
+        });
+        assert!(state.reject_wait_change_ids().is_empty());
+        assert_eq!(state.display_status("reject-c"), "applying");
     }
 
     // -----------------------------------------------------------------------
@@ -2447,6 +2817,51 @@ mod tests {
     }
 
     #[test]
+    fn test_archive_merge_defers_to_resolve_pending_when_rejecting_active() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["a".to_string(), "b".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "a".to_string(),
+            workspace_name: "ws-a".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("b".to_string()));
+
+        assert_eq!(state.display_status("a"), "rejecting");
+        assert_eq!(state.display_status("b"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["b".to_string()]);
+        assert!(state.reject_wait_change_ids().is_empty());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn test_active_applying_does_not_create_resolve_pending_on_archive() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["a".to_string(), "b".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: "a".to_string(),
+            command: "apply".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("b".to_string()));
+
+        assert_eq!(state.display_status("a"), "applying");
+        assert_eq!(state.display_status("b"), "resolving");
+        assert!(state.resolve_wait_change_ids().is_empty());
+    }
+
+    #[test]
     fn test_parallel_merge_events_drive_reducer_wait_states() {
         use crate::events::ExecutionEvent;
 
@@ -2553,8 +2968,15 @@ mod tests {
         let mut state =
             OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
 
-        // Step 1: change archived -> enters MergeWait in parallel mode.
-        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+        // Step 1: concrete manual merge blocker -> enters MergeWait in parallel mode.
+        // A bare ChangeArchived event now truthfully enters active post-archive
+        // merge handling; only MergeDeferred(auto_resumable=false) represents
+        // operator-owned manual merge wait.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
         assert_eq!(state.display_status("c"), "merge wait");
 
         // Step 2: user triggers manual resolve → reducer transitions to ResolveWait.

@@ -826,7 +826,9 @@ impl AppState {
         display_map: &HashMap<String, &'static str>,
     ) {
         for change in &mut self.changes {
-            if change.display_status_cache == "rejected" {
+            if change.display_status_cache == "rejected"
+                && !matches!(display_map.get(&change.id).copied(), Some("rejected"))
+            {
                 // rejected rows are display-only and remain immutable until marker removal.
                 change.selected = false;
                 continue;
@@ -3065,6 +3067,19 @@ mod tests {
             app.changes[0].display_status_cache, "queued",
             "reducer snapshot must preserve Queued through ChangesRefreshed display sync"
         );
+    }
+
+    #[test]
+    fn test_apply_display_statuses_from_reducer_shows_reject_pending() {
+        let changes = vec![create_test_change("reject-b", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].display_status_cache = "queued".to_string();
+
+        let mut display_map = std::collections::HashMap::new();
+        display_map.insert("reject-b".to_string(), "reject pending");
+        app.apply_display_statuses_from_reducer(&display_map);
+
+        assert_eq!(app.changes[0].display_status_cache, "reject pending");
     }
 
     /// resume_processing must sync queue intent into the shared reducer.

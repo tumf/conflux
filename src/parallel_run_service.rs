@@ -36,6 +36,9 @@ pub struct ParallelRunService {
     no_resume: bool,
     /// Shared stagger state for coordinating AI command execution delays
     shared_stagger_state: SharedStaggerState,
+    /// Shared reducer state used by CLI/server/TUI paths for base-mutating lane scheduling.
+    shared_orchestrator_state:
+        Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     /// AI command runner for analyze commands
     ai_runner: AiCommandRunner,
 }
@@ -70,11 +73,20 @@ impl ParallelRunService {
         ai_runner.set_stream_json_textify(config.get_stream_json_textify());
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
+        let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::with_mode(
+                Vec::new(),
+                1,
+                crate::orchestration::state::ExecutionMode::Parallel,
+            ),
+        ));
+
         Self {
             config,
             repo_root,
             no_resume: false,
             shared_stagger_state,
+            shared_orchestrator_state,
             ai_runner,
         }
     }
@@ -111,11 +123,20 @@ impl ParallelRunService {
         ai_runner.set_stream_json_textify(config.get_stream_json_textify());
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
+        let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::with_mode(
+                Vec::new(),
+                1,
+                crate::orchestration::state::ExecutionMode::Parallel,
+            ),
+        ));
+
         Self {
             config,
             repo_root,
             no_resume: false,
             shared_stagger_state,
+            shared_orchestrator_state,
             ai_runner,
         }
     }
@@ -127,6 +148,14 @@ impl ParallelRunService {
     /// are reused to resume interrupted work.
     pub fn set_no_resume(&mut self, no_resume: bool) {
         self.no_resume = no_resume;
+    }
+
+    /// Set shared reducer state for callers that already own UI/server state.
+    pub fn set_shared_orchestrator_state(
+        &mut self,
+        shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    ) {
+        self.shared_orchestrator_state = shared_state;
     }
 
     /// Check if git is available for parallel execution
@@ -324,8 +353,15 @@ impl ParallelRunService {
         let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(100);
 
         // Prepare changes using the common helper (sends warning event if needed)
+        {
+            let mut guard = self.shared_orchestrator_state.write().await;
+            for change in &changes {
+                guard.add_dynamic_change(change.id.clone());
+            }
+        }
+
         let changes = match self
-            .prepare_parallel_execution(changes, &event_tx, false)
+            .prepare_parallel_execution(changes, &event_tx, true)
             .await?
         {
             Some(changes) => changes,
@@ -359,6 +395,7 @@ impl ParallelRunService {
         });
 
         // Create and run executor with re-analysis (same as TUI), passing shared stagger state
+        // and reducer state so CLI/server paths make rejection-review lane decisions synchronously.
         let mut executor = ParallelExecutor::with_backend_and_queue_and_stagger(
             self.repo_root.clone(),
             self.config.clone(),
@@ -368,6 +405,7 @@ impl ParallelRunService {
             Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
+        executor.set_shared_orchestrator_state(self.shared_orchestrator_state.clone());
 
         // Set hooks from config
         let hooks =
@@ -465,6 +503,7 @@ impl ParallelRunService {
         event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
         // Prepare changes using the common helper (sends warning event if needed)
+        executor.set_shared_orchestrator_state(self.shared_orchestrator_state.clone());
         let allow_empty_when_resolve_wait = changes.is_empty() && executor.has_resolve_wait();
         let changes = match self
             .prepare_parallel_execution(changes, &event_tx, allow_empty_when_resolve_wait)

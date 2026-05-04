@@ -795,6 +795,11 @@ async fn run_tui_loop(
                     | crate::events::ExecutionEvent::ResolveCompleted { .. }
                     | crate::events::ExecutionEvent::ResolveFailed { .. }
                     | crate::events::ExecutionEvent::MergeDeferred { .. }
+                    | crate::events::ExecutionEvent::ChangeArchived(_)
+                    | crate::events::ExecutionEvent::MergeCompleted { .. }
+                    | crate::events::ExecutionEvent::WorkspaceStatusUpdated { .. }
+                    | crate::events::ExecutionEvent::RejectionReviewCompleted { .. }
+                    | crate::events::ExecutionEvent::RejectionReviewFailed { .. }
             );
             if apply_to_reducer {
                 let display_map = {
@@ -817,6 +822,15 @@ async fn run_tui_loop(
                     // Execution lifecycle events - forward to apply_execution_event
                     ExecutionEvent::ProcessingStarted(_)
                     | ExecutionEvent::ProcessingError { .. }
+                    | ExecutionEvent::ChangeArchived(_)
+                    | ExecutionEvent::MergeCompleted { .. }
+                    | ExecutionEvent::ResolveStarted { .. }
+                    | ExecutionEvent::ResolveCompleted { .. }
+                    | ExecutionEvent::ResolveFailed { .. }
+                    | ExecutionEvent::MergeDeferred { .. }
+                    | ExecutionEvent::WorkspaceStatusUpdated { .. }
+                    | ExecutionEvent::RejectionReviewCompleted { .. }
+                    | ExecutionEvent::RejectionReviewFailed { .. }
                     | ExecutionEvent::Stopping
                     | ExecutionEvent::Stopped
                     | ExecutionEvent::AllCompleted => {

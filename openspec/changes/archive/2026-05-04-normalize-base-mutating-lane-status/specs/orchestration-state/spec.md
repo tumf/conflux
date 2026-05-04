@@ -50,7 +50,7 @@ Automatic `ResolveWait` / `resolve pending` MUST NOT be created solely because a
 **And**: Conflux SHALL emit merge completion for B without requiring the user to press `M`
 **And**: B's derived display status SHALL become `merged`
 
-### Requirement: base-mutating-lane-exclusivity
+### Requirement: post-archive-merge-dispatch
 
 Conflux SHALL model `Resolving` and `Rejecting` as mutually exclusive activities on a single base-mutating lane. At any point, among all non-terminal changes, at most one change may have activity `Resolving` or `Rejecting`.
 
@@ -85,7 +85,7 @@ A pending operation that needs this lane SHALL preserve the operation it intends
 **And**: B transitions to `RejectWait`
 **And**: B's derived display status is `reject pending`
 
-### Requirement: reject-wait-queue-ownership
+### Requirement: post-archive-merge-dispatch
 
 The system SHALL treat rejection-review wait as reducer-owned scheduler intent, not as TUI-local display state and not as merge/resolve retry intent.
 

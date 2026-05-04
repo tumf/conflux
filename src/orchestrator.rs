@@ -1054,6 +1054,7 @@ impl Orchestrator {
     async fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
         {
             let mut state = self.shared_state.write().await;
+            state.add_dynamic_change(change_id.to_string());
             state.mark_stalled(change_id.to_string());
             state.clear_stalled_change(change_id);
             state.clear_error_history(change_id);
@@ -1190,6 +1191,7 @@ impl Orchestrator {
         let repo_root = std::env::current_dir()?;
         let mut service = ParallelRunService::new(repo_root.clone(), self.config.clone());
         service.set_no_resume(self.no_resume);
+        service.set_shared_orchestrator_state(self.shared_state.clone());
 
         // Check if Git is available for true parallel execution
         service.check_vcs_available().await?;
