@@ -1,0 +1,21 @@
+## Implementation Tasks
+
+- [ ] Trace the current no-blocker post-archive path and identify where an archived parallel change becomes stable `MergeWait` before merge is attempted. (verification: manual - implementation summary cites exact source paths and event sequence, expected candidates include `src/tui/orchestrator.rs:829-862`, `src/parallel/merge.rs:141-268`, and `src/orchestration/state.rs:1184-1218`; completion condition: the summary names the source location that caused no-blocker `merge wait` and explains why the path did or did not call immediate merge handling)
+
+- [ ] Implement immediate merge dispatch for the no-blocker archive-complete path. (verification: unit - add/update a Rust test in `src/tui/orchestrator.rs` or `src/parallel/tests/executor.rs` and run a targeted command such as `cargo test test_tui_archived_no_active_resolve_or_rejecting --lib` or the new test filter; completion condition: the test fails if archive completion only leaves the change in stable `MergeWait` without attempting merge)
+
+- [ ] Restrict stable `merge wait` after archive completion to concrete manual deferral events. (verification: unit - add/update tests in `src/orchestration/state.rs` and/or `src/tui/state/event_handlers/completion.rs` proving no-blocker `ChangeArchived` alone does not leave visible state as `merge wait`, while `ExecutionEvent::MergeDeferred { auto_resumable: false, .. }` still does; completion condition: `merge wait` is traceable to manual deferral or explicit retry state)
+
+- [ ] Preserve active resolving/rejecting blocker behavior. (verification: unit - keep/update `src/tui/orchestrator.rs` tests such as `test_tui_archived_during_resolve`, `test_tui_archived_during_rejecting_emits_auto_resumable_deferred`, `test_tui_archived_during_applying_does_not_emit_auto_resumable_deferred`, and `test_tui_archived_with_terminal_rejected_change_does_not_emit_auto_resumable_deferred`; completion condition: targeted `cargo test test_tui_archived_during --lib` exits 0 and only active resolving/rejecting creates auto-resumable `resolve pending`)
+
+- [ ] Preserve manual dirty-base deferral behavior and scheduler queue protection. (verification: unit - run/update `src/parallel/tests/executor.rs` coverage including `test_attempt_merge_deferred_when_resolve_active`, dirty-base/manual deferral tests, and `test_scheduler_reconciliation_does_not_requeue_manual_merge_deferred_change`; completion condition: targeted `cargo test test_scheduler_reconciliation_does_not_requeue_manual_merge_deferred_change --lib` exits 0 and manual merge-wait changes are not reintroduced as ordinary queued work)
+
+- [ ] Ensure final merge completion remains terminal in reducer and visible UI state. (verification: unit - add/update sequence tests in `src/orchestration/state.rs` or `src/tui/state.rs` for archive complete → immediate merge attempt → `MergeCompleted`/`ResolveCompleted` → later `ChangesRefreshed`, and run the new targeted `cargo test <test-filter> --lib`; completion condition: a later archived workspace observation cannot resurrect `merge wait` after `merged`)
+
+- [ ] Run targeted Rust verification for post-archive dispatch, merge deferral, reducer state, and TUI display behavior. (verification: integration - run targeted commands covering the changed tests, for example `cargo test test_tui_archived --lib`, `cargo test test_scheduler_reconciliation_does_not_requeue_manual_merge_deferred_change --lib`, and any new test filter added for immediate merge dispatch; completion condition: commands exit 0 and any test taking over 1 second is optimized or marked heavy per AGENTS.md)
+
+- [ ] Validate `openspec/changes/stabilize-parallel-archive-display/proposal.md`, `tasks.md`, and `specs/orchestration-state/spec.md` after code changes. (verification: manual - run `cflx openspec validate stabilize-parallel-archive-display --strict --evidence warn` from the repository root `/Users/tumf/work/conflux`; completion condition: validation passes with no unresolved evidence warnings, or any remaining warnings are explicitly justified in implementation notes)
+
+## Future Work
+
+- If WebUI/server-mode monitoring separately shows stale post-archive display after the merge dispatch fix, create a focused follow-up proposal for WebState display synchronization.
