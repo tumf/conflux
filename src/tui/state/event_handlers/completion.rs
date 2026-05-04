@@ -45,7 +45,9 @@ impl AppState {
 
     pub(crate) fn handle_change_archived(&mut self, id: String) {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            change.set_display_status_cache("archived");
+            if !matches!(change.display_status_cache.as_str(), "merged" | "resolving") {
+                change.set_display_status_cache("archived");
+            }
             if let Some(started) = change.started_at {
                 change.elapsed_time = Some(started.elapsed());
             }
@@ -257,6 +259,28 @@ mod tests {
         app.handle_all_completed();
 
         assert_eq!(app.mode, AppMode::Stopped);
+    }
+
+    #[test]
+    fn change_archived_does_not_regress_merged_display_status() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].display_status_cache = "merged".to_string();
+
+        app.handle_change_archived("change-a".to_string());
+
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+    }
+
+    #[test]
+    fn change_archived_does_not_regress_active_resolving_display_status() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].display_status_cache = "resolving".to_string();
+
+        app.handle_change_archived("change-a".to_string());
+
+        assert_eq!(app.changes[0].display_status_cache, "resolving");
     }
 
     #[test]
