@@ -1959,51 +1959,17 @@ Out-of-worktree durable state (for example under `~/.local/state/cflx/**`) MUST 
 
 ### Requirement: post-archive-merge-dispatch
 
-When a change is archived in parallel mode, the orchestrator must attempt to merge or defer the change according to structured blocker classification rather than leaving auto-resumable and manual-wait cases ambiguous.
+If `on_merged` fails because the root repository is not safe for repo-mutating hook execution, such as root `.git/index.lock` contention, Conflux SHALL treat that as a hook failure that blocks merged transition when `continue_on_failure=false`.
 
-A deferred merge caused by another active non-terminal change in `Resolving` or `Rejecting` SHALL advance into reducer-owned auto-resumable handling (`ResolveWait` or immediate resolving when promoted).
+#### Scenario: root index lock contention blocks merged transition
 
-A deferred merge caused by active `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, dirty base, or other manual intervention requirement SHALL NOT be classified as automatic `ResolveWait` solely because that state exists. Dirty base and manual intervention deferrals SHALL remain in manual merge wait handling (`MergeWait`).
-
-The implementation MUST NOT infer auto-resumable versus manual-wait behavior by parsing a human-readable deferred reason string.
-
-#### Scenario: active resolving deferred archive promotes to resolve wait
-
-**Given**: a change is archived in parallel mode
-**And**: merge is deferred because another change is actively `Resolving`
-**When**: the deferred merge result is processed
-**Then**: the archived change enters auto-resumable deferred handling (`ResolveWait` or equivalent queued resolve intent)
-**And**: this decision does not depend on parsing a free-form reason string
-
-#### Scenario: active rejecting deferred archive promotes to resolve wait
-
-**Given**: a change is archived in parallel mode
-**And**: merge is deferred because another change is actively `Rejecting`
-**When**: the deferred merge result is processed
-**Then**: the archived change enters auto-resumable deferred handling (`ResolveWait` or equivalent queued resolve intent)
-**And**: rejection review completion or failure triggers retry of deferred merge work
-
-#### Scenario: active applying deferred archive does not promote to resolve wait
-
-**Given**: a change is archived in parallel mode
-**And**: another change is actively `Applying`
-**When**: post-archive merge handling is evaluated
-**Then**: the archived change is not classified as auto-resumable `ResolveWait` because of that applying change
-
-#### Scenario: active accepting deferred archive does not promote to resolve wait
-
-**Given**: a change is archived in parallel mode
-**And**: another change is actively `Accepting`
-**When**: post-archive merge handling is evaluated
-**Then**: the archived change is not classified as auto-resumable `ResolveWait` because of that accepting change
-
-#### Scenario: dirty-base deferred archive stays merge wait
-
-**Given**: a change is archived in parallel mode
-**And**: merge is deferred because the base branch is dirty while no other change is actively `Resolving` or `Rejecting`
-**When**: the deferred merge result is processed
-**Then**: the change remains in manual merge wait handling (`MergeWait`)
-**And**: it is not classified as auto-resumable
+**Given**: change `alpha` is repository-visible merged
+**And**: `hooks.on_merged` runs a repo-mutating command such as `make bump-patch`
+**And**: root `.git/index.lock` contention causes the hook to exit non-zero
+**When**: the scheduler handles hook completion
+**Then**: `alpha` does not transition to terminal `Merged`
+**And**: `MergeCompleted` is not emitted for `alpha`
+**And**: the operator-visible failure context includes the hook failure details
 
 ### Requirement: Parallel execution acceptance loop
 
