@@ -17,6 +17,13 @@ use super::events::send_event;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 
+fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
+    format!(
+        "on_merged hook failed for '{}'; merged transition blocked: {}",
+        change_id, error
+    )
+}
+
 /// Check if the base branch is dirty (has uncommitted changes or merge in progress).
 ///
 /// Returns `Ok(None)` if the base branch is clean, or `Ok(Some(reason))` with a description
@@ -185,11 +192,27 @@ impl ParallelExecutor {
                             .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
                             .await
                         {
-                            tracing::warn!(
-                                "on_merged hook failed for {}: {}",
-                                workspace_result.change_id,
-                                e
-                            );
+                            let message =
+                                on_merged_failure_message(&workspace_result.change_id, &e);
+                            tracing::error!("{}", message);
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::HookFailed {
+                                    change_id: workspace_result.change_id.clone(),
+                                    hook_type: crate::hooks::HookType::OnMerged.to_string(),
+                                    error: e.to_string(),
+                                },
+                            )
+                            .await;
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveFailed {
+                                    change_id: workspace_result.change_id.clone(),
+                                    error: message,
+                                },
+                            )
+                            .await;
+                            return Ok(());
                         }
                     }
 
@@ -434,7 +457,26 @@ impl ParallelExecutor {
                         .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
                         .await
                     {
-                        tracing::warn!("on_merged hook failed for {}: {}", change_id, e);
+                        let message = on_merged_failure_message(change_id, &e);
+                        tracing::error!("{}", message);
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::HookFailed {
+                                change_id: change_id.to_string(),
+                                hook_type: crate::hooks::HookType::OnMerged.to_string(),
+                                error: e.to_string(),
+                            },
+                        )
+                        .await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ResolveFailed {
+                                change_id: change_id.to_string(),
+                                error: message,
+                            },
+                        )
+                        .await;
+                        return Ok(());
                     }
                 }
 
