@@ -27,7 +27,7 @@ fn post_archive_dispatch_event(
     state: &crate::orchestration::state::OrchestratorState,
     change_id: &str,
 ) -> Option<OrchestratorEvent> {
-    let has_resolve_lane_blocker = state.is_resolving_active() || state.is_rejecting_active();
+    let has_resolve_lane_blocker = state.has_other_post_archive_lane_blocker(change_id);
 
     if has_resolve_lane_blocker {
         return Some(OrchestratorEvent::MergeDeferred {
@@ -1448,7 +1448,9 @@ mod tests {
     #[test]
     fn test_tui_archived_no_active_resolve_or_rejecting() {
         use crate::events::ExecutionEvent;
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState, WaitState};
+        use crate::orchestration::state::{
+            ActivityState, ExecutionMode, OrchestratorState, WaitState,
+        };
 
         let mut state =
             OrchestratorState::with_mode(vec!["change-a".to_string()], 3, ExecutionMode::Parallel);
@@ -1464,7 +1466,8 @@ mod tests {
         let runtime = state
             .change_runtime("change-a")
             .expect("change-a runtime should exist");
-        assert_eq!(runtime.wait_state, WaitState::MergeWait);
+        assert_eq!(runtime.wait_state, WaitState::None);
+        assert_eq!(runtime.activity, ActivityState::Resolving);
     }
 
     #[test]

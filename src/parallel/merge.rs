@@ -358,6 +358,20 @@ impl ParallelExecutor {
             }
         }
 
+        for change_id in change_ids {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::ResolveStarted {
+                    change_id: change_id.clone(),
+                    command: format!(
+                        "merge archived change into base branch ({} revision(s))",
+                        revisions.len()
+                    ),
+                },
+            )
+            .await;
+        }
+
         let revision = self.merge_and_resolve(revisions, change_ids).await?;
         Ok(MergeAttempt::Merged { revision })
     }

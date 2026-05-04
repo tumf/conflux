@@ -76,6 +76,8 @@ Manual/user resolve intent for an existing `MergeWait` row remains valid and may
 **Then**: B does not transition to `ResolveWait` because of A
 **And**: B's derived display status is not `resolve pending` unless an explicit resolve intent is later recorded
 
+## ADDED Requirements
+
 ### Requirement: post-archive-status-idempotency
 
 Parallel post-archive status updates SHALL be idempotent and monotonic with respect to final merge completion. Once a change reaches `Merged`, later archive milestones, workspace refreshes, cleanup events, or archived workspace observations MUST NOT regress its derived display status to `archived`, `merge wait`, `resolve pending`, or `resolving`.
