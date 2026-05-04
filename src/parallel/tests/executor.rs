@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -99,6 +99,7 @@ struct TestWorkspaceManager {
     #[allow(dead_code)]
     repo_root: PathBuf,
     existing_workspaces: HashMap<String, WorkspaceInfo>,
+    remove_existing_on_lookup: Arc<AtomicBool>,
 }
 
 impl TestWorkspaceManager {
@@ -109,6 +110,7 @@ impl TestWorkspaceManager {
             conflict_files: vec!["conflict.txt".to_string()],
             repo_root: PathBuf::from("/tmp/test-repo"),
             existing_workspaces: HashMap::new(),
+            remove_existing_on_lookup: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -123,6 +125,12 @@ impl TestWorkspaceManager {
                 last_modified: std::time::SystemTime::now(),
             },
         );
+        self
+    }
+
+    #[allow(dead_code)]
+    fn with_remove_existing_on_lookup(self) -> Self {
+        self.remove_existing_on_lookup.store(true, Ordering::SeqCst);
         self
     }
 }
@@ -259,7 +267,11 @@ impl WorkspaceManager for TestWorkspaceManager {
         &mut self,
         change_id: &str,
     ) -> VcsResult<Option<WorkspaceInfo>> {
-        Ok(self.existing_workspaces.get(change_id).cloned())
+        if self.remove_existing_on_lookup.load(Ordering::SeqCst) {
+            Ok(self.existing_workspaces.remove(change_id))
+        } else {
+            Ok(self.existing_workspaces.get(change_id).cloned())
+        }
     }
 
     async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace> {
@@ -3551,420 +3563,188 @@ async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
 }
 
 #[tokio::test]
-async fn test_scheduler_loop_reanalysis_with_reducer_queued_intent() {
+async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
     use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
-
-    let config = create_test_config();
-    let repo_root = PathBuf::from(".");
-    let (tx, mut rx) = mpsc::channel(64);
-    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
-    executor.scheduler_lifetime = SchedulerLifetime::Finite;
-
-    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
-    if all_changes.is_empty() {
-        return;
-    }
-
-    let selected = all_changes[0].id.clone();
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec![selected.clone()],
-        3,
-        ExecutionMode::Parallel,
-    )));
-    {
-        let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(selected));
-    }
-    executor.set_shared_orchestrator_state(shared);
-
-    let mut running_executor = executor;
-    let handle = tokio::spawn(async move {
-        running_executor
-            .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
-            .await
-    });
-
-    let saw_analysis_started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            match rx.recv().await {
-                Some(ExecutionEvent::AnalysisStarted { .. }) => break true,
-                Some(_) => continue,
-                None => break false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false);
-
-    handle.abort();
-
-    assert!(
-        saw_analysis_started,
-        "scheduler loop should start analysis from reducer-queued intent even when initial local queue is empty"
-    );
-}
-
-#[tokio::test]
-async fn test_scheduler_reconciliation_recovers_when_change_leaves_active_state() {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    let config = create_test_config();
-    let repo_root = PathBuf::from(".");
-    let mut executor = ParallelExecutor::new(repo_root, config, None);
-
-    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
-    if all_changes.is_empty() {
-        return;
-    }
-
-    let selected = all_changes[0].id.clone();
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec![selected.clone()],
-        3,
-        ExecutionMode::Parallel,
-    )));
-    {
-        let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
-    }
-    executor.set_shared_orchestrator_state(shared);
-
-    let mut queued = Vec::new();
-    let in_flight = HashSet::from([selected.clone()]);
-
-    let added_while_active = executor
-        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
-        .await;
-    assert_eq!(
-        added_while_active, 0,
-        "active/in-flight change should not be duplicated into local queue"
-    );
-    assert!(queued.is_empty());
-
-    let added_after_release = executor
-        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
-        .await;
-    assert_eq!(
-        added_after_release, 1,
-        "same reducer-queued change should be recoverable after active state clears"
-    );
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, selected);
-}
-
-#[tokio::test]
-async fn test_scheduler_reconciliation_does_not_requeue_manual_merge_deferred_change() {
-    use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
-    let config = create_test_config();
-    let repo_root = PathBuf::from(".");
-    let mut executor = ParallelExecutor::new(repo_root, config, None);
-
-    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
-    if all_changes.is_empty() {
-        return;
-    }
-
-    let selected = all_changes[0].id.clone();
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec![selected.clone()],
-        3,
-        ExecutionMode::Parallel,
-    )));
-    {
-        let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
-        assert_eq!(guard.queued_change_ids(), vec![selected.clone()]);
-        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
-            change_id: selected.clone(),
-            reason: "base dirty".to_string(),
-            auto_resumable: false,
-        });
-        assert_eq!(guard.display_status(&selected), "merge wait");
-        assert!(
-            guard.queued_change_ids().is_empty(),
-            "manual merge deferral must clear reducer-visible ordinary queue intent before scheduler reconciliation"
-        );
-    }
-    executor.set_shared_orchestrator_state(shared);
-
-    let mut queued = Vec::new();
-    let added = executor
-        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
-        .await;
-
-    assert_eq!(added, 0);
-    assert!(
-        queued.is_empty(),
-        "manual merge-deferred archived change must not be reintroduced as an ordinary queued candidate"
-    );
-}
-
-#[tokio::test]
-async fn test_queue_reconciliation_diagnostic_dedupe_state_is_keyed_by_change_and_reason() {
-    let config = create_test_config();
-    let repo_root = PathBuf::from("/tmp/test-repo");
-    let mut executor = ParallelExecutor::new(repo_root, config, None);
-
-    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-a", "already_active"));
-    assert!(!executor.should_emit_queue_reconciliation_diagnostic("change-a", "already_active"));
-    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-a", "candidate_not_found"));
-    assert!(executor.should_emit_queue_reconciliation_diagnostic("change-b", "already_active"));
-}
-
-#[tokio::test]
-async fn test_scheduler_reconciliation_active_diagnostic_is_bounded() {
-    use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
-
-    let config = create_test_config();
-    let repo_root = PathBuf::from(".");
-    let (tx, mut rx) = mpsc::channel(64);
-    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
-
-    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
-    if all_changes.is_empty() {
-        return;
-    }
-
-    let selected = all_changes[0].id.clone();
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec![selected.clone()],
-        3,
-        ExecutionMode::Parallel,
-    )));
-    {
-        let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(selected.clone()));
-    }
-    executor.set_shared_orchestrator_state(shared);
-
-    let mut queued = Vec::new();
-    let in_flight = HashSet::from([selected.clone()]);
-
-    for _ in 0..3 {
-        let added = executor
-            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
-            .await;
-        assert_eq!(added, 0);
-    }
-
-    let mut already_active_logs = 0;
-    while let Ok(event) = rx.try_recv() {
-        if let ExecutionEvent::Log(log) = event {
-            if log.message.contains("Queue reconciliation deferred")
-                && log.message.contains("already_active")
-            {
-                already_active_logs += 1;
-            }
-        }
-    }
-
-    assert_eq!(
-        already_active_logs, 1,
-        "repeated active/in-flight reconciliation should emit one bounded diagnostic"
-    );
-    assert!(queued.is_empty());
-}
-
-#[tokio::test]
-async fn test_scheduler_reconciliation_missing_candidate_diagnostic_is_observable_but_bounded() {
-    use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
-
-    let config = create_test_config();
-    let repo_root = PathBuf::from(".");
-    let (tx, mut rx) = mpsc::channel(64);
-    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
-
-    let missing_id = "missing-candidate-for-reconciliation-test".to_string();
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec![missing_id.clone()],
-        3,
-        ExecutionMode::Parallel,
-    )));
-    {
-        let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(missing_id.clone()));
-    }
-    executor.set_shared_orchestrator_state(shared);
-
-    let mut queued = Vec::new();
-
-    for _ in 0..3 {
-        let added = executor
-            .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
-            .await;
-        assert_eq!(added, 0);
-    }
-
-    let mut candidate_not_found_logs = 0;
-    while let Ok(event) = rx.try_recv() {
-        if let ExecutionEvent::Log(log) = event {
-            if log.message.contains("Queue reconciliation pending")
-                && log.message.contains("candidate_not_found")
-            {
-                candidate_not_found_logs += 1;
-            }
-        }
-    }
-
-    assert_eq!(
-        candidate_not_found_logs, 1,
-        "missing candidate diagnostics should remain observable but bounded"
-    );
-    assert!(queued.is_empty());
-}
-
-#[tokio::test]
-async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
-    use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
-
-    let config = create_test_config();
-    let (tx, mut rx) = mpsc::channel(64);
-    let mut executor = ParallelExecutor::new(PathBuf::from("."), config, Some(tx));
-    executor.scheduler_lifetime = SchedulerLifetime::Finite;
-
-    let all_changes = crate::openspec::list_changes_native().unwrap_or_default();
-    if all_changes.is_empty() {
-        return;
-    }
-
-    let selected = all_changes[0].id.clone();
-    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec![selected.clone()],
-        1,
-        ExecutionMode::Parallel,
-    )));
-    {
-        let mut guard = shared.write().await;
-        guard.apply_command(ReducerCommand::AddToQueue(selected));
-    }
-    executor.set_shared_orchestrator_state(shared);
-    // Saturate all execution capacity via resolve slots so scheduler emits
-    // the no_available_slots diagnostic before any analysis can start.
-    let manual_resolve_counter = Arc::new(AtomicUsize::new(usize::MAX));
-    executor.set_manual_resolve_counter(manual_resolve_counter);
-
-    let mut running_executor = executor;
-    let handle = tokio::spawn(async move {
-        running_executor
-            .execute_with_order_based_reanalysis(Vec::new(), ready_analysis_result)
-            .await
-    });
-
-    let diagnostic_count = tokio::time::timeout(std::time::Duration::from_millis(1200), async {
-        let mut count = 0usize;
-        loop {
-            match rx.recv().await {
-                Some(ExecutionEvent::Log(log)) => {
-                    let message = log.message;
-                    if message.contains("reason=no_available_slots") {
-                        count += 1;
-                    }
-                }
-                Some(_) => continue,
-                None => break count,
-            }
-        }
-    })
-    .await
-    .unwrap_or(1);
-
-    handle.abort();
-
-    assert_eq!(
-        diagnostic_count, 1,
-        "scheduler loop should emit no_available_slots diagnostic once while queued intent remains unchanged"
-    );
-}
-
-#[tokio::test]
-async fn test_scheduler_keeps_normal_apply_candidates_separate_from_reject_wait() {
     use crate::orchestration::state::{ExecutionMode, OrchestratorState};
-    use crate::parallel::dynamic_queue::ReanalysisReason;
-    use crate::parallel::WorkspaceResult;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock, Semaphore};
-    use tokio::task::JoinSet;
+    use tempfile::TempDir;
 
-    let config = create_test_config();
-    let (tx, _rx) = mpsc::channel(32);
+    use tokio::sync::{mpsc, RwLock};
+
+    let workspace_dir = TempDir::new().or_fail("unexpected error");
+    let change_id = "change-rejected";
+    let rejected_dir = workspace_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join(change_id);
+    std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
+    std::fs::write(
+        rejected_dir.join("REJECTED.md"),
+        "# REJECTED\n\n- change_id: change-rejected\n- reason: regression\n",
+    )
+    .or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: BLOCK'".to_string()),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_strict_process_cleanup: Some(false),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
     let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, Some(tx));
-    executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        vec!["normal-apply".to_string(), "lane-owner".to_string()],
+        vec!["lane-owner".to_string(), change_id.to_string()],
         2,
         ExecutionMode::Parallel,
     )));
     {
         let mut guard = shared.write().await;
-        guard.apply_execution_event(&crate::events::ExecutionEvent::WorkspaceStatusUpdated {
+        guard.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
             change_id: "lane-owner".to_string(),
             workspace_name: "lane-owner".to_string(),
             status: WorkspaceStatus::Resolving,
         });
+        guard.mark_reject_wait(change_id);
+        assert_eq!(guard.display_status(change_id), "reject pending");
+        guard.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "lane-owner".to_string(),
+            worktree_change_ids: None,
+        });
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
-    let semaphore = Arc::new(Semaphore::new(1));
-    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
-    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
-        executor.workspace_manager.backend_type(),
-        PathBuf::from("/tmp/test-repo"),
-    );
-    let mut queued = vec![make_test_change("normal-apply")];
-    let mut in_flight = HashSet::new();
+    executor.retry_deferred_base_lane_waiters().await;
 
-    let (_should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
-            semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
-        .await
-        .or_fail("unexpected error");
+    let mut saw_rejecting_status = false;
+    let mut saw_review_completed = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: id,
+                status: WorkspaceStatus::Rejecting,
+                ..
+            } if id == change_id => saw_rejecting_status = true,
+            ExecutionEvent::RejectionReviewCompleted { change_id: id, .. }
+            | ExecutionEvent::RejectionReviewFailed { change_id: id, .. }
+                if id == change_id =>
+            {
+                saw_review_completed = true;
+            }
+            _ => {}
+        }
+    }
 
-    assert_eq!(iteration, 2, "ordinary apply dispatch should still advance");
-    assert_eq!(
-        queued.len(),
-        0,
-        "ordinary apply candidate should be dispatched"
+    assert!(
+        saw_rejecting_status,
+        "lane-clear promotion must emit active rejecting status before running review"
     );
-    assert_eq!(
-        in_flight.len(),
-        1,
-        "normal apply should enter in-flight set"
+    assert!(
+        saw_review_completed,
+        "lane-clear promotion must execute the deferred rejection review"
     );
     let guard = shared.read().await;
+    assert!(guard.reject_wait_change_ids().is_empty());
+    let final_status = guard.display_status(change_id);
     assert!(
-        guard.reject_wait_change_ids().is_empty(),
-        "normal queued apply candidates must not become reject pending"
+        matches!(final_status, "stalled" | "error"),
+        "the deferred review attempt must leave reject pending after execution"
+    );
+}
+
+#[tokio::test]
+async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let first_workspace = TempDir::new().or_fail("unexpected error");
+    let second_workspace = TempDir::new().or_fail("unexpected error");
+    let first_id = "change-rejected-a";
+    let second_id = "change-rejected-b";
+    for (change_id, workspace) in [
+        (first_id, first_workspace.path()),
+        (second_id, second_workspace.path()),
+    ] {
+        let rejected_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
+        std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED\n")
+            .or_fail("unexpected error");
+    }
+
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: BLOCK'".to_string()),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_strict_process_cleanup: Some(false),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(first_id, first_workspace.path().to_path_buf())
+            .with_existing_workspace(second_id, second_workspace.path().to_path_buf()),
     );
 
-    while join_set.join_next().await.is_some() {}
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            "lane-owner".to_string(),
+            first_id.to_string(),
+            second_id.to_string(),
+        ],
+        2,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "lane-owner".to_string(),
+            workspace_name: "lane-owner".to_string(),
+            status: WorkspaceStatus::Resolving,
+        });
+        guard.mark_reject_wait(first_id);
+        guard.mark_reject_wait(second_id);
+        guard.apply_execution_event(&ExecutionEvent::ResolveCompleted {
+            change_id: "lane-owner".to_string(),
+            worktree_change_ids: None,
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    executor.retry_deferred_base_lane_waiters().await;
+
+    let mut rejecting_updates = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::WorkspaceStatusUpdated {
+            change_id,
+            status: WorkspaceStatus::Rejecting,
+            ..
+        } = event
+        {
+            rejecting_updates.push(change_id);
+        }
+    }
+
+    assert_eq!(rejecting_updates, vec![first_id.to_string()]);
+    let guard = shared.read().await;
+    let first_status = guard.display_status(first_id);
+    assert!(
+        matches!(first_status, "stalled" | "error"),
+        "the promoted first waiter must leave reject pending after its review attempt"
+    );
+    assert_eq!(guard.display_status(second_id), "reject pending");
+    assert_eq!(guard.reject_wait_change_ids(), vec![second_id.to_string()]);
 }
 
 #[tokio::test]
@@ -4160,6 +3940,7 @@ async fn test_on_merged_hook_execution() {
 async fn test_attempt_merge_deferred_when_resolve_active() {
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;

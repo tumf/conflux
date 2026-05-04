@@ -1997,8 +1997,33 @@ mod validation_tests {
 mod openspec_list_show_tests {
     use super::*;
     use std::env;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
+
+    struct CwdTestGuard {
+        _lock: MutexGuard<'static, ()>,
+        original_cwd: PathBuf,
+    }
+
+    impl CwdTestGuard {
+        fn enter(path: &Path) -> Self {
+            let lock = cwd_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original_cwd = env::current_dir().unwrap();
+            env::set_current_dir(path).unwrap();
+            Self {
+                _lock: lock,
+                original_cwd,
+            }
+        }
+    }
+
+    impl Drop for CwdTestGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.original_cwd).unwrap();
+        }
+    }
 
     fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2073,11 +2098,8 @@ mod openspec_list_show_tests {
 
     #[test]
     fn test_list_changes_excludes_archived_entries() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let active_dir = temp.path().join("openspec/changes/active-change");
         let archived_dir = temp
@@ -2093,17 +2115,12 @@ mod openspec_list_show_tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].id, "active-change");
         assert!(changes[0].path.contains("openspec/changes/active-change"));
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_list_specs_includes_requirement_counts() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let foo_dir = temp.path().join("openspec/specs/foo-spec");
         fs::create_dir_all(&foo_dir).unwrap();
@@ -2137,17 +2154,12 @@ mod openspec_list_show_tests {
         assert!(rendered.contains("  \x1b[96mfoo-spec\x1b[0m"));
         assert!(rendered.contains("    Path: openspec/specs/foo-spec/spec.md"));
         assert!(rendered.contains("    Requirements: 2"));
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_show_change_resolves_archived_entry() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let archived_dir = temp.path().join("openspec/changes/archive/archived-change");
         create_change(&archived_dir, "Archived Change", "- [x] archived\n");
@@ -2162,17 +2174,12 @@ mod openspec_list_show_tests {
         assert!(info
             .path
             .contains("openspec/changes/archive/archived-change"));
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_show_change_resolves_dated_archived_entry() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let archived_dir = temp
             .path()
@@ -2189,17 +2196,12 @@ mod openspec_list_show_tests {
         assert!(info
             .path
             .contains("openspec/changes/archive/2026-04-28-archived-change"));
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_archive_change_creates_dated_destination_and_message() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let change_id = "archive-target";
         let change_dir = temp.path().join("openspec/changes").join(change_id);
@@ -2224,17 +2226,12 @@ mod openspec_list_show_tests {
         ));
         assert!(archive_dest.exists());
         assert!(!change_dir.exists());
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_archive_change_rejects_existing_dated_destination() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let change_id = "already-archived";
         let change_dir = temp.path().join("openspec/changes").join(change_id);
@@ -2254,16 +2251,12 @@ mod openspec_list_show_tests {
 
         assert!(err.contains("Archive destination already exists"));
         assert!(change_dir.exists());
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_validate_change_classifies_archived_dependency_as_warning() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let active_change = temp.path().join("openspec/changes/active-change");
         create_change_with_frontmatter_dependencies(
@@ -2286,16 +2279,12 @@ mod openspec_list_show_tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("classified as archived dependency reference")));
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 
     #[test]
     fn test_validate_change_reports_missing_dependency_as_error() {
-        let _guard = cwd_lock().lock().unwrap();
-        let original_cwd = env::current_dir().unwrap();
         let temp = TempDir::new().unwrap();
-        env::set_current_dir(temp.path()).unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
 
         let active_change = temp.path().join("openspec/changes/active-change");
         create_change_with_frontmatter_dependencies(
@@ -2313,8 +2302,6 @@ mod openspec_list_show_tests {
             .iter()
             .any(|e| e.contains("missing-dep") && e.contains("invalid")));
         assert!(warnings.is_empty());
-
-        env::set_current_dir(original_cwd).unwrap();
     }
 }
 
