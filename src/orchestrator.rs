@@ -1054,6 +1054,7 @@ impl Orchestrator {
     async fn mark_change_stalled(&mut self, change_id: &str, reason: &str) {
         {
             let mut state = self.shared_state.write().await;
+            state.add_dynamic_change(change_id.to_string());
             state.mark_stalled(change_id.to_string());
             state.clear_stalled_change(change_id);
             state.clear_error_history(change_id);

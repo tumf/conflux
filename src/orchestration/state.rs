@@ -1032,7 +1032,18 @@ impl OrchestratorState {
             ReducerCommand::ResolveMerge(change_id) => {
                 let rt = self.runtime_entry(&change_id);
                 if !matches!(rt.wait_state, WaitState::MergeWait | WaitState::ResolveWait) {
-                    return ReduceOutcome::NoOp;
+                    // TUI/manual resolve commands are already gated by the visible
+                    // `merge wait` row. If the shared reducer missed that local UI
+                    // milestone, accept the operator intent and record ResolveWait
+                    // rather than letting the next reducer sync regress the row to
+                    // `not queued`.
+                    if matches!(rt.activity, ActivityState::Idle)
+                        && matches!(rt.terminal, TerminalState::None)
+                    {
+                        rt.wait_state = WaitState::MergeWait;
+                    } else {
+                        return ReduceOutcome::NoOp;
+                    }
                 }
                 rt.wait_state = WaitState::ResolveWait;
                 self.reject_wait_queue.retain(|id| id != &change_id);
@@ -1303,6 +1314,19 @@ impl OrchestratorState {
                     return;
                 }
                 match status {
+                    crate::vcs::WorkspaceStatus::Blocked
+                        if self.stalled_change_ids.contains(change_id) =>
+                    {
+                        let rt = self.runtime_entry(change_id);
+                        rt.activity = ActivityState::Idle;
+                        rt.wait_state = WaitState::Stalled;
+                        rt.terminal = TerminalState::None;
+                        rt.set_blocked_metadata(
+                            "serial change stalled with recoverable blocker",
+                            "resolve blocker evidence and retry explicitly",
+                            "serial workflow state is preserved in the workspace",
+                        );
+                    }
                     crate::vcs::WorkspaceStatus::Rejecting => {
                         self.mark_reject_wait(change_id);
                     }
@@ -2944,8 +2968,15 @@ mod tests {
         let mut state =
             OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
 
-        // Step 1: change archived -> enters MergeWait in parallel mode.
-        state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
+        // Step 1: concrete manual merge blocker -> enters MergeWait in parallel mode.
+        // A bare ChangeArchived event now truthfully enters active post-archive
+        // merge handling; only MergeDeferred(auto_resumable=false) represents
+        // operator-owned manual merge wait.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
         assert_eq!(state.display_status("c"), "merge wait");
 
         // Step 2: user triggers manual resolve → reducer transitions to ResolveWait.
