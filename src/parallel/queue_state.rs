@@ -9,6 +9,10 @@ use std::sync::Arc;
 
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
+use crate::orchestration::{
+    execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
+    run_rejection_review, RejectionReviewVerdict,
+};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -73,6 +77,13 @@ impl ParallelExecutor {
         if let Some(shared) = &self.shared_orchestrator_state {
             let mut guard = shared.write().await;
             guard.clear_reject_wait_intent(change_id);
+        }
+    }
+
+    async fn apply_rejection_review_event_in_shared_state(&mut self, event: &ExecutionEvent) {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut guard = shared.write().await;
+            guard.apply_execution_event(event);
         }
     }
 
@@ -797,6 +808,167 @@ impl ParallelExecutor {
         )
         .await;
         self.clear_reject_wait_intent_for_success(&change_id).await;
+
+        match run_rejection_review(
+            &change_id,
+            &workspace_info.path,
+            &self.config,
+            &self.ai_runner,
+        )
+        .await
+        {
+            Ok(RejectionReviewVerdict::Confirm) => {
+                let rejected_path = workspace_info
+                    .path
+                    .join("openspec")
+                    .join("changes")
+                    .join(&change_id)
+                    .join("REJECTED.md");
+                let reason = format!(
+                    "Rejecting review confirmed rejection (proposal: {})",
+                    rejected_path.display()
+                );
+                let base_branch = self
+                    .workspace_manager
+                    .ensure_original_branch_initialized()
+                    .await
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            "Failed to resolve base branch while confirming deferred rejection review for '{}': {}",
+                            change_id, error
+                        );
+                        "main".to_string()
+                    });
+
+                match execute_rejection_flow(
+                    &change_id,
+                    &reason,
+                    &workspace_info.path,
+                    &base_branch,
+                    &self.repo_root,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let completed_event = ParallelEvent::RejectionReviewCompleted {
+                            change_id: change_id.clone(),
+                            outcome: crate::events::RejectionOutcome::Confirm,
+                        };
+                        self.apply_rejection_review_event_in_shared_state(&completed_event)
+                            .await;
+                        send_event(&self.event_tx, completed_event).await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ChangeRejected {
+                                change_id: change_id.clone(),
+                                reason,
+                            },
+                        )
+                        .await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::ChangeDequeued {
+                                change_id: change_id.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        error!(
+                            "Deferred rejection review confirm flow failed for '{}': {}",
+                            change_id, error
+                        );
+                        let failed_event = ParallelEvent::RejectionReviewFailed {
+                            change_id: change_id.clone(),
+                            error: format!(
+                                "Rejected flow failed after deferred rejecting CONFIRM verdict: {}",
+                                error
+                            ),
+                        };
+                        self.apply_rejection_review_event_in_shared_state(&failed_event)
+                            .await;
+                        send_event(&self.event_tx, failed_event).await;
+                    }
+                }
+            }
+            Ok(RejectionReviewVerdict::Resume) => {
+                match handle_resume_apply_from_rejecting(&change_id, &workspace_info.path).await {
+                    Ok(()) => {
+                        let completed_event = ParallelEvent::RejectionReviewCompleted {
+                            change_id: change_id.clone(),
+                            outcome: crate::events::RejectionOutcome::Resume,
+                        };
+                        self.apply_rejection_review_event_in_shared_state(&completed_event)
+                            .await;
+                        send_event(&self.event_tx, completed_event).await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::Log(
+                                LogEntry::warn(
+                                    "Deferred rejecting review returned RESUME; workspace is ready for apply resume",
+                                )
+                                .with_change_id(&change_id)
+                                .with_operation("rejecting"),
+                            ),
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let failed_event = ParallelEvent::RejectionReviewFailed {
+                            change_id: change_id.clone(),
+                            error: error.to_string(),
+                        };
+                        self.apply_rejection_review_event_in_shared_state(&failed_event)
+                            .await;
+                        send_event(&self.event_tx, failed_event).await;
+                    }
+                }
+            }
+            Ok(RejectionReviewVerdict::Block) => {
+                match handle_blocked_from_rejecting(&change_id, &workspace_info.path).await {
+                    Ok(()) => {
+                        let completed_event = ParallelEvent::RejectionReviewCompleted {
+                            change_id: change_id.clone(),
+                            outcome: crate::events::RejectionOutcome::Block,
+                        };
+                        self.apply_rejection_review_event_in_shared_state(&completed_event)
+                            .await;
+                        send_event(&self.event_tx, completed_event).await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::WorkspaceStatusUpdated {
+                                change_id: change_id.clone(),
+                                workspace_name: workspace_info.workspace_name.clone(),
+                                status: crate::vcs::WorkspaceStatus::Blocked,
+                            },
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let failed_event = ParallelEvent::RejectionReviewFailed {
+                            change_id: change_id.clone(),
+                            error: error.to_string(),
+                        };
+                        self.apply_rejection_review_event_in_shared_state(&failed_event)
+                            .await;
+                        send_event(&self.event_tx, failed_event).await;
+                    }
+                }
+            }
+            Err(error) => {
+                error!(
+                    "Deferred rejection review failed for '{}': {}",
+                    change_id, error
+                );
+                let failed_event = ParallelEvent::RejectionReviewFailed {
+                    change_id: change_id.clone(),
+                    error: format!("Rejecting review failed after deferred handoff: {}", error),
+                };
+                self.apply_rejection_review_event_in_shared_state(&failed_event)
+                    .await;
+                send_event(&self.event_tx, failed_event).await;
+            }
+        }
     }
 
     /// Retry rejection review for all RejectWait changes once the base-mutating lane is free.

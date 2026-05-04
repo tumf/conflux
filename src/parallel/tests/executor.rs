@@ -98,6 +98,7 @@ struct TestWorkspaceManager {
     conflict_files: Vec<String>,
     #[allow(dead_code)]
     repo_root: PathBuf,
+    existing_workspaces: HashMap<String, WorkspaceInfo>,
 }
 
 impl TestWorkspaceManager {
@@ -107,7 +108,22 @@ impl TestWorkspaceManager {
             merge_calls,
             conflict_files: vec!["conflict.txt".to_string()],
             repo_root: PathBuf::from("/tmp/test-repo"),
+            existing_workspaces: HashMap::new(),
         }
+    }
+
+    #[allow(dead_code)]
+    fn with_existing_workspace(mut self, change_id: &str, path: PathBuf) -> Self {
+        self.existing_workspaces.insert(
+            change_id.to_string(),
+            WorkspaceInfo {
+                path,
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                last_modified: std::time::SystemTime::now(),
+            },
+        );
+        self
     }
 }
 
@@ -241,9 +257,9 @@ impl WorkspaceManager for TestWorkspaceManager {
 
     async fn find_existing_workspace(
         &mut self,
-        _change_id: &str,
+        change_id: &str,
     ) -> VcsResult<Option<WorkspaceInfo>> {
-        Ok(None)
+        Ok(self.existing_workspaces.get(change_id).cloned())
     }
 
     async fn reuse_workspace(&mut self, workspace_info: &WorkspaceInfo) -> VcsResult<Workspace> {
@@ -3884,14 +3900,14 @@ async fn test_scheduler_keeps_normal_apply_candidates_separate_from_reject_wait(
     use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use crate::parallel::dynamic_queue::ReanalysisReason;
     use crate::parallel::WorkspaceResult;
-    use crate::vcs::VcsBackend;
     use std::sync::Arc;
     use tokio::sync::{mpsc, RwLock, Semaphore};
     use tokio::task::JoinSet;
 
     let config = create_test_config();
     let (tx, _rx) = mpsc::channel(32);
-    let mut executor = ParallelExecutor::new(PathBuf::from("."), config, Some(tx));
+    let mut executor = ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), config, Some(tx));
+    executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
         vec!["normal-apply".to_string(), "lane-owner".to_string()],
         2,
@@ -3909,8 +3925,10 @@ async fn test_scheduler_keeps_normal_apply_candidates_separate_from_reject_wait(
 
     let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
-    let mut cleanup_guard =
-        crate::parallel::cleanup::WorkspaceCleanupGuard::new(VcsBackend::Git, PathBuf::from("."));
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        executor.workspace_manager.backend_type(),
+        PathBuf::from("/tmp/test-repo"),
+    );
     let mut queued = vec![make_test_change("normal-apply")];
     let mut in_flight = HashSet::new();
 
