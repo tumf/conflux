@@ -66,14 +66,11 @@ pub enum HookType {
 }
 
 impl HookType {
-    /// Get the configuration key name for this hook type
     pub fn config_key(&self) -> &'static str {
         match self {
-            // Run lifecycle
             HookType::OnStart => "on_start",
             HookType::OnFinish => "on_finish",
             HookType::OnError => "on_error",
-            // Change lifecycle
             HookType::OnChangeStart => "on_change_start",
             HookType::PreApply => "pre_apply",
             HookType::PostApply => "post_apply",
@@ -82,7 +79,6 @@ impl HookType {
             HookType::PostArchive => "post_archive",
             HookType::OnChangeEnd => "on_change_end",
             HookType::OnMerged => "on_merged",
-            // User interaction (TUI only)
             HookType::OnQueueAdd => "on_queue_add",
             HookType::OnQueueRemove => "on_queue_remove",
         }
@@ -524,6 +520,20 @@ fn truncate_hook_output(s: &str, limit: usize) -> (&str, bool) {
 /// Default maximum wait time for .git/index.lock release (seconds)
 pub const DEFAULT_INDEX_LOCK_WAIT_SECS: u64 = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookRunnerLogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexLockWaitOutcome {
+    NotPresent,
+    Released,
+    TimedOut,
+}
+
 /// Hook runner that executes hooks based on configuration
 #[derive(Clone)]
 pub struct HookRunner {
@@ -606,19 +616,57 @@ impl HookRunner {
         self.config.get(hook_type).is_some()
     }
 
-    /// Wait for `.git/index.lock` to be released, polling every 500ms.
-    ///
-    /// Returns `true` if the lock was released within the timeout, `false` if timed out.
-    async fn wait_for_index_lock_release(&self, max_wait_secs: u64) -> bool {
-        let lock_path = self.repo_root.join(".git/index.lock");
-        if !lock_path.exists() {
-            return true;
+    async fn emit_runner_log(&self, level: HookRunnerLogLevel, message: String) {
+        match level {
+            HookRunnerLogLevel::Info => info!("{}", message),
+            HookRunnerLogLevel::Warn => warn!("{}", message),
+            HookRunnerLogLevel::Error => error!("{}", message),
         }
 
-        info!(
-            "Waiting for .git/index.lock release (max {}s)...",
-            max_wait_secs
-        );
+        if let Some(ref tx) = self.event_tx {
+            let entry = match level {
+                HookRunnerLogLevel::Info => LogEntry::info(message.clone()),
+                HookRunnerLogLevel::Warn => LogEntry::warn(message.clone()),
+                HookRunnerLogLevel::Error => LogEntry::error(message.clone()),
+            };
+            let _ = tx.send(ExecutionEvent::Log(entry)).await;
+        }
+
+        if let Some(ref handler) = self.output_handler {
+            match level {
+                HookRunnerLogLevel::Info => handler.on_info(&message),
+                HookRunnerLogLevel::Warn => handler.on_warn(&message),
+                HookRunnerLogLevel::Error => handler.on_error(&message),
+            }
+        }
+    }
+
+    /// Wait for `.git/index.lock` to be released, polling every 500ms.
+    ///
+    /// Returns the observed lock outcome so callers/tests can distinguish no-lock,
+    /// released, and timeout cases without depending on hidden state.
+    async fn wait_for_index_lock_release(&self, max_wait_secs: u64) -> IndexLockWaitOutcome {
+        let lock_path = self.repo_root.join(".git/index.lock");
+        if !lock_path.exists() {
+            self.emit_runner_log(
+                HookRunnerLogLevel::Info,
+                format!(
+                    "on_merged root lock preflight: {} was not present before hook execution",
+                    lock_path.display()
+                ),
+            )
+            .await;
+            return IndexLockWaitOutcome::NotPresent;
+        }
+
+        self.emit_runner_log(
+            HookRunnerLogLevel::Warn,
+            format!(
+                "on_merged root lock preflight: {} was already present; waiting up to {}s for release",
+                lock_path.display(), max_wait_secs
+            ),
+        )
+        .await;
         let poll_interval = Duration::from_millis(500);
         let max_wait = Duration::from_secs(max_wait_secs);
         let start = tokio::time::Instant::now();
@@ -626,18 +674,27 @@ impl HookRunner {
         loop {
             tokio::time::sleep(poll_interval).await;
             if !lock_path.exists() {
-                info!(
-                    ".git/index.lock released after {:.1}s",
-                    start.elapsed().as_secs_f64()
-                );
-                return true;
+                self.emit_runner_log(
+                    HookRunnerLogLevel::Info,
+                    format!(
+                        "on_merged root lock preflight: {} released after {:.1}s; proceeding with hook execution",
+                        lock_path.display(),
+                        start.elapsed().as_secs_f64()
+                    ),
+                )
+                .await;
+                return IndexLockWaitOutcome::Released;
             }
             if start.elapsed() >= max_wait {
-                warn!(
-                    ".git/index.lock still present after {}s, proceeding anyway",
-                    max_wait_secs
-                );
-                return false;
+                self.emit_runner_log(
+                    HookRunnerLogLevel::Warn,
+                    format!(
+                        "on_merged root lock preflight: {} still present after {}s; proceeding with hook execution after timeout",
+                        lock_path.display(), max_wait_secs
+                    ),
+                )
+                .await;
+                return IndexLockWaitOutcome::TimedOut;
             }
         }
     }
@@ -725,11 +782,14 @@ impl HookRunner {
             handler.on_info(&cmd_msg);
         }
 
-        // For on_merged hooks, wait for .git/index.lock to be released first
-        if hook_type == HookType::OnMerged {
-            self.wait_for_index_lock_release(self.config.index_lock_wait_secs)
-                .await;
-        }
+        let index_lock_outcome = if hook_type == HookType::OnMerged {
+            Some(
+                self.wait_for_index_lock_release(self.config.index_lock_wait_secs)
+                    .await,
+            )
+        } else {
+            None
+        };
 
         // Execute with retry loop
         let max_attempts = 1 + hook_config.max_retries;
@@ -746,6 +806,21 @@ impl HookRunner {
                     if success {
                         info!("{} hook completed successfully", hook_type);
                         return Ok(());
+                    }
+
+                    if hook_type == HookType::OnMerged {
+                        if let Some(outcome) = index_lock_outcome {
+                            self.emit_runner_log(
+                                HookRunnerLogLevel::Error,
+                                format!(
+                                    "on_merged hook execution failed after root lock preflight outcome {:?}: non-zero exit; stdout_bytes={}, stderr_bytes={}",
+                                    outcome,
+                                    stdout.len(),
+                                    stderr.len()
+                                ),
+                            )
+                            .await;
+                        }
                     }
 
                     // Non-zero exit: check if we should retry
@@ -784,6 +859,19 @@ impl HookRunner {
                     }
                 }
                 Err(e) => {
+                    if hook_type == HookType::OnMerged {
+                        if let Some(outcome) = index_lock_outcome {
+                            self.emit_runner_log(
+                                HookRunnerLogLevel::Error,
+                                format!(
+                                    "on_merged hook execution error after root lock preflight outcome {:?}: {}",
+                                    outcome, e
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+
                     // Execution error (spawn failure, timeout, etc.): check retry
                     if attempt < max_attempts {
                         warn!(
@@ -2022,18 +2110,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_index_lock_wait_no_lock_file() {
+    async fn test_on_merged_lock_preflight_logs_not_present_to_event_sink() {
         // When no .git/index.lock exists, wait returns immediately
         let tmp_dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp_dir.path().join(".git")).unwrap();
-        let runner = HookRunner::new(HooksConfig::default(), tmp_dir.path());
+        let (tx, mut rx) = mpsc::channel(4);
+        let runner = HookRunner::with_event_tx(HooksConfig::default(), tmp_dir.path(), tx);
 
-        let released = runner.wait_for_index_lock_release(1).await;
-        assert!(released, "Expected immediate return when no lock file");
+        let outcome = runner.wait_for_index_lock_release(1).await;
+        assert_eq!(
+            outcome,
+            IndexLockWaitOutcome::NotPresent,
+            "Expected immediate return when no lock file"
+        );
+        let log = rx.try_recv().expect("expected no-lock preflight log");
+        match log {
+            ExecutionEvent::Log(entry) => assert!(entry
+                .message
+                .contains("was not present before hook execution")),
+            other => panic!("expected log event, got {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn test_index_lock_wait_lock_released() {
+    async fn test_on_merged_lock_preflight_logs_release_to_event_sink() {
         // Lock file is released within wait period
         let tmp_dir = tempfile::tempdir().unwrap();
         let git_dir = tmp_dir.path().join(".git");
@@ -2041,7 +2141,8 @@ mod tests {
         let lock_file = git_dir.join("index.lock");
         std::fs::write(&lock_file, "lock").unwrap();
 
-        let runner = HookRunner::new(HooksConfig::default(), tmp_dir.path());
+        let (tx, mut rx) = mpsc::channel(4);
+        let runner = HookRunner::with_event_tx(HooksConfig::default(), tmp_dir.path(), tx);
 
         // Remove lock after a short delay
         let lock_clone = lock_file.clone();
@@ -2050,13 +2151,32 @@ mod tests {
             let _ = std::fs::remove_file(lock_clone);
         });
 
-        let released = runner.wait_for_index_lock_release(5).await;
-        assert!(released, "Expected lock to be released");
+        let outcome = runner.wait_for_index_lock_release(5).await;
+        assert_eq!(
+            outcome,
+            IndexLockWaitOutcome::Released,
+            "Expected lock to be released"
+        );
+        let logs: Vec<String> = (0..2)
+            .filter_map(|_| match rx.try_recv().ok()? {
+                ExecutionEvent::Log(entry) => Some(entry.message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            logs.iter()
+                .any(|message| message.contains("was already present")),
+            "expected pre-existing lock log, got {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|message| message.contains("released after")),
+            "expected lock release log, got {logs:?}"
+        );
     }
 
-    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
-    async fn test_index_lock_wait_timeout() {
+    async fn test_on_merged_lock_preflight_logs_timeout_to_event_sink() {
         // Lock file persists beyond timeout
         let tmp_dir = tempfile::tempdir().unwrap();
         let git_dir = tmp_dir.path().join(".git");
@@ -2064,9 +2184,70 @@ mod tests {
         let lock_file = git_dir.join("index.lock");
         std::fs::write(&lock_file, "lock").unwrap();
 
-        let runner = HookRunner::new(HooksConfig::default(), tmp_dir.path());
+        let (tx, mut rx) = mpsc::channel(4);
+        let runner = HookRunner::with_event_tx(HooksConfig::default(), tmp_dir.path(), tx);
 
-        let released = runner.wait_for_index_lock_release(1).await;
-        assert!(!released, "Expected timeout when lock persists");
+        let outcome = runner.wait_for_index_lock_release(0).await;
+        assert_eq!(
+            outcome,
+            IndexLockWaitOutcome::TimedOut,
+            "Expected timeout when lock persists"
+        );
+        let logs: Vec<String> = (0..2)
+            .filter_map(|_| match rx.try_recv().ok()? {
+                ExecutionEvent::Log(entry) => Some(entry.message),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            logs.iter()
+                .any(|message| message.contains("was already present")),
+            "expected pre-existing lock log, got {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|message| message.contains("proceeding with hook execution after timeout")),
+            "expected timeout/proceeding log, got {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_merged_failure_logs_preflight_outcome() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_dir.path().join(".git")).unwrap();
+        let json = r#"{
+            "on_merged": {
+                "command": "echo lock-failure >&2; exit 1",
+                "continue_on_failure": false
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let runner = HookRunner::with_event_tx(config, tmp_dir.path(), tx);
+
+        let result = runner
+            .run_hook(HookType::OnMerged, &HookContext::default())
+            .await;
+        assert!(
+            result.is_err(),
+            "non-continuable on_merged failure must propagate"
+        );
+
+        let mut logs = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::Log(entry) = event {
+                logs.push(entry.message);
+            }
+        }
+        assert!(
+            logs.iter()
+                .any(|message| message.contains("root lock preflight outcome NotPresent")),
+            "expected hook failure log with preflight outcome, got {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|message| message.contains("on_merged hook stderr")),
+            "expected captured stderr log, got {logs:?}"
+        );
     }
 }

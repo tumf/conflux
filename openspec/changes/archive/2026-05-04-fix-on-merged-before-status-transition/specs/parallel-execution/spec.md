@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: post-merge success path honors on_merged gate
+### Requirement: post-archive-merge-dispatch
 
 Parallel merge success paths SHALL treat non-continuable `on_merged` execution as part of merged-success completion rather than as a warning-only side effect.
 
@@ -22,7 +22,7 @@ When repository-visible merge success is followed by `on_merged` with `continue_
 **Then**: the scheduler does not emit `MergeCompleted` for `alpha`
 **And**: UI and reducer state do not claim `alpha` is merged
 
-### Requirement: root-repo lock contention remains non-terminal
+### Requirement: post-archive-merge-dispatch
 
 If `on_merged` fails because the root repository is not safe for repo-mutating hook execution, such as root `.git/index.lock` contention, Conflux SHALL treat that as a hook failure that blocks merged transition when `continue_on_failure=false`.
 

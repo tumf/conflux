@@ -491,7 +491,25 @@ pub async fn handle_tui_command(
                                 .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
                                 .await
                             {
-                                warn!("on_merged hook failed for {}: {}", change_id, e);
+                                let message = format!(
+                                    "on_merged hook failed for '{}'; branch merged transition blocked: {}",
+                                    change_id, e
+                                );
+                                warn!("{}", message);
+                                let _ = merge_tx
+                                    .send(OrchestratorEvent::HookFailed {
+                                        change_id: change_id.clone(),
+                                        hook_type: crate::hooks::HookType::OnMerged.to_string(),
+                                        error: e.to_string(),
+                                    })
+                                    .await;
+                                let _ = merge_tx
+                                    .send(OrchestratorEvent::BranchMergeFailed {
+                                        branch_name: merge_branch.clone(),
+                                        error: message,
+                                    })
+                                    .await;
+                                return;
                             }
                         } else {
                             warn!(

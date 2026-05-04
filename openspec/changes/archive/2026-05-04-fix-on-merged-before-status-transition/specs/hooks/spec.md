@@ -36,7 +36,7 @@ When `hooks.on_merged` is configured with `continue_on_failure=false`, `on_merge
 **Then**: `MergeCompleted` is emitted only after hook completion
 **And**: `alpha` may transition to terminal `Merged`
 
-### Requirement: on_merged root repo lock diagnostics
+### Requirement: on_merged hook
 
 For repo-mutating `on_merged` commands, the hook runner SHALL provide repository-verifiable diagnostics around root `.git/index.lock` waiting and execution readiness.
 
