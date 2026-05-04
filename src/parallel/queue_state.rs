@@ -53,6 +53,7 @@ impl ParallelExecutor {
         if let Some(shared) = &self.shared_orchestrator_state {
             if let Ok(guard) = shared.try_read() {
                 self.resolve_wait_changes = guard.resolve_wait_change_ids().into_iter().collect();
+                self.reject_wait_changes = guard.reject_wait_change_ids().into_iter().collect();
             }
         }
     }
@@ -63,6 +64,15 @@ impl ParallelExecutor {
         if let Some(shared) = &self.shared_orchestrator_state {
             let mut guard = shared.write().await;
             guard.clear_resolve_wait_intent(change_id);
+        }
+    }
+
+    pub(super) async fn clear_reject_wait_intent_for_success(&mut self, change_id: &str) {
+        self.reject_wait_changes.remove(change_id);
+        self.last_dispatched_reject_wait_changes.remove(change_id);
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut guard = shared.write().await;
+            guard.clear_reject_wait_intent(change_id);
         }
     }
 
@@ -85,12 +95,13 @@ impl ParallelExecutor {
     }
 
     pub(super) fn should_dispatch_resolve_wait_retry(&self) -> bool {
-        if self.resolve_wait_changes.is_empty() {
+        if self.resolve_wait_changes.is_empty() && self.reject_wait_changes.is_empty() {
             return false;
         }
 
         self.resolve_wait_retry_triggered
             || self.last_dispatched_resolve_wait_changes != self.resolve_wait_changes
+            || self.last_dispatched_reject_wait_changes != self.reject_wait_changes
     }
 
     pub(super) async fn maybe_dispatch_resolve_wait_retry(&mut self) {
@@ -98,18 +109,20 @@ impl ParallelExecutor {
             return;
         }
 
-        self.retry_deferred_merges().await;
+        self.retry_deferred_base_lane_waiters().await;
         self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
+        self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
         self.resolve_wait_retry_triggered = false;
     }
 
     pub(crate) fn has_resolve_wait(&self) -> bool {
         if let Some(shared) = &self.shared_orchestrator_state {
             if let Ok(guard) = shared.try_read() {
-                return !guard.resolve_wait_change_ids().is_empty();
+                return !guard.resolve_wait_change_ids().is_empty()
+                    || !guard.reject_wait_change_ids().is_empty();
             }
         }
-        !self.resolve_wait_changes.is_empty()
+        !self.resolve_wait_changes.is_empty() || !self.reject_wait_changes.is_empty()
     }
 
     #[allow(dead_code)]
@@ -382,7 +395,7 @@ impl ParallelExecutor {
 
             // Rejection review failure releases the rejecting lane. If any archived rows are
             // waiting in ResolveWait due to that blocker, retry them immediately.
-            self.retry_deferred_merges().await;
+            self.retry_deferred_base_lane_waiters().await;
         } else if let Some(reason) = &workspace_result.rejected {
             info!(
                 "Change '{}' rejected after acceptance blocker: {}",
@@ -425,7 +438,7 @@ impl ParallelExecutor {
 
             // Rejection review completion (confirm) also releases the rejecting lane;
             // retry deferred merges so ResolveWait rows are not stranded.
-            self.retry_deferred_merges().await;
+            self.retry_deferred_base_lane_waiters().await;
         } else {
             info!(
                 "Change '{}' completed successfully",
@@ -492,7 +505,7 @@ impl ParallelExecutor {
                     "Background merge task completed successfully for '{}'",
                     merge_result.change_id
                 );
-                self.retry_deferred_merges().await;
+                self.retry_deferred_base_lane_waiters().await;
             }
             Err(error) => {
                 error!(
@@ -510,6 +523,43 @@ impl ParallelExecutor {
                 )
                 .await;
             }
+        }
+    }
+
+    /// Retry one pending base-mutating lane operation according to reducer-owned ordering.
+    pub(super) async fn retry_deferred_base_lane_waiters(&mut self) {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            self.retry_deferred_merges().await;
+            return;
+        };
+
+        let promoted = {
+            let mut guard = shared.write().await;
+            guard.promote_next_base_mutating_lane_waiter()
+        };
+
+        match promoted {
+            Some((change_id, crate::orchestration::state::WaitState::ResolveWait)) => {
+                self.resolve_wait_changes.insert(change_id.clone());
+                self.retry_deferred_merges_for(vec![change_id]).await;
+            }
+            Some((change_id, crate::orchestration::state::WaitState::RejectWait)) => {
+                self.reject_wait_changes.insert(change_id.clone());
+                self.retry_deferred_rejection_review_for(change_id).await;
+            }
+            Some((change_id, wait_state)) => {
+                warn!(
+                    "Ignoring unsupported base-mutating lane promotion for '{}' with wait state {:?}",
+                    change_id, wait_state
+                );
+            }
+            None => {}
+        }
+
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let guard = shared.read().await;
+            self.resolve_wait_changes = guard.resolve_wait_change_ids().into_iter().collect();
+            self.reject_wait_changes = guard.reject_wait_change_ids().into_iter().collect();
         }
     }
 
@@ -533,7 +583,10 @@ impl ParallelExecutor {
         }
 
         let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
+        self.retry_deferred_merges_for(deferred).await;
+    }
 
+    async fn retry_deferred_merges_for(&mut self, deferred: Vec<String>) {
         for change_id in deferred {
             if self.is_change_already_merged_to_base(&change_id).await {
                 info!(
@@ -699,6 +752,78 @@ impl ParallelExecutor {
                 }
             }
         }
+    }
+
+    async fn retry_deferred_rejection_review_for(&mut self, change_id: String) {
+        send_event(
+            &self.event_tx,
+            ParallelEvent::Log(LogEntry::info(format!(
+                "RejectWait retry dispatch started for '{}'",
+                change_id
+            ))),
+        )
+        .await;
+
+        let workspace_info = match self
+            .workspace_manager
+            .find_existing_workspace(&change_id)
+            .await
+        {
+            Ok(Some(ws)) => ws,
+            Ok(None) => {
+                warn!(
+                    "No workspace found for deferred rejection review '{}', clearing reject wait",
+                    change_id
+                );
+                self.clear_reject_wait_intent_for_success(&change_id).await;
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to find workspace for deferred rejection review '{}': {}",
+                    change_id, e
+                );
+                return;
+            }
+        };
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::WorkspaceStatusUpdated {
+                change_id: change_id.clone(),
+                workspace_name: workspace_info.workspace_name.clone(),
+                status: crate::vcs::WorkspaceStatus::Rejecting,
+            },
+        )
+        .await;
+        self.clear_reject_wait_intent_for_success(&change_id).await;
+    }
+
+    /// Retry rejection review for all RejectWait changes once the base-mutating lane is free.
+    #[allow(dead_code)]
+    pub(super) async fn retry_deferred_rejection_reviews(&mut self) {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            return;
+        };
+
+        let (lane_occupied, reject_wait_ids) = {
+            let guard = shared.read().await;
+            (
+                guard.is_base_mutating_lane_occupied(),
+                guard.reject_wait_change_ids(),
+            )
+        };
+        self.reject_wait_changes = reject_wait_ids.into_iter().collect();
+
+        if lane_occupied || self.reject_wait_changes.is_empty() {
+            return;
+        }
+
+        let Some(change_id) = self.reject_wait_changes.iter().min().cloned() else {
+            return;
+        };
+
+        self.retry_deferred_rejection_review_for(change_id).await;
     }
 
     /// Check dynamic queue for newly added changes and update queued list.
@@ -1142,9 +1267,36 @@ impl ParallelExecutor {
         );
 
         // Select changes to dispatch based on order and available slots
-        let selected_changes = self
+        let mut selected_changes = self
             .select_changes_for_dispatch(&analysis_result, available_slots)
             .await;
+
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut lane_deferred = Vec::new();
+            {
+                let mut guard = shared.write().await;
+                selected_changes.retain(|change_id| {
+                    if guard.has_other_post_archive_lane_blocker(change_id) {
+                        guard.mark_reject_wait(change_id);
+                        lane_deferred.push(change_id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+
+            for change_id in lane_deferred {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::info(format!(
+                        "Deferring '{}' because the base-mutating lane is occupied; status=reject pending",
+                        change_id
+                    ))),
+                )
+                .await;
+            }
+        }
 
         // Dispatch selected changes
         let new_iteration = if !selected_changes.is_empty() {

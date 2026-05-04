@@ -68,7 +68,7 @@ pub struct ChangeStatus {
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
     /// Aligned with canonical display taxonomy values: "not queued", "queued", "blocked", "stalled", "applying",
-    /// "accepting", "archiving", "archived", "merged", "rejected", "merge wait", "resolving", "resolve pending", "error"
+    /// "accepting", "archiving", "archived", "merged", "rejected", "merge wait", "resolving", "resolve pending", "reject pending", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     /// Current iteration number for apply/archive loops
@@ -170,7 +170,11 @@ impl OrchestratorStateSnapshot {
             .iter()
             .filter(|c| {
                 c.queue_status.as_ref().is_some_and(|s| {
-                    s == "applying" || s == "accepting" || s == "archiving" || s == "resolving"
+                    s == "applying"
+                        || s == "accepting"
+                        || s == "archiving"
+                        || s == "resolving"
+                        || s == "rejecting"
                 })
             })
             .count();
@@ -460,8 +464,10 @@ impl WebState {
 
         for new_change in &mut new_state.changes {
             if let Some(existing) = old_changes.iter().find(|c| c.id == new_change.id) {
-                // Preserve queue_status
-                new_change.queue_status = existing.queue_status.clone();
+                // Preserve queue_status only when shared reducer state did not provide one.
+                if new_change.queue_status.is_none() {
+                    new_change.queue_status = existing.queue_status.clone();
+                }
 
                 // Preserve iteration_number
                 new_change.iteration_number = existing.iteration_number;
@@ -1786,6 +1792,42 @@ mod tests {
         // "not queued" maps to None to keep payload minimal (no API shape change)
         assert_eq!(notqueued.queue_status, None);
         assert_eq!(archived.queue_status, Some("archived".to_string()));
+    }
+
+    #[test]
+    fn test_web_snapshot_exposes_reject_pending_from_reducer() {
+        use crate::orchestration::state::OrchestratorState;
+
+        let mut shared = OrchestratorState::with_mode(
+            vec!["lane-a".to_string(), "reject-b".to_string()],
+            0,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        );
+        let changes = vec![
+            create_test_change("lane-a", 0, 1),
+            create_test_change("reject-b", 0, 1),
+        ];
+
+        shared.apply_execution_event(&crate::events::ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "lane-a".to_string(),
+            workspace_name: "ws-a".to_string(),
+            status: crate::vcs::WorkspaceStatus::Resolving,
+        });
+        shared.apply_execution_event(&crate::events::ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "reject-b".to_string(),
+            workspace_name: "ws-b".to_string(),
+            status: crate::vcs::WorkspaceStatus::Rejecting,
+        });
+
+        let snapshot =
+            OrchestratorStateSnapshot::from_changes_with_shared_state(&changes, Some(&shared));
+        let reject = snapshot
+            .changes
+            .iter()
+            .find(|c| c.id == "reject-b")
+            .unwrap();
+
+        assert_eq!(reject.queue_status, Some("reject pending".to_string()));
     }
 
     #[tokio::test]

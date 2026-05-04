@@ -34,6 +34,7 @@ impl ParallelExecutor {
             && queued_empty
             && in_flight_empty
             && self.resolve_wait_changes.is_empty()
+            && self.reject_wait_changes.is_empty()
             && self.manual_resolve_active() == 0
             && self.pending_merge_count.load(Ordering::Relaxed) == 0
             && self.scheduler_lifetime == SchedulerLifetime::Finite
@@ -69,24 +70,25 @@ impl ParallelExecutor {
             + Sync,
     {
         if changes.is_empty() {
-            let (reducer_has_queued_intent, reducer_has_resolve_wait) = self
+            let (reducer_has_queued_intent, reducer_has_lane_wait) = self
                 .shared_orchestrator_state
                 .as_ref()
                 .and_then(|state| state.try_read().ok())
                 .map(|state| {
                     (
                         !state.queued_change_ids().is_empty(),
-                        !state.resolve_wait_change_ids().is_empty(),
+                        !state.resolve_wait_change_ids().is_empty()
+                            || !state.reject_wait_change_ids().is_empty(),
                     )
                 })
                 .unwrap_or((false, false));
-            if !reducer_has_queued_intent && !reducer_has_resolve_wait {
+            if !reducer_has_queued_intent && !reducer_has_lane_wait {
                 send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
                 return Ok(());
             }
-            if reducer_has_resolve_wait {
+            if reducer_has_lane_wait {
                 info!(
-                    "Starting scheduler loop with reducer-visible ResolveWait retry intent and empty local queue"
+                    "Starting scheduler loop with reducer-visible base-lane wait retry intent and empty local queue"
                 );
             } else {
                 info!(
@@ -187,6 +189,7 @@ impl ParallelExecutor {
             let work_drained = queued.is_empty()
                 && in_flight.is_empty()
                 && self.resolve_wait_changes.is_empty()
+                && self.reject_wait_changes.is_empty()
                 && self.manual_resolve_active() == 0
                 && self.pending_merge_count.load(Ordering::Relaxed) == 0;
             if work_drained && self.scheduler_lifetime == SchedulerLifetime::Finite {

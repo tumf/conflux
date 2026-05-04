@@ -101,6 +101,8 @@ pub struct ParallelExecutor {
     change_dependencies: HashMap<String, Vec<String>>,
     /// Changes waiting for auto-resumable resolve retry (ResolveWait)
     resolve_wait_changes: HashSet<String>,
+    /// Changes waiting for rejection review to run once the base-mutating lane is free (RejectWait)
+    reject_wait_changes: HashSet<String>,
     /// Changes waiting for manual user intervention before merge can continue (MergeWait)
     merge_wait_changes: HashSet<String>,
     /// Changes that previously had unresolved dependencies (for worktree recreation tracking)
@@ -146,6 +148,8 @@ pub struct ParallelExecutor {
     shared_orchestrator_state: Option<Arc<RwLock<OrchestratorState>>>,
     /// Last resolve-wait snapshot that was dispatched via scheduler retry.
     last_dispatched_resolve_wait_changes: HashSet<String>,
+    /// Last reject-wait snapshot that was dispatched via scheduler retry.
+    last_dispatched_reject_wait_changes: HashSet<String>,
     /// One-shot flag to allow retry dispatch on explicit wake/completion triggers.
     resolve_wait_retry_triggered: bool,
     /// Runtime-only observability dedupe for queue reconciliation diagnostics.
