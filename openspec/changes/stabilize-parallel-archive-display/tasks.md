@@ -23,3 +23,6 @@
 ## Future Work
 
 - If WebUI/server-mode monitoring separately shows stale post-archive display after the reducer/orchestrator fix, create a focused follow-up proposal for WebState display synchronization.
+
+## Acceptance #1 Failure Follow-up
+- [x] src/orchestration/state.rs:3038 の test_parallel_mode_change_archived_keeps_merge_wait_when_other_change_is_accepting が stale な期待値 "merge wait" のままで、openspec/changes/stabilize-parallel-archive-display/specs/orchestration-state/spec.md:45-53 の no-blocker path は resolving -> merged 要件と矛盾しています。`cargo test test_parallel_mode_change_archived_keeps_merge_wait_when_other_change_is_accepting --lib` は agent-exec job 50d6decc6c2d22787599046f5b2ebfc6 で exit_code 101 となり、src/orchestration/state.rs:3038 の assertion が left "resolving" right "merge wait" で失敗しました。テストを `test_parallel_mode_change_archived_enters_resolving_when_other_change_is_accepting` にリネーム/更新し、accepting は resolve pending を作らず archived row は no-blocker merge handling として resolving に入ることを検証しました。

@@ -3019,7 +3019,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_mode_change_archived_keeps_merge_wait_when_other_change_is_accepting() {
+    fn test_parallel_mode_change_archived_enters_resolving_when_other_change_is_accepting() {
         use crate::events::ExecutionEvent;
 
         let mut state = OrchestratorState::with_mode(
@@ -3037,8 +3037,8 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
         assert_eq!(
             state.display_status("archived"),
-            "merge wait",
-            "Parallel: accepting activity must not transition archived rows to resolve pending"
+            "resolving",
+            "Parallel: accepting activity is not a merge/resolve lane blocker, so no-blocker archive handling must enter resolving instead of merge wait or resolve pending"
         );
     }
 
