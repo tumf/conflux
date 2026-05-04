@@ -11,50 +11,63 @@ references:
   - src/orchestration/state.rs
 ---
 
-# Stabilize immediate post-archive merge dispatch
+# Normalize post-archive status transitions
 
 **Change Type**: implementation
 
 ## Problem / Context
 
-A parallel-mode change can oscillate between `archived` and `merge wait` after archive completion even when there is no preceding active `Resolving` or `Rejecting` change. The observed case was `add-owner-skills-page` in `~/wakumo/avacus/avacuscc-dbot`: it oscillated several times, then eventually reached `merged`.
+Post-archive status management in parallel mode is inconsistent. After a change archives, the UI/reducer/scheduler can temporarily or repeatedly show states that do not match the actual merge lane condition.
 
-The user correction is the key premise: when there is no prior resolving/rejecting lane blocker, entering `merge wait` is itself suspicious. `merge wait` should represent a real deferred merge condition or explicit manual retry state, not the default archive-complete state. In the no-blocker case, Conflux should attempt the merge path immediately and move to `merged` or to a justified `MergeDeferred` state only if the merge attempt actually cannot proceed.
+Observed symptoms from `add-owner-skills-page` in `~/wakumo/avacus/avacuscc-dbot`:
 
-This proposal tightens an already-existing canonical requirement, `post-archive-merge-dispatch`, rather than changing merge policy. It does not introduce durable out-of-worktree workflow state and remains compliant with `openspec/CONSTITUTION.md`: workspace and git facts stay authoritative, while UI/log state remains observational.
+- `merged <> archived` vibrates for a while, then eventually settles on `merged`, even though there is no visible `resolving` phase.
+- `merge wait` appears even though there is no preceding active resolving/merge blocker, then eventually settles on `merged`.
+
+Expected post-archive state rules are:
+
+- If another merge/resolve lane is already in progress, the archived change should become `resolve pending`.
+- If merge cannot proceed because the relevant workspace/base state is dirty or otherwise manually blocked, the archived change should become `merge wait` with a concrete deferral reason.
+- Otherwise, the archived change should transition into `resolving` while merge handling runs, then become `merged` when merge completes.
+
+The current behavior makes `archived` and `merge wait` look like ordinary intermediate states even when they are not justified by repository/workspace facts. That violates truthful lifecycle display: users cannot tell whether Conflux is waiting for another merge, waiting for manual cleanup, actively merging, or already done.
+
+This proposal tightens the existing `post-archive-merge-dispatch` requirement and adds explicit no-vibration status invariants. It does not introduce durable out-of-worktree workflow state and remains compliant with `openspec/CONSTITUTION.md`: workspace and git facts stay authoritative, while UI/log state remains observational.
 
 ## Proposed Solution
 
-Make the post-archive path in parallel mode distinguish three cases explicitly:
+Define and implement a single reducer-owned post-archive state decision table for parallel mode:
 
-1. **Active resolving/rejecting blocker exists**: record auto-resumable deferral (`resolve pending`) so scheduler retry can run when the blocker clears.
-2. **No active resolving/rejecting blocker exists**: dispatch the immediate merge attempt for the archived workspace instead of settling into `merge wait`.
-3. **Immediate merge attempt is actually deferred**: record `merge wait` only when `attempt_merge()` returns a manual non-auto-resumable deferral such as dirty base workspace, incomplete archive verification, or another concrete manual blocker.
+1. **Merge/resolve lane occupied**: set `ResolveWait` / `resolve pending`. This covers another active merge/resolve operation that prevents immediate merge handling for the newly archived change.
+2. **Manual merge blocker exists**: set `MergeWait` / `merge wait` only after merge handling detects a concrete non-auto-resumable blocker such as dirty base workspace, dirty archive workspace, incomplete archive verification, or missing archive evidence.
+3. **No blocker exists**: transition to `Resolving` / `resolving`, run merge handling immediately, then transition to `Merged` / `merged` on completion.
 
-The TUI may briefly observe archive completion as an event, but it must not persist `merge wait` merely because archive completed. `merge wait` must be traceable to `MergeDeferred(auto_resumable=false)` or explicit user retry state, not to ordinary no-blocker archive completion.
+The implementation should make `archived` terminal only for serial mode. In parallel mode, `archived` is a repository milestone, not a stable visible lifecycle state after post-archive routing begins.
 
 ## Acceptance Criteria
 
-- When a parallel change archives and no other change is actively `Resolving` or `Rejecting`, Conflux attempts the immediate merge path without first waiting for user `M` or normal queue reconciliation.
-- In that no-blocker path, reducer/TUI state must not settle on `merge wait` unless a concrete `MergeDeferred(auto_resumable=false)` event is emitted by the merge attempt.
-- If another change is actively `Resolving` or `Rejecting`, archive completion may enter `resolve pending` and scheduler-owned retry remains valid.
-- Manual merge blockers such as dirty base workspace still enter `merge wait`, clear normal queue intent, and require explicit retry.
-- A final `MergeCompleted` or `ResolveCompleted` state remains `merged` and later refreshes do not regress it.
-- Regression tests cover the no-blocker archived path so the old `archived <> merge wait` vibration cannot return unnoticed.
+- After parallel archive completion, exactly one of the expected paths is selected from current reducer/workspace/git facts: `resolve pending`, `merge wait`, or `resolving -> merged`.
+- `resolve pending` is used only when another merge/resolve lane is in progress and the archived change is eligible for automatic retry.
+- `merge wait` is used only when merge handling has attempted or verified enough context to find a concrete manual blocker.
+- In the normal no-blocker path, the visible state transitions to `resolving` while merge handling runs and then to `merged` when merge completes.
+- `merged` is terminal for display purposes: later `ChangeArchived`, `ChangesRefreshed`, workspace observations, or cleanup events must not regress it to `archived`, `merge wait`, or `resolve pending`.
+- `archived <> merged` and `merge wait -> merged` vibration without a preceding justified `resolving`, `resolve pending`, or manual deferral is forbidden by regression tests.
+- Serial mode still displays `archived` for archive-terminal changes.
 
 ## Explicit Completion Conditions
 
-- The no-blocker post-archive path invokes the same immediate merge handling used for archived workspaces, or an equivalent single-change merge path, without requiring a separate user action.
-- `src/tui/orchestrator.rs`, `src/parallel/merge.rs`, or equivalent orchestration code no longer leaves a no-blocker archived change in `MergeWait` as a stable state before attempting merge.
-- Reducer/TUI tests prove no-blocker archive completion does not produce persistent `merge wait` unless a manual `MergeDeferred(false)` event is processed.
-- Existing tests for auto-resumable blocker behavior and manual dirty-base deferral continue to pass.
+- `src/orchestration/state.rs` or equivalent reducer state code encodes the post-archive decision table without treating parallel `archived` as a stable terminal display.
+- `src/tui/orchestrator.rs`, `src/parallel/merge.rs`, or equivalent orchestration code emits/apply events so the no-blocker path visibly enters `resolving` before `merged`.
+- Manual deferral paths still emit `MergeDeferred(auto_resumable=false)` with enough reason text to explain `merge wait`.
+- Auto-resumable blocked paths still emit a state that explains `resolve pending`.
+- Tests cover all three post-archive paths and both reported vibration regressions.
 - Targeted Rust tests pass for post-archive dispatch, merge deferral, reducer state, and TUI display behavior.
-- `cflx openspec validate stabilize-parallel-archive-display --strict --evidence warn` passes without unresolved evidence warnings for behavior-changing tasks.
+- `cflx openspec validate stabilize-parallel-archive-display --strict --evidence warn` passes. Any remaining evidence warning must be explicitly justified in implementation notes.
 
 ## Out of Scope
 
-- Changing conflict resolution mechanics inside `merge_and_resolve()`.
+- Changing conflict resolution mechanics inside `merge_and_resolve()` beyond lifecycle event/status emission needed for truthful display.
 - Treating dirty base workspace as auto-resumable.
 - Auto-stashing, auto-committing, or otherwise mutating a dirty base workspace.
 - Adding durable workflow state outside the worktree.
-- Reworking unrelated WebUI/server-mode display unless implementation inspection proves it shares this exact post-archive dispatch bug.
+- Reworking unrelated WebUI/server-mode display unless implementation inspection proves it shares this exact post-archive state bug.
