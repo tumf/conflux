@@ -65,9 +65,11 @@ acceptance output rather than working around it here.
    - Confirm specs updated
    ```bash
    cflx openspec validate --strict
-   cflx openspec validate <id> --strict --evidence warn
+   cflx openspec validate <id> --archive-gate
    ```
-   - Use only native evidence enum values (`off`, `warn`, `error`) when evidence validation is requested.
+   - `--archive-gate` is the archive-equivalent local readiness check; it runs strict validation with evidence findings treated as errors.
+   - Use only native evidence enum values (`off`, `warn`, `error`) when evidence validation is requested directly.
+   - If archive output names a self-referential final validation checkbox, move that validation text into a non-checkbox `## Final Validation` section and rerun `cflx openspec validate <id> --archive-gate`.
    - **Review canonical spec diff** -- run `git diff openspec/specs/` and verify each touched `openspec/specs/**` file shows the expected requirement changes. Do not rely solely on `Specs updated: [...]` output.
 
 ## Archive Completion Criteria
@@ -93,6 +95,9 @@ cflx openspec show <id>
 
 # Validate change
 cflx openspec validate <id> --strict
+
+# Reproduce archive readiness locally
+cflx openspec validate <id> --archive-gate
 
 # Validate all
 cflx openspec validate --strict
