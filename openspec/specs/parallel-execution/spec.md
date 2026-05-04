@@ -1726,15 +1726,38 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 ### Requirement: Parallel rejecting resume semantics
 
-Parallel execution SHALL restore a non-terminal workspace containing `openspec/changes/<change_id>/REJECTED.md` into `rejecting` on resume instead of `accepting` or `applying`.
+Parallel execution SHALL route rejection-review handoff through the same single base-mutating lane used by merge/resolve operations. A change that needs rejection review may enter active `Rejecting` only when no other non-terminal change is actively `Resolving` or `Rejecting`.
 
-#### Scenario: resumed rejection proposal re-enters rejecting
+If the base-mutating lane is occupied, the rejection-review handoff SHALL become reducer-owned `RejectWait` and display `reject pending`. This wait is auto-resumable and MUST NOT require manual user action.
 
-- **GIVEN** parallel execution resumes a workspace that has not completed archive
-- **AND** the workspace contains `openspec/changes/fix-auth/REJECTED.md`
-- **WHEN** the orchestrator determines the next non-terminal step
-- **THEN** the next step is `rejecting`
-- **AND** the workspace does not run the normal acceptance loop before rejection review
+#### Scenario: rejecting handoff waits behind resolving
+
+**Given**: Change A is actively `Resolving`
+**And**: Change B apply execution records `openspec/changes/<change_id>/REJECTED.md`
+**When**: parallel dispatch handles B's rejecting handoff
+**Then**: B does not start rejection review immediately
+**And**: B enters `RejectWait`
+**And**: B displays `reject pending`
+**And**: B is retried automatically after A clears the base-mutating lane
+
+#### Scenario: rejecting handoff waits behind rejecting
+
+**Given**: Change A is actively `Rejecting`
+**And**: Change B apply execution records `openspec/changes/<change_id>/REJECTED.md`
+**When**: parallel dispatch handles B's rejecting handoff
+**Then**: B does not start rejection review immediately
+**And**: B enters `RejectWait`
+**And**: B displays `reject pending`
+**And**: B is retried automatically after A's rejection review completes or fails
+
+#### Scenario: rejecting handoff starts when lane is clear
+
+**Given**: no non-terminal change is actively `Resolving` or `Rejecting`
+**And**: Change B apply execution records `openspec/changes/<change_id>/REJECTED.md`
+**When**: parallel dispatch handles B's rejecting handoff
+**Then**: B enters active `Rejecting`
+**And**: B displays `rejecting`
+**And**: no other change is active in the base-mutating lane
 
 ### Requirement: Parallel execution acceptance loop
 
@@ -1961,9 +1984,9 @@ Out-of-worktree durable state (for example under `~/.local/state/cflx/**`) MUST 
 
 When a change is archived in parallel mode, the orchestrator must attempt to merge or defer the change according to structured blocker classification rather than leaving auto-resumable and manual-wait cases ambiguous.
 
-A deferred merge caused by another active non-terminal change in `Resolving` or `Rejecting` SHALL advance into reducer-owned auto-resumable handling (`ResolveWait` or immediate resolving when promoted).
+A deferred merge caused by another active non-terminal change in `Resolving` or `Rejecting` SHALL advance into reducer-owned auto-resumable merge/resolve handling (`ResolveWait` or immediate resolving when promoted). Active `Rejecting` is included because rejection review can touch and dirty base state.
 
-A deferred merge caused by active `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, dirty base, or other manual intervention requirement SHALL NOT be classified as automatic `ResolveWait` solely because that state exists. Dirty base and manual intervention deferrals SHALL remain in manual merge wait handling (`MergeWait`).
+A deferred merge caused by active `Applying`, `Accepting`, `Archiving`, terminal `Rejected`, dirty base without an active base-mutating lane occupant, or other manual intervention requirement SHALL NOT be classified as automatic `ResolveWait` solely because that state exists. Dirty base and manual intervention deferrals SHALL remain in manual merge wait handling (`MergeWait`).
 
 The implementation MUST NOT infer auto-resumable versus manual-wait behavior by parsing a human-readable deferred reason string.
 
@@ -1982,20 +2005,6 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 **When**: the deferred merge result is processed
 **Then**: the archived change enters auto-resumable deferred handling (`ResolveWait` or equivalent queued resolve intent)
 **And**: rejection review completion or failure triggers retry of deferred merge work
-
-#### Scenario: active applying deferred archive does not promote to resolve wait
-
-**Given**: a change is archived in parallel mode
-**And**: another change is actively `Applying`
-**When**: post-archive merge handling is evaluated
-**Then**: the archived change is not classified as auto-resumable `ResolveWait` because of that applying change
-
-#### Scenario: active accepting deferred archive does not promote to resolve wait
-
-**Given**: a change is archived in parallel mode
-**And**: another change is actively `Accepting`
-**When**: post-archive merge handling is evaluated
-**Then**: the archived change is not classified as auto-resumable `ResolveWait` because of that accepting change
 
 #### Scenario: dirty-base deferred archive stays merge wait
 
