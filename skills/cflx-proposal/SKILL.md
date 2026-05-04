@@ -475,6 +475,18 @@ cflx openspec validate <id> --strict --evidence error
 cflx openspec validate <id> --strict --evidence warn
 # Resolve warnings about missing ownership, artifact-heavy tasks,
 # absent runnable verification, or executable surfaces lacking run checks
+
+# Archive-equivalent readiness check for final validation sections
+cflx openspec validate <id> --archive-gate
+```
+
+Final validation guidance must be written outside checkbox task lists, for example:
+
+```markdown
+## Final Validation
+
+Archive validation itself is the authoritative final OpenSpec validation gate.
+Expected archive gate: `cflx openspec validate <id> --archive-gate`
 ```
 
 ## Best Practices
@@ -499,6 +511,7 @@ cflx openspec validate <id> --strict --evidence warn
 - Specify verification for each task
 - Make implementation-facing tasks hard to mark complete without source/test evidence
 - Ensure tasks guidance keeps ownership traceable by pairing each implementation task with its verification path
+- Do not create final OpenSpec validation as a checkbox implementation task. Final validation belongs in a non-checkbox `## Final Validation` section because archive validation is the authoritative gate.
 - Check for proposal completeness by asking: "If Conflux executed these tasks in its own chosen order, would the full user request still be satisfied without any hidden assumptions?"
 
 ### User Experience

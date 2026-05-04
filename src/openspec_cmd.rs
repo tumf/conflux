@@ -1180,6 +1180,35 @@ fn has_verification_ownership_marker(verification_text: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
+fn is_self_referential_final_validation_task(task_text: &str, change_id: &str) -> bool {
+    let normalized = task_text.to_lowercase();
+    let change_id = change_id.to_lowercase();
+
+    let mentions_same_change_validation = normalized.contains("cflx openspec validate")
+        && normalized.contains(&change_id)
+        && (normalized.contains("--strict")
+            || normalized.contains("--evidence")
+            || normalized.contains("final")
+            || normalized.contains("archive"));
+
+    let asks_for_final_validation = normalized.contains("final openspec validation")
+        || normalized.contains("final validation")
+        || normalized.contains("archive validation")
+        || normalized.contains("archive gate")
+        || normalized.contains("archive readiness");
+
+    mentions_same_change_validation && asks_for_final_validation
+}
+
+fn self_referential_final_validation_message(change_id: &str, line_num: usize) -> String {
+    format!(
+        "{}: tasks.md:{}: self-referential final OpenSpec validation checkbox detected. \
+         Final OpenSpec validation must not be a checkbox task; move final validation to a \
+         non-checkbox `## Final Validation` section because archive validation is the authoritative gate.",
+        change_id, line_num
+    )
+}
+
 fn validate_tasks_content(
     content: &str,
     change_id: &str,
@@ -1247,7 +1276,12 @@ fn validate_tasks_content(
                     .or(continuation_verification)
                     .filter(|v| !v.is_empty());
 
-                if strict && evidence_mode != "off" && is_behavior_change {
+                if strict && is_self_referential_final_validation_task(task_text, change_id) {
+                    errors.push(self_referential_final_validation_message(
+                        change_id, line_num,
+                    ));
+                    pending_behavior_task_without_verification = None;
+                } else if strict && evidence_mode != "off" && is_behavior_change {
                     if let Some(vtext) = verification_text {
                         if !has_repository_evidence_hint(&vtext) {
                             let msg = format!(
@@ -1865,6 +1899,23 @@ mod validation_tests {
     }
 
     #[test]
+    fn test_cflx_proposal_skill_final_validation_uses_non_checkbox_section() {
+        let skill = include_str!("../skills/cflx-proposal/SKILL.md");
+        let final_validation_pos = skill
+            .find("## Final Validation")
+            .expect("cflx-proposal skill should document a Final Validation section");
+        let before_final_validation = &skill[..final_validation_pos];
+
+        assert!(skill.contains("cflx openspec validate <id> --archive-gate"));
+        assert!(skill.contains("Do not create final OpenSpec validation as a checkbox"));
+        assert!(
+            !before_final_validation.contains("- [ ] Final OpenSpec validation")
+                && !before_final_validation.contains("- [ ] Record final OpenSpec validation"),
+            "final OpenSpec validation guidance must not be modeled as a checkbox task"
+        );
+    }
+
+    #[test]
     fn test_validate_tasks_with_weak_verification() {
         let content = "- [ ] Add a new feature (verification: manual review)\n";
         let (errors, warnings) =
@@ -1872,6 +1923,62 @@ mod validation_tests {
         assert!(errors.is_empty());
         // "manual review" lacks repository-verifiable hints
         assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn test_rejects_self_referential_final_validation_checkbox() {
+        let content = "- [ ] Record final OpenSpec validation before archive (verification: manual - run `cflx openspec validate alpha --strict --evidence warn`)\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(warnings.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("self-referential final OpenSpec validation checkbox"));
+        assert!(errors[0].contains("non-checkbox `## Final Validation` section"));
+    }
+
+    #[test]
+    fn test_allows_non_checkbox_final_validation_section() {
+        let content = "## Implementation Tasks\n- [ ] Implement feature (verification: unit - cargo test openspec_cmd --lib)\n\n## Final Validation\n\nExpected archive gate: `cflx openspec validate alpha --strict --evidence warn` exits 0.\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_preserves_ordinary_repository_evidence() {
+        let content = "- [ ] Rust verification (verification: unit - cargo test openspec_cmd --lib)\n- [ ] Frontend verification (verification: integration - npm run test)\n- [ ] Go verification (verification: integration - go test ./...)\n- [ ] Path verification (verification: unit - src/openspec_cmd.rs and tests/fixtures cover this)\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(
+            errors.is_empty(),
+            "ordinary evidence should pass: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "ordinary evidence should not warn: {warnings:?}"
+        );
     }
 
     #[test]

@@ -954,14 +954,19 @@ async fn main() -> Result<()> {
                     }
                 }
                 OpenspecCommands::Validate(val_args) => {
-                    let evidence = match val_args.evidence {
-                        EvidenceMode::Off => "off",
-                        EvidenceMode::Warn => "warn",
-                        EvidenceMode::Error => "error",
+                    let strict = val_args.strict || val_args.archive_gate;
+                    let evidence = if val_args.archive_gate {
+                        "error"
+                    } else {
+                        match val_args.evidence {
+                            EvidenceMode::Off => "off",
+                            EvidenceMode::Warn => "warn",
+                            EvidenceMode::Error => "error",
+                        }
                     };
                     let (is_valid, exit_code) = crate::openspec_cmd::cmd_validate(
                         val_args.change_id.as_deref(),
-                        val_args.strict,
+                        strict,
                         evidence,
                     );
                     if !is_valid {

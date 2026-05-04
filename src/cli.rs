@@ -588,6 +588,9 @@ pub enum OpenspecCommands {
     Show(OpenspecShowArgs),
 
     /// Validate change structure and spec deltas
+    ///
+    /// Use `--archive-gate` to run the local archive-readiness equivalent
+    /// (`--strict --evidence error`) so evidence findings fail before archive.
     Validate(OpenspecValidateArgs),
 
     /// Archive a deployed change and promote spec deltas
@@ -638,6 +641,10 @@ pub struct OpenspecValidateArgs {
     /// Enable strict validation mode
     #[arg(long)]
     pub strict: bool,
+
+    /// Run archive-readiness validation locally (`--strict --evidence error`)
+    #[arg(long)]
+    pub archive_gate: bool,
 
     /// How to treat missing implementation evidence in tasks.md
     #[arg(long, value_enum, default_value_t = EvidenceMode::Off)]
@@ -1538,6 +1545,7 @@ mod tests {
                 super::OpenspecCommands::Validate(val_args) => {
                     assert!(val_args.change_id.is_none());
                     assert!(!val_args.strict);
+                    assert!(!val_args.archive_gate);
                     assert!(matches!(val_args.evidence, super::EvidenceMode::Off));
                 }
                 _ => panic!("Expected Validate subcommand"),
@@ -1589,6 +1597,27 @@ mod tests {
         let parsed = Cli::try_parse_from(["cflx", "openspec", "validate", "--evidence", "strict"]);
 
         assert!(parsed.is_err(), "strict evidence mode should be rejected");
+    }
+
+    #[test]
+    fn test_openspec_validate_archive_gate_flag() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "openspec",
+            "validate",
+            "my-change",
+            "--archive-gate",
+        ]);
+        match cli.command {
+            Some(Commands::Openspec(args)) => match args.command {
+                super::OpenspecCommands::Validate(val_args) => {
+                    assert_eq!(val_args.change_id, Some("my-change".to_string()));
+                    assert!(val_args.archive_gate);
+                }
+                _ => panic!("Expected Validate subcommand"),
+            },
+            _ => panic!("Expected Openspec subcommand"),
+        }
     }
 
     #[test]

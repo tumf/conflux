@@ -695,25 +695,42 @@ pub fn build_archive_error_message(
     workspace_path: Option<&Path>,
     runtime_blocker: Option<&str>,
 ) -> String {
+    let archive_gate_command = format!("cflx openspec validate {} --archive-gate", change_id);
+    let self_reference_hint = runtime_blocker
+        .filter(|blocker| {
+            blocker.to_ascii_lowercase().contains("self-referential final openspec validation")
+        })
+        .map(|_| {
+            " Self-referential final validation checkbox detected: move final OpenSpec validation into a non-checkbox `## Final Validation` section."
+        })
+        .unwrap_or("");
     let root_cause = runtime_blocker
         .map(|b| format!(" Root cause from archive attempt: {}.", b))
         .unwrap_or_default();
+    let archive_gate_hint = format!(
+        " Reproduce archive readiness locally with `{}`.",
+        archive_gate_command
+    );
 
     match workspace_path {
         Some(path) => format!(
-            "Archive command did not complete for change '{}' in workspace '{}'. \
-             The change directory still exists in openspec/changes/ after archive verification.{} \
-             Treat this as an archive failure with preserved root cause instead of a generic verification-only failure.",
+             "Archive command did not complete for change '{}' in workspace '{}'. \
+              The change directory still exists in openspec/changes/ after archive verification.{}{}{} \
+              Treat this as an archive failure with preserved root cause instead of a generic verification-only failure.",
             change_id,
             path.display(),
-            root_cause
+            root_cause,
+            self_reference_hint,
+            archive_gate_hint
         ),
         None => format!(
             "Archive command did not complete for change '{}'. \
-             The change directory still exists in openspec/changes/ after archive verification.{} \
+             The change directory still exists in openspec/changes/ after archive verification.{}{}{} \
              Treat this as an archive failure with preserved root cause instead of a generic verification-only failure.",
             change_id,
-            root_cause
+            root_cause,
+            self_reference_hint,
+            archive_gate_hint
         ),
     }
 }
@@ -1447,6 +1464,20 @@ fi\n";
             Some("validation failed: canonical promotion check"),
         );
         assert!(with_blocker.contains("Root cause from archive attempt"));
+        assert!(with_blocker.contains("cflx openspec validate add-feature --archive-gate"));
+    }
+
+    #[test]
+    fn test_build_archive_error_message_names_self_referential_validation_task() {
+        let msg = build_archive_error_message(
+            "alpha",
+            None,
+            Some("alpha: tasks.md:4: self-referential final OpenSpec validation checkbox detected"),
+        );
+
+        assert!(msg.contains("cflx openspec validate alpha --archive-gate"));
+        assert!(msg.contains("Self-referential final validation checkbox detected"));
+        assert!(msg.contains("non-checkbox `## Final Validation` section"));
     }
 
     // ===========================
