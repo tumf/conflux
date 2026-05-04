@@ -2058,7 +2058,7 @@ fn selective_dependency_analysis_result<'a>(
     })
 }
 
-#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+#[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_change_rejected() {
     use crate::events::ExecutionEvent;
@@ -3877,6 +3877,76 @@ async fn test_scheduler_emits_no_analysis_diagnostic_when_slots_unavailable() {
         diagnostic_count, 1,
         "scheduler loop should emit no_available_slots diagnostic once while queued intent remains unchanged"
     );
+}
+
+#[tokio::test]
+async fn test_scheduler_keeps_normal_apply_candidates_separate_from_reject_wait() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock, Semaphore};
+    use tokio::task::JoinSet;
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(PathBuf::from("."), config, Some(tx));
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["normal-apply".to_string(), "lane-owner".to_string()],
+        2,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&crate::events::ExecutionEvent::WorkspaceStatusUpdated {
+            change_id: "lane-owner".to_string(),
+            workspace_name: "lane-owner".to_string(),
+            status: WorkspaceStatus::Resolving,
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard =
+        crate::parallel::cleanup::WorkspaceCleanupGuard::new(VcsBackend::Git, PathBuf::from("."));
+    let mut queued = vec![make_test_change("normal-apply")];
+    let mut in_flight = HashSet::new();
+
+    let (_should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            1,
+            ReanalysisReason::QueueNotification,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    assert_eq!(iteration, 2, "ordinary apply dispatch should still advance");
+    assert_eq!(
+        queued.len(),
+        0,
+        "ordinary apply candidate should be dispatched"
+    );
+    assert_eq!(
+        in_flight.len(),
+        1,
+        "normal apply should enter in-flight set"
+    );
+    let guard = shared.read().await;
+    assert!(
+        guard.reject_wait_change_ids().is_empty(),
+        "normal queued apply candidates must not become reject pending"
+    );
+
+    while join_set.join_next().await.is_some() {}
 }
 
 #[tokio::test]

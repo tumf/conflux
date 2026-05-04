@@ -1191,6 +1191,7 @@ impl Orchestrator {
         let repo_root = std::env::current_dir()?;
         let mut service = ParallelRunService::new(repo_root.clone(), self.config.clone());
         service.set_no_resume(self.no_resume);
+        service.set_shared_orchestrator_state(self.shared_state.clone());
 
         // Check if Git is available for true parallel execution
         service.check_vcs_available().await?;

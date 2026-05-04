@@ -1267,36 +1267,16 @@ impl ParallelExecutor {
         );
 
         // Select changes to dispatch based on order and available slots
-        let mut selected_changes = self
+        let selected_changes = self
             .select_changes_for_dispatch(&analysis_result, available_slots)
             .await;
 
-        if let Some(shared) = &self.shared_orchestrator_state {
-            let mut lane_deferred = Vec::new();
-            {
-                let mut guard = shared.write().await;
-                selected_changes.retain(|change_id| {
-                    if guard.has_other_post_archive_lane_blocker(change_id) {
-                        guard.mark_reject_wait(change_id);
-                        lane_deferred.push(change_id.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-
-            for change_id in lane_deferred {
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Log(LogEntry::info(format!(
-                        "Deferring '{}' because the base-mutating lane is occupied; status=reject pending",
-                        change_id
-                    ))),
-                )
-                .await;
-            }
-        }
+        // Ordinary apply candidates must not be converted into RejectWait simply
+        // because another change occupies the base-mutating lane. RejectWait is
+        // only valid after a repository-visible rejection-review handoff
+        // (`REJECTED.md` or rejecting resume), where dispatch.rs marks that intent.
+        // Slot accounting still prevents normal apply dispatch when no execution
+        // capacity is available.
 
         // Dispatch selected changes
         let new_iteration = if !selected_changes.is_empty() {
