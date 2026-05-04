@@ -378,36 +378,25 @@ parallel mode での hook 実行時、`HookContext` には workspace 固有の�
 
 ### Requirement: on_merged hook
 
-The orchestrator SHALL run `on_merged` after a change is successfully merged into the base branch and before the change transitions to terminal `Merged` status.
+For repo-mutating `on_merged` commands, the hook runner SHALL provide repository-verifiable diagnostics around root `.git/index.lock` waiting and execution readiness.
 
-`on_merged` SHALL run only once for a successful merge of a given change, including immediate parallel merge success, deferred merge retry success, manual TUI resolve success, and conflictless merge-ready retry paths.
+At minimum, the logs SHALL make it observable whether root `.git/index.lock` was already present before hook execution, whether it was released during the configured wait window, or whether execution proceeded after timeout.
 
-A stale retry or repeated scheduler trigger for a change already integrated into the base branch SHALL NOT execute `on_merged` again.
+These diagnostics are observational only and MUST NOT introduce hidden out-of-worktree durable workflow-control state.
 
-#### Scenario: deferred merge retry invokes on_merged once
+#### Scenario: pre-existing root lock is logged before hook execution
 
-**Given**: `hooks.on_merged` is configured
-**And**: change `alpha` is in `ResolveWait` for a deferred merge retry
-**When**: the scheduler retries the merge and repository-visible merge integration succeeds
-**Then**: `on_merged` is executed once with `{change_id}=alpha`
-**And**: `MergeCompleted` is emitted only after the hook execution attempt completes
+**Given**: root `.git/index.lock` exists before `on_merged` starts
+**When**: the hook runner prepares `on_merged`
+**Then**: the logs indicate that root lock waiting began
+**And**: the logs later indicate whether the lock was released or the wait timed out
 
-#### Scenario: stale retry does not duplicate on_merged
+#### Scenario: timeout does not hide unsafe execution context
 
-**Given**: change `alpha` has already been integrated into the base branch
-**And**: a stale retry trigger or stale resolve-wait entry for `alpha` is observed
-**When**: the scheduler evaluates deferred merge retries
-**Then**: it clears the stale retry intent for `alpha`
-**And**: it does not execute `on_merged` for `alpha` again
-**And**: it does not start AI conflict resolution for `alpha`
-
-#### Scenario: repeated retry trigger after success is idempotent
-
-**Given**: change `alpha` completed deferred merge retry successfully
-**And**: `on_merged` already ran for that successful merge
-**When**: a later scheduler loop synchronizes retry state and receives another retry dispatch trigger
-**Then**: `alpha` is not re-added as retryable work
-**And**: no second `on_merged` execution is emitted for `alpha`
+**Given**: root `.git/index.lock` remains present until `index_lock_wait_secs` expires
+**When**: the hook runner proceeds to execute `on_merged`
+**Then**: the logs explicitly indicate that execution continued after lock wait timeout
+**And**: a later hook failure can be correlated with the unsafe root lock condition from repository-verifiable logs
 
 ### Requirement: CLI Hook Output Visibility
 
@@ -513,36 +502,25 @@ The detailed object form SHALL support the following fields:
 
 ### Requirement: on_merged hook
 
-The orchestrator SHALL run `on_merged` after a change is successfully merged into the base branch and before the change transitions to terminal `Merged` status.
+For repo-mutating `on_merged` commands, the hook runner SHALL provide repository-verifiable diagnostics around root `.git/index.lock` waiting and execution readiness.
 
-`on_merged` SHALL run only once for a successful merge of a given change, including immediate parallel merge success, deferred merge retry success, manual TUI resolve success, and conflictless merge-ready retry paths.
+At minimum, the logs SHALL make it observable whether root `.git/index.lock` was already present before hook execution, whether it was released during the configured wait window, or whether execution proceeded after timeout.
 
-A stale retry or repeated scheduler trigger for a change already integrated into the base branch SHALL NOT execute `on_merged` again.
+These diagnostics are observational only and MUST NOT introduce hidden out-of-worktree durable workflow-control state.
 
-#### Scenario: deferred merge retry invokes on_merged once
+#### Scenario: pre-existing root lock is logged before hook execution
 
-**Given**: `hooks.on_merged` is configured
-**And**: change `alpha` is in `ResolveWait` for a deferred merge retry
-**When**: the scheduler retries the merge and repository-visible merge integration succeeds
-**Then**: `on_merged` is executed once with `{change_id}=alpha`
-**And**: `MergeCompleted` is emitted only after the hook execution attempt completes
+**Given**: root `.git/index.lock` exists before `on_merged` starts
+**When**: the hook runner prepares `on_merged`
+**Then**: the logs indicate that root lock waiting began
+**And**: the logs later indicate whether the lock was released or the wait timed out
 
-#### Scenario: stale retry does not duplicate on_merged
+#### Scenario: timeout does not hide unsafe execution context
 
-**Given**: change `alpha` has already been integrated into the base branch
-**And**: a stale retry trigger or stale resolve-wait entry for `alpha` is observed
-**When**: the scheduler evaluates deferred merge retries
-**Then**: it clears the stale retry intent for `alpha`
-**And**: it does not execute `on_merged` for `alpha` again
-**And**: it does not start AI conflict resolution for `alpha`
-
-#### Scenario: repeated retry trigger after success is idempotent
-
-**Given**: change `alpha` completed deferred merge retry successfully
-**And**: `on_merged` already ran for that successful merge
-**When**: a later scheduler loop synchronizes retry state and receives another retry dispatch trigger
-**Then**: `alpha` is not re-added as retryable work
-**And**: no second `on_merged` execution is emitted for `alpha`
+**Given**: root `.git/index.lock` remains present until `index_lock_wait_secs` expires
+**When**: the hook runner proceeds to execute `on_merged`
+**Then**: the logs explicitly indicate that execution continued after lock wait timeout
+**And**: a later hook failure can be correlated with the unsafe root lock condition from repository-verifiable logs
 
 ### Requirement: Hook execution working directory
 
@@ -566,33 +544,22 @@ A stale retry or repeated scheduler trigger for a change already integrated into
 
 ### Requirement: on_merged hook
 
-The orchestrator SHALL run `on_merged` after a change is successfully merged into the base branch and before the change transitions to terminal `Merged` status.
+For repo-mutating `on_merged` commands, the hook runner SHALL provide repository-verifiable diagnostics around root `.git/index.lock` waiting and execution readiness.
 
-`on_merged` SHALL run only once for a successful merge of a given change, including immediate parallel merge success, deferred merge retry success, manual TUI resolve success, and conflictless merge-ready retry paths.
+At minimum, the logs SHALL make it observable whether root `.git/index.lock` was already present before hook execution, whether it was released during the configured wait window, or whether execution proceeded after timeout.
 
-A stale retry or repeated scheduler trigger for a change already integrated into the base branch SHALL NOT execute `on_merged` again.
+These diagnostics are observational only and MUST NOT introduce hidden out-of-worktree durable workflow-control state.
 
-#### Scenario: deferred merge retry invokes on_merged once
+#### Scenario: pre-existing root lock is logged before hook execution
 
-**Given**: `hooks.on_merged` is configured
-**And**: change `alpha` is in `ResolveWait` for a deferred merge retry
-**When**: the scheduler retries the merge and repository-visible merge integration succeeds
-**Then**: `on_merged` is executed once with `{change_id}=alpha`
-**And**: `MergeCompleted` is emitted only after the hook execution attempt completes
+**Given**: root `.git/index.lock` exists before `on_merged` starts
+**When**: the hook runner prepares `on_merged`
+**Then**: the logs indicate that root lock waiting began
+**And**: the logs later indicate whether the lock was released or the wait timed out
 
-#### Scenario: stale retry does not duplicate on_merged
+#### Scenario: timeout does not hide unsafe execution context
 
-**Given**: change `alpha` has already been integrated into the base branch
-**And**: a stale retry trigger or stale resolve-wait entry for `alpha` is observed
-**When**: the scheduler evaluates deferred merge retries
-**Then**: it clears the stale retry intent for `alpha`
-**And**: it does not execute `on_merged` for `alpha` again
-**And**: it does not start AI conflict resolution for `alpha`
-
-#### Scenario: repeated retry trigger after success is idempotent
-
-**Given**: change `alpha` completed deferred merge retry successfully
-**And**: `on_merged` already ran for that successful merge
-**When**: a later scheduler loop synchronizes retry state and receives another retry dispatch trigger
-**Then**: `alpha` is not re-added as retryable work
-**And**: no second `on_merged` execution is emitted for `alpha`
+**Given**: root `.git/index.lock` remains present until `index_lock_wait_secs` expires
+**When**: the hook runner proceeds to execute `on_merged`
+**Then**: the logs explicitly indicate that execution continued after lock wait timeout
+**And**: a later hook failure can be correlated with the unsafe root lock condition from repository-verifiable logs

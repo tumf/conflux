@@ -29,6 +29,13 @@ use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::{MergeResult, ParallelEvent, ParallelExecutor, WorkspaceResult};
 
+fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
+    format!(
+        "on_merged hook failed for '{}'; merged transition blocked: {}",
+        change_id, error
+    )
+}
+
 impl ParallelExecutor {
     /// Check if debounce period has elapsed for queue changes.
     ///
@@ -97,6 +104,17 @@ impl ParallelExecutor {
             guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
                 change_id: change_id.to_string(),
                 revision: revision.to_string(),
+            });
+        }
+    }
+
+    async fn mark_on_merged_failure_in_shared_state(&mut self, change_id: &str, error: &str) {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut guard = shared.write().await;
+            guard.apply_execution_event(&ExecutionEvent::HookFailed {
+                change_id: change_id.to_string(),
+                hook_type: crate::hooks::HookType::OnMerged.to_string(),
+                error: error.to_string(),
             });
         }
     }
@@ -657,7 +675,6 @@ impl ParallelExecutor {
             {
                 Ok(super::merge::MergeAttempt::Merged { revision }) => {
                     info!("Deferred merge succeeded for '{}' on retry", change_id);
-                    self.clear_resolve_wait_intent_for_success(&change_id).await;
 
                     // Run on_merged hook before merged status transition (MergeCompleted event).
                     if let Some(ref hooks) = self.hooks {
@@ -682,13 +699,33 @@ impl ParallelExecutor {
                             .run_hook(crate::hooks::HookType::OnMerged, &hook_ctx)
                             .await
                         {
-                            warn!(
-                                "on_merged hook failed for deferred retry of '{}': {}",
-                                change_id, e
-                            );
+                            let message = on_merged_failure_message(&change_id, &e);
+                            error!("{}", message);
+                            self.clear_resolve_wait_intent_for_success(&change_id).await;
+                            self.mark_on_merged_failure_in_shared_state(&change_id, &message)
+                                .await;
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::HookFailed {
+                                    change_id: change_id.clone(),
+                                    hook_type: crate::hooks::HookType::OnMerged.to_string(),
+                                    error: e.to_string(),
+                                },
+                            )
+                            .await;
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::ResolveFailed {
+                                    change_id: change_id.clone(),
+                                    error: message,
+                                },
+                            )
+                            .await;
+                            continue;
                         }
                     }
 
+                    self.clear_resolve_wait_intent_for_success(&change_id).await;
                     self.mark_deferred_merge_completed_in_shared_state(&change_id, &revision)
                         .await;
 

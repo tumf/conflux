@@ -78,6 +78,40 @@ impl AppState {
         )));
     }
 
+    pub(crate) fn handle_hook_failed(
+        &mut self,
+        change_id: String,
+        hook_type: String,
+        error: String,
+    ) {
+        if hook_type == "on_merged" {
+            if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+                if change.display_status_cache != "merged" {
+                    change.set_display_status_cache("merge wait");
+                    change.selected = false;
+                    if let Some(started) = change.started_at {
+                        change.elapsed_time = Some(started.elapsed());
+                    }
+                }
+            }
+            let message = format!(
+                "on_merged hook failed for '{}'; merged transition blocked: {}",
+                change_id, error
+            );
+            self.warning_popup = Some(WarningPopup {
+                title: "on_merged hook failed".to_string(),
+                message: message.clone(),
+            });
+            self.add_log(LogEntry::error(message));
+            self.try_transition_to_select();
+        } else {
+            self.add_log(LogEntry::error(format!(
+                "Hook '{}' failed for {}: {}",
+                hook_type, change_id, error
+            )));
+        }
+    }
+
     pub(crate) fn handle_merge_deferred(
         &mut self,
         change_id: String,
@@ -186,6 +220,26 @@ mod tests {
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
+    }
+
+    #[test]
+    fn handle_on_merged_hook_failed_surfaces_merge_wait_not_merged() {
+        let changes = vec![create_test_change("change-a", 1, 1)];
+        let mut app = AppState::new(changes);
+
+        app.changes[0].display_status_cache = "archived".to_string();
+        app.handle_orchestrator_event(OrchestratorEvent::HookFailed {
+            change_id: "change-a".to_string(),
+            hook_type: "on_merged".to_string(),
+            error: "git index lock held".to_string(),
+        });
+
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert!(app.warning_popup.is_some());
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("merged transition blocked")));
     }
 
     #[test]

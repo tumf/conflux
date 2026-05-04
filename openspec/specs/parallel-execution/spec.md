@@ -1982,7 +1982,7 @@ Out-of-worktree durable state (for example under `~/.local/state/cflx/**`) MUST 
 
 ### Requirement: post-archive-merge-dispatch
 
-When a change is archived in parallel mode, the orchestrator must attempt to merge or defer the change according to structured blocker classification rather than leaving auto-resumable and manual-wait cases ambiguous.
+If `on_merged` fails because the root repository is not safe for repo-mutating hook execution, such as root `.git/index.lock` contention, Conflux SHALL treat that as a hook failure that blocks merged transition when `continue_on_failure=false`.
 
 A deferred merge caused by another active non-terminal change in `Resolving` or `Rejecting` SHALL advance into reducer-owned auto-resumable merge/resolve handling (`ResolveWait` or immediate resolving when promoted). Active `Rejecting` is included because rejection review can touch and dirty base state.
 
@@ -2013,6 +2013,16 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 **When**: the deferred merge result is processed
 **Then**: the change remains in manual merge wait handling (`MergeWait`)
 **And**: it is not classified as auto-resumable
+
+#### Scenario: root index lock contention blocks merged transition
+
+**Given**: change `alpha` is repository-visible merged
+**And**: `hooks.on_merged` runs a repo-mutating command such as `make bump-patch`
+**And**: root `.git/index.lock` contention causes the hook to exit non-zero
+**When**: the scheduler handles hook completion
+**Then**: `alpha` does not transition to terminal `Merged`
+**And**: `MergeCompleted` is not emitted for `alpha`
+**And**: the operator-visible failure context includes the hook failure details
 
 ### Requirement: Parallel execution acceptance loop
 
