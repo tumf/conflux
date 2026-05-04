@@ -1260,19 +1260,25 @@ impl OrchestratorState {
                 ..
             } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() && !rt.is_active() {
+                if !rt.is_terminal() {
                     if *auto_resumable {
                         // Auto-resumable: will be retried after a preceding merge/resolve
                         // completes. Use ResolveWait so workspace-refresh reconciliation
-                        // does not regress it back to MergeWait.
-                        rt.wait_state = WaitState::ResolveWait;
-                        if !self.resolve_wait_queue.contains(change_id) {
-                            self.resolve_wait_queue.push(change_id.clone());
+                        // does not regress it back to MergeWait. Do not interrupt an
+                        // already-active merge attempt; that active state remains the
+                        // truthful visible state until completion or manual deferral.
+                        if !rt.is_active() {
+                            rt.wait_state = WaitState::ResolveWait;
+                            if !self.resolve_wait_queue.contains(change_id) {
+                                self.resolve_wait_queue.push(change_id.clone());
+                            }
                         }
                     } else {
                         // Manual intervention required: the change must remain visible
-                        // as merge-wait only, not as ordinary queued work. The explicit
-                        // ResolveMerge command is the authoritative retry signal.
+                        // as merge-wait only, not as ordinary queued work. Manual
+                        // deferral can be discovered during active post-archive merge
+                        // handling, so clear Resolving and surface the concrete blocker.
+                        rt.activity = ActivityState::Idle;
                         rt.wait_state = WaitState::MergeWait;
                         rt.queue_intent = QueueIntent::NotQueued;
                         self.resolve_wait_queue.retain(|id| id != change_id);
@@ -2819,7 +2825,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_mode_change_archived_transitions_to_merge_wait() {
+    fn test_parallel_mode_change_archived_transitions_to_resolving_without_blocker() {
         use crate::events::ExecutionEvent;
 
         let mut state =
@@ -2841,11 +2847,13 @@ mod tests {
         });
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
 
-        // In parallel mode, ChangeArchived should NOT be terminal.
+        // In parallel mode, ChangeArchived is a merge-routing milestone, not a
+        // stable terminal display. With no lane blocker or manual deferral
+        // evidence, the reducer must show active merge handling immediately.
         assert_eq!(
             state.display_status("c"),
-            "merge wait",
-            "Parallel: ChangeArchived must transition to merge wait when no resolving change exists"
+            "resolving",
+            "Parallel: no-blocker ChangeArchived must transition to active merge handling, not merge wait"
         );
         assert!(
             !state.is_terminal_change("c"),
@@ -2882,10 +2890,17 @@ mod tests {
 
         assert_eq!(
             state.display_status("alpha"),
-            "merge wait",
-            "same-change archive success must supersede a recoverable acceptance error"
+            "resolving",
+            "same-change archive success must supersede a recoverable acceptance error and enter active no-blocker merge handling"
         );
         assert!(!state.is_terminal_change("alpha"));
+
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "merge-rev".to_string(),
+        });
+        assert_eq!(state.display_status("alpha"), "merged");
+        assert!(state.is_terminal_change("alpha"));
     }
 
     #[test]
@@ -3061,7 +3076,11 @@ mod tests {
         assert_eq!(state.display_status("a"), "applying");
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("a".to_string()));
-        assert_eq!(state.display_status("a"), "merge wait");
+        assert_eq!(
+            state.display_status("a"),
+            "resolving",
+            "Parallel: no-blocker archive completion must enter active resolving before merged"
+        );
         assert!(!state.is_terminal_change("a"));
 
         // Merge 'a'
@@ -3084,9 +3103,13 @@ mod tests {
         let mut state =
             OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
 
-        // Archive the change
+        // Archive completion without a concrete blocker enters active merge handling.
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("c".to_string()));
-        assert_eq!(state.display_status("c"), "merge wait");
+        assert_eq!(
+            state.display_status("c"),
+            "resolving",
+            "Parallel: ChangeArchived alone must not imply merge wait before manual blocker evidence exists"
+        );
 
         // Merge deferred (manual, not auto-resumable)
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
