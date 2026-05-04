@@ -2504,7 +2504,11 @@ mod tests {
         use crate::events::ExecutionEvent;
 
         let mut state = OrchestratorState::with_mode(
-            vec!["resolving-a".to_string(), "rejecting-b".to_string(), "archive-c".to_string()],
+            vec![
+                "resolving-a".to_string(),
+                "rejecting-b".to_string(),
+                "archive-c".to_string(),
+            ],
             0,
             ExecutionMode::Parallel,
         );
@@ -2522,14 +2526,20 @@ mod tests {
 
         assert_eq!(state.display_status("resolving-a"), "resolving");
         assert_eq!(state.display_status("rejecting-b"), "reject pending");
-        assert_eq!(state.reject_wait_change_ids(), vec!["rejecting-b".to_string()]);
+        assert_eq!(
+            state.reject_wait_change_ids(),
+            vec!["rejecting-b".to_string()]
+        );
         assert!(state.resolve_wait_change_ids().is_empty());
         assert!(state.has_other_post_archive_lane_blocker("archive-c"));
         assert!(state.global_invariants_hold());
 
         state.apply_execution_event(&ExecutionEvent::ChangeArchived("archive-c".to_string()));
         assert_eq!(state.display_status("archive-c"), "resolve pending");
-        assert_eq!(state.resolve_wait_change_ids(), vec!["archive-c".to_string()]);
+        assert_eq!(
+            state.resolve_wait_change_ids(),
+            vec!["archive-c".to_string()]
+        );
         assert!(state.global_invariants_hold());
     }
 
@@ -2538,7 +2548,11 @@ mod tests {
         use crate::events::{ExecutionEvent, RejectionOutcome};
 
         let mut state = OrchestratorState::with_mode(
-            vec!["lane-a".to_string(), "resolve-b".to_string(), "reject-c".to_string()],
+            vec![
+                "lane-a".to_string(),
+                "resolve-b".to_string(),
+                "reject-c".to_string(),
+            ],
             0,
             ExecutionMode::Parallel,
         );
@@ -2563,7 +2577,10 @@ mod tests {
             error: "manual blocker".to_string(),
         });
         let promoted = state.promote_next_base_mutating_lane_waiter();
-        assert_eq!(promoted, Some(("resolve-b".to_string(), WaitState::ResolveWait)));
+        assert_eq!(
+            promoted,
+            Some(("resolve-b".to_string(), WaitState::ResolveWait))
+        );
         assert_eq!(state.display_status("resolve-b"), "resolving");
         assert_eq!(state.display_status("reject-c"), "reject pending");
         assert!(state.global_invariants_hold());
@@ -2574,7 +2591,10 @@ mod tests {
             revision: "rev-b".to_string(),
         });
         let promoted = state.promote_next_base_mutating_lane_waiter();
-        assert_eq!(promoted, Some(("reject-c".to_string(), WaitState::RejectWait)));
+        assert_eq!(
+            promoted,
+            Some(("reject-c".to_string(), WaitState::RejectWait))
+        );
         assert_eq!(state.display_status("reject-c"), "rejecting");
         assert!(state.reject_wait_change_ids().is_empty());
         assert!(state.global_invariants_hold());
