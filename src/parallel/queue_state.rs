@@ -1149,6 +1149,16 @@ impl ParallelExecutor {
             return;
         }
 
+        self.emit_queue_reconciliation_diagnostic_without_dedupe(level, change_id, reason)
+            .await;
+    }
+
+    async fn emit_queue_reconciliation_diagnostic_without_dedupe(
+        &self,
+        level: QueueReconciliationDiagnosticLevel,
+        change_id: &str,
+        reason: &str,
+    ) {
         let message = match level {
             QueueReconciliationDiagnosticLevel::Info => LogEntry::info(format!(
                 "Queue reconciliation deferred for '{}': {}",
@@ -1235,16 +1245,27 @@ impl ParallelExecutor {
                     added += 1;
                 }
                 None => {
-                    warn!(
-                        "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
-                        queued_id
-                    );
-                    self.emit_queue_reconciliation_diagnostic(
-                        QueueReconciliationDiagnosticLevel::Warn,
+                    if self.should_emit_queue_reconciliation_diagnostic(
                         &queued_id,
                         "candidate_not_found",
-                    )
-                    .await;
+                    ) {
+                        warn!(
+                            "Queue reconciliation could not load reducer-queued change '{}': candidate_not_found",
+                            queued_id
+                        );
+                        self.emit_queue_reconciliation_diagnostic_without_dedupe(
+                            QueueReconciliationDiagnosticLevel::Warn,
+                            &queued_id,
+                            "candidate_not_found",
+                        )
+                        .await;
+                    } else {
+                        debug!(
+                            change_id = %queued_id,
+                            reason = "candidate_not_found",
+                            "Suppressing repeated queue reconciliation candidate_not_found warning"
+                        );
+                    }
                 }
             }
         }
