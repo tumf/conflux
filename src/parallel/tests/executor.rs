@@ -3281,6 +3281,130 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_bounded() {
+    use crate::events::{ExecutionEvent, LogLevel};
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::{mpsc, RwLock};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured log buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(self.0.clone())
+        }
+    }
+
+    let captured_logs = Arc::new(StdMutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedLogs(captured_logs.clone()))
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let (tx, mut rx) = mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+
+    let missing_change_id = "definitely-missing-candidate-for-reconciliation";
+    let loadable_change_id = "fix-missing-candidate-log-spam";
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            missing_change_id.to_string(),
+            loadable_change_id.to_string(),
+        ],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(missing_change_id.to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue(loadable_change_id.to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+
+    let first_added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    let second_added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        first_added, 1,
+        "loadable reducer-queued change should be added"
+    );
+    assert_eq!(
+        second_added, 0,
+        "second reconciliation should not add duplicates"
+    );
+    assert!(
+        queued.iter().any(|change| change.id == loadable_change_id),
+        "loadable reducer-queued change should be present in scheduler-local queue"
+    );
+    assert!(
+        !queued.iter().any(|change| change.id == missing_change_id),
+        "missing reducer-queued candidate must not be inserted into scheduler-local queue"
+    );
+
+    let mut candidate_not_found_events = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.level == LogLevel::Warn && log.message.contains("candidate_not_found") {
+                candidate_not_found_events += 1;
+            }
+        }
+    }
+    assert_eq!(
+        candidate_not_found_events, 1,
+        "candidate_not_found should remain visible once without repeated TUI-visible warnings"
+    );
+
+    drop(_subscriber_guard);
+    let captured = String::from_utf8(
+        captured_logs
+            .lock()
+            .expect("captured log buffer poisoned")
+            .clone(),
+    )
+    .expect("tracing output should be valid UTF-8");
+    let structured_warn_count = captured
+        .matches("Queue reconciliation could not load reducer-queued change")
+        .count();
+    assert_eq!(
+        structured_warn_count, 1,
+        "structured WARN candidate_not_found log should be bounded across repeated reconciliation"
+    );
+}
+
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {
