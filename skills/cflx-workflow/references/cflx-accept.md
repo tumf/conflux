@@ -39,9 +39,9 @@ Permission Error Acceptance:
 
 Implementation Blocker review (acceptance stage scope):
 1. Check if tasks.md contains any "## Implementation Blocker #N" sections
-2. Apply FAIL vs GATED rubric before deciding verdict:
+2. Apply repository-fixable vs stalled-hold rubric before deciding verdict:
    - Output FAIL when the issue is solvable by autonomous repository work (code/tests/spec/tasks/docs updates inside this repo).
-   - Output GATED only when the blocker cannot be resolved by repository-only work in apply (human decision, repo-external prerequisite, missing external dependency resolution, or unresolved upstream constraint).
+   - Create a stalled acceptance hold only when the blocker cannot be resolved by repository-only work in apply (human decision, repo-external prerequisite, missing external dependency resolution, or unresolved upstream constraint); emit `{"acceptance":"gated"}` / `ACCEPTANCE: GATED` only as compatibility tokens for that hold.
 3. Check whether `openspec/changes/<change_id>/REJECTED.md` exists (apply-generated rejection proposal artifact)
 4. If both blocker section and `REJECTED.md` exist:
    - Treat this as a rejecting-stage handoff signal that should be reviewed by rejecting flow, not acceptance.
@@ -112,7 +112,7 @@ machine-readable payload, as its own line:
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence 1>","<evidence 2>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- GATED:    `{"acceptance":"gated"}`
+- STALLED HOLD (compatibility token): `{"acceptance":"gated"}`
 
 The JSON verdict is the canonical machine-readable contract. For FAIL the
 `findings` array mirrors the FINDINGS section.
@@ -124,7 +124,7 @@ existing runs do not break:
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
-- `ACCEPTANCE: GATED`
+- `ACCEPTANCE: GATED` (legacy fallback for a stalled implementation blocker hold)
 - Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
 When both a JSON verdict and a legacy text marker appear, the JSON verdict

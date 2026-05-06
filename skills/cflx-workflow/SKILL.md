@@ -176,14 +176,14 @@ formatting.
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}` (findings mirrors the FINDINGS section)
 - CONTINUE: `{"acceptance":"continue"}`
-- GATED (compatibility/protocol term): `{"acceptance":"gated"}`
+- STALLED HOLD (compatibility token): `{"acceptance":"gated"}`
 
 **Fallback (backward-compatible)** — legacy standalone plain-text markers:
 
 - `ACCEPTANCE: PASS` - All checks pass
 - `ACCEPTANCE: FAIL` - Checks fail (followed by FINDINGS and tasks.md update)
 - `ACCEPTANCE: CONTINUE` - Verification incomplete
-- `ACCEPTANCE: GATED` - Valid Implementation Blocker exists
+- `ACCEPTANCE: GATED` - Legacy fallback for a valid Implementation Blocker stalled hold
 - Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
 The JSON verdict is primary; legacy markers remain supported so existing runs
@@ -204,7 +204,7 @@ Do NOT wrap the verdict in headings (`##`), blockquotes (`>`), bullets (`-`), bo
 - Each finding must include concrete evidence (file path, function, line)
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
-- GATED only with valid `Implementation Blocker #<n>`
+- Valid `Implementation Blocker #<n>` creates a stalled acceptance hold; emit `{"acceptance":"gated"}` only as the current compatibility token for that hold
 
 **For detailed guidance**, read [references/cflx-accept.md](references/cflx-accept.md).
 
@@ -262,7 +262,7 @@ cflx openspec archive <id> --yes --skip-specs # Archive without spec updates
 | Apply | "apply \<id\>" | Completed tasks + code | No questions, update immediately |
 | Rejecting | "rejecting \<id\>" | CONFIRM / RESUME | Review blocker evidence |
 | Cleanup | "cleanup-review \<id\>" | CLEANUP_REVIEW: CLEAN | No blind staging |
-| Accept | "accept" | PASS/FAIL/CONTINUE/GATED | Output once, cite evidence |
+| Accept | "accept" | PASS/FAIL/CONTINUE/STALLED HOLD (`gated` compatibility token) | Output once, cite evidence |
 | Archive | "archive \<id\>" | Archived change | Validate before/after |
 
 **REMEMBER**: This skill operates autonomously. Never ask questions. Make decisions based on available context.

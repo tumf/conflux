@@ -232,7 +232,7 @@ Implementation Blocker の記録は以下を満たさなければならない（
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-acceptance プロンプトは Implementation Blocker を審査し、妥当と判断した場合は compatibility verdict として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力してもよい（MAY）。ただし、この verdict は user-facing lifecycle/status としての `gated` を意味してはならず、runtime は paused state を `stalled` として扱わなければならない（MUST）。
+acceptance プロンプトと配布 acceptance 関連 skill は Implementation Blocker を stalled acceptance hold として説明しなければならない（MUST）。妥当な blocker については、互換期間中の protocol handoff として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力してもよい（MAY）。ただし、この verdict は user-facing lifecycle/status としての `gated` を意味してはならず、runtime は paused state を `stalled` として扱わなければならない（MUST）。parser が別 change で対応するまで、配布 guidance は final machine-readable verdict として `{"acceptance":"stalled"}` を出力するよう指示してはならない（MUST NOT）。
 
 acceptance は以下を満たさなければならない（MUST）。
 - `Implementation Blocker` の内容が不十分または誤りの場合は `ACCEPTANCE: FAIL` を出力し、follow-up タスクを tasks.md に追加する
@@ -242,14 +242,17 @@ acceptance は以下を満たさなければならない（MUST）。
 - blocker verdict を返さず `FAIL` を返した場合、その finding は apply へ戻って repository 作業を行うことで解消可能であることを意味しなければならない（MUST）。
 - apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を stalled hold のまま保留するか」を区別できなければならない
 - 互換期間中に旧 `blocked` acceptance verdict や `gated` verdict を runtime が受理できても、新規 lifecycle/status contract は `stalled` を operator-facing term として使わなければならない（MUST）
+- 配布 skill と command mirror は `gated` を primary rubric label や lifecycle/status 名として説明してはならず、stalled hold の互換 protocol token としてのみ説明しなければならない（MUST）
 
 #### Scenario: acceptance emits blocker verdict for a valid implementation blocker
 - **GIVEN** acceptance が妥当な Implementation Blocker を確認した
 - **AND** その blocker は repository 内編集だけでは解決できない
 - **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は acceptance blocker として解釈される
+- **THEN** verdict は stalled acceptance hold の compatibility handoff として解釈される
+- **AND** 互換 token は現在の parser が受理する `{"acceptance":"gated"}` / `ACCEPTANCE: GATED` である
 - **AND** runtime/user-facing status は `stalled` として扱われる
 - **AND** blocker の概要が添えられる
+- **AND** reviewer は parser support が入るまで `{"acceptance":"stalled"}` を出力しない
 
 #### Scenario: acceptance uses fail for repository-fixable issues
 - **GIVEN** acceptance が code / tests / tasks / spec の repository 内修正で解決できる問題を見つけた
@@ -579,7 +582,7 @@ Selecting a different operation skill MUST NOT duplicate fixed operation procedu
 
 The orchestrator MUST include a built-in `cflx-accept-with-speca` skill that can be selected as the acceptance operation skill.
 
-The `cflx-accept-with-speca` skill MUST preserve the Conflux acceptance verdict contract. It MUST produce exactly one final machine-readable acceptance verdict using the existing `pass`, `fail`, `continue`, or `gated` outcomes, with actionable `findings` for fail outcomes.
+The `cflx-accept-with-speca` skill MUST preserve the Conflux acceptance verdict contract. It MUST produce exactly one final machine-readable acceptance verdict using the existing `pass`, `fail`, `continue`, or current stalled-hold compatibility token `gated` outcomes, with actionable `findings` for fail outcomes. It MUST NOT introduce a SPECA-specific verdict protocol or instruct `{"acceptance":"stalled"}` before parser support exists.
 
 The skill MUST treat `.opencode/commands/cflx-accept.md` and the standard `cflx-accept` acceptance contract as the authoritative source for fixed checks and final verdict formatting.
 
@@ -589,7 +592,7 @@ When the official NyxFoundation/speca runner is available and usable outside the
 
 The skill MUST require official SPECA runner artifacts to be scoped by project/workspace and attempt, for example under `~/tmp/cflx-speca/<workspace-key>/`, so multiple Conflux projects, repeated acceptance attempts, and concurrent acceptance attempts cannot collide when they use the same OpenSpec change id.
 
-The skill MUST treat official SPECA runner outputs as supporting proof/falsification evidence only. Runner outputs, logs, caches, and temporary inputs MUST NOT become authoritative workflow-control state for pass/fail/continue/gated routing.
+The skill MUST treat official SPECA runner outputs as supporting proof/falsification evidence only. Runner outputs, logs, caches, and temporary inputs MUST NOT become authoritative workflow-control state for pass/fail/continue/stalled-hold routing; `gated` remains only the compatibility token for stalled holds.
 
 The skill MUST require fallback to manual SPECA-style property review when the official runner, prerequisites, authentication/session access, or usable outputs are unavailable. Runner unavailability MUST NOT be treated as an automatic pass and MUST NOT introduce a SPECA-specific verdict format.
 

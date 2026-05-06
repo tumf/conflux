@@ -135,10 +135,10 @@ cflx openspec archive <id> --yes  # Archive change
 - Active sections must have checkboxes (`- [ ]` or `- [x]`)
 - Future Work sections must NOT have checkboxes
 
-### Implementation Blocker Gate
+### Implementation Blocker Stalled Hold
 
 - Apply can escalate `IMPLEMENTATION_BLOCKER` when implementation is truly impossible in current loop
-- Accept can return `ACCEPTANCE: GATED` only with concrete blocker evidence (legacy `BLOCKED` is input compatibility only)
+- Accept treats a valid Implementation Blocker as a stalled acceptance hold; during the compatibility period it returns `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` only as protocol handoff tokens with concrete blocker evidence (legacy `BLOCKED` is input compatibility only)
 
 ### Autonomous Execution (all operation-specific skills)
 

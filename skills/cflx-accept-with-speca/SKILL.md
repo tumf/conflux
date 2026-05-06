@@ -26,7 +26,7 @@ If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat
 
 `.opencode/commands/cflx-accept.md` is the single source of truth for fixed acceptance procedure, checklist ownership, retry semantics, and final verdict formatting. This skill MUST NOT redefine that protocol.
 
-Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or `gated`. For blocking SPECA/property failures, return the standard JSON `fail` verdict with actionable `findings` under the command-template contract. Do not emit any SPECA-specific terminal marker or alternate verdict line.
+Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the command-template contract. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker or alternate verdict line.
 
 ## Official NyxFoundation/speca Runner Adapter (Optional)
 
@@ -73,7 +73,7 @@ Replace `...` with the phase and arguments supported by the checked-out NyxFound
 - Runner completes and produces relevant outputs: cite the output location in reasoning and use outputs as supporting proof/falsification evidence. Map any concrete blocking property failure to the standard JSON `fail` verdict with `findings`.
 - Runner prerequisites are missing or auth/session access is unavailable: record the limitation, then perform manual SPECA-style review from repository evidence.
 - Runner crashes, times out, or produces unusable output: record the failed command and output/log location, then perform manual SPECA-style review.
-- Runner output conflicts with repository evidence, OpenSpec requirements, task claims, or `openspec/CONSTITUTION.md`: repository/workspace evidence is authoritative for pass/fail/continue/gated routing.
+- Runner output conflicts with repository evidence, OpenSpec requirements, task claims, or `openspec/CONSTITUTION.md`: repository/workspace evidence is authoritative for pass/fail/continue/stalled-hold routing; `gated` remains only the current compatibility token for that stalled hold.
 
 Never treat official SPECA runner output as durable workflow-control state. Never treat runner unavailability, setup failure, missing auth, or inconclusive output as an automatic pass or as a SPECA-specific protocol error.
 
@@ -113,7 +113,7 @@ For each high-value property:
 - **Blocking**: Concrete property failure with repository evidence. Map to standard acceptance `fail` with a `findings` item naming the property, evidence path/function/line when available, and required autonomous fix.
 - **Advisory**: Non-blocking risk or improvement. Mention in reasoning if useful, but do not force failure by itself.
 - **Incomplete**: Repository-only work/checks are still needed. Treat as `fail` when the agent can resolve it by editing code/tests/spec/tasks/docs.
-- **Gated**: Use only when the standard acceptance blocker rubric allows it and repository-only work cannot resolve the issue.
+- **Stalled hold**: Use only when the standard acceptance blocker rubric allows it and repository-only work cannot resolve the issue. During the compatibility period, emit the shared `{"acceptance":"gated"}` verdict for this hold; do not introduce `{"acceptance":"stalled"}` or any SPECA-specific outcome.
 
 ### 5. Emit one Conflux verdict
 
@@ -124,7 +124,7 @@ After the SPECA-style pass, emit the final verdict using only the standard Confl
 - Do not ask the user questions.
 - Do not defer repository-fixable issues to humans.
 - Base workflow-control decisions on workspace files, workspace git state, and base-branch comparison.
-- Do not use out-of-worktree durable state to decide pass/fail/continue/gated.
+- Do not use out-of-worktree durable state to decide pass/fail/continue/stalled-hold routing; `gated` is only the current parser-compatible token for stalled holds.
 - Do not change `acceptance_command` merely because this skill is selected; selection only changes the loaded operation skill.
 
 ## Built-in Tools
