@@ -319,7 +319,8 @@ mod tests {
     fn test_cflx_accept_with_speca_documents_official_runner_adapter() {
         assert!(
             CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("NyxFoundation/speca")
-                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("~/tmp/speca")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD
+                    .contains("~/tmp/cflx-speca/<workspace-key>/runner/speca/")
                 && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("uv run python3 scripts/run_phase.py"),
             "SPECA acceptance skill must document the official runner checkout and command shape"
         );
@@ -332,8 +333,9 @@ mod tests {
     #[test]
     fn test_cflx_accept_with_speca_keeps_runner_artifacts_outside_worktree() {
         for required in &[
-            "~/tmp/speca-conflux-input/<change-id>/",
-            "~/tmp/speca-conflux-output/<change-id>/",
+            "~/tmp/cflx-speca/<workspace-key>/",
+            "~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/",
+            "~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/",
             "outside the target Conflux worktree",
             "Do not clone NyxFoundation/speca, write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths",
             "Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action",
@@ -344,6 +346,12 @@ mod tests {
                 "SPECA acceptance skill must contain workspace-boundary guidance: {required}"
             );
         }
+        assert!(
+            !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("~/tmp/speca-conflux-input/<change-id>/")
+                && !CFLX_ACCEPT_WITH_SPECA_SKILL_MD
+                    .contains("~/tmp/speca-conflux-output/<change-id>/"),
+            "SPECA acceptance skill must not recommend global change-id-only input/output paths"
+        );
     }
 
     #[test]

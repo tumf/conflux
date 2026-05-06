@@ -587,6 +587,8 @@ The skill SHOULD guide acceptance review to derive or select SPECA-style propert
 
 When the official NyxFoundation/speca runner is available and usable outside the Conflux worktree, the skill MUST guide the reviewer to attempt official SPECA runner execution as supporting evidence using the checked-out runner's documented `uv run python3 scripts/run_phase.py ...` command shape. The skill MUST require generated runner inputs, outputs, logs, and tool checkout/cache files to remain outside the Conflux worktree by default.
 
+The skill MUST require official SPECA runner artifacts to be scoped by project/workspace and attempt, for example under `~/tmp/cflx-speca/<workspace-key>/`, so multiple Conflux projects, repeated acceptance attempts, and concurrent acceptance attempts cannot collide when they use the same OpenSpec change id.
+
 The skill MUST treat official SPECA runner outputs as supporting proof/falsification evidence only. Runner outputs, logs, caches, and temporary inputs MUST NOT become authoritative workflow-control state for pass/fail/continue/gated routing.
 
 The skill MUST require fallback to manual SPECA-style property review when the official runner, prerequisites, authentication/session access, or usable outputs are unavailable. Runner unavailability MUST NOT be treated as an automatic pass and MUST NOT introduce a SPECA-specific verdict format.
@@ -616,6 +618,15 @@ The skill MUST NOT require changing `acceptance_command` merely to opt into SPEC
 - **THEN** the skill guides the reviewer to prepare inputs outside the Conflux worktree
 - **AND** the reviewer attempts the official runner using the installed checkout's documented `uv run python3 scripts/run_phase.py ...` command shape
 - **AND** any produced official outputs are considered supporting evidence for standard acceptance findings
+
+#### Scenario: official SPECA runner artifacts are project-scoped
+
+- **GIVEN** acceptance is using `cflx-accept-with-speca`
+- **AND** multiple Conflux projects or concurrent attempts may use the same OpenSpec change id
+- **WHEN** the reviewer prepares SPECA checkout/cache, input, output, or log paths
+- **THEN** the paths are namespaced by a stable project/workspace key
+- **AND** repeated or concurrent attempts for the same change are namespaced by an attempt id
+- **AND** no global input/output path is keyed only by `<change-id>`
 
 #### Scenario: official SPECA runner artifacts remain non-authoritative
 

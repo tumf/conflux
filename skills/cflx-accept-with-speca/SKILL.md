@@ -34,36 +34,39 @@ Attempt the official NyxFoundation/speca runner when it is locally available and
 
 ### Workspace boundary and artifact locations
 
-Keep all official SPECA runner artifacts outside the target Conflux worktree by default:
+Keep all official SPECA runner artifacts outside the target Conflux worktree by default, and namespace them by project/workspace so multiple Conflux projects and concurrent acceptance attempts do not collide:
 
-- SPECA checkout/cache: `~/tmp/speca`
-- Generated Conflux/OpenSpec input bundle: `~/tmp/speca-conflux-input/<change-id>/`
-- Official SPECA outputs and logs: `~/tmp/speca-conflux-output/<change-id>/` or a documented output directory inside the external `~/tmp/speca` checkout
+- SPECA workspace root: `~/tmp/cflx-speca/<workspace-key>/`
+- SPECA checkout/cache: `~/tmp/cflx-speca/<workspace-key>/runner/speca/`
+- Generated Conflux/OpenSpec input bundle: `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/`
+- Official SPECA outputs and logs: `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` or a documented output directory inside the scoped external SPECA workspace
+
+`<workspace-key>` MUST be stable for the target project/workspace and collision-resistant across projects, for example `<repo-basename>-<hash12>` derived from the canonical repository root path, git common directory, or git remote identity. `<attempt-id>` MUST distinguish repeated or concurrent acceptance attempts for the same change, for example a UTC timestamp plus process id or random suffix. Do not use global paths keyed only by `<change-id>`, because different projects may use the same OpenSpec change id.
 
 Do not clone NyxFoundation/speca, write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths unless a separate implementation task explicitly asks for a tracked fixture. Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action for the same workspace file state and git state.
 
 ### Prerequisite checks before running
 
-Before launching setup or execution, inspect the installed SPECA checkout and verify:
+Before launching setup or execution, derive or select the scoped external SPECA workspace and verify:
 
 - `uv` is installed and available on `PATH`.
-- `~/tmp/speca` exists, is outside the Conflux worktree, and is a NyxFoundation/speca checkout.
+- The scoped checkout path `~/tmp/cflx-speca/<workspace-key>/runner/speca/` exists, is outside the Conflux worktree, and is a NyxFoundation/speca checkout.
 - The checkout documents the current `scripts/run_phase.py` phases and arguments; installed docs/help win over older examples.
-- Python dependencies are ready, or setup can be run from the SPECA checkout.
+- Python dependencies are ready, or setup can be run from the scoped SPECA checkout.
 - Required Claude/API/session/auth access is available for the official runner without asking the user questions or logging secrets.
 
 If any prerequisite is missing, unavailable, unauthenticated, or unsafe, record the limitation in human-readable reasoning and continue with manual SPECA-style property review.
 
 ### Observable setup and runner execution on mini
 
-SPECA setup and execution may be long-running or noisy. On mini, run those commands through `agent-exec run -- ...` so progress remains observable and context-efficient. Run from the external SPECA checkout, not from the Conflux worktree. Examples:
+SPECA setup and execution may be long-running or noisy. On mini, run those commands through `agent-exec run -- ...` so progress remains observable and context-efficient. Run from the scoped external SPECA checkout, not from the Conflux worktree. Examples:
 
 ```bash
 agent-exec run -- uv sync
 agent-exec run -- uv run python3 scripts/run_phase.py ...
 ```
 
-Replace `...` with the phase and arguments supported by the checked-out NyxFoundation/speca version. Prepare input/output paths under `~/tmp/speca-conflux-input/<change-id>/` and `~/tmp/speca-conflux-output/<change-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree.
+Replace `...` with the phase and arguments supported by the checked-out NyxFoundation/speca version. Prepare input/output paths under `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/` and `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree and inside the scoped external SPECA workspace.
 
 ### Evidence classification and fallback
 
