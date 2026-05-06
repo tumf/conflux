@@ -232,7 +232,7 @@ Implementation Blocker の記録は以下を満たさなければならない（
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-acceptance プロンプトは Implementation Blocker を審査し、妥当と判断した場合は compatibility verdict として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力してもよい（MAY）。ただし、この verdict は user-facing lifecycle/status としての `gated` を意味してはならず、runtime は paused state を `stalled` として扱わなければならない（MUST）。
+acceptance プロンプトと配布 acceptance 関連 skill は Implementation Blocker を stalled acceptance hold として説明しなければならない（MUST）。妥当な blocker については、互換期間中の protocol handoff として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力してもよい（MAY）。ただし、この verdict は user-facing lifecycle/status としての `gated` を意味してはならず、runtime は paused state を `stalled` として扱わなければならない（MUST）。parser が別 change で対応するまで、配布 guidance は final machine-readable verdict として `{"acceptance":"stalled"}` を出力するよう指示してはならない（MUST NOT）。
 
 acceptance は以下を満たさなければならない（MUST）。
 - `Implementation Blocker` の内容が不十分または誤りの場合は `ACCEPTANCE: FAIL` を出力し、follow-up タスクを tasks.md に追加する
@@ -242,14 +242,17 @@ acceptance は以下を満たさなければならない（MUST）。
 - blocker verdict を返さず `FAIL` を返した場合、その finding は apply へ戻って repository 作業を行うことで解消可能であることを意味しなければならない（MUST）。
 - apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を stalled hold のまま保留するか」を区別できなければならない
 - 互換期間中に旧 `blocked` acceptance verdict や `gated` verdict を runtime が受理できても、新規 lifecycle/status contract は `stalled` を operator-facing term として使わなければならない（MUST）
+- 配布 skill と command mirror は `gated` を primary rubric label や lifecycle/status 名として説明してはならず、stalled hold の互換 protocol token としてのみ説明しなければならない（MUST）
 
 #### Scenario: acceptance emits blocker verdict for a valid implementation blocker
 - **GIVEN** acceptance が妥当な Implementation Blocker を確認した
 - **AND** その blocker は repository 内編集だけでは解決できない
 - **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は acceptance blocker として解釈される
+- **THEN** verdict は stalled acceptance hold の compatibility handoff として解釈される
+- **AND** 互換 token は現在の parser が受理する `{"acceptance":"gated"}` / `ACCEPTANCE: GATED` である
 - **AND** runtime/user-facing status は `stalled` として扱われる
 - **AND** blocker の概要が添えられる
+- **AND** reviewer は parser support が入るまで `{"acceptance":"stalled"}` を出力しない
 
 #### Scenario: acceptance uses fail for repository-fixable issues
 - **GIVEN** acceptance が code / tests / tasks / spec の repository 内修正で解決できる問題を見つけた
@@ -581,7 +584,7 @@ Selecting a different operation skill MUST NOT duplicate fixed operation procedu
 
 The orchestrator MUST include a built-in `cflx-accept-with-speca` skill that can be selected as the acceptance operation skill.
 
-The `cflx-accept-with-speca` skill MUST preserve the Conflux acceptance verdict contract. It MUST produce exactly one final machine-readable acceptance verdict using the existing `pass`, `fail`, `continue`, or `gated` outcomes, with actionable `findings` for fail outcomes.
+The `cflx-accept-with-speca` skill MUST preserve the Conflux acceptance verdict contract. It MUST produce exactly one final machine-readable acceptance verdict using the existing `pass`, `fail`, `continue`, or current stalled-hold compatibility token `gated` outcomes, with actionable `findings` for fail outcomes. It MUST NOT introduce a SPECA-specific verdict protocol or instruct `{"acceptance":"stalled"}` before parser support exists.
 
 The skill MUST be a drop-in replacement for `cflx-accept` as an acceptance operation skill. It MUST expose the exact same portable verdict output interface as `cflx-accept`; the SPECA lens may add review steps, reasoning, and findings, but MUST NOT change the output schema, accepted outcomes, retry semantics, or final machine-readable verdict format. It MUST NOT require runtime-specific command files or a particular command invocation mechanism to describe or emit the correct verdict.
 
@@ -591,7 +594,7 @@ When the official NyxFoundation/speca runner is available and usable outside the
 
 The skill MUST require official SPECA runner artifacts to be scoped by project/workspace and attempt, for example under `~/tmp/cflx-speca/<workspace-key>/`, so multiple Conflux projects, repeated acceptance attempts, and concurrent acceptance attempts cannot collide when they use the same OpenSpec change id.
 
-The skill MUST treat official SPECA runner outputs as supporting proof/falsification evidence only. Runner outputs, logs, caches, and temporary inputs MUST NOT become authoritative workflow-control state for pass/fail/continue/gated routing.
+The skill MUST treat official SPECA runner outputs as supporting proof/falsification evidence only. Runner outputs, logs, caches, and temporary inputs MUST NOT become authoritative workflow-control state for pass/fail/continue/stalled-hold routing; `gated` remains only the compatibility token for stalled holds.
 
 The skill MUST require fallback to manual SPECA-style property review when the official runner, prerequisites, authentication/session access, or usable outputs are unavailable. Runner unavailability MUST NOT be treated as an automatic pass and MUST NOT introduce a SPECA-specific verdict format.
 
@@ -661,3 +664,45 @@ The skill MUST NOT require changing `acceptance_command` merely to opt into SPEC
 - **WHEN** the reviewer evaluates a change
 - **THEN** the skill instructs the reviewer not to ask user questions
 - **AND** workflow-control decisions are based on repository/workspace evidence rather than out-of-worktree durable state
+
+### Requirement: Acceptance prompt MUST evaluate implementation blockers
+
+Acceptance prompts and distributed acceptance-related skills MUST frame valid Implementation Blockers as stalled acceptance holds in user-facing guidance. During the compatibility period, the runtime-compatible acceptance verdict token MAY remain `{"acceptance":"gated"}` / `ACCEPTANCE: GATED`, but distributed guidance MUST present that token as a protocol compatibility handoff for a stalled hold rather than as a user-facing lifecycle/status or primary rubric label.
+
+Acceptance-related skills MUST NOT instruct agents to emit `{"acceptance":"stalled"}` as the final machine-readable verdict until runtime parser support for that verdict exists in a separate change.
+
+#### Scenario: distributed skills describe implementation blockers as stalled holds
+
+- **GIVEN** bundled acceptance-related skills under `skills/` are reviewed
+- **WHEN** they explain how to handle a valid `Implementation Blocker #<n>`
+- **THEN** the primary operator-facing concept is a stalled acceptance hold
+- **AND** `gated` appears only as current runtime-compatible protocol/fallback token wording or reason metadata
+- **AND** the guidance does not describe `gated` as a lifecycle/display status
+
+#### Scenario: distributed skills preserve parser-compatible blocker handoff
+
+- **GIVEN** current runtime parser compatibility still depends on the `gated` acceptance token for implementation-blocker handoff
+- **WHEN** distributed skills specify the final machine-readable verdict for a valid stalled implementation blocker hold
+- **THEN** they continue to instruct the parser-compatible `{"acceptance":"gated"}` verdict and legacy `ACCEPTANCE: GATED` fallback where needed
+- **AND** they explicitly state that these tokens represent a stalled acceptance hold
+- **AND** they do not instruct `{"acceptance":"stalled"}` until a runtime parser migration supports it
+
+### Requirement: Acceptance skills MUST define a JSON-primary verdict contract
+
+The primary acceptance verdict contract MUST be a strict JSON object emitted as the final machine-readable verdict payload. The runtime MAY continue to accept legacy plain-text standalone lines such as `ACCEPTANCE: PASS` as a backward-compatible fallback, but canonical guidance MUST prefer the JSON contract.
+
+#### Scenario: cflx-accept defines JSON-primary verdict contract
+
+- **GIVEN** the acceptance prompt loads `cflx-accept`
+- **WHEN** the skill describes the final verdict format
+- **THEN** it defines a strict JSON verdict object as the primary machine-readable contract
+- **AND** it documents plain-text standalone verdict markers only as backward-compatible fallback guidance
+- **AND** it does not require `.opencode/commands/` files or OpenCode slash command invocation to describe the verdict interface
+
+#### Scenario: repo-local acceptance skills follow the same contract
+
+- **GIVEN** repo-local acceptance-related skills under `skills/` are reviewed
+- **WHEN** they describe acceptance output expectations
+- **THEN** they reference the same JSON-primary verdict contract
+- **AND** they do not redefine a conflicting text-only canonical output rule
+- **AND** they do not treat OpenCode command templates as the authoritative source for the skill interface

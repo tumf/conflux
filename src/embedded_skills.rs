@@ -487,6 +487,38 @@ mod tests {
     }
 
     #[test]
+    fn test_acceptance_skills_frame_blockers_as_stalled_holds() {
+        for (label, content) in &[
+            ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
+            ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
+            ("cflx-workflow", CFLX_WORKFLOW_SKILL_MD),
+            (
+                "cflx-workflow references/cflx-accept.md",
+                CFLX_WORKFLOW_REF_ACCEPT,
+            ),
+            (".opencode/commands/cflx-accept.md", CFLX_ACCEPT_COMMAND_MD),
+        ] {
+            assert!(
+                content.contains("stalled") && content.contains("Implementation Blocker"),
+                "{label} must describe valid Implementation Blockers as stalled holds"
+            );
+            assert!(
+                content.contains("compatibility") && content.contains("{\"acceptance\":\"gated\"}"),
+                "{label} must keep gated as a parser-compatible handoff token"
+            );
+            assert!(
+                !content.contains("- GATED:") && !content.contains("FAIL vs GATED"),
+                "{label} must not use GATED as the primary blocker outcome label or rubric"
+            );
+            assert!(
+                !content.contains("STALLED HOLD (primary): {\"acceptance\":\"stalled\"}")
+                    && !content.contains("- STALLED:    {\"acceptance\":\"stalled\"}"),
+                "{label} must not define a stalled JSON verdict as a supported output before parser support exists"
+            );
+        }
+    }
+
+    #[test]
     fn test_acceptance_verdict_contract_consistency() {
         // Verify canonical verdict markers are documented consistently
         // across the parser, OpenCode adapter reference, and the cflx-workflow skill.
