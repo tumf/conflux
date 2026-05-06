@@ -28,6 +28,52 @@ If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat
 
 Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or `gated`. For blocking SPECA/property failures, return the standard JSON `fail` verdict with actionable `findings` under the command-template contract. Do not emit any SPECA-specific terminal marker or alternate verdict line.
 
+## Official NyxFoundation/speca Runner Adapter (Optional)
+
+Attempt the official NyxFoundation/speca runner when it is locally available and usable. This runner is a supporting proof/falsification helper only; it is not required for acceptance and it never replaces repository evidence or the final Conflux verdict contract.
+
+### Workspace boundary and artifact locations
+
+Keep all official SPECA runner artifacts outside the target Conflux worktree by default:
+
+- SPECA checkout/cache: `~/tmp/speca`
+- Generated Conflux/OpenSpec input bundle: `~/tmp/speca-conflux-input/<change-id>/`
+- Official SPECA outputs and logs: `~/tmp/speca-conflux-output/<change-id>/` or a documented output directory inside the external `~/tmp/speca` checkout
+
+Do not clone NyxFoundation/speca, write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths unless a separate implementation task explicitly asks for a tracked fixture. Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action for the same workspace file state and git state.
+
+### Prerequisite checks before running
+
+Before launching setup or execution, inspect the installed SPECA checkout and verify:
+
+- `uv` is installed and available on `PATH`.
+- `~/tmp/speca` exists, is outside the Conflux worktree, and is a NyxFoundation/speca checkout.
+- The checkout documents the current `scripts/run_phase.py` phases and arguments; installed docs/help win over older examples.
+- Python dependencies are ready, or setup can be run from the SPECA checkout.
+- Required Claude/API/session/auth access is available for the official runner without asking the user questions or logging secrets.
+
+If any prerequisite is missing, unavailable, unauthenticated, or unsafe, record the limitation in human-readable reasoning and continue with manual SPECA-style property review.
+
+### Observable setup and runner execution on mini
+
+SPECA setup and execution may be long-running or noisy. On mini, run those commands through `agent-exec run -- ...` so progress remains observable and context-efficient. Run from the external SPECA checkout, not from the Conflux worktree. Examples:
+
+```bash
+agent-exec run -- uv sync
+agent-exec run -- uv run python3 scripts/run_phase.py ...
+```
+
+Replace `...` with the phase and arguments supported by the checked-out NyxFoundation/speca version. Prepare input/output paths under `~/tmp/speca-conflux-input/<change-id>/` and `~/tmp/speca-conflux-output/<change-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree.
+
+### Evidence classification and fallback
+
+- Runner completes and produces relevant outputs: cite the output location in reasoning and use outputs as supporting proof/falsification evidence. Map any concrete blocking property failure to the standard JSON `fail` verdict with `findings`.
+- Runner prerequisites are missing or auth/session access is unavailable: record the limitation, then perform manual SPECA-style review from repository evidence.
+- Runner crashes, times out, or produces unusable output: record the failed command and output/log location, then perform manual SPECA-style review.
+- Runner output conflicts with repository evidence, OpenSpec requirements, task claims, or `openspec/CONSTITUTION.md`: repository/workspace evidence is authoritative for pass/fail/continue/gated routing.
+
+Never treat official SPECA runner output as durable workflow-control state. Never treat runner unavailability, setup failure, missing auth, or inconclusive output as an automatic pass or as a SPECA-specific protocol error.
+
 ## SPECA-Style Review Loop
 
 ### 1. Load baseline acceptance context
