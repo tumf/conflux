@@ -132,6 +132,7 @@ pub async fn resolve_conflicts_with_retry(
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = build_conflict_resolve_prompt(
+        config.get_resolve_skill(),
         vcs_prompt_prefix,
         &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         vcs_error,
@@ -167,6 +168,7 @@ pub async fn resolve_conflicts_with_retry(
 
         // Build the resolve prompt with VCS-specific context
         let mut resolve_prompt = build_conflict_resolve_prompt(
+            config.get_resolve_skill(),
             vcs_prompt_prefix,
             &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             vcs_error,
@@ -500,6 +502,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = build_sequential_merge_resolve_prompt(
+        config.get_resolve_skill(),
         vcs_prompt_prefix,
         target_branch,
         base_revision,
@@ -538,6 +541,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         );
 
         let mut resolve_prompt = build_sequential_merge_resolve_prompt(
+            config.get_resolve_skill(),
             vcs_prompt_prefix,
             target_branch,
             base_revision,
@@ -1012,6 +1016,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
 /// Build prompt for conflict resolution (variable context only; fixed guidance lives in cflx-resolve).
 fn build_conflict_resolve_prompt(
+    resolve_skill: &str,
     vcs_prompt_prefix: &str,
     revisions: &[&str],
     vcs_error: &str,
@@ -1020,7 +1025,7 @@ fn build_conflict_resolve_prompt(
     conflict_files_str: &str,
 ) -> String {
     format!(
-        "load skills: cflx-resolve\n\n\
+        "load skills: {}\n\n\
          {}\n\n\
          Conflicting revisions: {}\n\n\
          VCS error output:\n\
@@ -1030,6 +1035,7 @@ fn build_conflict_resolve_prompt(
          VCS log for conflicting changes:\n\
          {}\n\n\
          Conflicting files: {}",
+        resolve_skill,
         vcs_prompt_prefix,
         revisions.join(", "),
         vcs_error,
@@ -1042,6 +1048,7 @@ fn build_conflict_resolve_prompt(
 /// Build prompt for sequential merge resolution (variable context only; fixed guidance lives in cflx-resolve).
 #[allow(clippy::too_many_arguments)]
 fn build_sequential_merge_resolve_prompt(
+    resolve_skill: &str,
     vcs_prompt_prefix: &str,
     target_branch: &str,
     base_revision: &str,
@@ -1052,7 +1059,7 @@ fn build_sequential_merge_resolve_prompt(
     conflict_files_str: &str,
 ) -> String {
     format!(
-        "load skills: cflx-resolve\n\n\
+        "load skills: {}\n\n\
          {}\n\n\
          Operation: sequential merge\n\n\
          Target branch: {}\n\
@@ -1062,6 +1069,7 @@ fn build_sequential_merge_resolve_prompt(
          Current VCS status:\n{}\n\n\
          VCS log for branches:\n{}\n\n\
          Conflicting files (repo root, if any): {}",
+        resolve_skill,
         vcs_prompt_prefix,
         target_branch,
         base_revision,
@@ -1080,6 +1088,7 @@ mod tests {
     #[test]
     fn test_conflict_resolve_prompt_has_skill_prelude() {
         let prompt = build_conflict_resolve_prompt(
+            crate::config::defaults::DEFAULT_RESOLVE_SKILL,
             "Git conflict resolution:",
             &["branch-a", "branch-b"],
             "merge failed",
@@ -1094,9 +1103,31 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_resolve_prompt_uses_custom_skill_prelude() {
+        let prompt = build_conflict_resolve_prompt(
+            "team-resolve",
+            "prefix",
+            &["rev1"],
+            "err",
+            "status",
+            "log",
+            "files",
+        );
+        assert!(prompt.contains("load skills: team-resolve"));
+        assert!(!prompt.contains("load skills: cflx-resolve"));
+    }
+
+    #[test]
     fn test_conflict_resolve_prompt_no_fixed_guidance() {
-        let prompt =
-            build_conflict_resolve_prompt("prefix", &["rev1"], "err", "status", "log", "files");
+        let prompt = build_conflict_resolve_prompt(
+            crate::config::defaults::DEFAULT_RESOLVE_SKILL,
+            "prefix",
+            &["rev1"],
+            "err",
+            "status",
+            "log",
+            "files",
+        );
         // Fixed guidance must NOT appear (owned by cflx-resolve skill)
         assert!(
             !prompt.contains("Please resolve the merge conflicts"),
@@ -1115,6 +1146,7 @@ mod tests {
     #[test]
     fn test_sequential_merge_prompt_has_skill_prelude() {
         let prompt = build_sequential_merge_resolve_prompt(
+            crate::config::defaults::DEFAULT_RESOLVE_SKILL,
             "Git conflict resolution:",
             "main",
             "abc123",
@@ -1133,8 +1165,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sequential_merge_prompt_uses_custom_skill_prelude() {
+        let prompt = build_sequential_merge_resolve_prompt(
+            "team-resolve",
+            "prefix",
+            "main",
+            "base",
+            "plan",
+            "locations",
+            "status",
+            "log",
+            "files",
+        );
+        assert!(prompt.contains("load skills: team-resolve"));
+        assert!(!prompt.contains("load skills: cflx-resolve"));
+    }
+
+    #[test]
     fn test_sequential_merge_prompt_no_fixed_guidance() {
         let prompt = build_sequential_merge_resolve_prompt(
+            crate::config::defaults::DEFAULT_RESOLVE_SKILL,
             "prefix",
             "main",
             "base",

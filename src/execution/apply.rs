@@ -442,7 +442,13 @@ pub fn build_apply_prompt(
     acceptance_tail: &str,
 ) -> String {
     let user_prompt = config.get_apply_prompt();
-    crate::agent::build_apply_prompt(change_id, user_prompt, history, acceptance_tail)
+    crate::agent::build_apply_prompt_with_skill(
+        config.get_apply_skill(),
+        change_id,
+        user_prompt,
+        history,
+        acceptance_tail,
+    )
 }
 
 /// Expand the apply command template with change_id and prompt.

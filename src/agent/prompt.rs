@@ -18,7 +18,24 @@ pub const APPLY_SYSTEM_PROMPT: &str = "";
 ///
 /// The acceptance_tail_context should be built using `build_last_acceptance_output_context`
 /// and should only be provided for the first apply attempt after acceptance failure.
+#[allow(dead_code)]
 pub fn build_apply_prompt(
+    change_id: &str,
+    user_prompt: &str,
+    history_context: &str,
+    acceptance_tail_context: &str,
+) -> String {
+    build_apply_prompt_with_skill(
+        crate::config::defaults::DEFAULT_APPLY_SKILL,
+        change_id,
+        user_prompt,
+        history_context,
+        acceptance_tail_context,
+    )
+}
+
+pub fn build_apply_prompt_with_skill(
+    apply_skill: &str,
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
@@ -26,7 +43,7 @@ pub fn build_apply_prompt(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-apply".to_string());
+    parts.push(format!("load skills: {}", apply_skill));
     parts.push(format!("Apply change id: {}", change_id));
 
     if !user_prompt.is_empty() {
@@ -48,10 +65,25 @@ pub fn build_apply_prompt(
 
 /// Build archive prompt from change metadata, user prompt, and history context
 /// Format: fixed prelude + user_prompt + history_context
+#[allow(dead_code)]
 pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context: &str) -> String {
+    build_archive_prompt_with_skill(
+        crate::config::defaults::DEFAULT_ARCHIVE_SKILL,
+        change_id,
+        user_prompt,
+        history_context,
+    )
+}
+
+pub fn build_archive_prompt_with_skill(
+    archive_skill: &str,
+    change_id: &str,
+    user_prompt: &str,
+    history_context: &str,
+) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-archive".to_string());
+    parts.push(format!("load skills: {}", archive_skill));
     parts.push(format!("Archive change id: {}", change_id));
 
     if !user_prompt.is_empty() {
@@ -71,10 +103,21 @@ pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context:
 /// - It must clean only the apply-generated dirty state.
 /// - It must not perform blind staging (e.g. `git add -A`).
 /// - On success it must emit exactly one marker: `CLEANUP_REVIEW: CLEAN`.
+#[allow(dead_code)]
 pub fn build_cleanup_review_prompt(change_id: &str) -> String {
+    build_cleanup_review_prompt_with_skill(
+        crate::config::defaults::DEFAULT_CLEANUP_REVIEW_SKILL,
+        change_id,
+    )
+}
+
+pub fn build_cleanup_review_prompt_with_skill(
+    cleanup_review_skill: &str,
+    change_id: &str,
+) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-cleanup-review".to_string());
+    parts.push(format!("load skills: {}", cleanup_review_skill));
     parts.push(format!("Cleanup-review change id: {}", change_id));
     parts.push(format!(
         "change_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nworkspace_path: .",
@@ -124,6 +167,7 @@ pub fn parse_cleanup_review_output(output: &str) -> bool {
 /// 3. last_output_context (if not empty) - previous acceptance stdout/stderr tail for 2nd+ attempts
 /// 4. user_prompt (if not empty)
 /// 5. history_context (if not empty)
+#[allow(dead_code)]
 pub fn build_acceptance_prompt(
     change_id: &str,
     user_prompt: &str,
@@ -133,6 +177,24 @@ pub fn build_acceptance_prompt(
 ) -> String {
     // Delegate to context_only implementation - "full" mode is now deprecated
     build_acceptance_prompt_context_only(
+        change_id,
+        user_prompt,
+        history_context,
+        last_output_context,
+        diff_context,
+    )
+}
+
+pub fn build_acceptance_prompt_with_skill(
+    accept_skill: &str,
+    change_id: &str,
+    user_prompt: &str,
+    history_context: &str,
+    last_output_context: &str,
+    diff_context: &str,
+) -> String {
+    build_acceptance_prompt_context_only_with_skill(
+        accept_skill,
         change_id,
         user_prompt,
         history_context,
@@ -159,7 +221,26 @@ Do not defer commit-path blockers to archive.\n\
 ///
 /// Use this when the fixed acceptance instructions live in the OpenCode command template
 /// and the orchestrator should only inject variable context via `{prompt}`.
+#[allow(dead_code)]
 pub fn build_acceptance_prompt_context_only(
+    change_id: &str,
+    user_prompt: &str,
+    history_context: &str,
+    last_output_context: &str,
+    diff_context: &str,
+) -> String {
+    build_acceptance_prompt_context_only_with_skill(
+        crate::config::defaults::DEFAULT_ACCEPT_SKILL,
+        change_id,
+        user_prompt,
+        history_context,
+        last_output_context,
+        diff_context,
+    )
+}
+
+pub fn build_acceptance_prompt_context_only_with_skill(
+    accept_skill: &str,
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
@@ -168,7 +249,7 @@ pub fn build_acceptance_prompt_context_only(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-accept".to_string());
+    parts.push(format!("load skills: {}", accept_skill));
     parts.push(format!("Acceptance id:{}", change_id));
 
     // Change metadata first so downstream templates can reference it.
@@ -458,6 +539,35 @@ pub(crate) mod tests {
         // Should NOT contain diff context section with actual content
         assert!(!result.contains("Files changed since last acceptance check:"));
         assert!(!result.contains("Previous acceptance findings:"));
+    }
+
+    #[test]
+    fn test_operation_prompt_builders_use_custom_skill_preludes() {
+        let apply =
+            build_apply_prompt_with_skill("team-apply", "change-123", "user", "history", "");
+        assert!(apply.contains("load skills: team-apply"));
+        assert!(!apply.contains("load skills: cflx-apply"));
+
+        let archive =
+            build_archive_prompt_with_skill("team-archive", "change-123", "user", "history");
+        assert!(archive.contains("load skills: team-archive"));
+        assert!(!archive.contains("load skills: cflx-archive"));
+
+        let cleanup = build_cleanup_review_prompt_with_skill("team-cleanup-review", "change-123");
+        assert!(cleanup.contains("load skills: team-cleanup-review"));
+        assert!(!cleanup.contains("load skills: cflx-cleanup-review"));
+
+        let acceptance = build_acceptance_prompt_context_only_with_skill(
+            "cflx-accept-with-speca",
+            "change-123",
+            "user",
+            "history",
+            "last",
+            "diff",
+        );
+        assert!(acceptance.contains("load skills: cflx-accept-with-speca"));
+        assert!(!acceptance.contains("load skills: cflx-accept\n"));
+        assert!(acceptance.contains("change_id: change-123"));
     }
 
     #[test]

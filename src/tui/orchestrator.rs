@@ -451,7 +451,8 @@ pub async fn run_orchestrator(
         let apply_template = agent.config().get_apply_command()?;
         let apply_user_prompt = agent.config().get_apply_prompt();
         let apply_history_context = agent.format_apply_history(&change_id);
-        let apply_full_prompt = crate::agent::build_apply_prompt(
+        let apply_full_prompt = crate::agent::build_apply_prompt_with_skill(
+            agent.config().get_apply_skill(),
             &change_id,
             apply_user_prompt,
             &apply_history_context,

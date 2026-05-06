@@ -22,6 +22,17 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
+  // Operation skill preludes loaded into generated prompts (all optional; shown with defaults)
+  // Example: set accept_skill to "cflx-accept-with-speca" to customize acceptance guidance only.
+  "analyze_skill": "cflx-analyze",
+  "apply_skill": "cflx-apply",
+  "rejecting_skill": "cflx-rejecting",
+  "cleanup_review_skill": "cflx-cleanup-review",
+  "accept_skill": "cflx-accept",
+  // "accept_skill": "cflx-accept-with-speca",
+  "archive_skill": "cflx-archive",
+  "resolve_skill": "cflx-resolve",
+
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
   //"apply_prompt": "",
@@ -96,6 +107,17 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run {prompt}",
 
+  // Operation skill preludes loaded into generated prompts (all optional; shown with defaults)
+  // Example: set accept_skill to "cflx-accept-with-speca" to customize acceptance guidance only.
+  "analyze_skill": "cflx-analyze",
+  "apply_skill": "cflx-apply",
+  "rejecting_skill": "cflx-rejecting",
+  "cleanup_review_skill": "cflx-cleanup-review",
+  "accept_skill": "cflx-accept",
+  // "accept_skill": "cflx-accept-with-speca",
+  "archive_skill": "cflx-archive",
+  "resolve_skill": "cflx-resolve",
+
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
   //"apply_prompt": "",
@@ -169,6 +191,17 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "codex {prompt}",
+
+  // Operation skill preludes loaded into generated prompts (all optional; shown with defaults)
+  // Example: set accept_skill to "cflx-accept-with-speca" to customize acceptance guidance only.
+  "analyze_skill": "cflx-analyze",
+  "apply_skill": "cflx-apply",
+  "rejecting_skill": "cflx-rejecting",
+  "cleanup_review_skill": "cflx-cleanup-review",
+  "accept_skill": "cflx-accept",
+  // "accept_skill": "cflx-accept-with-speca",
+  "archive_skill": "cflx-archive",
+  "resolve_skill": "cflx-resolve",
 
   // System prompt for apply command (user-customizable, injected into {prompt} placeholder)
   // Note: A hardcoded system prompt is always appended after this value
@@ -272,6 +305,20 @@ mod tests {
     }
 
     #[test]
+    fn test_templates_document_operation_skill_keys_and_speca_example() {
+        for template in [CLAUDE_TEMPLATE, OPENCODE_TEMPLATE, CODEX_TEMPLATE] {
+            assert!(template.contains("\"analyze_skill\": \"cflx-analyze\""));
+            assert!(template.contains("\"apply_skill\": \"cflx-apply\""));
+            assert!(template.contains("\"rejecting_skill\": \"cflx-rejecting\""));
+            assert!(template.contains("\"cleanup_review_skill\": \"cflx-cleanup-review\""));
+            assert!(template.contains("\"accept_skill\": \"cflx-accept\""));
+            assert!(template.contains("\"archive_skill\": \"cflx-archive\""));
+            assert!(template.contains("\"resolve_skill\": \"cflx-resolve\""));
+            assert!(template.contains("\"accept_skill\": \"cflx-accept-with-speca\""));
+        }
+    }
+
+    #[test]
     fn test_get_template_content() {
         assert_eq!(get_template_content(Template::Claude), CLAUDE_TEMPLATE);
         assert_eq!(get_template_content(Template::Opencode), OPENCODE_TEMPLATE);
@@ -313,6 +360,8 @@ mod tests {
         assert!(config.apply_command.is_some());
         assert!(config.archive_command.is_some());
         assert!(config.analyze_command.is_some());
+        assert_eq!(config.get_accept_skill(), "cflx-accept");
+        assert_eq!(config.get_resolve_skill(), "cflx-resolve");
         assert!(config.apply_command.unwrap().contains("claude"));
     }
 
@@ -324,6 +373,8 @@ mod tests {
         assert!(config.apply_command.is_some());
         assert!(config.archive_command.is_some());
         assert!(config.analyze_command.is_some());
+        assert_eq!(config.get_accept_skill(), "cflx-accept");
+        assert_eq!(config.get_resolve_skill(), "cflx-resolve");
         assert!(config.apply_command.unwrap().contains("opencode"));
     }
 
@@ -335,6 +386,8 @@ mod tests {
         assert!(config.apply_command.is_some());
         assert!(config.archive_command.is_some());
         assert!(config.analyze_command.is_some());
+        assert_eq!(config.get_accept_skill(), "cflx-accept");
+        assert_eq!(config.get_resolve_skill(), "cflx-resolve");
         assert!(config.apply_command.unwrap().contains("codex"));
     }
 }

@@ -2,7 +2,10 @@
 
 use super::history_ops;
 use super::output::OutputLine;
-use super::prompt::{build_acceptance_prompt, build_apply_prompt, build_archive_prompt};
+use super::prompt::{
+    build_acceptance_prompt_context_only_with_skill, build_acceptance_prompt_with_skill,
+    build_apply_prompt_with_skill, build_archive_prompt_with_skill,
+};
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine};
 use crate::config::defaults::*;
@@ -203,8 +206,13 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt =
-            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
+        let full_prompt = build_apply_prompt_with_skill(
+            self.config.get_apply_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+            &acceptance_tail,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
@@ -251,8 +259,13 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt =
-            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
+        let full_prompt = build_apply_prompt_with_skill(
+            self.config.get_apply_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+            &acceptance_tail,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
@@ -370,7 +383,12 @@ impl AgentRunner {
         let history_context = self.archive_history.format_context(change_id);
 
         // Build full prompt: user_prompt + history_context
-        let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
+        let full_prompt = build_archive_prompt_with_skill(
+            self.config.get_archive_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
@@ -421,7 +439,12 @@ impl AgentRunner {
         let history_context = self.archive_history.format_context(change_id);
 
         // Build full prompt: user_prompt + history_context
-        let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
+        let full_prompt = build_archive_prompt_with_skill(
+            self.config.get_archive_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
@@ -507,8 +530,13 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt =
-            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
+        let full_prompt = build_apply_prompt_with_skill(
+            self.config.get_apply_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+            &acceptance_tail,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
@@ -554,8 +582,13 @@ impl AgentRunner {
         let history_context = self.apply_history.format_context(change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
-        let full_prompt =
-            build_apply_prompt(change_id, user_prompt, &history_context, &acceptance_tail);
+        let full_prompt = build_apply_prompt_with_skill(
+            self.config.get_apply_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+            &acceptance_tail,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
@@ -698,7 +731,8 @@ impl AgentRunner {
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
         // The match is kept for clarity, but both branches produce the same result.
         let full_prompt = match self.config.get_acceptance_prompt_mode() {
-            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
+            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt_with_skill(
+                self.config.get_accept_skill(),
                 change_id,
                 user_prompt,
                 &history_context,
@@ -706,7 +740,8 @@ impl AgentRunner {
                 &diff_context,
             ),
             crate::config::AcceptancePromptMode::ContextOnly => {
-                super::prompt::build_acceptance_prompt_context_only(
+                build_acceptance_prompt_context_only_with_skill(
+                    self.config.get_accept_skill(),
                     change_id,
                     user_prompt,
                     &history_context,
@@ -783,7 +818,8 @@ impl AgentRunner {
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
         // The match is kept for clarity, but both branches produce the same result.
         let full_prompt = match self.config.get_acceptance_prompt_mode() {
-            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
+            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt_with_skill(
+                self.config.get_accept_skill(),
                 change_id,
                 user_prompt,
                 &history_context,
@@ -791,7 +827,8 @@ impl AgentRunner {
                 &diff_context,
             ),
             crate::config::AcceptancePromptMode::ContextOnly => {
-                super::prompt::build_acceptance_prompt_context_only(
+                build_acceptance_prompt_context_only_with_skill(
+                    self.config.get_accept_skill(),
                     change_id,
                     user_prompt,
                     &history_context,
@@ -1010,7 +1047,12 @@ impl AgentRunner {
         let history_context = self.archive_history.format_context(change_id);
 
         // Build full prompt: user_prompt + history_context
-        let full_prompt = build_archive_prompt(change_id, user_prompt, &history_context);
+        let full_prompt = build_archive_prompt_with_skill(
+            self.config.get_archive_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+        );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
