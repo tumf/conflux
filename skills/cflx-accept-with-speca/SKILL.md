@@ -53,23 +53,23 @@ Attempt the official NyxFoundation/speca runner when it is locally available and
 
 Keep all official SPECA runner artifacts outside the target Conflux worktree by default, and namespace generated run artifacts by project/workspace so multiple Conflux projects and concurrent acceptance attempts do not collide:
 
-- Shared SPECA source checkout/cache: `~/tmp/cflx-speca/runner/speca/`
+- Operator-provisioned SPECA source checkout: `$SPECA_CHECKOUT` or `~/services/speca/`
 - Per-attempt SPECA run worktree/copy: `~/tmp/cflx-speca/<workspace-key>/run/<change-id>/<attempt-id>/speca/`
 - Generated Conflux/OpenSpec input bundle: `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/`
 - Official SPECA outputs and logs: `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` or a documented output directory inside the scoped external SPECA workspace
 
-`<workspace-key>` MUST be stable for the target project/workspace and collision-resistant across projects, for example `<repo-basename>-<hash12>` derived from the canonical repository root path, git common directory, or git remote identity. `<attempt-id>` MUST distinguish repeated or concurrent acceptance attempts for the same change, for example a UTC timestamp plus process id or random suffix. Do not put the SPECA source checkout/cache under `<change-id>` or `<attempt-id>`; clone SPECA once into the shared cache and create isolated per-attempt run worktrees/copies from that cache. Do not use global input/output paths keyed only by `<change-id>`, because different projects may use the same OpenSpec change id.
+`<workspace-key>` MUST be stable for the target project/workspace and collision-resistant across projects, for example `<repo-basename>-<hash12>` derived from the canonical repository root path, git common directory, or git remote identity. `<attempt-id>` MUST distinguish repeated or concurrent acceptance attempts for the same change, for example a UTC timestamp plus process id or random suffix. Do not put the SPECA source checkout under `<change-id>` or `<attempt-id>`; use an operator-provisioned checkout and create isolated per-attempt run worktrees/copies from it. Do not use global input/output paths keyed only by `<change-id>`, because different projects may use the same OpenSpec change id.
 
-Do not clone NyxFoundation/speca, write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths unless a separate implementation task explicitly asks for a tracked fixture. Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action for the same workspace file state and git state.
+Do not clone or install NyxFoundation/speca from this acceptance skill. Do not write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths unless a separate implementation task explicitly asks for a tracked fixture. Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action for the same workspace file state and git state.
 
 ### Prerequisite checks before running
 
 Before launching setup or execution, derive or select the scoped external SPECA workspace and verify:
 
 - `uv` is installed and available on `PATH`.
-- The shared checkout path `~/tmp/cflx-speca/runner/speca/` exists, is outside the Conflux worktree, and is a NyxFoundation/speca checkout.
-- The checkout documents the current `scripts/run_phase.py` phases and arguments; installed docs/help win over older examples.
-- Python dependencies are ready, or setup can be run from the scoped SPECA checkout.
+- `$SPECA_CHECKOUT` is set to an existing NyxFoundation/speca checkout, or the default operator-managed checkout `~/services/speca/` exists.
+- The selected checkout is outside the Conflux worktree and documents the current `scripts/run_phase.py` phases and arguments; installed docs/help win over older examples.
+- Python dependencies are ready in that checkout, or `uv sync` can be run there without installing SPECA itself.
 - Required model/API/session/auth access is available for the official runner without asking the user questions or logging secrets.
 
 If any prerequisite is missing, unavailable, unauthenticated, or unsafe, record the limitation in human-readable reasoning and continue with manual SPECA-style property review.
@@ -80,35 +80,26 @@ SPECA setup and execution may be long-running or noisy. Use the current runtime'
 
 Use these concrete commands as the default adapter shape. Replace `<workspace-key>`, `<change-id>`, `<attempt-id>`, `<spec-url>`, `<target-repo-url>`, `<target-commit>`, and `<target-language>` before running.
 
-#### 1. Create or reuse the shared SPECA checkout/cache
+#### 1. Select the operator-provisioned SPECA checkout
 
 ```bash
-mkdir -p "$HOME/tmp/cflx-speca/runner"
-cd "$HOME/tmp/cflx-speca/runner"
-if [ ! -d speca/.git ]; then
-  git clone https://github.com/NyxFoundation/speca.git speca
+SPECA_CHECKOUT="${SPECA_CHECKOUT:-$HOME/services/speca}"
+if [ ! -d "$SPECA_CHECKOUT/.git" ]; then
+  printf 'SPECA checkout not found: %s\n' "$SPECA_CHECKOUT" >&2
+  exit 1
 fi
-cd speca
+cd "$SPECA_CHECKOUT"
 git status --short
 uv sync
 ```
 
-This shared checkout is not scoped by `<workspace-key>`, `<change-id>`, or `<attempt-id>`. Reuse it across Conflux changes; isolate only generated inputs, outputs, logs, and per-attempt working copies.
-
-If Claude Code or MCP setup is missing and the environment allows setup without user input, use the README-documented setup commands from the SPECA checkout:
-
-```bash
-npm install -g @anthropic-ai/claude-code
-bash scripts/setup_mcp.sh
-bash scripts/setup_mcp.sh --verify
-```
-
-If global npm installation, MCP registration, or authentication is not safe or available, skip the official runner and continue with manual SPECA-style review.
+This acceptance skill does not clone, install, or globally configure SPECA. If `$SPECA_CHECKOUT` or `~/services/speca/` is missing, skip the official runner and continue with manual SPECA-style review. Installation, updates, Claude Code CLI setup, MCP registration, and authentication are operator-owned outside this skill.
 
 #### 2. Inspect the installed runner interface
 
 ```bash
-cd "$HOME/tmp/cflx-speca/runner/speca"
+SPECA_CHECKOUT="${SPECA_CHECKOUT:-$HOME/services/speca}"
+cd "$SPECA_CHECKOUT"
 uv run python3 scripts/run_phase.py --help
 ```
 
@@ -120,7 +111,8 @@ Installed help and checked-out scripts are authoritative. Prefer the documented 
 mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/run/<change-id>/<attempt-id>"
 mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>"
 mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>"
-rsync -a --delete --exclude .git "$HOME/tmp/cflx-speca/runner/speca/" "$HOME/tmp/cflx-speca/<workspace-key>/run/<change-id>/<attempt-id>/speca/"
+SPECA_CHECKOUT="${SPECA_CHECKOUT:-$HOME/services/speca}"
+rsync -a --delete --exclude .git "$SPECA_CHECKOUT/" "$HOME/tmp/cflx-speca/<workspace-key>/run/<change-id>/<attempt-id>/speca/"
 cd "$HOME/tmp/cflx-speca/<workspace-key>/run/<change-id>/<attempt-id>/speca"
 uv sync
 ```
@@ -197,13 +189,14 @@ Use only the phases supported by the checked-out runner. Phase meanings from the
 #### 7. Validate the SPECA checkout when diagnosing runner failures
 
 ```bash
-cd "$HOME/tmp/cflx-speca/runner/speca"
+SPECA_CHECKOUT="${SPECA_CHECKOUT:-$HOME/services/speca}"
+cd "$SPECA_CHECKOUT"
 uv run python3 -m pytest tests/ -v --tb=short
 ```
 
 Runner test failure is evidence about runner health only. It is not, by itself, a Conflux acceptance failure unless it reveals a repository-fixable issue in the target Conflux change.
 
-Prepare input/output paths under `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/` and `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree and inside the scoped external SPECA workspace. Do not reclone SPECA per change.
+Prepare input/output paths under `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/` and `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree and inside the scoped external SPECA workspace. Do not clone, install, update, or globally configure SPECA from this acceptance operation.
 
 ### Evidence classification and fallback
 
