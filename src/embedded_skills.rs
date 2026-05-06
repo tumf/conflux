@@ -234,42 +234,54 @@ mod tests {
 
     // --- Prompt ownership drift-detection tests ---
     // These tests verify that the workflow-split ownership boundaries are maintained:
-    // - cflx-accept skill must not duplicate the fixed acceptance procedure
-    // - Rust prompt builders must not contain fixed guidance phrases
-    // - Embedded skills must maintain their documented role boundaries
+    // - cflx-accept skill owns the portable acceptance operation interface
+    // - Rust prompt builders inject variable context rather than provider-specific checklists
+    // - Embedded skills maintain their documented role boundaries
 
-    /// Phrases that belong exclusively to the command template (.opencode/commands/cflx-accept.md).
-    /// If cflx-accept SKILL.md contains these, it means fixed procedure has drifted into the skill.
-    const ACCEPTANCE_FIXED_PROCEDURE_PHRASES: &[&str] = &[
-        "CRITICAL formatting rule:",
-        "Forbidden wrappings",
-        "NO markdown headings",
-        "CRITICAL - When outputting FAIL:",
+    /// Phrases that indicate provider-specific command-template coupling or
+    /// apply-loop mutation workflow details that must not become the portable skill interface.
+    const ACCEPTANCE_PORTABILITY_FORBIDDEN_PHRASES: &[&str] = &[
+        "single source of truth",
+        "command template as authoritative",
+        "command-template contract",
+        "opencode",
+        "OpenCode",
+        "agent-exec run --",
+        "On mini",
         "## Acceptance #",
     ];
 
     #[test]
-    fn test_cflx_accept_skill_does_not_duplicate_fixed_procedure() {
-        // The cflx-accept skill provides operation identity and scoped guidance only.
-        // The fixed acceptance procedure (checklist, verdict formatting rules, FAIL workflow)
-        // must remain in .opencode/commands/cflx-accept.md.
-        for phrase in ACCEPTANCE_FIXED_PROCEDURE_PHRASES {
+    fn test_cflx_accept_skill_defines_portable_contract() {
+        for required in &[
+            "portable Conflux acceptance interface",
+            "agent-runtime independent",
+            "Runtime-specific entrypoints are adapters",
+            "{\"acceptance\":\"pass\"}",
+            "{\"acceptance\":\"fail\",\"findings\":[\"<evidence>\"]}",
+            "{\"acceptance\":\"continue\"}",
+            "{\"acceptance\":\"gated\"}",
+            "ACCEPTANCE: PASS",
+            "ACCEPTANCE: FAIL",
+            "ACCEPTANCE: CONTINUE",
+            "ACCEPTANCE: GATED",
+        ] {
+            assert!(
+                CFLX_ACCEPT_SKILL_MD.contains(required),
+                "cflx-accept SKILL.md must define portable acceptance contract: {required}"
+            );
+        }
+        assert!(
+            !CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
+            "cflx-accept SKILL.md must not require runtime-specific command files for its interface"
+        );
+        for phrase in ACCEPTANCE_PORTABILITY_FORBIDDEN_PHRASES {
             assert!(
                 !CFLX_ACCEPT_SKILL_MD.contains(phrase),
-                "cflx-accept SKILL.md must NOT contain fixed procedure phrase '{}' — \
-                 this belongs in .opencode/commands/cflx-accept.md",
+                "cflx-accept SKILL.md must not contain provider-coupled phrase '{}'",
                 phrase
             );
         }
-    }
-
-    #[test]
-    fn test_cflx_accept_skill_references_command_template() {
-        // The cflx-accept skill must reference the command template as the single source
-        assert!(
-            CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
-            "cflx-accept SKILL.md must reference the command template as single source"
-        );
     }
 
     #[test]
@@ -281,13 +293,28 @@ mod tests {
             .expect("cflx-accept-with-speca must be embedded");
 
         assert_eq!(skill.name, "cflx-accept-with-speca");
+        for required in &[
+            "drop-in replacement for `cflx-accept`",
+            "exact same verdict output interface as `cflx-accept`",
+            "agent-runtime independent",
+            "Runtime-specific entrypoints are adapters",
+            "{\"acceptance\":\"pass\"}",
+            "{\"acceptance\":\"fail\",\"findings\":[\"<evidence>\"]}",
+            "{\"acceptance\":\"continue\"}",
+            "{\"acceptance\":\"gated\"}",
+            "ACCEPTANCE: PASS",
+            "ACCEPTANCE: FAIL",
+            "ACCEPTANCE: CONTINUE",
+            "ACCEPTANCE: GATED",
+        ] {
+            assert!(
+                CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(required),
+                "SPECA acceptance skill must preserve portable cflx-accept interface: {required}"
+            );
+        }
         assert!(
-            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
-            "SPECA acceptance skill must reference the standard command template"
-        );
-        assert!(
-            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("standard `cflx-accept` acceptance contract"),
-            "SPECA acceptance skill must preserve standard acceptance contract ownership"
+            !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
+            "SPECA acceptance skill must not require runtime-specific command files for its interface"
         );
         assert!(
             CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("Derive checkable properties")
@@ -359,7 +386,7 @@ mod tests {
         for required in &[
             "`uv` is installed and available on `PATH`",
             "Python dependencies are ready",
-            "Required Claude/API/session/auth access is available",
+            "Required model/API/session/auth access is available",
             "record the limitation in human-readable reasoning and continue with manual SPECA-style property review",
             "Never treat runner unavailability, setup failure, missing auth, or inconclusive output as an automatic pass",
         ] {
@@ -371,26 +398,37 @@ mod tests {
     }
 
     #[test]
-    fn test_cflx_accept_with_speca_uses_agent_exec_for_long_runner_work() {
-        assert!(
-            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("agent-exec run -- uv sync")
-                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD
-                    .contains("agent-exec run -- uv run python3 scripts/run_phase.py"),
-            "SPECA runner setup/execution examples must use agent-exec run --"
-        );
-        assert!(
-            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("On mini"),
-            "SPECA acceptance skill must document mini-specific observable command guidance"
-        );
+    fn test_cflx_accept_with_speca_documents_runtime_neutral_long_runner_work() {
+        for required in &[
+            "Use the current runtime's standard long-running-command mechanism",
+            "uv sync",
+            "uv run python3 scripts/run_phase.py",
+        ] {
+            assert!(
+                CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(required),
+                "SPECA runner setup/execution guidance must remain runtime-neutral: {required}"
+            );
+        }
+        for forbidden in &[
+            "agent-exec run --",
+            "On mini",
+            "opencode",
+            "OpenCode",
+            "Claude",
+        ] {
+            assert!(
+                !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(forbidden),
+                "SPECA runner guidance must not depend on a specific harness: {forbidden}"
+            );
+        }
     }
 
     #[test]
-    fn test_cflx_accept_with_speca_skill_does_not_duplicate_fixed_procedure() {
-        for phrase in ACCEPTANCE_FIXED_PROCEDURE_PHRASES {
+    fn test_cflx_accept_with_speca_skill_remains_portable() {
+        for phrase in ACCEPTANCE_PORTABILITY_FORBIDDEN_PHRASES {
             assert!(
                 !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(phrase),
-                "cflx-accept-with-speca SKILL.md must NOT contain fixed procedure phrase '{}' — \
-                 this belongs in .opencode/commands/cflx-accept.md",
+                "cflx-accept-with-speca SKILL.md must not contain provider-coupled phrase '{}'",
                 phrase
             );
         }
@@ -430,8 +468,8 @@ mod tests {
     #[test]
     fn test_rust_prompt_builder_does_not_contain_acceptance_checklist() {
         // The ARCHIVE_READINESS_CONTEXT is the only fixed content the Rust prompt builder
-        // injects. Verify it doesn't contain acceptance checklist items that belong
-        // to the command template.
+        // injects. Verify it doesn't contain the portable acceptance checklist
+        // owned by the acceptance operation skill or runtime-specific adapters.
         let archive_ctx = crate::agent::prompt::tests::get_archive_readiness_context();
         let checklist_phrases = [
             "Output format (output exactly ONCE",
@@ -442,8 +480,7 @@ mod tests {
         for phrase in &checklist_phrases {
             assert!(
                 !archive_ctx.contains(phrase),
-                "ARCHIVE_READINESS_CONTEXT must NOT contain acceptance checklist phrase '{}' — \
-                 this belongs in .opencode/commands/cflx-accept.md",
+                "ARCHIVE_READINESS_CONTEXT must NOT contain acceptance checklist phrase '{}'",
                 phrase
             );
         }
@@ -452,7 +489,7 @@ mod tests {
     #[test]
     fn test_acceptance_verdict_contract_consistency() {
         // Verify canonical verdict markers are documented consistently
-        // across the parser, the command template reference, and the cflx-workflow skill.
+        // across the parser, OpenCode adapter reference, and the cflx-workflow skill.
         let canonical_markers = [
             "ACCEPTANCE: PASS",
             "ACCEPTANCE: FAIL",

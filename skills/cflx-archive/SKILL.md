@@ -25,8 +25,7 @@ following contract:
 
 - **Primary**: strict JSON verdict object
   (`{"acceptance":"pass|fail|continue|gated", "findings":[...]}`) on its
-  own line, possibly wrapped inside an `opencode run --format json` event
-  payload.
+  own line, possibly wrapped inside a supported agent event payload that the runtime can unwrap.
 - **Fallback**: legacy standalone plain-text markers (`ACCEPTANCE: PASS`,
   `ACCEPTANCE: FAIL`, `ACCEPTANCE: CONTINUE`, `ACCEPTANCE: GATED`) remain
   supported so older runs continue to hand off, but JSON wins when both are

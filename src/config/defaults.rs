@@ -66,8 +66,8 @@ All file paths should be relative to the repository root.
 /// Default prompt for archive command - empty by default
 pub const DEFAULT_ARCHIVE_PROMPT: &str = "";
 
-/// Acceptance system prompt - now empty to enforce template-only approach.
-/// All acceptance instructions must come from the command template (e.g., .opencode/commands/cflx-accept.md).
+/// Acceptance system prompt - now empty to keep runtime prompts context-only.
+/// Acceptance operation guidance comes from the selected portable accept_skill.
 /// The acceptance_prompt_mode "full" is now deprecated and behaves identically to "context_only".
 #[allow(dead_code)]
 pub const ACCEPTANCE_SYSTEM_PROMPT: &str = "";
@@ -634,11 +634,11 @@ mod tests {
 
     #[test]
     fn test_acceptance_system_prompt_is_empty() {
-        // After template-only refactoring, ACCEPTANCE_SYSTEM_PROMPT should be empty.
-        // All acceptance instructions must come from the command template.
+        // ACCEPTANCE_SYSTEM_PROMPT should stay empty so runtime prompts remain context-only.
+        // Acceptance guidance comes from the selected portable accept_skill.
         assert!(
             ACCEPTANCE_SYSTEM_PROMPT.is_empty(),
-            "ACCEPTANCE_SYSTEM_PROMPT should be empty to enforce template-only approach"
+            "ACCEPTANCE_SYSTEM_PROMPT should be empty to keep acceptance prompts context-only"
         );
     }
 
