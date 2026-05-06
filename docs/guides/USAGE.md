@@ -26,6 +26,8 @@ cflx init --template codex
 cflx init --force
 ```
 
+For a full reference of `.cflx.jsonc` and `~/.config/cflx/config.jsonc`, see [CONFIG.md](./CONFIG.md).
+
 ### 3. Launch the TUI (Default)
 
 The primary interface is the interactive TUI dashboard:
