@@ -155,6 +155,7 @@ fn test_embedded_install_without_skills_dir() {
         "cflx-rejecting",
         "cflx-cleanup-review",
         "cflx-accept",
+        "cflx-accept-with-speca",
         "cflx-archive",
         "cflx-resolve",
     ];

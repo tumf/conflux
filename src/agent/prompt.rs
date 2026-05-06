@@ -177,6 +177,7 @@ pub fn build_acceptance_prompt(
 ) -> String {
     // Delegate to context_only implementation - "full" mode is now deprecated
     build_acceptance_prompt_context_only(
+        crate::config::defaults::DEFAULT_ACCEPT_SKILL,
         change_id,
         user_prompt,
         history_context,
@@ -223,6 +224,7 @@ Do not defer commit-path blockers to archive.\n\
 /// and the orchestrator should only inject variable context via `{prompt}`.
 #[allow(dead_code)]
 pub fn build_acceptance_prompt_context_only(
+    _accept_skill: &str,
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
@@ -510,6 +512,22 @@ pub(crate) mod tests {
             user_pos < history_pos,
             "User prompt should come before history context"
         );
+    }
+
+    #[test]
+    fn test_build_acceptance_prompt_context_only_uses_configured_accept_skill() {
+        let result = build_acceptance_prompt_context_only(
+            "cflx-accept-with-speca",
+            "test-change",
+            "",
+            "",
+            "",
+            "",
+        );
+
+        assert!(result.contains("load skills: cflx-accept-with-speca"));
+        assert!(!result.contains("load skills: cflx-accept\n"));
+        assert!(result.contains("Acceptance id:test-change"));
     }
 
     #[test]

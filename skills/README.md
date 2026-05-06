@@ -21,6 +21,7 @@ Conflux uses a **router + per-operation skill** architecture. New orchestrator p
         │  cflx-rejecting→ Rejection review   │
         │  cflx-cleanup-review → Cleanup      │
         │  cflx-accept   → Acceptance review  │
+        │  cflx-accept-with-speca → SPECA lens│
         │  cflx-archive  → Finalization       │
         │  cflx-resolve  → Conflict resolution│
         └─────────────────────────────────────┘
@@ -58,10 +59,21 @@ Most of these skills are loaded directly by the orchestrator. `cflx-rejection-gu
 | `cflx-rejection-guide` | operator guide | Explain how to handle rejected vs blocked changes |
 | `cflx-cleanup-review` | cleanup-review | Post-apply worktree cleanup |
 | `cflx-accept` | accept | Acceptance review (operation identity) |
+| `cflx-accept-with-speca` | accept | Acceptance review with SPECA-style property/proof-attempt lens |
 | `cflx-archive` | archive | Finalize deployed changes |
 | `cflx-resolve` | resolve | Merge conflict resolution |
 
 The orchestrator-loaded operation skills are autonomous (cannot ask questions) and are called by the orchestration system. `cflx-rejection-guide` is intended for direct human/operator guidance.
+
+When configurable operation skills are available, select the SPECA acceptance lens with:
+
+```jsonc
+{
+  "accept_skill": "cflx-accept-with-speca"
+}
+```
+
+This changes only the acceptance prompt prelude (`load skills: cflx-accept-with-speca`); it does not require changing `acceptance_command` or the acceptance verdict parser.
 
 ### cflx-workflow (Compatibility Router)
 
@@ -88,6 +100,7 @@ This installs all bundled skills:
 - `cflx-rejection-guide` - Operator guidance for rejected vs blocked changes
 - `cflx-cleanup-review` - Post-apply cleanup
 - `cflx-accept` - Acceptance review identity
+- `cflx-accept-with-speca` - Acceptance review with SPECA-style property checks
 - `cflx-archive` - Change archival
 - `cflx-resolve` - Conflict resolution
 

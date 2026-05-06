@@ -176,38 +176,38 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub archive_command: Option<String>,
 
+    /// Operation skill loaded for apply prompts.
+    #[serde(default)]
+    pub apply_skill: Option<String>,
+
+    /// Operation skill loaded for archive prompts.
+    #[serde(default)]
+    pub archive_skill: Option<String>,
+
+    /// Operation skill loaded for dependency-analysis prompts.
+    #[serde(default)]
+    pub analyze_skill: Option<String>,
+
+    /// Operation skill loaded for acceptance prompts.
+    #[serde(default)]
+    pub accept_skill: Option<String>,
+
+    /// Operation skill loaded for rejecting-review prompts.
+    #[serde(default)]
+    pub rejecting_skill: Option<String>,
+
+    /// Operation skill loaded for cleanup-review prompts.
+    #[serde(default)]
+    pub cleanup_review_skill: Option<String>,
+
+    /// Operation skill loaded for resolve prompts.
+    #[serde(default)]
+    pub resolve_skill: Option<String>,
+
     /// Command template for dependency analysis.
     /// Supports `{prompt}` placeholder.
     #[serde(default)]
     pub analyze_command: Option<String>,
-
-    /// Skill prelude for dependency analysis prompts.
-    #[serde(default)]
-    pub analyze_skill: Option<String>,
-
-    /// Skill prelude for apply prompts.
-    #[serde(default)]
-    pub apply_skill: Option<String>,
-
-    /// Skill prelude for rejecting-review prompts.
-    #[serde(default)]
-    pub rejecting_skill: Option<String>,
-
-    /// Skill prelude for cleanup-review prompts.
-    #[serde(default)]
-    pub cleanup_review_skill: Option<String>,
-
-    /// Skill prelude for acceptance prompts.
-    #[serde(default)]
-    pub accept_skill: Option<String>,
-
-    /// Skill prelude for archive prompts.
-    #[serde(default)]
-    pub archive_skill: Option<String>,
-
-    /// Skill prelude for conflict-resolution prompts.
-    #[serde(default)]
-    pub resolve_skill: Option<String>,
 
     /// Command template for acceptance testing after apply.
     /// Supports `{change_id}` and `{prompt}` placeholders.
@@ -677,6 +677,27 @@ impl OrchestratorConfig {
         if other.archive_command.is_some() {
             self.archive_command = other.archive_command;
         }
+        if other.apply_skill.is_some() {
+            self.apply_skill = other.apply_skill;
+        }
+        if other.archive_skill.is_some() {
+            self.archive_skill = other.archive_skill;
+        }
+        if other.analyze_skill.is_some() {
+            self.analyze_skill = other.analyze_skill;
+        }
+        if other.accept_skill.is_some() {
+            self.accept_skill = other.accept_skill;
+        }
+        if other.rejecting_skill.is_some() {
+            self.rejecting_skill = other.rejecting_skill;
+        }
+        if other.cleanup_review_skill.is_some() {
+            self.cleanup_review_skill = other.cleanup_review_skill;
+        }
+        if other.resolve_skill.is_some() {
+            self.resolve_skill = other.resolve_skill;
+        }
         if other.analyze_command.is_some() {
             self.analyze_command = other.analyze_command;
         }
@@ -685,29 +706,6 @@ impl OrchestratorConfig {
         }
         if other.resolve_command.is_some() {
             self.resolve_command = other.resolve_command;
-        }
-
-        // Operation skill fields
-        if other.analyze_skill.is_some() {
-            self.analyze_skill = other.analyze_skill;
-        }
-        if other.apply_skill.is_some() {
-            self.apply_skill = other.apply_skill;
-        }
-        if other.rejecting_skill.is_some() {
-            self.rejecting_skill = other.rejecting_skill;
-        }
-        if other.cleanup_review_skill.is_some() {
-            self.cleanup_review_skill = other.cleanup_review_skill;
-        }
-        if other.accept_skill.is_some() {
-            self.accept_skill = other.accept_skill;
-        }
-        if other.archive_skill.is_some() {
-            self.archive_skill = other.archive_skill;
-        }
-        if other.resolve_skill.is_some() {
-            self.resolve_skill = other.resolve_skill;
         }
 
         // Prompt fields

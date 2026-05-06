@@ -28,6 +28,8 @@ const CFLX_REJECTION_GUIDE_REF: &str =
     include_str!("../skills/cflx-rejection-guide/references/guide.md");
 const CFLX_CLEANUP_REVIEW_SKILL_MD: &str = include_str!("../skills/cflx-cleanup-review/SKILL.md");
 const CFLX_ACCEPT_SKILL_MD: &str = include_str!("../skills/cflx-accept/SKILL.md");
+const CFLX_ACCEPT_WITH_SPECA_SKILL_MD: &str =
+    include_str!("../skills/cflx-accept-with-speca/SKILL.md");
 #[cfg(test)]
 const CFLX_ACCEPT_COMMAND_MD: &str = include_str!("../.opencode/commands/cflx-accept.md");
 const CFLX_ARCHIVE_SKILL_MD: &str = include_str!("../skills/cflx-archive/SKILL.md");
@@ -68,6 +70,7 @@ pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
     let cleanup_review = register_embedded_skill(CFLX_CLEANUP_REVIEW_SKILL_MD, &[])?;
 
     let accept = register_embedded_skill(CFLX_ACCEPT_SKILL_MD, &[])?;
+    let accept_with_speca = register_embedded_skill(CFLX_ACCEPT_WITH_SPECA_SKILL_MD, &[])?;
 
     let archive = register_embedded_skill(
         CFLX_ARCHIVE_SKILL_MD,
@@ -86,6 +89,7 @@ pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
         rejection_guide,
         cleanup_review,
         accept,
+        accept_with_speca,
         archive,
         resolve,
     ])
@@ -98,7 +102,7 @@ mod tests {
     #[test]
     fn test_embedded_skills_count() {
         let skills = get_cflx_embedded_skills().expect("Failed to get embedded skills");
-        assert_eq!(skills.len(), 11, "Expected exactly 11 embedded skills");
+        assert_eq!(skills.len(), 12, "Expected exactly 12 embedded skills");
     }
 
     #[test]
@@ -115,6 +119,7 @@ mod tests {
             "cflx-rejection-guide",
             "cflx-cleanup-review",
             "cflx-accept",
+            "cflx-accept-with-speca",
             "cflx-archive",
             "cflx-resolve",
         ];
@@ -215,6 +220,7 @@ mod tests {
             "cflx-rejection-guide",
             "cflx-cleanup-review",
             "cflx-accept",
+            "cflx-accept-with-speca",
             "cflx-resolve",
         ] {
             let skill = skills.iter().find(|s| s.name == *name).unwrap();
@@ -264,6 +270,77 @@ mod tests {
             CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
             "cflx-accept SKILL.md must reference the command template as single source"
         );
+    }
+
+    #[test]
+    fn test_cflx_accept_with_speca_skill_contract() {
+        let skills = get_cflx_embedded_skills().unwrap();
+        let skill = skills
+            .iter()
+            .find(|s| s.name == "cflx-accept-with-speca")
+            .expect("cflx-accept-with-speca must be embedded");
+
+        assert_eq!(skill.name, "cflx-accept-with-speca");
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
+            "SPECA acceptance skill must reference the standard command template"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("standard `cflx-accept` acceptance contract"),
+            "SPECA acceptance skill must preserve standard acceptance contract ownership"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("Derive checkable properties")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("Attempt proof or falsification"),
+            "SPECA acceptance skill must include property derivation and proof-attempt guidance"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("standard JSON `fail` verdict")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("findings"),
+            "SPECA acceptance skill must map blocking property failures to standard fail findings"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("unavailable SPECA tooling")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD
+                    .contains("Never treat unavailable SPECA tooling as an automatic pass"),
+            "SPECA acceptance skill must define fallback behavior when tooling is unavailable"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("Do not ask the user questions"),
+            "SPECA acceptance skill must remain autonomous"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("out-of-worktree durable"),
+            "SPECA acceptance skill must preserve workspace-local workflow-control constraints"
+        );
+    }
+
+    #[test]
+    fn test_cflx_accept_with_speca_skill_does_not_duplicate_fixed_procedure() {
+        for phrase in ACCEPTANCE_FIXED_PROCEDURE_PHRASES {
+            assert!(
+                !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(phrase),
+                "cflx-accept-with-speca SKILL.md must NOT contain fixed procedure phrase '{}' — \
+                 this belongs in .opencode/commands/cflx-accept.md",
+                phrase
+            );
+        }
+    }
+
+    #[test]
+    fn test_cflx_accept_with_speca_skill_has_no_speca_terminal_protocol() {
+        for forbidden in &[
+            "SPECA: PASS",
+            "SPECA: FAIL",
+            "SPECA: CONTINUE",
+            "SPECA: GATED",
+        ] {
+            assert!(
+                !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(forbidden),
+                "cflx-accept-with-speca must not introduce terminal protocol '{}'",
+                forbidden
+            );
+        }
     }
 
     #[test]
