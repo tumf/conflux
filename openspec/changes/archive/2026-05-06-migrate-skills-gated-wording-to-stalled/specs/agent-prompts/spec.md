@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
