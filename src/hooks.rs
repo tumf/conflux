@@ -2109,6 +2109,7 @@ mod tests {
         assert_eq!(hook.max_retries, 0);
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_on_merged_lock_preflight_logs_not_present_to_event_sink() {
         // When no .git/index.lock exists, wait returns immediately
@@ -2132,6 +2133,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_on_merged_lock_preflight_logs_release_to_event_sink() {
         // Lock file is released within wait period
@@ -2175,6 +2177,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "heavy-tests")]
     #[tokio::test]
     async fn test_on_merged_lock_preflight_logs_timeout_to_event_sink() {
         // Lock file persists beyond timeout

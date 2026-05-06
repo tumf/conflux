@@ -79,7 +79,12 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
         ),
         (
             "src/hooks.rs",
-            &["test_hook_runner_timeout", "test_index_lock_wait_timeout"],
+            &[
+                "test_hook_runner_timeout",
+                "test_on_merged_lock_preflight_logs_not_present_to_event_sink",
+                "test_on_merged_lock_preflight_logs_release_to_event_sink",
+                "test_on_merged_lock_preflight_logs_timeout_to_event_sink",
+            ],
         ),
     ];
 
