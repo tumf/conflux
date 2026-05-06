@@ -229,7 +229,7 @@ pub struct OrchestratorConfig {
     /// - context_only: only include change metadata + diff/history context
     ///
     /// The "full" mode is now deprecated and unified with "context_only".
-    /// All acceptance instructions must come from the command template.
+    /// Acceptance operation guidance comes from the selected portable accept_skill.
     #[serde(default)]
     pub acceptance_prompt_mode: Option<AcceptancePromptMode>,
 
@@ -642,8 +642,8 @@ pub enum AcceptancePromptMode {
     /// Kept for backward compatibility.
     #[default]
     Full,
-    /// Only inject variable context (change metadata, diff, history).
-    /// Fixed acceptance instructions come from the command template.
+    /// Only inject selected skill prelude and variable context (change metadata, diff, history).
+    /// Acceptance guidance comes from the selected portable accept_skill.
     ContextOnly,
 }
 

@@ -159,7 +159,7 @@ pub fn parse_cleanup_review_output(output: &str) -> bool {
 /// Build acceptance prompt from user prompt and history context
 ///
 /// Now unified with context_only mode - no embedded system prompt.
-/// All fixed instructions must come from the command template.
+/// Acceptance operation guidance comes from the selected portable accept_skill.
 ///
 /// The prompt is constructed as:
 /// 1. change metadata (change_id and paths)
@@ -220,8 +220,8 @@ Do not defer commit-path blockers to archive.\n\
 
 /// Build acceptance prompt context without the hardcoded system prompt.
 ///
-/// Use this when the fixed acceptance instructions live in the OpenCode command template
-/// and the orchestrator should only inject variable context via `{prompt}`.
+/// Use this when the orchestrator should inject only the selected skill prelude
+/// and variable context via `{prompt}`.
 #[allow(dead_code)]
 pub fn build_acceptance_prompt_context_only(
     _accept_skill: &str,

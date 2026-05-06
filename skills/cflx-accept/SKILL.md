@@ -1,21 +1,19 @@
 ---
 name: cflx-accept
-description: Operation identity and scoped guidance for Conflux acceptance review. The fixed acceptance procedure remains defined by the .opencode/commands/cflx-accept.md command template. CRITICAL - This skill CANNOT ask questions or request user input.
+description: Portable Conflux acceptance operation skill. Defines the JSON-primary verdict interface and autonomous acceptance review guidance for any agent runtime. CRITICAL - This skill CANNOT ask questions or request user input.
 ---
 
-# Conflux Acceptance Review (Operation Identity)
+# Conflux Acceptance Review
 
-Provides operation identity and scoped acceptance guidance for Conflux orchestrator prompts.
+Provides portable operation identity, verdict interface, and scoped acceptance guidance for Conflux orchestrator prompts.
 
 **CRITICAL**: This skill CANNOT ask questions to users. All decisions must be made autonomously based on available context.
 
 ## Purpose
 
-This skill identifies the current operation as acceptance review and provides scoped guidance. The fixed acceptance procedure (checklist, verdict workflow, output format) remains defined by `.opencode/commands/cflx-accept.md` as the single source of truth.
+This skill identifies the current operation as acceptance review and defines the portable Conflux acceptance interface. It is agent-runtime independent and may be loaded by any supported agent runtime. Runtime-specific entrypoints are adapters that may mirror this contract, but they are not the authoritative interface for this skill.
 
 If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat it as higher-priority project law than proposal/spec deltas when judging correctness.
-
-This skill does NOT replace the command template. It supplements the orchestrator prompt with operation identity so the agent knows which operation mode it is in.
 
 ## Operation Identity
 
@@ -33,11 +31,7 @@ machine-readable payload, on its own line:
 - CONTINUE: `{"acceptance":"continue"}`
 - STALLED HOLD (compatibility token): `{"acceptance":"gated"}`
 
-The JSON verdict is the canonical machine-readable contract. The runtime
-parser resolves it with priority over the legacy plain-text marker, including
-when the JSON verdict is wrapped inside an `opencode run --format json`
-assistant/result event payload (the runtime unwraps the text and matches the
-JSON verdict inside it).
+The JSON verdict is the canonical machine-readable contract. The Conflux runtime parser resolves it with priority over the legacy plain-text marker, including when the JSON verdict is wrapped inside a supported agent event payload and the runtime can unwrap the text. Do not rely on a specific agent runtime for this behavior.
 
 **Fallback (backward-compatible)** — older runs still recognize the legacy
 standalone plain-text markers on their own line:
@@ -59,9 +53,7 @@ with no markdown wrapping. Newer runtimes resolve the JSON verdict first
 and finalize; older runtimes still finalize on the legacy marker. The
 canonical contract remains JSON-primary.
 
-The full verdict contract (forbidden wrappings, findings format, retry
-semantics) is owned by `.opencode/commands/cflx-accept.md`; this skill MUST
-NOT redefine it.
+Do not emit alternate schemas, extra machine-readable verdict objects, or provider-specific terminal markers.
 
 ## Scoped Guidance
 
@@ -110,9 +102,9 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
   - Stalled hold via compatibility token `{"acceptance":"gated"}`: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, or missing upstream constraint resolution).
 - For behavior-changing work, missing/ambiguous verification planning is FAIL (not CONTINUE)
 
-## Single-Source Constraint
+## Portable Interface Constraint
 
-The fixed acceptance procedure MUST remain defined by `.opencode/commands/cflx-accept.md`. This skill MUST NOT duplicate or override that command template's checklist, verdict workflow, or output format rules.
+This operation skill owns a portable acceptance interface for Conflux agents. Runtime-specific entrypoints may mirror this interface, but this skill MUST NOT require an agent to inspect runtime-specific command directories or be invoked through a particular command mechanism in order to produce the correct verdict.
 
 ## Built-in Tools
 

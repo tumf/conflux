@@ -185,17 +185,17 @@ acceptance プロンプトは、サブエージェントが利用できない場
 - **WHEN** acceptance プロンプトに従って検証を開始する
 - **THEN** 同等のチェックを逐次で完了する手順が提示される
 
-### Requirement: Acceptance 固定手順は単一ソースでなければならない
-acceptance の固定手順は一箇所に集約されなければならない（MUST）。
-固定手順を OpenCode コマンドテンプレート（例: `.opencode/commands/cflx-accept.md`）に置く場合、オーケストレーターは `{prompt}` に固定手順を含めず、可変コンテキストのみを渡さなければならない（MUST）。
-acceptance の埋め込みシステムプロンプトは使用してはならず（MUST NOT）、固定手順はコマンドテンプレートからのみ供給される（MUST）。
+### Requirement: Acceptance guidance MUST use portable operation skills
+acceptance の固定インターフェイスと操作ガイダンスは agent runtime 非依存の operation skill から供給されなければならない（MUST）。
+Runtime-specific entrypoint は adapter として同じ contract を反映してよいが、acceptance skill が特定ランタイムのコマンドディレクトリや呼び出し形式に依存してはならない（MUST NOT）。
+acceptance の埋め込みシステムプロンプトは使用してはならず（MUST NOT）、オーケストレーターは `{prompt}` に選択された acceptance skill prelude と可変コンテキストのみを渡さなければならない（MUST）。
 acceptance_prompt_mode の `full` は互換エイリアスとして扱い、`context_only` と同じ挙動になる（MUST）。
 
 #### Scenario: cflx-accept を使用する場合は context_only を採用する
-- **GIVEN** acceptance_command が `/cflx-accept {change_id} {prompt}` を使用する
+- **GIVEN** acceptance_command が `{prompt}` を受け取る任意の agent runtime entrypoint を使用する
 - **WHEN** acceptance プロンプトを構築する
-- **THEN** `{prompt}` は change_id とパス、diff/履歴などの可変コンテキストのみを含む
-- **AND** 固定の acceptance 手順は `.opencode/commands/cflx-accept.md` のみから供給される
+- **THEN** `{prompt}` は `load skills: <accept_skill>`、change_id とパス、diff/履歴などの可変コンテキストのみを含む
+- **AND** portable acceptance verdict interface は選択された acceptance skill から供給される
 
 #### Scenario: full 指定でも固定手順は注入されない
 - **GIVEN** acceptance_prompt_mode が `full` に設定されている
@@ -467,18 +467,19 @@ The dedicated `cflx-analyze` skill MUST define the allowed dependency target set
 - **THEN** the authoritative guidance from `cflx-analyze` states that `dependencies` may reference only queued change IDs and explicit in-flight change IDs
 - **AND** it forbids returning unrelated active/repo-local change IDs as dependency targets
 
-### Requirement: cflx-accept MUST preserve acceptance command-template single source
+### Requirement: cflx-accept MUST define a portable acceptance skill interface
 
-The dedicated `cflx-accept` skill MAY provide operation identity and scoped acceptance guidance, but it MUST NOT become the primary source of fixed acceptance procedure. The fixed acceptance procedure MUST remain defined by `.opencode/commands/cflx-accept.md`, and the acceptance output contract MUST be stated in a machine-readable form that is consistent with runtime verdict parsing and regression tests.
+The dedicated `cflx-accept` skill MUST provide operation identity, scoped acceptance guidance, and the portable acceptance verdict output interface without requiring a specific agent runtime or command template. Runtime-specific entrypoints MAY mirror this interface as adapters, but they MUST NOT be the authoritative source that an acceptance skill must inspect to produce a correct verdict.
 
 The primary acceptance verdict contract MUST be a strict JSON object emitted as the final machine-readable verdict payload. The runtime MAY continue to accept legacy plain-text standalone lines such as `ACCEPTANCE: PASS` as a backward-compatible fallback, but canonical guidance MUST prefer the JSON contract.
 
-#### Scenario: command template defines JSON-primary verdict contract
+#### Scenario: cflx-accept defines JSON-primary verdict contract
 
 - **GIVEN** the acceptance prompt loads `cflx-accept`
-- **WHEN** the command template describes the final verdict format
+- **WHEN** the skill describes the final verdict format
 - **THEN** it defines a strict JSON verdict object as the primary machine-readable contract
 - **AND** it documents plain-text standalone verdict markers only as backward-compatible fallback guidance
+- **AND** it does not require runtime-specific command files or a particular command invocation mechanism to describe the verdict interface
 
 #### Scenario: repo-local acceptance skills follow the same contract
 
@@ -486,6 +487,7 @@ The primary acceptance verdict contract MUST be a strict JSON object emitted as 
 - **WHEN** they describe acceptance output expectations
 - **THEN** they reference the same JSON-primary verdict contract
 - **AND** they do not redefine a conflicting text-only canonical output rule
+- **AND** they do not treat runtime-specific command templates as the authoritative source for the skill interface
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
@@ -542,7 +544,7 @@ Selecting a different operation skill MUST NOT duplicate fixed operation procedu
 
 #### Scenario: acceptance prompt keeps context-only payload
 
-- **GIVEN** acceptance_command uses `/cflx-accept {change_id} {prompt}`
+- **GIVEN** acceptance_command passes `{prompt}` to an agent runtime
 - **AND** the effective `accept_skill` is `cflx-accept-with-speca`
 - **WHEN** acceptance prompt construction builds the `{prompt}` payload
 - **THEN** the payload contains `load skills: cflx-accept-with-speca`
@@ -584,7 +586,7 @@ The orchestrator MUST include a built-in `cflx-accept-with-speca` skill that can
 
 The `cflx-accept-with-speca` skill MUST preserve the Conflux acceptance verdict contract. It MUST produce exactly one final machine-readable acceptance verdict using the existing `pass`, `fail`, `continue`, or current stalled-hold compatibility token `gated` outcomes, with actionable `findings` for fail outcomes. It MUST NOT introduce a SPECA-specific verdict protocol or instruct `{"acceptance":"stalled"}` before parser support exists.
 
-The skill MUST treat `.opencode/commands/cflx-accept.md` and the standard `cflx-accept` acceptance contract as the authoritative source for fixed checks and final verdict formatting.
+The skill MUST be a drop-in replacement for `cflx-accept` as an acceptance operation skill. It MUST expose the exact same portable verdict output interface as `cflx-accept`; the SPECA lens may add review steps, reasoning, and findings, but MUST NOT change the output schema, accepted outcomes, retry semantics, or final machine-readable verdict format. It MUST NOT require runtime-specific command files or a particular command invocation mechanism to describe or emit the correct verdict.
 
 The skill SHOULD guide acceptance review to derive or select SPECA-style properties from OpenSpec deltas, task claims, changed files, and constitution constraints; perform a property-grounded proof attempt when tooling and context are available; and map blocking property failures into the existing acceptance verdict format.
 

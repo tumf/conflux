@@ -1,6 +1,6 @@
 ---
 name: cflx-accept-with-speca
-description: Conflux acceptance review with an additional SPECA-style property/proof-attempt lens. Preserves the .opencode/commands/cflx-accept.md verdict contract and cannot ask questions or request user input.
+description: Portable Conflux acceptance review with an additional SPECA-style property/proof-attempt lens. Drop-in compatible with cflx-accept and cannot ask questions or request user input.
 ---
 
 # Conflux Acceptance Review with SPECA Lens
@@ -11,7 +11,9 @@ Use this skill when the acceptance operation should add SPECA-style property rev
 
 ## Purpose
 
-This skill adds a property-oriented falsification pass to Conflux acceptance. It does not replace standard acceptance. The fixed acceptance checks, verdict workflow, and final machine-readable verdict format remain owned by `.opencode/commands/cflx-accept.md` and the standard `cflx-accept` acceptance contract.
+This skill is a drop-in replacement for `cflx-accept` as a Conflux acceptance operation skill. It adds a property-oriented falsification pass to Conflux acceptance without changing the portable verdict output interface, accepted outcomes, retry semantics, or workflow-control meaning.
+
+This skill is agent-runtime independent and may be loaded by any supported agent runtime. Runtime-specific entrypoints are adapters that may mirror the Conflux acceptance contract, but they are not required for this skill to produce a correct verdict.
 
 If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat it as higher-priority project law than proposal/spec deltas when judging correctness.
 
@@ -20,13 +22,28 @@ If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat
 - **Mode**: Acceptance review
 - **Additional lens**: SPECA-style property derivation and proof/falsification attempt
 - **Goal**: Verify that implementation evidence satisfies OpenSpec requirements, task claims, and derived properties
-- **Output**: Use the existing Conflux acceptance verdict contract exactly as defined by `.opencode/commands/cflx-accept.md`
+- **Output**: Use the exact same verdict output interface as `cflx-accept`
 
-## Single-Source Verdict Constraint
+## Portable Verdict Interface Constraint
 
-`.opencode/commands/cflx-accept.md` is the single source of truth for fixed acceptance procedure, checklist ownership, retry semantics, and final verdict formatting. This skill MUST NOT redefine that protocol.
+This skill MUST expose the exact same verdict output interface as `cflx-accept`. The SPECA lens may add reasoning and findings, but MUST NOT change the output schema, accepted outcomes, retry semantics, or final machine-readable verdict format.
 
-Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the command-template contract. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker or alternate verdict line.
+Primary verdict:
+
+- PASS:     `{"acceptance":"pass"}`
+- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
+- CONTINUE: `{"acceptance":"continue"}`
+- GATED:    `{"acceptance":"gated"}`
+
+Backward-compatible fallback markers:
+
+- `ACCEPTANCE: PASS`
+- `ACCEPTANCE: FAIL`
+- `ACCEPTANCE: CONTINUE`
+- `ACCEPTANCE: GATED`
+- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
+
+Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the command-template contract. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
 
 ## Official NyxFoundation/speca Runner Adapter (Optional)
 
@@ -53,17 +70,17 @@ Before launching setup or execution, derive or select the scoped external SPECA 
 - The scoped checkout path `~/tmp/cflx-speca/<workspace-key>/runner/speca/` exists, is outside the Conflux worktree, and is a NyxFoundation/speca checkout.
 - The checkout documents the current `scripts/run_phase.py` phases and arguments; installed docs/help win over older examples.
 - Python dependencies are ready, or setup can be run from the scoped SPECA checkout.
-- Required Claude/API/session/auth access is available for the official runner without asking the user questions or logging secrets.
+- Required model/API/session/auth access is available for the official runner without asking the user questions or logging secrets.
 
 If any prerequisite is missing, unavailable, unauthenticated, or unsafe, record the limitation in human-readable reasoning and continue with manual SPECA-style property review.
 
-### Observable setup and runner execution on mini
+### Observable setup and runner execution
 
-SPECA setup and execution may be long-running or noisy. On mini, run those commands through `agent-exec run -- ...` so progress remains observable and context-efficient. Run from the scoped external SPECA checkout, not from the Conflux worktree. Examples:
+SPECA setup and execution may be long-running or noisy. Use the current runtime's standard long-running-command mechanism when available so progress remains observable and context-efficient. Run from the scoped external SPECA checkout, not from the Conflux worktree. Example command shapes:
 
 ```bash
-agent-exec run -- uv sync
-agent-exec run -- uv run python3 scripts/run_phase.py ...
+uv sync
+uv run python3 scripts/run_phase.py ...
 ```
 
 Replace `...` with the phase and arguments supported by the checked-out NyxFoundation/speca version. Prepare input/output paths under `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/` and `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree and inside the scoped external SPECA workspace.
@@ -84,7 +101,7 @@ Never treat official SPECA runner output as durable workflow-control state. Neve
 - Read the target change proposal, tasks, and spec deltas.
 - Read changed implementation paths and test evidence from the workspace.
 - Read `openspec/CONSTITUTION.md` when present.
-- Apply the standard acceptance checks from the command template as authoritative.
+- Apply the standard `cflx-accept` acceptance checks as authoritative.
 
 ### 2. Derive checkable properties
 
@@ -94,7 +111,7 @@ Derive candidate properties from repository evidence, including:
 - Task completion claims and their planned verification ownership.
 - Changed files, public entry points, and integration call sites.
 - Constitution constraints, especially workspace-local workflow control and truthful completion.
-- Parser, prompt, and command-template contracts touched by the change.
+- Parser, prompt, skill, and runtime verdict contracts touched by the change.
 
 Prefer properties that can be falsified with concrete file paths, functions, tests, or command output. Keep each property tied to a repository artifact so any finding is actionable.
 
@@ -117,7 +134,7 @@ For each high-value property:
 
 ### 5. Emit one Conflux verdict
 
-After the SPECA-style pass, emit the final verdict using only the standard Conflux acceptance contract owned by `.opencode/commands/cflx-accept.md`. Missing or inconclusive proof attempts do not create a new protocol; they become standard findings only when they reveal an actionable acceptance failure.
+After the SPECA-style pass, emit the final verdict using only the portable Conflux acceptance contract shared with `cflx-accept`. Missing or inconclusive proof attempts do not create a new protocol; they become standard findings only when they reveal an actionable acceptance failure.
 
 ## Autonomy and Workspace Rules
 

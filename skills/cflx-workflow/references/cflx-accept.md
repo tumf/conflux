@@ -148,10 +148,10 @@ markers exactly (after stripping defensively-tolerated
 bold/italic/heading/blockquote/bullet prefixes) is rejected and treated as
 if no verdict was emitted, so acceptance will retry. The runtime also
 finalizes acceptance the moment a JSON verdict or a canonical standalone
-text marker is observed in stdout — including when wrapped inside an
-`opencode run --format json` assistant/result event — which means emitting
-the verdict immediately ends acceptance even if the agent process keeps
-stdout open afterwards.
+text marker is observed in stdout — including when wrapped inside a
+supported agent event payload that the runtime can unwrap — which means
+emitting the verdict immediately ends acceptance even if the agent process
+keeps stdout open afterwards.
 
 Forbidden wrappings (will cause parser failures or unintended fallback):
 - NO markdown headings: "## ACCEPTANCE: PASS" is WRONG
