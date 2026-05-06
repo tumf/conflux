@@ -76,14 +76,128 @@ If any prerequisite is missing, unavailable, unauthenticated, or unsafe, record 
 
 ### Observable setup and runner execution
 
-SPECA setup and execution may be long-running or noisy. Use the current runtime's standard long-running-command mechanism when available so progress remains observable and context-efficient. Run from the scoped external SPECA checkout, not from the Conflux worktree. Example command shapes:
+SPECA setup and execution may be long-running or noisy. Use the current runtime's standard long-running-command mechanism when available so progress remains observable and context-efficient. Run from the scoped external SPECA checkout, not from the Conflux worktree.
+
+Use these concrete commands as the default adapter shape. Replace `<workspace-key>`, `<change-id>`, `<attempt-id>`, `<spec-url>`, `<target-repo-url>`, `<target-commit>`, and `<target-language>` before running.
+
+#### 1. Create or reuse the scoped external SPECA checkout
 
 ```bash
+mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/runner"
+cd "$HOME/tmp/cflx-speca/<workspace-key>/runner"
+if [ ! -d speca/.git ]; then
+  git clone https://github.com/NyxFoundation/speca.git speca
+fi
+cd speca
+git status --short
 uv sync
-uv run python3 scripts/run_phase.py ...
 ```
 
-Replace `...` with the phase and arguments supported by the checked-out NyxFoundation/speca version. Prepare input/output paths under `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/` and `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree and inside the scoped external SPECA workspace.
+If Claude Code or MCP setup is missing and the environment allows setup without user input, use the README-documented setup commands from the SPECA checkout:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+bash scripts/setup_mcp.sh
+bash scripts/setup_mcp.sh --verify
+```
+
+If global npm installation, MCP registration, or authentication is not safe or available, skip the official runner and continue with manual SPECA-style review.
+
+#### 2. Inspect the installed runner interface
+
+```bash
+cd "$HOME/tmp/cflx-speca/<workspace-key>/runner/speca"
+uv run python3 scripts/run_phase.py --help
+```
+
+Installed help and checked-out scripts are authoritative. Prefer the documented `--phase <ID>` and `--target <ID>` arguments shown by this command over stale examples.
+
+#### 3. Prepare an isolated run directory
+
+```bash
+mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>"
+mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>"
+```
+
+SPECA expects its phase files under an `outputs/` directory inside the SPECA checkout. For a Conflux acceptance attempt, create a temporary SPECA run copy or symlink-free staging area inside the scoped external workspace, then write only generated SPECA inputs there. Do not write these files inside the Conflux worktree.
+
+Minimum `outputs/TARGET_INFO.json` shape:
+
+```json
+{
+  "name": "<target-name>",
+  "repo": "<target-repo-url>",
+  "commit": "<target-commit>",
+  "language": "<target-language>"
+}
+```
+
+Minimum `outputs/BUG_BOUNTY_SCOPE.json` shape:
+
+```json
+{
+  "in_scope": { "components": ["<component>"], "scope_restriction": "<scope>" },
+  "out_of_scope": [],
+  "conditional_scope": [],
+  "trust_assumptions": {
+    "workspace_change": { "trust_level": "UNTRUSTED", "rationale": "Acceptance must verify repository-visible changes against OpenSpec requirements." }
+  },
+  "severity_classification": {
+    "CRITICAL": "Breaks mandatory workflow-control or safety invariants.",
+    "HIGH": "Causes incorrect pass/fail/archive routing or accepts invalid implementation evidence.",
+    "MEDIUM": "Materially weakens verification or produces misleading acceptance evidence.",
+    "LOW": "Minor review-quality issue with limited workflow impact."
+  },
+  "deployment_context": { "type": "single-repository", "target_share": { "value": 1.0, "metric": "repository" } }
+}
+```
+
+#### 4. Run a smoke-test discovery phase when spec URLs are available
+
+```bash
+cd "$HOME/tmp/cflx-speca/<workspace-key>/runner/speca"
+SPEC_URLS="<spec-url>" uv run python3 scripts/run_phase.py --phase 01a
+```
+
+For OpenSpec-only Conflux changes that do not have external specification URLs, do not invent URLs. Instead, stage the relevant OpenSpec proposal/spec text as local generated inputs and continue only if the installed SPECA runner supports that input shape; otherwise use manual property review.
+
+#### 5. Run the documented end-to-end phase target when required inputs exist
+
+```bash
+cd "$HOME/tmp/cflx-speca/<workspace-key>/runner/speca"
+uv run python3 scripts/run_phase.py --target 04 --workers 4 --max-concurrent 64
+```
+
+The README documents outputs as `outputs/<phase_id>_PARTIAL_*.json`. After completion, copy or move relevant SPECA outputs/logs to:
+
+```bash
+mkdir -p "$HOME/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>"
+```
+
+#### 6. Run individual phases when resuming or narrowing evidence
+
+```bash
+cd "$HOME/tmp/cflx-speca/<workspace-key>/runner/speca"
+uv run python3 scripts/run_phase.py --phase 01a
+uv run python3 scripts/run_phase.py --phase 01b
+uv run python3 scripts/run_phase.py --phase 01e
+uv run python3 scripts/run_phase.py --phase 02c
+uv run python3 scripts/run_phase.py --phase 03
+uv run python3 scripts/run_phase.py --phase 04
+```
+
+Use only the phases supported by the checked-out runner. Phase meanings from the README are: `01a` discovery, `01b` subgraph extraction, `01e` property generation, `02c` code location pre-resolution, `03` property-grounded audit, and `04` audit review.
+
+#### 7. Validate the SPECA checkout when diagnosing runner failures
+
+```bash
+cd "$HOME/tmp/cflx-speca/<workspace-key>/runner/speca"
+uv run python3 -m pytest tests/ -v --tb=short
+```
+
+Runner test failure is evidence about runner health only. It is not, by itself, a Conflux acceptance failure unless it reveals a repository-fixable issue in the target Conflux change.
+
+Prepare input/output paths under `~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/` and `~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/` unless the installed runner documents a safer equivalent outside the Conflux worktree and inside the scoped external SPECA workspace.
 
 ### Evidence classification and fallback
 
