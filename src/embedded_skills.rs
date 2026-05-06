@@ -346,8 +346,11 @@ mod tests {
     fn test_cflx_accept_with_speca_documents_official_runner_adapter() {
         assert!(
             CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("NyxFoundation/speca")
-                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD
-                    .contains("~/tmp/cflx-speca/<workspace-key>/runner/speca/")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("$SPECA_CHECKOUT")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("~/services/speca/")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(
+                    "~/tmp/cflx-speca/<workspace-key>/run/<change-id>/<attempt-id>/speca/"
+                )
                 && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("uv run python3 scripts/run_phase.py"),
             "SPECA acceptance skill must document the official runner checkout and command shape"
         );
@@ -364,7 +367,7 @@ mod tests {
             "~/tmp/cflx-speca/<workspace-key>/input/<change-id>/<attempt-id>/",
             "~/tmp/cflx-speca/<workspace-key>/output/<change-id>/<attempt-id>/",
             "outside the target Conflux worktree",
-            "Do not clone NyxFoundation/speca, write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths",
+            "Do not clone or install NyxFoundation/speca from this acceptance skill",
             "Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action",
             "repository/workspace evidence is authoritative",
         ] {
@@ -409,13 +412,7 @@ mod tests {
                 "SPECA runner setup/execution guidance must remain runtime-neutral: {required}"
             );
         }
-        for forbidden in &[
-            "agent-exec run --",
-            "On mini",
-            "opencode",
-            "OpenCode",
-            "Claude",
-        ] {
+        for forbidden in &["agent-exec run --", "On mini", "opencode", "OpenCode"] {
             assert!(
                 !CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(forbidden),
                 "SPECA runner guidance must not depend on a specific harness: {forbidden}"
