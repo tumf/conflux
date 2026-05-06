@@ -38,6 +38,21 @@ pub const DEFAULT_RESOLVE_COMMAND: &str = "opencode run {prompt}";
 #[allow(dead_code)]
 pub const DEFAULT_ANALYZE_COMMAND: &str = "opencode run --format json {prompt}";
 
+/// Default operation skill loaded before dependency analysis prompt context.
+pub const DEFAULT_ANALYZE_SKILL: &str = "cflx-analyze";
+/// Default operation skill loaded before apply prompt context.
+pub const DEFAULT_APPLY_SKILL: &str = "cflx-apply";
+/// Default operation skill loaded before rejecting-review prompt context.
+pub const DEFAULT_REJECTING_SKILL: &str = "cflx-rejecting";
+/// Default operation skill loaded before cleanup-review prompt context.
+pub const DEFAULT_CLEANUP_REVIEW_SKILL: &str = "cflx-cleanup-review";
+/// Default operation skill loaded before acceptance prompt context.
+pub const DEFAULT_ACCEPT_SKILL: &str = "cflx-accept";
+/// Default operation skill loaded before archive prompt context.
+pub const DEFAULT_ARCHIVE_SKILL: &str = "cflx-archive";
+/// Default operation skill loaded before conflict-resolution prompt context.
+pub const DEFAULT_RESOLVE_SKILL: &str = "cflx-resolve";
+
 /// Default prompt for apply command - includes path context.
 /// The hardcoded system prompt in agent.rs is always appended.
 pub const DEFAULT_APPLY_PROMPT: &str = r#"

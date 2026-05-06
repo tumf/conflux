@@ -86,7 +86,7 @@ async fn analyze_with_llm(
     agent: &AgentRunner,
     ai_runner: Option<&crate::ai_command_runner::AiCommandRunner>,
 ) -> Result<Change> {
-    let prompt = build_analysis_prompt(changes);
+    let prompt = build_analysis_prompt_with_skill(agent.config().get_analyze_skill(), changes);
     let response = if let Some(ai_runner) = ai_runner {
         agent
             .analyze_dependencies_with_runner(&prompt, ai_runner)
@@ -109,6 +109,10 @@ async fn analyze_with_llm(
 
 /// Build prompt for LLM dependency analysis.
 fn build_analysis_prompt(changes: &[Change]) -> String {
+    build_analysis_prompt_with_skill(crate::config::defaults::DEFAULT_ANALYZE_SKILL, changes)
+}
+
+fn build_analysis_prompt_with_skill(analyze_skill: &str, changes: &[Change]) -> String {
     let change_list = changes
         .iter()
         .map(|c| {
@@ -124,10 +128,10 @@ fn build_analysis_prompt(changes: &[Change]) -> String {
         .join("\n");
 
     format!(
-        "load skills: cflx-analyze\n\n\
+        "load skills: {}\n\n\
          Queued changes:\n\
          {}\n",
-        change_list
+        analyze_skill, change_list
     )
 }
 
@@ -213,6 +217,16 @@ mod tests {
 
         // Verify prompt contains queued changes header
         assert!(prompt.contains("Queued changes:"));
+    }
+
+    #[test]
+    fn test_build_analysis_prompt_uses_custom_skill_prelude() {
+        let changes = vec![test_change("add-feature", 2, 5)];
+        let prompt = build_analysis_prompt_with_skill("team-analyze", &changes);
+
+        assert!(prompt.contains("load skills: team-analyze"));
+        assert!(!prompt.contains("load skills: cflx-analyze"));
+        assert!(prompt.contains("add-feature"));
     }
 
     #[test]

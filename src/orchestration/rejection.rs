@@ -35,9 +35,13 @@ fn resolve_rejection_review_command(template: &str, prompt: &str, change_id: &st
 }
 
 fn rejection_review_prompt(change_id: &str) -> String {
+    rejection_review_prompt_with_skill(crate::config::defaults::DEFAULT_REJECTING_SKILL, change_id)
+}
+
+fn rejection_review_prompt_with_skill(rejecting_skill: &str, change_id: &str) -> String {
     format!(
-        "load skills: cflx-rejecting\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
-        change_id, change_id, change_id, change_id, change_id
+        "load skills: {}\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
+        rejecting_skill, change_id, change_id, change_id, change_id, change_id
     )
 }
 
@@ -92,7 +96,7 @@ pub async fn run_rejection_review(
     ai_runner: &AiCommandRunner,
 ) -> Result<RejectionReviewVerdict> {
     let command_template = config.get_acceptance_command()?;
-    let prompt = rejection_review_prompt(change_id);
+    let prompt = rejection_review_prompt_with_skill(config.get_rejecting_skill(), change_id);
     let command = resolve_rejection_review_command(command_template, &prompt, change_id);
 
     info!(
@@ -515,6 +519,14 @@ mod tests {
             .await
             .expect("git commit failed");
         assert!(status.success());
+    }
+
+    #[test]
+    fn test_rejection_review_prompt_uses_custom_skill_prelude() {
+        let prompt = rejection_review_prompt_with_skill("team-rejecting", "change-a");
+        assert!(prompt.contains("load skills: team-rejecting"));
+        assert!(!prompt.contains("load skills: cflx-rejecting"));
+        assert!(prompt.contains("Rejecting review id:change-a"));
     }
 
     #[test]

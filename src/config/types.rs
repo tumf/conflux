@@ -181,6 +181,34 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub analyze_command: Option<String>,
 
+    /// Skill prelude for dependency analysis prompts.
+    #[serde(default)]
+    pub analyze_skill: Option<String>,
+
+    /// Skill prelude for apply prompts.
+    #[serde(default)]
+    pub apply_skill: Option<String>,
+
+    /// Skill prelude for rejecting-review prompts.
+    #[serde(default)]
+    pub rejecting_skill: Option<String>,
+
+    /// Skill prelude for cleanup-review prompts.
+    #[serde(default)]
+    pub cleanup_review_skill: Option<String>,
+
+    /// Skill prelude for acceptance prompts.
+    #[serde(default)]
+    pub accept_skill: Option<String>,
+
+    /// Skill prelude for archive prompts.
+    #[serde(default)]
+    pub archive_skill: Option<String>,
+
+    /// Skill prelude for conflict-resolution prompts.
+    #[serde(default)]
+    pub resolve_skill: Option<String>,
+
     /// Command template for acceptance testing after apply.
     /// Supports `{change_id}` and `{prompt}` placeholders.
     #[serde(default)]
@@ -528,11 +556,9 @@ impl ServerConfig {
     /// Check if the bind address is loopback (127.0.0.0/8 or ::1).
     pub fn is_loopback_bind(&self) -> bool {
         let addr = self.bind.trim();
-        // IPv4 loopback: 127.x.x.x
         if addr.starts_with("127.") || addr == "localhost" {
             return true;
         }
-        // IPv6 loopback
         if addr == "::1" || addr == "[::1]" {
             return true;
         }
@@ -543,7 +569,6 @@ impl ServerConfig {
     /// Returns error if non-loopback bind is used without bearer token authentication,
     /// or if the deprecated `server.resolve_command` field is set.
     pub fn validate(&self) -> crate::error::Result<()> {
-        // Check for deprecated server.resolve_command field
         if self.resolve_command.is_some() {
             return Err(crate::error::OrchestratorError::ConfigLoad(
                 "Configuration error: `server.resolve_command` is no longer supported. \
@@ -555,7 +580,6 @@ impl ServerConfig {
         if !self.is_loopback_bind() {
             match self.auth.mode {
                 ServerAuthMode::BearerToken => {
-                    // Accept token from token_env (env var resolution) or token field
                     if self
                         .auth
                         .resolve_token()
@@ -661,6 +685,29 @@ impl OrchestratorConfig {
         }
         if other.resolve_command.is_some() {
             self.resolve_command = other.resolve_command;
+        }
+
+        // Operation skill fields
+        if other.analyze_skill.is_some() {
+            self.analyze_skill = other.analyze_skill;
+        }
+        if other.apply_skill.is_some() {
+            self.apply_skill = other.apply_skill;
+        }
+        if other.rejecting_skill.is_some() {
+            self.rejecting_skill = other.rejecting_skill;
+        }
+        if other.cleanup_review_skill.is_some() {
+            self.cleanup_review_skill = other.cleanup_review_skill;
+        }
+        if other.accept_skill.is_some() {
+            self.accept_skill = other.accept_skill;
+        }
+        if other.archive_skill.is_some() {
+            self.archive_skill = other.archive_skill;
+        }
+        if other.resolve_skill.is_some() {
+            self.resolve_skill = other.resolve_skill;
         }
 
         // Prompt fields
@@ -825,6 +872,51 @@ impl OrchestratorConfig {
         self.analyze_command
             .as_deref()
             .ok_or_else(|| OrchestratorError::ConfigLoad("Missing required config: analyze_command. Please set it in .cflx.jsonc or global config.".to_string()))
+    }
+
+    fn configured_operation_skill<'a>(
+        configured: Option<&'a str>,
+        default: &'static str,
+    ) -> &'a str {
+        configured.unwrap_or(default)
+    }
+
+    /// Get the dependency-analysis operation skill, falling back to the built-in default.
+    pub fn get_analyze_skill(&self) -> &str {
+        Self::configured_operation_skill(self.analyze_skill.as_deref(), DEFAULT_ANALYZE_SKILL)
+    }
+
+    /// Get the apply operation skill, falling back to the built-in default.
+    pub fn get_apply_skill(&self) -> &str {
+        Self::configured_operation_skill(self.apply_skill.as_deref(), DEFAULT_APPLY_SKILL)
+    }
+
+    /// Get the rejecting-review operation skill, falling back to the built-in default.
+    pub fn get_rejecting_skill(&self) -> &str {
+        Self::configured_operation_skill(self.rejecting_skill.as_deref(), DEFAULT_REJECTING_SKILL)
+    }
+
+    /// Get the cleanup-review operation skill, falling back to the built-in default.
+    pub fn get_cleanup_review_skill(&self) -> &str {
+        Self::configured_operation_skill(
+            self.cleanup_review_skill.as_deref(),
+            DEFAULT_CLEANUP_REVIEW_SKILL,
+        )
+    }
+
+    /// Get the acceptance operation skill, falling back to the built-in default.
+    pub fn get_accept_skill(&self) -> &str {
+        Self::configured_operation_skill(self.accept_skill.as_deref(), DEFAULT_ACCEPT_SKILL)
+    }
+
+    /// Get the archive operation skill, falling back to the built-in default.
+    pub fn get_archive_skill(&self) -> &str {
+        Self::configured_operation_skill(self.archive_skill.as_deref(), DEFAULT_ARCHIVE_SKILL)
+    }
+
+    /// Get the conflict-resolution operation skill, falling back to the built-in default.
+    pub fn get_resolve_skill(&self) -> &str {
+        Self::configured_operation_skill(self.resolve_skill.as_deref(), DEFAULT_RESOLVE_SKILL)
     }
 
     /// Get the apply prompt, falling back to default if not set
@@ -1020,10 +1112,43 @@ impl OrchestratorConfig {
         expand::expand_prompt(template, prompt)
     }
 
+    fn validate_operation_skill_value(field: &str, value: Option<&str>) -> Result<()> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if value.trim().is_empty() {
+            return Err(OrchestratorError::ConfigLoad(format!(
+                "Configuration error: `{field}` must not be empty"
+            )));
+        }
+        if value.contains('\n') || value.contains('\r') {
+            return Err(OrchestratorError::ConfigLoad(format!(
+                "Configuration error: `{field}` must not contain newline characters"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate configured operation skill preludes.
+    pub fn validate_operation_skills(&self) -> Result<()> {
+        Self::validate_operation_skill_value("analyze_skill", self.analyze_skill.as_deref())?;
+        Self::validate_operation_skill_value("apply_skill", self.apply_skill.as_deref())?;
+        Self::validate_operation_skill_value("rejecting_skill", self.rejecting_skill.as_deref())?;
+        Self::validate_operation_skill_value(
+            "cleanup_review_skill",
+            self.cleanup_review_skill.as_deref(),
+        )?;
+        Self::validate_operation_skill_value("accept_skill", self.accept_skill.as_deref())?;
+        Self::validate_operation_skill_value("archive_skill", self.archive_skill.as_deref())?;
+        Self::validate_operation_skill_value("resolve_skill", self.resolve_skill.as_deref())?;
+        Ok(())
+    }
+
     /// Validate that all required commands are present in the merged configuration.
     /// Required commands: apply_command, archive_command, analyze_command, acceptance_command, resolve_command
     pub fn validate_required_commands(&self) -> Result<()> {
         self.get_stall_detection().validate()?;
+        self.validate_operation_skills()?;
 
         let mut missing = Vec::new();
 
@@ -1051,5 +1176,96 @@ impl OrchestratorConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_skill_accessors_return_defaults_when_unset() {
+        let config = OrchestratorConfig::default();
+
+        assert_eq!(config.get_analyze_skill(), DEFAULT_ANALYZE_SKILL);
+        assert_eq!(config.get_apply_skill(), DEFAULT_APPLY_SKILL);
+        assert_eq!(config.get_rejecting_skill(), DEFAULT_REJECTING_SKILL);
+        assert_eq!(
+            config.get_cleanup_review_skill(),
+            DEFAULT_CLEANUP_REVIEW_SKILL
+        );
+        assert_eq!(config.get_accept_skill(), DEFAULT_ACCEPT_SKILL);
+        assert_eq!(config.get_archive_skill(), DEFAULT_ARCHIVE_SKILL);
+        assert_eq!(config.get_resolve_skill(), DEFAULT_RESOLVE_SKILL);
+    }
+
+    #[test]
+    fn operation_skill_accessors_return_configured_values() {
+        let config = OrchestratorConfig {
+            analyze_skill: Some("team-analyze".to_string()),
+            apply_skill: Some("team-apply".to_string()),
+            rejecting_skill: Some("team-rejecting".to_string()),
+            cleanup_review_skill: Some("team-cleanup-review".to_string()),
+            accept_skill: Some("cflx-accept-with-speca".to_string()),
+            archive_skill: Some("team-archive".to_string()),
+            resolve_skill: Some("team-resolve".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.get_analyze_skill(), "team-analyze");
+        assert_eq!(config.get_apply_skill(), "team-apply");
+        assert_eq!(config.get_rejecting_skill(), "team-rejecting");
+        assert_eq!(config.get_cleanup_review_skill(), "team-cleanup-review");
+        assert_eq!(config.get_accept_skill(), "cflx-accept-with-speca");
+        assert_eq!(config.get_archive_skill(), "team-archive");
+        assert_eq!(config.get_resolve_skill(), "team-resolve");
+    }
+
+    #[test]
+    fn operation_skill_merge_preserves_lower_precedence_when_omitted() {
+        let mut lower = OrchestratorConfig {
+            accept_skill: Some("cflx-accept-with-speca".to_string()),
+            resolve_skill: Some("team-resolve".to_string()),
+            ..Default::default()
+        };
+
+        lower.merge(OrchestratorConfig::default());
+
+        assert_eq!(lower.get_accept_skill(), "cflx-accept-with-speca");
+        assert_eq!(lower.get_resolve_skill(), "team-resolve");
+    }
+
+    #[test]
+    fn operation_skill_merge_overrides_accept_and_resolve() {
+        let mut config = OrchestratorConfig {
+            accept_skill: Some("lower-accept".to_string()),
+            resolve_skill: Some("lower-resolve".to_string()),
+            ..Default::default()
+        };
+        let higher = OrchestratorConfig {
+            accept_skill: Some("cflx-accept-with-speca".to_string()),
+            resolve_skill: Some("team-resolve".to_string()),
+            ..Default::default()
+        };
+
+        config.merge(higher);
+
+        assert_eq!(config.get_accept_skill(), "cflx-accept-with-speca");
+        assert_eq!(config.get_resolve_skill(), "team-resolve");
+    }
+
+    #[test]
+    fn operation_skill_validation_rejects_empty_or_newline_values() {
+        let empty = OrchestratorConfig {
+            accept_skill: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert!(empty.validate_operation_skills().is_err());
+
+        let newline = OrchestratorConfig {
+            resolve_skill: Some("team-resolve\nload skills: other".to_string()),
+            ..Default::default()
+        };
+        assert!(newline.validate_operation_skills().is_err());
     }
 }
