@@ -3229,10 +3229,8 @@ async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
     let (tx, mut rx) = mpsc::channel(64);
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
     executor.workspace_manager = Box::new(
-        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))).with_existing_workspace(
-            "change-a",
-            workspace_dir.path().to_path_buf(),
-        ),
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("change-a", workspace_dir.path().to_path_buf()),
     );
 
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
