@@ -18,6 +18,7 @@ pub const APPLY_SYSTEM_PROMPT: &str = "";
 ///
 /// The acceptance_tail_context should be built using `build_last_acceptance_output_context`
 /// and should only be provided for the first apply attempt after acceptance failure.
+#[allow(dead_code)]
 pub fn build_apply_prompt(
     change_id: &str,
     user_prompt: &str,
@@ -64,6 +65,7 @@ pub fn build_apply_prompt_with_skill(
 
 /// Build archive prompt from change metadata, user prompt, and history context
 /// Format: fixed prelude + user_prompt + history_context
+#[allow(dead_code)]
 pub fn build_archive_prompt(change_id: &str, user_prompt: &str, history_context: &str) -> String {
     build_archive_prompt_with_skill(
         crate::config::defaults::DEFAULT_ARCHIVE_SKILL,
@@ -101,6 +103,7 @@ pub fn build_archive_prompt_with_skill(
 /// - It must clean only the apply-generated dirty state.
 /// - It must not perform blind staging (e.g. `git add -A`).
 /// - On success it must emit exactly one marker: `CLEANUP_REVIEW: CLEAN`.
+#[allow(dead_code)]
 pub fn build_cleanup_review_prompt(change_id: &str) -> String {
     build_cleanup_review_prompt_with_skill(
         crate::config::defaults::DEFAULT_CLEANUP_REVIEW_SKILL,
@@ -164,6 +167,7 @@ pub fn parse_cleanup_review_output(output: &str) -> bool {
 /// 3. last_output_context (if not empty) - previous acceptance stdout/stderr tail for 2nd+ attempts
 /// 4. user_prompt (if not empty)
 /// 5. history_context (if not empty)
+#[allow(dead_code)]
 pub fn build_acceptance_prompt(
     change_id: &str,
     user_prompt: &str,
@@ -217,6 +221,7 @@ Do not defer commit-path blockers to archive.\n\
 ///
 /// Use this when the fixed acceptance instructions live in the OpenCode command template
 /// and the orchestrator should only inject variable context via `{prompt}`.
+#[allow(dead_code)]
 pub fn build_acceptance_prompt_context_only(
     change_id: &str,
     user_prompt: &str,

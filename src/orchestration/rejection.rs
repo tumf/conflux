@@ -34,6 +34,7 @@ fn resolve_rejection_review_command(template: &str, prompt: &str, change_id: &st
     OrchestratorConfig::expand_prompt(&command, prompt)
 }
 
+#[allow(dead_code)]
 fn rejection_review_prompt(change_id: &str) -> String {
     rejection_review_prompt_with_skill(crate::config::defaults::DEFAULT_REJECTING_SKILL, change_id)
 }
