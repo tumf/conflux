@@ -3214,6 +3214,95 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
 }
 
 #[tokio::test]
+async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use crate::parallel::WorkspaceResult;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("change-a", workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["applying-change".to_string(), "change-a".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.last_dispatched_resolve_wait_changes = executor.resolve_wait_changes.clone();
+
+    assert!(
+        !executor.should_dispatch_resolve_wait_retry(),
+        "unchanged ResolveWait should stay pending while unrelated apply work is still in flight"
+    );
+
+    executor
+        .handle_workspace_completion(
+            WorkspaceResult {
+                change_id: "applying-change".to_string(),
+                workspace_name: "applying-change".to_string(),
+                final_revision: None,
+                error: None,
+                rejected: None,
+            },
+            1,
+            &mut HashSet::from(["applying-change".to_string()]),
+            &mpsc::channel(1).0,
+        )
+        .await;
+    executor.trigger_resolve_wait_retry_dispatch();
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    let mut saw_retry_dispatch = false;
+    let mut saw_manual_deferral = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::Log(log)
+                if log
+                    .message
+                    .contains("ResolveWait retry dispatch started for 'change-a'") =>
+            {
+                saw_retry_dispatch = true;
+            }
+            crate::events::ExecutionEvent::MergeDeferred {
+                change_id,
+                auto_resumable: false,
+                ..
+            } if change_id == "change-a" => saw_manual_deferral = true,
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_retry_dispatch,
+        "completion of unrelated in-flight apply work must wake scheduler-owned ResolveWait retry"
+    );
+    assert!(
+        saw_manual_deferral,
+        "retry attempt must produce a visible terminal wait outcome instead of silent pending"
+    );
+}
+
+#[tokio::test]
 async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_work() {
     use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
