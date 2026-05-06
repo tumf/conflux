@@ -881,24 +881,28 @@ impl OrchestratorConfig {
         self.apply_prompt.as_deref().unwrap_or(DEFAULT_APPLY_PROMPT)
     }
 
+    #[allow(dead_code)]
     pub fn get_analyze_skill(&self) -> &str {
         self.analyze_skill
             .as_deref()
             .unwrap_or(defaults::DEFAULT_ANALYZE_SKILL)
     }
 
+    #[allow(dead_code)]
     pub fn get_apply_skill(&self) -> &str {
         self.apply_skill
             .as_deref()
             .unwrap_or(defaults::DEFAULT_APPLY_SKILL)
     }
 
+    #[allow(dead_code)]
     pub fn get_rejecting_skill(&self) -> &str {
         self.rejecting_skill
             .as_deref()
             .unwrap_or(defaults::DEFAULT_REJECTING_SKILL)
     }
 
+    #[allow(dead_code)]
     pub fn get_cleanup_review_skill(&self) -> &str {
         self.cleanup_review_skill
             .as_deref()
@@ -911,12 +915,14 @@ impl OrchestratorConfig {
             .unwrap_or(defaults::DEFAULT_ACCEPT_SKILL)
     }
 
+    #[allow(dead_code)]
     pub fn get_archive_skill(&self) -> &str {
         self.archive_skill
             .as_deref()
             .unwrap_or(defaults::DEFAULT_ARCHIVE_SKILL)
     }
 
+    #[allow(dead_code)]
     pub fn get_resolve_skill(&self) -> &str {
         self.resolve_skill
             .as_deref()

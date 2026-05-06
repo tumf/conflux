@@ -124,6 +124,7 @@ pub fn parse_cleanup_review_output(output: &str) -> bool {
 /// 3. last_output_context (if not empty) - previous acceptance stdout/stderr tail for 2nd+ attempts
 /// 4. user_prompt (if not empty)
 /// 5. history_context (if not empty)
+#[allow(dead_code)]
 pub fn build_acceptance_prompt(
     change_id: &str,
     user_prompt: &str,

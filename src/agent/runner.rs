@@ -2,7 +2,7 @@
 
 use super::history_ops;
 use super::output::OutputLine;
-use super::prompt::{build_acceptance_prompt, build_apply_prompt, build_archive_prompt};
+use super::prompt::{build_apply_prompt, build_archive_prompt};
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine};
 use crate::config::defaults::*;

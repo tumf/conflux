@@ -60,12 +60,18 @@ pub const ACCEPTANCE_SYSTEM_PROMPT: &str = "";
 /// Default prompt for acceptance command - appended after hardcoded prompt
 pub const DEFAULT_ACCEPTANCE_PROMPT: &str = "";
 
+#[allow(dead_code)]
 pub const DEFAULT_ANALYZE_SKILL: &str = "cflx-analyze";
+#[allow(dead_code)]
 pub const DEFAULT_APPLY_SKILL: &str = "cflx-apply";
+#[allow(dead_code)]
 pub const DEFAULT_REJECTING_SKILL: &str = "cflx-rejecting";
+#[allow(dead_code)]
 pub const DEFAULT_CLEANUP_REVIEW_SKILL: &str = "cflx-cleanup-review";
 pub const DEFAULT_ACCEPT_SKILL: &str = "cflx-accept";
+#[allow(dead_code)]
 pub const DEFAULT_ARCHIVE_SKILL: &str = "cflx-archive";
+#[allow(dead_code)]
 pub const DEFAULT_RESOLVE_SKILL: &str = "cflx-resolve";
 
 /// Default maximum iterations for the orchestration loop

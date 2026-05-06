@@ -17,3 +17,7 @@
 
 Archive validation is the authoritative final OpenSpec gate.
 Expected archive gate: `cflx openspec validate add-speca-acceptance-skill --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] Archive-readiness blocker evidence resolved. (verification: manual - `cargo test embedded_skills` passed in agent-exec job `1009c5491d4cb2271ccc6259a29a1444`, `cargo fmt --check` passed, and `cflx openspec validate add-speca-acceptance-skill --strict --evidence warn` passed in agent-exec job `056e241bc5c792372f7859affec38790`; completion condition: targeted checks pass after the commit-path blocker is fixed)
+- [x] Commit-path blocker fixed. (verification: manual - removed the unused `build_acceptance_prompt` import/re-export that caused the earlier clippy failure, kept `src/agent/prompt.rs::build_acceptance_prompt` with an explicit dead-code compatibility annotation, and reran `cargo clippy --locked --all-targets --all-features -- -D warnings` successfully in agent-exec job `326e9c145cebca2ed1f99cf371745022`; completion condition: strict clippy no longer fails before archive commit)
