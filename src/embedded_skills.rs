@@ -316,6 +316,67 @@ mod tests {
     }
 
     #[test]
+    fn test_cflx_accept_with_speca_documents_official_runner_adapter() {
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("NyxFoundation/speca")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("~/tmp/speca")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("uv run python3 scripts/run_phase.py"),
+            "SPECA acceptance skill must document the official runner checkout and command shape"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("Official NyxFoundation/speca Runner Adapter"),
+            "SPECA acceptance skill must include a dedicated official runner adapter section"
+        );
+    }
+
+    #[test]
+    fn test_cflx_accept_with_speca_keeps_runner_artifacts_outside_worktree() {
+        for required in &[
+            "~/tmp/speca-conflux-input/<change-id>/",
+            "~/tmp/speca-conflux-output/<change-id>/",
+            "outside the target Conflux worktree",
+            "Do not clone NyxFoundation/speca, write generated inputs, store runner outputs, or place runner logs inside tracked Conflux paths",
+            "Deleting the out-of-worktree SPECA input/output/log/cache directories must not change the next Conflux action",
+            "repository/workspace evidence is authoritative",
+        ] {
+            assert!(
+                CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(required),
+                "SPECA acceptance skill must contain workspace-boundary guidance: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cflx_accept_with_speca_documents_prerequisites_and_fallback() {
+        for required in &[
+            "`uv` is installed and available on `PATH`",
+            "Python dependencies are ready",
+            "Required Claude/API/session/auth access is available",
+            "record the limitation in human-readable reasoning and continue with manual SPECA-style property review",
+            "Never treat runner unavailability, setup failure, missing auth, or inconclusive output as an automatic pass",
+        ] {
+            assert!(
+                CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(required),
+                "SPECA acceptance skill must contain prerequisite/fallback guidance: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cflx_accept_with_speca_uses_agent_exec_for_long_runner_work() {
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("agent-exec run -- uv sync")
+                && CFLX_ACCEPT_WITH_SPECA_SKILL_MD
+                    .contains("agent-exec run -- uv run python3 scripts/run_phase.py"),
+            "SPECA runner setup/execution examples must use agent-exec run --"
+        );
+        assert!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains("On mini"),
+            "SPECA acceptance skill must document mini-specific observable command guidance"
+        );
+    }
+
+    #[test]
     fn test_cflx_accept_with_speca_skill_does_not_duplicate_fixed_procedure() {
         for phrase in ACCEPTANCE_FIXED_PROCEDURE_PHRASES {
             assert!(
