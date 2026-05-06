@@ -679,6 +679,7 @@ impl AgentRunner {
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         let start = Instant::now();
         let template = self.config.get_acceptance_command()?;
+        let accept_skill = self.config.get_accept_skill();
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
@@ -698,15 +699,19 @@ impl AgentRunner {
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
         // The match is kept for clarity, but both branches produce the same result.
         let full_prompt = match self.config.get_acceptance_prompt_mode() {
-            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
-                change_id,
-                user_prompt,
-                &history_context,
-                &last_output_context,
-                &diff_context,
-            ),
+            crate::config::AcceptancePromptMode::Full => {
+                super::prompt::build_acceptance_prompt_context_only(
+                    accept_skill,
+                    change_id,
+                    user_prompt,
+                    &history_context,
+                    &last_output_context,
+                    &diff_context,
+                )
+            }
             crate::config::AcceptancePromptMode::ContextOnly => {
                 super::prompt::build_acceptance_prompt_context_only(
+                    accept_skill,
                     change_id,
                     user_prompt,
                     &history_context,
@@ -764,6 +769,7 @@ impl AgentRunner {
     )> {
         let start = Instant::now();
         let template = self.config.get_acceptance_command()?;
+        let accept_skill = self.config.get_accept_skill();
         let user_prompt = self.config.get_acceptance_prompt();
         let history_context = self.acceptance_history.format_context(change_id);
 
@@ -783,15 +789,19 @@ impl AgentRunner {
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
         // The match is kept for clarity, but both branches produce the same result.
         let full_prompt = match self.config.get_acceptance_prompt_mode() {
-            crate::config::AcceptancePromptMode::Full => build_acceptance_prompt(
-                change_id,
-                user_prompt,
-                &history_context,
-                &last_output_context,
-                &diff_context,
-            ),
+            crate::config::AcceptancePromptMode::Full => {
+                super::prompt::build_acceptance_prompt_context_only(
+                    accept_skill,
+                    change_id,
+                    user_prompt,
+                    &history_context,
+                    &last_output_context,
+                    &diff_context,
+                )
+            }
             crate::config::AcceptancePromptMode::ContextOnly => {
                 super::prompt::build_acceptance_prompt_context_only(
+                    accept_skill,
                     change_id,
                     user_prompt,
                     &history_context,

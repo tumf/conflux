@@ -176,6 +176,34 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub archive_command: Option<String>,
 
+    /// Operation skill loaded for apply prompts.
+    #[serde(default)]
+    pub apply_skill: Option<String>,
+
+    /// Operation skill loaded for archive prompts.
+    #[serde(default)]
+    pub archive_skill: Option<String>,
+
+    /// Operation skill loaded for dependency-analysis prompts.
+    #[serde(default)]
+    pub analyze_skill: Option<String>,
+
+    /// Operation skill loaded for acceptance prompts.
+    #[serde(default)]
+    pub accept_skill: Option<String>,
+
+    /// Operation skill loaded for rejecting-review prompts.
+    #[serde(default)]
+    pub rejecting_skill: Option<String>,
+
+    /// Operation skill loaded for cleanup-review prompts.
+    #[serde(default)]
+    pub cleanup_review_skill: Option<String>,
+
+    /// Operation skill loaded for resolve prompts.
+    #[serde(default)]
+    pub resolve_skill: Option<String>,
+
     /// Command template for dependency analysis.
     /// Supports `{prompt}` placeholder.
     #[serde(default)]
@@ -653,6 +681,27 @@ impl OrchestratorConfig {
         if other.archive_command.is_some() {
             self.archive_command = other.archive_command;
         }
+        if other.apply_skill.is_some() {
+            self.apply_skill = other.apply_skill;
+        }
+        if other.archive_skill.is_some() {
+            self.archive_skill = other.archive_skill;
+        }
+        if other.analyze_skill.is_some() {
+            self.analyze_skill = other.analyze_skill;
+        }
+        if other.accept_skill.is_some() {
+            self.accept_skill = other.accept_skill;
+        }
+        if other.rejecting_skill.is_some() {
+            self.rejecting_skill = other.rejecting_skill;
+        }
+        if other.cleanup_review_skill.is_some() {
+            self.cleanup_review_skill = other.cleanup_review_skill;
+        }
+        if other.resolve_skill.is_some() {
+            self.resolve_skill = other.resolve_skill;
+        }
         if other.analyze_command.is_some() {
             self.analyze_command = other.analyze_command;
         }
@@ -830,6 +879,48 @@ impl OrchestratorConfig {
     /// Get the apply prompt, falling back to default if not set
     pub fn get_apply_prompt(&self) -> &str {
         self.apply_prompt.as_deref().unwrap_or(DEFAULT_APPLY_PROMPT)
+    }
+
+    pub fn get_analyze_skill(&self) -> &str {
+        self.analyze_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_ANALYZE_SKILL)
+    }
+
+    pub fn get_apply_skill(&self) -> &str {
+        self.apply_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_APPLY_SKILL)
+    }
+
+    pub fn get_rejecting_skill(&self) -> &str {
+        self.rejecting_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_REJECTING_SKILL)
+    }
+
+    pub fn get_cleanup_review_skill(&self) -> &str {
+        self.cleanup_review_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_CLEANUP_REVIEW_SKILL)
+    }
+
+    pub fn get_accept_skill(&self) -> &str {
+        self.accept_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_ACCEPT_SKILL)
+    }
+
+    pub fn get_archive_skill(&self) -> &str {
+        self.archive_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_ARCHIVE_SKILL)
+    }
+
+    pub fn get_resolve_skill(&self) -> &str {
+        self.resolve_skill
+            .as_deref()
+            .unwrap_or(defaults::DEFAULT_RESOLVE_SKILL)
     }
 
     /// Get the archive prompt, falling back to default if not set
@@ -1051,5 +1142,56 @@ impl OrchestratorConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_operation_skill_defaults() {
+        let config = OrchestratorConfig::default();
+
+        assert_eq!(config.get_analyze_skill(), "cflx-analyze");
+        assert_eq!(config.get_apply_skill(), "cflx-apply");
+        assert_eq!(config.get_rejecting_skill(), "cflx-rejecting");
+        assert_eq!(config.get_cleanup_review_skill(), "cflx-cleanup-review");
+        assert_eq!(config.get_accept_skill(), "cflx-accept");
+        assert_eq!(config.get_archive_skill(), "cflx-archive");
+        assert_eq!(config.get_resolve_skill(), "cflx-resolve");
+    }
+
+    #[test]
+    fn test_operation_skill_merge_precedence() {
+        let mut base = OrchestratorConfig {
+            accept_skill: Some("cflx-accept".to_string()),
+            resolve_skill: Some("cflx-resolve".to_string()),
+            ..Default::default()
+        };
+        let override_config = OrchestratorConfig {
+            accept_skill: Some("cflx-accept-with-speca".to_string()),
+            resolve_skill: Some("team-resolve".to_string()),
+            ..Default::default()
+        };
+
+        base.merge(override_config);
+
+        assert_eq!(base.get_accept_skill(), "cflx-accept-with-speca");
+        assert_eq!(base.get_resolve_skill(), "team-resolve");
+    }
+
+    #[test]
+    fn test_operation_skill_merge_retains_lower_precedence_when_omitted() {
+        let mut base = OrchestratorConfig {
+            accept_skill: Some("cflx-accept-with-speca".to_string()),
+            resolve_skill: Some("team-resolve".to_string()),
+            ..Default::default()
+        };
+
+        base.merge(OrchestratorConfig::default());
+
+        assert_eq!(base.get_accept_skill(), "cflx-accept-with-speca");
+        assert_eq!(base.get_resolve_skill(), "team-resolve");
     }
 }

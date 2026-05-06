@@ -1012,6 +1012,7 @@ pub async fn execute_acceptance_in_workspace(
     let acceptance_iteration = agent.next_acceptance_attempt_number(change_id);
 
     // Build prompt with system instructions and history context
+    let accept_skill = config.get_accept_skill();
     let user_prompt = config.get_acceptance_prompt();
     let history_context = agent.format_acceptance_history(change_id);
 
@@ -1083,15 +1084,19 @@ pub async fn execute_acceptance_in_workspace(
 
     // Build prompt injected into `{prompt}`
     let full_prompt = match config.get_acceptance_prompt_mode() {
-        crate::config::AcceptancePromptMode::Full => crate::agent::build_acceptance_prompt(
-            change_id,
-            user_prompt,
-            &history_context,
-            &last_output_context,
-            &diff_context,
-        ),
+        crate::config::AcceptancePromptMode::Full => {
+            crate::agent::build_acceptance_prompt_context_only(
+                accept_skill,
+                change_id,
+                user_prompt,
+                &history_context,
+                &last_output_context,
+                &diff_context,
+            )
+        }
         crate::config::AcceptancePromptMode::ContextOnly => {
             crate::agent::build_acceptance_prompt_context_only(
+                accept_skill,
                 change_id,
                 user_prompt,
                 &history_context,

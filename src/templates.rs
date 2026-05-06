@@ -19,6 +19,10 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
   "acceptance_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'",
 
+  // Operation skill for acceptance prompts (defaults to cflx-accept).
+  // Opt into SPECA-style property review without changing acceptance_command:
+  // "accept_skill": "cflx-accept-with-speca",
+
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "claude --dangerously-skip-permissions --verbose --output-format stream-json -p {prompt}",
 
@@ -93,6 +97,10 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
   "acceptance_command": "opencode run '{prompt}'",
 
+  // Operation skill for acceptance prompts (defaults to cflx-accept).
+  // Opt into SPECA-style property review without changing acceptance_command:
+  // "accept_skill": "cflx-accept-with-speca",
+
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "opencode run {prompt}",
 
@@ -166,6 +174,10 @@ pub const CODEX_TEMPLATE: &str = r#"{
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
   "acceptance_command": "codex '{prompt}'",
+
+  // Operation skill for acceptance prompts (defaults to cflx-accept).
+  // Opt into SPECA-style property review without changing acceptance_command:
+  // "accept_skill": "cflx-accept-with-speca",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
   "resolve_command": "codex {prompt}",
@@ -285,6 +297,7 @@ mod tests {
         assert!(CLAUDE_TEMPLATE.contains("\"acceptance_command\": \"claude --dangerously-skip-permissions --verbose --output-format stream-json -p '{prompt}'\""));
         assert!(CLAUDE_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
         assert!(!CLAUDE_TEMPLATE.contains("\"acceptance_prompt_mode\""));
+        assert!(CLAUDE_TEMPLATE.contains("\"accept_skill\": \"cflx-accept-with-speca\""));
     }
 
     #[test]
@@ -294,6 +307,7 @@ mod tests {
         assert!(OPENCODE_TEMPLATE.contains("\"acceptance_command\": \"opencode run '{prompt}'\""));
         assert!(OPENCODE_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
         assert!(!OPENCODE_TEMPLATE.contains("\"acceptance_prompt_mode\""));
+        assert!(OPENCODE_TEMPLATE.contains("\"accept_skill\": \"cflx-accept-with-speca\""));
     }
 
     #[test]
@@ -303,6 +317,7 @@ mod tests {
         assert!(CODEX_TEMPLATE.contains("\"acceptance_command\": \"codex '{prompt}'\""));
         assert!(CODEX_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
         assert!(!CODEX_TEMPLATE.contains("\"acceptance_prompt_mode\""));
+        assert!(CODEX_TEMPLATE.contains("\"accept_skill\": \"cflx-accept-with-speca\""));
     }
 
     #[test]

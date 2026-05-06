@@ -133,6 +133,7 @@ pub fn build_acceptance_prompt(
 ) -> String {
     // Delegate to context_only implementation - "full" mode is now deprecated
     build_acceptance_prompt_context_only(
+        crate::config::defaults::DEFAULT_ACCEPT_SKILL,
         change_id,
         user_prompt,
         history_context,
@@ -160,6 +161,7 @@ Do not defer commit-path blockers to archive.\n\
 /// Use this when the fixed acceptance instructions live in the OpenCode command template
 /// and the orchestrator should only inject variable context via `{prompt}`.
 pub fn build_acceptance_prompt_context_only(
+    accept_skill: &str,
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
@@ -168,7 +170,7 @@ pub fn build_acceptance_prompt_context_only(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push("load skills: cflx-accept".to_string());
+    parts.push(format!("load skills: {}", accept_skill));
     parts.push(format!("Acceptance id:{}", change_id));
 
     // Change metadata first so downstream templates can reference it.
@@ -429,6 +431,22 @@ pub(crate) mod tests {
             user_pos < history_pos,
             "User prompt should come before history context"
         );
+    }
+
+    #[test]
+    fn test_build_acceptance_prompt_context_only_uses_configured_accept_skill() {
+        let result = build_acceptance_prompt_context_only(
+            "cflx-accept-with-speca",
+            "test-change",
+            "",
+            "",
+            "",
+            "",
+        );
+
+        assert!(result.contains("load skills: cflx-accept-with-speca"));
+        assert!(!result.contains("load skills: cflx-accept\n"));
+        assert!(result.contains("Acceptance id:test-change"));
     }
 
     #[test]
