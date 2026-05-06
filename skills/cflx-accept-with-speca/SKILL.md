@@ -30,10 +30,10 @@ This skill MUST expose the exact same verdict output interface as `cflx-accept`.
 
 Primary verdict:
 
-- PASS:     `{"acceptance":"pass"}`
-- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
+- PASS: `{"acceptance":"pass"}`
+- FAIL: `{"acceptance":"fail","findings":["<evidence>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- GATED:    `{"acceptance":"gated"}`
+- Stalled hold compatibility handoff: `{"acceptance":"gated"}`
 
 Backward-compatible fallback markers:
 
@@ -43,7 +43,7 @@ Backward-compatible fallback markers:
 - `ACCEPTANCE: GATED`
 - Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
-Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the command-template contract. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
+Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the portable Conflux acceptance interface. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
 
 ## Official NyxFoundation/speca Runner Adapter (Optional)
 

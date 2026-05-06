@@ -3327,12 +3327,26 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
     let _subscriber_guard = tracing::subscriber::set_default(subscriber);
 
     let config = create_test_config();
-    let repo_root = PathBuf::from("/tmp/test-repo");
+    let repo_dir = tempfile::tempdir().or_fail("create temp repo");
+    let changes_dir = repo_dir.path().join("openspec/changes");
+    let loadable_change_id = "fix-missing-candidate-log-spam";
+    let loadable_change_dir = changes_dir.join(loadable_change_id);
+    std::fs::create_dir_all(&loadable_change_dir).or_fail("create loadable change dir");
+    std::fs::write(
+        loadable_change_dir.join("proposal.md"),
+        "# Fix missing candidate log spam\n",
+    )
+    .or_fail("write loadable proposal");
+    std::fs::write(
+        loadable_change_dir.join("tasks.md"),
+        "- [ ] Add bounded warning\n",
+    )
+    .or_fail("write loadable tasks");
+
     let (tx, mut rx) = mpsc::channel(16);
-    let mut executor = ParallelExecutor::new(repo_root, config, Some(tx));
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
     let missing_change_id = "definitely-missing-candidate-for-reconciliation";
-    let loadable_change_id = "fix-missing-candidate-log-spam";
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
         vec![
             missing_change_id.to_string(),
@@ -3401,7 +3415,7 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
         .count();
     assert_eq!(
         structured_warn_count, 1,
-        "structured WARN candidate_not_found log should be bounded across repeated reconciliation"
+        "tracing warn should be emitted once for missing reducer-queued candidate"
     );
 }
 

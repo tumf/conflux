@@ -224,7 +224,7 @@ Do not defer commit-path blockers to archive.\n\
 /// and variable context via `{prompt}`.
 #[allow(dead_code)]
 pub fn build_acceptance_prompt_context_only(
-    _accept_skill: &str,
+    accept_skill: &str,
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
@@ -232,7 +232,7 @@ pub fn build_acceptance_prompt_context_only(
     diff_context: &str,
 ) -> String {
     build_acceptance_prompt_context_only_with_skill(
-        crate::config::defaults::DEFAULT_ACCEPT_SKILL,
+        accept_skill,
         change_id,
         user_prompt,
         history_context,

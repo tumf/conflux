@@ -1194,7 +1194,7 @@ impl ParallelExecutor {
         let reducer_active_set: std::collections::HashSet<String> =
             active_ids_from_reducer.into_iter().collect();
 
-        let mut known_changes = match crate::openspec::list_changes_native() {
+        let mut known_changes = match crate::openspec::list_changes_native_from(&self.repo_root) {
             Ok(changes) => changes,
             Err(e) => {
                 warn!(

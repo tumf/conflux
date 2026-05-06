@@ -336,7 +336,12 @@ fn parse_body_dependencies(content: &str, path: &Path) -> Vec<String> {
 }
 
 fn parse_dependencies(change_id: &str) -> ProposalMetadata {
-    let proposal_path = Path::new("openspec/changes")
+    parse_dependencies_from_base(Path::new("."), change_id)
+}
+
+fn parse_dependencies_from_base(base_path: &Path, change_id: &str) -> ProposalMetadata {
+    let proposal_path = base_path
+        .join("openspec/changes")
         .join(change_id)
         .join("proposal.md");
 
@@ -384,7 +389,11 @@ fn extract_dependency_id(item: &str) -> String {
 /// `openspec list --json` command. It reads the directory structure and
 /// parses tasks.md files to get accurate task progress.
 pub fn list_changes_native() -> Result<Vec<Change>> {
-    let changes_dir = Path::new("openspec/changes");
+    list_changes_native_from(Path::new("."))
+}
+
+pub fn list_changes_native_from(base_path: &Path) -> Result<Vec<Change>> {
+    let changes_dir = base_path.join("openspec/changes");
 
     if !changes_dir.exists() {
         debug!("Changes directory does not exist: {:?}", changes_dir);
@@ -437,17 +446,19 @@ pub fn list_changes_native() -> Result<Vec<Change>> {
         }
 
         // Parse tasks.md for this change
-        let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
-            Ok(progress) => (progress.completed, progress.total),
-            Err(_) => {
-                // If tasks.md doesn't exist or can't be parsed, use 0/0
-                debug!("Could not parse tasks for change '{}', using 0/0", dir_name);
-                (0, 0)
-            }
-        };
+        let tasks_path = path.join("tasks.md");
+        let (completed_tasks, total_tasks) =
+            match task_parser::parse_file(&tasks_path, Some(dir_name)) {
+                Ok(progress) => (progress.completed, progress.total),
+                Err(_) => {
+                    // If tasks.md doesn't exist or can't be parsed, use 0/0
+                    debug!("Could not parse tasks for change '{}', using 0/0", dir_name);
+                    (0, 0)
+                }
+            };
 
         // Parse dependencies and metadata from proposal.md
-        let metadata = parse_dependencies(dir_name);
+        let metadata = parse_dependencies_from_base(base_path, dir_name);
         let dependencies = metadata.dependencies.clone();
 
         changes.push(Change {
