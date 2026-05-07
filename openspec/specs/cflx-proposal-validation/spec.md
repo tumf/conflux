@@ -34,6 +34,13 @@ The `_EVIDENCE_HINTS` tuple used by `_has_repository_evidence_hint` must include
 **When**: `cflx openspec validate <id> --strict --evidence error` is executed
 **Then**: The verification note is accepted (backward compatible)
 
+#### Scenario: Inline verification before completion prose accepted
+
+**Given**: A behavior-bearing task line contains `(verification: manual - inspect src/openspec_cmd.rs and run cargo test openspec_cmd --lib)` followed by additional completion-condition prose on the same line
+**When**: `cflx openspec validate <id> --strict --evidence error` is executed
+**Then**: The verification note is accepted
+**And**: validation does not report `Behavior-bearing task missing '(verification: ...)' note` for that line
+
 ## Requirements
 
 ### Requirement: no-delta-marker-validation

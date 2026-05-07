@@ -1230,8 +1230,8 @@ fn validate_tasks_content(
     let checkbox_detail_re =
         CHECKBOX_DETAIL_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[([ x])\]\s+(.*)$").unwrap());
     let bare_task_re = BARE_TASK_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+[^\[]").unwrap());
-    let verification_re = VERIFICATION_RE
-        .get_or_init(|| Regex::new(r"(?i)\(verification:\s*(.+?)\)\s*[.。]?$").unwrap());
+    let verification_re =
+        VERIFICATION_RE.get_or_init(|| Regex::new(r"(?i)\(verification:\s*([^)]*?)\)").unwrap());
     let verification_continuation_re = VERIFICATION_CONTINUATION_RE
         .get_or_init(|| Regex::new(r"^\s{2,}(?i:verification:)\s*(.+)$").unwrap());
 
@@ -1881,6 +1881,22 @@ mod validation_tests {
             validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_validate_tasks_accepts_inline_verification_before_completion_prose() {
+        let content = "- [ ] Update validator parsing (verification: manual - inspect src/openspec_cmd.rs and run cargo test openspec_cmd --lib) Completion condition: additional prose after the verification note remains ordinary task text.\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "error", Some("implementation"), None);
+
+        assert!(
+            errors.is_empty(),
+            "inline verification before completion prose should pass: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "inline verification before completion prose should not warn: {warnings:?}"
+        );
     }
 
     #[test]
