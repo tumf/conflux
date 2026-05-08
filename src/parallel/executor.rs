@@ -350,6 +350,118 @@ pub async fn execute_apply_in_workspace(
 
 /// Execute archive command in a workspace with streaming output
 #[allow(clippy::too_many_arguments)]
+pub async fn execute_archive_finalization_in_workspace(
+    change_id: &str,
+    workspace_path: &Path,
+    config: &OrchestratorConfig,
+    event_tx: Option<mpsc::Sender<ParallelEvent>>,
+    vcs_backend: VcsBackend,
+    ai_runner: &AiCommandRunner,
+    shared_stagger_state: &Arc<Mutex<Option<std::time::Instant>>>,
+) -> Result<String> {
+    use crate::execution::archive::{ensure_archive_commit, verify_archive_completion};
+
+    let verification = verify_archive_completion(change_id, Some(workspace_path));
+    if !verification.is_success() {
+        return Err(OrchestratorError::AgentCommand(format!(
+            "Cannot resume archive finalization for '{}': archive move has regressed; active change directory is present or archive files are missing in '{}'",
+            change_id,
+            workspace_path.display()
+        )));
+    }
+
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::ArchiveResumed {
+                change_id: change_id.to_string(),
+                reason: Some("archive_commit_incomplete".to_string()),
+                summary: Some(
+                    "Archive move is already complete; resuming commit finalization only"
+                        .to_string(),
+                ),
+            })
+            .await;
+    }
+
+    let resolve_agent =
+        AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
+    let change_id_owned = change_id.to_string();
+    let event_tx_clone = event_tx.clone();
+    ensure_archive_commit(
+        change_id,
+        workspace_path,
+        &resolve_agent,
+        ai_runner,
+        vcs_backend,
+        move |line| {
+            let event_tx = event_tx_clone.clone();
+            let change_id = change_id_owned.clone();
+            async move {
+                let text = match line {
+                    OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
+                };
+                if let Some(ref tx) = event_tx {
+                    if text.contains("Archive commit finalization retry scheduled") {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                crate::events::LogEntry::warn(text.clone())
+                                    .with_change_id(&change_id)
+                                    .with_operation("archive-finalization"),
+                            ))
+                            .await;
+                    }
+                    let _ = tx
+                        .send(ParallelEvent::ArchiveOutput {
+                            change_id,
+                            output: text,
+                            iteration: 1,
+                        })
+                        .await;
+                }
+            }
+        },
+    )
+    .await?;
+
+    if let Err(err) = delete_acceptance_state(workspace_path) {
+        warn!(
+            "Failed to delete acceptance state for {} after archive finalization resume: {}",
+            change_id, err
+        );
+    }
+    if let Err(err) = delete_archive_state(workspace_path) {
+        warn!(
+            "Failed to delete archive state for {} after archive finalization resume: {}",
+            change_id, err
+        );
+    }
+
+    match vcs_backend {
+        VcsBackend::Git | VcsBackend::Auto => {
+            let revision = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(workspace_path)
+                .output()
+                .await
+                .map_err(|e| {
+                    OrchestratorError::GitCommand(format!(
+                        "Failed to get revision after archive finalization resume: {}",
+                        e
+                    ))
+                })?;
+            if revision.status.success() {
+                Ok(String::from_utf8_lossy(&revision.stdout).trim().to_string())
+            } else {
+                Err(OrchestratorError::GitCommand(format!(
+                    "Failed to get revision after archive finalization resume: {}",
+                    String::from_utf8_lossy(&revision.stderr).trim()
+                )))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,
@@ -363,7 +475,7 @@ pub async fn execute_archive_in_workspace(
     ai_runner: &AiCommandRunner,
     archive_history: &Arc<Mutex<crate::history::ArchiveHistory>>,
     apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
-    shared_stagger_state: &crate::ai_command_runner::SharedStaggerState,
+    shared_stagger_state: &Arc<Mutex<Option<std::time::Instant>>>,
 ) -> Result<String> {
     if cancel_token.is_some_and(|token| token.is_cancelled()) {
         return Err(OrchestratorError::AgentCommand(format!(
@@ -770,6 +882,16 @@ pub async fn execute_archive_in_workspace(
                     OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
                 };
                 if let Some(ref tx) = event_tx {
+                    if text.contains("Archive commit finalization retry scheduled") {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                crate::events::LogEntry::warn(text.clone())
+                                    .with_change_id(&change_id)
+                                    .with_operation("archive-finalization")
+                                    .with_iteration(iteration),
+                            ))
+                            .await;
+                    }
                     let _ = tx
                         .send(ParallelEvent::ArchiveOutput {
                             change_id,

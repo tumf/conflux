@@ -29,7 +29,8 @@ use crate::vcs::WorkspaceStatus;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
-    execute_acceptance_in_workspace, execute_apply_in_workspace, execute_archive_in_workspace,
+    execute_acceptance_in_workspace, execute_apply_in_workspace,
+    execute_archive_finalization_in_workspace, execute_archive_in_workspace,
 };
 use super::types::WorkspaceResult;
 use super::workspace;
@@ -38,7 +39,10 @@ use super::ParallelExecutor;
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_resume_action, resume_cycle_flags, should_run_apply, ResumeAction};
+    use super::{
+        archived_dirty_repair_candidate_from_workspace, decide_resume_action, resume_cycle_flags,
+        should_run_apply, ResumeAction,
+    };
     use crate::execution::state::WorkspaceState;
     use std::fs;
     use std::process::Command;
@@ -228,6 +232,38 @@ mod tests {
         assert!(skip_apply_once);
         assert!(skip_acceptance_once);
     }
+
+    #[test]
+    fn archived_dirty_repair_candidate_reads_archived_tasks_without_active_change_dir() {
+        let tmp = TempDir::new().unwrap();
+        init_git_workspace(tmp.path());
+        let archive_dir = tmp
+            .path()
+            .join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(
+            archive_dir.join("proposal.md"),
+            "---\nchange_type: implementation\ndependencies: []\n---\n# Change\n",
+        )
+        .unwrap();
+        fs::write(
+            archive_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+        fs::write(archive_dir.join("report.md"), "# Report\n").unwrap();
+
+        let candidate = archived_dirty_repair_candidate_from_workspace(
+            "fix-dependency-target-handling",
+            tmp.path(),
+        )
+        .expect("archived dirty candidate should be reconstructed from archive entry");
+
+        assert_eq!(candidate.id, "fix-dependency-target-handling");
+        assert_eq!(candidate.completed_tasks, 1);
+        assert_eq!(candidate.total_tasks, 1);
+        assert!(candidate.metadata.change_type.as_deref() == Some("implementation"));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +282,8 @@ pub(super) fn decide_resume_action(
     state: &WorkspaceState,
 ) -> ResumeAction {
     match state {
-        WorkspaceState::Merged | WorkspaceState::Archived => ResumeAction::Terminal,
+        WorkspaceState::Merged => ResumeAction::Terminal,
+        WorkspaceState::Archived => ResumeAction::Terminal,
         WorkspaceState::Archiving => ResumeAction::Archive,
         WorkspaceState::Applied => {
             if should_route_to_apply_for_incomplete_implementation_tasks(change_id, workspace_path)
@@ -332,19 +369,75 @@ fn read_implementation_task_progress(
         return Ok(None);
     }
 
-    let progress = task_parser::parse_file(&tasks_path, Some(change_id)).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!(
-            "Failed to parse tasks file '{}' for resume routing: {}",
-            tasks_path.display(),
-            e
-        ))
-    })?;
+    let progress = parse_tasks_progress(&tasks_path, change_id)?;
 
     if progress.total == 0 {
         Ok(None)
     } else {
         Ok(Some((progress.completed, progress.total)))
     }
+}
+
+fn parse_tasks_progress(
+    tasks_path: &Path,
+    change_id: &str,
+) -> Result<crate::task_parser::TaskProgress> {
+    task_parser::parse_file(tasks_path, Some(change_id)).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!(
+            "Failed to parse tasks file '{}' for resume routing: {}",
+            tasks_path.display(),
+            e
+        ))
+    })
+}
+
+pub(super) fn archived_dirty_repair_candidate_from_workspace(
+    change_id: &str,
+    workspace_path: &Path,
+) -> Option<crate::openspec::Change> {
+    let active_change_dir = workspace_path.join("openspec/changes").join(change_id);
+    if active_change_dir.exists() {
+        return None;
+    }
+
+    let archive_dir = workspace_path.join("openspec/changes/archive");
+    let archive_entry = find_archive_entry_path(change_id, &archive_dir)?;
+    if !archive_entry.join("proposal.md").exists() {
+        return None;
+    }
+
+    let tasks_path = archive_entry.join("tasks.md");
+    let (completed_tasks, total_tasks) = parse_tasks_progress(&tasks_path, change_id)
+        .map(|progress| (progress.completed, progress.total))
+        .unwrap_or((0, 0));
+    let metadata =
+        crate::openspec::parse_proposal_metadata_from_file(&archive_entry.join("proposal.md"));
+    let dependencies = metadata.dependencies.clone();
+
+    Some(crate::openspec::Change {
+        id: change_id.to_string(),
+        completed_tasks,
+        total_tasks,
+        last_modified: String::new(),
+        dependencies,
+        metadata,
+    })
+}
+
+fn find_archive_entry_path(change_id: &str, archive_dir: &Path) -> Option<std::path::PathBuf> {
+    if !archive_dir.exists() {
+        return None;
+    }
+
+    std::fs::read_dir(archive_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name == change_id || name.ends_with(&format!("-{change_id}"))) && entry.path().is_dir()
+        })
+        .map(|entry| entry.path())
 }
 
 fn should_run_apply(skip_apply_once: &mut bool) -> bool {
@@ -535,9 +628,9 @@ impl ParallelExecutor {
                     let _ = tx
                         .send(ParallelEvent::ArchiveResumed {
                             change_id: change_id.clone(),
-                            reason: None,
+                            reason: Some("archive_commit_incomplete".to_string()),
                             summary: Some(
-                                "Resuming archive from workspace-local archiving state"
+                                "Resuming archived dirty workspace; archive move is complete and commit finalization is incomplete"
                                     .to_string(),
                             ),
                         })
@@ -1794,23 +1887,38 @@ impl ParallelExecutor {
                     .await;
             }
 
-            // ArchiveStarted event is sent inside execute_archive_in_workspace with command string
-            let archive_result = execute_archive_in_workspace(
-                &change_id,
-                &workspace.path,
-                &archive_command,
-                &config,
-                event_tx.clone(),
-                vcs_backend,
-                None, // hooks
-                None, // parallel_ctx
-                Some(&per_change_cancel),
-                &ai_runner,
-                &archive_history,
-                &apply_history,
-                &shared_stagger_state,
-            )
-            .await;
+            let archive_result = if matches!(resume_action, ResumeAction::Archive)
+                && matches!(effective_state, WorkspaceState::Archiving)
+            {
+                execute_archive_finalization_in_workspace(
+                    &change_id,
+                    &workspace.path,
+                    &config,
+                    event_tx.clone(),
+                    vcs_backend,
+                    &ai_runner,
+                    &shared_stagger_state,
+                )
+                .await
+            } else {
+                // ArchiveStarted event is sent inside execute_archive_in_workspace with command string
+                execute_archive_in_workspace(
+                    &change_id,
+                    &workspace.path,
+                    &archive_command,
+                    &config,
+                    event_tx.clone(),
+                    vcs_backend,
+                    None, // hooks
+                    None, // parallel_ctx
+                    Some(&per_change_cancel),
+                    &ai_runner,
+                    &archive_history,
+                    &apply_history,
+                    &shared_stagger_state,
+                )
+                .await
+            };
 
             match archive_result {
                 Ok(archive_revision) => {

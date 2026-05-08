@@ -28,6 +28,7 @@ enum QueueReconciliationDiagnosticLevel {
 
 use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
+use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::{MergeResult, ParallelEvent, ParallelExecutor, WorkspaceResult};
@@ -1220,17 +1221,66 @@ impl ParallelExecutor {
             return 0;
         };
 
-        let (queued_intent_ids, active_ids_from_reducer) = match shared_state.try_read() {
+        let (mut queued_intent_ids, active_ids_from_reducer) = match shared_state.try_read() {
             Ok(state) => (state.queued_change_ids(), state.active_change_ids()),
             Err(_) => return 0,
         };
 
+        let reducer_active_set: std::collections::HashSet<String> =
+            active_ids_from_reducer.into_iter().collect();
+
+        match self.workspace_manager.list_worktree_change_ids().await {
+            Ok(worktree_change_ids) => {
+                for worktree_change_id in worktree_change_ids {
+                    if queued_intent_ids.iter().any(|id| id == &worktree_change_id)
+                        || in_flight.contains(&worktree_change_id)
+                        || reducer_active_set.contains(&worktree_change_id)
+                    {
+                        continue;
+                    }
+
+                    let archived_dirty = self
+                        .workspace_manager
+                        .find_existing_workspace(&worktree_change_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|workspace| {
+                            archived_dirty_repair_candidate_from_workspace(
+                                &worktree_change_id,
+                                &workspace.path,
+                            )
+                        })
+                        .is_some();
+
+                    if archived_dirty {
+                        info!(
+                            change_id = %worktree_change_id,
+                            "Queue reconciliation discovered archived dirty workspace without reducer queued intent"
+                        );
+                        queued_intent_ids.push(worktree_change_id);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to list worktree change ids during archived dirty queue reconciliation: {}",
+                    e
+                );
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn(format!(
+                        "Queue reconciliation skipped archived-dirty worktree scan: failed_to_list_worktrees ({})",
+                        e
+                    ))),
+                )
+                .await;
+            }
+        }
+
         if queued_intent_ids.is_empty() {
             return 0;
         }
-
-        let reducer_active_set: std::collections::HashSet<String> =
-            active_ids_from_reducer.into_iter().collect();
 
         let mut known_changes = match crate::openspec::list_changes_native_from(&self.repo_root) {
             Ok(changes) => changes,
@@ -1283,7 +1333,33 @@ impl ParallelExecutor {
                     added += 1;
                 }
                 None => {
-                    if self.should_emit_queue_reconciliation_diagnostic(
+                    let archived_dirty_candidate = self
+                        .workspace_manager
+                        .find_existing_workspace(&queued_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|workspace| {
+                            archived_dirty_repair_candidate_from_workspace(
+                                &queued_id,
+                                &workspace.path,
+                            )
+                        });
+
+                    if let Some(change) = archived_dirty_candidate {
+                        info!(
+                            "Queue reconciliation adding archived dirty repair candidate: {}",
+                            queued_id
+                        );
+                        self.emit_queue_reconciliation_diagnostic_without_dedupe(
+                            QueueReconciliationDiagnosticLevel::Info,
+                            &queued_id,
+                            "archived_dirty_repair_candidate",
+                        )
+                        .await;
+                        queued.push(change);
+                        added += 1;
+                    } else if self.should_emit_queue_reconciliation_diagnostic(
                         &queued_id,
                         "candidate_not_found",
                     ) {

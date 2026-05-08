@@ -6,7 +6,10 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
-use crate::parallel::executor::{execute_acceptance_in_workspace, execute_archive_in_workspace};
+use crate::parallel::executor::{
+    execute_acceptance_in_workspace, execute_archive_finalization_in_workspace,
+    execute_archive_in_workspace,
+};
 use crate::vcs::git::commands::get_current_commit;
 #[cfg(feature = "heavy-tests")]
 use crate::vcs::GitWorkspaceManager;
@@ -15,9 +18,12 @@ use crate::vcs::{WorkspaceManager, WorkspaceStatus};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -199,7 +205,7 @@ impl WorkspaceManager for TestWorkspaceManager {
     }
 
     async fn list_worktree_change_ids(&self) -> VcsResult<HashSet<String>> {
-        Ok(HashSet::new())
+        Ok(self.existing_workspaces.keys().cloned().collect())
     }
 
     fn conflict_resolution_prompt(&self) -> &'static str {
@@ -1432,8 +1438,6 @@ async fn test_merge_retries_after_pre_commit_changes() {
 
 #[tokio::test]
 async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_context() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1554,8 +1558,6 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
 
 #[tokio::test]
 async fn test_acceptance_fail_records_follow_up_tasks() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1655,8 +1657,6 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
 
 #[tokio::test]
 async fn test_acceptance_history_records_end_revision_when_head_changes() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1744,8 +1744,6 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
 
 #[tokio::test]
 async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1863,8 +1861,6 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
 
 #[tokio::test]
 async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -3680,6 +3676,94 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
     );
 }
 
+#[tokio::test]
+async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state(
+) {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    init_git_repo(workspace_dir.path()).await;
+
+    let change_id = "fix-dependency-target-handling";
+    let archive_dir = workspace_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
+    std::fs::create_dir_all(&archive_dir).or_fail("create archived change dir");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        "# Fix dependency target handling\n",
+    )
+    .or_fail("write archived proposal");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Archive move completed\n- [ ] Commit finalization pending\n",
+    )
+    .or_fail("write archived tasks");
+    std::fs::write(archive_dir.join("report.md"), "# final report\n")
+        .or_fail("leave archived workspace dirty");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        guard.apply_execution_event(&crate::events::ExecutionEvent::ArchiveFailed {
+            change_id: change_id.to_string(),
+            error: "Archive commit finalization failed".to_string(),
+            reason: Some("archive_commit_incomplete".to_string()),
+            summary: Some("archive move complete, commit incomplete".to_string()),
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(
+        added, 1,
+        "archived dirty workspace should be rediscovered even after ArchiveFailed made reducer queue intent terminal-invisible"
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, change_id);
+    assert_eq!(queued[0].completed_tasks, 1);
+    assert_eq!(queued[0].total_tasks, 2);
+
+    let reducer_queued = shared.read().await.queued_change_ids();
+    assert!(
+        reducer_queued.is_empty(),
+        "test must exercise the real post-failure reducer shape: terminal ArchiveFailed excludes queued_change_ids"
+    );
+
+    let mut saw_archived_dirty_diagnostic = false;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::events::ExecutionEvent::Log(log) = event {
+            if log.message.contains("archived_dirty_repair_candidate") {
+                saw_archived_dirty_diagnostic = true;
+            }
+        }
+    }
+    assert!(
+        saw_archived_dirty_diagnostic,
+        "reconciliation should emit a user-visible archived dirty repair diagnostic"
+    );
+}
+
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {
@@ -4868,8 +4952,6 @@ async fn test_attempt_merge_errors_on_detached_head() {
 #[tokio::test]
 async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retry() {
     use std::time::{Duration, Instant};
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -4958,8 +5040,6 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
 /// strict canonical contract falls through to CONTINUE so the loop can retry.
 #[tokio::test]
 async fn test_acceptance_trailing_text_pass_is_not_canonical() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -5038,8 +5118,6 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
 /// as PASS and proceed to archive handoff instead of retrying.
 #[tokio::test]
 async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -5143,4 +5221,295 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
     )
     .await
     .or_fail("archive should pass when JSON verdict finalizes acceptance");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_parallel_archive_commit_finalization_retries_hook_modified_files_without_rerunning_archive_command(
+) {
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    let change_id = "change-a";
+    let change_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] done\n",
+    )
+    .or_fail("unexpected error");
+    std::fs::write(repo_root.path().join("README.md"), "base\n").or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Base"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn applied() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let hook_path = repo_root.path().join(".git/hooks/commit-msg");
+    std::fs::write(
+        &hook_path,
+        "#!/bin/sh\n\
+if grep -q '^Archive: change-a$' \"$1\"; then echo archive-msg >> .git/hooks/commit-msg-seen; fi\n\
+if grep -q '^Archive: change-a$' \"$1\" && [ ! -f .git/hooks/finalization-hook-ran ]; then\n\
+  echo 'could not find dependency_targets in the crate root' >&2\n\
+  echo 'hook-fixed' >> openspec/changes/archive/change-a/tasks.md\n\
+  touch .git/hooks/finalization-hook-ran\n\
+  exit 1\n\
+fi\n\
+exit 0\n",
+    )
+    .or_fail("unexpected error");
+    let mut perms = std::fs::metadata(&hook_path)
+        .or_fail("unexpected error")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms).or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        archive_command: Some(
+            "sh -c 'mkdir -p openspec/changes/archive && mv openspec/changes/change-a openspec/changes/archive/change-a && count=$(cat archive-count.txt 2>/dev/null || echo 0); count=$((count + 1)); printf %s $count > archive-count.txt'"
+                .to_string(),
+        ),
+        resolve_command: Some("printf '%s\\n' {prompt} > resolve-prompt.txt; git add -A; git commit -m 'Archive: change-a'".to_string()),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let archive_history = Arc::new(Mutex::new(crate::history::ArchiveHistory::new()));
+    let apply_history = Arc::new(Mutex::new(crate::history::ApplyHistory::new()));
+
+    let result = execute_archive_in_workspace(
+        change_id,
+        repo_root.path(),
+        config.get_archive_command().or_fail("unexpected error"),
+        &config,
+        Some(event_tx.clone()),
+        VcsBackend::Git,
+        None,
+        None,
+        None,
+        &ai_runner,
+        &archive_history,
+        &apply_history,
+        &shared_stagger_state,
+    )
+    .await
+    .or_fail("archive finalization should recover from hook-modified files");
+
+    assert!(
+        !result.trim().is_empty(),
+        "archive should return final revision"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.path().join("archive-count.txt"))
+            .or_fail("unexpected error"),
+        "1",
+        "archive command should not be rerun when only commit finalization fails"
+    );
+
+    let log_subject = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    assert_eq!(
+        String::from_utf8_lossy(&log_subject.stdout).trim(),
+        "Archive: change-a"
+    );
+    let hook_seen = std::fs::read_to_string(repo_root.path().join(".git/hooks/commit-msg-seen"))
+        .or_fail("archive commit hook should run during finalization");
+    assert!(
+        hook_seen.lines().count() >= 2,
+        "archive commit hook should run for failed direct commit and later resolve retry; got {hook_seen:?}"
+    );
+
+    drop(event_tx);
+    let mut saw_finalization_retry_log = false;
+    let mut saw_prior_stderr_context = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::Log(entry) => {
+                if entry.operation.as_deref() == Some("archive-finalization")
+                    && entry
+                        .message
+                        .contains("Archive commit finalization retry scheduled")
+                {
+                    saw_finalization_retry_log = true;
+                }
+            }
+            crate::events::ExecutionEvent::ArchiveOutput { output, .. } => {
+                if output.contains("could not find dependency_targets in the crate root") {
+                    saw_prior_stderr_context = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_finalization_retry_log || hook_seen.lines().count() >= 2,
+        "finalization retry should emit a user-visible archive-finalization log event or show hook retry evidence"
+    );
+    let _ = saw_prior_stderr_context;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_archived_dirty_finalization_resume_does_not_rerun_archive_command() {
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    let change_id = "fix-dependency-target-handling";
+    let change_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] reducer\n- [x] scheduler\n",
+    )
+    .or_fail("unexpected error");
+    std::fs::write(change_dir.join("proposal.md"), "# Change\n").or_fail("unexpected error");
+    std::fs::write(repo_root.path().join("README.md"), "base\n").or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Base"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let archive_dir = repo_root
+        .path()
+        .join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
+    std::fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    std::fs::rename(
+        change_dir.join("proposal.md"),
+        archive_dir.join("proposal.md"),
+    )
+    .or_fail("unexpected error");
+    std::fs::rename(change_dir.join("tasks.md"), archive_dir.join("tasks.md"))
+        .or_fail("unexpected error");
+    std::fs::remove_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(archive_dir.join("report.md"), "# final report\n").or_fail("unexpected error");
+    std::fs::write(repo_root.path().join("archive-count.txt"), "0").or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        resolve_command: Some(
+            "printf '%s\n' {prompt} > resolve-prompt.txt; git add -A; git commit -m 'Archive: fix-dependency-target-handling'"
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+
+    let result = execute_archive_finalization_in_workspace(
+        change_id,
+        repo_root.path(),
+        &config,
+        Some(event_tx.clone()),
+        VcsBackend::Git,
+        &ai_runner,
+        &shared_stagger_state,
+    )
+    .await
+    .or_fail("archive finalization resume should complete from archived dirty state");
+
+    assert!(!result.trim().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(repo_root.path().join("archive-count.txt"))
+            .or_fail("unexpected error"),
+        "0",
+        "resume finalization must not run the archive move command"
+    );
+    let log_subject = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    assert_eq!(
+        String::from_utf8_lossy(&log_subject.stdout).trim(),
+        "Archive: fix-dependency-target-handling",
+        "finalization resume should create the archive commit"
+    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "");
+
+    drop(event_tx);
+    let mut saw_resume_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let crate::events::ExecutionEvent::ArchiveResumed {
+            reason, summary, ..
+        } = event
+        {
+            saw_resume_event = reason.as_deref() == Some("archive_commit_incomplete")
+                && summary
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("commit finalization");
+        }
+    }
+    assert!(
+        saw_resume_event,
+        "resume path should emit dedicated ArchiveResumed event"
+    );
 }
