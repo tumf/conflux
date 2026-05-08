@@ -748,6 +748,12 @@ impl ParallelExecutor {
                         crate::vcs::git::commands::get_current_commit(&workspace.path).await;
                     match resume_revision {
                         Ok(rev) => {
+                            if let Some(shared) = &shared_orchestrator_state {
+                                let mut guard = shared.write().await;
+                                guard.apply_execution_event(&ParallelEvent::ChangeArchived(
+                                    change_id.clone(),
+                                ));
+                            }
                             if let Some(ref tx) = event_tx {
                                 let _ = tx
                                     .send(ParallelEvent::Log(
