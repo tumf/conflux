@@ -2082,7 +2082,9 @@ mod validation_tests {
             "observed manual note should retain repository evidence: {errors:?}"
         );
         assert!(
-            !errors.iter().any(|e| e.contains("Verification ownership missing")),
+            !errors
+                .iter()
+                .any(|e| e.contains("Verification ownership missing")),
             "observed manual note should retain ownership marker: {errors:?}"
         );
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
