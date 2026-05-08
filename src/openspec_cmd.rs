@@ -3,6 +3,7 @@
 //! Replaces the former Python helper `scripts/cflx.py` with native Rust
 //! implementations for list, show, validate, and archive operations.
 
+use crate::dependency_targets;
 use chrono::Local;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -281,6 +282,8 @@ impl OpenSpecManager {
             return changes;
         }
 
+        let dependency_status_context = DependencyStatusContext::from_workspace(&self.root_dir);
+
         if let Ok(entries) = fs::read_dir(&self.changes_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
@@ -298,7 +301,9 @@ impl OpenSpecManager {
                     );
                     continue;
                 }
-                if let Some(info) = self.get_change_info(&path, false) {
+                if let Some(mut info) = self.get_change_info(&path, false) {
+                    info.dependency_statuses =
+                        dependency_status_context.statuses_for(&info.dependencies);
                     changes.push(info);
                 }
             }
@@ -350,16 +355,25 @@ impl OpenSpecManager {
             format!("openspec/changes/{}", id)
         };
 
+        let proposal_path = change_dir.join("proposal.md");
+        let dependencies = if archived {
+            Vec::new()
+        } else {
+            crate::openspec::parse_proposal_metadata_from_file(&proposal_path).dependencies
+        };
+
         let mut info = ChangeInfo {
             id,
             path: rel_path,
             title: None,
             tasks_completed: 0,
             tasks_total: 0,
+            dependencies,
+            dependency_statuses: Vec::new(),
         };
 
         // Extract title from proposal.md
-        if let Ok(content) = fs::read_to_string(change_dir.join("proposal.md")) {
+        if let Ok(content) = fs::read_to_string(&proposal_path) {
             static TITLE_RE: OnceLock<Regex> = OnceLock::new();
             let re = TITLE_RE.get_or_init(|| Regex::new(r"(?m)^#\s+(.+)$").unwrap());
             if let Some(caps) = re.captures(&content) {
@@ -905,6 +919,72 @@ struct ChangeInfo {
     title: Option<String>,
     tasks_completed: u32,
     tasks_total: u32,
+    dependencies: Vec<String>,
+    dependency_statuses: Vec<DependencyStatusInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependencyStatusInfo {
+    id: String,
+    status: DependencyListStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyListStatus {
+    Done,
+    Running,
+    Pending,
+    Missing,
+}
+
+impl DependencyListStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Running => "running",
+            Self::Pending => "pending",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+struct DependencyStatusContext {
+    active_ids: HashSet<String>,
+    in_flight_ids: HashSet<String>,
+    archived_ids: HashSet<String>,
+}
+
+impl DependencyStatusContext {
+    fn from_workspace(root_dir: &Path) -> Self {
+        Self {
+            active_ids: collect_active_change_ids_from_root(root_dir),
+            in_flight_ids: collect_in_flight_change_ids_from_root(root_dir),
+            archived_ids: dependency_targets::collect_archived_change_ids(root_dir),
+        }
+    }
+
+    fn statuses_for(&self, dependencies: &[String]) -> Vec<DependencyStatusInfo> {
+        dependencies
+            .iter()
+            .map(|dependency| DependencyStatusInfo {
+                id: dependency.clone(),
+                status: self.status_for(dependency),
+            })
+            .collect()
+    }
+
+    fn status_for(&self, dependency: &str) -> DependencyListStatus {
+        // Running is checked before pending so an in-flight active change is surfaced as work in progress.
+        if self.archived_ids.contains(dependency) {
+            DependencyListStatus::Done
+        } else if self.in_flight_ids.contains(dependency) {
+            DependencyListStatus::Running
+        } else if self.active_ids.contains(dependency) {
+            DependencyListStatus::Pending
+        } else {
+            DependencyListStatus::Missing
+        }
+    }
 }
 
 struct SpecInfo {
@@ -1057,7 +1137,11 @@ fn classify_proposal_dependency_targets(
 }
 
 fn collect_active_change_ids() -> HashSet<String> {
-    let changes_dir = Path::new("openspec/changes");
+    collect_active_change_ids_from_root(Path::new("."))
+}
+
+fn collect_active_change_ids_from_root(root_dir: &Path) -> HashSet<String> {
+    let changes_dir = root_dir.join("openspec/changes");
     let Ok(entries) = fs::read_dir(changes_dir) else {
         return HashSet::new();
     };
@@ -1082,7 +1166,11 @@ fn collect_active_change_ids() -> HashSet<String> {
 }
 
 fn collect_in_flight_change_ids() -> HashSet<String> {
-    let state_file = Path::new(".conflux-inflight");
+    collect_in_flight_change_ids_from_root(Path::new("."))
+}
+
+fn collect_in_flight_change_ids_from_root(root_dir: &Path) -> HashSet<String> {
+    let state_file = root_dir.join(".conflux-inflight");
     let Ok(content) = fs::read_to_string(state_file) else {
         return HashSet::new();
     };
@@ -1095,39 +1183,8 @@ fn collect_in_flight_change_ids() -> HashSet<String> {
         .collect()
 }
 
-fn strip_archive_date_prefix(name: &str) -> &str {
-    if name.len() > 11 {
-        let bytes = name.as_bytes();
-        let has_date_prefix = bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes[10] == b'-'
-            && bytes[..4].iter().all(u8::is_ascii_digit)
-            && bytes[5..7].iter().all(u8::is_ascii_digit)
-            && bytes[8..10].iter().all(u8::is_ascii_digit);
-        if has_date_prefix {
-            return &name[11..];
-        }
-    }
-    name
-}
-
 fn collect_archived_change_ids() -> HashSet<String> {
-    let archive_dir = Path::new("openspec/changes/archive");
-    let Ok(entries) = fs::read_dir(archive_dir) else {
-        return HashSet::new();
-    };
-
-    entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() || !path.join("proposal.md").exists() {
-                return None;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            Some(strip_archive_date_prefix(&name).to_string())
-        })
-        .collect()
+    dependency_targets::collect_archived_change_ids(Path::new("."))
 }
 
 /// Evidence hint patterns
@@ -1467,6 +1524,38 @@ fn render_specs_output(specs: &[SpecInfo]) -> String {
     output
 }
 
+fn render_changes_output(changes: &[ChangeInfo]) -> String {
+    let mut output = String::from("\n\x1b[1mChanges:\x1b[0m\n\n");
+    for change in changes {
+        output.push_str(&format!(
+            "  \x1b[92m[ACTIVE]\x1b[0m \x1b[1m{}\x1b[0m\n",
+            change.id
+        ));
+        if let Some(ref title) = change.title {
+            output.push_str(&format!("    Title: {}\n", title));
+        }
+        if change.tasks_total > 0 {
+            let progress = format!("{}/{}", change.tasks_completed, change.tasks_total);
+            if change.tasks_completed == change.tasks_total {
+                output.push_str(&format!("    Tasks: \x1b[92m{}\x1b[0m\n", progress));
+            } else {
+                output.push_str(&format!("    Tasks: {}\n", progress));
+            }
+        }
+        if !change.dependency_statuses.is_empty() {
+            let dependencies = change
+                .dependency_statuses
+                .iter()
+                .map(|dependency| format!("{} [{}]", dependency.id, dependency.status.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            output.push_str(&format!("    Dependencies: {}\n", dependencies));
+        }
+        output.push_str(&format!("    Path: {}\n\n", change.path));
+    }
+    output
+}
+
 /// `cflx openspec list` — list changes or specs.
 pub fn cmd_list(show_specs: bool) -> Result<(), String> {
     let mgr = OpenSpecManager::new();
@@ -1476,23 +1565,7 @@ pub fn cmd_list(show_specs: bool) -> Result<(), String> {
         print!("{}", render_specs_output(&specs));
     } else {
         let changes = mgr.list_changes();
-        println!("\n\x1b[1mChanges:\x1b[0m\n");
-        for change in &changes {
-            println!("  \x1b[92m[ACTIVE]\x1b[0m \x1b[1m{}\x1b[0m", change.id);
-            if let Some(ref title) = change.title {
-                println!("    Title: {}", title);
-            }
-            if change.tasks_total > 0 {
-                let progress = format!("{}/{}", change.tasks_completed, change.tasks_total);
-                if change.tasks_completed == change.tasks_total {
-                    println!("    Tasks: \x1b[92m{}\x1b[0m", progress);
-                } else {
-                    println!("    Tasks: {}", progress);
-                }
-            }
-            println!("    Path: {}", change.path);
-            println!();
-        }
+        print!("{}", render_changes_output(&changes));
     }
 
     Ok(())
@@ -2181,6 +2254,21 @@ mod openspec_list_show_tests {
         fs::write(dir.join("tasks.md"), tasks).unwrap();
     }
 
+    fn create_change_with_body_dependencies(
+        dir: &Path,
+        proposal_title: &str,
+        dependencies: &[&str],
+        tasks: &str,
+    ) {
+        fs::create_dir_all(dir).unwrap();
+        let mut proposal = format!("# {}\n\nbody\n\n## Dependencies\n", proposal_title);
+        for dependency in dependencies {
+            proposal.push_str(&format!("- {}\n", dependency));
+        }
+        fs::write(dir.join("proposal.md"), proposal).unwrap();
+        fs::write(dir.join("tasks.md"), tasks).unwrap();
+    }
+
     fn create_strict_valid_change(dir: &Path, proposal_title: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(
@@ -2228,6 +2316,168 @@ mod openspec_list_show_tests {
     }
 
     #[test]
+    fn test_list_change_records_include_frontmatter_dependencies() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let dependent_dir = temp.path().join("openspec/changes/dependent-change");
+        let dependency_dir = temp.path().join("openspec/changes/base-change");
+        create_change_with_frontmatter_dependencies(
+            &dependent_dir,
+            "Dependent Change",
+            &["base-change"],
+            "- [ ] pending\n",
+        );
+        create_change(&dependency_dir, "Base Change", "- [ ] pending\n");
+
+        let mgr = OpenSpecManager::new();
+        let changes = mgr.list_changes();
+        let dependent = changes
+            .iter()
+            .find(|change| change.id == "dependent-change")
+            .expect("dependent change should be listed");
+
+        assert_eq!(dependent.dependencies, vec!["base-change".to_string()]);
+        assert_eq!(
+            dependent.dependency_statuses,
+            vec![DependencyStatusInfo {
+                id: "base-change".to_string(),
+                status: DependencyListStatus::Pending,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_list_change_dependency_statuses_cover_workspace_states() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let dependent_dir = temp.path().join("openspec/changes/dependent-change");
+        create_change_with_frontmatter_dependencies(
+            &dependent_dir,
+            "Dependent Change",
+            &["pending-dep", "running-dep", "done-dep", "missing-dep"],
+            "- [ ] pending\n",
+        );
+        create_change(
+            &temp.path().join("openspec/changes/pending-dep"),
+            "Pending Dep",
+            "- [ ] pending\n",
+        );
+        create_change(
+            &temp.path().join("openspec/changes/running-dep"),
+            "Running Dep",
+            "- [ ] running\n",
+        );
+        fs::write(temp.path().join(".conflux-inflight"), "running-dep\n").unwrap();
+        create_change(
+            &temp
+                .path()
+                .join("openspec/changes/archive/2026-05-08-done-dep"),
+            "Done Dep",
+            "- [x] done\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let changes = mgr.list_changes();
+        let dependent = changes
+            .iter()
+            .find(|change| change.id == "dependent-change")
+            .expect("dependent change should be listed");
+
+        assert_eq!(
+            dependent.dependency_statuses,
+            vec![
+                DependencyStatusInfo {
+                    id: "pending-dep".to_string(),
+                    status: DependencyListStatus::Pending,
+                },
+                DependencyStatusInfo {
+                    id: "running-dep".to_string(),
+                    status: DependencyListStatus::Running,
+                },
+                DependencyStatusInfo {
+                    id: "done-dep".to_string(),
+                    status: DependencyListStatus::Done,
+                },
+                DependencyStatusInfo {
+                    id: "missing-dep".to_string(),
+                    status: DependencyListStatus::Missing,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_render_changes_output_shows_dependencies_only_when_present() {
+        let changes = vec![
+            ChangeInfo {
+                id: "dependent-change".to_string(),
+                path: "openspec/changes/dependent-change".to_string(),
+                title: Some("Dependent Change".to_string()),
+                tasks_completed: 0,
+                tasks_total: 1,
+                dependencies: vec!["done-dep".to_string(), "running-dep".to_string()],
+                dependency_statuses: vec![
+                    DependencyStatusInfo {
+                        id: "done-dep".to_string(),
+                        status: DependencyListStatus::Done,
+                    },
+                    DependencyStatusInfo {
+                        id: "running-dep".to_string(),
+                        status: DependencyListStatus::Running,
+                    },
+                ],
+            },
+            ChangeInfo {
+                id: "independent-change".to_string(),
+                path: "openspec/changes/independent-change".to_string(),
+                title: Some("Independent Change".to_string()),
+                tasks_completed: 0,
+                tasks_total: 1,
+                dependencies: Vec::new(),
+                dependency_statuses: Vec::new(),
+            },
+        ];
+
+        let rendered = render_changes_output(&changes);
+
+        assert!(rendered.contains("    Dependencies: done-dep [done], running-dep [running]\n"));
+        let independent_block = rendered
+            .split("\x1b[1mindependent-change\x1b[0m")
+            .nth(1)
+            .expect("independent change block should render");
+        assert!(!independent_block.contains("Dependencies:"));
+    }
+
+    #[test]
+    fn test_body_dependencies_fallback_appears_in_list_output() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let dependent_dir = temp.path().join("openspec/changes/body-dependent");
+        let dependency_dir = temp.path().join("openspec/changes/body-dep");
+        create_change_with_body_dependencies(
+            &dependent_dir,
+            "Body Dependent",
+            &["body-dep"],
+            "- [ ] pending\n",
+        );
+        create_change(&dependency_dir, "Body Dep", "- [ ] pending\n");
+
+        let mgr = OpenSpecManager::new();
+        let changes = mgr.list_changes();
+        let rendered = render_changes_output(&changes);
+
+        let dependent = changes
+            .iter()
+            .find(|change| change.id == "body-dependent")
+            .expect("body-dependent change should be listed");
+        assert_eq!(dependent.dependencies, vec!["body-dep".to_string()]);
+        assert!(rendered.contains("    Dependencies: body-dep [pending]\n"));
+    }
+
+    #[test]
     fn test_list_specs_includes_requirement_counts() {
         let temp = TempDir::new().unwrap();
         let _guard = CwdTestGuard::enter(temp.path());
@@ -2264,6 +2514,7 @@ mod openspec_list_show_tests {
         assert!(rendered.contains("  \x1b[96mfoo-spec\x1b[0m"));
         assert!(rendered.contains("    Path: openspec/specs/foo-spec/spec.md"));
         assert!(rendered.contains("    Requirements: 2"));
+        assert!(!rendered.contains("Dependencies:"));
     }
 
     #[test]
