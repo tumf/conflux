@@ -20,6 +20,27 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct QueueReconciliationOutcome {
+    pub queued_added: usize,
+    pub repair_added: usize,
+}
+
+impl QueueReconciliationOutcome {
+    #[cfg(test)]
+    pub fn total_added(self) -> usize {
+        self.queued_added + self.repair_added
+    }
+
+    pub fn has_queued_additions(self) -> bool {
+        self.queued_added > 0
+    }
+
+    pub fn has_repair_additions(self) -> bool {
+        self.repair_added > 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueReconciliationDiagnosticLevel {
     Info,
@@ -1216,14 +1237,14 @@ impl ParallelExecutor {
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
         in_flight: &HashSet<String>,
-    ) -> usize {
+    ) -> QueueReconciliationOutcome {
         let Some(shared_state) = &self.shared_orchestrator_state else {
-            return 0;
+            return QueueReconciliationOutcome::default();
         };
 
         let (mut queued_intent_ids, active_ids_from_reducer) = match shared_state.try_read() {
             Ok(state) => (state.queued_change_ids(), state.active_change_ids()),
-            Err(_) => return 0,
+            Err(_) => return QueueReconciliationOutcome::default(),
         };
 
         let reducer_active_set: std::collections::HashSet<String> =
@@ -1279,7 +1300,7 @@ impl ParallelExecutor {
         }
 
         if queued_intent_ids.is_empty() {
-            return 0;
+            return QueueReconciliationOutcome::default();
         }
 
         let mut known_changes = match crate::openspec::list_changes_native_from(&self.repo_root) {
@@ -1297,7 +1318,7 @@ impl ParallelExecutor {
                     ))),
                 )
                 .await;
-                return 0;
+                return QueueReconciliationOutcome::default();
             }
         };
 
@@ -1307,7 +1328,7 @@ impl ParallelExecutor {
                 .map(|change| (change.id.clone(), change))
                 .collect();
 
-        let mut added = 0usize;
+        let mut outcome = QueueReconciliationOutcome::default();
 
         for queued_id in queued_intent_ids {
             if queued.iter().any(|change| change.id == queued_id) {
@@ -1330,7 +1351,7 @@ impl ParallelExecutor {
                         queued_id
                     );
                     queued.push(change);
-                    added += 1;
+                    outcome.queued_added += 1;
                 }
                 None => {
                     let archived_dirty_candidate = self
@@ -1351,14 +1372,14 @@ impl ParallelExecutor {
                             "Queue reconciliation adding archived dirty repair candidate: {}",
                             queued_id
                         );
-                        self.emit_queue_reconciliation_diagnostic_without_dedupe(
+                        self.emit_queue_reconciliation_diagnostic(
                             QueueReconciliationDiagnosticLevel::Info,
                             &queued_id,
                             "archived_dirty_repair_candidate",
                         )
                         .await;
                         queued.push(change);
-                        added += 1;
+                        outcome.repair_added += 1;
                     } else if self.should_emit_queue_reconciliation_diagnostic(
                         &queued_id,
                         "candidate_not_found",
@@ -1384,12 +1405,12 @@ impl ParallelExecutor {
             }
         }
 
-        if added > 0 {
+        if outcome.queued_added > 0 {
             let mut last_change = self.last_queue_change_at.lock().await;
             *last_change = Some(std::time::Instant::now());
         }
 
-        added
+        outcome
     }
 
     pub(super) async fn emit_no_analysis_diagnostic(
@@ -1516,7 +1537,9 @@ impl ParallelExecutor {
             };
         let bypass_debounce = matches!(
             effective_reason,
-            ReanalysisReason::SlotRecovery | ReanalysisReason::ResolveCompletion
+            ReanalysisReason::SlotRecovery
+                | ReanalysisReason::ResolveCompletion
+                | ReanalysisReason::RepairCandidate
         );
 
         // Check debounce (skip on first iteration)

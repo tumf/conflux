@@ -178,11 +178,13 @@ impl ParallelExecutor {
             self.maybe_dispatch_resolve_wait_retry().await;
 
             // Step 2: Reconcile reducer-visible queue intent into scheduler-local candidates.
-            let reconciled = self
+            let reconciliation = self
                 .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
                 .await;
-            if reconciled > 0 {
+            if reconciliation.has_queued_additions() {
                 reanalysis_reason = ReanalysisReason::QueueNotification;
+            } else if reconciliation.has_repair_additions() {
+                reanalysis_reason = ReanalysisReason::RepairCandidate;
             }
 
             // Step 3: Re-analysis decision is derived from scheduler state.
