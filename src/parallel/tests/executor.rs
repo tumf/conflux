@@ -1950,7 +1950,7 @@ async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
         &shared_stagger_state,
     )
     .await
-    .or_fail("archive should pass when workspace-local acceptance evidence allows handoff");
+    .or_fail("archive should pass when acceptance history records the final revision for handoff");
 
     assert!(
         repo_root.path().join("archive-ran.txt").exists(),
@@ -5028,9 +5028,31 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
         elapsed
     );
 
+    let report_path = repo_root.path().join("ACCEPTANCE_REPORT.json");
     assert!(
-        repo_root.path().join("ACCEPTANCE_REPORT.json").exists(),
-        "verdict-finalized PASS must produce workspace-local acceptance evidence"
+        !report_path.exists(),
+        "verdict-finalized PASS must record acceptance history without creating {}",
+        report_path.display()
+    );
+
+    let history = acceptance_history.lock().await;
+    let attempts = history
+        .get("change-a")
+        .expect("verdict-finalized PASS must be recorded in acceptance history");
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].passed);
+    assert!(
+        attempts[0]
+            .stdout_tail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ACCEPTANCE: PASS"),
+        "acceptance history should retain PASS stdout tail, got {:?}",
+        attempts[0].stdout_tail
+    );
+    assert!(
+        attempts[0].commit_hash.is_some(),
+        "acceptance history should retain final revision"
     );
 }
 
@@ -5038,6 +5060,99 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
 /// MUST NOT be treated as canonical PASS by the parallel executor. The legacy
 /// `starts_with` check accepted these and could lock in a bogus pass; the
 /// strict canonical contract falls through to CONTINUE so the loop can retry.
+#[tokio::test]
+async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(
+            "sh -c 'echo command-failed-before-verdict; echo stderr-tail >&2; exit 42'".to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("unexpected error");
+
+    assert!(
+        matches!(
+            result,
+            crate::orchestration::AcceptanceResult::CommandFailed { .. }
+        ),
+        "failing acceptance command should return CommandFailed, got {:?}",
+        result
+    );
+    let report_path = repo_root.path().join("ACCEPTANCE_REPORT.json");
+    assert!(
+        !report_path.exists(),
+        "command-failure acceptance must not create misleading {}",
+        report_path.display()
+    );
+
+    let history = acceptance_history.lock().await;
+    let attempts = history
+        .get("change-a")
+        .expect("command-failure acceptance must be recorded in history");
+    assert_eq!(attempts.len(), 1);
+    assert!(!attempts[0].passed);
+    assert_eq!(attempts[0].exit_code, Some(42));
+    assert!(
+        attempts[0]
+            .stdout_tail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("command-failed-before-verdict"),
+        "acceptance history should retain command-failure stdout tail, got {:?}",
+        attempts[0].stdout_tail
+    );
+}
+
 #[tokio::test]
 async fn test_acceptance_trailing_text_pass_is_not_canonical() {
     let repo_root = TempDir::new().or_fail("unexpected error");
@@ -5106,7 +5221,7 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
 
     assert!(
         !repo_root.path().join("ACCEPTANCE_REPORT.json").exists(),
-        "malformed trailing-text verdict must not produce workspace-local acceptance evidence"
+        "malformed trailing-text verdict must not produce a workspace-root acceptance report"
     );
 }
 
