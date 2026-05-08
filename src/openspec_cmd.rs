@@ -1180,6 +1180,41 @@ fn has_verification_ownership_marker(verification_text: &str) -> bool {
         .any(|marker| normalized.contains(marker))
 }
 
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_lower = needle.to_lowercase();
+    haystack
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .find(|&idx| haystack[idx..].to_lowercase().starts_with(&needle_lower))
+}
+
+fn extract_inline_verification(task_text: &str) -> Option<String> {
+    let marker = "(verification:";
+    let start = find_case_insensitive(task_text, marker)?;
+    let mut depth = 1usize;
+    let mut in_backticks = false;
+    let content_start = start + marker.len();
+    let mut content_end = None;
+
+    for (relative_idx, ch) in task_text[content_start..].char_indices() {
+        match ch {
+            '`' => in_backticks = !in_backticks,
+            '(' if !in_backticks => depth += 1,
+            ')' if !in_backticks => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    content_end = Some(content_start + relative_idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let end = content_end.unwrap_or(task_text.len());
+    Some(task_text[content_start..end].trim().to_string())
+}
+
 fn is_self_referential_final_validation_task(task_text: &str, change_id: &str) -> bool {
     let normalized = task_text.to_lowercase();
     let change_id = change_id.to_lowercase();
@@ -1223,15 +1258,12 @@ fn validate_tasks_content(
     static CHECKBOX_RE: OnceLock<Regex> = OnceLock::new();
     static CHECKBOX_DETAIL_RE: OnceLock<Regex> = OnceLock::new();
     static BARE_TASK_RE: OnceLock<Regex> = OnceLock::new();
-    static VERIFICATION_RE: OnceLock<Regex> = OnceLock::new();
     static VERIFICATION_CONTINUATION_RE: OnceLock<Regex> = OnceLock::new();
 
     let checkbox_re = CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
     let checkbox_detail_re =
         CHECKBOX_DETAIL_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[([ x])\]\s+(.*)$").unwrap());
     let bare_task_re = BARE_TASK_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s+[^\[]").unwrap());
-    let verification_re =
-        VERIFICATION_RE.get_or_init(|| Regex::new(r"(?i)\(verification:\s*([^)]*?)\)").unwrap());
     let verification_continuation_re = VERIFICATION_CONTINUATION_RE
         .get_or_init(|| Regex::new(r"^\s{2,}(?i:verification:)\s*(.+)$").unwrap());
 
@@ -1266,9 +1298,7 @@ fn validate_tasks_content(
             if !in_excluded {
                 let task_text = caps.get(2).map_or("", |m| m.as_str()).trim();
 
-                let inline_verification = verification_re
-                    .captures(task_text)
-                    .and_then(|vcaps| vcaps.get(1).map(|m| m.as_str().trim().to_string()));
+                let inline_verification = extract_inline_verification(task_text);
                 let continuation_verification = verification_continuation_re
                     .captures(line)
                     .and_then(|vcaps| vcaps.get(1).map(|m| m.as_str().trim().to_string()));
@@ -1900,6 +1930,44 @@ mod validation_tests {
     }
 
     #[test]
+    fn test_extract_inline_verification_tolerates_parentheses_before_evidence() {
+        let content = "- [ ] Update verification note parsing (verification: manual - run (`cflx openspec validate fixture --strict`) after inspecting src/openspec_cmd.rs) Completion condition: parser keeps command evidence.\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(
+            errors.is_empty(),
+            "parenthesized command should not truncate verification evidence: {errors:?}"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_extract_inline_verification_tolerates_backticked_parentheses_before_evidence() {
+        let content = "- [ ] Update verification note parsing (verification: manual - reviewed command `printf \"done ) still command\"` then inspected src/openspec_cmd.rs and ran cflx openspec validate fixture --strict) Completion condition: evidence after backticked parenthesis is preserved.\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(
+            errors.is_empty(),
+            "backticked inner parenthesis should not truncate verification evidence: {errors:?}"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
     fn test_standalone_verification_line_utf8_no_panic_and_findings() {
         let content = "## Implementation\n- [ ] Add a new feature\n  verification: 手動確認のみ\n";
         let (errors, warnings) =
@@ -1995,6 +2063,32 @@ mod validation_tests {
             warnings.is_empty(),
             "ordinary evidence should not warn: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn test_accepts_observed_archive_gate_manual_note_shape() {
+        let content = "- [x] Task 9: Complete archive gate verification for workspace persistence. (verification: manual - implemented in src/workspace/persistence.rs and tests/workspace_persistence_tests.rs; ran `cflx openspec validate add-s3-workspace-persistence --strict`) Completion condition: archive readiness evidence is repository-verifiable.\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "current-change",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(
+            !errors.iter().any(|e| e.contains("Verification note should cite repository-verifiable evidence")),
+            "observed manual note should retain repository evidence: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("Verification ownership missing")),
+            "observed manual note should retain ownership marker: {errors:?}"
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 
     #[test]

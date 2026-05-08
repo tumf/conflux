@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Archive gate verification notes must be parsed completely
+### Requirement: evidence-hint-matching
 
 The OpenSpec archive gate MUST evaluate repository-verifiable evidence and ownership markers from the complete task verification note, not from a truncated substring caused by parenthesized or backticked command/prose content inside the note.
 

@@ -2,44 +2,25 @@
 
 ### Requirement: evidence-hint-matching
 
-The `_EVIDENCE_HINTS` tuple used by `_has_repository_evidence_hint` must include hints for common build/test toolchains across Python, Node.js, Rust, and Go ecosystems so that verification notes citing runnable commands from these ecosystems are accepted. Inline verification annotations must be recognized when they appear anywhere in a checkbox task line, including before additional completion-condition prose.
+The OpenSpec archive gate MUST evaluate repository-verifiable evidence and ownership markers from the complete task verification note, not from a truncated substring caused by parenthesized or backticked command/prose content inside the note.
 
-#### Scenario: Node.js npm run command accepted
+#### Scenario: Manual verification note contains source paths and runnable command
 
-**Given**: A task with verification note `(verification: run npm run build -- succeeds)`
-**When**: `cflx openspec validate <id> --strict --evidence error` is executed
-**Then**: The verification note is accepted (no error about missing repository-verifiable evidence)
+**Given**: an implementation change task line contains an inline `(verification: manual - ...)` note with source paths and a runnable `cflx openspec validate <id> --strict` command
+**When**: `cflx openspec validate <id> --archive-gate` evaluates the task
+**Then**: the archive gate accepts the task's verification evidence instead of reporting that repository-verifiable evidence is missing
 
-#### Scenario: Rust cargo test command accepted
+#### Scenario: Verification note contains parenthesized command or prose content
 
-**Given**: A task with verification note `(verification: cargo test passes)`
-**When**: `cflx openspec validate <id> --strict --evidence error` is executed
-**Then**: The verification note is accepted
+**Given**: an inline verification note contains parenthesized or backticked command/prose segments before the repository evidence hint
+**When**: the validator extracts the verification note
+**Then**: extraction includes the full evidence-bearing note rather than stopping at the first inner closing parenthesis
 
-#### Scenario: Go test command accepted
+#### Scenario: Missing or weak verification remains rejected
 
-**Given**: A task with verification note `(verification: go test ./... passes)`
-**When**: `cflx openspec validate <id> --strict --evidence error` is executed
-**Then**: The verification note is accepted
-
-#### Scenario: Test directory path accepted
-
-**Given**: A task with verification note `(verification: test/integration/auth.test.ts passes)`
-**When**: `cflx openspec validate <id> --strict --evidence error` is executed
-**Then**: The verification note is accepted
-
-#### Scenario: Existing Python hints still accepted
-
-**Given**: A task with verification note `(verification: pytest tests/test_auth.py passes)`
-**When**: `cflx openspec validate <id> --strict --evidence error` is executed
-**Then**: The verification note is accepted (backward compatible)
-
-#### Scenario: Inline verification before completion prose accepted
-
-**Given**: A behavior-bearing task line contains `(verification: manual - inspect src/openspec_cmd.rs and run cargo test openspec_cmd --lib)` followed by additional completion-condition prose on the same line
-**When**: `cflx openspec validate <id> --strict --evidence error` is executed
-**Then**: the verification note is accepted
-**And**: validation does not report `Behavior-bearing task missing '(verification: ...)' note` for that line
+**Given**: an implementation change task has no verification note, lacks a recognized verification ownership marker, or lacks repository-verifiable evidence
+**When**: the archive gate evaluates the task
+**Then**: the archive gate continues to emit the appropriate strict validation finding
 
 ### Requirement: no-delta-marker-validation
 
