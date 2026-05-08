@@ -673,6 +673,7 @@ Rules:
     /// The `in_flight_ids` parameter specifies currently executing change IDs.
     /// Dependencies referencing these IDs are considered valid even though
     /// they are not present in the `order` array.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate_dependency_graph(
         &self,
         result: &AnalysisResult,
