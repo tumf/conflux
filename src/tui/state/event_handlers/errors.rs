@@ -1,7 +1,5 @@
 use crate::tui::events::{LogEntry, TuiCommand};
 
-use crate::tui::state::WarningPopup;
-
 use super::AppState;
 
 impl AppState {
@@ -62,10 +60,7 @@ impl AppState {
             }
         }
         let message = format!("Failed to resolve merge for '{}': {}", change_id, error);
-        self.warning_popup = Some(WarningPopup {
-            title: "Merge resolve failed".to_string(),
-            message: message.clone(),
-        });
+        self.show_warning_popup("Merge resolve failed", message.clone());
         self.add_log(LogEntry::error(message));
 
         self.try_transition_to_select();
@@ -98,10 +93,7 @@ impl AppState {
                 "on_merged hook failed for '{}'; merged transition blocked: {}",
                 change_id, error
             );
-            self.warning_popup = Some(WarningPopup {
-                title: "on_merged hook failed".to_string(),
-                message: message.clone(),
-            });
+            self.show_warning_popup("on_merged hook failed", message.clone());
             self.add_log(LogEntry::error(message));
             self.try_transition_to_select();
         } else {
@@ -228,18 +220,27 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.changes[0].display_status_cache = "archived".to_string();
+        let hook_error =
+            "git index lock held\nstderr: fatal: unable to lock index\nstdout: retry later";
         app.handle_orchestrator_event(OrchestratorEvent::HookFailed {
             change_id: "change-a".to_string(),
             hook_type: "on_merged".to_string(),
-            error: "git index lock held".to_string(),
+            error: hook_error.to_string(),
         });
 
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
-        assert!(app.warning_popup.is_some());
-        assert!(app
+        let popup = app.warning_popup.as_ref().expect("warning popup");
+        assert!(popup.message.contains(hook_error));
+        assert!(popup.message.contains("git index lock held\nstderr:"));
+        let logged_message = app
             .logs
             .iter()
-            .any(|log| log.message.contains("merged transition blocked")));
+            .find(|log| log.message.contains("merged transition blocked"))
+            .map(|log| log.message.as_str())
+            .expect("on_merged log entry");
+        assert!(logged_message.contains("git index lock held"));
+        assert!(logged_message.contains("stderr: fatal: unable to lock index"));
+        assert!(logged_message.contains("stdout: retry later"));
     }
 
     #[test]

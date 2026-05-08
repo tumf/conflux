@@ -1,7 +1,5 @@
 use crate::tui::events::LogEntry;
 
-use crate::tui::state::WarningPopup;
-
 use super::AppState;
 
 impl AppState {
@@ -99,10 +97,7 @@ impl AppState {
 
     pub(crate) fn handle_warning(&mut self, title: String, message: String) {
         if title != "Uncommitted Changes Detected" {
-            self.warning_popup = Some(WarningPopup {
-                title,
-                message: message.clone(),
-            });
+            self.show_warning_popup(title, message.clone());
         }
         self.add_log(LogEntry::warn(message));
     }
