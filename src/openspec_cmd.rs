@@ -408,13 +408,23 @@ impl OpenSpecManager {
             tasks: None,
             tasks_completed: 0,
             tasks_total: 0,
+            dependencies: Vec::new(),
+            dependency_statuses: Vec::new(),
             design: None,
             specs: HashMap::new(),
         };
 
         // Read proposal
-        if let Ok(content) = fs::read_to_string(change_dir.join("proposal.md")) {
+        let proposal_path = change_dir.join("proposal.md");
+        if let Ok(content) = fs::read_to_string(&proposal_path) {
             info.proposal = Some(content);
+        }
+
+        if !archived && !deltas_only {
+            info.dependencies =
+                crate::openspec::parse_proposal_metadata_from_file(&proposal_path).dependencies;
+            info.dependency_statuses = DependencyStatusContext::from_workspace(&self.root_dir)
+                .statuses_for(&info.dependencies);
         }
 
         // Read tasks
@@ -462,6 +472,8 @@ impl OpenSpecManager {
                 tasks: None,
                 tasks_completed: 0,
                 tasks_total: 0,
+                dependencies: Vec::new(),
+                dependency_statuses: Vec::new(),
                 design: None,
                 specs: info.specs,
             });
@@ -1001,6 +1013,8 @@ struct ShowInfo {
     tasks: Option<String>,
     tasks_completed: u32,
     tasks_total: u32,
+    dependencies: Vec<String>,
+    dependency_statuses: Vec<DependencyStatusInfo>,
     design: Option<String>,
     specs: HashMap<String, String>,
 }
@@ -1524,6 +1538,14 @@ fn render_specs_output(specs: &[SpecInfo]) -> String {
     output
 }
 
+fn format_dependency_statuses(dependency_statuses: &[DependencyStatusInfo]) -> String {
+    dependency_statuses
+        .iter()
+        .map(|dependency| format!("{} [{}]", dependency.id, dependency.status.label()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_changes_output(changes: &[ChangeInfo]) -> String {
     let mut output = String::from("\n\x1b[1mChanges:\x1b[0m\n\n");
     for change in changes {
@@ -1543,13 +1565,10 @@ fn render_changes_output(changes: &[ChangeInfo]) -> String {
             }
         }
         if !change.dependency_statuses.is_empty() {
-            let dependencies = change
-                .dependency_statuses
-                .iter()
-                .map(|dependency| format!("{} [{}]", dependency.id, dependency.status.label()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            output.push_str(&format!("    Dependencies: {}\n", dependencies));
+            output.push_str(&format!(
+                "    Dependencies: {}\n",
+                format_dependency_statuses(&change.dependency_statuses)
+            ));
         }
         output.push_str(&format!("    Path: {}\n\n", change.path));
     }
@@ -1580,6 +1599,117 @@ fn truncate_for_display(content: &str, max_chars: usize) -> String {
     }
 }
 
+fn render_show_json_value(info: &ShowInfo) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("id".to_string(), serde_json::Value::String(info.id.clone()));
+    map.insert(
+        "path".to_string(),
+        serde_json::Value::String(info.path.clone()),
+    );
+    map.insert(
+        "archived".to_string(),
+        serde_json::Value::Bool(info.archived),
+    );
+
+    if let Some(ref proposal) = info.proposal {
+        map.insert(
+            "proposal".to_string(),
+            serde_json::Value::String(proposal.clone()),
+        );
+    }
+    if let Some(ref tasks) = info.tasks {
+        map.insert(
+            "tasks".to_string(),
+            serde_json::Value::String(tasks.clone()),
+        );
+        map.insert(
+            "tasks_completed".to_string(),
+            serde_json::Value::Number(info.tasks_completed.into()),
+        );
+        map.insert(
+            "tasks_total".to_string(),
+            serde_json::Value::Number(info.tasks_total.into()),
+        );
+    }
+    if let Some(ref design) = info.design {
+        map.insert(
+            "design".to_string(),
+            serde_json::Value::String(design.clone()),
+        );
+    }
+    if !info.dependencies.is_empty() {
+        let dependencies = info
+            .dependency_statuses
+            .iter()
+            .map(|dependency| {
+                let mut dep_map = serde_json::Map::new();
+                dep_map.insert(
+                    "id".to_string(),
+                    serde_json::Value::String(dependency.id.clone()),
+                );
+                dep_map.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(dependency.status.label().to_string()),
+                );
+                serde_json::Value::Object(dep_map)
+            })
+            .collect::<Vec<_>>();
+        map.insert(
+            "dependencies".to_string(),
+            serde_json::Value::Array(dependencies),
+        );
+    }
+    if !info.specs.is_empty() {
+        let specs_map: serde_json::Map<String, serde_json::Value> = info
+            .specs
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        map.insert("specs".to_string(), serde_json::Value::Object(specs_map));
+    }
+
+    serde_json::Value::Object(map)
+}
+
+fn render_show_output(info: &ShowInfo) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("\n\x1b[1mChange: {}\x1b[0m\n", info.id));
+    output.push_str(&format!("Path: {}\n", info.path));
+    output.push_str(&format!(
+        "Status: {}\n",
+        if info.archived { "ARCHIVED" } else { "ACTIVE" }
+    ));
+
+    if info.tasks.is_some() {
+        output.push_str(&format!(
+            "Tasks: {}/{}\n",
+            info.tasks_completed, info.tasks_total
+        ));
+    }
+
+    if !info.dependency_statuses.is_empty() {
+        output.push_str(&format!(
+            "Dependencies: {}\n",
+            format_dependency_statuses(&info.dependency_statuses)
+        ));
+    }
+
+    if let Some(ref proposal) = info.proposal {
+        output.push_str("\n\x1b[1mProposal:\x1b[0m\n");
+        output.push_str(&format!("{}\n", truncate_for_display(proposal, 500)));
+    }
+
+    if !info.specs.is_empty() {
+        output.push_str("\n\x1b[1mSpec Deltas:\x1b[0m\n");
+        for (name, content) in &info.specs {
+            output.push_str(&format!("\n  \x1b[96m{}:\x1b[0m\n", name));
+            output.push_str(&format!("  {}\n", truncate_for_display(content, 300)));
+        }
+    }
+
+    output
+}
+
 /// `cflx openspec show` — show change details.
 pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result<(), String> {
     let mgr = OpenSpecManager::new();
@@ -1588,50 +1718,7 @@ pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result
         .ok_or_else(|| format!("Change '{}' not found", change_id))?;
 
     if json_output {
-        let mut map = serde_json::Map::new();
-        map.insert("id".to_string(), serde_json::Value::String(info.id));
-        map.insert("path".to_string(), serde_json::Value::String(info.path));
-        map.insert(
-            "archived".to_string(),
-            serde_json::Value::Bool(info.archived),
-        );
-
-        if let Some(ref proposal) = info.proposal {
-            map.insert(
-                "proposal".to_string(),
-                serde_json::Value::String(proposal.clone()),
-            );
-        }
-        if let Some(ref tasks) = info.tasks {
-            map.insert(
-                "tasks".to_string(),
-                serde_json::Value::String(tasks.clone()),
-            );
-            map.insert(
-                "tasks_completed".to_string(),
-                serde_json::Value::Number(info.tasks_completed.into()),
-            );
-            map.insert(
-                "tasks_total".to_string(),
-                serde_json::Value::Number(info.tasks_total.into()),
-            );
-        }
-        if let Some(ref design) = info.design {
-            map.insert(
-                "design".to_string(),
-                serde_json::Value::String(design.clone()),
-            );
-        }
-        if !info.specs.is_empty() {
-            let specs_map: serde_json::Map<String, serde_json::Value> = info
-                .specs
-                .iter()
-                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                .collect();
-            map.insert("specs".to_string(), serde_json::Value::Object(specs_map));
-        }
-
-        let json_value = serde_json::Value::Object(map);
+        let json_value = render_show_json_value(&info);
         println!(
             "{}",
             serde_json::to_string_pretty(&json_value).unwrap_or_default()
@@ -1639,30 +1726,7 @@ pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result
         return Ok(());
     }
 
-    // Human-readable output
-    println!("\n\x1b[1mChange: {}\x1b[0m", info.id);
-    println!("Path: {}", info.path);
-    println!(
-        "Status: {}",
-        if info.archived { "ARCHIVED" } else { "ACTIVE" }
-    );
-
-    if info.tasks.is_some() {
-        println!("Tasks: {}/{}", info.tasks_completed, info.tasks_total);
-    }
-
-    if let Some(ref proposal) = info.proposal {
-        println!("\n\x1b[1mProposal:\x1b[0m");
-        println!("{}", truncate_for_display(proposal, 500));
-    }
-
-    if !info.specs.is_empty() {
-        println!("\n\x1b[1mSpec Deltas:\x1b[0m");
-        for (name, content) in &info.specs {
-            println!("\n  \x1b[96m{}:\x1b[0m", name);
-            println!("  {}", truncate_for_display(content, 300));
-        }
-    }
+    print!("{}", render_show_output(&info));
 
     Ok(())
 }
@@ -2515,6 +2579,192 @@ mod openspec_list_show_tests {
         assert!(rendered.contains("    Path: openspec/specs/foo-spec/spec.md"));
         assert!(rendered.contains("    Requirements: 2"));
         assert!(!rendered.contains("Dependencies:"));
+    }
+
+    #[test]
+    fn test_show_change_dependency_statuses_cover_workspace_states() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let dependent_dir = temp.path().join("openspec/changes/dependent-change");
+        create_change_with_frontmatter_dependencies(
+            &dependent_dir,
+            "Dependent Change",
+            &["pending-dep", "running-dep", "done-dep", "missing-dep"],
+            "- [ ] pending\n",
+        );
+        create_change(
+            &temp.path().join("openspec/changes/pending-dep"),
+            "Pending Dep",
+            "- [ ] pending\n",
+        );
+        create_change(
+            &temp.path().join("openspec/changes/running-dep"),
+            "Running Dep",
+            "- [ ] running\n",
+        );
+        fs::write(temp.path().join(".conflux-inflight"), "running-dep\n").unwrap();
+        create_change(
+            &temp
+                .path()
+                .join("openspec/changes/archive/2026-05-08-done-dep"),
+            "Done Dep",
+            "- [x] done\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let info = mgr
+            .show_change("dependent-change", false)
+            .expect("dependent change should resolve via show");
+
+        assert_eq!(
+            info.dependencies,
+            vec![
+                "pending-dep".to_string(),
+                "running-dep".to_string(),
+                "done-dep".to_string(),
+                "missing-dep".to_string(),
+            ]
+        );
+        assert_eq!(
+            info.dependency_statuses,
+            vec![
+                DependencyStatusInfo {
+                    id: "pending-dep".to_string(),
+                    status: DependencyListStatus::Pending,
+                },
+                DependencyStatusInfo {
+                    id: "running-dep".to_string(),
+                    status: DependencyListStatus::Running,
+                },
+                DependencyStatusInfo {
+                    id: "done-dep".to_string(),
+                    status: DependencyListStatus::Done,
+                },
+                DependencyStatusInfo {
+                    id: "missing-dep".to_string(),
+                    status: DependencyListStatus::Missing,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_render_show_output_shows_dependencies_only_when_present() {
+        let dependent = ShowInfo {
+            id: "dependent-change".to_string(),
+            path: "openspec/changes/dependent-change".to_string(),
+            archived: false,
+            proposal: Some("# Dependent Change\n".to_string()),
+            tasks: Some("- [ ] pending\n".to_string()),
+            tasks_completed: 0,
+            tasks_total: 1,
+            dependencies: vec!["feature-a".to_string()],
+            dependency_statuses: vec![DependencyStatusInfo {
+                id: "feature-a".to_string(),
+                status: DependencyListStatus::Pending,
+            }],
+            design: None,
+            specs: HashMap::new(),
+        };
+        let independent = ShowInfo {
+            id: "independent-change".to_string(),
+            path: "openspec/changes/independent-change".to_string(),
+            archived: false,
+            proposal: Some("# Independent Change\n".to_string()),
+            tasks: Some("- [ ] pending\n".to_string()),
+            tasks_completed: 0,
+            tasks_total: 1,
+            dependencies: Vec::new(),
+            dependency_statuses: Vec::new(),
+            design: None,
+            specs: HashMap::new(),
+        };
+
+        let dependent_output = render_show_output(&dependent);
+        let independent_output = render_show_output(&independent);
+
+        assert!(dependent_output.contains("Dependencies: feature-a [pending]\n"));
+        assert!(!independent_output.contains("Dependencies:"));
+    }
+
+    #[test]
+    fn test_render_show_json_includes_structured_dependency_statuses() {
+        let info = ShowInfo {
+            id: "dependent-change".to_string(),
+            path: "openspec/changes/dependent-change".to_string(),
+            archived: false,
+            proposal: Some("# Dependent Change\n".to_string()),
+            tasks: Some("- [ ] pending\n".to_string()),
+            tasks_completed: 0,
+            tasks_total: 1,
+            dependencies: vec!["feature-a".to_string()],
+            dependency_statuses: vec![DependencyStatusInfo {
+                id: "feature-a".to_string(),
+                status: DependencyListStatus::Pending,
+            }],
+            design: None,
+            specs: HashMap::new(),
+        };
+
+        let json = render_show_json_value(&info);
+        let dependencies = json
+            .get("dependencies")
+            .and_then(|value| value.as_array())
+            .expect("dependencies should be a JSON array");
+
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(
+            dependencies[0].get("id").and_then(|value| value.as_str()),
+            Some("feature-a")
+        );
+        assert_eq!(
+            dependencies[0]
+                .get("status")
+                .and_then(|value| value.as_str()),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn test_show_change_deltas_only_omits_dependency_statuses() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let dependent_dir = temp.path().join("openspec/changes/dependent-change");
+        create_change_with_frontmatter_dependencies(
+            &dependent_dir,
+            "Dependent Change",
+            &["feature-a"],
+            "- [ ] pending\n",
+        );
+        create_change(
+            &temp.path().join("openspec/changes/feature-a"),
+            "Feature A",
+            "- [ ] pending\n",
+        );
+        let spec_dir = dependent_dir.join("specs/cli");
+        fs::create_dir_all(&spec_dir).unwrap();
+        fs::write(
+            spec_dir.join("spec.md"),
+            "## ADDED Requirements\n\n### Requirement: Example\n\n#### Scenario: Example\n- WHEN shown\n- THEN works\n",
+        )
+        .unwrap();
+
+        let mgr = OpenSpecManager::new();
+        let info = mgr
+            .show_change("dependent-change", true)
+            .expect("dependent change should resolve via deltas-only show");
+        let json = render_show_json_value(&info);
+        let output = render_show_output(&info);
+
+        assert!(info.proposal.is_none());
+        assert!(info.tasks.is_none());
+        assert!(info.dependencies.is_empty());
+        assert!(info.dependency_statuses.is_empty());
+        assert!(!json.as_object().unwrap().contains_key("dependencies"));
+        assert!(!output.contains("Dependencies:"));
+        assert!(output.contains("Spec Deltas:"));
     }
 
     #[test]
