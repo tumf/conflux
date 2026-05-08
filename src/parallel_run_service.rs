@@ -9,6 +9,7 @@ use crate::analyzer::{ParallelGroup, ParallelizationAnalyzer};
 use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
+use crate::dependency_targets::union_metadata_dependencies;
 use crate::error::Result;
 use crate::hooks::HookRunner;
 use crate::openspec::Change;
@@ -602,18 +603,26 @@ impl ParallelRunService {
                 Err(e) => {
                     error!("LLM analysis failed: {}", e);
                     warn!(
-                        "Falling back to running all changes in parallel (no dependency analysis)"
+                        "Falling back to metadata-dependency-only analysis after LLM analysis failure"
                     );
                 }
             }
         } else {
-            info!("LLM analysis disabled, running all changes in parallel");
+            info!("LLM analysis disabled, using metadata-dependency-only analysis");
         }
 
-        // Fallback: all changes in order with no dependencies
+        Self::metadata_dependency_analysis_result(changes)
+    }
+
+    fn metadata_dependency_analysis_result(changes: &[Change]) -> crate::analyzer::AnalysisResult {
+        let mut dependencies = HashMap::new();
+        for change in changes {
+            union_metadata_dependencies(&mut dependencies, &change.id, &change.dependencies);
+        }
+
         crate::analyzer::AnalysisResult {
             order: changes.iter().map(|c| c.id.clone()).collect(),
-            dependencies: HashMap::new(),
+            dependencies,
             groups: None,
         }
     }
@@ -1065,6 +1074,31 @@ mod tests {
         assert!(
             result.is_none(),
             "empty startup without reducer-owned ResolveWait must remain a safe no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_order_fallback_preserves_metadata_dependencies_when_llm_disabled() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut config = create_test_config();
+        config.use_llm_analysis = Some(false);
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), config);
+        let changes = vec![
+            create_test_change("route", vec!["policy"]),
+            create_test_change("policy", vec![]),
+        ];
+
+        let result = service
+            .analyze_order_with_sender(&changes, &[], None, 1)
+            .await;
+
+        assert_eq!(
+            result.order,
+            vec!["route".to_string(), "policy".to_string()]
+        );
+        assert_eq!(
+            result.dependencies.get("route"),
+            Some(&vec!["policy".to_string()])
         );
     }
 

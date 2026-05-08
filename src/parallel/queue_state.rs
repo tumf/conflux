@@ -7,6 +7,9 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::dependency_targets::{
+    classify_dependency_target, collect_archived_change_ids, DependencyTargetClass,
+};
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::{
@@ -164,6 +167,10 @@ impl ParallelExecutor {
         None
     }
 
+    fn archived_dependency_ids(&self) -> HashSet<String> {
+        collect_archived_change_ids(&self.repo_root)
+    }
+
     /// Check if a dependency is resolved (merged to base branch).
     ///
     /// A dependency is considered resolved if its archive commit is present in the base branch.
@@ -298,14 +305,45 @@ impl ParallelExecutor {
         &mut self,
         analysis_result: &crate::analyzer::AnalysisResult,
         available_slots: usize,
+        in_flight: &HashSet<String>,
     ) -> Vec<String> {
         let mut selected_changes: Vec<String> = Vec::new();
+
+        let queued_ids: HashSet<&str> = analysis_result.order.iter().map(String::as_str).collect();
+        let in_flight_ids: HashSet<&str> = in_flight.iter().map(String::as_str).collect();
+        let archived_ids = self.archived_dependency_ids();
 
         for change_id in &analysis_result.order {
             // Check if change has unresolved dependencies
             if let Some(deps) = analysis_result.dependencies.get(change_id) {
                 let mut unresolved_deps = Vec::new();
                 for dep_id in deps {
+                    match classify_dependency_target(
+                        dep_id,
+                        queued_ids.iter().copied(),
+                        in_flight_ids.iter().copied(),
+                        &archived_ids,
+                    ) {
+                        DependencyTargetClass::Archived => {
+                            info!(
+                                "Change '{}' dependency '{}' is archived and already satisfied",
+                                change_id, dep_id
+                            );
+                            continue;
+                        }
+                        DependencyTargetClass::Missing => {
+                            let message = format!(
+                                "Change '{}' has missing dependency '{}' and will remain queued",
+                                change_id, dep_id
+                            );
+                            warn!("{}", message);
+                            send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+                            unresolved_deps.push(dep_id.clone());
+                            continue;
+                        }
+                        DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                    }
+
                     match self.is_dependency_resolved(dep_id).await {
                         Ok(true) => {}
                         Ok(false) => unresolved_deps.push(dep_id.clone()),
@@ -1498,7 +1536,7 @@ impl ParallelExecutor {
 
         // Select changes to dispatch based on order and available slots
         let selected_changes = self
-            .select_changes_for_dispatch(&analysis_result, available_slots)
+            .select_changes_for_dispatch(&analysis_result, available_slots, in_flight)
             .await;
 
         // Ordinary apply candidates must not be converted into RejectWait simply
