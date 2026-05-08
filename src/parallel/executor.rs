@@ -461,6 +461,7 @@ pub async fn execute_archive_finalization_in_workspace(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_archive_in_workspace(
     change_id: &str,
     workspace_path: &Path,

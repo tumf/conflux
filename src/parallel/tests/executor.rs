@@ -3505,8 +3505,8 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
 }
 
 #[tokio::test]
-async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state()
-{
+async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state(
+) {
     use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
     use tempfile::TempDir;
     use tokio::sync::{mpsc, RwLock};
@@ -3520,8 +3520,11 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
         .path()
         .join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
     std::fs::create_dir_all(&archive_dir).or_fail("create archived change dir");
-    std::fs::write(archive_dir.join("proposal.md"), "# Fix dependency target handling\n")
-        .or_fail("write archived proposal");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        "# Fix dependency target handling\n",
+    )
+    .or_fail("write archived proposal");
     std::fs::write(
         archive_dir.join("tasks.md"),
         "## Implementation Tasks\n\n- [x] Archive move completed\n- [ ] Commit finalization pending\n",
