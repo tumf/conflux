@@ -5,6 +5,7 @@ use crate::agent::AgentRunner;
 use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
+use crate::events::ExecutionEvent;
 use crate::parallel::executor::{
     execute_acceptance_in_workspace, execute_archive_finalization_in_workspace,
     execute_archive_in_workspace,
@@ -2082,6 +2083,36 @@ fn selective_dependency_analysis_result<'a>(
     })
 }
 
+fn dependency_on_inflight_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    let dependency = in_flight
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "policy".to_string());
+    let dependencies = changes
+        .iter()
+        .map(|change| {
+            if change.id == "route" {
+                (change.id.clone(), vec![dependency.clone()])
+            } else {
+                (change.id.clone(), Vec::new())
+            }
+        })
+        .collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies,
+            groups: None,
+        }
+    })
+}
+
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_change_rejected() {
@@ -2283,6 +2314,147 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     );
 
     while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("route")];
+    let mut in_flight = HashSet::from(["policy".to_string()]);
+
+    let (_should_break, _iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            2,
+            1,
+            ReanalysisReason::QueueNotification,
+            &dependency_on_inflight_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    assert!(
+        !in_flight.contains("route"),
+        "route must not dispatch while policy is in-flight and unmerged"
+    );
+
+    let mut saw_blocked = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::DependencyBlocked {
+            change_id,
+            dependency_ids,
+        } = event
+        {
+            if change_id == "route" && dependency_ids == vec!["policy".to_string()] {
+                saw_blocked = true;
+            }
+        }
+    }
+    assert!(
+        saw_blocked,
+        "in-flight dependency should emit DependencyBlocked"
+    );
+}
+
+#[tokio::test]
+async fn test_archived_dependency_is_satisfied_without_rejection() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let archived_dir = repo_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join("archive")
+        .join("2026-04-29-contracts");
+    std::fs::create_dir_all(&archived_dir).or_fail("unexpected error");
+    std::fs::write(archived_dir.join("proposal.md"), "# Archived").or_fail("unexpected error");
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["contracts".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
+    assert_eq!(selected, vec!["route".to_string()]);
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, ExecutionEvent::ChangeRejected { .. }),
+            "archived dependency must not emit ChangeRejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_missing_dependency_fails_closed_without_dispatch() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["ghost".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
+    assert!(selected.is_empty(), "missing dependency must not dispatch");
+    let mut saw_missing_diagnostic = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::Error { message } if message.contains("missing dependency 'ghost'") => {
+                saw_missing_diagnostic = true;
+            }
+            ExecutionEvent::ChangeRejected { .. } => {
+                panic!("missing dependency should fail closed without ChangeRejected")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_missing_diagnostic,
+        "missing dependency diagnostic should be emitted"
+    );
 }
 
 #[tokio::test]

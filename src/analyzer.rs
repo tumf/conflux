@@ -4,6 +4,10 @@
 //! in parallel and what dependencies exist between them.
 
 use crate::ai_command_runner::OutputLine as AiOutputLine;
+use crate::dependency_targets::{
+    classify_dependency_target, collect_archived_change_ids, union_metadata_dependencies,
+    DependencyTargetClass,
+};
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::{Change, ProposalFrontmatterMetadata};
 use regex::Regex;
@@ -26,22 +30,6 @@ pub struct ParallelGroup {
 }
 
 /// Result of parallelization analysis
-fn strip_archive_date_prefix(name: &str) -> &str {
-    if name.len() > 11 {
-        let bytes = name.as_bytes();
-        let has_date_prefix = bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes[10] == b'-'
-            && bytes[..4].iter().all(u8::is_ascii_digit)
-            && bytes[5..7].iter().all(u8::is_ascii_digit)
-            && bytes[8..10].iter().all(u8::is_ascii_digit);
-        if has_date_prefix {
-            return &name[11..];
-        }
-    }
-    name
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
     /// Execution order (recommended execution sequence considering dependencies)
@@ -137,13 +125,15 @@ impl ParallelizationAnalyzer {
             });
         }
 
-        // For single change, no parallelization needed
+        // For a single change, LLM analysis is unnecessary, but proposal
+        // metadata dependencies are still authoritative hard dependencies.
         if changes.len() == 1 {
-            return Ok(AnalysisResult {
+            let result = AnalysisResult {
                 order: vec![changes[0].id.clone()],
                 dependencies: HashMap::new(),
                 groups: None,
-            });
+            };
+            return self.normalize_and_validate_result(result, changes, in_flight_ids);
         }
 
         // Build prompt for LLM analysis
@@ -249,7 +239,7 @@ impl ParallelizationAnalyzer {
             let preview = response.chars().take(200).collect::<String>();
             let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             let err_text = e.to_string();
-            if err_text.contains("Invalid dependency reference") {
+            if err_text.contains("Invalid dependency reference") || err_text.contains("Missing dependency reference") {
                 let decorated = self.decorate_dependency_error_with_archive_context(
                     &err_text,
                     changes,
@@ -532,8 +522,26 @@ Rules:
         // Validate all change IDs exist
         self.validate_change_ids(&result, changes)?;
 
-        // Validate dependency graph (no circular dependencies, in-flight refs allowed)
-        self.validate_dependency_graph(&result, in_flight_ids)?;
+        self.normalize_and_validate_result(result, changes, in_flight_ids)
+    }
+
+    fn normalize_and_validate_result(
+        &self,
+        mut result: AnalysisResult,
+        changes: &[Change],
+        in_flight_ids: &[String],
+    ) -> Result<AnalysisResult> {
+        for change in changes {
+            union_metadata_dependencies(&mut result.dependencies, &change.id, &change.dependencies);
+        }
+
+        let archived_ids = self.collect_archived_change_ids();
+        self.validate_dependency_graph_with_changes(
+            &result,
+            changes,
+            in_flight_ids,
+            &archived_ids,
+        )?;
 
         Ok(result)
     }
@@ -665,6 +673,7 @@ Rules:
     /// The `in_flight_ids` parameter specifies currently executing change IDs.
     /// Dependencies referencing these IDs are considered valid even though
     /// they are not present in the `order` array.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn validate_dependency_graph(
         &self,
         result: &AnalysisResult,
@@ -707,23 +716,67 @@ Rules:
         Ok(())
     }
 
-    fn collect_archived_change_ids(&self) -> HashSet<String> {
-        let archive_dir = Path::new("openspec/changes/archive");
-        let Ok(entries) = std::fs::read_dir(archive_dir) else {
-            return HashSet::new();
-        };
+    fn validate_dependency_graph_with_changes(
+        &self,
+        result: &AnalysisResult,
+        changes: &[Change],
+        in_flight_ids: &[String],
+        archived_ids: &HashSet<String>,
+    ) -> Result<()> {
+        let queued_ids: Vec<&str> = changes.iter().map(|change| change.id.as_str()).collect();
+        let in_flight_refs: Vec<&str> = in_flight_ids.iter().map(String::as_str).collect();
 
-        entries
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                let path = entry.path();
-                if !path.is_dir() || !path.join("proposal.md").exists() {
-                    return None;
+        for (change_id, deps) in &result.dependencies {
+            if deps.contains(change_id) {
+                return Err(OrchestratorError::Parse(format!(
+                    "Self-dependency detected: change '{}' depends on itself",
+                    change_id
+                )));
+            }
+
+            for dep_id in deps {
+                match classify_dependency_target(
+                    dep_id,
+                    queued_ids.iter().copied(),
+                    in_flight_refs.iter().copied(),
+                    archived_ids,
+                ) {
+                    DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                    DependencyTargetClass::Archived => {
+                        debug!(
+                            change_id,
+                            dependency = dep_id,
+                            "Accepted archived dependency target as already satisfied"
+                        );
+                    }
+                    DependencyTargetClass::Missing => {
+                        let mut allowed_ids: Vec<String> = result.order.clone();
+                        allowed_ids.extend(in_flight_ids.iter().cloned());
+                        allowed_ids.extend(archived_ids.iter().cloned());
+                        allowed_ids.sort();
+                        allowed_ids.dedup();
+
+                        return Err(OrchestratorError::Parse(format!(
+                            "Missing dependency reference: change '{}' depends on '{}' classified as missing dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_archived_ids={:?}, allowed_ids={:?}",
+                            change_id,
+                            dep_id,
+                            result.order,
+                            in_flight_ids,
+                            archived_ids,
+                            allowed_ids
+                        )));
+                    }
                 }
-                let name = entry.file_name().to_string_lossy().to_string();
-                Some(strip_archive_date_prefix(&name).to_string())
-            })
-            .collect()
+            }
+        }
+
+        self.detect_cycles_from_dependencies(&result.dependencies)?;
+
+        Ok(())
+    }
+
+    fn collect_archived_change_ids(&self) -> HashSet<String> {
+        collect_archived_change_ids(Path::new("."))
     }
 
     fn decorate_dependency_error_with_archive_context(
@@ -735,7 +788,7 @@ Rules:
     ) -> String {
         static DEP_RE: OnceLock<Regex> = OnceLock::new();
         let dep_re = DEP_RE.get_or_init(|| {
-            Regex::new(r"change '([^']+)' depends on '([^']+)' outside allowed dependency targets")
+            Regex::new(r"change '([^']+)' depends on '([^']+)'(?: outside allowed dependency targets| classified as missing dependency target)")
                 .unwrap()
         });
 
@@ -752,19 +805,19 @@ Rules:
         let queued_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
         let in_flight_set: HashSet<&str> = in_flight_ids.iter().map(|id| id.as_str()).collect();
 
-        let classification = if queued_ids.contains(&dep_id) {
-            "queued"
-        } else if in_flight_set.contains(dep_id) {
-            "in-flight"
-        } else if archived_ids.contains(dep_id) {
-            "archived"
-        } else {
-            "missing"
-        };
+        let classification = classify_dependency_target(
+            dep_id,
+            queued_ids.iter().copied(),
+            in_flight_set.iter().copied(),
+            archived_ids,
+        );
 
         format!(
             "{} dependency_target_classification={{change:'{}', dependency:'{}', class:'{}'}}",
-            err_text, change_id, dep_id, classification
+            err_text,
+            change_id,
+            dep_id,
+            classification.as_str()
         )
     }
 
@@ -1414,6 +1467,84 @@ That's all."#;
         std::env::set_current_dir(original_dir).unwrap();
 
         assert!(archived_ids.contains("sample-change"));
+    }
+
+    #[tokio::test]
+    async fn test_single_change_fast_path_preserves_metadata_dependency() {
+        let analyzer = create_test_analyzer();
+        let mut change = create_test_change("route");
+        change.dependencies = vec!["policy".to_string()];
+
+        let result = analyzer
+            .analyze_with_callback(&[change], &["policy".to_string()], |_| {})
+            .await
+            .expect("single change analysis should succeed");
+
+        assert_eq!(result.order, vec!["route".to_string()]);
+        assert_eq!(
+            result.dependencies.get("route"),
+            Some(&vec!["policy".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_response_unions_metadata_dependency_omitted_by_llm() {
+        let analyzer = create_test_analyzer();
+        let mut route = create_test_change("route");
+        route.dependencies = vec!["policy".to_string()];
+        let policy = create_test_change("policy");
+        let changes = vec![route, policy];
+        let response = r#"{"order":["policy","route"],"dependencies":{}}"#;
+
+        let result = analyzer
+            .parse_response(response, &changes, &[])
+            .expect("metadata dependency should be unioned into parsed result");
+
+        assert_eq!(
+            result.dependencies.get("route"),
+            Some(&vec!["policy".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_validate_dependency_graph_accepts_archived_dependency() {
+        let analyzer = create_test_analyzer();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let archived_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("archive")
+            .join("2026-04-29-contracts");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        std::fs::write(archived_dir.join("proposal.md"), "# Archived").unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let mut route = create_test_change("route");
+        route.dependencies = vec!["contracts".to_string()];
+        let result =
+            analyzer.parse_response(r#"{"order":["route"],"dependencies":{}}"#, &[route], &[]);
+
+        std::env::set_current_dir(original_dir).unwrap();
+        assert!(result.is_ok(), "archived dependency should be accepted");
+    }
+
+    #[test]
+    fn test_validate_dependency_graph_reports_missing_dependency() {
+        let analyzer = create_test_analyzer();
+        let mut route = create_test_change("route");
+        route.dependencies = vec!["ghost".to_string()];
+
+        let error = analyzer
+            .parse_response(r#"{"order":["route"],"dependencies":{}}"#, &[route], &[])
+            .expect_err("missing dependency should fail closed")
+            .to_string();
+
+        assert!(error.contains("Missing dependency reference"));
+        assert!(error.contains("classified as missing dependency target"));
+        assert!(!error.contains("Analysis returned invalid JSON"));
     }
 
     #[test]
