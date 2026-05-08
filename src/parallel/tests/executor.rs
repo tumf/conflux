@@ -3577,7 +3577,7 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
 
     let mut saw_archived_dirty_diagnostic = false;
     while let Ok(event) = rx.try_recv() {
-        if let ExecutionEvent::Log(log) = event {
+        if let crate::events::ExecutionEvent::Log(log) = event {
             if log.message.contains("archived_dirty_repair_candidate") {
                 saw_archived_dirty_diagnostic = true;
             }
