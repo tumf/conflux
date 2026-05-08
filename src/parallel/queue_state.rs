@@ -1250,6 +1250,29 @@ impl ParallelExecutor {
         let reducer_active_set: std::collections::HashSet<String> =
             active_ids_from_reducer.into_iter().collect();
 
+        let base_branch_for_archived_dirty_scan = match self
+            .workspace_manager
+            .ensure_original_branch_initialized()
+            .await
+        {
+            Ok(branch) => Some(branch),
+            Err(error) => {
+                warn!(
+                    "Failed to determine base branch during archived dirty queue reconciliation: {}",
+                    error
+                );
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::warn(format!(
+                        "Queue reconciliation skipped archived-dirty worktree scan: failed_to_determine_base_branch ({})",
+                        error
+                    ))),
+                )
+                .await;
+                None
+            }
+        };
+
         match self.workspace_manager.list_worktree_change_ids().await {
             Ok(worktree_change_ids) => {
                 for worktree_change_id in worktree_change_ids {
@@ -1260,19 +1283,34 @@ impl ParallelExecutor {
                         continue;
                     }
 
-                    let archived_dirty = self
-                        .workspace_manager
-                        .find_existing_workspace(&worktree_change_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|workspace| {
-                            archived_dirty_repair_candidate_from_workspace(
+                    let archived_dirty = if let Some(base_branch) =
+                        &base_branch_for_archived_dirty_scan
+                    {
+                        match self
+                            .workspace_manager
+                            .find_existing_workspace(&worktree_change_id)
+                            .await
+                        {
+                            Ok(Some(workspace)) => archived_dirty_repair_candidate_from_workspace(
                                 &worktree_change_id,
                                 &workspace.path,
+                                base_branch,
                             )
-                        })
-                        .is_some();
+                            .await
+                            .is_some(),
+                            Ok(None) => false,
+                            Err(error) => {
+                                warn!(
+                                    change_id = %worktree_change_id,
+                                    "Failed to find workspace during archived dirty queue reconciliation: {}",
+                                    error
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
 
                     if archived_dirty {
                         info!(
@@ -1354,18 +1392,35 @@ impl ParallelExecutor {
                     outcome.queued_added += 1;
                 }
                 None => {
-                    let archived_dirty_candidate = self
-                        .workspace_manager
-                        .find_existing_workspace(&queued_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|workspace| {
-                            archived_dirty_repair_candidate_from_workspace(
-                                &queued_id,
-                                &workspace.path,
-                            )
-                        });
+                    let archived_dirty_candidate = if let Some(base_branch) =
+                        &base_branch_for_archived_dirty_scan
+                    {
+                        match self
+                            .workspace_manager
+                            .find_existing_workspace(&queued_id)
+                            .await
+                        {
+                            Ok(Some(workspace)) => {
+                                archived_dirty_repair_candidate_from_workspace(
+                                    &queued_id,
+                                    &workspace.path,
+                                    base_branch,
+                                )
+                                .await
+                            }
+                            Ok(None) => None,
+                            Err(error) => {
+                                warn!(
+                                    change_id = %queued_id,
+                                    "Failed to find workspace for reducer-queued archived dirty repair candidate: {}",
+                                    error
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     if let Some(change) = archived_dirty_candidate {
                         info!(

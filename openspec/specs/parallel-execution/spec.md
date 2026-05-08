@@ -1275,6 +1275,8 @@ When parallel execution resumes a workspace already detected as `WorkspaceState:
 
 The resumed workspace MUST NOT silently complete in a way that bypasses merge handling or causes the change to regress to `NotQueued` before merge resolution is attempted.
 
+Queue reconciliation MUST NOT rediscover an archived or archived-dirty worktree as scheduler-local queued work when workspace-local Git/base-branch evidence shows that the same change is already merged into the base branch.
+
 #### Scenario: Resumed archived workspace enters merge wait on restart
 
 - **GIVEN** a parallel worktree is reused on restart
@@ -1303,8 +1305,23 @@ The resumed workspace MUST NOT silently complete in a way that bypasses merge ha
 - **THEN** all three changes converge to archive-complete merge handling as their resume paths finish
 - **AND** none of the resumed changes regresses to `NotQueued` solely because archive completed before shutdown
 
+#### Scenario: Already merged archived worktree is terminal residue
 
-#
+- **GIVEN** a leftover parallel worktree contains an archived change entry for `alpha`
+- **AND** workspace-local Git/base-branch comparison shows `alpha` is already merged into the base branch
+- **WHEN** scheduler queue reconciliation scans existing worktrees
+- **THEN** the worktree is not added to scheduler-local queued work as an archived-dirty repair candidate
+- **AND** apply, acceptance, and archive are not run for `alpha`
+- **AND** no user-visible archived-dirty repair diagnostic is emitted for `alpha`
+
+#### Scenario: Non-merged archived dirty worktree remains repairable
+
+- **GIVEN** a leftover parallel worktree contains an archived change entry for `beta`
+- **AND** workspace-local Git/base-branch comparison does not show `beta` as merged
+- **AND** the worktree represents an interrupted archive-finalization path
+- **WHEN** scheduler queue reconciliation scans existing worktrees
+- **THEN** `beta` may be added as an archived-dirty repair candidate
+- **AND** the normal archive-complete merge handoff or repair path remains available
 
 ### Requirement: Parallel Execution Event Reporting
 
