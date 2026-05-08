@@ -46,26 +46,95 @@ if [[ -z "$CURRENT_BRANCH" ]]; then
 	exit 1
 fi
 
+read_manifest_version() {
+	grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/'
+}
+
+next_core_version() {
+	local version="$1"
+	if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+		echo "Invalid version in Cargo.toml: $version" >&2
+		exit 1
+	fi
+
+	local major="${BASH_REMATCH[1]}"
+	local minor="${BASH_REMATCH[2]}"
+	local patch="${BASH_REMATCH[3]}"
+
+	case "$LEVEL" in
+	patch) echo "$major.$minor.$((patch + 1))" ;;
+	minor) echo "$major.$((minor + 1)).0" ;;
+	major) echo "$((major + 1)).0.0" ;;
+	esac
+}
+
+is_clean_tree() {
+	git diff --quiet --exit-code && git diff --cached --quiet --exit-code && [[ -z "$(git ls-files --others --exclude-standard)" ]]
+}
+
+acquire_bump_lock() {
+	local git_common_dir
+	git_common_dir=$(git rev-parse --git-common-dir)
+	BUMP_LOCK_DIR="$git_common_dir/cflx-bump.lock"
+	local waited=0
+
+	while ! mkdir "$BUMP_LOCK_DIR" 2>/dev/null; do
+		if ((waited >= 120)); then
+			echo "Timed out waiting for bump lock: $BUMP_LOCK_DIR" >&2
+			exit 1
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+
+	trap 'rmdir "${BUMP_LOCK_DIR:-}" 2>/dev/null || true' EXIT
+}
+
+replace_versions() {
+	local version="$1"
+	perl -0pi -e 'BEGIN { $v = shift @ARGV } s/(^\[package\]\s*.*?^version\s*=\s*")[^"]+(")/$1$v$2/ms' "$version" Cargo.toml
+	if [[ -f docs/openapi.yaml ]]; then
+		perl -0pi -e 'BEGIN { $v = shift @ARGV } s/(^  version: ).*/$1$v/m' "$version" docs/openapi.yaml
+	fi
+}
+
 if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
-	VERSION_ARGS=("$LEVEL" --no-confirm)
-	if ! $DRY_RUN; then
-		VERSION_ARGS+=(--execute)
+	if [[ ! -f Cargo.toml ]]; then
+		echo "Cargo.toml not found" >&2
+		exit 1
 	fi
 
-	cargo release version "${VERSION_ARGS[@]}"
+	acquire_bump_lock
 
-	REPLACE_ARGS=(--no-confirm)
-	if ! $DRY_RUN; then
-		REPLACE_ARGS+=(--execute)
+	CURRENT_VERSION=$(read_manifest_version)
+	if [[ -z "$CURRENT_VERSION" ]]; then
+		echo "Could not determine current version from Cargo.toml" >&2
+		exit 1
 	fi
-	cargo release replace "${REPLACE_ARGS[@]}"
 
-	NEW_VERSION=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-	cargo generate-lockfile
+	CURRENT_HEAD=$(git rev-parse HEAD)
+	CURRENT_TAG_HEAD=$(git rev-list -n 1 "v${CURRENT_VERSION}" 2>/dev/null || true)
+	if [[ "$CURRENT_TAG_HEAD" == "$CURRENT_HEAD" ]] && is_clean_tree; then
+		echo "Release v${CURRENT_VERSION} already exists at HEAD; nothing to do"
+		exit 0
+	fi
+
+	NEW_VERSION=$(next_core_version "$CURRENT_VERSION")
+	while git rev-parse -q --verify "refs/tags/v${NEW_VERSION}" >/dev/null; do
+		NEW_VERSION=$(next_core_version "$NEW_VERSION")
+	done
 
 	if $DRY_RUN; then
-		echo "[dry-run] Would commit, tag v${NEW_VERSION}, and push"
+		echo "[dry-run] Would bump ${CURRENT_VERSION} to ${NEW_VERSION}, commit, tag v${NEW_VERSION}, and push"
 		exit 0
+	fi
+
+	replace_versions "$NEW_VERSION"
+	cargo generate-lockfile
+
+	if is_clean_tree; then
+		echo "No release changes produced for v${NEW_VERSION}" >&2
+		exit 1
 	fi
 
 	COMMIT_ARGS=(-m "chore(release): release v${NEW_VERSION}")
@@ -85,26 +154,13 @@ if [[ ! -f Cargo.toml ]]; then
 	exit 1
 fi
 
-CURRENT_VERSION=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+CURRENT_VERSION=$(read_manifest_version)
 if [[ -z "$CURRENT_VERSION" ]]; then
 	echo "Could not determine current version from Cargo.toml" >&2
 	exit 1
 fi
 
-if [[ ! "$CURRENT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-	echo "Invalid version in Cargo.toml: $CURRENT_VERSION" >&2
-	exit 1
-fi
-
-MAJOR="${BASH_REMATCH[1]}"
-MINOR="${BASH_REMATCH[2]}"
-PATCH="${BASH_REMATCH[3]}"
-
-case "$LEVEL" in
-patch) NEW_VERSION_CORE="$MAJOR.$MINOR.$((PATCH + 1))" ;;
-minor) NEW_VERSION_CORE="$MAJOR.$((MINOR + 1)).0" ;;
-major) NEW_VERSION_CORE="$((MAJOR + 1)).0.0" ;;
-esac
+NEW_VERSION_CORE=$(next_core_version "$CURRENT_VERSION")
 
 BRANCH_SUFFIX=$(echo "$CURRENT_BRANCH" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^0-9a-z-]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
 if [[ -z "$BRANCH_SUFFIX" ]]; then
