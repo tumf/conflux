@@ -1,0 +1,19 @@
+## Implementation Tasks
+
+- [x] Gate archived-dirty reconciliation against terminal merged worktrees. Completion condition: before `src/parallel/queue_state.rs` inserts an archived-dirty repair candidate, it proves from workspace-local Git/base-branch evidence that the change is not already merged. (verification: unit - added `test_archived_dirty_reconciliation_skips_workspace_already_merged_to_base` in `src/parallel/tests/executor.rs`; ran `agent-exec run -- cargo test test_archived_dirty_reconciliation_skips_workspace_already_merged_to_base`, job `bc02ee5b4edf9d27bc045be4fe892fa5`, exit_code=0)
+
+- [x] Preserve legitimate archived-dirty repair for non-merged interrupted archive work. Completion condition: an archived workspace whose archive move is complete but merge has not completed is still eligible for archive-complete handoff or repair, and the existing archived-dirty discovery test continues to pass. (verification: unit - updated `src/parallel/tests/executor.rs::test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state`; ran `agent-exec run -- cargo test test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state`, job `d2113458c388c337ecfde4af17169280`, exit_code=0)
+
+- [x] Prevent terminal merged worktrees from re-entering apply or acceptance. Completion condition: a requeued or reconciled worktree detected as merged returns terminal/no-op behavior and cannot emit `ApplyStarted` or `AcceptanceStarted` for that change. (verification: integration - added `test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance_started` in `src/parallel/tests/executor.rs`; ran `agent-exec run -- cargo test test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance_started`, job `bcbe8fc3440fed06e89d1d92b168c49a`, exit_code=0)
+
+- [x] Keep reducer and scheduler intent semantics intact. Completion condition: reducer-owned `ResolveWait` and manual `MergeWait` behavior remain unchanged, and queue reconciliation still handles reducer-visible queued candidates that are active and not terminal. (verification: integration - ran existing scheduler tests: `agent-exec run -- cargo test resolve_wait` job `84a3f0d86459c506262b565cd5bd01ea`, `agent-exec run -- cargo test manual_resolve` job `76365f3c4c7abb472abc3802c82ca148`, `agent-exec run -- cargo test merge_wait` job `2c0c03f4bbaa38c993d7665889fb1ba5`; all exit_code=0)
+
+- [x] Run repository verification. Completion condition: targeted regression tests pass, default test suite passes or long-running tests are correctly marked heavy, and lint/typecheck succeeds or blockers are recorded with exact command output. (verification: integration - targeted regression tests passed: jobs `d4544b9c097ad0c59887de163133a38c`, `a681c3b57aa96f7e157f75ffb7dbdde2`, `df9c49fe76c2c6ae9408c66465dc277b`; scheduler wait tests passed: jobs `84a3f0d86459c506262b565cd5bd01ea`, `76365f3c4c7abb472abc3802c82ca148`, `2c0c03f4bbaa38c993d7665889fb1ba5`; `cargo test` parallel exposed pre-existing/flaky `openspec_cmd::openspec_list_show_tests::test_archive_change_creates_dated_destination_and_message` failure in jobs `f034a2154e394135bd677c6d32324432` and `484a23df4870b4db4a43f61cd6aac804`, but that test passed alone in job `8360ad1318250f3d5e95c3d7c7534fde`; `agent-exec run -- cargo test -- --test-threads=1` job `2ecd31dc284518c13591e090c3a822a6` exit_code=0; `agent-exec run -- cargo clippy --all-targets --all-features -- -D warnings` job `4589e91a31c17fb4a7a5dee675d5c09e` exit_code=0)
+
+## Future Work
+
+- Consider a separate cleanup-focused proposal if terminal merged worktrees should be proactively pruned sooner rather than merely ignored by reconciliation.
+
+## Final Validation
+
+Archive validation itself is the authoritative final OpenSpec validation gate. Expected archive gate: `cflx openspec validate fix-merged-worktree-requeue --archive-gate`

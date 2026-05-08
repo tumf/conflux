@@ -3677,9 +3677,8 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
 }
 
 #[tokio::test]
-async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state(
-) {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_base() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use tempfile::TempDir;
     use tokio::sync::{mpsc, RwLock};
 
@@ -3699,11 +3698,104 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
     .or_fail("write archived proposal");
     std::fs::write(
         archive_dir.join("tasks.md"),
-        "## Implementation Tasks\n\n- [x] Archive move completed\n- [ ] Commit finalization pending\n",
+        "## Implementation Tasks\n\n- [x] Archive move completed\n",
     )
     .or_fail("write archived tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(workspace_dir.path())
+        .output()
+        .await
+        .or_fail("git add archived change");
+    Command::new("git")
+        .args(["commit", "-m", "Archive fix-dependency-target-handling"])
+        .current_dir(workspace_dir.path())
+        .output()
+        .await
+        .or_fail("git commit archived change");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        Vec::new(),
+        1,
+        ExecutionMode::Parallel,
+    )));
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(
+        added, 0,
+        "terminal merged leftover worktree must not be rediscovered as an archived dirty repair candidate"
+    );
+    assert!(
+        queued.is_empty(),
+        "merged leftover worktree must not enter scheduler-local queued work"
+    );
+
+    while let Ok(event) = rx.try_recv() {
+        if let crate::events::ExecutionEvent::Log(log) = event {
+            assert!(
+                !log.message.contains("archived_dirty_repair_candidate"),
+                "merged terminal worktree must not emit archived-dirty repair diagnostics: {}",
+                log.message
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state(
+) {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    init_git_repo(workspace_dir.path()).await;
+
+    let change_id = "fix-dependency-target-handling";
+    let archive_dir = workspace_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
+    std::fs::write(workspace_dir.path().join("base-only.txt"), "base\n")
+        .or_fail("write unrelated base content");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(workspace_dir.path())
+        .output()
+        .await
+        .or_fail("git add base content before dirty repair fixture");
+    Command::new("git")
+        .args(["commit", "-m", "base before archived dirty repair"])
+        .current_dir(workspace_dir.path())
+        .output()
+        .await
+        .or_fail("git commit base content before dirty repair fixture");
+    std::fs::create_dir_all(&archive_dir).or_fail("create archived change dir after base commit");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        "# Fix dependency target handling\n",
+    )
+    .or_fail("write archived proposal after base commit");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Archive move completed\n- [ ] Commit finalization pending\n",
+    )
+    .or_fail("write archived tasks after base commit");
     std::fs::write(archive_dir.join("report.md"), "# final report\n")
-        .or_fail("leave archived workspace dirty");
+        .or_fail("leave archived workspace dirty after base commit");
 
     let (tx, mut rx) = mpsc::channel(64);
     let config = create_test_config();
@@ -3721,6 +3813,10 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        guard.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+            change_id: change_id.to_string(),
+            command: "apply".to_string(),
+        });
         guard.apply_execution_event(&crate::events::ExecutionEvent::ArchiveFailed {
             change_id: change_id.to_string(),
             error: "Archive commit finalization failed".to_string(),
@@ -3761,6 +3857,170 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
     assert!(
         saw_archived_dirty_diagnostic,
         "reconciliation should emit a user-visible archived dirty repair diagnostic"
+    );
+}
+
+#[tokio::test]
+async fn test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance_started() {
+    use crate::events::ExecutionEvent;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    init_git_repo(repo_dir.path()).await;
+
+    let change_id = "fix-dependency-target-handling";
+    let change_dir = repo_dir.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create active change dir");
+    std::fs::write(
+        change_dir.join("proposal.md"),
+        "# Fix dependency target handling\n",
+    )
+    .or_fail("write active proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("write active tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git add active change");
+    Command::new("git")
+        .args(["commit", "-m", "Add active change"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git commit active change");
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let workspace_path = workspace_base.path().join(format!("cflx-{change_id}"));
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            change_id,
+            workspace_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("create leftover worktree");
+
+    std::fs::remove_dir_all(workspace_path.join("openspec/changes").join(change_id))
+        .or_fail("remove active change dir in leftover worktree");
+    let archive_dir =
+        workspace_path.join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
+    std::fs::create_dir_all(&archive_dir).or_fail("create archive dir in leftover worktree");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        "# Fix dependency target handling\n",
+    )
+    .or_fail("write archived proposal in leftover worktree");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("write archived tasks in leftover worktree");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&workspace_path)
+        .output()
+        .await
+        .or_fail("git add archive in leftover worktree");
+    Command::new("git")
+        .args(["commit", "-m", "Archive fix-dependency-target-handling"])
+        .current_dir(&workspace_path)
+        .output()
+        .await
+        .or_fail("git commit archive in leftover worktree");
+
+    Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("checkout base branch");
+    Command::new("git")
+        .args(["merge", "--ff-only", change_id])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("merge archive branch to base");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'echo unexpected-apply >&2; exit 42'".to_string()),
+        acceptance_command: Some("sh -c 'echo unexpected-acceptance >&2; exit 43'".to_string()),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch merged leftover worktree");
+
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    assert!(
+        result.error.is_none(),
+        "merged leftover should be terminal no-op: {:?}",
+        result.error
+    );
+    assert!(
+        result.final_revision.is_none(),
+        "merged leftover should not hand off another revision for merge"
+    );
+
+    let mut saw_apply_started = false;
+    let mut saw_acceptance_started = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                saw_apply_started = true;
+            }
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                saw_acceptance_started = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        !saw_apply_started,
+        "merged leftover must not re-enter apply"
+    );
+    assert!(
+        !saw_acceptance_started,
+        "merged leftover must not re-enter acceptance"
     );
 }
 

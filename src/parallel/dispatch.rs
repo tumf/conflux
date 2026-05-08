@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
-use crate::execution::state::{detect_workspace_state, WorkspaceState};
+use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
     run_rejection_review, RejectionReviewVerdict,
@@ -40,8 +40,8 @@ use super::ParallelExecutor;
 #[cfg(test)]
 mod tests {
     use super::{
-        archived_dirty_repair_candidate_from_workspace, decide_resume_action, resume_cycle_flags,
-        should_run_apply, ResumeAction,
+        archived_dirty_repair_candidate_from_unmerged_workspace, decide_resume_action,
+        resume_cycle_flags, should_run_apply, ResumeAction,
     };
     use crate::execution::state::WorkspaceState;
     use std::fs;
@@ -253,7 +253,7 @@ mod tests {
         .unwrap();
         fs::write(archive_dir.join("report.md"), "# Report\n").unwrap();
 
-        let candidate = archived_dirty_repair_candidate_from_workspace(
+        let candidate = archived_dirty_repair_candidate_from_unmerged_workspace(
             "fix-dependency-target-handling",
             tmp.path(),
         )
@@ -391,7 +391,38 @@ fn parse_tasks_progress(
     })
 }
 
-pub(super) fn archived_dirty_repair_candidate_from_workspace(
+pub(super) async fn archived_dirty_repair_candidate_from_workspace(
+    change_id: &str,
+    workspace_path: &Path,
+    base_branch: &str,
+) -> Option<crate::openspec::Change> {
+    match is_merged_to_base(change_id, workspace_path, base_branch).await {
+        Ok(true) => {
+            info!(
+                change_id = %change_id,
+                base_branch = %base_branch,
+                workspace_path = %workspace_path.display(),
+                "Skipping archived dirty repair candidate because workspace evidence is already merged to base"
+            );
+            return None;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(
+                change_id = %change_id,
+                base_branch = %base_branch,
+                workspace_path = %workspace_path.display(),
+                "Failed to check merged state before archived dirty repair discovery: {}",
+                error
+            );
+            return None;
+        }
+    }
+
+    archived_dirty_repair_candidate_from_unmerged_workspace(change_id, workspace_path)
+}
+
+fn archived_dirty_repair_candidate_from_unmerged_workspace(
     change_id: &str,
     workspace_path: &Path,
 ) -> Option<crate::openspec::Change> {
