@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 use std::time::Duration;
@@ -1694,18 +1694,30 @@ fn render_worktree_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect)
     frame.render_widget(body, inner_area);
 }
 
+fn warning_popup_modal_area(area: Rect) -> Rect {
+    let modal_width = (area.width.saturating_mul(85) / 100)
+        .max(40)
+        .min(area.width.saturating_sub(2).max(1));
+    let modal_height = (area.height.saturating_mul(70) / 100)
+        .max(10)
+        .min(area.height.saturating_sub(2).max(1));
+    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
+
+    Rect::new(modal_x, modal_y, modal_width, modal_height)
+}
+
+fn warning_popup_message_lines(message: &str) -> Vec<Line<'_>> {
+    message.split('\n').map(Line::from).collect()
+}
+
 /// Render the warning popup modal
 fn render_warning_popup(frame: &mut Frame, app: &AppState, area: Rect) {
     let Some(popup) = &app.warning_popup else {
         return;
     };
 
-    let modal_width = (area.width * 70 / 100).clamp(40, 90);
-    let modal_height = (area.height * 40 / 100).clamp(8, 14);
-    let modal_x = (area.width.saturating_sub(modal_width)) / 2;
-    let modal_y = (area.height.saturating_sub(modal_height)) / 2;
-
-    let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
+    let modal_area = warning_popup_modal_area(area);
     frame.render_widget(Clear, modal_area);
 
     let block = Block::default()
@@ -1716,8 +1728,23 @@ fn render_warning_popup(frame: &mut Frame, app: &AppState, area: Rect) {
     let inner_area = block.inner(modal_area);
     frame.render_widget(block, modal_area);
 
-    let body = Paragraph::new(popup.message.clone()).style(Style::default().fg(Color::Yellow));
-    frame.render_widget(body, inner_area);
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner_area);
+
+    let body = Paragraph::new(warning_popup_message_lines(&popup.message))
+        .style(Style::default().fg(Color::Yellow))
+        .scroll((app.warning_popup_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, chunks[0]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("↑↓/jk PgUp/PgDn", Style::default().fg(Color::Cyan)),
+        Span::raw(" scroll  "),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" close"),
+    ]))
+    .alignment(Alignment::Center)
+    .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
 }
 
 /// Render the QR code popup
@@ -1839,6 +1866,43 @@ mod tests {
             lines.push(line);
         }
         lines.join("\n")
+    }
+
+    #[test]
+    fn warning_popup_message_lines_preserve_explicit_newlines() {
+        let lines = warning_popup_message_lines("first\nsecond\nthird");
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content, "first");
+        assert_eq!(lines[1].spans[0].content, "second");
+        assert_eq!(lines[2].spans[0].content, "third");
+    }
+
+    #[test]
+    fn warning_popup_render_shows_footer_hint_and_multiline_content() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.show_warning_popup(
+            "Hook failed",
+            "first diagnostic line\nsecond diagnostic line",
+        );
+
+        let buffer = render_buffer(&mut app, 100, 30);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("Hook failed"));
+        assert!(content.contains("first diagnostic line"));
+        assert!(content.contains("second diagnostic line"));
+        assert!(content.contains("PgUp/PgDn"));
+        assert!(content.contains("Esc"));
+    }
+
+    #[test]
+    fn warning_popup_uses_diagnostics_sized_modal_area() {
+        let area = Rect::new(0, 0, 100, 30);
+        let modal = warning_popup_modal_area(area);
+
+        assert_eq!(modal.width, 85);
+        assert_eq!(modal.height, 21);
     }
 
     #[test]

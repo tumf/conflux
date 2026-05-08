@@ -292,10 +292,10 @@ pub async fn handle_tui_command(
                     }
                 }
                 Err(e) => {
-                    ctx.app.warning_popup = Some(crate::tui::state::WarningPopup {
-                        title: "Worktree delete failed".to_string(),
-                        message: format!("Failed to delete worktree '{}': {}", path.display(), e),
-                    });
+                    ctx.app.show_warning_popup(
+                        "Worktree delete failed",
+                        format!("Failed to delete worktree '{}': {}", path.display(), e),
+                    );
                     ctx.app.add_log(LogEntry::error(format!(
                         "Worktree delete failed for '{}': {}",
                         path.display(),

@@ -419,6 +419,33 @@ pub async fn handle_plus_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
     .await
 }
 
+pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> bool {
+    if app.warning_popup.is_none() {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            app.clear_warning_popup();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.scroll_warning_popup(-1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.scroll_warning_popup(1);
+        }
+        KeyCode::PageUp => {
+            app.scroll_warning_popup(-5);
+        }
+        KeyCode::PageDown => {
+            app.scroll_warning_popup(5);
+        }
+        _ => {}
+    }
+
+    true
+}
+
 /// Handle main key events
 ///
 /// Returns Some(TuiCommand) if the key event should trigger an orchestrator start (F5 key)
@@ -427,7 +454,11 @@ pub async fn handle_key_event(
     ctx: &mut KeyEventContext<'_>,
 ) -> Result<Option<TuiCommand>> {
     let had_warning_message = ctx.app.warning_message.is_some();
-    let had_warning_popup = ctx.app.warning_popup.is_some();
+
+    if handle_warning_popup_key(ctx.app, key) {
+        ctx.app.warning_message = None;
+        return Ok(None);
+    }
 
     // Handle QrPopup mode - any key closes the popup
     if ctx.app.mode == AppMode::QrPopup {
@@ -599,11 +630,70 @@ pub async fn handle_key_event(
         _ => {}
     }
 
-    // Clear previous warning message on any key press
-    if had_warning_message || had_warning_popup {
+    // Clear legacy one-line warning message on any key press.
+    if had_warning_message {
         ctx.app.warning_message = None;
-        ctx.app.warning_popup = None;
     }
 
     Ok(cmd_to_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openspec::{Change, ProposalMetadata};
+    use crossterm::event::KeyCode;
+
+    fn create_test_change(id: &str) -> Change {
+        Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn warning_popup_scroll_keys_do_not_move_underlying_cursor_or_close_popup() {
+        let mut app = AppState::new(vec![create_test_change("a"), create_test_change("b")]);
+        app.show_warning_popup("warning", "line 1\nline 2\nline 3");
+        let cursor_before = app.cursor_index;
+
+        assert!(handle_warning_popup_key(&mut app, key(KeyCode::Down)));
+
+        assert_eq!(app.cursor_index, cursor_before);
+        assert_eq!(app.warning_popup_scroll, 1);
+        assert!(app.warning_popup.is_some());
+    }
+
+    #[test]
+    fn warning_popup_close_key_clears_popup_and_resets_scroll() {
+        let mut app = AppState::new(vec![create_test_change("a")]);
+        app.show_warning_popup("warning", "diagnostic");
+        app.warning_popup_scroll = 7;
+
+        assert!(handle_warning_popup_key(&mut app, key(KeyCode::Esc)));
+
+        assert!(app.warning_popup.is_none());
+        assert_eq!(app.warning_popup_scroll, 0);
+    }
+
+    #[test]
+    fn warning_popup_ignores_non_popup_keys_without_underlying_action() {
+        let mut app = AppState::new(vec![create_test_change("a"), create_test_change("b")]);
+        app.show_warning_popup("warning", "diagnostic");
+        let cursor_before = app.cursor_index;
+
+        assert!(handle_warning_popup_key(&mut app, key(KeyCode::Char('x'))));
+
+        assert_eq!(app.cursor_index, cursor_before);
+        assert_eq!(app.warning_popup_scroll, 0);
+        assert!(app.warning_popup.is_some());
+    }
 }

@@ -120,6 +120,15 @@ pub struct WarningPopup {
     pub message: String,
 }
 
+impl WarningPopup {
+    pub fn new(title: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            message: message.into(),
+        }
+    }
+}
+
 /// State of a single change in the TUI
 #[derive(Debug, Clone)]
 pub struct ChangeState {
@@ -191,6 +200,8 @@ pub struct AppState {
     pub warning_message: Option<String>,
     /// Warning popup content
     pub warning_popup: Option<WarningPopup>,
+    /// Scroll offset for the warning popup body (presentation-only state)
+    pub warning_popup_scroll: u16,
     /// Current spinner animation frame
     pub spinner_frame: usize,
     /// Log scroll offset (0 = show most recent at bottom)
@@ -373,6 +384,7 @@ impl AppState {
             should_quit: false,
             warning_message: None,
             warning_popup: None,
+            warning_popup_scroll: 0,
             spinner_frame: 0,
             log_scroll_offset: 0,
             log_auto_scroll: true,
@@ -391,6 +403,29 @@ impl AppState {
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
             logs_panel_enabled: true, // Default: logs panel visible
+        }
+    }
+
+    /// Show a warning popup and reset popup-local presentation state.
+    pub fn show_warning_popup(&mut self, title: impl Into<String>, message: impl Into<String>) {
+        self.warning_popup = Some(WarningPopup::new(title, message));
+        self.warning_popup_scroll = 0;
+    }
+
+    /// Clear any warning popup and reset popup-local presentation state.
+    pub fn clear_warning_popup(&mut self) {
+        self.warning_popup = None;
+        self.warning_popup_scroll = 0;
+    }
+
+    /// Scroll the warning popup body by a signed amount while keeping the offset non-negative.
+    pub fn scroll_warning_popup(&mut self, delta: i16) {
+        if delta.is_negative() {
+            self.warning_popup_scroll = self
+                .warning_popup_scroll
+                .saturating_sub(delta.unsigned_abs());
+        } else {
+            self.warning_popup_scroll = self.warning_popup_scroll.saturating_add(delta as u16);
         }
     }
 
@@ -1415,6 +1450,35 @@ mod tests {
             dependencies: Vec::new(),
             metadata: crate::openspec::ProposalMetadata::default(),
         }
+    }
+
+    #[test]
+    fn warning_popup_lifecycle_resets_scroll_offset() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.show_warning_popup("first", "message");
+        app.scroll_warning_popup(3);
+        assert_eq!(app.warning_popup_scroll, 3);
+
+        app.show_warning_popup("second", "message");
+        assert_eq!(app.warning_popup_scroll, 0);
+
+        app.scroll_warning_popup(2);
+        app.clear_warning_popup();
+        assert_eq!(app.warning_popup_scroll, 0);
+        assert!(app.warning_popup.is_none());
+    }
+
+    #[test]
+    fn warning_popup_scroll_saturates_at_zero() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.show_warning_popup("warning", "message");
+
+        app.scroll_warning_popup(-5);
+
+        assert_eq!(app.warning_popup_scroll, 0);
     }
 
     #[test]

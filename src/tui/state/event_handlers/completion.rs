@@ -4,8 +4,6 @@ use crate::task_parser;
 use crate::tui::events::{LogEntry, TuiCommand};
 use crate::tui::types::{AppMode, StopMode};
 
-use crate::tui::state::WarningPopup;
-
 use super::AppState;
 
 impl AppState {
@@ -175,10 +173,10 @@ impl AppState {
     }
 
     pub(crate) fn handle_branch_merge_failed(&mut self, branch_name: String, error: String) {
-        self.warning_popup = Some(WarningPopup {
-            title: "Merge failed".to_string(),
-            message: format!("Failed to merge '{}': {}", branch_name, error),
-        });
+        self.show_warning_popup(
+            "Merge failed",
+            format!("Failed to merge '{}': {}", branch_name, error),
+        );
         self.add_log(LogEntry::error(format!(
             "Merge failed for '{}': {}",
             branch_name, error
