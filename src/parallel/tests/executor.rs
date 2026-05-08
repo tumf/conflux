@@ -5480,19 +5480,18 @@ exit 0\n",
     let mut saw_prior_stderr_context = false;
     while let Ok(event) = event_rx.try_recv() {
         match event {
-            crate::events::ExecutionEvent::Log(entry) => {
+            crate::events::ExecutionEvent::Log(entry)
                 if entry.operation.as_deref() == Some("archive-finalization")
                     && entry
                         .message
-                        .contains("Archive commit finalization retry scheduled")
-                {
-                    saw_finalization_retry_log = true;
-                }
+                        .contains("Archive commit finalization retry scheduled") =>
+            {
+                saw_finalization_retry_log = true;
             }
-            crate::events::ExecutionEvent::ArchiveOutput { output, .. } => {
-                if output.contains("could not find dependency_targets in the crate root") {
-                    saw_prior_stderr_context = true;
-                }
+            crate::events::ExecutionEvent::ArchiveOutput { output, .. }
+                if output.contains("could not find dependency_targets in the crate root") =>
+            {
+                saw_prior_stderr_context = true;
             }
             _ => {}
         }
