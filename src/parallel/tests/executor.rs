@@ -2835,6 +2835,76 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
 }
 
 #[tokio::test]
+async fn test_repair_candidate_reanalysis_bypasses_debounce_and_dispatches_work() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now());
+    }
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("repair-after-archive")];
+    let mut in_flight = HashSet::new();
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            2,
+            ReanalysisReason::RepairCandidate,
+            &ready_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    assert!(
+        !should_break,
+        "repair candidate should resume the scheduler instead of terminating it"
+    );
+    assert_eq!(
+        iteration, 3,
+        "repair candidate should immediately trigger a dispatch iteration"
+    );
+    assert!(
+        queued.is_empty(),
+        "repair candidate should dispatch queued work without waiting for queue debounce"
+    );
+    assert_eq!(
+        in_flight.len(),
+        1,
+        "repair candidate should become in-flight after repair-triggered analysis"
+    );
+
+    while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
 async fn test_rejected_workspace_completion_retries_deferred_merges() {
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -3630,11 +3700,16 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
         .await;
 
     assert_eq!(
-        first_added, 1,
+        first_added.queued_added, 1,
         "loadable reducer-queued change should be added"
     );
     assert_eq!(
-        second_added, 0,
+        first_added.repair_added, 0,
+        "missing candidate test should not add repair candidates"
+    );
+    assert_eq!(
+        second_added.total_added(),
+        0,
         "second reconciliation should not add duplicates"
     );
     assert!(
@@ -3735,7 +3810,8 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
         .await;
 
     assert_eq!(
-        added, 0,
+        added.total_added(),
+        0,
         "terminal merged leftover worktree must not be rediscovered as an archived dirty repair candidate"
     );
     assert!(
@@ -3800,6 +3876,10 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
     let (tx, mut rx) = mpsc::channel(64);
     let config = create_test_config();
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(std::time::Instant::now());
+    }
     executor.workspace_manager = Box::new(
         TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
             .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
@@ -3830,10 +3910,28 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
     let added = executor
         .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
         .await;
+    let last_queue_change_after_repair = *executor.last_queue_change_at.lock().await;
+    let rediscovered = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
 
     assert_eq!(
-        added, 1,
+        added.queued_added, 0,
+        "terminal-invisible reducer state must not be classified as a normal queued addition"
+    );
+    assert_eq!(
+        added.repair_added, 1,
         "archived dirty workspace should be rediscovered even after ArchiveFailed made reducer queue intent terminal-invisible"
+    );
+    assert_eq!(
+        rediscovered.total_added(),
+        0,
+        "unchanged archived dirty repair rediscovery should not claim new scheduler progress"
+    );
+    assert_eq!(
+        *executor.last_queue_change_at.lock().await,
+        last_queue_change_after_repair,
+        "repair discovery and rediscovery must not refresh normal queue debounce"
     );
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].id, change_id);
@@ -3846,17 +3944,17 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
         "test must exercise the real post-failure reducer shape: terminal ArchiveFailed excludes queued_change_ids"
     );
 
-    let mut saw_archived_dirty_diagnostic = false;
+    let mut archived_dirty_diagnostic_count = 0usize;
     while let Ok(event) = rx.try_recv() {
         if let crate::events::ExecutionEvent::Log(log) = event {
             if log.message.contains("archived_dirty_repair_candidate") {
-                saw_archived_dirty_diagnostic = true;
+                archived_dirty_diagnostic_count += 1;
             }
         }
     }
-    assert!(
-        saw_archived_dirty_diagnostic,
-        "reconciliation should emit a user-visible archived dirty repair diagnostic"
+    assert_eq!(
+        archived_dirty_diagnostic_count, 1,
+        "reconciliation should emit the first archived dirty repair diagnostic while bounding unchanged repeats"
     );
 }
 
