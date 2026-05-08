@@ -4404,6 +4404,159 @@ async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
 }
 
 #[tokio::test]
+async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    init_git_repo(repo_dir.path()).await;
+
+    let change_id = "improve-warning-popup-readability";
+    let change_dir = repo_dir.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create active change dir");
+    std::fs::write(
+        change_dir.join("proposal.md"),
+        "# Improve warning popup readability\n",
+    )
+    .or_fail("write active proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("write active tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git add active change");
+    Command::new("git")
+        .args(["commit", "-m", "Add active change"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git commit active change");
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let workspace_path = workspace_base.path().join(format!("cflx-{change_id}"));
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            change_id,
+            workspace_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("create archived worktree");
+    std::fs::remove_dir_all(workspace_path.join("openspec/changes").join(change_id))
+        .or_fail("remove active change dir in worktree");
+    let archive_dir = workspace_path
+        .join("openspec/changes/archive/2026-05-08-improve-warning-popup-readability");
+    std::fs::create_dir_all(&archive_dir).or_fail("create archive dir in worktree");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        "# Improve warning popup readability\n",
+    )
+    .or_fail("write archived proposal");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("write archived tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&workspace_path)
+        .output()
+        .await
+        .or_fail("git add archive in worktree");
+    Command::new("git")
+        .args(["commit", "-m", "Archive improve-warning-popup-readability"])
+        .current_dir(&workspace_path)
+        .output()
+        .await
+        .or_fail("git commit archive in worktree");
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+            change_id.to_string(),
+        ));
+    }
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'echo unexpected-apply >&2; exit 42'".to_string()),
+        acceptance_command: Some("sh -c 'echo unexpected-acceptance >&2; exit 43'".to_string()),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.set_shared_orchestrator_state(shared.clone());
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch archived worktree");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    assert!(result.error.is_none());
+    assert!(result.final_revision.is_some());
+    assert!(
+        shared.read().await.queued_change_ids().is_empty(),
+        "resumed Archived dispatch must clear reducer queued intent before scheduler reconciliation can re-add it"
+    );
+
+    let mut saw_apply_started = false;
+    let mut saw_archived = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                saw_apply_started = true;
+            }
+            ExecutionEvent::ChangeArchived(id) if id == change_id => {
+                saw_archived = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(!saw_apply_started);
+    assert!(saw_archived);
+}
+
+#[tokio::test]
 async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
     use crate::events::ExecutionEvent;
     use crate::orchestration::state::{ExecutionMode, OrchestratorState};
