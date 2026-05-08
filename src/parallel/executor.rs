@@ -770,6 +770,16 @@ pub async fn execute_archive_in_workspace(
                     OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
                 };
                 if let Some(ref tx) = event_tx {
+                    if text.contains("Archive commit finalization retry scheduled") {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                crate::events::LogEntry::warn(text.clone())
+                                    .with_change_id(&change_id)
+                                    .with_operation("archive-finalization")
+                                    .with_iteration(iteration),
+                            ))
+                            .await;
+                    }
                     let _ = tx
                         .send(ParallelEvent::ArchiveOutput {
                             change_id,

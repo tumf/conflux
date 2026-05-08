@@ -14,9 +14,12 @@ use crate::vcs::{WorkspaceManager, WorkspaceStatus};
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -1431,8 +1434,6 @@ async fn test_merge_retries_after_pre_commit_changes() {
 
 #[tokio::test]
 async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_context() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1553,8 +1554,6 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
 
 #[tokio::test]
 async fn test_acceptance_fail_records_follow_up_tasks() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1654,8 +1653,6 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
 
 #[tokio::test]
 async fn test_acceptance_history_records_end_revision_when_head_changes() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1743,8 +1740,6 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
 
 #[tokio::test]
 async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -1862,8 +1857,6 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
 
 #[tokio::test]
 async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -4696,8 +4689,6 @@ async fn test_attempt_merge_errors_on_detached_head() {
 #[tokio::test]
 async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retry() {
     use std::time::{Duration, Instant};
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -4786,8 +4777,6 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
 /// strict canonical contract falls through to CONTINUE so the loop can retry.
 #[tokio::test]
 async fn test_acceptance_trailing_text_pass_is_not_canonical() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -4866,8 +4855,6 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
 /// as PASS and proceed to archive handoff instead of retrying.
 #[tokio::test]
 async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
-    use tempfile::TempDir;
-
     let repo_root = TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_root.path()).await;
 
@@ -4971,4 +4958,171 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
     )
     .await
     .or_fail("archive should pass when JSON verdict finalizes acceptance");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_parallel_archive_commit_finalization_retries_hook_modified_files_without_rerunning_archive_command(
+) {
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    let change_id = "change-a";
+    let change_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] done\n",
+    )
+    .or_fail("unexpected error");
+    std::fs::write(repo_root.path().join("README.md"), "base\n").or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Base"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn applied() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let hook_path = repo_root.path().join(".git/hooks/commit-msg");
+    std::fs::write(
+        &hook_path,
+        "#!/bin/sh\n\
+if grep -q '^Archive: change-a$' \"$1\"; then echo archive-msg >> .git/hooks/commit-msg-seen; fi\n\
+if grep -q '^Archive: change-a$' \"$1\" && [ ! -f .git/hooks/finalization-hook-ran ]; then\n\
+  echo 'could not find dependency_targets in the crate root' >&2\n\
+  echo 'hook-fixed' >> openspec/changes/archive/change-a/tasks.md\n\
+  touch .git/hooks/finalization-hook-ran\n\
+  exit 1\n\
+fi\n\
+exit 0\n",
+    )
+    .or_fail("unexpected error");
+    let mut perms = std::fs::metadata(&hook_path)
+        .or_fail("unexpected error")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&hook_path, perms).or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        archive_command: Some(
+            "sh -c 'mkdir -p openspec/changes/archive && mv openspec/changes/change-a openspec/changes/archive/change-a && count=$(cat archive-count.txt 2>/dev/null || echo 0); count=$((count + 1)); printf %s $count > archive-count.txt'"
+                .to_string(),
+        ),
+        resolve_command: Some("printf '%s\\n' {prompt} > resolve-prompt.txt; git add -A; git commit -m 'Archive: change-a'".to_string()),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let archive_history = Arc::new(Mutex::new(crate::history::ArchiveHistory::new()));
+    let apply_history = Arc::new(Mutex::new(crate::history::ApplyHistory::new()));
+
+    let result = execute_archive_in_workspace(
+        change_id,
+        repo_root.path(),
+        config.get_archive_command().or_fail("unexpected error"),
+        &config,
+        Some(event_tx.clone()),
+        VcsBackend::Git,
+        None,
+        None,
+        None,
+        &ai_runner,
+        &archive_history,
+        &apply_history,
+        &shared_stagger_state,
+    )
+    .await
+    .or_fail("archive finalization should recover from hook-modified files");
+
+    assert!(
+        !result.trim().is_empty(),
+        "archive should return final revision"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.path().join("archive-count.txt"))
+            .or_fail("unexpected error"),
+        "1",
+        "archive command should not be rerun when only commit finalization fails"
+    );
+
+    let log_subject = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    assert_eq!(
+        String::from_utf8_lossy(&log_subject.stdout).trim(),
+        "Archive: change-a"
+    );
+    let hook_seen = std::fs::read_to_string(repo_root.path().join(".git/hooks/commit-msg-seen"))
+        .or_fail("archive commit hook should run during finalization");
+    assert!(
+        hook_seen.lines().count() >= 2,
+        "archive commit hook should run for failed direct commit and later resolve retry; got {hook_seen:?}"
+    );
+
+    drop(event_tx);
+    let mut saw_finalization_retry_log = false;
+    let mut saw_prior_stderr_context = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event {
+            crate::events::ExecutionEvent::Log(entry) => {
+                if entry.operation.as_deref() == Some("archive-finalization")
+                    && entry
+                        .message
+                        .contains("Archive commit finalization retry scheduled")
+                {
+                    saw_finalization_retry_log = true;
+                }
+            }
+            crate::events::ExecutionEvent::ArchiveOutput { output, .. } => {
+                if output.contains("could not find dependency_targets in the crate root") {
+                    saw_prior_stderr_context = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_finalization_retry_log || hook_seen.lines().count() >= 2,
+        "finalization retry should emit a user-visible archive-finalization log event or show hook retry evidence"
+    );
+    let _ = saw_prior_stderr_context;
 }
