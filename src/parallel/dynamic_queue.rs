@@ -65,6 +65,8 @@ pub enum ReanalysisReason {
     SlotRecovery,
     /// Queue notification (dynamic queue has new items)
     QueueNotification,
+    /// Workspace-derived archived-dirty repair candidate became analysis-eligible.
+    RepairCandidate,
 }
 
 impl std::fmt::Display for ReanalysisReason {
@@ -75,6 +77,7 @@ impl std::fmt::Display for ReanalysisReason {
             ReanalysisReason::ResolveCompletion => write!(f, "resolve_completion"),
             ReanalysisReason::SlotRecovery => write!(f, "slot_recovery"),
             ReanalysisReason::QueueNotification => write!(f, "queue"),
+            ReanalysisReason::RepairCandidate => write!(f, "repair_candidate"),
         }
     }
 }
