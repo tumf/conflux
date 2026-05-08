@@ -10,6 +10,7 @@ mod install_skills;
 mod cli;
 mod command_queue;
 mod config;
+mod dependency_targets;
 mod error;
 mod error_history;
 mod events;

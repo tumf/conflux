@@ -1,0 +1,180 @@
+//! Repository-visible dependency target classification helpers.
+//!
+//! The classifier is intentionally small and deterministic: callers provide the
+//! queued and in-flight sets from scheduler/analyzer state, plus archive evidence
+//! collected from the workspace or base tree. No durable state outside the
+//! repository participates in the decision.
+
+use std::collections::HashSet;
+use std::path::Path;
+use tracing::warn;
+
+/// Classification for a dependency target referenced by an active change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DependencyTargetClass {
+    Queued,
+    InFlight,
+    Archived,
+    Missing,
+}
+
+impl DependencyTargetClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::InFlight => "in-flight",
+            Self::Archived => "archived",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// Strip Conflux archive date prefixes such as `2026-04-29-change-id`.
+pub(crate) fn strip_archive_date_prefix(name: &str) -> &str {
+    if name.len() > 11 {
+        let bytes = name.as_bytes();
+        let has_date_prefix = bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'-'
+            && bytes[..4].iter().all(u8::is_ascii_digit)
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[8..10].iter().all(u8::is_ascii_digit);
+        if has_date_prefix {
+            return &name[11..];
+        }
+    }
+    name
+}
+
+/// Classify a dependency using already-collected repository-visible evidence.
+pub(crate) fn classify_dependency_target<'a>(
+    dep_id: &str,
+    queued_ids: impl IntoIterator<Item = &'a str>,
+    in_flight_ids: impl IntoIterator<Item = &'a str>,
+    archived_ids: &HashSet<String>,
+) -> DependencyTargetClass {
+    if queued_ids.into_iter().any(|id| id == dep_id) {
+        DependencyTargetClass::Queued
+    } else if in_flight_ids.into_iter().any(|id| id == dep_id) {
+        DependencyTargetClass::InFlight
+    } else if archived_ids.contains(dep_id) {
+        DependencyTargetClass::Archived
+    } else {
+        DependencyTargetClass::Missing
+    }
+}
+
+/// Collect archive IDs from `openspec/changes/archive` under a repository root.
+pub(crate) fn collect_archived_change_ids(repo_root: &Path) -> HashSet<String> {
+    let archive_dir = repo_root.join("openspec/changes/archive");
+    let Ok(entries) = std::fs::read_dir(&archive_dir) else {
+        return HashSet::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() || !path.join("proposal.md").exists() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            Some(strip_archive_date_prefix(&name).to_string())
+        })
+        .collect()
+}
+
+/// Add authoritative proposal metadata/body dependencies to an analysis result.
+pub(crate) fn union_metadata_dependencies(
+    dependencies: &mut std::collections::HashMap<String, Vec<String>>,
+    change_id: &str,
+    metadata_dependencies: &[String],
+) {
+    if metadata_dependencies.is_empty() {
+        return;
+    }
+
+    let entry = dependencies.entry(change_id.to_string()).or_default();
+    for dep_id in metadata_dependencies {
+        if dep_id == change_id {
+            warn!(
+                change_id,
+                dependency = dep_id,
+                "Ignoring self-referential proposal metadata dependency during dependency union"
+            );
+            continue;
+        }
+        if !entry.contains(dep_id) {
+            entry.push(dep_id.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_dependency_targets_from_supplied_evidence() {
+        let archived = HashSet::from(["archived-a".to_string()]);
+
+        assert_eq!(
+            classify_dependency_target(
+                "queued-a",
+                ["queued-a"].into_iter(),
+                [].into_iter(),
+                &archived
+            ),
+            DependencyTargetClass::Queued
+        );
+        assert_eq!(
+            classify_dependency_target(
+                "flight-a",
+                [].into_iter(),
+                ["flight-a"].into_iter(),
+                &archived
+            ),
+            DependencyTargetClass::InFlight
+        );
+        assert_eq!(
+            classify_dependency_target("archived-a", [].into_iter(), [].into_iter(), &archived),
+            DependencyTargetClass::Archived
+        );
+        assert_eq!(
+            classify_dependency_target("missing-a", [].into_iter(), [].into_iter(), &archived),
+            DependencyTargetClass::Missing
+        );
+    }
+
+    #[test]
+    fn strips_date_prefixed_archive_names() {
+        assert_eq!(
+            strip_archive_date_prefix("2026-04-29-sample-change"),
+            "sample-change"
+        );
+        assert_eq!(strip_archive_date_prefix("sample-change"), "sample-change");
+        assert_eq!(
+            strip_archive_date_prefix("2026-4-29-sample-change"),
+            "2026-4-29-sample-change"
+        );
+    }
+
+    #[test]
+    fn unions_metadata_dependencies_without_removing_existing_dependencies() {
+        let mut deps = std::collections::HashMap::from([(
+            "route".to_string(),
+            vec!["llm-discovered".to_string()],
+        )]);
+
+        union_metadata_dependencies(
+            &mut deps,
+            "route",
+            &["policy".to_string(), "llm-discovered".to_string()],
+        );
+
+        assert_eq!(
+            deps.get("route").cloned().unwrap(),
+            vec!["llm-discovered".to_string(), "policy".to_string()]
+        );
+    }
+}
