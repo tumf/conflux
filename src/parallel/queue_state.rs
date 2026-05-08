@@ -25,6 +25,7 @@ enum QueueReconciliationDiagnosticLevel {
 
 use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
+use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::{MergeResult, ParallelEvent, ParallelExecutor, WorkspaceResult};
@@ -1245,7 +1246,33 @@ impl ParallelExecutor {
                     added += 1;
                 }
                 None => {
-                    if self.should_emit_queue_reconciliation_diagnostic(
+                    let archived_dirty_candidate = self
+                        .workspace_manager
+                        .find_existing_workspace(&queued_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|workspace| {
+                            archived_dirty_repair_candidate_from_workspace(
+                                &queued_id,
+                                &workspace.path,
+                            )
+                        });
+
+                    if let Some(change) = archived_dirty_candidate {
+                        info!(
+                            "Queue reconciliation adding archived dirty repair candidate: {}",
+                            queued_id
+                        );
+                        self.emit_queue_reconciliation_diagnostic_without_dedupe(
+                            QueueReconciliationDiagnosticLevel::Info,
+                            &queued_id,
+                            "archived_dirty_repair_candidate",
+                        )
+                        .await;
+                        queued.push(change);
+                        added += 1;
+                    } else if self.should_emit_queue_reconciliation_diagnostic(
                         &queued_id,
                         "candidate_not_found",
                     ) {

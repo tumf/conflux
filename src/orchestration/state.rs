@@ -1378,8 +1378,13 @@ impl OrchestratorState {
             }
             ExecutionEvent::ArchiveResumed { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
+                if matches!(rt.terminal, TerminalState::Error(_)) {
+                    rt.terminal = TerminalState::None;
+                }
+                if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Archiving;
+                    rt.wait_state = WaitState::None;
+                    rt.clear_blocked_metadata();
                 }
             }
             ExecutionEvent::ArchiveRetryScheduled { change_id, .. } => {
@@ -2077,6 +2082,32 @@ mod tests {
         let outcome8 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(matches!(outcome8, ReduceOutcome::Changed(_)));
         assert_eq!(state.display_status("c"), "queued");
+    }
+
+    #[test]
+    fn archive_resumed_clears_recoverable_archive_error_and_restores_archiving_activity() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+        state.apply_execution_event(&ExecutionEvent::ArchiveFailed {
+            change_id: "c".to_string(),
+            error: "Archive commit finalization failed".to_string(),
+            reason: Some("verification_failed".to_string()),
+            summary: Some("commit incomplete".to_string()),
+        });
+        assert_eq!(state.display_status("c"), "error");
+
+        state.apply_execution_event(&ExecutionEvent::ArchiveResumed {
+            change_id: "c".to_string(),
+            reason: Some("archive_commit_incomplete".to_string()),
+            summary: Some("resuming archived dirty repair".to_string()),
+        });
+
+        assert_eq!(state.display_status("c"), "archiving");
+        let runtime = state.change_runtime("c").expect("runtime should exist");
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        assert!(state.global_invariants_hold());
     }
 
     #[test]
