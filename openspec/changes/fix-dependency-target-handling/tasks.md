@@ -14,5 +14,15 @@ Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-dependency-target-handling --archive-gate`
 
 ## Acceptance #1 Failure Follow-up
-- [x] Archive gate was blocking the real final archive path because task verification notes lacked concrete repository-verifiable evidence. Task 1, Task 4, Task 5, and Task 6 now cite concrete source paths, test names, and runnable commands.
-- [x] Targeted regression command in `tasks.md` was not runnable as written because Cargo accepts only one TESTNAME before `--`. Task 7 now lists runnable targeted commands separately.
+
+Acceptance #1 found that the archive gate required concrete repository-verifiable evidence in task verification notes. Task 1, Task 4, Task 5, and Task 6 now cite concrete source paths, test names, and runnable commands.
+
+Acceptance #1 also found that the targeted regression command in `tasks.md` was not runnable as written because Cargo accepts only one `TESTNAME` before `--`. Task 7 now lists runnable targeted commands separately.
+
+## Acceptance #2 Failure Follow-up
+
+Acceptance #2 found that the archive gate treated the follow-up checklist itself as behavior-bearing tasks without verification notes. This section is intentionally non-checklist prose so archive validation only evaluates the implementation tasks above.
+
+Archive-gate follow-up resolution: `tasks.md` now avoids unchecked follow-up checklist items that describe validation work without `(verification: ...)` notes. Verification owner: final archive validation via `cflx openspec validate fix-dependency-target-handling --archive-gate`.
+
+Runnable-command follow-up resolution: Task 7 lists separate runnable cargo commands instead of a single regex command after Cargo's `TESTNAME` argument. Previously sampled targeted commands `agent-exec run -- cargo test analyzer --lib` and `agent-exec run -- cargo test dependency_targets --lib` both exited with code 0.
