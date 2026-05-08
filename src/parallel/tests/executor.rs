@@ -204,7 +204,7 @@ impl WorkspaceManager for TestWorkspaceManager {
     }
 
     async fn list_worktree_change_ids(&self) -> VcsResult<HashSet<String>> {
-        Ok(HashSet::new())
+        Ok(self.existing_workspaces.keys().cloned().collect())
     }
 
     fn conflict_resolution_prompt(&self) -> &'static str {
@@ -3501,6 +3501,91 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
     assert_eq!(
         structured_warn_count, 1,
         "tracing warn should be emitted once for missing reducer-queued candidate"
+    );
+}
+
+#[tokio::test]
+async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state()
+{
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    init_git_repo(workspace_dir.path()).await;
+
+    let change_id = "fix-dependency-target-handling";
+    let archive_dir = workspace_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-08-fix-dependency-target-handling");
+    std::fs::create_dir_all(&archive_dir).or_fail("create archived change dir");
+    std::fs::write(archive_dir.join("proposal.md"), "# Fix dependency target handling\n")
+        .or_fail("write archived proposal");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Archive move completed\n- [ ] Commit finalization pending\n",
+    )
+    .or_fail("write archived tasks");
+    std::fs::write(archive_dir.join("report.md"), "# final report\n")
+        .or_fail("leave archived workspace dirty");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        guard.apply_execution_event(&crate::events::ExecutionEvent::ArchiveFailed {
+            change_id: change_id.to_string(),
+            error: "Archive commit finalization failed".to_string(),
+            reason: Some("archive_commit_incomplete".to_string()),
+            summary: Some("archive move complete, commit incomplete".to_string()),
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(
+        added, 1,
+        "archived dirty workspace should be rediscovered even after ArchiveFailed made reducer queue intent terminal-invisible"
+    );
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, change_id);
+    assert_eq!(queued[0].completed_tasks, 1);
+    assert_eq!(queued[0].total_tasks, 2);
+
+    let reducer_queued = shared.read().await.queued_change_ids();
+    assert!(
+        reducer_queued.is_empty(),
+        "test must exercise the real post-failure reducer shape: terminal ArchiveFailed excludes queued_change_ids"
+    );
+
+    let mut saw_archived_dirty_diagnostic = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.message.contains("archived_dirty_repair_candidate") {
+                saw_archived_dirty_diagnostic = true;
+            }
+        }
+    }
+    assert!(
+        saw_archived_dirty_diagnostic,
+        "reconciliation should emit a user-visible archived dirty repair diagnostic"
     );
 }
 
