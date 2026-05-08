@@ -1,8 +1,6 @@
 ---
 change_type: implementation
 priority: high
-dependencies:
-  - retry-archive-commit-finalization
 references:
   - src/execution/state.rs
   - src/parallel/dispatch.rs
