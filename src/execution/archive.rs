@@ -22,7 +22,7 @@ use std::future::Future;
 use std::path::Path;
 
 use tokio::process::Command;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::{AgentRunner, OutputLine};
 use crate::error::{OrchestratorError, Result};
@@ -33,6 +33,9 @@ use crate::vcs::VcsBackend;
 
 /// Maximum number of archive retries after a verification failure.
 pub const ARCHIVE_COMMAND_MAX_RETRIES: u32 = 2;
+
+/// Maximum number of archive commit finalization retries after archive move verification succeeds.
+pub const ARCHIVE_COMMIT_FINALIZATION_MAX_RETRIES: u32 = ARCHIVE_COMMAND_MAX_RETRIES;
 
 /// Result of archive path verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +202,170 @@ pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path
 ///
 /// Returns an error if `openspec/changes/<change_id>` still exists, indicating
 /// the change was not properly archived.
-async fn try_direct_archive_commit(change_id: &str, repo_root: &Path) -> Result<bool> {
+#[derive(Debug, Clone, Default)]
+struct ArchiveFinalizationAttemptContext {
+    last_direct_commit_stdout: Option<String>,
+    last_direct_commit_stderr: Option<String>,
+    last_direct_commit_exit_code: Option<i32>,
+    last_resolve_stdout_tail: Option<String>,
+    last_resolve_stderr_tail: Option<String>,
+    last_resolve_exit_code: Option<i32>,
+    last_verification_complete: Option<bool>,
+    last_blocker: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveFinalizationSnapshot {
+    git_status_porcelain: String,
+    latest_commit_subject: Option<String>,
+    change_exists: bool,
+    archive_exists: bool,
+    archive_commit_complete: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DirectArchiveCommitResult {
+    success: bool,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+}
+
+fn tail_text(text: &str, max_lines: usize) -> Option<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    Some(lines[start..].join("\n"))
+}
+
+async fn git_status_porcelain(repo_root: &Path) -> Result<String> {
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .map_err(|e| OrchestratorError::GitCommand(format!("Failed to check git status: {}", e)))?;
+
+    if !status_output.status.success() {
+        let stderr = String::from_utf8_lossy(&status_output.stderr);
+        return Err(OrchestratorError::GitCommand(format!(
+            "Failed to check git status: {}",
+            stderr.trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&status_output.stdout).to_string())
+}
+
+async fn archive_finalization_snapshot(
+    change_id: &str,
+    repo_root: &Path,
+) -> Result<ArchiveFinalizationSnapshot> {
+    let git_status_porcelain = git_status_porcelain(repo_root).await?;
+    let latest_commit_subject = git_commands::run_git(&["log", "-1", "--format=%s"], repo_root)
+        .await
+        .ok()
+        .map(|subject| subject.trim().to_string())
+        .filter(|subject| !subject.is_empty());
+    let change_exists = repo_root.join("openspec/changes").join(change_id).exists();
+    let archive_exists =
+        archive_entry_exists(change_id, &repo_root.join("openspec/changes/archive"));
+    let archive_commit_complete = is_archive_commit_complete(change_id, Some(repo_root)).await?;
+
+    Ok(ArchiveFinalizationSnapshot {
+        git_status_porcelain,
+        latest_commit_subject,
+        change_exists,
+        archive_exists,
+        archive_commit_complete,
+    })
+}
+
+fn build_archive_finalization_prompt(
+    change_id: &str,
+    attempt: u32,
+    max_attempts: u32,
+    snapshot: &ArchiveFinalizationSnapshot,
+    context: &ArchiveFinalizationAttemptContext,
+) -> String {
+    let status = if snapshot.git_status_porcelain.trim().is_empty() {
+        "<clean>".to_string()
+    } else {
+        snapshot.git_status_porcelain.clone()
+    };
+    let latest_subject = snapshot
+        .latest_commit_subject
+        .as_deref()
+        .unwrap_or("<no commits>");
+    let mut prompt = format!(
+        "You are finalizing the archive commit for change '{change_id}'.\n\n\
+Archive commit finalization attempt {attempt}/{max_attempts}.\n\n\
+Requirements:\n\
+1) Ensure `git status --porcelain` is empty when done.\n\
+2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
+3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
+4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
+5) Do not use destructive commands like `git reset --hard`.\n\n\
+Current archive finalization state:\n\
+- git status --porcelain:\n{status}\n\
+- active change directory exists: {change_exists}\n\
+- archive entry exists: {archive_exists}\n\
+- latest commit subject: {latest_subject}\n\
+- archive commit complete: {archive_commit_complete}\n",
+        change_id = change_id,
+        attempt = attempt,
+        max_attempts = max_attempts,
+        status = status,
+        change_exists = snapshot.change_exists,
+        archive_exists = snapshot.archive_exists,
+        latest_subject = latest_subject,
+        archive_commit_complete = snapshot.archive_commit_complete,
+    );
+
+    if context.last_direct_commit_stdout.is_some()
+        || context.last_direct_commit_stderr.is_some()
+        || context.last_resolve_stdout_tail.is_some()
+        || context.last_resolve_stderr_tail.is_some()
+        || context.last_blocker.is_some()
+    {
+        prompt.push_str("\nPrevious archive finalization failure context:\n");
+        if let Some(code) = context.last_direct_commit_exit_code {
+            prompt.push_str(&format!("- last direct commit exit code: {code:?}\n"));
+        }
+        if let Some(stdout) = &context.last_direct_commit_stdout {
+            prompt.push_str(&format!("- last direct commit stdout:\n{stdout}\n"));
+        }
+        if let Some(stderr) = &context.last_direct_commit_stderr {
+            prompt.push_str(&format!("- last direct commit stderr:\n{stderr}\n"));
+        }
+        if let Some(code) = context.last_resolve_exit_code {
+            prompt.push_str(&format!("- last resolve exit code: {code:?}\n"));
+        }
+        if let Some(stdout) = &context.last_resolve_stdout_tail {
+            prompt.push_str(&format!("- last resolve stdout tail:\n{stdout}\n"));
+        }
+        if let Some(stderr) = &context.last_resolve_stderr_tail {
+            prompt.push_str(&format!("- last resolve stderr tail:\n{stderr}\n"));
+        }
+        if let Some(complete) = context.last_verification_complete {
+            prompt.push_str(&format!(
+                "- last archive completion verification: {complete}\n"
+            ));
+        }
+        if let Some(blocker) = &context.last_blocker {
+            prompt.push_str(&format!("- last actionable blocker: {blocker}\n"));
+        }
+    }
+
+    prompt
+}
+
+async fn try_direct_archive_commit(
+    change_id: &str,
+    repo_root: &Path,
+) -> Result<DirectArchiveCommitResult> {
     let commit_message = format!("Archive: {}", change_id);
 
     debug!(
@@ -232,25 +398,33 @@ async fn try_direct_archive_commit(change_id: &str, repo_root: &Path) -> Result<
             OrchestratorError::GitCommand(format!("Failed to run direct archive commit: {}", e))
         })?;
 
-    if !commit_output.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+    let stdout = String::from_utf8_lossy(&commit_output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&commit_output.stderr).to_string();
+    let success = commit_output.status.success();
+    let exit_code = commit_output.status.code();
+
+    if !success {
         warn!(
             change_id = %change_id,
             repo_root = %repo_root.display(),
-            exit_code = ?commit_output.status.code(),
+            exit_code = ?exit_code,
             stderr = %stderr.trim(),
-            "Direct archive commit failed; falling back to AI resolve"
+            "Direct archive commit failed; archive finalization will retry or invoke AI resolve"
         );
-        return Ok(false);
+    } else {
+        debug!(
+            change_id = %change_id,
+            repo_root = %repo_root.display(),
+            "Direct archive commit succeeded"
+        );
     }
 
-    debug!(
-        change_id = %change_id,
-        repo_root = %repo_root.display(),
-        "Direct archive commit succeeded"
-    );
-
-    Ok(true)
+    Ok(DirectArchiveCommitResult {
+        success,
+        stdout,
+        stderr,
+        exit_code,
+    })
 }
 
 pub async fn ensure_archive_commit<F, Fut>(
@@ -304,89 +478,204 @@ where
                 )));
             }
 
-            if is_archive_commit_complete(change_id, Some(repo_root)).await? {
-                return Ok(());
-            }
+            let max_attempts = ARCHIVE_COMMIT_FINALIZATION_MAX_RETRIES.saturating_add(1);
+            let mut context = ArchiveFinalizationAttemptContext::default();
 
-            let (has_changes, _) = git_commands::has_uncommitted_changes(repo_root)
-                .await
-                .map_err(OrchestratorError::from_vcs_error)?;
-            if !has_changes {
-                let subject = git_commands::run_git(&["log", "-1", "--format=%s"], repo_root)
-                    .await
-                    .map_err(OrchestratorError::from_vcs_error)?;
-                let subject = subject.trim();
-                let wip_prefix = format!("WIP(archive): {}", change_id);
-                if subject.starts_with(&wip_prefix) {
-                    match git_commands::squash_archive_wip_commits(repo_root, change_id).await {
-                        Ok(()) => {
-                            if is_archive_commit_complete(change_id, Some(repo_root)).await? {
-                                return Ok(());
+            for attempt in 1..=max_attempts {
+                let snapshot = archive_finalization_snapshot(change_id, repo_root).await?;
+                if snapshot.archive_commit_complete {
+                    return Ok(());
+                }
+
+                info!(
+                    change_id = %change_id,
+                    repo_root = %repo_root.display(),
+                    attempt = attempt,
+                    max_attempts = max_attempts,
+                    git_status = %snapshot.git_status_porcelain.trim(),
+                    change_exists = snapshot.change_exists,
+                    archive_exists = snapshot.archive_exists,
+                    "Starting archive commit finalization attempt"
+                );
+
+                if snapshot.change_exists {
+                    context.last_blocker = Some(format!(
+                        "active change directory still exists at {}",
+                        repo_root.join("openspec/changes").join(change_id).display()
+                    ));
+                }
+
+                if snapshot.git_status_porcelain.trim().is_empty() {
+                    let wip_prefix = format!("WIP(archive): {}", change_id);
+                    if snapshot
+                        .latest_commit_subject
+                        .as_deref()
+                        .is_some_and(|subject| subject.starts_with(&wip_prefix))
+                    {
+                        match git_commands::squash_archive_wip_commits(repo_root, change_id).await {
+                            Ok(()) => {
+                                let complete =
+                                    is_archive_commit_complete(change_id, Some(repo_root)).await?;
+                                context.last_verification_complete = Some(complete);
+                                if complete {
+                                    return Ok(());
+                                }
+                                context.last_blocker = Some(
+                                    "WIP archive commit squash finished but archive commit verification remained incomplete"
+                                        .to_string(),
+                                );
+                            }
+                            Err(err) => {
+                                let blocker = format!(
+                                    "Failed to squash WIP(archive) commits before resolving archive: {err}"
+                                );
+                                warn!(change_id = %change_id, error = %err, "{blocker}");
+                                context.last_blocker = Some(blocker.clone());
+                                handle_output(OutputLine::Stderr(format!(
+                                    "Archive commit finalization retry scheduled for {change_id} (attempt {}/{max_attempts}): {blocker}",
+                                    attempt + 1
+                                )))
+                                .await;
                             }
                         }
-                        Err(err) => {
-                            warn!(
-                                change_id = %change_id,
-                                error = %err,
-                                "Failed to squash WIP(archive) commits before resolving archive"
-                            );
-                        }
+                    } else {
+                        context.last_blocker = Some(
+                            "archive commit verification incomplete while working tree is clean"
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    let commit_result = try_direct_archive_commit(change_id, repo_root).await?;
+                    context.last_direct_commit_stdout = tail_text(&commit_result.stdout, 40);
+                    context.last_direct_commit_stderr = tail_text(&commit_result.stderr, 80);
+                    context.last_direct_commit_exit_code = commit_result.exit_code;
+                    if !commit_result.success {
+                        context.last_blocker = tail_text(&commit_result.stderr, 80)
+                            .or_else(|| tail_text(&commit_result.stdout, 40))
+                            .or_else(|| Some("direct archive commit failed".to_string()));
+                        let reason = context
+                            .last_blocker
+                            .as_deref()
+                            .unwrap_or("direct archive commit failed");
+                        handle_output(OutputLine::Stderr(format!(
+                            "Archive commit finalization retry scheduled for {change_id} (attempt {}/{max_attempts}): {reason}",
+                            attempt + 1
+                        )))
+                        .await;
+                    }
+
+                    let complete = is_archive_commit_complete(change_id, Some(repo_root)).await?;
+                    context.last_verification_complete = Some(complete);
+                    if commit_result.success && complete {
+                        return Ok(());
+                    }
+                    if commit_result.success && !complete {
+                        context.last_blocker = Some(
+                            "direct archive commit succeeded but archive commit verification remained incomplete"
+                                .to_string(),
+                        );
                     }
                 }
-            } else if try_direct_archive_commit(change_id, repo_root).await?
-                && is_archive_commit_complete(change_id, Some(repo_root)).await?
-            {
-                return Ok(());
-            }
 
-            let prompt = format!(
-                "You are finalizing the archive commit for change '{change_id}'.\n\n\
-Requirements:\n\
-1) Ensure `git status --porcelain` is empty when done.\n\
-2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
-3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
-4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
-5) Do not use destructive commands like `git reset --hard`.",
-                change_id = change_id
-            );
-
-            let (mut child, mut rx) = agent
-                .run_resolve_streaming_in_dir_with_runner(&prompt, repo_root, ai_runner)
-                .await?;
-
-            while let Some(line) = rx.recv().await {
-                handle_output(line).await;
-            }
-
-            let status = child.wait().await.map_err(|e| {
-                OrchestratorError::AgentCommand(format!(
-                    "Archive resolve command failed for change '{}' in workspace '{}': {}",
+                let snapshot = archive_finalization_snapshot(change_id, repo_root).await?;
+                let prompt = build_archive_finalization_prompt(
                     change_id,
-                    repo_root.display(),
-                    e
-                ))
-            })?;
+                    attempt,
+                    max_attempts,
+                    &snapshot,
+                    &context,
+                );
 
-            if !status.success() {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Archive resolve command failed for change '{}' in workspace '{}' with exit code: {:?}",
-                    change_id,
-                    repo_root.display(),
-                    status.code()
-                )));
+                let (mut child, mut rx) = agent
+                    .run_resolve_streaming_in_dir_with_runner(&prompt, repo_root, ai_runner)
+                    .await?;
+
+                let mut resolve_stdout = String::new();
+                let mut resolve_stderr = String::new();
+                while let Some(line) = rx.recv().await {
+                    match &line {
+                        OutputLine::Stdout(text) => {
+                            resolve_stdout.push_str(text);
+                            resolve_stdout.push('\n');
+                        }
+                        OutputLine::Stderr(text) => {
+                            resolve_stderr.push_str(text);
+                            resolve_stderr.push('\n');
+                        }
+                    }
+                    handle_output(line).await;
+                }
+
+                let status = child.wait().await.map_err(|e| {
+                    OrchestratorError::AgentCommand(format!(
+                        "Archive resolve command failed for change '{}' in workspace '{}': {}",
+                        change_id,
+                        repo_root.display(),
+                        e
+                    ))
+                })?;
+
+                context.last_resolve_stdout_tail = tail_text(&resolve_stdout, 80);
+                context.last_resolve_stderr_tail = tail_text(&resolve_stderr, 80);
+                context.last_resolve_exit_code = status.code();
+                if !status.success() {
+                    context.last_blocker = tail_text(&resolve_stderr, 80)
+                        .or_else(|| tail_text(&resolve_stdout, 80))
+                        .or_else(|| {
+                            Some(format!(
+                                "archive finalization resolve command failed with exit code {:?}",
+                                status.code()
+                            ))
+                        });
+                }
+
+                let complete = is_archive_commit_complete(change_id, Some(repo_root)).await?;
+                context.last_verification_complete = Some(complete);
+                if complete {
+                    return Ok(());
+                }
+
+                if status.success() {
+                    context.last_blocker.get_or_insert_with(|| {
+                        "archive finalization resolve completed but archive commit verification remained incomplete"
+                            .to_string()
+                    });
+                }
+
+                if attempt < max_attempts {
+                    let reason = context
+                        .last_blocker
+                        .as_deref()
+                        .unwrap_or("archive commit verification remained incomplete");
+                    warn!(
+                        change_id = %change_id,
+                        repo_root = %repo_root.display(),
+                        attempt = attempt,
+                        max_attempts = max_attempts,
+                        reason = %reason,
+                        "Archive commit finalization failed; scheduling retry"
+                    );
+                    handle_output(OutputLine::Stderr(format!(
+                        "Archive commit finalization retry scheduled for {change_id} (attempt {}/{max_attempts}): {reason}",
+                        attempt + 1
+                    )))
+                    .await;
+                }
             }
 
-            if !is_archive_commit_complete(change_id, Some(repo_root)).await? {
-                return Err(OrchestratorError::AgentCommand(format!(
-                    "Archive commit verification failed for change '{}' in workspace '{}'",
-                    change_id,
-                    repo_root.display()
-                )));
-            }
+            let last_blocker = context
+                .last_blocker
+                .as_deref()
+                .unwrap_or("archive commit verification remained incomplete");
+            Err(OrchestratorError::AgentCommand(format!(
+                "Archive commit finalization failed for change '{}' in workspace '{}' after {} attempts. Last actionable blocker: {}",
+                change_id,
+                repo_root.display(),
+                max_attempts,
+                last_blocker
+            )))
         }
     }
-
-    Ok(())
 }
 
 /// Delete the change directory after successful archive.
@@ -1219,6 +1508,7 @@ mod tests {
             let hook_path = hooks_dir.join("pre-commit");
             let hook_contents = "#!/bin/sh\n\
 if [ ! -f .git/hooks/pre-commit-ran ]; then\n\
+  echo 'could not find dependency_targets in the crate root' >&2\n\
   echo 'hooked' >> openspec/changes/archive/change-a/archive.txt\n\
   git add openspec/changes/archive/change-a/archive.txt\n\
   touch .git/hooks/pre-commit-ran\n\
@@ -1243,19 +1533,29 @@ fi\n";
             fs::set_permissions(&resolver_script, perms).unwrap();
 
             let config = OrchestratorConfig {
-                resolve_command: Some("sh archive-resolver.sh".to_string()),
+                resolve_command: Some("printf '%s\\n' {prompt}; sh archive-resolver.sh".to_string()),
                 ..Default::default()
             };
             let agent = AgentRunner::new(config.clone());
             let ai_runner = make_ai_runner(&config);
 
+            let output_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let output_lines_for_handler = output_lines.clone();
             ensure_archive_commit(
                 "change-a",
                 repo_root,
                 &agent,
                 &ai_runner,
                 VcsBackend::Git,
-                |_| async {},
+                move |line| {
+                    let output_lines = output_lines_for_handler.clone();
+                    async move {
+                        let text = match line {
+                            OutputLine::Stdout(text) | OutputLine::Stderr(text) => text,
+                        };
+                        output_lines.lock().unwrap().push(text);
+                    }
+                },
             )
             .await
             .unwrap();
@@ -1264,6 +1564,20 @@ fi\n";
                 .await
                 .unwrap();
             assert!(result);
+
+            let joined_output = output_lines.lock().unwrap().join("\n");
+            assert!(
+                joined_output.contains("could not find dependency_targets in the crate root"),
+                "resolve prompt/output should receive hook stderr context, got: {joined_output}"
+            );
+            assert!(
+                joined_output.contains("git status --porcelain"),
+                "resolve prompt/output should include current git status context, got: {joined_output}"
+            );
+            assert!(
+                joined_output.contains("Archive commit finalization retry scheduled"),
+                "finalization retry should be observable, got: {joined_output}"
+            );
         });
     }
 
