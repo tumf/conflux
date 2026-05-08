@@ -65,6 +65,30 @@ Read when present:
 - `BLOCK`: keep the change alive, make unblock/recovery work explicit in `tasks.md`
 - `RESUME`: remove worktree-local `REJECTED.md`, append recovery work to `tasks.md`, return to apply
 
+## Default Recovery Workflow for Rejected Changes
+
+When the user wants to handle a rejected change, prefer repairing the existing change instead of creating a replacement change. A `REJECTED.md` file is a review artifact and recovery signal, not automatic proof that the change should be abandoned.
+
+Use this sequence by default:
+
+1. Re-review the rejected change:
+   - Read `openspec/changes/<change-id>/REJECTED.md`.
+   - Read `proposal.md`, `tasks.md`, `design.md` if present, and relevant spec deltas.
+   - Run `cflx openspec show <change-id>` and `cflx openspec validate <change-id> --strict` when available.
+2. Analyze the rejection cause:
+   - Identify whether the blocker is a real terminal mismatch, missing implementation work, incomplete tests, environment failure, or agent mistake.
+   - Cite concrete files, commands, or task entries rather than relying on the rejection summary alone.
+3. Repair the existing change:
+   - Update implementation, tests, specs, or `tasks.md` in the same `openspec/changes/<change-id>/` scope as needed.
+   - Add or update recovery tasks in `tasks.md` so the reason for resuming is durable.
+4. Remove `REJECTED.md` only after the repair path is understood and the change is ready to continue.
+5. Verify:
+   - Re-run strict OpenSpec validation.
+   - Run the targeted tests or checks relevant to the repaired cause.
+6. Commit the repair if the workflow or user explicitly asks for a commit; otherwise leave the repaired worktree ready for review.
+
+Do not create a new change merely because the current change has `REJECTED.md`. Create a new change only when analysis shows the original proposal premise is obsolete, the required scope is materially different, or the user explicitly asks to abandon the original change.
+
 ## Response Format
 
 Structure guidance as:
