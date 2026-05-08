@@ -153,25 +153,37 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -1363,25 +1375,37 @@ When parallel merge verification runs after archive completion, a change that is
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -1578,25 +1602,37 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -1741,47 +1777,71 @@ If the base-mutating lane is occupied, the rejection-review handoff SHALL become
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -1922,25 +1982,37 @@ runtime は dependency blocked だった change が resolved になったこと�
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: Applied resume uses workspace-local evidence only
 
@@ -2022,25 +2094,37 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 
 ### Requirement: Parallel execution acceptance loop
 
-When apply execution records a rejection proposal by generating `openspec/changes/<change_id>/REJECTED.md`, the runtime SHALL transition the workspace into a dedicated `rejecting` stage even if `tasks.md` still contains unchecked implementation tasks. A workspace in `rejecting` SHALL NOT re-enter the normal apply retry loop or empty-WIP stall policy before rejection review runs.
+Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-`APPLY_BLOCKED/marker.md` SHALL remain the marker for resumable apply-side stalled handoff. `REJECTED.md` SHALL remain the marker for terminal-rejection proposal review and MUST route to rejecting review.
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
-#### Scenario: apply-generated REJECTED.md skips apply stall detection
+Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/REJECTED.md`
-- **AND** `openspec/changes/fix-auth/tasks.md` still has unchecked tasks
-- **WHEN** the apply iteration completes or is grace-terminated after observing the handoff artifact
-- **THEN** the runtime exits the apply retry loop as a rejecting handoff
-- **AND** the empty WIP stall detector is not used to convert the change into terminal `Error`
-- **AND** the next orchestration step is rejection review
+#### Scenario: acceptance pass does not create report artifact
 
-#### Scenario: APPLY_BLOCKED remains distinct from REJECTED
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command emits a canonical PASS verdict
+- **WHEN** acceptance finalizes the pass
+- **THEN** the runtime records the acceptance attempt in existing acceptance history
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** the pass result does not require any workspace-root report file for later routing
 
-- **GIVEN** apply execution for change `fix-auth` generates `openspec/changes/fix-auth/APPLY_BLOCKED/marker.md`
-- **WHEN** the apply loop evaluates handoff artifacts
-- **THEN** the runtime treats the change as a resumable stalled/apply hold
-- **AND** it does not route to terminal rejection review solely because an apply blocker exists
+#### Scenario: command failure does not create misleading pass report
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
+- **WHEN** acceptance returns a command-failure result
+- **THEN** the runtime records the failed attempt through existing history paths
+- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+
+#### Scenario: non-pass verdicts do not create report artifact
+
+- **GIVEN** a parallel workspace runs acceptance for change `alpha`
+- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
+- **WHEN** acceptance finalizes that outcome
+- **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
+- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
 
 ### Requirement: Archive retry observability is non-authoritative
 

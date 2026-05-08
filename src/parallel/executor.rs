@@ -1051,34 +1051,6 @@ fn revision_to_history_commit_hash(revision: &str) -> Option<String> {
     }
 }
 
-fn write_acceptance_report(
-    workspace_path: &Path,
-    change_id: &str,
-    attempt_number: u32,
-    end_revision: &str,
-    stdout_tail: Option<&str>,
-    stderr_tail: Option<&str>,
-) -> Result<()> {
-    let report_path = workspace_path.join("ACCEPTANCE_REPORT.json");
-    let report = serde_json::json!({
-        "change_id": change_id,
-        "result": "pass",
-        "attempt": attempt_number,
-        "revision": revision_to_history_commit_hash(end_revision),
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
-    });
-    let report_json = serde_json::to_string_pretty(&report).map_err(OrchestratorError::Json)?;
-    std::fs::write(&report_path, report_json).map_err(|e| {
-        OrchestratorError::AgentCommand(format!(
-            "Failed to write acceptance report for change '{}' in workspace '{}': {}",
-            change_id,
-            workspace_path.display(),
-            e
-        ))
-    })
-}
-
 const ACCEPTANCE_VERDICT_GRACE_DEFAULT_SECS: u64 = 30;
 
 tokio::task_local! {
@@ -1432,14 +1404,6 @@ pub async fn execute_acceptance_in_workspace(
         // Record to both agent history (local) and shared acceptance history
         agent.record_acceptance_attempt(change_id, attempt.clone());
         acceptance_history.lock().await.record(change_id, attempt);
-        write_acceptance_report(
-            workspace_path,
-            change_id,
-            attempt_number,
-            &end_revision,
-            stdout_tail.as_deref(),
-            stderr_tail.as_deref(),
-        )?;
         // Reset acceptance tail injection flag so next apply can receive new output
 
         acceptance_tail_injected.lock().await.remove(change_id);
@@ -1487,14 +1451,6 @@ pub async fn execute_acceptance_in_workspace(
             // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
             acceptance_history.lock().await.record(change_id, attempt);
-            write_acceptance_report(
-                workspace_path,
-                change_id,
-                attempt_number,
-                &end_revision,
-                stdout_tail.as_deref(),
-                stderr_tail.as_deref(),
-            )?;
             // Reset acceptance tail injection flag so next apply can receive new output
 
             acceptance_tail_injected.lock().await.remove(change_id);
