@@ -20,8 +20,12 @@ Expected archive gate: `cflx openspec validate fix-terminal-dependency-blocked-r
 
 ## Acceptance #1 Failure Follow-up
 
-- [x] Update archive-gate verification notes with explicit repository-verifiable evidence for diagnostic deduplication, blocker reclassification, and fresh-workspace behavior (verification: not-testable - this is OpenSpec task metadata correction in `openspec/changes/fix-terminal-dependency-blocked-retry/tasks.md`, with no runtime code path; repository-verifiable evidence is this tasks file plus the runnable command `cflx openspec validate fix-terminal-dependency-blocked-retry --archive-gate`).
+- [x] Update archive-gate verification notes with explicit repository-verifiable evidence for diagnostic deduplication, blocker reclassification, and fresh-workspace behavior (verification: not-testable - this is OpenSpec task metadata correction in `openspec/changes/fix-terminal-dependency-blocked-retry/tasks.md`, with validator ownership in `src/openspec_cmd.rs`; no runtime code path is changed).
 
 ## Acceptance #1 Notes
 
 Archive gate commit path was previously blocked because `cflx openspec validate fix-terminal-dependency-blocked-retry --archive-gate` reported tasks.md verification evidence/ownership errors at `openspec/changes/fix-terminal-dependency-blocked-retry/tasks.md:6`, `:7`, and `:8`, plus self-referential final validation checkboxes at lines 22-23. The follow-up task above is limited to metadata correction; final OpenSpec validation remains in the non-checkbox `## Final Validation` section.
+
+## Acceptance #2 Failure Follow-up
+- [x] Correct the Acceptance #1 follow-up verification note that previously failed the archive-gate validator for missing repository-verifiable evidence hints at `openspec/changes/fix-terminal-dependency-blocked-retry/tasks.md:23`. (verification: not-testable - metadata-only correction in `openspec/changes/fix-terminal-dependency-blocked-retry/tasks.md` with accepted evidence hints matching `src/openspec_cmd.rs`; no production runtime code path is changed.)
+- [x] Confirm the remaining Acceptance #2 blocker is resolved by repository-local task metadata changes, not production code changes. (verification: manual - repository state evidence in `openspec/changes/fix-terminal-dependency-blocked-retry/tasks.md` and validator behavior in `src/openspec_cmd.rs`.)
