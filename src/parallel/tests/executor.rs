@@ -347,6 +347,106 @@ async fn commit_workspace_change(
         .await
         .or_fail("unexpected error");
 }
+#[tokio::test]
+async fn test_dependency_blocker_diagnostics_dedupe_and_reemit_on_signature_change() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    let rejected_dir = temp.path().join("openspec/changes/dep-a");
+    std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
+    std::fs::write(rejected_dir.join("proposal.md"), "# Dep A\n").or_fail("unexpected error");
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        temp.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let analysis = crate::analyzer::AnalysisResult {
+        order: vec!["dependent".to_string()],
+        dependencies: HashMap::from([("dependent".to_string(), vec!["dep-a".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let first = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+    let second = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+
+    assert!(first.is_empty());
+    assert!(second.is_empty());
+    let mut missing_errors = 0;
+    while let Ok(event) = event_rx.try_recv() {
+        if let ParallelEvent::Error { message } = event {
+            if message.contains("missing dependency 'dep-a'") {
+                missing_errors += 1;
+            }
+        }
+    }
+    assert_eq!(
+        missing_errors, 1,
+        "unchanged missing blocker should emit once"
+    );
+
+    std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED\n").or_fail("unexpected error");
+    let third = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+    assert!(third.is_empty());
+
+    let mut rejected_errors = 0;
+    while let Ok(event) = event_rx.try_recv() {
+        if let ParallelEvent::Error { message } = event {
+            if message.contains("rejected dependency 'dep-a'") {
+                rejected_errors += 1;
+            }
+        }
+    }
+    assert_eq!(rejected_errors, 1, "changed blocker class should re-emit");
+}
+
+#[tokio::test]
+async fn test_dependency_blocker_archived_unblocks_dispatch_after_terminal_marker_removed() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    let rejected_dir = temp.path().join("openspec/changes/dep-a");
+    std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
+    std::fs::write(rejected_dir.join("proposal.md"), "# Dep A\n").or_fail("unexpected error");
+    std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED\n").or_fail("unexpected error");
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        temp.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let analysis = crate::analyzer::AnalysisResult {
+        order: vec!["dependent".to_string()],
+        dependencies: HashMap::from([("dependent".to_string(), vec!["dep-a".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let blocked = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+    assert!(blocked.is_empty());
+
+    std::fs::remove_file(rejected_dir.join("REJECTED.md")).or_fail("unexpected error");
+    let archive_dir = temp
+        .path()
+        .join("openspec/changes/archive/2026-05-09-dep-a");
+    std::fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    std::fs::write(archive_dir.join("proposal.md"), "# Dep A Archived\n")
+        .or_fail("unexpected error");
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+    assert_eq!(selected, vec!["dependent".to_string()]);
+    assert!(executor.force_recreate_worktree.contains("dependent"));
+}
+
 #[test]
 fn test_skip_reason_for_merge_deferred_dependency() {
     let merge_calls = Arc::new(AtomicUsize::new(0));
@@ -409,6 +509,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -526,6 +627,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -634,6 +736,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -791,6 +894,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1003,6 +1107,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1207,6 +1312,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1417,6 +1523,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         resolve_wait_retry_triggered: false,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
     let revisions = vec![workspace_a.name];

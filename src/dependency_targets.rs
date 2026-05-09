@@ -15,6 +15,7 @@ pub(crate) enum DependencyTargetClass {
     Queued,
     InFlight,
     Archived,
+    Rejected,
     Missing,
 }
 
@@ -24,6 +25,7 @@ impl DependencyTargetClass {
             Self::Queued => "queued",
             Self::InFlight => "in-flight",
             Self::Archived => "archived",
+            Self::Rejected => "rejected",
             Self::Missing => "missing",
         }
     }
@@ -52,13 +54,16 @@ pub(crate) fn classify_dependency_target<'a>(
     queued_ids: impl IntoIterator<Item = &'a str>,
     in_flight_ids: impl IntoIterator<Item = &'a str>,
     archived_ids: &HashSet<String>,
+    rejected_ids: &HashSet<String>,
 ) -> DependencyTargetClass {
-    if queued_ids.into_iter().any(|id| id == dep_id) {
-        DependencyTargetClass::Queued
+    if archived_ids.contains(dep_id) {
+        DependencyTargetClass::Archived
+    } else if rejected_ids.contains(dep_id) {
+        DependencyTargetClass::Rejected
     } else if in_flight_ids.into_iter().any(|id| id == dep_id) {
         DependencyTargetClass::InFlight
-    } else if archived_ids.contains(dep_id) {
-        DependencyTargetClass::Archived
+    } else if queued_ids.into_iter().any(|id| id == dep_id) {
+        DependencyTargetClass::Queued
     } else {
         DependencyTargetClass::Missing
     }
@@ -80,6 +85,32 @@ pub(crate) fn collect_archived_change_ids(repo_root: &Path) -> HashSet<String> {
             }
             let name = entry.file_name().to_string_lossy().to_string();
             Some(strip_archive_date_prefix(&name).to_string())
+        })
+        .collect()
+}
+
+/// Collect rejected active change IDs from terminal `REJECTED.md` markers.
+pub(crate) fn collect_rejected_change_ids(repo_root: &Path) -> HashSet<String> {
+    let changes_dir = repo_root.join("openspec/changes");
+    let Ok(entries) = std::fs::read_dir(changes_dir) else {
+        return HashSet::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir()
+                || !path.join("proposal.md").exists()
+                || !path.join("REJECTED.md").exists()
+            {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "archive" || name.starts_with('.') {
+                return None;
+            }
+            Some(name)
         })
         .collect()
 }
@@ -117,13 +148,15 @@ mod tests {
     #[test]
     fn classifies_dependency_targets_from_supplied_evidence() {
         let archived = HashSet::from(["archived-a".to_string()]);
+        let rejected = HashSet::from(["rejected-a".to_string()]);
 
         assert_eq!(
             classify_dependency_target(
                 "queued-a",
                 ["queued-a"].into_iter(),
                 [].into_iter(),
-                &archived
+                &archived,
+                &rejected,
             ),
             DependencyTargetClass::Queued
         );
@@ -132,18 +165,57 @@ mod tests {
                 "flight-a",
                 [].into_iter(),
                 ["flight-a"].into_iter(),
-                &archived
+                &archived,
+                &rejected,
             ),
             DependencyTargetClass::InFlight
         );
         assert_eq!(
-            classify_dependency_target("archived-a", [].into_iter(), [].into_iter(), &archived),
+            classify_dependency_target(
+                "archived-a",
+                [].into_iter(),
+                [].into_iter(),
+                &archived,
+                &rejected,
+            ),
             DependencyTargetClass::Archived
         );
         assert_eq!(
-            classify_dependency_target("missing-a", [].into_iter(), [].into_iter(), &archived),
+            classify_dependency_target(
+                "rejected-a",
+                ["rejected-a"].into_iter(),
+                [].into_iter(),
+                &archived,
+                &rejected,
+            ),
+            DependencyTargetClass::Rejected
+        );
+        assert_eq!(
+            classify_dependency_target(
+                "missing-a",
+                [].into_iter(),
+                [].into_iter(),
+                &archived,
+                &rejected,
+            ),
             DependencyTargetClass::Missing
         );
+    }
+
+    #[test]
+    fn collects_rejected_change_ids_from_repository_markers() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes");
+        std::fs::create_dir_all(changes_dir.join("rejected-a")).unwrap();
+        std::fs::write(changes_dir.join("rejected-a/proposal.md"), "# Rejected\n").unwrap();
+        std::fs::write(changes_dir.join("rejected-a/REJECTED.md"), "# REJECTED\n").unwrap();
+        std::fs::create_dir_all(changes_dir.join("active-a")).unwrap();
+        std::fs::write(changes_dir.join("active-a/proposal.md"), "# Active\n").unwrap();
+
+        let rejected = collect_rejected_change_ids(temp_dir.path());
+
+        assert!(rejected.contains("rejected-a"));
+        assert!(!rejected.contains("active-a"));
     }
 
     #[test]

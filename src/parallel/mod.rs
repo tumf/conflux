@@ -157,6 +157,10 @@ pub struct ParallelExecutor {
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
     queue_reconciliation_diagnostics_seen: HashSet<(String, String)>,
     no_analysis_diagnostics_seen: HashSet<(Vec<String>, usize, usize, String)>,
+    /// Runtime-only observability dedupe for unchanged dependency blocker signatures.
+    ///
+    /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
+    dependency_blocker_diagnostics_seen: HashSet<(String, Vec<(String, String)>)>,
 }
 
 #[cfg(test)]

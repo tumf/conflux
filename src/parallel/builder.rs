@@ -168,6 +168,7 @@ impl ParallelExecutor {
             resolve_wait_retry_triggered: false,
             queue_reconciliation_diagnostics_seen: HashSet::new(),
             no_analysis_diagnostics_seen: HashSet::new(),
+            dependency_blocker_diagnostics_seen: HashSet::new(),
         }
     }
 

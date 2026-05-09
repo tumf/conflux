@@ -5,8 +5,8 @@
 
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::dependency_targets::{
-    classify_dependency_target, collect_archived_change_ids, union_metadata_dependencies,
-    DependencyTargetClass,
+    classify_dependency_target, collect_archived_change_ids, collect_rejected_change_ids,
+    union_metadata_dependencies, DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::{Change, ProposalFrontmatterMetadata};
@@ -239,7 +239,7 @@ impl ParallelizationAnalyzer {
             let preview = response.chars().take(200).collect::<String>();
             let change_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
             let err_text = e.to_string();
-            if err_text.contains("Invalid dependency reference") || err_text.contains("Missing dependency reference") {
+            if err_text.contains("Invalid dependency reference") || err_text.contains("Missing dependency reference") || err_text.contains("Rejected dependency reference") {
                 let decorated = self.decorate_dependency_error_with_archive_context(
                     &err_text,
                     changes,
@@ -536,11 +536,13 @@ Rules:
         }
 
         let archived_ids = self.collect_archived_change_ids();
+        let rejected_ids = self.collect_rejected_change_ids();
         self.validate_dependency_graph_with_changes(
             &result,
             changes,
             in_flight_ids,
             &archived_ids,
+            &rejected_ids,
         )?;
 
         Ok(result)
@@ -722,6 +724,7 @@ Rules:
         changes: &[Change],
         in_flight_ids: &[String],
         archived_ids: &HashSet<String>,
+        rejected_ids: &HashSet<String>,
     ) -> Result<()> {
         let queued_ids: Vec<&str> = changes.iter().map(|change| change.id.as_str()).collect();
         let in_flight_refs: Vec<&str> = in_flight_ids.iter().map(String::as_str).collect();
@@ -740,6 +743,7 @@ Rules:
                     queued_ids.iter().copied(),
                     in_flight_refs.iter().copied(),
                     archived_ids,
+                    rejected_ids,
                 ) {
                     DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
                     DependencyTargetClass::Archived => {
@@ -749,20 +753,41 @@ Rules:
                             "Accepted archived dependency target as already satisfied"
                         );
                     }
-                    DependencyTargetClass::Missing => {
+                    DependencyTargetClass::Rejected => {
                         let mut allowed_ids: Vec<String> = result.order.clone();
                         allowed_ids.extend(in_flight_ids.iter().cloned());
                         allowed_ids.extend(archived_ids.iter().cloned());
+                        allowed_ids.extend(rejected_ids.iter().cloned());
                         allowed_ids.sort();
                         allowed_ids.dedup();
 
                         return Err(OrchestratorError::Parse(format!(
-                            "Missing dependency reference: change '{}' depends on '{}' classified as missing dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_archived_ids={:?}, allowed_ids={:?}",
+                            "Rejected dependency reference: change '{}' depends on '{}' classified as rejected dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_archived_ids={:?}, allowed_rejected_ids={:?}, allowed_ids={:?}",
                             change_id,
                             dep_id,
                             result.order,
                             in_flight_ids,
                             archived_ids,
+                            rejected_ids,
+                            allowed_ids
+                        )));
+                    }
+                    DependencyTargetClass::Missing => {
+                        let mut allowed_ids: Vec<String> = result.order.clone();
+                        allowed_ids.extend(in_flight_ids.iter().cloned());
+                        allowed_ids.extend(archived_ids.iter().cloned());
+                        allowed_ids.extend(rejected_ids.iter().cloned());
+                        allowed_ids.sort();
+                        allowed_ids.dedup();
+
+                        return Err(OrchestratorError::Parse(format!(
+                            "Missing dependency reference: change '{}' depends on '{}' classified as missing dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_archived_ids={:?}, allowed_rejected_ids={:?}, allowed_ids={:?}",
+                            change_id,
+                            dep_id,
+                            result.order,
+                            in_flight_ids,
+                            archived_ids,
+                            rejected_ids,
                             allowed_ids
                         )));
                     }
@@ -779,6 +804,10 @@ Rules:
         collect_archived_change_ids(Path::new("."))
     }
 
+    fn collect_rejected_change_ids(&self) -> HashSet<String> {
+        collect_rejected_change_ids(Path::new("."))
+    }
+
     fn decorate_dependency_error_with_archive_context(
         &self,
         err_text: &str,
@@ -788,7 +817,7 @@ Rules:
     ) -> String {
         static DEP_RE: OnceLock<Regex> = OnceLock::new();
         let dep_re = DEP_RE.get_or_init(|| {
-            Regex::new(r"change '([^']+)' depends on '([^']+)'(?: outside allowed dependency targets| classified as missing dependency target)")
+            Regex::new(r"change '([^']+)' depends on '([^']+)'(?: outside allowed dependency targets| classified as (?:missing|rejected) dependency target)")
                 .unwrap()
         });
 
@@ -805,11 +834,13 @@ Rules:
         let queued_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
         let in_flight_set: HashSet<&str> = in_flight_ids.iter().map(|id| id.as_str()).collect();
 
+        let rejected_ids = self.collect_rejected_change_ids();
         let classification = classify_dependency_target(
             dep_id,
             queued_ids.iter().copied(),
             in_flight_set.iter().copied(),
             archived_ids,
+            &rejected_ids,
         );
 
         format!(
@@ -1529,6 +1560,34 @@ That's all."#;
 
         std::env::set_current_dir(original_dir).unwrap();
         assert!(result.is_ok(), "archived dependency should be accepted");
+    }
+
+    #[test]
+    fn test_validate_dependency_graph_reports_rejected_dependency() {
+        let analyzer = create_test_analyzer();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let rejected_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("contracts");
+        std::fs::create_dir_all(&rejected_dir).unwrap();
+        std::fs::write(rejected_dir.join("proposal.md"), "# Rejected").unwrap();
+        std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED").unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let mut route = create_test_change("route");
+        route.dependencies = vec!["contracts".to_string()];
+        let error = analyzer
+            .parse_response(r#"{"order":["route"],"dependencies":{}}"#, &[route], &[])
+            .expect_err("rejected dependency should fail closed")
+            .to_string();
+
+        std::env::set_current_dir(original_dir).unwrap();
+        assert!(error.contains("Rejected dependency reference"));
+        assert!(error.contains("classified as rejected dependency target"));
     }
 
     #[test]
