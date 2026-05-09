@@ -8,7 +8,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::dependency_targets::{
-    classify_dependency_target, collect_archived_change_ids, DependencyTargetClass,
+    classify_dependency_target, collect_archived_change_ids, collect_rejected_change_ids,
+    DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
@@ -193,6 +194,66 @@ impl ParallelExecutor {
         collect_archived_change_ids(&self.repo_root)
     }
 
+    fn rejected_dependency_ids(&self) -> HashSet<String> {
+        collect_rejected_change_ids(&self.repo_root)
+    }
+
+    fn should_emit_dependency_blocker_diagnostic(
+        &mut self,
+        change_id: &str,
+        blockers: &[(String, DependencyTargetClass)],
+    ) -> bool {
+        let mut signature = blockers
+            .iter()
+            .map(|(dep_id, class)| (dep_id.clone(), class.as_str().to_string()))
+            .collect::<Vec<_>>();
+        signature.sort();
+        self.dependency_blocker_diagnostics_seen
+            .insert((change_id.to_string(), signature))
+    }
+
+    async fn emit_dependency_blocker_diagnostic(
+        &mut self,
+        change_id: &str,
+        blockers: &[(String, DependencyTargetClass)],
+    ) {
+        if blockers.is_empty() {
+            return;
+        }
+        if !self.should_emit_dependency_blocker_diagnostic(change_id, blockers) {
+            debug!(
+                change_id,
+                blockers = ?blockers,
+                "Suppressing repeated dependency blocker diagnostic"
+            );
+            return;
+        }
+
+        for (dep_id, class) in blockers {
+            let message = format!(
+                "Change '{}' blocked by {} dependency '{}' and will remain queued",
+                change_id,
+                class.as_str(),
+                dep_id
+            );
+            match class {
+                DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
+                    warn!("{}", message)
+                }
+                DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {
+                    info!("{}", message)
+                }
+                DependencyTargetClass::Archived => debug!("{}", message),
+            }
+            if matches!(
+                class,
+                DependencyTargetClass::Missing | DependencyTargetClass::Rejected
+            ) {
+                send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+            }
+        }
+    }
+
     /// Check if a dependency is resolved (merged to base branch).
     ///
     /// A dependency is considered resolved if its archive commit is present in the base branch.
@@ -334,18 +395,22 @@ impl ParallelExecutor {
         let queued_ids: HashSet<&str> = analysis_result.order.iter().map(String::as_str).collect();
         let in_flight_ids: HashSet<&str> = in_flight.iter().map(String::as_str).collect();
         let archived_ids = self.archived_dependency_ids();
+        let rejected_ids = self.rejected_dependency_ids();
 
         for change_id in &analysis_result.order {
             // Check if change has unresolved dependencies
             if let Some(deps) = analysis_result.dependencies.get(change_id) {
                 let mut unresolved_deps = Vec::new();
+                let mut blockers = Vec::new();
                 for dep_id in deps {
-                    match classify_dependency_target(
+                    let class = classify_dependency_target(
                         dep_id,
                         queued_ids.iter().copied(),
                         in_flight_ids.iter().copied(),
                         &archived_ids,
-                    ) {
+                        &rejected_ids,
+                    );
+                    match class {
                         DependencyTargetClass::Archived => {
                             info!(
                                 "Change '{}' dependency '{}' is archived and already satisfied",
@@ -353,14 +418,9 @@ impl ParallelExecutor {
                             );
                             continue;
                         }
-                        DependencyTargetClass::Missing => {
-                            let message = format!(
-                                "Change '{}' has missing dependency '{}' and will remain queued",
-                                change_id, dep_id
-                            );
-                            warn!("{}", message);
-                            send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+                        DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
                             unresolved_deps.push(dep_id.clone());
+                            blockers.push((dep_id.clone(), class));
                             continue;
                         }
                         DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
@@ -368,7 +428,10 @@ impl ParallelExecutor {
 
                     match self.is_dependency_resolved(dep_id).await {
                         Ok(true) => {}
-                        Ok(false) => unresolved_deps.push(dep_id.clone()),
+                        Ok(false) => {
+                            unresolved_deps.push(dep_id.clone());
+                            blockers.push((dep_id.clone(), class));
+                        }
                         Err(e) => {
                             error!(
                                 "Failed to evaluate dependency resolution for '{}' (dependency '{}'): {}",
@@ -385,6 +448,7 @@ impl ParallelExecutor {
                             )
                             .await;
                             unresolved_deps.push(dep_id.clone());
+                            blockers.push((dep_id.clone(), class));
                         }
                     }
                 }
@@ -394,6 +458,8 @@ impl ParallelExecutor {
                         "Change '{}' blocked: waiting for dependencies {:?}",
                         change_id, unresolved_deps
                     );
+                    self.emit_dependency_blocker_diagnostic(change_id, &blockers)
+                        .await;
                     // Track this change as blocked
                     self.previously_blocked_changes.insert(change_id.clone());
                     // Send DependencyBlocked event

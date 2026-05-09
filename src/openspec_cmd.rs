@@ -3,7 +3,7 @@
 //! Replaces the former Python helper `scripts/cflx.py` with native Rust
 //! implementations for list, show, validate, and archive operations.
 
-use crate::dependency_targets;
+use crate::dependency_targets::{self, DependencyTargetClass};
 use chrono::Local;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -591,7 +591,9 @@ impl OpenSpecManager {
                     classify_proposal_dependency_targets(&change_id, &proposal_file);
                 for diagnostic in dependency_diagnostics {
                     match diagnostic.classification {
-                        DependencyTargetClass::Missing => errors.push(diagnostic.message),
+                        DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
+                            errors.push(diagnostic.message)
+                        }
                         DependencyTargetClass::Archived => warnings.push(diagnostic.message),
                         DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
                     }
@@ -946,6 +948,7 @@ enum DependencyListStatus {
     Done,
     Running,
     Pending,
+    Rejected,
     Missing,
 }
 
@@ -955,6 +958,7 @@ impl DependencyListStatus {
             Self::Done => "done",
             Self::Running => "running",
             Self::Pending => "pending",
+            Self::Rejected => "rejected",
             Self::Missing => "missing",
         }
     }
@@ -964,6 +968,7 @@ struct DependencyStatusContext {
     active_ids: HashSet<String>,
     in_flight_ids: HashSet<String>,
     archived_ids: HashSet<String>,
+    rejected_ids: HashSet<String>,
 }
 
 impl DependencyStatusContext {
@@ -972,6 +977,7 @@ impl DependencyStatusContext {
             active_ids: collect_active_change_ids_from_root(root_dir),
             in_flight_ids: collect_in_flight_change_ids_from_root(root_dir),
             archived_ids: dependency_targets::collect_archived_change_ids(root_dir),
+            rejected_ids: dependency_targets::collect_rejected_change_ids(root_dir),
         }
     }
 
@@ -986,15 +992,18 @@ impl DependencyStatusContext {
     }
 
     fn status_for(&self, dependency: &str) -> DependencyListStatus {
-        // Running is checked before pending so an in-flight active change is surfaced as work in progress.
-        if self.archived_ids.contains(dependency) {
-            DependencyListStatus::Done
-        } else if self.in_flight_ids.contains(dependency) {
-            DependencyListStatus::Running
-        } else if self.active_ids.contains(dependency) {
-            DependencyListStatus::Pending
-        } else {
-            DependencyListStatus::Missing
+        match dependency_targets::classify_dependency_target(
+            dependency,
+            self.active_ids.iter().map(String::as_str),
+            self.in_flight_ids.iter().map(String::as_str),
+            &self.archived_ids,
+            &self.rejected_ids,
+        ) {
+            DependencyTargetClass::Archived => DependencyListStatus::Done,
+            DependencyTargetClass::InFlight => DependencyListStatus::Running,
+            DependencyTargetClass::Queued => DependencyListStatus::Pending,
+            DependencyTargetClass::Rejected => DependencyListStatus::Rejected,
+            DependencyTargetClass::Missing => DependencyListStatus::Missing,
         }
     }
 }
@@ -1082,14 +1091,6 @@ fn extract_change_type(proposal_content: &str) -> Option<String> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DependencyTargetClass {
-    Queued,
-    InFlight,
-    Archived,
-    Missing,
-}
-
 #[derive(Debug, Clone)]
 struct DependencyTargetDiagnostic {
     classification: DependencyTargetClass,
@@ -1108,20 +1109,19 @@ fn classify_proposal_dependency_targets(
     let active_ids = collect_active_change_ids();
     let in_flight_ids = collect_in_flight_change_ids();
     let archived_ids = collect_archived_change_ids();
+    let rejected_ids = dependency_targets::collect_rejected_change_ids(Path::new("."));
 
     proposal_metadata
         .dependencies
         .into_iter()
         .map(|dependency| {
-            let classification = if active_ids.contains(&dependency) {
-                DependencyTargetClass::Queued
-            } else if in_flight_ids.contains(&dependency) {
-                DependencyTargetClass::InFlight
-            } else if archived_ids.contains(&dependency) {
-                DependencyTargetClass::Archived
-            } else {
-                DependencyTargetClass::Missing
-            };
+            let classification = dependency_targets::classify_dependency_target(
+                &dependency,
+                active_ids.iter().map(String::as_str),
+                in_flight_ids.iter().map(String::as_str),
+                &archived_ids,
+                &rejected_ids,
+            );
 
             let message = match classification {
                 DependencyTargetClass::Queued => format!(
@@ -1136,8 +1136,12 @@ fn classify_proposal_dependency_targets(
                     "{}: proposal dependency '{}' classified as archived dependency reference (warning: metadata should be reviewed after archive)",
                     change_id, dependency
                 ),
+                DependencyTargetClass::Rejected => format!(
+                    "{}: proposal dependency '{}' is invalid: classified as rejected dependency target",
+                    change_id, dependency
+                ),
                 DependencyTargetClass::Missing => format!(
-                    "{}: proposal dependency '{}' is invalid: not found in active, in-flight, or archived change targets",
+                    "{}: proposal dependency '{}' is invalid: not found in active, in-flight, archived, or rejected change targets",
                     change_id, dependency
                 ),
             };
@@ -1171,7 +1175,7 @@ fn collect_active_change_ids_from_root(root_dir: &Path) -> HashSet<String> {
             if name == "archive" || name.starts_with('.') {
                 return None;
             }
-            if !path.join("proposal.md").exists() {
+            if !path.join("proposal.md").exists() || path.join("REJECTED.md").exists() {
                 return None;
             }
             Some(name)
@@ -2420,7 +2424,13 @@ mod openspec_list_show_tests {
         create_change_with_frontmatter_dependencies(
             &dependent_dir,
             "Dependent Change",
-            &["pending-dep", "running-dep", "done-dep", "missing-dep"],
+            &[
+                "pending-dep",
+                "running-dep",
+                "done-dep",
+                "rejected-dep",
+                "missing-dep",
+            ],
             "- [ ] pending\n",
         );
         create_change(
@@ -2441,6 +2451,17 @@ mod openspec_list_show_tests {
             "Done Dep",
             "- [x] done\n",
         );
+        create_change(
+            &temp.path().join("openspec/changes/rejected-dep"),
+            "Rejected Dep",
+            "- [ ] rejected\n",
+        );
+        fs::write(
+            temp.path()
+                .join("openspec/changes/rejected-dep/REJECTED.md"),
+            "# REJECTED\n",
+        )
+        .unwrap();
 
         let mgr = OpenSpecManager::new();
         let changes = mgr.list_changes();
@@ -2463,6 +2484,10 @@ mod openspec_list_show_tests {
                 DependencyStatusInfo {
                     id: "done-dep".to_string(),
                     status: DependencyListStatus::Done,
+                },
+                DependencyStatusInfo {
+                    id: "rejected-dep".to_string(),
+                    status: DependencyListStatus::Rejected,
                 },
                 DependencyStatusInfo {
                     id: "missing-dep".to_string(),
@@ -2590,7 +2615,13 @@ mod openspec_list_show_tests {
         create_change_with_frontmatter_dependencies(
             &dependent_dir,
             "Dependent Change",
-            &["pending-dep", "running-dep", "done-dep", "missing-dep"],
+            &[
+                "pending-dep",
+                "running-dep",
+                "done-dep",
+                "rejected-dep",
+                "missing-dep",
+            ],
             "- [ ] pending\n",
         );
         create_change(
@@ -2611,6 +2642,17 @@ mod openspec_list_show_tests {
             "Done Dep",
             "- [x] done\n",
         );
+        create_change(
+            &temp.path().join("openspec/changes/rejected-dep"),
+            "Rejected Dep",
+            "- [ ] rejected\n",
+        );
+        fs::write(
+            temp.path()
+                .join("openspec/changes/rejected-dep/REJECTED.md"),
+            "# REJECTED\n",
+        )
+        .unwrap();
 
         let mgr = OpenSpecManager::new();
         let info = mgr
@@ -2623,6 +2665,7 @@ mod openspec_list_show_tests {
                 "pending-dep".to_string(),
                 "running-dep".to_string(),
                 "done-dep".to_string(),
+                "rejected-dep".to_string(),
                 "missing-dep".to_string(),
             ]
         );
@@ -2640,6 +2683,10 @@ mod openspec_list_show_tests {
                 DependencyStatusInfo {
                     id: "done-dep".to_string(),
                     status: DependencyListStatus::Done,
+                },
+                DependencyStatusInfo {
+                    id: "rejected-dep".to_string(),
+                    status: DependencyListStatus::Rejected,
                 },
                 DependencyStatusInfo {
                     id: "missing-dep".to_string(),
@@ -2735,19 +2782,42 @@ mod openspec_list_show_tests {
         create_change_with_frontmatter_dependencies(
             &dependent_dir,
             "Dependent Change",
-            &["feature-a"],
+            &[
+                "pending-dep",
+                "running-dep",
+                "done-dep",
+                "rejected-dep",
+                "missing-dep",
+            ],
             "- [ ] pending\n",
         );
         create_change(
-            &temp.path().join("openspec/changes/feature-a"),
-            "Feature A",
+            &temp.path().join("openspec/changes/pending-dep"),
+            "Pending Dep",
             "- [ ] pending\n",
         );
-        let spec_dir = dependent_dir.join("specs/cli");
-        fs::create_dir_all(&spec_dir).unwrap();
+        create_change(
+            &temp.path().join("openspec/changes/running-dep"),
+            "Running Dep",
+            "- [ ] running\n",
+        );
+        fs::write(temp.path().join(".conflux-inflight"), "running-dep\n").unwrap();
+        create_change(
+            &temp
+                .path()
+                .join("openspec/changes/archive/2026-05-08-done-dep"),
+            "Done Dep",
+            "- [x] done\n",
+        );
+        create_change(
+            &temp.path().join("openspec/changes/rejected-dep"),
+            "Rejected Dep",
+            "- [ ] rejected\n",
+        );
         fs::write(
-            spec_dir.join("spec.md"),
-            "## ADDED Requirements\n\n### Requirement: Example\n\n#### Scenario: Example\n- WHEN shown\n- THEN works\n",
+            temp.path()
+                .join("openspec/changes/rejected-dep/REJECTED.md"),
+            "# REJECTED\n",
         )
         .unwrap();
 
@@ -2764,7 +2834,6 @@ mod openspec_list_show_tests {
         assert!(info.dependency_statuses.is_empty());
         assert!(!json.as_object().unwrap().contains_key("dependencies"));
         assert!(!output.contains("Dependencies:"));
-        assert!(output.contains("Spec Deltas:"));
     }
 
     #[test]
