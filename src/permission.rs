@@ -22,6 +22,118 @@ fn permission_reject_pattern() -> &'static Regex {
     })
 }
 
+fn file_read_denied_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)(?:read|open|access)\s+(?:permission\s+)?denied(?:\s+(?:for|to))?\s*:?\s*([^\n]*)")
+            .expect("Invalid regex")
+    })
+}
+
+fn tool_denied_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)(?:tool|command)\s+(?:access\s+)?(?:denied|not\s+allowed|blocked|rejected)\s*:?\s*([^\n]*)")
+            .expect("Invalid regex")
+    })
+}
+
+fn harness_policy_denied_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| {
+        Regex::new(r"(?i)(?:permission|policy|sandbox|harness)[^\n]*(?:denied|not\s+allowed|blocked|rejected)\s*:?\s*([^\n]*)")
+            .expect("Invalid regex")
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionDenialCategory {
+    AutoReject,
+    FileRead,
+    ToolAccess,
+    CommandPolicy,
+}
+
+impl PermissionDenialCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AutoReject => "auto_reject",
+            Self::FileRead => "file_read",
+            Self::ToolAccess => "tool_access",
+            Self::CommandPolicy => "command_policy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDenial {
+    pub category: PermissionDenialCategory,
+    pub denied_target: String,
+    pub evidence: String,
+}
+
+impl PermissionDenial {
+    pub fn signature(&self) -> PermissionDenialSignature {
+        PermissionDenialSignature {
+            category: self.category.clone(),
+            denied_target: normalize_signature_target(&self.denied_target),
+        }
+    }
+
+    pub fn format_guidance(&self) -> String {
+        format!(
+            "Repeated unresolved permission/tool policy denial detected for {}: {}. \
+Operator action required: update the local harness/tool permission policy or grant access, then resume the preserved workspace.",
+            self.category.as_str(),
+            self.denied_target
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDenialSignature {
+    pub category: PermissionDenialCategory,
+    pub denied_target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDenialTracker {
+    last_signature: Option<PermissionDenialSignature>,
+}
+
+impl PermissionDenialTracker {
+    pub fn new() -> Self {
+        Self { last_signature: None }
+    }
+
+    pub fn observe(
+        &mut self,
+        denial: &PermissionDenial,
+        repository_visible_progress: bool,
+    ) -> PermissionDenialObservation {
+        let signature = denial.signature();
+        let repeated = self.last_signature.as_ref() == Some(&signature);
+        let stalled = repeated && !repository_visible_progress;
+
+        if repository_visible_progress || !repeated {
+            self.last_signature = Some(signature);
+        }
+
+        PermissionDenialObservation { stalled }
+    }
+}
+
+impl Default for PermissionDenialTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionDenialObservation {
+    pub stalled: bool,
+}
+
 /// Result of permission auto-reject detection
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionReject {
@@ -48,40 +160,93 @@ impl PermissionReject {
     }
 }
 
+fn combine_sources(sources: &[Option<&str>]) -> Option<String> {
+    let combined = sources
+        .iter()
+        .filter_map(|source| source.map(str::trim).filter(|text| !text.is_empty()))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+fn capture_target(caps: &regex::Captures<'_>) -> String {
+    caps.get(1)
+        .map(|m| m.as_str().trim())
+        .filter(|text| !text.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn normalize_signature_target(target: &str) -> String {
+    target.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+pub fn classify_permission_denial(sources: &[Option<&str>]) -> Option<PermissionDenial> {
+    let combined = combine_sources(sources)?;
+
+    if let Some(caps) = permission_reject_pattern().captures(&combined) {
+        return Some(PermissionDenial {
+            category: PermissionDenialCategory::AutoReject,
+            denied_target: capture_target(&caps),
+            evidence: caps
+                .get(0)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_else(|| combined.clone()),
+        });
+    }
+
+    if let Some(caps) = file_read_denied_pattern().captures(&combined) {
+        return Some(PermissionDenial {
+            category: PermissionDenialCategory::FileRead,
+            denied_target: capture_target(&caps),
+            evidence: caps
+                .get(0)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_else(|| combined.clone()),
+        });
+    }
+
+    if let Some(caps) = tool_denied_pattern().captures(&combined) {
+        return Some(PermissionDenial {
+            category: PermissionDenialCategory::ToolAccess,
+            denied_target: capture_target(&caps),
+            evidence: caps
+                .get(0)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_else(|| combined.clone()),
+        });
+    }
+
+    if let Some(caps) = harness_policy_denied_pattern().captures(&combined) {
+        return Some(PermissionDenial {
+            category: PermissionDenialCategory::CommandPolicy,
+            denied_target: capture_target(&caps),
+            evidence: caps
+                .get(0)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or(combined),
+        });
+    }
+
+    None
+}
+
 /// Detect permission auto-reject pattern in output.
 ///
 /// Searches for the pattern "permission requested" + "auto-rejecting" in the
 /// combined stdout/stderr tail output.
-///
-/// # Arguments
-///
-/// * `stdout_tail` - Last N lines of stdout (optional)
-/// * `stderr_tail` - Last N lines of stderr (optional)
-///
-/// # Returns
-///
-/// * `Some(PermissionReject)` - If auto-reject pattern is detected
-/// * `None` - If no auto-reject pattern found
 pub fn detect_permission_reject(
     stdout_tail: Option<&str>,
     stderr_tail: Option<&str>,
 ) -> Option<PermissionReject> {
-    // Combine stdout and stderr for pattern matching
-    let combined = match (stdout_tail, stderr_tail) {
-        (Some(out), Some(err)) => format!("{}\n{}", out, err),
-        (Some(out), None) => out.to_string(),
-        (None, Some(err)) => err.to_string(),
-        (None, None) => return None,
-    };
-
-    // Search for the pattern
-    let pattern = permission_reject_pattern();
-    pattern.captures(&combined).map(|caps| {
-        let denied_path = caps
-            .get(1)
-            .map(|m| m.as_str().trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        PermissionReject::new(denied_path)
+    classify_permission_denial(&[stdout_tail, stderr_tail]).and_then(|denial| {
+        (denial.category == PermissionDenialCategory::AutoReject)
+            .then(|| PermissionReject::new(denial.denied_target))
     })
 }
 
@@ -161,5 +326,65 @@ mod tests {
     fn test_detect_permission_reject_empty_input() {
         let result = detect_permission_reject(None, None);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_classifies_file_read_permission_denied() {
+        let result = classify_permission_denial(&[Some(
+            "Error: Read permission denied for /private/config.json",
+        )])
+        .expect("file read denial should match");
+
+        assert_eq!(result.category, PermissionDenialCategory::FileRead);
+        assert_eq!(result.denied_target, "/private/config.json");
+    }
+
+    #[test]
+    fn test_classifies_tool_access_denied() {
+        let result = classify_permission_denial(&[Some("Tool access denied: Bash")])
+            .expect("tool denial should match");
+
+        assert_eq!(result.category, PermissionDenialCategory::ToolAccess);
+        assert_eq!(result.denied_target, "Bash");
+    }
+
+    #[test]
+    fn test_classifies_command_level_harness_policy_rejection() {
+        let result = classify_permission_denial(&[Some(
+            "harness policy rejected command: git push origin main",
+        )])
+        .expect("command policy denial should match");
+
+        assert_eq!(result.category, PermissionDenialCategory::CommandPolicy);
+        assert_eq!(result.denied_target, "command: git push origin main");
+    }
+
+    #[test]
+    fn test_non_permission_failure_does_not_match() {
+        let result = classify_permission_denial(&[Some(
+            "cargo test failed: assertion failed in parser unit test",
+        )]);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_permission_denial_tracker_first_changed_and_progressing_are_not_stalled() {
+        let mut tracker = PermissionDenialTracker::new();
+        let first = classify_permission_denial(&[Some("Tool access denied: Bash")]).unwrap();
+        let changed = classify_permission_denial(&[Some("Tool access denied: Read")]).unwrap();
+
+        assert!(!tracker.observe(&first, false).stalled);
+        assert!(!tracker.observe(&changed, false).stalled);
+        assert!(!tracker.observe(&changed, true).stalled);
+    }
+
+    #[test]
+    fn test_permission_denial_tracker_repeated_without_progress_stalls() {
+        let mut tracker = PermissionDenialTracker::new();
+        let denial = classify_permission_denial(&[Some("Tool access denied: Bash")]).unwrap();
+
+        assert!(!tracker.observe(&denial, false).stalled);
+        assert!(tracker.observe(&denial, false).stalled);
     }
 }

@@ -282,6 +282,46 @@ pub async fn execute_apply_in_workspace(
     .await
     {
         Ok(result) => result,
+        Err(crate::error::OrchestratorError::PermissionStalled {
+            denied_path,
+            guidance,
+        }) => {
+            warn!(
+                "Repeated unresolved permission/tool policy denial for {} in workspace {}: {}",
+                change_id,
+                workspace_path.display(),
+                denied_path
+            );
+
+            let denial = crate::permission::PermissionDenial {
+                category: crate::permission::PermissionDenialCategory::CommandPolicy,
+                denied_target: denied_path.clone(),
+                evidence: guidance.clone(),
+            };
+            if let Some(ref tx) = event_tx_for_permission {
+                let _ = tx
+                    .send(ParallelEvent::ExecutionBlocked {
+                        change_id: change_id.to_string(),
+                        blocker: crate::events::StalledBlocker::permission_denial("apply", &denial),
+                    })
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::WorkspaceStatusUpdated {
+                        change_id: change_id.to_string(),
+                        workspace_name: workspace_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| workspace_path.display().to_string()),
+                        status: crate::vcs::WorkspaceStatus::Blocked,
+                    })
+                    .await;
+            }
+
+            return Err(crate::error::OrchestratorError::PermissionStalled {
+                denied_path,
+                guidance,
+            });
+        }
         Err(crate::error::OrchestratorError::PermissionBlocked {
             denied_path,
             guidance,
@@ -1178,6 +1218,14 @@ pub async fn execute_acceptance_in_workspace(
     // Build last acceptance output context for 2nd+ attempts
     let stdout_tail = agent.get_last_acceptance_stdout_tail(change_id);
     let stderr_tail = agent.get_last_acceptance_stderr_tail(change_id);
+    let previous_findings_text = agent
+        .get_last_acceptance_findings(change_id)
+        .map(|findings| findings.join("\n"));
+    let previous_acceptance_denial = crate::permission::classify_permission_denial(&[
+        stdout_tail.as_deref(),
+        stderr_tail.as_deref(),
+        previous_findings_text.as_deref(),
+    ]);
     let last_output_context = crate::agent::build_last_acceptance_output_context(
         stdout_tail.as_deref(),
         stderr_tail.as_deref(),
@@ -1386,6 +1434,52 @@ pub async fn execute_acceptance_in_workspace(
     // after the canonical verdict, so the non-zero exit is expected and the
     // verdict drives the final result.
     if !status.success() && !verdict_finalized_run {
+        let current_denial = crate::permission::classify_permission_denial(&[
+            stdout_tail.as_deref(),
+            stderr_tail.as_deref(),
+        ]);
+        if let Some(denial) = &current_denial {
+            let repeated_unresolved = previous_acceptance_denial
+                .as_ref()
+                .is_some_and(|previous| previous.signature() == denial.signature())
+                && end_revision == start_revision;
+            if repeated_unresolved {
+                let attempt_number = agent.next_acceptance_attempt_number(change_id);
+                let attempt = crate::history::AcceptanceAttempt {
+                    attempt: attempt_number,
+                    passed: false,
+                    duration: start_time.elapsed(),
+                    findings: Some(tail_findings.clone()),
+                    exit_code: status.code(),
+                    stdout_tail: stdout_tail.clone(),
+                    stderr_tail: stderr_tail.clone(),
+                    commit_hash: revision_to_history_commit_hash(&end_revision),
+                };
+                agent.record_acceptance_attempt(change_id, attempt.clone());
+                acceptance_history.lock().await.record(change_id, attempt);
+                acceptance_tail_injected.lock().await.remove(change_id);
+
+                let blocker = crate::events::StalledBlocker::permission_denial("acceptance", denial);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::ExecutionBlocked {
+                            change_id: change_id.to_string(),
+                            blocker: blocker.clone(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(ParallelEvent::AcceptanceCompleted {
+                            change_id: change_id.to_string(),
+                        })
+                        .await;
+                }
+                return Ok((
+                    crate::orchestration::AcceptanceResult::PermissionStalled { blocker },
+                    attempt_number,
+                ));
+            }
+        }
+
         let error_msg = format!(
             "Acceptance command failed with exit code: {:?}",
             status.code()
@@ -1563,6 +1657,53 @@ pub async fn execute_acceptance_in_workspace(
             } else {
                 findings
             };
+            let findings_text = findings_for_tasks.join("\n");
+            let current_denial = crate::permission::classify_permission_denial(&[
+                stdout_tail.as_deref(),
+                stderr_tail.as_deref(),
+                Some(findings_text.as_str()),
+            ]);
+            if let Some(denial) = &current_denial {
+                let repeated_unresolved = previous_acceptance_denial
+                    .as_ref()
+                    .is_some_and(|previous| previous.signature() == denial.signature())
+                    && end_revision == start_revision;
+                if repeated_unresolved {
+                    let attempt_number = agent.next_acceptance_attempt_number(change_id);
+                    let attempt = crate::history::AcceptanceAttempt {
+                        attempt: attempt_number,
+                        passed: false,
+                        duration: start_time.elapsed(),
+                        findings: Some(findings_for_tasks.clone()),
+                        exit_code: status.code(),
+                        stdout_tail: stdout_tail.clone(),
+                        stderr_tail: stderr_tail.clone(),
+                        commit_hash: revision_to_history_commit_hash(&end_revision),
+                    };
+                    agent.record_acceptance_attempt(change_id, attempt.clone());
+                    acceptance_history.lock().await.record(change_id, attempt);
+                    acceptance_tail_injected.lock().await.remove(change_id);
+
+                    let blocker = crate::events::StalledBlocker::permission_denial("acceptance", denial);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::ExecutionBlocked {
+                                change_id: change_id.to_string(),
+                                blocker: blocker.clone(),
+                            })
+                            .await;
+                        let _ = tx
+                            .send(ParallelEvent::AcceptanceCompleted {
+                                change_id: change_id.to_string(),
+                            })
+                            .await;
+                    }
+                    return Ok((
+                        crate::orchestration::AcceptanceResult::PermissionStalled { blocker },
+                        attempt_number,
+                    ));
+                }
+            }
             let blocking_gate_context = findings_for_tasks
                 .first()
                 .cloned()

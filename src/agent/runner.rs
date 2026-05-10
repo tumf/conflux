@@ -954,6 +954,12 @@ impl AgentRunner {
         self.acceptance_history.last_stderr_tail(change_id)
     }
 
+    /// Get the last findings from the most recent acceptance attempt.
+    /// Returns None if there are no previous attempts or the last attempt has no findings.
+    pub fn get_last_acceptance_findings(&self, change_id: &str) -> Option<Vec<String>> {
+        self.acceptance_history.last_findings(change_id)
+    }
+
     /// Get acceptance tail context for apply prompt.
     /// Returns the formatted context block if:
     /// 1. There is a previous acceptance attempt with output

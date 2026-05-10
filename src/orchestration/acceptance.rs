@@ -57,6 +57,10 @@ pub enum AcceptanceResult {
         error: String,
         findings: Vec<String>,
     },
+    /// Acceptance detected a repeated unresolved permission/policy blocker.
+    PermissionStalled {
+        blocker: crate::events::StalledBlocker,
+    },
     /// Acceptance was cancelled (e.g., by user or timeout).
     Cancelled,
 }
@@ -343,6 +347,10 @@ mod tests {
         assert!(!AcceptanceResult::CommandFailed {
             error: "test".to_string(),
             findings: vec!["failure".to_string()],
+        }
+        .is_pass());
+        assert!(!AcceptanceResult::PermissionStalled {
+            blocker: crate::events::StalledBlocker::acceptance_infrastructure("permission denied"),
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());
