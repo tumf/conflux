@@ -53,7 +53,7 @@ use super::cleanup::WorkspaceCleanupGuard;
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
-use super::{MergeResult, ParallelEvent, ParallelExecutor, WorkspaceResult};
+use super::{MergeResult, MergeTaskOutcome, ParallelEvent, ParallelExecutor, WorkspaceResult};
 
 fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
     format!(
@@ -607,7 +607,10 @@ impl ParallelExecutor {
                     .send(MergeResult {
                         change_id,
                         workspace_name,
-                        outcome: Ok(()),
+                        outcome: Ok(MergeTaskOutcome::deferred(
+                            "duplicate post-archive merge task suppressed because the same change is already active",
+                            true,
+                        )),
                     })
                     .await
                 {
@@ -639,16 +642,27 @@ impl ParallelExecutor {
         });
     }
 
-    pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) {
+    pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) -> bool {
         self.pending_merge_count.fetch_sub(1, Ordering::Relaxed);
 
         match merge_result.outcome {
-            Ok(()) => {
+            Ok(MergeTaskOutcome::Merged) => {
                 info!(
                     "Background merge task completed successfully for '{}'",
                     merge_result.change_id
                 );
                 self.retry_deferred_base_lane_waiters().await;
+                true
+            }
+            Ok(MergeTaskOutcome::Deferred {
+                reason,
+                auto_resumable,
+            }) => {
+                info!(
+                    "Background merge task deferred for '{}' (workspace '{}', auto_resumable={}): {}",
+                    merge_result.change_id, merge_result.workspace_name, auto_resumable, reason
+                );
+                false
             }
             Err(error) => {
                 error!(
@@ -665,6 +679,7 @@ impl ParallelExecutor {
                     },
                 )
                 .await;
+                false
             }
         }
     }

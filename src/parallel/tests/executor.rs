@@ -3135,7 +3135,7 @@ async fn test_rejection_review_failure_retries_deferred_merges() {
 
 #[tokio::test]
 async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
-    use crate::parallel::MergeResult;
+    use crate::parallel::{MergeResult, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -3147,28 +3147,32 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
     executor.pending_merge_count.store(2, Ordering::Relaxed);
-    executor
-        .handle_merge_result(MergeResult {
-            change_id: "change-ok".to_string(),
-            workspace_name: "ws-change-ok".to_string(),
-            outcome: Ok(()),
-        })
-        .await;
+    assert!(
+        executor
+            .handle_merge_result(MergeResult {
+                change_id: "change-ok".to_string(),
+                workspace_name: "ws-change-ok".to_string(),
+                outcome: Ok(MergeTaskOutcome::Merged),
+            })
+            .await
+    );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 1);
 
-    executor
-        .handle_merge_result(MergeResult {
-            change_id: "change-err".to_string(),
-            workspace_name: "ws-change-err".to_string(),
-            outcome: Err("merge failed".to_string()),
-        })
-        .await;
+    assert!(
+        !executor
+            .handle_merge_result(MergeResult {
+                change_id: "change-err".to_string(),
+                workspace_name: "ws-change-err".to_string(),
+                outcome: Err("merge failed".to_string()),
+            })
+            .await
+    );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
 async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_completion() {
-    use crate::parallel::MergeResult;
+    use crate::parallel::{MergeResult, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -3181,19 +3185,102 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
 
-    executor
+    let merged = executor
         .handle_merge_result(MergeResult {
             change_id: "change-ok".to_string(),
             workspace_name: "ws-change-ok".to_string(),
-            outcome: Ok(()),
+            outcome: Ok(MergeTaskOutcome::Merged),
         })
         .await;
 
+    assert!(
+        merged,
+        "actual merged background outcomes must trigger success-only scheduler follow-up"
+    );
     assert_eq!(
         executor.pending_merge_count.load(Ordering::Relaxed),
         0,
         "scheduler must clear pending merge counter after merge result is handled"
     );
+}
+
+#[tokio::test]
+async fn test_handle_merge_result_deferred_is_not_successful_completion() {
+    use crate::parallel::{MergeResult, MergeTaskOutcome};
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, _rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    executor.resolve_wait_changes.insert("beta".to_string());
+
+    let merged = executor
+        .handle_merge_result(MergeResult {
+            change_id: "alpha".to_string(),
+            workspace_name: "ws-alpha".to_string(),
+            outcome: Ok(MergeTaskOutcome::deferred(
+                "archive verification incomplete",
+                false,
+            )),
+        })
+        .await;
+
+    assert!(
+        !merged,
+        "deferred background merge outcomes must not be reported as completed merges"
+    );
+    assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
+    assert!(
+        executor.resolve_wait_changes.contains("beta"),
+        "deferred merge result handling must not run success-only retry_deferred_base_lane_waiters"
+    );
+}
+
+#[tokio::test]
+async fn test_handle_merge_result_failed_emits_error_event_with_context() {
+    use crate::parallel::MergeResult;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+
+    let merged = executor
+        .handle_merge_result(MergeResult {
+            change_id: "alpha".to_string(),
+            workspace_name: "ws-alpha".to_string(),
+            outcome: Err("merge failed hard".to_string()),
+        })
+        .await;
+
+    assert!(!merged, "failed merge outcomes are not successful merges");
+    let event = rx.try_recv().or_fail("expected merge failure event");
+    match event {
+        ExecutionEvent::Error { message } => {
+            assert!(message.contains("alpha"), "missing change id: {message}");
+            assert!(
+                message.contains("ws-alpha"),
+                "missing workspace name: {message}"
+            );
+            assert!(
+                message.contains("merge failed hard"),
+                "missing error: {message}"
+            );
+        }
+        other => panic!("expected error event, got {other:?}"),
+    }
 }
 
 #[tokio::test]

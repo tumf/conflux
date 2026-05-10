@@ -33,7 +33,7 @@ pub use crate::events::ExecutionEvent as ParallelEvent;
 #[cfg(all(test, feature = "heavy-tests"))]
 #[allow(unused_imports)]
 pub use merge::{base_dirty_reason, resolve_deferred_merge};
-pub use types::{FailedChangeTracker, MergeResult, WorkspaceResult};
+pub use types::{FailedChangeTracker, MergeResult, MergeTaskOutcome, WorkspaceResult};
 
 // Re-exports used in tests via `use super::super::*`.
 #[cfg(test)]
