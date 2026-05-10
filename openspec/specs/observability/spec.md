@@ -21,8 +21,7 @@ The specification covers:
 
 apply/archive/resolveのAIエージェントコマンドは、`{change_id}`、`{prompt}`、`{conflict_files}`などのプレースホルダーを展開した完全なコマンド文字列を、実行前にTUI Logs Viewへ表示しなければならない（MUST）。このログはユーザー向けの`info`相当ログとして扱う（SHALL）。
 
-hookコマンドは、実行前にコマンド文字列をTUI Logs Viewへ表示しなければならない（MUST）。
-hookコマンドのstdout/stderrは取得可能な範囲でTUI Logs Viewへ表示しなければならない（MUST）。
+hookコマンドは、実行前にコマンド文字列をTUI Logs Viewへ表示しなければならない（MUST）。hookコマンドのstdout/stderrは取得可能な範囲でTUI Logs Viewへ表示しなければならない（MUST）。
 
 TUI Logs Viewに表示されるすべてのログエントリーは、常にデバッグログファイルにも出力されなければならない（MUST）。出力先は `XDG_STATE_HOME` が設定されていれば `XDG_STATE_HOME/cflx/logs/<project_slug>/<YYYY-MM-DD>.log`、未設定時は `~/.local/state/cflx/logs/<project_slug>/<YYYY-MM-DD>.log` とする（MUST）。ログは日付単位で分割し、`project_slug` ごとに最新7日分のみ保持しなければならない（MUST）。
 
@@ -36,6 +35,22 @@ TUI Logs Viewに表示されるすべてのログエントリーは、常にデ�
 - **AND** the debug log file does not show an unbounded sequence of identical WARN-level entries for the same scheduler diagnostic
 - **AND** the diagnostic remains available at least once or through a summary/rate-limited entry
 - **AND** suppression state is not used to decide scheduling, resume routing, acceptance, archive, or next-action behavior
+
+#### Scenario: unchanged scheduler observations do not create new diagnostics
+
+- **GIVEN** a scheduler loop repeatedly observes the same dependency blocker, worktree status, or merge-wait diagnostic state
+- **AND** the comparable observation fingerprint has not changed since the previous emitted diagnostic
+- **WHEN** the scheduler loop runs again
+- **THEN** Conflux does not emit another user-visible TUI log entry for that unchanged observation
+- **AND** Conflux does not emit another repeated info/warn debug log entry for that unchanged observation
+- **AND** any suppression or fingerprint state remains non-authoritative and is not used for workflow-control decisions
+
+#### Scenario: changed scheduler observations remain visible
+
+- **GIVEN** a scheduler diagnostic was previously emitted for a dependency blocker, worktree status, or merge-wait observation
+- **WHEN** the comparable observation fingerprint changes
+- **THEN** Conflux emits a new diagnostic/log entry that makes the changed state visible
+- **AND** the new diagnostic includes enough context to distinguish it from the prior observation
 
 ### Requirement: REQ-OBS-002 Appropriate Log Level Classification
 
