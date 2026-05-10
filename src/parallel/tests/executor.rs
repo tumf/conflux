@@ -528,7 +528,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         resolve_wait_changes,
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -646,7 +646,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         resolve_wait_changes: HashSet::new(),
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -755,7 +755,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         resolve_wait_changes: HashSet::new(),
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -913,7 +913,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         resolve_wait_changes: HashSet::new(),
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -1126,7 +1126,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         resolve_wait_changes: HashSet::new(),
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -1331,7 +1331,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         resolve_wait_changes: HashSet::new(),
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -1542,7 +1542,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         resolve_wait_changes: HashSet::new(),
         reject_wait_changes: HashSet::new(),
         merge_wait_changes: HashSet::new(),
-        previously_blocked_changes: HashSet::new(),
+        dependency_blocker_fingerprints: HashMap::new(),
         force_recreate_worktree: HashSet::new(),
         hooks: None,
         cancel_token: None,
@@ -2530,6 +2530,182 @@ async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
         saw_blocked,
         "in-flight dependency should emit DependencyBlocked"
     );
+}
+
+#[tokio::test]
+async fn test_dependency_blocked_event_emits_once_for_unchanged_snapshot() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["ghost".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let first_selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+    let second_selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
+    assert!(first_selected.is_empty());
+    assert!(second_selected.is_empty());
+    let blocked_events = drain_dependency_events(&mut rx, "route");
+    assert_eq!(
+        blocked_events,
+        vec!["blocked:ghost".to_string()],
+        "unchanged blocker fingerprint should emit one DependencyBlocked event"
+    );
+}
+
+#[tokio::test]
+async fn test_changed_dependency_blocker_snapshot_emits_again() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let in_flight = HashSet::new();
+    let missing_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["ghost".to_string()])]),
+        groups: None,
+    };
+    let queued_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string(), "policy".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+        groups: None,
+    };
+
+    let missing_selected = executor
+        .select_changes_for_dispatch(&missing_analysis, 1, &in_flight)
+        .await;
+    let queued_selected = executor
+        .select_changes_for_dispatch(&queued_analysis, 1, &in_flight)
+        .await;
+
+    assert!(missing_selected.is_empty());
+    assert_eq!(queued_selected, vec!["policy".to_string()]);
+    let blocked_events = drain_dependency_events(&mut rx, "route");
+    assert_eq!(
+        blocked_events,
+        vec!["blocked:ghost".to_string(), "blocked:policy".to_string()],
+        "changed blocker fingerprint should emit another DependencyBlocked event"
+    );
+}
+
+#[tokio::test]
+async fn test_dependency_resolved_emits_once_and_blocked_again_can_emit() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let in_flight = HashSet::new();
+    let blocked_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["ghost".to_string()])]),
+        groups: None,
+    };
+    let ready_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::new(),
+        groups: None,
+    };
+
+    let first_blocked = executor
+        .select_changes_for_dispatch(&blocked_analysis, 1, &in_flight)
+        .await;
+    let first_ready = executor
+        .select_changes_for_dispatch(&ready_analysis, 1, &in_flight)
+        .await;
+    let second_ready = executor
+        .select_changes_for_dispatch(&ready_analysis, 1, &in_flight)
+        .await;
+    let second_blocked = executor
+        .select_changes_for_dispatch(&blocked_analysis, 1, &in_flight)
+        .await;
+
+    assert!(first_blocked.is_empty());
+    assert_eq!(first_ready, vec!["route".to_string()]);
+    assert_eq!(second_ready, vec!["route".to_string()]);
+    assert!(second_blocked.is_empty());
+    let dependency_events = drain_dependency_events(&mut rx, "route");
+    assert_eq!(
+        dependency_events,
+        vec![
+            "blocked:ghost".to_string(),
+            "resolved".to_string(),
+            "blocked:ghost".to_string(),
+        ],
+        "resolved transition should emit once and a later blocked transition should emit again"
+    );
+}
+
+#[tokio::test]
+async fn test_dependency_suppression_state_does_not_change_dispatch_selection() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let in_flight = HashSet::new();
+    let blocked_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string(), "policy".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+        groups: None,
+    };
+
+    let before = executor
+        .select_changes_for_dispatch(&blocked_analysis, 2, &in_flight)
+        .await;
+    assert_eq!(before, vec!["policy".to_string()]);
+    assert!(
+        executor
+            .dependency_blocker_fingerprints
+            .contains_key("route"),
+        "diagnostic fingerprint should be stored only after deriving blockers"
+    );
+
+    let after = executor
+        .select_changes_for_dispatch(&blocked_analysis, 2, &in_flight)
+        .await;
+    assert_eq!(
+        after,
+        vec!["policy".to_string()],
+        "in-memory diagnostic suppression must not alter dispatch selection"
+    );
+}
+
+fn drain_dependency_events(
+    rx: &mut tokio::sync::mpsc::Receiver<ExecutionEvent>,
+    target_change_id: &str,
+) -> Vec<String> {
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::DependencyBlocked {
+                change_id,
+                dependency_ids,
+            } if change_id == target_change_id => {
+                events.push(format!("blocked:{}", dependency_ids.join(",")));
+            }
+            ExecutionEvent::DependencyResolved { change_id } if change_id == target_change_id => {
+                events.push("resolved".to_string());
+            }
+            _ => {}
+        }
+    }
+    events
 }
 
 #[tokio::test]

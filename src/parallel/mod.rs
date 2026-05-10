@@ -53,6 +53,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::state::OrchestratorState;
 
+type DependencyBlockerFingerprint = Vec<(String, String)>;
+
 const DEFAULT_MAX_CONFLICT_RETRIES: u32 = 3;
 
 /// Defines when the parallel scheduler should terminate.
@@ -117,9 +119,13 @@ pub struct ParallelExecutor {
     reject_wait_changes: HashSet<String>,
     /// Changes waiting for manual user intervention before merge can continue (MergeWait)
     merge_wait_changes: HashSet<String>,
-    /// Changes that previously had unresolved dependencies (for worktree recreation tracking)
-    #[allow(dead_code)]
-    previously_blocked_changes: HashSet<String>,
+    /// Last emitted dependency blocker fingerprint per change.
+    ///
+    /// This runtime-only observability state drives blocked/resolved diagnostics and
+    /// worktree recreation after dependency resolution. It MUST NOT decide dispatch
+    /// eligibility; `select_changes_for_dispatch` still derives executable work from
+    /// the current analysis result and repository/workspace state on every pass.
+    dependency_blocker_fingerprints: HashMap<String, DependencyBlockerFingerprint>,
     /// Changes that need forced worktree recreation (dependency just resolved)
     force_recreate_worktree: HashSet<String>,
     /// Hook runner for executing hooks (optional)
@@ -172,7 +178,9 @@ pub struct ParallelExecutor {
     /// Runtime-only observability dedupe for unchanged dependency blocker signatures.
     ///
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
-    dependency_blocker_diagnostics_seen: HashSet<(String, Vec<(String, String)>)>,
+    /// It is retained for older diagnostics helpers/tests; transition emission uses
+    /// `dependency_blocker_fingerprints` above.
+    dependency_blocker_diagnostics_seen: HashSet<(String, DependencyBlockerFingerprint)>,
 }
 
 #[cfg(test)]

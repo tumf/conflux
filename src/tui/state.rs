@@ -3374,6 +3374,48 @@ mod tests {
         );
     }
 
+    /// Duplicate DependencyBlocked/DependencyResolved events should not spam user-visible TUI logs
+    /// when the display state has not changed.
+    #[test]
+    fn test_duplicate_dependency_events_are_tui_log_noops() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_dependency_blocked("change-a".to_string());
+        app.handle_dependency_blocked("change-a".to_string());
+        assert_eq!(app.changes[0].display_status_cache, "blocked");
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|log| log.message.contains("blocked by dependencies"))
+                .count(),
+            1,
+            "duplicate blocked event should not append a duplicate log"
+        );
+
+        app.handle_dependency_resolved("change-a".to_string());
+        app.handle_dependency_resolved("change-a".to_string());
+        assert_eq!(app.changes[0].display_status_cache, "queued");
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|log| log.message.contains("dependencies resolved"))
+                .count(),
+            1,
+            "duplicate resolved event should not append a duplicate log"
+        );
+
+        app.handle_dependency_blocked("change-a".to_string());
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|log| log.message.contains("blocked by dependencies"))
+                .count(),
+            2,
+            "real resolved -> blocked transition should still append a new log"
+        );
+    }
+
     /// ParallelStartRejected must also clear the reducer queue intent so subsequent
     /// ChangesRefreshed display syncs don't re-queue the rejected row.
     #[test]

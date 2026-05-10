@@ -198,37 +198,46 @@ impl ParallelExecutor {
         collect_rejected_change_ids(&self.repo_root)
     }
 
-    fn should_emit_dependency_blocker_diagnostic(
+    fn dependency_blocker_fingerprint(
+        change_id: &str,
+        blockers: &[(String, DependencyTargetClass)],
+    ) -> super::DependencyBlockerFingerprint {
+        let mut fingerprint = blockers
+            .iter()
+            .map(|(dep_id, class)| (dep_id.clone(), class.as_str().to_string()))
+            .collect::<Vec<_>>();
+        fingerprint.sort();
+        fingerprint.insert(0, ("change_id".to_string(), change_id.to_string()));
+        fingerprint
+    }
+
+    fn should_emit_dependency_blocked_transition(
         &mut self,
         change_id: &str,
         blockers: &[(String, DependencyTargetClass)],
     ) -> bool {
-        let mut signature = blockers
-            .iter()
-            .map(|(dep_id, class)| (dep_id.clone(), class.as_str().to_string()))
-            .collect::<Vec<_>>();
-        signature.sort();
-        self.dependency_blocker_diagnostics_seen
-            .insert((change_id.to_string(), signature))
+        let fingerprint = Self::dependency_blocker_fingerprint(change_id, blockers);
+        let changed = self
+            .dependency_blocker_fingerprints
+            .get(change_id)
+            .is_none_or(|previous| previous != &fingerprint);
+
+        if changed {
+            self.dependency_blocker_fingerprints
+                .insert(change_id.to_string(), fingerprint.clone());
+            self.dependency_blocker_diagnostics_seen
+                .insert((change_id.to_string(), fingerprint));
+            return true;
+        }
+
+        false
     }
 
     async fn emit_dependency_blocker_diagnostic(
-        &mut self,
+        &self,
         change_id: &str,
         blockers: &[(String, DependencyTargetClass)],
     ) {
-        if blockers.is_empty() {
-            return;
-        }
-        if !self.should_emit_dependency_blocker_diagnostic(change_id, blockers) {
-            debug!(
-                change_id,
-                blockers = ?blockers,
-                "Suppressing repeated dependency blocker diagnostic"
-            );
-            return;
-        }
-
         for (dep_id, class) in blockers {
             let message = format!(
                 "Change '{}' blocked by {} dependency '{}' and will remain queued",
@@ -419,36 +428,44 @@ impl ParallelExecutor {
                 }
 
                 if !unresolved_deps.is_empty() {
-                    info!(
-                        "Change '{}' blocked: waiting for dependencies {:?}",
-                        change_id, unresolved_deps
-                    );
-                    self.emit_dependency_blocker_diagnostic(change_id, &blockers)
+                    if self.should_emit_dependency_blocked_transition(change_id, &blockers) {
+                        info!(
+                            "Change '{}' blocked: waiting for dependencies {:?}",
+                            change_id, unresolved_deps
+                        );
+                        self.emit_dependency_blocker_diagnostic(change_id, &blockers)
+                            .await;
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::DependencyBlocked {
+                                change_id: change_id.clone(),
+                                dependency_ids: unresolved_deps,
+                            },
+                        )
                         .await;
-                    // Track this change as blocked
-                    self.previously_blocked_changes.insert(change_id.clone());
-                    // Send DependencyBlocked event
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::DependencyBlocked {
-                            change_id: change_id.clone(),
-                            dependency_ids: unresolved_deps,
-                        },
-                    )
-                    .await;
+                    } else {
+                        debug!(
+                            change_id,
+                            blockers = ?blockers,
+                            "Suppressing repeated dependency blocked transition"
+                        );
+                    }
                     continue;
                 }
             }
 
-            // Check if this change was previously blocked and is now resolved
-            if self.previously_blocked_changes.contains(change_id) {
+            // Check if this change was previously blocked and is now resolved.
+            // Clearing the in-memory fingerprint makes the next blocked observation a new transition.
+            if self
+                .dependency_blocker_fingerprints
+                .remove(change_id)
+                .is_some()
+            {
                 info!(
                     "Change '{}' dependencies resolved, forcing fresh workspace recreation",
                     change_id
                 );
-                self.previously_blocked_changes.remove(change_id);
                 self.force_recreate_worktree.insert(change_id.clone());
-                // Send DependencyResolved event
                 send_event(
                     &self.event_tx,
                     ParallelEvent::DependencyResolved {
