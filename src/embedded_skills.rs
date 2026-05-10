@@ -484,6 +484,54 @@ mod tests {
     }
 
     #[test]
+    fn test_rejecting_skill_documents_block_tri_state_contract() {
+        for required in &[
+            "REJECTION_REVIEW: CONFIRM",
+            "REJECTION_REVIEW: RESUME",
+            "REJECTION_REVIEW: BLOCK",
+            "CONFIRM`: terminal rejection",
+            "RESUME`: reject proposal is dismissed",
+            "BLOCK`: reject proposal describes a real non-terminal blocker",
+        ] {
+            assert!(
+                CFLX_REJECTING_SKILL_MD.contains(required),
+                "cflx-rejecting SKILL.md must document tri-state rejecting outcome: {required}"
+            );
+        }
+        assert!(
+            !CFLX_REJECTING_SKILL_MD.contains("CONFIRM|RESUME")
+                && !CFLX_REJECTING_SKILL_MD.contains("CONFIRM or RESUME"),
+            "cflx-rejecting must not describe rejecting review as confirm/resume-only"
+        );
+    }
+
+    #[test]
+    fn test_apply_and_acceptance_skills_keep_recoverable_infra_blockers_non_terminal() {
+        for (label, content) in &[
+            ("cflx-apply", CFLX_APPLY_SKILL_MD),
+            ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
+            ("cflx-workflow", CFLX_WORKFLOW_SKILL_MD),
+        ] {
+            assert!(
+                content.contains("infrastructure")
+                    && content.contains("non-terminal")
+                    && content.contains("stalled"),
+                "{label} must route recoverable infrastructure blockers to non-terminal stalled holds"
+            );
+            assert!(
+                content.contains("Docker")
+                    && content.contains("credential")
+                    && content.contains("pending"),
+                "{label} must mention representative recoverable blocker classes"
+            );
+        }
+        assert!(
+            CFLX_APPLY_SKILL_MD.contains("do not create `REJECTED.md` for these recoverable cases"),
+            "cflx-apply must prohibit REJECTED.md for recoverable infrastructure blockers"
+        );
+    }
+
+    #[test]
     fn test_acceptance_skills_frame_blockers_as_stalled_holds() {
         for (label, content) in &[
             ("cflx-accept", CFLX_ACCEPT_SKILL_MD),

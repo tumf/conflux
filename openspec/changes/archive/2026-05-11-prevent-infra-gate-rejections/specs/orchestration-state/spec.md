@@ -48,6 +48,8 @@ Non-terminal execution blockers that preserve the change for later resume SHALL 
 - **AND** `alpha` SHALL display as `stalled`
 - **AND** `alpha` SHALL NOT display as `rejected`
 
+## ADDED Requirements
+
 ### Requirement: Stalled blocker metadata
 
 When a change enters non-terminal stalled state because of an infrastructure, external dependency, credential, or pending-verification blocker, reducer-owned state SHALL preserve operator-facing metadata sufficient to distinguish the blocker from dependency blocking and terminal rejection.

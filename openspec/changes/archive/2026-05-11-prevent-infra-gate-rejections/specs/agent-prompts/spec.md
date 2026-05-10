@@ -79,6 +79,8 @@ acceptance は以下を満たさなければならない（MUST）。
 - **AND** guidance states this must be runtime/user-facing `stalled`, not terminal `rejected`
 - **AND** guidance includes next action to restore the missing infrastructure or credential and rerun the gate
 
+## ADDED Requirements
+
 ### Requirement: Rejecting review MUST distinguish terminal rejection from stalled blockers
 
 Rejecting review prompt and distributed `cflx-rejecting` skill SHALL support three final verdicts: `REJECTION_REVIEW: CONFIRM`, `REJECTION_REVIEW: RESUME`, and `REJECTION_REVIEW: BLOCK`.
