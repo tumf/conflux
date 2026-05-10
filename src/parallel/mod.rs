@@ -47,7 +47,7 @@ use crate::hooks::HookRunner;
 use crate::vcs::WorkspaceManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
@@ -70,9 +70,21 @@ pub enum SchedulerLifetime {
 /// at any given time, regardless of which `ParallelExecutor` instance initiates it.
 static GLOBAL_MERGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// Runtime-only set of post-archive merge tasks currently owning a change.
+///
+/// This is intentionally not durable workflow state. It only prevents the live
+/// scheduler from redispatching the same archived dirty workspace while an
+/// already-spawned post-archive merge task is still deriving the authoritative
+/// outcome from repository/workspace git state.
+static ACTIVE_POST_ARCHIVE_MERGES: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
 /// Get the global merge lock, initializing it if necessary.
 fn global_merge_lock() -> &'static Mutex<()> {
     GLOBAL_MERGE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn active_post_archive_merges() -> &'static StdMutex<HashSet<String>> {
+    ACTIVE_POST_ARCHIVE_MERGES.get_or_init(|| StdMutex::new(HashSet::new()))
 }
 
 /// Parallel executor for running changes in VCS workspaces (git worktrees today).

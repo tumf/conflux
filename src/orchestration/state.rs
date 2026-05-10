@@ -2945,6 +2945,28 @@ mod tests {
     // applied to the shared reducer before the next ChangesRefreshed.
 
     #[test]
+    fn test_merge_completed_ignores_later_stale_manual_merge_deferred() {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev-alpha".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "Archive incomplete for 'alpha': worktree may be dirty".to_string(),
+            auto_resumable: false,
+        });
+
+        assert_eq!(state.display_status("alpha"), "merged");
+        assert!(state.queued_change_ids().is_empty());
+        assert!(state.resolve_wait_change_ids().is_empty());
+    }
+
+    #[test]
     fn test_merge_completed_clears_resolve_wait_intent() {
         use crate::events::ExecutionEvent;
 
