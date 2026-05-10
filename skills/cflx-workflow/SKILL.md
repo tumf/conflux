@@ -109,14 +109,16 @@ If implementation is impossible, add `## Implementation Blocker #<n>` to `tasks.
 1. Confirm `REJECTED.md` exists and contains a concrete reason.
 2. Confirm blocker evidence in `tasks.md` (`## Implementation Blocker #N`) is specific and actionable.
 3. Decide one outcome only:
-   - `CONFIRM`: reject proposal is valid.
+   - `CONFIRM`: terminal rejection evidence proves invalid/obsolete/contradictory/constitution-violating change intent.
    - `RESUME`: reject proposal is dismissed; change returns to apply.
-4. Output exactly one final marker line: `REJECTION_REVIEW: CONFIRM` or `REJECTION_REVIEW: RESUME`
+   - `BLOCK`: rejection proposal describes a real non-terminal infrastructure/pending-verification blocker; change becomes stalled.
+4. Output exactly one final marker line: `REJECTION_REVIEW: CONFIRM`, `REJECTION_REVIEW: RESUME`, or `REJECTION_REVIEW: BLOCK`
 
 ### Outcome Rules
 
-- On CONFIRM, runtime finalizes rejection flow.
-- On RESUME, runtime removes `REJECTED.md` and appends recovery task.
+- On CONFIRM, runtime finalizes rejection flow and may write base-branch `REJECTED.md`.
+- On RESUME, runtime removes worktree-local `REJECTED.md` and appends recovery task.
+- On BLOCK, runtime removes worktree-local `REJECTED.md`, preserves the worktree, records a stalled hold, and MUST NOT write base-branch `REJECTED.md`.
 - MUST NOT output `ACCEPTANCE: GATED`.
 
 ---

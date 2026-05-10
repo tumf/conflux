@@ -194,6 +194,83 @@ pub enum RejectionOutcome {
     Block,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalledBlocker {
+    pub category: String,
+    pub phase: String,
+    pub gate: String,
+    pub error_summary: String,
+    pub next_action: String,
+    pub resumable: bool,
+    pub worktree_preserved: bool,
+}
+
+fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
+    let lower = error_summary.to_ascii_lowercase();
+    if lower.contains("credential")
+        || lower.contains(" api key")
+        || lower.contains("token")
+        || lower.contains("auth")
+    {
+        "credential"
+    } else if lower.contains("still running")
+        || lower.contains("pending")
+        || lower.contains("agent-exec")
+        || lower.contains("managed verification job")
+    {
+        "pending_verification"
+    } else if lower.contains("registry")
+        || lower.contains("external service")
+        || lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("service outage")
+    {
+        "external_service"
+    } else if lower.contains("docker")
+        || lower.contains("daemon")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("timeout")
+        || lower.contains("port conflict")
+        || lower.contains("address already in use")
+        || lower.contains("image")
+    {
+        "infrastructure"
+    } else {
+        "infrastructure"
+    }
+}
+
+impl StalledBlocker {
+    pub fn acceptance_infrastructure(error_summary: impl Into<String>) -> Self {
+        let error_summary = error_summary.into();
+        Self {
+            category: classify_stalled_blocker_category(&error_summary).to_string(),
+            phase: "acceptance".to_string(),
+            gate: "acceptance".to_string(),
+            error_summary,
+            next_action: "resolve the external verification blocker and rerun acceptance".to_string(),
+            resumable: true,
+            worktree_preserved: true,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "category={}, phase={}, gate={}, resumable={}, next_action={}, error={}",
+            self.category, self.phase, self.gate, self.resumable, self.next_action, self.error_summary
+        )
+    }
+
+    pub fn worktree_snapshot(&self) -> String {
+        if self.worktree_preserved {
+            "existing worktree and WIP context are preserved while stalled".to_string()
+        } else {
+            "worktree preservation unavailable for this stalled hold".to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExecutionEvent {
     // Lifecycle events
@@ -383,8 +460,8 @@ pub enum ExecutionEvent {
     /// A change's dependencies were resolved and it can now be queued
     DependencyResolved { change_id: String },
 
-    /// Acceptance observed a gate and follow-up routing should classify it separately
-    AcceptanceGated { change_id: String, reason: String },
+    /// Acceptance observed a compatibility gated token that becomes a non-terminal stalled hold.
+    AcceptanceGated { change_id: String, blocker: StalledBlocker },
 
     // Analysis events (parallel mode)
     /// Analysis started for remaining changes

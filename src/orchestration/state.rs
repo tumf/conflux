@@ -1573,16 +1573,16 @@ impl OrchestratorState {
                     rt.clear_blocked_metadata();
                 }
             }
-            ExecutionEvent::AcceptanceGated { change_id, reason } => {
+            ExecutionEvent::AcceptanceGated { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
                     rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::Stalled;
                     rt.terminal = TerminalState::None;
                     rt.set_blocked_metadata(
-                        "acceptance-gated",
-                        "review acceptance blocker evidence and decide resume/reject route",
-                        reason.clone(),
+                        format!("acceptance-gated:{}", blocker.category),
+                        blocker.summary(),
+                        blocker.worktree_snapshot(),
                     );
                 }
             }
@@ -1912,6 +1912,25 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 1.4: display_status derivation
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lifecycle_display_distinguishes_rejected_stalled_blocked_and_error() {
+        let mut rejected = ChangeRuntimeState::default();
+        rejected.terminal = TerminalState::Rejected("terminal".to_string());
+        assert_eq!(rejected.display_status(), "rejected");
+
+        let mut stalled = ChangeRuntimeState::default();
+        stalled.wait_state = WaitState::Stalled;
+        assert_eq!(stalled.display_status(), "stalled");
+
+        let mut dependency_blocked = ChangeRuntimeState::default();
+        dependency_blocked.wait_state = WaitState::DependencyBlocked;
+        assert_eq!(dependency_blocked.display_status(), "blocked");
+
+        let mut error = ChangeRuntimeState::default();
+        error.terminal = TerminalState::Error("repo-fixable failure".to_string());
+        assert_eq!(error.display_status(), "error");
+    }
 
     #[test]
     fn test_display_status_derivation() {
@@ -2263,6 +2282,91 @@ mod tests {
                 .expect("runtime for c after rejecting confirm")
                 .activity,
             ActivityState::Rejecting
+        );
+    }
+
+    #[test]
+    fn test_representative_infrastructure_blockers_map_to_stalled_categories() {
+        let cases = [
+            (
+                "docker image pull failed: lookup registry-1.docker.io i/o timeout",
+                "external_service",
+            ),
+            ("Cannot connect to the Docker daemon", "infrastructure"),
+            ("missing non-mockable external credential", "credential"),
+            ("package registry timeout fetching crate", "external_service"),
+            ("agent-exec managed verification job still running", "pending_verification"),
+        ];
+
+        for (idx, (message, expected_category)) in cases.iter().enumerate() {
+            let change_id = format!("c-{idx}");
+            let mut state = OrchestratorState::new(vec![change_id.clone()], 0);
+            state.apply_execution_event(&crate::events::ExecutionEvent::AcceptanceGated {
+                change_id: change_id.clone(),
+                blocker: crate::events::StalledBlocker::acceptance_infrastructure(*message),
+            });
+
+            let runtime = state
+                .change_runtime(&change_id)
+                .expect("runtime after blocker classification");
+            assert_eq!(state.display_status(&change_id), "stalled");
+            assert!(matches!(runtime.terminal, TerminalState::None));
+            assert_eq!(
+                runtime.blocked_metadata.blocker_reason.as_deref(),
+                Some(format!("acceptance-gated:{expected_category}").as_str())
+            );
+            assert!(
+                runtime
+                    .blocked_metadata
+                    .unblock_metadata
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(message),
+                "metadata should preserve observed error summary for {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_acceptance_gated_transitions_to_stalled_with_structured_metadata() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "c".to_string(),
+            command: "accept".to_string(),
+        });
+
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker::acceptance_infrastructure(
+                "docker image pull failed: lookup registry-1.docker.io i/o timeout",
+            ),
+        });
+
+        let runtime = state
+            .change_runtime("c")
+            .expect("runtime for c after acceptance gated");
+        assert_eq!(state.display_status("c"), "stalled");
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        assert_eq!(
+            runtime.blocked_metadata.blocker_reason.as_deref(),
+            Some("acceptance-gated:infrastructure")
+        );
+        let unblock = runtime
+            .blocked_metadata
+            .unblock_metadata
+            .as_deref()
+            .expect("unblock metadata");
+        assert!(unblock.contains("phase=acceptance"));
+        assert!(unblock.contains("gate=acceptance"));
+        assert!(unblock.contains("resumable=true"));
+        assert!(unblock.contains("docker image pull failed"));
+        assert_eq!(
+            runtime.blocked_metadata.worktree_snapshot.as_deref(),
+            Some("existing worktree and WIP context are preserved while stalled")
         );
     }
 

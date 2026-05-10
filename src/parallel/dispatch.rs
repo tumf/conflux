@@ -1746,19 +1746,20 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::Gated,
                         acceptance_iteration,
                     )) => {
-                        let reason = blocked_handoff
+                        let blocker_summary = blocked_handoff
                             .as_ref()
                             .map(|handoff| {
                                 format!(
-                                    "Acceptance-confirmed apply blocker (proposal: {})",
+                                    "acceptance emitted gated compatibility token; blocker evidence at {}",
                                     handoff.blocker_path.display()
                                 )
                             })
                             .unwrap_or_else(|| {
-                                "Acceptance-confirmed implementation blocker".to_string()
+                                "acceptance emitted gated compatibility token without a dedicated blocker artifact".to_string()
                             });
+                        let blocker = crate::events::StalledBlocker::acceptance_infrastructure(blocker_summary);
                         warn!(
-                            "Acceptance gated for {} - running rejection flow",
+                            "Acceptance gated for {} - recording non-terminal stalled hold",
                             change_id
                         );
 
@@ -1766,63 +1767,35 @@ impl ParallelExecutor {
                             let _ = tx
                                 .send(ParallelEvent::AcceptanceGated {
                                     change_id: change_id.clone(),
-                                    reason: reason.clone(),
+                                    blocker: blocker.clone(),
                                 })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::WorkspaceStatusUpdated {
+                                    change_id: change_id.clone(),
+                                    workspace_name: workspace.name.clone(),
+                                    status: WorkspaceStatus::Blocked,
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::warn(
+                                        "Acceptance gated compatibility token recorded as stalled hold; no terminal rejection flow executed",
+                                    )
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
+                                ))
                                 .await;
                         }
 
-                        let resolved_base = base_branch.clone();
-
-                        match execute_rejection_flow(
-                            &change_id,
-                            &reason,
-                            &workspace.path,
-                            &resolved_base,
-                            &repo_root,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::Log(
-                                            LogEntry::warn(format!(
-                                                "Acceptance gated - rejection flow completed ({})",
-                                                resolved_base
-                                            ))
-                                            .with_change_id(&change_id)
-                                            .with_operation("acceptance")
-                                            .with_iteration(acceptance_iteration),
-                                        ))
-                                        .await;
-                                    let _ = tx
-                                        .send(ParallelEvent::ChangeDequeued {
-                                            change_id: change_id.clone(),
-                                        })
-                                        .await;
-                                }
-
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name: workspace.name,
-                                    final_revision: None,
-                                    error: None,
-                                    rejected: Some(reason),
-                                };
-                            }
-                            Err(e) => {
-                                return WorkspaceResult {
-                                    change_id,
-                                    workspace_name: workspace.name,
-                                    final_revision: None,
-                                    error: Some(format!(
-                                        "Rejected flow failed after blocked acceptance: {}",
-                                        e
-                                    )),
-                                    rejected: None,
-                                };
-                            }
-                        }
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None,
+                            rejected: None,
+                        };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::Cancelled,

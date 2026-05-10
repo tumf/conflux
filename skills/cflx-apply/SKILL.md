@@ -161,7 +161,9 @@ Never mark a task complete based only on any of the following:
 
 ## Implementation Blocker Escalation
 
-If apply determines the change is currently impossible to implement (for example: spec contradiction, non-mockable external limitation, or policy constraint), do not loop blindly.
+If apply determines the change is currently impossible to implement because the change intent is terminally invalid (for example: spec contradiction or policy/constitution constraint), do not loop blindly.
+
+Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection proposals. Docker daemon unavailable, Docker image pull DNS/network timeout, package registry timeout, external service outage, missing non-mockable external credential, rate limit, port conflict, and managed verification jobs that are still running/pending are non-terminal stalled holds. Record concrete blocker details in `tasks.md` and use the runtime's stalled/blocker handoff artifacts; do not create `REJECTED.md` for these recoverable cases.
 
 1. Add a new section to `openspec/changes/<change-id>/tasks.md`:
    ```markdown
@@ -177,7 +179,7 @@ If apply determines the change is currently impossible to implement (for example
    - owner: <team_or_role>
    - decision_due: <YYYY-MM-DD>
    ```
-2. Create or update `openspec/changes/<change-id>/REJECTED.md` as an **apply-generated rejection proposal artifact** (not terminal by itself). Include at minimum:
+2. For terminal-invalid blockers only, create or update `openspec/changes/<change-id>/REJECTED.md` as an **apply-generated rejection proposal artifact** (not terminal by itself). Include at minimum:
    ```markdown
    # REJECTED
 
