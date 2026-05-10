@@ -28,6 +28,8 @@ TUI Logs Viewに表示されるすべてのログエントリーは、常にデ�
 
 ただし、scheduler loop 等から発生する同一状態・同一理由の診断ログは、user-visible TUI Logs View と debug log file のどちらでも連続して同一内容が大量表示されないよう、dedupe、rate-limit、または summary 化してよい（MAY）。この抑制は観測性のためだけに使われ、workflow-control input として使ってはならない（MUST NOT）。
 
+TUI Logs View は、依存未解決のまま進展しない queued change に対する repeated `AnalysisStarted` / `DependencyBlocked` event を受け取っても、同一状態の `Re-analyzing queued changes for dispatch` および `Change '<id>' blocked by dependencies` entries を無制限に追加してはならない（MUST NOT）。
+
 #### Scenario: repetitive scheduler diagnostics are bounded in TUI logs and debug files
 
 - **GIVEN** a scheduler diagnostic has the same change id, reason, and message across repeated loop iterations
@@ -36,6 +38,22 @@ TUI Logs Viewに表示されるすべてのログエントリーは、常にデ�
 - **AND** the debug log file does not show an unbounded sequence of identical WARN-level entries for the same scheduler diagnostic
 - **AND** the diagnostic remains available at least once or through a summary/rate-limited entry
 - **AND** suppression state is not used to decide scheduling, resume routing, acceptance, archive, or next-action behavior
+
+#### Scenario: dependency-blocked TUI logs are bounded while blocked state is unchanged
+
+- **GIVEN** queued change `alpha` has already been displayed as `blocked`
+- **AND** the TUI has already appended `Change 'alpha' blocked by dependencies`
+- **WHEN** repeated `DependencyBlocked` events for `alpha` arrive without an intervening dependency resolution or display-state change
+- **THEN** the TUI keeps `alpha` displayed as `blocked`
+- **AND** the TUI does not append additional identical blocked log entries for `alpha`
+- **AND** the suppression state is not used to decide scheduler dispatch, resume routing, acceptance, archive, or next-action behavior
+
+#### Scenario: analysis-started TUI logs are bounded while remaining work is unchanged
+
+- **GIVEN** the TUI has already appended `Re-analyzing queued changes for dispatch (remaining: 1)`
+- **WHEN** repeated `AnalysisStarted { remaining_changes: 1 }` events arrive without relevant progress or state reset
+- **THEN** the TUI does not append additional identical re-analysis log entries
+- **AND** a changed remaining count or meaningful progress/reset event can make a later analysis-started log visible again
 
 ### Requirement: REQ-OBS-002 Appropriate Log Level Classification
 

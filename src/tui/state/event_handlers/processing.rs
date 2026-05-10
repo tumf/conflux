@@ -8,6 +8,7 @@ use super::AppState;
 
 impl AppState {
     pub(crate) fn handle_processing_started(&mut self, id: String) {
+        self.reset_analysis_log_dedupe();
         self.current_change = Some(id.clone());
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_display_status_cache("applying");
@@ -18,6 +19,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_apply_started(&mut self, change_id: String, command: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
@@ -39,6 +41,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_archive_started(&mut self, id: String, command: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
@@ -66,6 +69,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_resolve_started(&mut self, change_id: String, command: String) {
+        self.reset_analysis_log_dedupe();
         self.is_resolving = true;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
@@ -88,6 +92,15 @@ impl AppState {
     }
 
     pub(crate) fn handle_analysis_started(&mut self, remaining_changes: usize) {
+        if self.last_logged_analysis_remaining == Some(remaining_changes) {
+            tracing::debug!(
+                remaining_changes = remaining_changes,
+                "Suppressing repeated analysis-started TUI log"
+            );
+            return;
+        }
+
+        self.last_logged_analysis_remaining = Some(remaining_changes);
         self.add_log(LogEntry::info(format!(
             "Re-analyzing queued changes for dispatch (remaining: {})",
             remaining_changes
@@ -95,6 +108,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_acceptance_started(&mut self, change_id: String, command: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());
@@ -149,6 +163,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_stopped(&mut self) {
+        self.reset_analysis_log_dedupe();
         self.mode = AppMode::Stopped;
         self.current_change = None;
         self.stop_mode = StopMode::None;
@@ -176,6 +191,7 @@ impl AppState {
         completed: u32,
         total: u32,
     ) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if total > 0 {
                 change.completed_tasks = completed;
@@ -199,6 +215,49 @@ mod tests {
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
         }
+    }
+
+    fn count_analysis_logs(app: &AppState, remaining_changes: usize) -> usize {
+        let message = format!(
+            "Re-analyzing queued changes for dispatch (remaining: {})",
+            remaining_changes
+        );
+        app.logs
+            .iter()
+            .filter(|entry| entry.message == message)
+            .count()
+    }
+
+    #[test]
+    fn repeated_analysis_started_with_same_remaining_count_logs_once() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_analysis_started(1);
+        app.handle_analysis_started(1);
+
+        assert_eq!(count_analysis_logs(&app, 1), 1);
+    }
+
+    #[test]
+    fn analysis_started_logs_again_when_remaining_count_changes() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_analysis_started(1);
+        app.handle_analysis_started(2);
+
+        assert_eq!(count_analysis_logs(&app, 1), 1);
+        assert_eq!(count_analysis_logs(&app, 2), 1);
+    }
+
+    #[test]
+    fn analysis_started_logs_again_after_progress_reset() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_analysis_started(1);
+        app.handle_progress_updated("change-a".to_string(), 1, 1);
+        app.handle_analysis_started(1);
+
+        assert_eq!(count_analysis_logs(&app, 1), 2);
     }
 
     #[test]
