@@ -1030,22 +1030,32 @@ impl OrchestratorState {
                 })
             }
             ReducerCommand::ResolveMerge(change_id) => {
-                let rt = self.runtime_entry(&change_id);
-                if !matches!(rt.wait_state, WaitState::MergeWait | WaitState::ResolveWait) {
-                    // TUI/manual resolve commands are already gated by the visible
-                    // `merge wait` row. If the shared reducer missed that local UI
-                    // milestone, accept the operator intent and record ResolveWait
-                    // rather than letting the next reducer sync regress the row to
-                    // `not queued`.
-                    if matches!(rt.activity, ActivityState::Idle)
-                        && matches!(rt.terminal, TerminalState::None)
-                    {
-                        rt.wait_state = WaitState::MergeWait;
-                    } else {
-                        return ReduceOutcome::NoOp;
+                {
+                    let rt = self.runtime_entry(&change_id);
+                    if !matches!(rt.wait_state, WaitState::MergeWait | WaitState::ResolveWait) {
+                        // TUI/manual resolve commands are already gated by a visible
+                        // `merge wait` row. In the observed stuck case the visible row
+                        // can be reconstructed from archive-complete workspace evidence
+                        // while the reducer still carries terminal Archived from an
+                        // earlier serial/archive observation. Treat explicit operator
+                        // retry for Archived as scheduler-owned merge retry intent, but
+                        // continue to reject permanent terminal states such as Merged or
+                        // Rejected so stale clicks cannot reintroduce resolve work.
+                        if matches!(rt.activity, ActivityState::Idle)
+                            && matches!(rt.terminal, TerminalState::None | TerminalState::Archived)
+                        {
+                            rt.terminal = TerminalState::None;
+                            rt.wait_state = WaitState::MergeWait;
+                        } else {
+                            return ReduceOutcome::NoOp;
+                        }
                     }
+                    rt.activity = ActivityState::Idle;
+                    rt.terminal = TerminalState::None;
+                    rt.wait_state = WaitState::ResolveWait;
+                    rt.queue_intent = QueueIntent::NotQueued;
+                    rt.clear_blocked_metadata();
                 }
-                rt.wait_state = WaitState::ResolveWait;
                 self.reject_wait_queue.retain(|id| id != &change_id);
                 if !self.resolve_wait_queue.contains(&change_id) {
                     self.resolve_wait_queue.push(change_id.clone());
@@ -2826,6 +2836,44 @@ mod tests {
             state.queued_change_ids().is_empty(),
             "explicit merge retry must use resolve-wait intent, not normal queue intent"
         );
+    }
+
+    #[test]
+    fn test_archived_manual_retry_becomes_scheduler_consumable_resolve_wait() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Serial);
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
+            "alpha".to_string(),
+        ));
+        assert_eq!(state.display_status("alpha"), "archived");
+
+        let outcome = state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+
+        assert!(
+            matches!(outcome, ReduceOutcome::Changed(_)),
+            "explicit manual retry for repository-visible archived merge-wait must not be dropped"
+        );
+        assert_eq!(state.display_status("alpha"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
+        assert!(state.queued_change_ids().is_empty());
+    }
+
+    #[test]
+    fn test_merged_manual_retry_remains_noop() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev-alpha".to_string(),
+        });
+
+        let outcome = state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+
+        assert!(matches!(outcome, ReduceOutcome::NoOp));
+        assert_eq!(state.display_status("alpha"), "merged");
+        assert!(state.resolve_wait_change_ids().is_empty());
     }
 
     #[test]

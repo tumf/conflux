@@ -4,7 +4,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
-use crate::orchestration::state::ReducerCommand;
+use crate::orchestration::state::{ReduceOutcome, ReducerCommand};
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use crate::tui::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use crate::tui::queue::DynamicQueue;
@@ -581,10 +581,19 @@ pub async fn handle_tui_command(
         }
         TuiCommand::ResolveMerge(id) => {
             // Apply reducer command first so shared state reflects scheduler-visible resolve intent.
-            shared_state
+            // A NoOp means reducer-owned retry intent was not accepted, so do not notify or
+            // start the scheduler as if display-only pending were real work.
+            let reduce_outcome = shared_state
                 .write()
                 .await
                 .apply_command(ReducerCommand::ResolveMerge(id.clone()));
+            if matches!(reduce_outcome, ReduceOutcome::NoOp) {
+                ctx.app.add_log(LogEntry::warn(format!(
+                    "Manual merge-wait retry intent for '{}' was not accepted by scheduler state",
+                    id
+                )));
+                return Ok(None);
+            }
 
             if ctx.orchestrator_running {
                 // Scheduler-owned execution model when scheduler is already alive:
@@ -884,6 +893,68 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("notified existing scheduler")));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_merge_noop_does_not_notify_or_log_scheduled() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["change-a".to_string()],
+            10,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        )));
+        {
+            let mut guard = shared_state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-a".to_string(),
+            });
+        }
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle = handle_tui_command(
+            TuiCommand::ResolveMerge("change-a".to_string()),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("resolve merge command should not fail");
+
+        assert!(handle.is_none());
+        assert!(orchestrator_cancel.is_none());
+        assert!(ctx.app.logs.iter().any(|entry| entry
+            .message
+            .contains("was not accepted by scheduler state")));
+        assert!(!ctx
+            .app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Scheduled merge-wait retry intent")));
+        assert!(shared_state
+            .read()
+            .await
+            .resolve_wait_change_ids()
+            .is_empty());
     }
 
     #[tokio::test]
