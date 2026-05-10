@@ -1801,9 +1801,9 @@ mod tests {
 
         let messages = handler.all();
         assert!(
-            messages.iter().any(|(_, m)| {
-                m.contains("on_start hook stderr") && m.contains("hello stderr")
-            }),
+            messages
+                .iter()
+                .any(|(_, m)| { m.contains("on_start hook stderr") && m.contains("hello stderr") }),
             "stderr output not found: {:?}",
             messages
         );
@@ -1816,7 +1816,9 @@ mod tests {
         );
         assert!(
             !messages.iter().any(|(level, m)| {
-                level == "stderr" && m.contains("on_start hook stderr") && m.contains("hello stderr")
+                level == "stderr"
+                    && m.contains("on_start hook stderr")
+                    && m.contains("hello stderr")
             }),
             "successful hook stderr must not be emitted as warning stderr: {:?}",
             messages
@@ -1885,9 +1887,7 @@ mod tests {
             .position(|entry| entry.message.contains("post_apply hook stderr"))
             .expect("expected captured stderr log entry");
         assert_eq!(entries[stderr_index].level, crate::events::LogLevel::Warn);
-        assert!(entries[stderr_index]
-            .message
-            .contains("failure diagnostic"));
+        assert!(entries[stderr_index].message.contains("failure diagnostic"));
         assert!(
             entries
                 .iter()
