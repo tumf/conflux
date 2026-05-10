@@ -1,7 +1,7 @@
 # Graph Report - /Users/tumf/work/conflux  (2026-05-11)
 
 ## Corpus Check
-- 235 files · ~1,448,719 words
+- 235 files · ~1,483,946 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -879,12 +879,12 @@ Nodes (1): Print detailed change information.
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `execute_acceptance_in_workspace()` connect `Community 1` to `Community 0`, `Community 2`, `Community 3`, `Community 5`, `Community 8`, `Community 11`, `Community 12`, `Community 18`?**
-  _High betweenness centrality (0.032) - this node is a cross-community bridge._
-- **Why does `main()` connect `Community 12` to `Community 0`, `Community 1`, `Community 4`, `Community 5`, `Community 6`, `Community 8`, `Community 10`, `Community 11`, `Community 13`, `Community 14`, `Community 15`, `Community 27`?**
-  _High betweenness centrality (0.028) - this node is a cross-community bridge._
 - **Why does `merge_spec_delta()` connect `Community 4` to `Community 0`, `Community 1`, `Community 7`, `Community 8`, `Community 13`, `Community 14`?**
-  _High betweenness centrality (0.026) - this node is a cross-community bridge._
+  _High betweenness centrality (0.037) - this node is a cross-community bridge._
+- **Why does `run_tui_loop()` connect `Community 10` to `Community 0`, `Community 1`, `Community 2`, `Community 3`, `Community 6`, `Community 7`, `Community 8`, `Community 12`, `Community 13`, `Community 15`, `Community 16`?**
+  _High betweenness centrality (0.035) - this node is a cross-community bridge._
+- **Why does `parse_findings()` connect `Community 18` to `Community 0`, `Community 1`, `Community 8`?**
+  _High betweenness centrality (0.032) - this node is a cross-community bridge._
 - **Are the 59 inferred relationships involving `execute_acceptance_in_workspace()` (e.g. with `.dispatch_change_to_workspace()` and `.is_cancelled()`) actually correct?**
   _`execute_acceptance_in_workspace()` has 59 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 57 inferred relationships involving `run_orchestrator()` (e.g. with `handle_start_processing_command()` and `.with_event_tx()`) actually correct?**
