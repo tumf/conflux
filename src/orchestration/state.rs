@@ -1915,20 +1915,28 @@ mod tests {
 
     #[test]
     fn test_lifecycle_display_distinguishes_rejected_stalled_blocked_and_error() {
-        let mut rejected = ChangeRuntimeState::default();
-        rejected.terminal = TerminalState::Rejected("terminal".to_string());
+        let rejected = ChangeRuntimeState {
+            terminal: TerminalState::Rejected("terminal".to_string()),
+            ..Default::default()
+        };
         assert_eq!(rejected.display_status(), "rejected");
 
-        let mut stalled = ChangeRuntimeState::default();
-        stalled.wait_state = WaitState::Stalled;
+        let stalled = ChangeRuntimeState {
+            wait_state: WaitState::Stalled,
+            ..Default::default()
+        };
         assert_eq!(stalled.display_status(), "stalled");
 
-        let mut dependency_blocked = ChangeRuntimeState::default();
-        dependency_blocked.wait_state = WaitState::DependencyBlocked;
+        let dependency_blocked = ChangeRuntimeState {
+            wait_state: WaitState::DependencyBlocked,
+            ..Default::default()
+        };
         assert_eq!(dependency_blocked.display_status(), "blocked");
 
-        let mut error = ChangeRuntimeState::default();
-        error.terminal = TerminalState::Error("repo-fixable failure".to_string());
+        let error = ChangeRuntimeState {
+            terminal: TerminalState::Error("repo-fixable failure".to_string()),
+            ..Default::default()
+        };
         assert_eq!(error.display_status(), "error");
     }
 
@@ -2294,10 +2302,7 @@ mod tests {
             ),
             ("Cannot connect to the Docker daemon", "infrastructure"),
             ("missing non-mockable external credential", "credential"),
-            (
-                "package registry timeout fetching crate",
-                "external_service",
-            ),
+            ("package registry timeout fetching crate", "infrastructure"),
             (
                 "agent-exec managed verification job still running",
                 "pending_verification",

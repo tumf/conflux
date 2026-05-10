@@ -226,17 +226,15 @@ fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
         || lower.contains("port conflict")
         || lower.contains("address already in use")
         || lower.contains("image")
+        || lower.contains("timeout")
     {
         "infrastructure"
-    } else if lower.contains("registry")
-        || lower.contains("external service")
+    } else if lower.contains("external service")
         || lower.contains("rate limit")
         || lower.contains("429")
         || lower.contains("service outage")
     {
         "external_service"
-    } else if lower.contains("timeout") {
-        "infrastructure"
     } else {
         "infrastructure"
     }
