@@ -7,6 +7,10 @@ use crate::tui::types::WorktreeInfo;
 
 use super::AppState;
 
+fn is_refresh_merge_wait_terminal_status(status: &str) -> bool {
+    matches!(status, "archived" | "merged" | "rejected")
+}
+
 impl AppState {
     pub(crate) fn handle_dependency_blocked(&mut self, change_id: String) {
         let was_already_blocked = self
@@ -56,12 +60,56 @@ impl AppState {
         worktree_change_ids: HashSet<String>,
         worktree_paths: HashMap<String, PathBuf>,
         _worktree_not_ahead_ids: HashSet<String>,
-        _merge_wait_ids: HashSet<String>,
+        merge_wait_ids: HashSet<String>,
     ) {
+        let terminal_merge_wait_statuses = self.terminal_merge_wait_statuses(&merge_wait_ids);
+
         self.worktree_paths = worktree_paths;
         self.update_changes(changes);
         self.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
         self.apply_worktree_status(&worktree_change_ids);
+        self.apply_refresh_merge_wait_status(&merge_wait_ids, &terminal_merge_wait_statuses);
+    }
+
+    fn terminal_merge_wait_statuses(
+        &self,
+        merge_wait_ids: &HashSet<String>,
+    ) -> HashMap<String, String> {
+        self.changes
+            .iter()
+            .filter(|change| {
+                merge_wait_ids.contains(&change.id)
+                    && is_refresh_merge_wait_terminal_status(&change.display_status_cache)
+            })
+            .map(|change| (change.id.clone(), change.display_status_cache.clone()))
+            .collect()
+    }
+
+    fn apply_refresh_merge_wait_status(
+        &mut self,
+        merge_wait_ids: &HashSet<String>,
+        terminal_merge_wait_statuses: &HashMap<String, String>,
+    ) {
+        if merge_wait_ids.is_empty() {
+            return;
+        }
+
+        for change in &mut self.changes {
+            if !merge_wait_ids.contains(&change.id) {
+                continue;
+            }
+
+            if let Some(terminal_status) = terminal_merge_wait_statuses.get(&change.id) {
+                change.set_display_status_cache(terminal_status);
+                continue;
+            }
+
+            if is_refresh_merge_wait_terminal_status(&change.display_status_cache) {
+                continue;
+            }
+
+            change.set_display_status_cache("merge wait");
+        }
     }
 
     pub(crate) fn handle_worktrees_refreshed(&mut self, worktrees: Vec<WorktreeInfo>) {
@@ -95,6 +143,70 @@ mod tests {
             .iter()
             .filter(|entry| entry.message == message)
             .count()
+    }
+
+    type RefreshSets = (
+        HashSet<String>,
+        HashSet<String>,
+        HashSet<String>,
+        HashMap<String, PathBuf>,
+        HashSet<String>,
+    );
+
+    fn empty_refresh_sets() -> RefreshSets {
+        (
+            HashSet::new(),
+            HashSet::new(),
+            HashSet::new(),
+            HashMap::new(),
+            HashSet::new(),
+        )
+    }
+
+    #[test]
+    fn merge_wait_refresh_corrects_stale_resolve_pending_row() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.changes[0].set_display_status_cache("resolve pending");
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![create_test_change("change-a")],
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from(["change-a".to_string()]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+    }
+
+    #[test]
+    fn merge_wait_refresh_preserves_terminal_rows() {
+        let mut app = AppState::new(vec![
+            create_test_change("merged-change"),
+            create_test_change("rejected-change"),
+        ]);
+        app.changes[0].set_display_status_cache("merged");
+        app.changes[1].set_display_status_cache("rejected");
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![
+                create_test_change("merged-change"),
+                create_test_change("rejected-change"),
+            ],
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from(["merged-change".to_string(), "rejected-change".to_string()]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert_eq!(app.changes[1].display_status_cache, "rejected");
     }
 
     #[test]
