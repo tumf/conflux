@@ -15,7 +15,7 @@ import os
 import re
 import subprocess
 import sys
-from collections import Counter, defaultdict
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +57,12 @@ class Hit:
 
 
 @dataclass
+class PendingHit:
+    hit: Hit
+    remaining_after: int
+
+
+@dataclass
 class Group:
     key: str
     level: str
@@ -66,11 +72,13 @@ class Group:
 
     def add(
         self, file: Path, line: int, text: str, context: list[str], max_examples: int
-    ) -> None:
+    ) -> bool:
         self.count += 1
         self.files.add(str(file))
         if len(self.examples) < max_examples:
             self.examples.append(Hit(str(file), line, text, context))
+            return True
+        return False
 
 
 def normalize(text: str) -> str:
@@ -97,17 +105,36 @@ def iter_log_files(log_root: Path, since_mtime: float) -> Iterable[Path]:
             continue
 
 
-def read_lines(path: Path) -> list[str]:
+def iter_lines(path: Path) -> Iterable[tuple[int, str]]:
     try:
-        return path.read_text(errors="replace").splitlines()
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                yield line_no, line.rstrip("\n\r")
     except OSError:
-        return []
+        return
 
 
-def context(lines: list[str], index: int, radius: int) -> list[str]:
-    start = max(0, index - radius)
-    end = min(len(lines), index + radius + 1)
-    return [f"{i + 1}: {lines[i][:1000]}" for i in range(start, end)]
+def append_after_context(pending_hits: list[PendingHit], context_line: str) -> None:
+    for pending in pending_hits:
+        if pending.remaining_after > 0:
+            pending.hit.context.append(context_line)
+            pending.remaining_after -= 1
+
+
+def retain_pending_hits(pending_hits: list[PendingHit]) -> list[PendingHit]:
+    return [pending for pending in pending_hits if pending.remaining_after > 0]
+
+
+def make_hit(
+    file: Path,
+    line_no: int,
+    text: str,
+    previous_context: Iterable[str],
+    context_line: str,
+    context_radius: int,
+) -> PendingHit:
+    hit = Hit(str(file), line_no, text[:1000], [*previous_context, context_line])
+    return PendingHit(hit=hit, remaining_after=context_radius)
 
 
 def classify(level: str, target: str, message: str) -> str:
@@ -137,33 +164,43 @@ def mine(
     total_lines = 0
 
     for path in iter_log_files(log_root, since_mtime):
-        lines = read_lines(path)
-        if not lines:
-            continue
-        files_seen.append(str(path))
-        total_lines += len(lines)
-        for idx, line in enumerate(lines):
-            line_no = idx + 1
+        file_seen = False
+        previous_context: deque[str] = deque(maxlen=context_radius)
+        pending_hits: list[PendingHit] = []
+
+        for line_no, line in iter_lines(path):
+            if not file_seen:
+                files_seen.append(str(path))
+                file_seen = True
+            total_lines += 1
+            context_line = f"{line_no}: {line[:1000]}"
+            append_after_context(pending_hits, context_line)
+            pending_hits = retain_pending_hits(pending_hits)
+
             manual = MANUAL_RE.search(line)
             action = ACTION_RE.search(line)
             if manual and len(manual_events) < max_examples * 10:
-                manual_events.append(
-                    Hit(
-                        str(path),
-                        line_no,
-                        line[:1000],
-                        context(lines, idx, context_radius),
-                    )
+                pending = make_hit(
+                    path,
+                    line_no,
+                    line,
+                    previous_context,
+                    context_line,
+                    context_radius,
                 )
+                manual_events.append(pending.hit)
+                pending_hits.append(pending)
             if action and len(action_events) < max_examples * 20:
-                action_events.append(
-                    Hit(
-                        str(path),
-                        line_no,
-                        line[:1000],
-                        context(lines, idx, context_radius),
-                    )
+                pending = make_hit(
+                    path,
+                    line_no,
+                    line,
+                    previous_context,
+                    context_line,
+                    context_radius,
                 )
+                action_events.append(pending.hit)
+                pending_hits.append(pending)
 
             match = LEVEL_RE.match(line)
             if match:
@@ -176,24 +213,44 @@ def mine(
                     if cls.startswith(("warn:", "error:"))
                     else cls
                 )
-                groups.setdefault(key, Group(key=key, level=level)).add(
+                pending = make_hit(
+                    path,
+                    line_no,
+                    line,
+                    previous_context,
+                    context_line,
+                    context_radius,
+                )
+                added_example = groups.setdefault(key, Group(key=key, level=level)).add(
                     path,
                     line_no,
                     line[:1000],
-                    context(lines, idx, context_radius),
+                    pending.hit.context,
                     max_examples,
                 )
-                continue
-
-            if ERROR_RE.search(line):
+                if added_example:
+                    pending_hits.append(pending)
+            elif ERROR_RE.search(line):
                 key = f"unstructured|{normalize(line)}"
-                groups.setdefault(key, Group(key=key, level="UNSTRUCTURED")).add(
+                pending = make_hit(
+                    path,
+                    line_no,
+                    line,
+                    previous_context,
+                    context_line,
+                    context_radius,
+                )
+                added_example = groups.setdefault(key, Group(key=key, level="UNSTRUCTURED")).add(
                     path,
                     line_no,
                     line[:1000],
-                    context(lines, idx, context_radius),
+                    pending.hit.context,
                     max_examples,
                 )
+                if added_example:
+                    pending_hits.append(pending)
+
+            previous_context.append(context_line)
 
     sorted_groups = sorted(groups.values(), key=lambda group: group.count, reverse=True)
     return {

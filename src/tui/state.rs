@@ -251,6 +251,10 @@ pub struct AppState {
     ///
     /// Runtime-only observability dedupe; it is not workflow-control state.
     last_merge_deferred_diagnostic: Option<MergeDeferredDiagnosticSignature>,
+    /// Last `AnalysisStarted` remaining count that produced a TUI log entry.
+    ///
+    /// Runtime-only observability dedupe; it is not workflow-control state.
+    last_logged_analysis_remaining: Option<usize>,
 }
 
 // ============================================================================
@@ -415,6 +419,7 @@ impl AppState {
             resolve_queue_set: HashSet::new(),
             logs_panel_enabled: true, // Default: logs panel visible
             last_merge_deferred_diagnostic: None,
+            last_logged_analysis_remaining: None,
         }
     }
 
@@ -970,6 +975,11 @@ impl AppState {
         self.error_change_id = None;
         self.orchestration_started_at = Some(Instant::now());
         self.orchestration_elapsed = None;
+        self.reset_analysis_log_dedupe();
+    }
+
+    pub(crate) fn reset_analysis_log_dedupe(&mut self) {
+        self.last_logged_analysis_remaining = None;
     }
 
     /// Start processing selected changes

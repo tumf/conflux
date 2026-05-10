@@ -103,6 +103,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_change_rejected(&mut self, change_id: String, reason: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self
             .changes
             .iter_mut()
@@ -123,6 +124,7 @@ impl AppState {
         change_ids: Vec<String>,
         reason: String,
     ) {
+        self.reset_analysis_log_dedupe();
         let mut reset_ids = Vec::new();
         for change in &mut self.changes {
             if change_ids.contains(&change.id)
@@ -155,6 +157,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_error(&mut self, message: String) {
+        self.reset_analysis_log_dedupe();
         self.add_log(LogEntry::error(message.clone()));
         self.mode = crate::tui::types::AppMode::Error;
         self.error_change_id = None;
