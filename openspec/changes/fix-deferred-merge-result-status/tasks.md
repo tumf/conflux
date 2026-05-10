@@ -11,3 +11,6 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-deferred-merge-result-status --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] コミット経路の pre-commit hook が失敗します。実リポジトリの `.git/hooks/pre-commit` は `prek hook-impl` を実行し、`.pre-commit-config.yaml:23-28` の local `clippy` hook は `cargo clippy --locked --all-targets --all-features -- -D warnings` を必ず実行します。この実コマンドを `agent-exec run -- cargo clippy --locked --all-targets --all-features -- -D warnings` で確認したところ exit_code=101 で失敗しました。具体的には `src/parallel/merge.rs:433`, `src/parallel/merge.rs:474`, `src/parallel/merge.rs:489`, `src/parallel/merge.rs:498` の needless `return` が `-D warnings` によりエラー化しています。archive commit 前に該当 `return` を clippy 提案どおり式返却へ直し、`cargo fmt --check` と clippy hook 相当を再実行してください。

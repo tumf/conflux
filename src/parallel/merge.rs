@@ -430,7 +430,7 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
-                    return Ok(MergeTaskOutcome::Merged);
+                    Ok(MergeTaskOutcome::Merged)
                 }
                 Ok(MergeAttempt::Deferred(deferred)) => {
                     let reason = deferred.reason.clone();
@@ -471,7 +471,7 @@ impl ParallelExecutor {
                         },
                     )
                     .await;
-                    return Ok(MergeTaskOutcome::deferred(reason, auto_resumable));
+                    Ok(MergeTaskOutcome::deferred(reason, auto_resumable))
                 }
                 Err(e) => {
                     let error_msg = format!(
@@ -486,7 +486,7 @@ impl ParallelExecutor {
                         },
                     )
                     .await;
-                    return Err(OrchestratorError::GitCommand(error_msg));
+                    Err(OrchestratorError::GitCommand(error_msg))
                 }
             }
         } else {
@@ -495,7 +495,7 @@ impl ParallelExecutor {
                 workspace_result.workspace_name
             );
             tracing::warn!("{}", reason);
-            return Ok(MergeTaskOutcome::deferred(reason, false));
+            Ok(MergeTaskOutcome::deferred(reason, false))
         }
     }
 
