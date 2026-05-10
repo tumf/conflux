@@ -24,6 +24,17 @@ fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> Stri
     )
 }
 
+fn archive_completion_verification_root<'a>(
+    repo_root: &'a Path,
+    archive_path: &'a Path,
+) -> &'a Path {
+    if archive_path.exists() {
+        archive_path
+    } else {
+        repo_root
+    }
+}
+
 /// Check if the base branch is dirty (has uncommitted changes or merge in progress).
 ///
 /// Returns `Ok(None)` if the base branch is clean, or `Ok(Some(reason))` with a description
@@ -517,8 +528,25 @@ impl ParallelExecutor {
         // the stale path may see the archived worktree as dirty/incomplete even though
         // the archive evidence is already integrated into base. In that case base git
         // state is authoritative and the duplicate task is idempotent success.
+        //
+        // Also, the archive worktree can be cleaned up before a deferred retry runs, so
+        // never invoke `git status` from a missing archive path. Use the workspace-local
+        // archive path only while it exists; otherwise fall back to the stable base
+        // repository root for repository-visible evidence.
         for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
-            let status = match is_archive_commit_complete(change_id, Some(archive_path)).await {
+            let verification_root =
+                archive_completion_verification_root(&self.repo_root, archive_path.as_path());
+            if verification_root == self.repo_root.as_path() && !archive_path.exists() {
+                tracing::warn!(
+                    change_id = %change_id,
+                    stale_archive_path = %archive_path.display(),
+                    repo_root = %self.repo_root.display(),
+                    "Archive verification path is stale; using stable repository root"
+                );
+            }
+
+            let status = match is_archive_commit_complete(change_id, Some(verification_root)).await
+            {
                 Ok(true) => ArchiveVerificationStatus::Complete,
                 Ok(false) => ArchiveVerificationStatus::Incomplete,
                 Err(error) => ArchiveVerificationStatus::Failed(error.to_string()),
@@ -1010,9 +1038,11 @@ pub async fn resolve_deferred_merge(
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_verification_outcome, ArchiveVerificationStatus, DeferredMerge, MergeAttempt,
+        archive_completion_verification_root, archive_verification_outcome,
+        ArchiveVerificationStatus, DeferredMerge, MergeAttempt,
     };
     use std::path::Path;
+    use tempfile::TempDir;
 
     #[test]
     fn test_archive_incomplete_after_base_integration_is_idempotent_merged() {
@@ -1149,5 +1179,25 @@ mod tests {
         let deferred = DeferredMerge::manual("Working tree has uncommitted changes");
         assert!(!deferred.auto_resumable);
         assert_eq!(deferred.reason, "Working tree has uncommitted changes");
+    }
+
+    #[test]
+    fn archive_verification_root_falls_back_to_repo_root_for_deleted_archive_path() {
+        let repo_root = TempDir::new().expect("repo tempdir");
+        let missing_archive_path = repo_root.path().join("deleted-worktree");
+
+        let root = archive_completion_verification_root(repo_root.path(), &missing_archive_path);
+
+        assert_eq!(root, repo_root.path());
+    }
+
+    #[test]
+    fn archive_verification_root_uses_existing_archive_path() {
+        let repo_root = TempDir::new().expect("repo tempdir");
+        let archive_path = TempDir::new().expect("archive tempdir");
+
+        let root = archive_completion_verification_root(repo_root.path(), archive_path.path());
+
+        assert_eq!(root, archive_path.path());
     }
 }

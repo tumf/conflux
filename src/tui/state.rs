@@ -20,6 +20,13 @@ use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInf
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet, VecDeque};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeDeferredDiagnosticSignature {
+    change_id: String,
+    reason: String,
+    auto_resumable: bool,
+}
 use std::path::PathBuf;
 
 use std::time::{Duration, Instant};
@@ -240,6 +247,10 @@ pub struct AppState {
     pub resolve_queue_set: HashSet<String>,
     /// Whether the log panel is visible in Changes view
     pub logs_panel_enabled: bool,
+    /// Last merge-deferred diagnostic shown in the TUI.
+    ///
+    /// Runtime-only observability dedupe; it is not workflow-control state.
+    last_merge_deferred_diagnostic: Option<MergeDeferredDiagnosticSignature>,
 }
 
 // ============================================================================
@@ -403,6 +414,7 @@ impl AppState {
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
             logs_panel_enabled: true, // Default: logs panel visible
+            last_merge_deferred_diagnostic: None,
         }
     }
 

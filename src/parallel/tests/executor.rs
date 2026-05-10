@@ -4271,6 +4271,35 @@ async fn test_resumed_merged_leftover_worktree_does_not_emit_apply_or_acceptance
     );
 }
 
+#[test]
+fn test_stale_retry_reason_detects_deleted_workspace_path() {
+    let temp_dir = TempDir::new().or_fail("create temp dir");
+    let workspace_path = temp_dir.path().join("deleted-worktree");
+    let workspace = WorkspaceInfo {
+        path: workspace_path.clone(),
+        change_id: "alpha".to_string(),
+        workspace_name: "ws-alpha".to_string(),
+        last_modified: std::time::SystemTime::now(),
+    };
+
+    let reason = ParallelExecutor::stale_retry_reason(&workspace).or_fail("stale reason");
+
+    assert!(reason.contains(&workspace_path.display().to_string()));
+}
+
+#[test]
+fn test_stale_retry_reason_allows_existing_workspace_path() {
+    let temp_dir = TempDir::new().or_fail("create temp dir");
+    let workspace = WorkspaceInfo {
+        path: temp_dir.path().to_path_buf(),
+        change_id: "alpha".to_string(),
+        workspace_name: "ws-alpha".to_string(),
+        last_modified: std::time::SystemTime::now(),
+    };
+
+    assert!(ParallelExecutor::stale_retry_reason(&workspace).is_none());
+}
+
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {

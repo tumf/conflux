@@ -729,6 +729,17 @@ impl ParallelExecutor {
         self.retry_deferred_merges_for(deferred).await;
     }
 
+    pub(super) fn stale_retry_reason(workspace_info: &crate::vcs::WorkspaceInfo) -> Option<String> {
+        if workspace_info.path.exists() {
+            return None;
+        }
+
+        Some(format!(
+            "workspace path '{}' no longer exists",
+            workspace_info.path.display()
+        ))
+    }
+
     async fn retry_deferred_merges_for(&mut self, deferred: Vec<String>) {
         for change_id in deferred {
             if self.is_change_already_merged_to_base(&change_id).await {
@@ -758,7 +769,7 @@ impl ParallelExecutor {
                 Ok(Some(ws)) => ws,
                 Ok(None) => {
                     warn!(
-                        "No workspace found for deferred change '{}', skipping retry",
+                        "No workspace found for deferred change '{}', clearing stale retry intent",
                         change_id
                     );
                     // Remove from deferred set; the workspace is gone, nothing to retry.
@@ -773,6 +784,18 @@ impl ParallelExecutor {
                     continue;
                 }
             };
+
+            if let Some(stale_reason) = Self::stale_retry_reason(&workspace_info) {
+                warn!(
+                    change_id = %change_id,
+                    workspace = %workspace_info.workspace_name,
+                    workspace_path = %workspace_info.path.display(),
+                    stale_reason = %stale_reason,
+                    "Deferred merge retry workspace path is stale; clearing retry intent"
+                );
+                self.clear_resolve_wait_intent_for_success(&change_id).await;
+                continue;
+            }
 
             info!(
                 "Retrying deferred merge for '{}' (workspace: {})",

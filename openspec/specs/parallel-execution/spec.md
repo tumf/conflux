@@ -6,53 +6,36 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 
 ### Requirement: Shared Parallel Orchestration Service
 
-システムはCLIとTUIの並列実行を扱う統一的な`ParallelRunService`を提供しなければならない（SHALL）。
+Parallel merge retry dispatch SHALL handle stale or deleted retry worktree paths without running merge-readiness `git status` commands in missing directories. Archive-completion verification used for base merge readiness MUST use an existing repository root or fail before command execution with a bounded stale-retry outcome.
 
-サービスはイベント通知のためのコールバック機構を受け取り、TUIへ送るイベントは共有状態の更新より先に送信しなければならない（MUST）。これによりUI更新が共有状態のロック待ちで遅延しない。
+When a deferred merge retry no longer has a valid worktree path, the scheduler MUST derive the next action from repository-visible evidence: already merged changes are treated as completed, valid archived changes may be retried from an existing root, and changes with no valid retry evidence have retry intent cleared or suppressed with a single diagnostic.
 
-サービスは以下をカプセル化すること：
+#### Scenario: deleted deferred worktree does not run git status in missing cwd
 
-- Git availability checking
-- Change grouping by dependencies
-- ParallelExecutor coordination
-- Archiving of completed changes
+- **GIVEN** change `alpha` is in reducer-owned `ResolveWait`
+- **AND** the scheduler's discovered retry worktree path for `alpha` has been deleted
+- **WHEN** deferred merge retry dispatch evaluates `alpha`
+- **THEN** the scheduler SHALL NOT run `git status --porcelain` with cwd set to the deleted worktree path
+- **AND** the retry outcome SHALL be derived from existing repository/base evidence
+- **AND** the operator SHALL NOT see repeated `No such file or directory` merge-deferred warnings for the same stale path
 
-ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
+#### Scenario: legitimate dirty base remains manual merge wait
 
-When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
+- **GIVEN** change `alpha` has archived successfully
+- **AND** the base repository root exists
+- **AND** the base repository has uncommitted changes or an unresolved merge blocker before `alpha` can merge
+- **WHEN** merge readiness is evaluated
+- **THEN** the scheduler SHALL emit a manual `MergeDeferred(auto_resumable=false)` outcome
+- **AND** `alpha` SHALL remain visible as `MergeWait`
+- **AND** the diagnostic SHALL describe the actionable base blocker rather than a stale missing worktree
 
-The loop-based frontend startup path SHALL preserve reducer-owned `ResolveWait` before calling into `ParallelRunService`; otherwise the service cannot distinguish an intentional empty retry run from a true no-op.
+#### Scenario: stale retry converges after base integration
 
-#### Scenario: empty active changes with resolve wait enters scheduler retry
-
-**Given**: `ParallelRunService` is invoked with an empty active change list from a loop-based frontend
-**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
-**When**: parallel run startup evaluates committed active changes
-**Then**: the service does not return solely because the active change list is empty
-**And**: the executor synchronizes `ResolveWait` from shared state
-**And**: scheduler-owned merge retry dispatch is attempted for `alpha`
-
-#### Scenario: frontend preserves resolve wait before service invocation
-
-**Given**: a loop-based frontend is about to invoke `ParallelRunService` with an empty active change list for manual resolve
-**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
-**When**: the frontend performs run startup initialization
-**Then**: it preserves the shared reducer state containing `alpha`
-**And**: `ParallelRunService` receives an executor whose `has_resolve_wait()` returns true
-
-#### Scenario: normal committed-change filtering still applies to active changes
-
-**Given**: `ParallelRunService` is invoked with active changes to apply
-**When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
-**Then**: that active change is skipped with the existing warning/rejection events
-**And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
-
-#### Scenario: true empty run remains no-op
-
-**Given**: `ParallelRunService` is invoked with an empty active change list
-**And**: the shared orchestrator state has no `ResolveWait` work
-**When**: startup evaluates work availability
-**Then**: the service returns without dispatching apply, merge retry, or resolve work
+- **GIVEN** change `alpha` has already been integrated into the base branch
+- **AND** a stale `ResolveWait` retry still references a deleted worktree path
+- **WHEN** deferred merge retry dispatch evaluates `alpha`
+- **THEN** the scheduler SHALL treat the retry as complete or stale-successful based on base evidence
+- **AND** `alpha` SHALL NOT remain in an endless resolve-wait retry loop
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1478,53 +1461,36 @@ Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The abse
 
 ### Requirement: Shared Parallel Orchestration Service
 
-システムはCLIとTUIの並列実行を扱う統一的な`ParallelRunService`を提供しなければならない（SHALL）。
+Parallel merge retry dispatch SHALL handle stale or deleted retry worktree paths without running merge-readiness `git status` commands in missing directories. Archive-completion verification used for base merge readiness MUST use an existing repository root or fail before command execution with a bounded stale-retry outcome.
 
-サービスはイベント通知のためのコールバック機構を受け取り、TUIへ送るイベントは共有状態の更新より先に送信しなければならない（MUST）。これによりUI更新が共有状態のロック待ちで遅延しない。
+When a deferred merge retry no longer has a valid worktree path, the scheduler MUST derive the next action from repository-visible evidence: already merged changes are treated as completed, valid archived changes may be retried from an existing root, and changes with no valid retry evidence have retry intent cleared or suppressed with a single diagnostic.
 
-サービスは以下をカプセル化すること：
+#### Scenario: deleted deferred worktree does not run git status in missing cwd
 
-- Git availability checking
-- Change grouping by dependencies
-- ParallelExecutor coordination
-- Archiving of completed changes
+- **GIVEN** change `alpha` is in reducer-owned `ResolveWait`
+- **AND** the scheduler's discovered retry worktree path for `alpha` has been deleted
+- **WHEN** deferred merge retry dispatch evaluates `alpha`
+- **THEN** the scheduler SHALL NOT run `git status --porcelain` with cwd set to the deleted worktree path
+- **AND** the retry outcome SHALL be derived from existing repository/base evidence
+- **AND** the operator SHALL NOT see repeated `No such file or directory` merge-deferred warnings for the same stale path
 
-ParallelRunService は、コミットツリーに存在しない change の除外と警告通知を CLI/TUI のどちらの経路でも同一ロジックで実行しなければならない（SHALL）。
+#### Scenario: legitimate dirty base remains manual merge wait
 
-When invoked by a loop-based frontend with no active changes but with reducer-owned `ResolveWait` work, `ParallelRunService` SHALL start scheduler-owned retry processing instead of returning before the executor can synchronize reducer state.
+- **GIVEN** change `alpha` has archived successfully
+- **AND** the base repository root exists
+- **AND** the base repository has uncommitted changes or an unresolved merge blocker before `alpha` can merge
+- **WHEN** merge readiness is evaluated
+- **THEN** the scheduler SHALL emit a manual `MergeDeferred(auto_resumable=false)` outcome
+- **AND** `alpha` SHALL remain visible as `MergeWait`
+- **AND** the diagnostic SHALL describe the actionable base blocker rather than a stale missing worktree
 
-The loop-based frontend startup path SHALL preserve reducer-owned `ResolveWait` before calling into `ParallelRunService`; otherwise the service cannot distinguish an intentional empty retry run from a true no-op.
+#### Scenario: stale retry converges after base integration
 
-#### Scenario: empty active changes with resolve wait enters scheduler retry
-
-**Given**: `ParallelRunService` is invoked with an empty active change list from a loop-based frontend
-**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
-**When**: parallel run startup evaluates committed active changes
-**Then**: the service does not return solely because the active change list is empty
-**And**: the executor synchronizes `ResolveWait` from shared state
-**And**: scheduler-owned merge retry dispatch is attempted for `alpha`
-
-#### Scenario: frontend preserves resolve wait before service invocation
-
-**Given**: a loop-based frontend is about to invoke `ParallelRunService` with an empty active change list for manual resolve
-**And**: the shared orchestrator state contains change `alpha` in `ResolveWait`
-**When**: the frontend performs run startup initialization
-**Then**: it preserves the shared reducer state containing `alpha`
-**And**: `ParallelRunService` receives an executor whose `has_resolve_wait()` returns true
-
-#### Scenario: normal committed-change filtering still applies to active changes
-
-**Given**: `ParallelRunService` is invoked with active changes to apply
-**When**: one active change is not present in the HEAD commit tree or has uncommitted files under `openspec/changes/<change_id>/`
-**Then**: that active change is skipped with the existing warning/rejection events
-**And**: this filtering does not suppress separate reducer-owned `ResolveWait` retry work when such work exists
-
-#### Scenario: true empty run remains no-op
-
-**Given**: `ParallelRunService` is invoked with an empty active change list
-**And**: the shared orchestrator state has no `ResolveWait` work
-**When**: startup evaluates work availability
-**Then**: the service returns without dispatching apply, merge retry, or resolve work
+- **GIVEN** change `alpha` has already been integrated into the base branch
+- **AND** a stale `ResolveWait` retry still references a deleted worktree path
+- **WHEN** deferred merge retry dispatch evaluates `alpha`
+- **THEN** the scheduler SHALL treat the retry as complete or stale-successful based on base evidence
+- **AND** `alpha` SHALL NOT remain in an endless resolve-wait retry loop
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
