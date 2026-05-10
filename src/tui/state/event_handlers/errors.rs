@@ -4,6 +4,7 @@ use crate::tui::state::{AppState, MergeDeferredDiagnosticSignature};
 
 impl AppState {
     pub(crate) fn handle_processing_error(&mut self, id: String, error: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_error_message_cache(error.clone());
             change.selected = false;
@@ -17,6 +18,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_apply_failed(&mut self, change_id: String, error: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
             change.selected = false;
@@ -31,6 +33,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_archive_failed(&mut self, change_id: String, error: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(error.clone());
             change.selected = false;
@@ -45,6 +48,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_resolve_failed(&mut self, change_id: String, error: String) {
+        self.reset_analysis_log_dedupe();
         self.is_resolving = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.display_status_cache == "merged" {
@@ -79,6 +83,7 @@ impl AppState {
         hook_type: String,
         error: String,
     ) {
+        self.reset_analysis_log_dedupe();
         if hook_type == "on_merged" {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 if change.display_status_cache != "merged" {

@@ -8,6 +8,7 @@ use super::AppState;
 
 impl AppState {
     pub(crate) fn handle_processing_completed(&mut self, id: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             change.set_display_status_cache("archiving");
             if let Ok(progress) = task_parser::parse_change(&id) {
@@ -19,6 +20,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_all_completed(&mut self) {
+        self.reset_analysis_log_dedupe();
         if matches!(self.mode, AppMode::Stopped | AppMode::Error) {
             if let Some(started) = self.orchestration_started_at {
                 self.orchestration_elapsed = Some(started.elapsed());
@@ -42,6 +44,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_change_archived(&mut self, id: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
             if !matches!(change.display_status_cache.as_str(), "merged" | "resolving") {
                 change.set_display_status_cache("archived");
@@ -65,6 +68,7 @@ impl AppState {
         change_id: String,
         worktree_change_ids: Option<HashSet<String>>,
     ) -> Option<TuiCommand> {
+        self.reset_analysis_log_dedupe();
         self.is_resolving = false;
         let mut already_merged = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
@@ -109,6 +113,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_merge_completed(&mut self, change_id: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("merged");
             if let Some(started) = change.started_at {
@@ -152,6 +157,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_acceptance_completed(&mut self, change_id: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("archiving");
         }
@@ -162,6 +168,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_change_skipped(&mut self, change_id: String, reason: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(reason.clone());
             change.selected = false;
@@ -187,6 +194,7 @@ impl AppState {
     }
 
     pub(crate) fn handle_change_stopped(&mut self, change_id: String) {
+        self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("not queued");
             change.selected = false;
