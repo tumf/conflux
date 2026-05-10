@@ -447,6 +447,48 @@ async fn test_dependency_blocker_archived_unblocks_dispatch_after_terminal_marke
     assert!(executor.force_recreate_worktree.contains("dependent"));
 }
 
+#[tokio::test]
+async fn test_queue_reconciliation_skips_archived_dirty_candidate_when_post_archive_merge_active() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    init_git_repo(temp.path()).await;
+
+    let workspace_path = temp.path().join("worktrees/ws-gamma");
+    std::fs::create_dir_all(&workspace_path).or_fail("unexpected error");
+    let worktree_changes_dir = workspace_path.join("openspec/changes");
+    std::fs::create_dir_all(worktree_changes_dir.join("archive/2026-05-10-gamma"))
+        .or_fail("unexpected error");
+    std::fs::write(
+        worktree_changes_dir.join("archive/2026-05-10-gamma/proposal.md"),
+        "# Gamma\n",
+    )
+    .or_fail("unexpected error");
+
+    let merge_calls = Arc::new(AtomicUsize::new(0));
+    let manager = TestWorkspaceManager::new(merge_calls)
+        .with_existing_workspace("gamma", workspace_path.clone());
+    let mut executor = ParallelExecutor::new(temp.path().to_path_buf(), create_test_config(), None);
+    executor.workspace_manager = Box::new(manager);
+    executor.set_shared_orchestrator_state(Arc::new(tokio::sync::RwLock::new(
+        crate::orchestration::state::OrchestratorState::with_mode(
+            vec!["gamma".to_string()],
+            0,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        ),
+    )));
+
+    let _active_merge_guard =
+        crate::parallel::merge::ActivePostArchiveMergeGuard::force_register_for_test("gamma");
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+
+    let outcome = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(outcome.total_added(), 0);
+    assert!(queued.is_empty());
+}
+
 #[test]
 fn test_skip_reason_for_merge_deferred_dependency() {
     let merge_calls = Arc::new(AtomicUsize::new(0));

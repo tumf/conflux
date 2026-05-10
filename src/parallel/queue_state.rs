@@ -280,41 +280,6 @@ impl ParallelExecutor {
         }
     }
 
-    async fn is_change_already_merged_to_base(&self, change_id: &str) -> bool {
-        let original_branch = match self
-            .workspace_manager
-            .ensure_original_branch_initialized()
-            .await
-        {
-            Ok(branch) => branch,
-            Err(error) => {
-                warn!(
-                    "Failed to determine base branch before stale deferred retry check for '{}': {}",
-                    change_id, error
-                );
-                return false;
-            }
-        };
-
-        match crate::execution::state::is_merged_to_base(
-            change_id,
-            &self.repo_root,
-            &original_branch,
-        )
-        .await
-        {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(error) => {
-                warn!(
-                    "Failed to check whether deferred retry '{}' is already merged to base: {}",
-                    change_id, error
-                );
-                false
-            }
-        }
-    }
-
     /// Calculate available execution slots accounting for in-flight changes and resolves.
     ///
     /// # Arguments
@@ -630,6 +595,29 @@ impl ParallelExecutor {
         tokio::spawn(async move {
             let change_id = workspace_result.change_id.clone();
             let workspace_name = workspace_result.workspace_name.clone();
+            let Some(_active_merge_guard) =
+                super::merge::ActivePostArchiveMergeGuard::acquire(change_id.clone())
+            else {
+                info!(
+                    change_id = %change_id,
+                    workspace = %workspace_name,
+                    "Skipping duplicate post-archive merge task because the same change is already active"
+                );
+                if let Err(send_error) = merge_result_tx
+                    .send(MergeResult {
+                        change_id,
+                        workspace_name,
+                        outcome: Ok(()),
+                    })
+                    .await
+                {
+                    warn!(
+                        "Failed to send duplicate merge suppression result to scheduler loop: {}",
+                        send_error
+                    );
+                }
+                return;
+            };
             let outcome = merge_executor
                 .handle_merge_and_cleanup(workspace_result)
                 .await
@@ -1368,6 +1356,7 @@ impl ParallelExecutor {
                     if queued_intent_ids.iter().any(|id| id == &worktree_change_id)
                         || in_flight.contains(&worktree_change_id)
                         || reducer_active_set.contains(&worktree_change_id)
+                        || Self::is_post_archive_merge_active_for(&worktree_change_id)
                     {
                         continue;
                     }
@@ -1466,6 +1455,15 @@ impl ParallelExecutor {
                     QueueReconciliationDiagnosticLevel::Info,
                     &queued_id,
                     "already_active",
+                )
+                .await;
+                continue;
+            }
+            if Self::is_post_archive_merge_active_for(&queued_id) {
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    &queued_id,
+                    "post_archive_merge_active",
                 )
                 .await;
                 continue;
