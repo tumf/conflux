@@ -700,7 +700,13 @@ impl HookRunner {
     }
 
     /// Emit captured output (stdout/stderr) to configured log sinks.
-    async fn emit_hook_output(&self, hook_type: HookType, stdout: &str, stderr: &str) {
+    async fn emit_hook_output(
+        &self,
+        hook_type: HookType,
+        stdout: &str,
+        stderr: &str,
+        hook_succeeded: bool,
+    ) {
         if !stdout.is_empty() {
             let (display, was_truncated) = truncate_hook_output(stdout, HOOK_OUTPUT_TRUNCATE_BYTES);
             let mut msg = format!("{} hook stdout: {}", hook_type, display);
@@ -729,13 +735,25 @@ impl HookRunner {
                     stderr.len() - HOOK_OUTPUT_TRUNCATE_BYTES
                 ));
             }
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx
-                    .send(ExecutionEvent::Log(LogEntry::warn(msg.clone())))
-                    .await;
-            }
-            if let Some(ref handler) = self.output_handler {
-                handler.on_stderr(&msg);
+
+            if hook_succeeded {
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx
+                        .send(ExecutionEvent::Log(LogEntry::info(msg.clone())))
+                        .await;
+                }
+                if let Some(ref handler) = self.output_handler {
+                    handler.on_info(&msg);
+                }
+            } else {
+                if let Some(ref tx) = self.event_tx {
+                    let _ = tx
+                        .send(ExecutionEvent::Log(LogEntry::warn(msg.clone())))
+                        .await;
+                }
+                if let Some(ref handler) = self.output_handler {
+                    handler.on_stderr(&msg);
+                }
             }
         }
     }
@@ -801,7 +819,8 @@ impl HookRunner {
                 .await
             {
                 Ok((success, stdout, stderr)) => {
-                    self.emit_hook_output(hook_type, &stdout, &stderr).await;
+                    self.emit_hook_output(hook_type, &stdout, &stderr, success)
+                        .await;
 
                     if success {
                         info!("{} hook completed successfully", hook_type);
@@ -1609,8 +1628,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_hook_output_captured_and_logged() {
-        use tokio::sync::mpsc;
-
         let json = r#"{"on_start": "echo 'Hello from hook'"}"#;
         let config: HooksConfig = serde_json::from_str(json).unwrap();
 
@@ -1782,13 +1799,103 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let content = handler.content();
+        let messages = handler.all();
         assert!(
-            content
-                .iter()
-                .any(|m| m.contains("on_start hook stderr") && m.contains("hello stderr")),
+            messages.iter().any(|(_, m)| {
+                m.contains("on_start hook stderr") && m.contains("hello stderr")
+            }),
             "stderr output not found: {:?}",
-            content
+            messages
+        );
+        assert!(
+            messages.iter().any(|(level, m)| {
+                level == "info" && m.contains("on_start hook stderr") && m.contains("hello stderr")
+            }),
+            "successful hook stderr should be informational: {:?}",
+            messages
+        );
+        assert!(
+            !messages.iter().any(|(level, m)| {
+                level == "stderr" && m.contains("on_start hook stderr") && m.contains("hello stderr")
+            }),
+            "successful hook stderr must not be emitted as warning stderr: {:?}",
+            messages
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hook_successful_stderr_event_log_is_info_not_warn() {
+        let json = r#"{"pre_apply": "echo 'hook diagnostic' >&2"}"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let runner = HookRunner::with_event_tx(config, ".", tx);
+
+        let result = runner
+            .run_hook(HookType::PreApply, &HookContext::default())
+            .await;
+        assert!(result.is_ok());
+
+        let mut entries = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::Log(entry) = event {
+                entries.push(entry);
+            }
+        }
+
+        let stderr_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.message.contains("pre_apply hook stderr"))
+            .collect();
+        assert_eq!(
+            stderr_entries.len(),
+            1,
+            "expected exactly one stderr log entry: {:?}",
+            entries
+        );
+        assert_eq!(stderr_entries[0].level, crate::events::LogLevel::Info);
+        assert!(stderr_entries[0].message.contains("hook diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn test_hook_failure_stderr_event_log_remains_warn_before_error() {
+        let json = r#"{
+            "post_apply": {
+                "command": "echo 'failure diagnostic' >&2; exit 1",
+                "continue_on_failure": false
+            }
+        }"#;
+        let config: HooksConfig = serde_json::from_str(json).unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+        let runner = HookRunner::with_event_tx(config, ".", tx);
+
+        let result = runner
+            .run_hook(HookType::PostApply, &HookContext::default())
+            .await;
+        assert!(result.is_err());
+
+        let mut entries = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::Log(entry) = event {
+                entries.push(entry);
+            }
+        }
+
+        let stderr_index = entries
+            .iter()
+            .position(|entry| entry.message.contains("post_apply hook stderr"))
+            .expect("expected captured stderr log entry");
+        assert_eq!(entries[stderr_index].level, crate::events::LogLevel::Warn);
+        assert!(entries[stderr_index]
+            .message
+            .contains("failure diagnostic"));
+        assert!(
+            entries
+                .iter()
+                .skip(stderr_index + 1)
+                .any(|entry| entry.level == crate::events::LogLevel::Error
+                    && entry.message.contains("post_apply hook failed")),
+            "expected hook failure error after stderr warning: {:?}",
+            entries
         );
     }
 
