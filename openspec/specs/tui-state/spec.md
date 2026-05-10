@@ -2,9 +2,11 @@
 
 TUI の Change ステータス表示（文字列・色）は `ChangeRuntimeState::display_status()` および `display_color()` から導出されなければならない（MUST）。
 
-TUI 固有のステータス enum（旧 `QueueStatus`）を保持してはならない（SHALL NOT）。`ChangeState` は表示用の文字列キャッシュ（`display_status_cache`）と色キャッシュ（`display_color_cache`）のみを持ち、これらは Reducer のスナップショットから更新される。
+TUI 固有のステータス enum（旧 `QueueStatus`）を保持してはならない（SHALL NOT）。`ChangeState` は表示用の文字列キャッシュ（`display_status_cache`）と色キャッシュ（`display_color_cache`）のみを持ち、これらは Reducer のスナップショットまたは同じ workspace/git-derived refresh evidence から更新される。
 
 TUI はログ表示の重複抑制のために transient な観測用状態を保持してよい（MAY）が、その状態を reducer-derived display status、scheduler dispatch、resume routing、acceptance、archive、または next-action decision の入力として使ってはならない（MUST NOT）。
+
+Refresh-time `merge_wait_ids` は、archived-but-not-merged workspace evidence から導出された TUI display synchronization input として扱ってよい（MAY）。TUI はこれを scheduler dispatch、resume routing、acceptance、archive、または next-action decision の入力として使ってはならない（MUST NOT）。
 
 #### Scenario: TUI が Reducer からステータスを読み取る
 
@@ -19,20 +21,20 @@ TUI はログ表示の重複抑制のために transient な観測用状態を�
 - **THEN** `ChangeState.display_status_cache` が `"applying"` に更新される
 - **AND** `ChangeState.display_color_cache` が `Color::Cyan` に更新される
 
-#### Scenario: dependency-blocked event keeps display state while duplicate log is suppressed
+#### Scenario: refresh-derived merge wait corrects stale resolve pending display
 
-- **GIVEN** change `alpha` is already displayed with `display_status_cache = "blocked"`
-- **WHEN** the TUI receives another `OrchestratorEvent::DependencyBlocked` for `alpha`
-- **THEN** `alpha` remains displayed as `blocked`
-- **AND** no duplicate `Change 'alpha' blocked by dependencies` entry is appended solely because the unchanged event repeated
+- **GIVEN** change `alpha` is displayed as `resolve pending`
+- **AND** the refresh loop observes `alpha` as archive-complete but not merged into base
+- **WHEN** the TUI handles `OrchestratorEvent::ChangesRefreshed` with `alpha` in `merge_wait_ids`
+- **THEN** `alpha` is displayed as `merge wait`
+- **AND** the display correction does not enqueue, dispatch, archive, accept, or otherwise route workflow execution
 
-#### Scenario: dependency resolution allows a later fresh blocked log
+#### Scenario: stale merge wait refresh does not regress terminal display
 
-- **GIVEN** change `alpha` has been displayed as `blocked`
-- **WHEN** the TUI receives `OrchestratorEvent::DependencyResolved` for `alpha`
-- **AND** a later `OrchestratorEvent::DependencyBlocked` for `alpha` arrives
-- **THEN** the TUI may append a fresh `Change 'alpha' blocked by dependencies` entry
-- **AND** `alpha` is displayed as `blocked`
+- **GIVEN** change `alpha` is already displayed as `merged` or `rejected`
+- **WHEN** the TUI handles a stale `OrchestratorEvent::ChangesRefreshed` that includes `alpha` in `merge_wait_ids`
+- **THEN** `alpha` remains displayed as its terminal state
+- **AND** the terminal row is not regressed to `merge wait`
 
 ### Requirement: is_resolving scope limitation
 
