@@ -62,39 +62,24 @@ When a merge attempt is deferred because manual user action is required, such as
 
 An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-#### Scenario: manual dirty-base deferral clears normal queue intent
+After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
-**Given**: change `alpha` has already archived in parallel mode
-**And**: `alpha` still has normal queued intent from an earlier dispatch
-**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
-**Then**: `alpha` SHALL display as `merge wait`
-**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
-**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
+#### Scenario: stale archive-incomplete deferral after merge success is ignored
 
-#### Scenario: manual merge-wait change is not re-added by queue reconciliation
+**Given**: change `alpha` has already emitted `MergeCompleted` and is integrated into the base branch
+**When**: a stale duplicate post-archive merge path emits `MergeDeferred(auto_resumable=false)` for `alpha` because the archived worktree appears dirty or incomplete during cleanup
+**Then**: `alpha` remains terminal `Merged`
+**And**: `alpha` is not returned by `queued_change_ids()` or `resolve_wait_change_ids()`
+**And**: the user does not see a new manual `MergeWait` blocker for `alpha`
 
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the archived workspace for `alpha` is still present
-**When**: scheduler queue reconciliation reads reducer-owned queued candidates
-**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
-**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
+#### Scenario: real dirty-base deferral remains manual merge wait
 
-#### Scenario: explicit retry after manual deferral enters resolve wait
-
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the user has resolved the manual blocker outside Conflux
-**When**: the user requests merge retry for `alpha` through `ResolveMerge`
-**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
-**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
-**And**: scheduler-owned merge retry may attempt the archived workspace merge
-
-#### Scenario: auto-resumable deferral remains scheduler retry intent
-
-**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
-**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
-**Then**: `beta` SHALL display as `resolve pending`
-**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
-**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
+**Given**: change `beta` is archive-complete but not integrated into the base branch
+**And**: the base working tree has uncommitted changes before merge starts
+**When**: the merge attempt is deferred with `auto_resumable=false`
+**Then**: `beta` displays as `merge wait`
+**And**: `beta` is not silently marked merged
+**And**: explicit user retry remains required after the dirty-base blocker is resolved
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
@@ -134,17 +119,15 @@ In Parallel execution mode, when a resumed workspace is already archive-complete
 
 This resume-time archive-complete transition MUST preserve the user-visible merge-wait lifecycle and MUST NOT fall back to `not queued` before merge handling has been attempted.
 
-#### Scenario: Resume-time archived change becomes merge wait
+Queue reconciliation MUST NOT redispatch an archive-complete workspace as ordinary queued work while the same change already has an active post-archive merge task or repository-visible base integration.
 
-- **GIVEN** the orchestrator is running in Parallel execution mode
-- **AND** a reused workspace is detected as already archived but not yet merged
-- **WHEN** the parallel resume path reports archive-complete completion for that change
-- **THEN** the wait state becomes `MergeWait`
-- **AND** the derived display status is merge wait
-- **AND** the change does not regress to `not queued` during the restart flow
+#### Scenario: active post-archive merge suppresses duplicate archived repair dispatch
 
-
-#
+**Given**: change `gamma` has an archive-complete workspace
+**And**: a post-archive merge task for `gamma` is already active
+**When**: scheduler queue reconciliation scans existing worktrees
+**Then**: `gamma` is not added again to the ordinary queued dispatch list
+**And**: no second merge task is spawned solely from the archived dirty repair candidate path
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -156,39 +139,24 @@ When a merge attempt is deferred because manual user action is required, such as
 
 An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-#### Scenario: manual dirty-base deferral clears normal queue intent
+After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
-**Given**: change `alpha` has already archived in parallel mode
-**And**: `alpha` still has normal queued intent from an earlier dispatch
-**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
-**Then**: `alpha` SHALL display as `merge wait`
-**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
-**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
+#### Scenario: stale archive-incomplete deferral after merge success is ignored
 
-#### Scenario: manual merge-wait change is not re-added by queue reconciliation
+**Given**: change `alpha` has already emitted `MergeCompleted` and is integrated into the base branch
+**When**: a stale duplicate post-archive merge path emits `MergeDeferred(auto_resumable=false)` for `alpha` because the archived worktree appears dirty or incomplete during cleanup
+**Then**: `alpha` remains terminal `Merged`
+**And**: `alpha` is not returned by `queued_change_ids()` or `resolve_wait_change_ids()`
+**And**: the user does not see a new manual `MergeWait` blocker for `alpha`
 
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the archived workspace for `alpha` is still present
-**When**: scheduler queue reconciliation reads reducer-owned queued candidates
-**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
-**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
+#### Scenario: real dirty-base deferral remains manual merge wait
 
-#### Scenario: explicit retry after manual deferral enters resolve wait
-
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the user has resolved the manual blocker outside Conflux
-**When**: the user requests merge retry for `alpha` through `ResolveMerge`
-**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
-**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
-**And**: scheduler-owned merge retry may attempt the archived workspace merge
-
-#### Scenario: auto-resumable deferral remains scheduler retry intent
-
-**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
-**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
-**Then**: `beta` SHALL display as `resolve pending`
-**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
-**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
+**Given**: change `beta` is archive-complete but not integrated into the base branch
+**And**: the base working tree has uncommitted changes before merge starts
+**When**: the merge attempt is deferred with `auto_resumable=false`
+**Then**: `beta` displays as `merge wait`
+**And**: `beta` is not silently marked merged
+**And**: explicit user retry remains required after the dirty-base blocker is resolved
 
 ### Requirement: merge-deferred-reducer-sync
 
@@ -310,39 +278,24 @@ When a merge attempt is deferred because manual user action is required, such as
 
 An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-#### Scenario: manual dirty-base deferral clears normal queue intent
+After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
-**Given**: change `alpha` has already archived in parallel mode
-**And**: `alpha` still has normal queued intent from an earlier dispatch
-**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
-**Then**: `alpha` SHALL display as `merge wait`
-**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
-**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
+#### Scenario: stale archive-incomplete deferral after merge success is ignored
 
-#### Scenario: manual merge-wait change is not re-added by queue reconciliation
+**Given**: change `alpha` has already emitted `MergeCompleted` and is integrated into the base branch
+**When**: a stale duplicate post-archive merge path emits `MergeDeferred(auto_resumable=false)` for `alpha` because the archived worktree appears dirty or incomplete during cleanup
+**Then**: `alpha` remains terminal `Merged`
+**And**: `alpha` is not returned by `queued_change_ids()` or `resolve_wait_change_ids()`
+**And**: the user does not see a new manual `MergeWait` blocker for `alpha`
 
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the archived workspace for `alpha` is still present
-**When**: scheduler queue reconciliation reads reducer-owned queued candidates
-**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
-**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
+#### Scenario: real dirty-base deferral remains manual merge wait
 
-#### Scenario: explicit retry after manual deferral enters resolve wait
-
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the user has resolved the manual blocker outside Conflux
-**When**: the user requests merge retry for `alpha` through `ResolveMerge`
-**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
-**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
-**And**: scheduler-owned merge retry may attempt the archived workspace merge
-
-#### Scenario: auto-resumable deferral remains scheduler retry intent
-
-**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
-**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
-**Then**: `beta` SHALL display as `resolve pending`
-**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
-**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
+**Given**: change `beta` is archive-complete but not integrated into the base branch
+**And**: the base working tree has uncommitted changes before merge starts
+**When**: the merge attempt is deferred with `auto_resumable=false`
+**Then**: `beta` displays as `merge wait`
+**And**: `beta` is not silently marked merged
+**And**: explicit user retry remains required after the dirty-base blocker is resolved
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -874,39 +827,24 @@ When a merge attempt is deferred because manual user action is required, such as
 
 An explicit `ResolveMerge` command remains the way to retry a manual merge-wait change after the user resolves the manual blocker.
 
-#### Scenario: manual dirty-base deferral clears normal queue intent
+After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
-**Given**: change `alpha` has already archived in parallel mode
-**And**: `alpha` still has normal queued intent from an earlier dispatch
-**When**: the reducer processes `MergeDeferred` for `alpha` with `auto_resumable=false` because the base working tree has uncommitted changes
-**Then**: `alpha` SHALL display as `merge wait`
-**And**: `alpha` SHALL NOT be returned by `queued_change_ids()`
-**And**: `alpha` SHALL NOT remain in reducer-owned resolve-wait retry membership
+#### Scenario: stale archive-incomplete deferral after merge success is ignored
 
-#### Scenario: manual merge-wait change is not re-added by queue reconciliation
+**Given**: change `alpha` has already emitted `MergeCompleted` and is integrated into the base branch
+**When**: a stale duplicate post-archive merge path emits `MergeDeferred(auto_resumable=false)` for `alpha` because the archived worktree appears dirty or incomplete during cleanup
+**Then**: `alpha` remains terminal `Merged`
+**And**: `alpha` is not returned by `queued_change_ids()` or `resolve_wait_change_ids()`
+**And**: the user does not see a new manual `MergeWait` blocker for `alpha`
 
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the archived workspace for `alpha` is still present
-**When**: scheduler queue reconciliation reads reducer-owned queued candidates
-**Then**: `alpha` SHALL NOT be added to the scheduler-local queued list as ordinary apply/archive work
-**And**: the scheduler SHALL NOT repeatedly resume the archived workspace solely because the base working tree remains dirty
+#### Scenario: real dirty-base deferral remains manual merge wait
 
-#### Scenario: explicit retry after manual deferral enters resolve wait
-
-**Given**: change `alpha` is in `MergeWait` after a manual merge deferral
-**And**: the user has resolved the manual blocker outside Conflux
-**When**: the user requests merge retry for `alpha` through `ResolveMerge`
-**Then**: the reducer SHALL transition `alpha` to `ResolveWait`
-**And**: `alpha` SHALL be returned by `resolve_wait_change_ids()`
-**And**: scheduler-owned merge retry may attempt the archived workspace merge
-
-#### Scenario: auto-resumable deferral remains scheduler retry intent
-
-**Given**: change `beta` has a merge attempt deferred because another resolve or merge is in progress
-**When**: the reducer processes `MergeDeferred` for `beta` with `auto_resumable=true`
-**Then**: `beta` SHALL display as `resolve pending`
-**And**: `beta` SHALL be returned by `resolve_wait_change_ids()`
-**And**: `beta` SHALL remain eligible for automatic retry after the blocking merge or resolve completes
+**Given**: change `beta` is archive-complete but not integrated into the base branch
+**And**: the base working tree has uncommitted changes before merge starts
+**When**: the merge attempt is deferred with `auto_resumable=false`
+**Then**: `beta` displays as `merge wait`
+**And**: `beta` is not silently marked merged
+**And**: explicit user retry remains required after the dirty-base blocker is resolved
 
 ### Requirement: post-archive-status-idempotency
 
