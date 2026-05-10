@@ -24,7 +24,10 @@ fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> Stri
     )
 }
 
-fn archive_completion_verification_root<'a>(repo_root: &'a Path, archive_path: &'a Path) -> &'a Path {
+fn archive_completion_verification_root<'a>(
+    repo_root: &'a Path,
+    archive_path: &'a Path,
+) -> &'a Path {
     if archive_path.exists() {
         archive_path
     } else {

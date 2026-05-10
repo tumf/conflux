@@ -509,9 +509,10 @@ mod tests {
             .logs
             .iter()
             .any(|log| log.message.contains("stale workspace path")));
-        assert!(app.logs.iter().any(|log| log
-            .message
-            .contains("Working tree has uncommitted changes")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("Working tree has uncommitted changes")));
         assert_eq!(
             app.logs
                 .iter()
