@@ -102,6 +102,12 @@ pub async fn handle_editor_launch(ctx: &mut KeyEventContext<'_>) -> Result<()> {
         None
     };
     let worktree_path = ctx.app.get_selected_worktree_path();
+    if view_mode == ViewMode::Worktrees && ctx.app.suppress_if_selected_worktree_deleting() {
+        ctx.app.add_log(LogEntry::warn(
+            "Editor ignored: worktree is already being deleted",
+        ));
+        return Ok(());
+    }
 
     suspend_terminal_and_execute_sync(ctx.terminal, || {
         // Launch editor based on view mode
@@ -252,6 +258,13 @@ pub async fn handle_enter_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
             .add_log(LogEntry::warn("Enter ignored: no worktree selected"));
         return Ok(());
     };
+
+    if ctx.app.suppress_if_selected_worktree_deleting() {
+        ctx.app.add_log(LogEntry::warn(
+            "Enter ignored: worktree is already being deleted",
+        ));
+        return Ok(());
+    }
 
     let Some(template) = ctx.config.get_worktree_command().map(str::to_string) else {
         ctx.app.add_log(LogEntry::warn(
@@ -498,13 +511,8 @@ pub async fn handle_key_event(
                 ctx.app.cancel_worktree_action();
             }
             (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) => {
-                if let Some(TuiCommand::DeleteWorktreeByPath(path, branch, _)) =
-                    ctx.app.confirm_worktree_action_delete()
-                {
-                    let _ = ctx
-                        .cmd_tx
-                        .send(TuiCommand::DeleteWorktreeByPath(path, branch, true))
-                        .await;
+                if let Some(cmd) = ctx.app.confirm_worktree_action_delete_with_options(true) {
+                    let _ = ctx.cmd_tx.send(cmd).await;
                 }
             }
             _ => {}

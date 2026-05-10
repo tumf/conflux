@@ -11,11 +11,72 @@ use crate::tui::queue::DynamicQueue;
 use crate::tui::state::AppState;
 use crate::tui::types::{AppMode, StopMode};
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum DeleteWorktreeTestOutcome {
+    Success,
+    Failure(String),
+}
+
+#[cfg(test)]
+static DELETE_WORKTREE_TEST_OUTCOMES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, DeleteWorktreeTestOutcome>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+fn set_delete_worktree_test_outcome(path: PathBuf, outcome: DeleteWorktreeTestOutcome) {
+    DELETE_WORKTREE_TEST_OUTCOMES
+        .lock()
+        .expect("delete worktree test outcomes lock")
+        .insert(path, outcome);
+}
+
+#[cfg(test)]
+async fn remove_worktree_for_tui(
+    _repo_root: &Path,
+    path: &Path,
+    _skip_teardown: bool,
+) -> crate::error::Result<()> {
+    let outcome = DELETE_WORKTREE_TEST_OUTCOMES
+        .lock()
+        .expect("delete worktree test outcomes lock")
+        .remove(path)
+        .unwrap_or(DeleteWorktreeTestOutcome::Success);
+
+    match outcome {
+        DeleteWorktreeTestOutcome::Success => Ok(()),
+        DeleteWorktreeTestOutcome::Failure(message) => {
+            Err(crate::error::OrchestratorError::GitCommand(format!(
+                "stubbed delete failure for {}: {}",
+                path.display(),
+                message
+            )))
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn remove_worktree_for_tui(
+    repo_root: &Path,
+    path: &Path,
+    skip_teardown: bool,
+) -> crate::error::Result<()> {
+    crate::vcs::git::commands::worktree_remove_with_options(
+        repo_root,
+        path.to_string_lossy().as_ref(),
+        crate::vcs::git::commands::WorktreeRemoveOptions { skip_teardown },
+    )
+    .await
+    .map_err(crate::error::OrchestratorError::from)
+}
 
 use super::worktrees::load_worktrees_with_conflict_check;
 
@@ -237,13 +298,10 @@ pub async fn handle_tui_command(
             )));
         }
         TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
-            match crate::vcs::git::commands::worktree_remove_with_options(
-                ctx.repo_root,
-                path.to_string_lossy().as_ref(),
-                crate::vcs::git::commands::WorktreeRemoveOptions { skip_teardown },
-            )
-            .await
-            {
+            let delete_result = remove_worktree_for_tui(ctx.repo_root, &path, skip_teardown).await;
+            ctx.app.clear_worktree_deleting(&path);
+
+            match delete_result {
                 Ok(_) => {
                     info!("Worktree deleted successfully: {}", path.display());
                     ctx.app.add_log(LogEntry::success(format!(
@@ -666,7 +724,8 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::orchestration::state::OrchestratorState;
-    use std::path::Path;
+    use crate::tui::types::WorktreeInfo;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::RwLock;
 
@@ -683,6 +742,113 @@ mod tests {
 
     fn create_test_config() -> OrchestratorConfig {
         OrchestratorConfig::default()
+    }
+
+    fn create_test_worktree(path: &str) -> WorktreeInfo {
+        WorktreeInfo {
+            path: PathBuf::from(path),
+            head: "abc123".to_string(),
+            branch: "feature-a".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: true,
+            is_merging: false,
+        }
+    }
+
+    fn create_command_context<'a>(
+        app: &'a mut AppState,
+        tx: &'a mpsc::Sender<OrchestratorEvent>,
+        dynamic_queue: &'a DynamicQueue,
+        config: &'a OrchestratorConfig,
+    ) -> TuiCommandContext<'a> {
+        TuiCommandContext {
+            app,
+            repo_root: Path::new("."),
+            config,
+            tx,
+            dynamic_queue,
+            remote_client: None,
+            orchestrator_running: false,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_worktree_command_clears_marker_on_success() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(vec![], 10)));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+        let path = PathBuf::from("/tmp/worktree-success");
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        let mut app = AppState::new(vec![]);
+
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-success")];
+        app.mark_worktree_deleting(path.clone());
+
+        let mut ctx = create_command_context(&mut app, &tx, &dynamic_queue, &config);
+        let handle = handle_tui_command(
+            TuiCommand::DeleteWorktreeByPath(path.clone(), None, false),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("delete command should succeed");
+
+        assert!(handle.is_none());
+        assert!(!ctx.app.is_worktree_deleting(&path));
+        assert!(ctx.app.logs.iter().any(|entry| entry
+            .message
+            .contains("Deleted worktree: /tmp/worktree-success")));
+    }
+
+    #[tokio::test]
+    async fn test_delete_worktree_command_clears_marker_on_failure() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(vec![], 10)));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+        let path = PathBuf::from("/tmp/worktree-failure");
+        set_delete_worktree_test_outcome(
+            path.clone(),
+            DeleteWorktreeTestOutcome::Failure("boom".to_string()),
+        );
+        let mut app = AppState::new(vec![]);
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-failure")];
+        app.mark_worktree_deleting(path.clone());
+
+        let mut ctx = create_command_context(&mut app, &tx, &dynamic_queue, &config);
+        let handle = handle_tui_command(
+            TuiCommand::DeleteWorktreeByPath(path.clone(), None, false),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("delete command should handle failures as UI errors");
+
+        assert!(handle.is_none());
+        assert!(!ctx.app.is_worktree_deleting(&path));
+        assert!(ctx.app.warning_popup.is_some());
+        assert!(ctx
+            .app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Worktree delete failed")));
     }
 
     #[tokio::test]
