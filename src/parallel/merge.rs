@@ -77,6 +77,67 @@ pub enum MergeAttempt {
     Deferred(DeferredMerge),
 }
 
+#[derive(Debug)]
+enum ArchiveVerificationStatus {
+    Complete,
+    Incomplete,
+    Failed(String),
+}
+
+fn already_merged_revision() -> String {
+    "already-merged-to-base".to_string()
+}
+
+fn archive_verification_outcome(
+    change_id: &str,
+    archive_path: &Path,
+    status: ArchiveVerificationStatus,
+    already_merged_to_base: bool,
+) -> Option<MergeAttempt> {
+    match status {
+        ArchiveVerificationStatus::Complete => None,
+        ArchiveVerificationStatus::Incomplete => {
+            if already_merged_to_base {
+                tracing::info!(
+                    change_id = %change_id,
+                    archive_path = %archive_path.display(),
+                    "Suppressing archive-incomplete merge deferral because change is already integrated into base"
+                );
+                return Some(MergeAttempt::Merged {
+                    revision: already_merged_revision(),
+                });
+            }
+
+            let reason = format!(
+                "Archive incomplete for '{}': worktree may be dirty, openspec/changes/{} may still exist, or archive entry may be missing",
+                change_id, change_id
+            );
+            tracing::warn!("{}", reason);
+            Some(MergeAttempt::Deferred(DeferredMerge::manual(reason)))
+        }
+        ArchiveVerificationStatus::Failed(error) => {
+            if already_merged_to_base {
+                tracing::info!(
+                    change_id = %change_id,
+                    archive_path = %archive_path.display(),
+                    error = %error,
+                    "Suppressing archive-verification merge deferral because change is already integrated into base"
+                );
+                return Some(MergeAttempt::Merged {
+                    revision: already_merged_revision(),
+                });
+            }
+
+            let reason = format!(
+                "Failed to verify archive completion for '{}': {}",
+                change_id, error
+            );
+            tracing::warn!("{}", reason);
+            Some(MergeAttempt::Deferred(DeferredMerge::manual(reason)))
+        }
+    }
+}
+
 impl DeferredMerge {
     fn auto(reason: impl Into<String>) -> Self {
         Self {
@@ -93,7 +154,103 @@ impl DeferredMerge {
     }
 }
 
+pub(super) struct ActivePostArchiveMergeGuard {
+    change_id: String,
+    active: bool,
+}
+
+impl ActivePostArchiveMergeGuard {
+    pub(super) fn acquire(change_id: impl Into<String>) -> Option<Self> {
+        let change_id = change_id.into();
+        let mut active = super::active_post_archive_merges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(change_id.clone()) {
+            return None;
+        }
+        Some(Self {
+            change_id,
+            active: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn force_register_for_test(change_id: impl Into<String>) -> Self {
+        let change_id = change_id.into();
+        let mut active = super::active_post_archive_merges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.insert(change_id.clone());
+        Self {
+            change_id,
+            active: true,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut active = super::active_post_archive_merges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.remove(&self.change_id);
+        self.active = false;
+    }
+}
+
+impl Drop for ActivePostArchiveMergeGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl ParallelExecutor {
+    pub(super) async fn is_change_already_merged_to_base(&self, change_id: &str) -> bool {
+        let original_branch = match self
+            .workspace_manager
+            .ensure_original_branch_initialized()
+            .await
+        {
+            Ok(branch) => branch,
+            Err(error) => {
+                tracing::warn!(
+                    change_id = %change_id,
+                    "Failed to determine base branch before post-archive merge idempotency check: {}",
+                    error
+                );
+                return false;
+            }
+        };
+
+        match crate::execution::state::is_merged_to_base(
+            change_id,
+            &self.repo_root,
+            &original_branch,
+        )
+        .await
+        {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(
+                    change_id = %change_id,
+                    base_branch = %original_branch,
+                    "Failed to check whether change is already merged to base: {}",
+                    error
+                );
+                false
+            }
+        }
+    }
+
+    pub(super) fn is_post_archive_merge_active_for(change_id: &str) -> bool {
+        super::active_post_archive_merges()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(change_id)
+    }
+
     /// Handle merge attempt and cleanup after successful archive.
     ///
     /// # Arguments
@@ -355,29 +512,30 @@ impl ParallelExecutor {
             )));
         }
 
-        // Verify that all changes are actually archived before attempting merge
+        // Verify that all changes are actually archived before attempting merge.
+        // A duplicate post-archive merge can race with a successful merge+cleanup path:
+        // the stale path may see the archived worktree as dirty/incomplete even though
+        // the archive evidence is already integrated into base. In that case base git
+        // state is authoritative and the duplicate task is idempotent success.
         for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
-            match is_archive_commit_complete(change_id, Some(archive_path)).await {
-                Ok(true) => {
-                    // Archive is complete, continue
+            let status = match is_archive_commit_complete(change_id, Some(archive_path)).await {
+                Ok(true) => ArchiveVerificationStatus::Complete,
+                Ok(false) => ArchiveVerificationStatus::Incomplete,
+                Err(error) => ArchiveVerificationStatus::Failed(error.to_string()),
+            };
+            let already_merged_to_base = match status {
+                ArchiveVerificationStatus::Complete => false,
+                ArchiveVerificationStatus::Incomplete | ArchiveVerificationStatus::Failed(_) => {
+                    self.is_change_already_merged_to_base(change_id).await
                 }
-                Ok(false) => {
-                    // Archive is incomplete, defer merge with detailed reason
-                    let reason = format!(
-                        "Archive incomplete for '{}': worktree may be dirty, openspec/changes/{} may still exist, or archive entry may be missing",
-                        change_id, change_id
-                    );
-                    tracing::warn!("{}", reason);
-                    return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
-                }
-                Err(e) => {
-                    let reason = format!(
-                        "Failed to verify archive completion for '{}': {}",
-                        change_id, e
-                    );
-                    tracing::warn!("{}", reason);
-                    return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
-                }
+            };
+            if let Some(outcome) = archive_verification_outcome(
+                change_id,
+                archive_path,
+                status,
+                already_merged_to_base,
+            ) {
+                return Ok(outcome);
             }
         }
 
@@ -851,7 +1009,133 @@ pub async fn resolve_deferred_merge(
 
 #[cfg(test)]
 mod tests {
-    use super::DeferredMerge;
+    use super::{
+        archive_verification_outcome, ArchiveVerificationStatus, DeferredMerge, MergeAttempt,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn test_archive_incomplete_after_base_integration_is_idempotent_merged() {
+        let outcome = archive_verification_outcome(
+            "change-a",
+            Path::new("/tmp/worktree-change-a"),
+            ArchiveVerificationStatus::Incomplete,
+            true,
+        );
+
+        match outcome {
+            Some(MergeAttempt::Merged { revision }) => {
+                assert_eq!(revision, "already-merged-to-base");
+            }
+            other => panic!(
+                "already-integrated archive-incomplete duplicate must be idempotent merged, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_archive_incomplete_without_base_integration_remains_manual_deferred() {
+        let outcome = archive_verification_outcome(
+            "change-a",
+            Path::new("/tmp/worktree-change-a"),
+            ArchiveVerificationStatus::Incomplete,
+            false,
+        );
+
+        match outcome {
+            Some(MergeAttempt::Deferred(deferred)) => {
+                assert!(!deferred.auto_resumable);
+                assert!(deferred
+                    .reason
+                    .contains("Archive incomplete for 'change-a'"));
+            }
+            other => panic!(
+                "non-integrated archive-incomplete workspace must remain manual deferred, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_archive_verification_failure_after_base_integration_is_idempotent_merged() {
+        let outcome = archive_verification_outcome(
+            "change-a",
+            Path::new("/tmp/worktree-change-a"),
+            ArchiveVerificationStatus::Failed("worktree vanished".to_string()),
+            true,
+        );
+
+        assert!(matches!(outcome, Some(MergeAttempt::Merged { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_attempt_merge_dirty_base_remains_manual_deferred() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(temp.path())
+            .output()
+            .await
+            .expect("git init");
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp.path())
+            .output()
+            .await
+            .expect("git config user.email");
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp.path())
+            .output()
+            .await
+            .expect("git config user.name");
+        std::fs::write(temp.path().join("README.md"), "base").expect("write readme");
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(temp.path())
+            .output()
+            .await
+            .expect("git add");
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(temp.path())
+            .output()
+            .await
+            .expect("git commit");
+
+        std::fs::write(temp.path().join("dirty.txt"), "dirty").expect("write dirty file");
+
+        let config = crate::config::OrchestratorConfig {
+            apply_command: Some("echo apply".to_string()),
+            archive_command: Some("echo archive".to_string()),
+            ..Default::default()
+        };
+        let executor =
+            crate::parallel::ParallelExecutor::new(temp.path().to_path_buf(), config, None);
+
+        let result = executor
+            .attempt_merge(
+                &["dummy-revision".to_string()],
+                &["change-a".to_string()],
+                &[temp.path().to_path_buf()],
+            )
+            .await;
+
+        match result.expect("attempt merge should return deferred") {
+            MergeAttempt::Deferred(deferred) => {
+                assert!(!deferred.auto_resumable);
+                assert!(
+                    deferred
+                        .reason
+                        .contains("Working tree has uncommitted changes"),
+                    "expected dirty-base manual deferral, got {}",
+                    deferred.reason
+                );
+            }
+            other => panic!("dirty base must remain manual deferred, got {:?}", other),
+        }
+    }
 
     #[test]
     fn test_auto_deferred_sets_auto_resumable_true() {
