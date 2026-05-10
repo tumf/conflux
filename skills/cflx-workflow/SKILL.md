@@ -207,6 +207,7 @@ Do NOT wrap the verdict in headings (`##`), blockquotes (`>`), bullets (`-`), bo
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
 - Valid `Implementation Blocker #<n>` creates a stalled acceptance hold; emit `{"acceptance":"gated"}` only as the current compatibility token for that hold
+- Recoverable infrastructure blockers are non-terminal stalled holds, not terminal rejection evidence. Representative classes include Docker daemon/image pull failures, DNS/network timeouts, package registry outages, missing non-mockable credentials, port conflicts, and pending managed verification jobs.
 
 **For detailed guidance**, read [references/cflx-accept.md](references/cflx-accept.md).
 

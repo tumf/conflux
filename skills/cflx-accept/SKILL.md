@@ -95,11 +95,13 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
 - A valid `Implementation Blocker #<n>` with concrete evidence and unblock actions creates a stalled acceptance hold for operators and lifecycle/status displays.
+- Recoverable infrastructure blockers are non-terminal stalled holds, not rejection evidence. Examples include Docker daemon/image pull failures, DNS/network timeouts, package registry outages, missing non-mockable credentials, port conflicts, and pending managed verification jobs.
 - For the current runtime compatibility period, emit `{"acceptance":"gated"}` and the legacy fallback marker `ACCEPTANCE: GATED` only as protocol handoff tokens for that stalled hold.
 - Legacy `blocked` acceptance verdict is input compatibility; `gated` is also compatibility/protocol terminology and MUST NOT be treated as operator-facing lifecycle taxonomy.
+- Do not require or create terminal `REJECTED.md` evidence for recoverable infrastructure blockers unless independent evidence proves the change intent is invalid, obsolete, contradictory, or constitution-violating.
 - Repository-fixable vs stalled-hold rubric:
   - `FAIL`: repository-only autonomous work (code/tests/spec/tasks/docs in this repo) can resolve the issue.
-  - Stalled hold via compatibility token `{"acceptance":"gated"}`: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, or missing upstream constraint resolution).
+  - Stalled hold via compatibility token `{"acceptance":"gated"}`: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, missing upstream constraint resolution, or recoverable infrastructure/credential/pending verification blocker).
 - For behavior-changing work, missing/ambiguous verification planning is FAIL (not CONTINUE)
 
 ## Portable Interface Constraint

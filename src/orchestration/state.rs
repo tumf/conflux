@@ -2290,12 +2290,18 @@ mod tests {
         let cases = [
             (
                 "docker image pull failed: lookup registry-1.docker.io i/o timeout",
-                "external_service",
+                "infrastructure",
             ),
             ("Cannot connect to the Docker daemon", "infrastructure"),
             ("missing non-mockable external credential", "credential"),
-            ("package registry timeout fetching crate", "external_service"),
-            ("agent-exec managed verification job still running", "pending_verification"),
+            (
+                "package registry timeout fetching crate",
+                "external_service",
+            ),
+            (
+                "agent-exec managed verification job still running",
+                "pending_verification",
+            ),
         ];
 
         for (idx, (message, expected_category)) in cases.iter().enumerate() {

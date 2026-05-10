@@ -219,6 +219,15 @@ fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
         || lower.contains("managed verification job")
     {
         "pending_verification"
+    } else if lower.contains("docker")
+        || lower.contains("daemon")
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("port conflict")
+        || lower.contains("address already in use")
+        || lower.contains("image")
+    {
+        "infrastructure"
     } else if lower.contains("registry")
         || lower.contains("external service")
         || lower.contains("rate limit")
@@ -226,15 +235,7 @@ fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
         || lower.contains("service outage")
     {
         "external_service"
-    } else if lower.contains("docker")
-        || lower.contains("daemon")
-        || lower.contains("dns")
-        || lower.contains("network")
-        || lower.contains("timeout")
-        || lower.contains("port conflict")
-        || lower.contains("address already in use")
-        || lower.contains("image")
-    {
+    } else if lower.contains("timeout") {
         "infrastructure"
     } else {
         "infrastructure"
@@ -249,7 +250,8 @@ impl StalledBlocker {
             phase: "acceptance".to_string(),
             gate: "acceptance".to_string(),
             error_summary,
-            next_action: "resolve the external verification blocker and rerun acceptance".to_string(),
+            next_action: "resolve the external verification blocker and rerun acceptance"
+                .to_string(),
             resumable: true,
             worktree_preserved: true,
         }
@@ -258,7 +260,12 @@ impl StalledBlocker {
     pub fn summary(&self) -> String {
         format!(
             "category={}, phase={}, gate={}, resumable={}, next_action={}, error={}",
-            self.category, self.phase, self.gate, self.resumable, self.next_action, self.error_summary
+            self.category,
+            self.phase,
+            self.gate,
+            self.resumable,
+            self.next_action,
+            self.error_summary
         )
     }
 
@@ -461,7 +468,10 @@ pub enum ExecutionEvent {
     DependencyResolved { change_id: String },
 
     /// Acceptance observed a compatibility gated token that becomes a non-terminal stalled hold.
-    AcceptanceGated { change_id: String, blocker: StalledBlocker },
+    AcceptanceGated {
+        change_id: String,
+        blocker: StalledBlocker,
+    },
 
     // Analysis events (parallel mode)
     /// Analysis started for remaining changes
