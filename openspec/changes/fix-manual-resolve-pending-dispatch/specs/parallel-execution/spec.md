@@ -25,3 +25,12 @@ When a user registers manual retry intent while other apply/archive work is in f
 **When**: the scheduler reevaluates retry work
 **Then**: no retry dispatch starts for `alpha`
 **And**: the system does not treat a display-only pending state as scheduler-owned retry work
+
+#### Scenario: repeated unchanged manual resolve blocker is bounded
+
+**Given**: change `alpha` remains in reducer-owned manual resolve pending
+**And**: repeated scheduler reevaluations observe the same unchanged repository-visible blocker signature for `alpha`
+**When**: retry reevaluation runs repeatedly without any relevant state change
+**Then**: identical user-visible retry/blocker diagnostics are deduped, rate-limited, or summarized
+**And**: the scheduler continues to preserve truthful pending/blocker state
+**And**: a changed blocker signature emits a fresh diagnostic

@@ -57,6 +57,7 @@ Make manual resolve pending a truthful scheduler-owned state across TUI, reducer
 - If a manual resolve retry cannot be accepted or dispatched because the change is no longer retry-eligible, the row MUST return to a truthful blocker/terminal state with visible evidence rather than staying pending.
 - Archived-but-not-merged changes that are eligible for manual merge retry MUST remain retryable through the reducer-owned loop even when the preserved workspace is archive-complete and no longer listed as an active `openspec/changes/<id>` directory.
 - The implementation MUST preserve workspace-local workflow-state rules from `openspec/CONSTITUTION.md` and MUST NOT add hidden durable routing inputs.
+- Repeated scheduler reevaluation of the same manual resolve pending change with the same repository-visible blocker reason MUST NOT flood user-visible logs; identical diagnostics MUST be deduped, rate-limited, or summarized until relevant state changes.
 
 ## Explicit Completion Conditions
 
