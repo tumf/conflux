@@ -10,6 +10,8 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+
 #### Scenario: archive success clears prior acceptance error in parallel mode
 
 - **GIVEN** change `alpha` is in parallel execution mode
@@ -39,6 +41,16 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 - **WHEN** stale or unrelated success observations are processed
 - **THEN** `alpha` SHALL remain rejected
 - **AND** no success event SHALL silently turn rejected into merged or archived
+
+#### Scenario: stalled infrastructure hold remains resumable
+
+- **GIVEN** change `alpha` has a valid active proposal
+- **AND** a required verification gate cannot complete because infrastructure is unavailable
+- **WHEN** the reducer receives the stalled-hold event or workspace status
+- **THEN** `alpha` SHALL have terminal state `None`
+- **AND** `alpha` SHALL have wait state `Stalled`
+- **AND** `alpha` SHALL display as `stalled`
+- **AND** `alpha` SHALL NOT display as `rejected`
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -238,6 +250,8 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+
 #### Scenario: archive success clears prior acceptance error in parallel mode
 
 - **GIVEN** change `alpha` is in parallel execution mode
@@ -267,6 +281,16 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 - **WHEN** stale or unrelated success observations are processed
 - **THEN** `alpha` SHALL remain rejected
 - **AND** no success event SHALL silently turn rejected into merged or archived
+
+#### Scenario: stalled infrastructure hold remains resumable
+
+- **GIVEN** change `alpha` has a valid active proposal
+- **AND** a required verification gate cannot complete because infrastructure is unavailable
+- **WHEN** the reducer receives the stalled-hold event or workspace status
+- **THEN** `alpha` SHALL have terminal state `None`
+- **AND** `alpha` SHALL have wait state `Stalled`
+- **AND** `alpha` SHALL display as `stalled`
+- **AND** `alpha` SHALL NOT display as `rejected`
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -303,6 +327,8 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+
 #### Scenario: archive success clears prior acceptance error in parallel mode
 
 - **GIVEN** change `alpha` is in parallel execution mode
@@ -332,6 +358,16 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 - **WHEN** stale or unrelated success observations are processed
 - **THEN** `alpha` SHALL remain rejected
 - **AND** no success event SHALL silently turn rejected into merged or archived
+
+#### Scenario: stalled infrastructure hold remains resumable
+
+- **GIVEN** change `alpha` has a valid active proposal
+- **AND** a required verification gate cannot complete because infrastructure is unavailable
+- **WHEN** the reducer receives the stalled-hold event or workspace status
+- **THEN** `alpha` SHALL have terminal state `None`
+- **AND** `alpha` SHALL have wait state `Stalled`
+- **AND** `alpha` SHALL display as `stalled`
+- **AND** `alpha` SHALL NOT display as `rejected`
 
 ### Requirement: Rejection Flow Execution
 
@@ -544,6 +580,8 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+
 #### Scenario: archive success clears prior acceptance error in parallel mode
 
 - **GIVEN** change `alpha` is in parallel execution mode
@@ -573,6 +611,16 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 - **WHEN** stale or unrelated success observations are processed
 - **THEN** `alpha` SHALL remain rejected
 - **AND** no success event SHALL silently turn rejected into merged or archived
+
+#### Scenario: stalled infrastructure hold remains resumable
+
+- **GIVEN** change `alpha` has a valid active proposal
+- **AND** a required verification gate cannot complete because infrastructure is unavailable
+- **WHEN** the reducer receives the stalled-hold event or workspace status
+- **THEN** `alpha` SHALL have terminal state `None`
+- **AND** `alpha` SHALL have wait state `Stalled`
+- **AND** `alpha` SHALL display as `stalled`
+- **AND** `alpha` SHALL NOT display as `rejected`
 
 ### Requirement: Rejected terminal state remains distinct from errors
 
@@ -618,6 +666,8 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+
 #### Scenario: archive success clears prior acceptance error in parallel mode
 
 - **GIVEN** change `alpha` is in parallel execution mode
@@ -647,6 +697,16 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 - **WHEN** stale or unrelated success observations are processed
 - **THEN** `alpha` SHALL remain rejected
 - **AND** no success event SHALL silently turn rejected into merged or archived
+
+#### Scenario: stalled infrastructure hold remains resumable
+
+- **GIVEN** change `alpha` has a valid active proposal
+- **AND** a required verification gate cannot complete because infrastructure is unavailable
+- **WHEN** the reducer receives the stalled-hold event or workspace status
+- **THEN** `alpha` SHALL have terminal state `None`
+- **AND** `alpha` SHALL have wait state `Stalled`
+- **AND** `alpha` SHALL display as `stalled`
+- **AND** `alpha` SHALL NOT display as `rejected`
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -666,6 +726,8 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+
 #### Scenario: archive success clears prior acceptance error in parallel mode
 
 - **GIVEN** change `alpha` is in parallel execution mode
@@ -695,6 +757,16 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 - **WHEN** stale or unrelated success observations are processed
 - **THEN** `alpha` SHALL remain rejected
 - **AND** no success event SHALL silently turn rejected into merged or archived
+
+#### Scenario: stalled infrastructure hold remains resumable
+
+- **GIVEN** change `alpha` has a valid active proposal
+- **AND** a required verification gate cannot complete because infrastructure is unavailable
+- **WHEN** the reducer receives the stalled-hold event or workspace status
+- **THEN** `alpha` SHALL have terminal state `None`
+- **AND** `alpha` SHALL have wait state `Stalled`
+- **AND** `alpha` SHALL display as `stalled`
+- **AND** `alpha` SHALL NOT display as `rejected`
 
 ### Requirement: WebSocket change status consistency with TUI
 
@@ -914,3 +986,28 @@ The scheduler SHALL be able to re-own and resume archive finalization repair for
 - **WHEN** Conflux reports the final outcome
 - **THEN** it MAY emit a terminal archive failure
 - **AND** the reported blocker identifies the final archive-finalization reason rather than implying the archive move itself never happened
+
+### Requirement: Stalled blocker metadata
+
+When a change enters non-terminal stalled state because of an infrastructure, external dependency, credential, or pending-verification blocker, reducer-owned state SHALL preserve operator-facing metadata sufficient to distinguish the blocker from dependency blocking and terminal rejection.
+
+The metadata SHALL include, either as individual fields or an equivalent structured string, the failed gate or phase, observed error summary, resumability, recommended next action, and worktree preservation context.
+
+#### Scenario: stalled blocker records next action
+
+- **GIVEN** acceptance cannot run an API startup smoke gate because Docker image pull failed with DNS timeout
+- **WHEN** the change enters stalled state
+- **THEN** blocked metadata identifies the blocker as infrastructure or equivalent
+- **AND** the metadata includes the failed gate or phase
+- **AND** the metadata summarizes the observed Docker/DNS error
+- **AND** the metadata states the hold is resumable
+- **AND** the metadata recommends restoring Docker image or network/DNS availability and rerunning the gate
+
+#### Scenario: dependency blocked and execution stalled remain distinguishable
+
+- **GIVEN** change `beta` is waiting on an unresolved dependency
+- **AND** change `gamma` is held by an infrastructure verification blocker
+- **WHEN** display statuses are derived from reducer-owned state
+- **THEN** `beta` displays as dependency `blocked`
+- **AND** `gamma` displays as execution `stalled`
+- **AND** neither state is derived from base-branch `REJECTED.md`
