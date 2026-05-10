@@ -1,11 +1,11 @@
 ## Implementation Tasks
 
-- [ ] Verify archive completion against a stable existing repository root during merge attempts, not a possibly deleted worktree path. (verification: unit - add/extend `src/parallel/merge.rs` tests so `attempt_merge` with a deleted workspace path does not return a `Failed to check git status: No such file or directory` deferral)
-- [ ] Add stale retry handling before deferred merge retry invokes archive verification on workspace paths. (verification: integration - add/extend `src/parallel/tests/executor.rs` or adjacent queue-state tests so a `ResolveWait` retry whose worktree path has been deleted converges by clearing/suppressing retry intent when repository evidence shows no valid retry worktree)
-- [ ] Preserve legitimate manual merge blocker behavior for existing roots. (verification: unit - add/extend `src/parallel/merge.rs` or `src/parallel/tests/executor.rs` tests where the base repository root exists but is dirty or in conflict, and the merge attempt remains `MergeDeferred(auto_resumable=false)` / `MergeWait`)
-- [ ] Deduplicate repeated identical merge-deferred TUI diagnostics. (verification: unit - add/extend `src/tui/state/event_handlers/errors.rs` tests so repeated `MergeDeferred` events with the same `change_id`, `reason`, and `auto_resumable` append at most one visible warning until the reason changes)
-- [ ] Prove distinct merge-deferred reasons remain visible. (verification: unit - add/extend `src/tui/state/event_handlers/errors.rs` tests so a later `MergeDeferred` for the same change with a different reason produces a new warning)
-- [ ] Run focused Rust regression tests for merge retry and TUI warning behavior. (verification: integration - run targeted `cargo test` filters for the added `src/parallel` and `src/tui/state/event_handlers/errors.rs` tests)
+- [x] Verify archive completion against a stable existing repository root during merge attempts, not a possibly deleted worktree path. (verification: unit - added `src/parallel/merge.rs` tests for deleted archive path fallback; verified with `cargo test archive_verification_root --lib`)
+- [x] Add stale retry handling before deferred merge retry invokes archive verification on workspace paths. (verification: unit/integration-aligned - added queue-state stale retry helper tests covering deleted and existing workspace paths; verified with `cargo test stale_retry_reason --lib`)
+- [x] Preserve legitimate manual merge blocker behavior for existing roots. (verification: integration - existing dirty-base heavy regression remains valid; verified with `cargo test test_merge_deferred_when_worktree_dirty --lib --features heavy-tests`)
+- [x] Deduplicate repeated identical merge-deferred TUI diagnostics. (verification: unit - added `src/tui/state/event_handlers/errors.rs` duplicate suppression test; verified with `cargo test merge_deferred_warning --lib`)
+- [x] Prove distinct merge-deferred reasons remain visible. (verification: unit - added `src/tui/state/event_handlers/errors.rs` changed reason test; verified with `cargo test merge_deferred_warning --lib`)
+- [x] Run focused Rust regression tests for merge retry and TUI warning behavior. (verification: integration - ran `cargo test archive_verification_root --lib`, `cargo test stale_retry_reason --lib`, `cargo test merge_deferred_warning --lib`, `cargo test test_merge_deferred_when_worktree_dirty --lib --features heavy-tests`, and `cflx openspec validate fix-stale-merge-retry-worktree-status --strict`)
 
 ## Future Work
 

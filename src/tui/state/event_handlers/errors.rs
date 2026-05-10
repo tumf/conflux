@@ -1,6 +1,6 @@
 use crate::tui::events::{LogEntry, TuiCommand};
 
-use super::AppState;
+use crate::tui::state::{AppState, MergeDeferredDiagnosticSignature};
 
 impl AppState {
     pub(crate) fn handle_processing_error(&mut self, id: String, error: String) {
@@ -104,6 +104,37 @@ impl AppState {
         }
     }
 
+    fn add_merge_deferred_warning_log(
+        &mut self,
+        change_id: &str,
+        reason: &str,
+        auto_resumable: bool,
+        message: String,
+    ) {
+        let signature = MergeDeferredDiagnosticSignature {
+            change_id: change_id.to_string(),
+            reason: reason.to_string(),
+            auto_resumable,
+        };
+
+        if self
+            .last_merge_deferred_diagnostic
+            .as_ref()
+            .is_some_and(|last| last == &signature)
+        {
+            tracing::debug!(
+                change_id = %change_id,
+                auto_resumable = auto_resumable,
+                reason = %reason,
+                "Suppressing repeated merge-deferred TUI diagnostic"
+            );
+            return;
+        }
+
+        self.last_merge_deferred_diagnostic = Some(signature);
+        self.add_log(LogEntry::warn(message));
+    }
+
     pub(crate) fn handle_merge_deferred(
         &mut self,
         change_id: String,
@@ -117,24 +148,39 @@ impl AppState {
                 .any(|c| c.id == change_id && c.display_status_cache == "resolving");
 
             if is_current_resolving {
-                self.add_log(LogEntry::warn(format!(
-                    "Merge deferred for '{}' (currently resolving, not queued): {}",
-                    change_id, reason
-                )));
+                self.add_merge_deferred_warning_log(
+                    &change_id,
+                    &reason,
+                    auto_resumable,
+                    format!(
+                        "Merge deferred for '{}' (currently resolving, not queued): {}",
+                        change_id, reason
+                    ),
+                );
             } else {
                 if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                     change.set_display_status_cache("resolve pending");
                 }
                 if self.add_to_resolve_queue(&change_id) {
-                    self.add_log(LogEntry::warn(format!(
-                        "Merge deferred for '{}' (queued for resolve): {}",
-                        change_id, reason
-                    )));
+                    self.add_merge_deferred_warning_log(
+                        &change_id,
+                        &reason,
+                        auto_resumable,
+                        format!(
+                            "Merge deferred for '{}' (queued for resolve): {}",
+                            change_id, reason
+                        ),
+                    );
                 } else {
-                    self.add_log(LogEntry::warn(format!(
-                        "Merge deferred for '{}' (already queued): {}",
-                        change_id, reason
-                    )));
+                    self.add_merge_deferred_warning_log(
+                        &change_id,
+                        &reason,
+                        auto_resumable,
+                        format!(
+                            "Merge deferred for '{}' (already queued): {}",
+                            change_id, reason
+                        ),
+                    );
                 }
             }
             None
@@ -143,19 +189,26 @@ impl AppState {
                 change.set_display_status_cache("resolve pending");
             }
             self.add_to_resolve_queue(&change_id);
-            self.add_log(LogEntry::warn(format!(
-                "Merge deferred for '{}' (auto-resumable, queued scheduler retry intent): {}",
-                change_id, reason
-            )));
+            self.add_merge_deferred_warning_log(
+                &change_id,
+                &reason,
+                auto_resumable,
+                format!(
+                    "Merge deferred for '{}' (auto-resumable, queued scheduler retry intent): {}",
+                    change_id, reason
+                ),
+            );
             Some(TuiCommand::ResolveMerge(change_id))
         } else {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 change.set_display_status_cache("merge wait");
             }
-            self.add_log(LogEntry::warn(format!(
-                "Merge deferred for {}: {}",
-                change_id, reason
-            )));
+            self.add_merge_deferred_warning_log(
+                &change_id,
+                &reason,
+                auto_resumable,
+                format!("Merge deferred for {}: {}", change_id, reason),
+            );
             None
         }
     }
@@ -405,6 +458,67 @@ mod tests {
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
         assert!(cmd.is_none());
         assert!(app.resolve_queue_set.contains("change-b"));
+    }
+
+    #[test]
+    fn duplicate_merge_deferred_warning_is_suppressed() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "stale workspace path".to_string(),
+            false,
+        );
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "stale workspace path".to_string(),
+            false,
+        );
+
+        let matching_logs = app
+            .logs
+            .iter()
+            .filter(|log| log.message.contains("stale workspace path"))
+            .count();
+        assert_eq!(matching_logs, 1);
+    }
+
+    #[test]
+    fn distinct_merge_deferred_reason_is_logged_after_suppressed_duplicate() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "stale workspace path".to_string(),
+            false,
+        );
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "stale workspace path".to_string(),
+            false,
+        );
+        app.handle_merge_deferred(
+            "change-a".to_string(),
+            "Working tree has uncommitted changes".to_string(),
+            false,
+        );
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message.contains("stale workspace path")));
+        assert!(app.logs.iter().any(|log| log
+            .message
+            .contains("Working tree has uncommitted changes")));
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|log| log.message.contains("Merge deferred for change-a"))
+                .count(),
+            2
+        );
     }
 
     #[test]
