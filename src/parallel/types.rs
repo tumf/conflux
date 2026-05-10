@@ -17,6 +17,29 @@ pub struct WorkspaceResult {
     pub rejected: Option<String>,
 }
 
+/// Successful bookkeeping outcome of a background merge operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeTaskOutcome {
+    /// The archived change was merged into the base branch.
+    Merged,
+    /// The merge did not complete and must remain pending for retry or operator action.
+    Deferred {
+        /// Human-readable reason for defer.
+        reason: String,
+        /// Whether the deferral can be retried automatically when the base-mutating lane frees.
+        auto_resumable: bool,
+    },
+}
+
+impl MergeTaskOutcome {
+    pub fn deferred(reason: impl Into<String>, auto_resumable: bool) -> Self {
+        Self::Deferred {
+            reason: reason.into(),
+            auto_resumable,
+        }
+    }
+}
+
 /// Result of a background merge operation triggered after workspace completion.
 #[derive(Debug, Clone)]
 pub struct MergeResult {
@@ -25,7 +48,7 @@ pub struct MergeResult {
     /// Workspace name that produced this merge attempt.
     pub workspace_name: String,
     /// Outcome of the merge attempt.
-    pub outcome: std::result::Result<(), String>,
+    pub outcome: std::result::Result<MergeTaskOutcome, String>,
 }
 
 /// Tracks failed changes and their dependencies to enable automatic skipping.

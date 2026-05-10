@@ -284,9 +284,11 @@ impl ParallelExecutor {
 
                 // Background merge completion: merge+cleanup finished asynchronously
                 Some(merge_result) = merge_result_rx.recv() => {
-                    self.handle_merge_result(merge_result).await;
-                    self.trigger_resolve_wait_retry_dispatch();
-                    reanalysis_reason = ReanalysisReason::ResolveCompletion;
+                    let merged = self.handle_merge_result(merge_result).await;
+                    if merged {
+                        self.trigger_resolve_wait_retry_dispatch();
+                        reanalysis_reason = ReanalysisReason::ResolveCompletion;
+                    }
                 }
 
                 // Queue notification: dynamic queue has new items

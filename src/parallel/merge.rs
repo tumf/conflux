@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use super::acceptance_state::delete_acceptance_state;
 use super::conflict;
 use super::events::send_event;
+use super::MergeTaskOutcome;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 
@@ -269,7 +270,7 @@ impl ParallelExecutor {
     pub(super) async fn handle_merge_and_cleanup(
         &mut self,
         workspace_result: super::types::WorkspaceResult,
-    ) -> Result<()> {
+    ) -> Result<MergeTaskOutcome> {
         let revisions = vec![workspace_result.workspace_name.clone()];
         let change_ids = vec![workspace_result.change_id.clone()];
 
@@ -376,11 +377,11 @@ impl ParallelExecutor {
                                 &self.event_tx,
                                 ParallelEvent::ResolveFailed {
                                     change_id: workspace_result.change_id.clone(),
-                                    error: message,
+                                    error: message.clone(),
                                 },
                             )
                             .await;
-                            return Ok(());
+                            return Err(OrchestratorError::GitCommand(message));
                         }
                     }
 
@@ -429,9 +430,12 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
+                    Ok(MergeTaskOutcome::Merged)
                 }
                 Ok(MergeAttempt::Deferred(deferred)) => {
-                    if deferred.auto_resumable {
+                    let reason = deferred.reason.clone();
+                    let auto_resumable = deferred.auto_resumable;
+                    if auto_resumable {
                         self.resolve_wait_changes
                             .insert(workspace_result.change_id.clone());
                         self.merge_wait_changes.remove(&workspace_result.change_id);
@@ -452,8 +456,8 @@ impl ParallelExecutor {
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: workspace_result.change_id.clone(),
-                            reason: deferred.reason,
-                            auto_resumable: deferred.auto_resumable,
+                            reason: reason.clone(),
+                            auto_resumable,
                         },
                     )
                     .await;
@@ -467,6 +471,7 @@ impl ParallelExecutor {
                         },
                     )
                     .await;
+                    Ok(MergeTaskOutcome::deferred(reason, auto_resumable))
                 }
                 Err(e) => {
                     let error_msg = format!(
@@ -474,17 +479,24 @@ impl ParallelExecutor {
                         workspace_result.change_id, workspace_result.workspace_name, e
                     );
                     tracing::error!("{}", error_msg);
-                    send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Error {
+                            message: error_msg.clone(),
+                        },
+                    )
+                    .await;
+                    Err(OrchestratorError::GitCommand(error_msg))
                 }
             }
         } else {
-            tracing::warn!(
+            let reason = format!(
                 "Workspace '{}' not found after archive completion, skipping merge",
                 workspace_result.workspace_name
             );
+            tracing::warn!("{}", reason);
+            Ok(MergeTaskOutcome::deferred(reason, false))
         }
-
-        Ok(())
     }
 
     pub(super) async fn attempt_merge(
