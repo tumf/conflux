@@ -145,7 +145,7 @@ impl ParallelExecutor {
             resolve_wait_changes: HashSet::new(),
             reject_wait_changes: HashSet::new(),
             merge_wait_changes: HashSet::new(),
-            previously_blocked_changes: HashSet::new(),
+            dependency_blocker_fingerprints: HashMap::new(),
             force_recreate_worktree: HashSet::new(),
             hooks: None,
             cancel_token: None,

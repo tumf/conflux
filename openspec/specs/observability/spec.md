@@ -47,6 +47,22 @@ TUI Logs View は、依存未解決のまま進展しない queued change に対
 - **AND** the diagnostic remains available at least once or through a summary/rate-limited entry
 - **AND** suppression state is not used to decide scheduling, resume routing, acceptance, archive, or next-action behavior
 
+#### Scenario: unchanged scheduler observations do not create new diagnostics
+
+- **GIVEN** a scheduler loop repeatedly observes the same dependency blocker, worktree status, or merge-wait diagnostic state
+- **AND** the comparable observation fingerprint has not changed since the previous emitted diagnostic
+- **WHEN** the scheduler loop runs again
+- **THEN** Conflux does not emit another user-visible TUI log entry for that unchanged observation
+- **AND** Conflux does not emit another repeated info/warn debug log entry for that unchanged observation
+- **AND** any suppression or fingerprint state remains non-authoritative and is not used for workflow-control decisions
+
+#### Scenario: changed scheduler observations remain visible
+
+- **GIVEN** a scheduler diagnostic was previously emitted for a dependency blocker, worktree status, or merge-wait observation
+- **WHEN** the comparable observation fingerprint changes
+- **THEN** Conflux emits a new diagnostic/log entry that makes the changed state visible
+- **AND** the new diagnostic includes enough context to distinguish it from the prior observation
+
 #### Scenario: dependency-blocked TUI logs are bounded while blocked state is unchanged
 
 - **GIVEN** queued change `alpha` has already been displayed as `blocked`
