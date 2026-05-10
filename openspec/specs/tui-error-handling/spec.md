@@ -46,27 +46,21 @@ Non-fatal warning popups used for merge, resolve, hook, and warning diagnostics 
 
 ### Requirement: App Error Mode Is Reserved for Fatal Errors
 
-TUI は致命的なエラーイベントを受信した場合にのみ AppMode を `Error` に遷移させなければならない（SHALL）。
+TUI merge-deferred diagnostics caused by retry scheduling SHALL be bounded when the same change repeatedly receives the same merge-deferred reason and retry classification. Exact duplicate diagnostics MUST NOT flood the visible log, while distinct reasons for the same change MUST remain visible.
 
-Stale local auto-refresh roots, including a repository/worktree path deleted after the TUI captured it, SHALL NOT be treated as change-processing errors or fatal AppMode errors. The TUI SHALL bound warnings for such stale roots so the same missing root does not produce repeated snapshot warnings on every refresh tick.
+This diagnostic suppression is UI observability behavior only and MUST NOT be used as workflow-control input.
 
-#### Scenario: 致命的エラーで AppMode が Error になる
-- **GIVEN** the TUI is running
-- **WHEN** a fatal `Error` event is received
-- **THEN** the AppMode SHALL transition to `Error`
+#### Scenario: repeated identical merge-deferred warning is bounded
 
-#### Scenario: Missing auto-refresh root does not flood warnings
+- **GIVEN** the TUI has already logged a `MergeDeferred` warning for change `alpha`
+- **AND** the warning reason and `auto_resumable` classification are unchanged
+- **WHEN** subsequent identical `MergeDeferred` events arrive during retry convergence
+- **THEN** the TUI SHALL NOT append an unbounded number of identical warning log entries
+- **AND** the application mode SHALL NOT transition to fatal error solely because of the repeated warning
 
-- **GIVEN** a local TUI session captured a repository/worktree root
-- **AND** that root no longer exists when auto-refresh runs
-- **WHEN** multiple auto-refresh ticks occur
-- **THEN** the TUI SHALL NOT run repeated snapshot git commands against the missing root on every tick
-- **AND** the TUI SHALL emit at most one warning for that stale root per session, or apply an explicit rate limit/backoff
-- **AND** AppMode SHALL NOT transition to `Error` solely because of the stale refresh root
+#### Scenario: changed merge-deferred reason remains visible
 
-#### Scenario: Existing-root snapshot failures remain visible
-
-- **GIVEN** a local TUI session captured a repository/worktree root that still exists
-- **AND** a refresh snapshot command fails for an actionable git/VCS reason
-- **WHEN** auto-refresh handles the failure
-- **THEN** the TUI SHALL log a warning with enough context to identify the failed snapshot operation and root
+- **GIVEN** the TUI previously suppressed or logged a `MergeDeferred` warning for change `alpha`
+- **WHEN** a later `MergeDeferred` event for `alpha` has a different reason or retry classification
+- **THEN** the TUI SHALL append a new visible warning log entry
+- **AND** the new diagnostic SHALL preserve enough content for the operator to identify the current blocker
