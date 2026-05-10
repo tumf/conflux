@@ -105,6 +105,11 @@ pub(super) fn request_merge_worktree_branch(state: &mut AppState) -> Option<TuiC
         return None;
     }
 
+    if state.suppress_if_selected_worktree_deleting() {
+        debug!("Merge blocked: selected worktree is already being deleted");
+        return None;
+    }
+
     let worktree = &state.worktrees[state.worktree_cursor_index];
     debug!(
         "Worktree selected: path={}, branch={}, is_main={}, is_detached={}, has_conflict={}",

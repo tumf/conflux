@@ -1540,16 +1540,20 @@ fn render_worktree_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
             } else {
                 String::new()
             };
+            let deleting = app.is_worktree_deleting(&wt.path);
+            let delete_indicator = if deleting { " [Deleting...]" } else { "" };
 
             let line = format!(
-                "{} → {}{}{}{}",
-                label, branch, indicator, merge_indicator, conflict_badge
+                "{} → {}{}{}{}{}",
+                label, branch, indicator, merge_indicator, conflict_badge, delete_indicator
             );
 
             // Style based on conflict and selection
             let mut style = Style::default();
 
-            if wt.has_merge_conflict() {
+            if deleting {
+                style = style.fg(Color::Yellow);
+            } else if wt.has_merge_conflict() {
                 style = style.fg(Color::Red);
             } else if wt.is_main {
                 style = style.fg(Color::Green);
@@ -1631,6 +1635,11 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
     // Status line
     let status = if let Some(ref msg) = app.warning_message {
         Span::styled(msg, Style::default().fg(Color::Yellow))
+    } else if let Some(label) = app.deleting_worktree_status_label() {
+        Span::styled(
+            format!("Deleting worktree: {}", label),
+            Style::default().fg(Color::Yellow),
+        )
     } else {
         let count = app.worktrees.len();
         Span::styled(
@@ -1824,6 +1833,7 @@ mod tests {
     use crate::openspec::Change;
     use crate::openspec::ProposalMetadata;
     use crate::tui::events::LogEntry;
+    use crate::tui::types::{ViewMode, WorktreeInfo};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
@@ -1849,6 +1859,19 @@ mod tests {
         app
     }
 
+    fn create_test_worktree(path: &str, branch: &str) -> WorktreeInfo {
+        WorktreeInfo {
+            path: path.into(),
+            head: "abc123".to_string(),
+            branch: branch.to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: true,
+            is_merging: false,
+        }
+    }
+
     fn render_buffer(app: &mut AppState, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal init");
@@ -1866,6 +1889,20 @@ mod tests {
             lines.push(line);
         }
         lines.join("\n")
+    }
+
+    #[test]
+    fn worktree_view_renders_deleting_badge_and_footer_status() {
+        let mut app = create_test_app(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
+        app.mark_worktree_deleting("/tmp/worktree-a");
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("[Deleting...]"));
+        assert!(content.contains("Deleting worktree: worktree-a"));
     }
 
     #[test]

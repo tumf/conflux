@@ -237,6 +237,11 @@ pub struct AppState {
     pub is_resolving: bool,
     /// Map of change_id to worktree path for active worktrees (for progress fallback)
     pub worktree_paths: HashMap<String, PathBuf>,
+    /// Process-local UI markers for manually requested worktree deletions.
+    ///
+    /// This is transient observability/input-suppression state only. It must not be
+    /// persisted or used by orchestration reducers/schedulers as workflow-control input.
+    deleting_worktree_paths: HashSet<PathBuf>,
     /// Reference to shared orchestration state (for unified state tracking)
     /// TUI can query this for pending/archived status, apply counts, etc.
     pub shared_orchestrator_state:
@@ -414,6 +419,7 @@ impl AppState {
             web_url: None,
             is_resolving: false,
             worktree_paths: HashMap::new(),
+            deleting_worktree_paths: HashSet::new(),
             shared_orchestrator_state: None,
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
@@ -547,10 +553,62 @@ impl AppState {
         }
     }
 
+    /// Mark a worktree as having an accepted delete request in progress.
+    pub fn mark_worktree_deleting(&mut self, path: impl Into<PathBuf>) {
+        self.deleting_worktree_paths.insert(path.into());
+    }
+
+    /// Clear the transient delete-in-progress marker for a worktree.
+    pub fn clear_worktree_deleting(&mut self, path: &PathBuf) {
+        self.deleting_worktree_paths.remove(path);
+    }
+
+    /// Return whether a worktree path is currently marked deleting.
+    pub fn is_worktree_deleting(&self, path: &PathBuf) -> bool {
+        self.deleting_worktree_paths.contains(path)
+    }
+
+    /// Return a display label for the first visible deleting worktree, if any.
+    pub fn deleting_worktree_status_label(&self) -> Option<String> {
+        self.worktrees
+            .iter()
+            .find(|worktree| self.is_worktree_deleting(&worktree.path))
+            .map(|worktree| worktree.display_label())
+            .or_else(|| {
+                self.deleting_worktree_paths
+                    .iter()
+                    .next()
+                    .map(|path| path.display().to_string())
+            })
+    }
+
+    fn selected_worktree_is_deleting(&self) -> bool {
+        self.get_selected_worktree()
+            .is_some_and(|worktree| self.is_worktree_deleting(&worktree.path))
+    }
+
+    fn block_selected_deleting_worktree_action(&mut self) -> bool {
+        if self.selected_worktree_is_deleting() {
+            self.warning_message = Some("Worktree is already being deleted".to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return true if the selected worktree is deleting and the caller should suppress its action.
+    pub fn suppress_if_selected_worktree_deleting(&mut self) -> bool {
+        self.block_selected_deleting_worktree_action()
+    }
+
     /// Request worktree delete with validation
     ///
     /// Returns Some(TuiCommand) if deletion should proceed, None if it should be blocked
     pub fn request_worktree_delete_from_list(&mut self) -> Option<TuiCommand> {
+        if self.block_selected_deleting_worktree_action() {
+            return None;
+        }
+
         match worktree_action_logic::validate_delete_request(
             &self.worktrees,
             self.worktree_cursor_index,
@@ -574,11 +632,31 @@ impl AppState {
         }
     }
 
-    /// Confirm and execute pending worktree action
+    /// Confirm and execute pending worktree action.
     pub fn confirm_worktree_action_delete(&mut self) -> Option<TuiCommand> {
+        self.confirm_worktree_action_delete_with_options(false)
+    }
+
+    /// Confirm and execute pending worktree deletion with explicit teardown behavior.
+    pub fn confirm_worktree_action_delete_with_options(
+        &mut self,
+        skip_teardown: bool,
+    ) -> Option<TuiCommand> {
         if let Some((path, WorktreeAction::Delete)) = self.pending_worktree_action.take() {
             // Get the branch name that was stored when the delete was requested
             let branch_name = self.pending_worktree_branch.take();
+            let path_buf = PathBuf::from(&path);
+            self.mark_worktree_deleting(path_buf.clone());
+            let teardown_note = if skip_teardown {
+                " with skip-teardown"
+            } else {
+                ""
+            };
+            self.add_log(LogEntry::info(format!(
+                "Deleting worktree{}: {}",
+                teardown_note,
+                path_buf.display()
+            )));
 
             // Restore previous mode
             if let Some(mode) = self.previous_mode.take() {
@@ -588,9 +666,9 @@ impl AppState {
             }
 
             Some(TuiCommand::DeleteWorktreeByPath(
-                path.into(),
+                path_buf,
                 branch_name,
-                false,
+                skip_teardown,
             ))
         } else {
             None
@@ -1472,6 +1550,105 @@ mod tests {
             dependencies: Vec::new(),
             metadata: crate::openspec::ProposalMetadata::default(),
         }
+    }
+
+    fn create_test_worktree(path: &str, branch: &str, is_main: bool) -> WorktreeInfo {
+        WorktreeInfo {
+            path: PathBuf::from(path),
+            head: "abc123".to_string(),
+            branch: branch.to_string(),
+            is_detached: false,
+            is_main,
+            merge_conflict: None,
+            has_commits_ahead: true,
+            is_merging: false,
+        }
+    }
+
+    #[test]
+    fn worktree_delete_progress_marker_marks_and_clears_path() {
+        let mut app = AppState::new(vec![]);
+        let path = PathBuf::from("/tmp/worktree-a");
+
+        assert!(!app.is_worktree_deleting(&path));
+        app.mark_worktree_deleting(path.clone());
+        assert!(app.is_worktree_deleting(&path));
+        app.clear_worktree_deleting(&path);
+        assert!(!app.is_worktree_deleting(&path));
+    }
+
+    #[test]
+    fn worktree_delete_confirmation_marks_before_emitting_delete_command() {
+        let mut app = AppState::new(vec![]);
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a", false)];
+        app.request_worktree_delete_from_list();
+
+        let command = app.confirm_worktree_action_delete();
+
+        assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
+        assert!(matches!(
+            command,
+            Some(TuiCommand::DeleteWorktreeByPath(path, Some(branch), false))
+                if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
+        ));
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Deleting worktree: /tmp/worktree-a")));
+    }
+
+    #[test]
+    fn worktree_skip_teardown_confirmation_marks_before_emitting_delete_command() {
+        let mut app = AppState::new(vec![]);
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a", false)];
+        app.request_worktree_delete_from_list();
+
+        let command = app.confirm_worktree_action_delete_with_options(true);
+
+        assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
+        assert!(matches!(
+            command,
+            Some(TuiCommand::DeleteWorktreeByPath(path, Some(branch), true))
+                if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
+        ));
+        assert!(app.logs.iter().any(|entry| {
+            entry
+                .message
+                .contains("Deleting worktree with skip-teardown: /tmp/worktree-a")
+        }));
+    }
+
+    #[test]
+    fn worktree_delete_request_is_suppressed_while_marker_is_active() {
+        let mut app = AppState::new(vec![]);
+        let path = PathBuf::from("/tmp/worktree-a");
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a", false)];
+        app.mark_worktree_deleting(path);
+
+        app.request_worktree_delete_from_list();
+
+        assert!(app.pending_worktree_action.is_none());
+        assert_eq!(
+            app.warning_message.as_deref(),
+            Some("Worktree is already being deleted")
+        );
+    }
+
+    #[test]
+    fn merge_request_is_suppressed_while_selected_worktree_is_deleting() {
+        let mut app = AppState::new(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        let path = PathBuf::from("/tmp/worktree-a");
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a", false)];
+        app.mark_worktree_deleting(path);
+
+        let command = app.request_merge_worktree_branch();
+
+        assert!(command.is_none());
+        assert_eq!(
+            app.warning_message.as_deref(),
+            Some("Worktree is already being deleted")
+        );
     }
 
     #[test]
