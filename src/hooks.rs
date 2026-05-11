@@ -864,10 +864,11 @@ impl HookRunner {
                         );
                         return Ok(());
                     } else {
-                        error!(
-                            "{} hook failed after {} attempt(s)",
-                            hook_type, max_attempts
-                        );
+                        self.emit_runner_log(
+                            HookRunnerLogLevel::Error,
+                            format!("{} hook failed after {} attempt(s)", hook_type, max_attempts),
+                        )
+                        .await;
                         return Err(OrchestratorError::HookFailed {
                             hook_type: hook_type.to_string(),
                             message: format!(
