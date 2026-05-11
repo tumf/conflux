@@ -83,7 +83,7 @@ impl PermissionDenial {
     pub fn format_guidance(&self) -> String {
         format!(
             "Repeated unresolved permission/tool policy denial detected for {}: {}. \
-Operator action required: update the local harness/tool permission policy or grant access, then resume the preserved workspace.",
+operator action required: update the local harness/tool permission policy or grant access, then resume the preserved workspace.",
             self.category.as_str(),
             self.denied_target
         )
@@ -208,9 +208,9 @@ pub fn classify_permission_denial(sources: &[Option<&str>]) -> Option<Permission
         });
     }
 
-    if let Some(caps) = file_read_denied_pattern().captures(&combined) {
+    if let Some(caps) = tool_denied_pattern().captures(&combined) {
         return Some(PermissionDenial {
-            category: PermissionDenialCategory::FileRead,
+            category: PermissionDenialCategory::ToolAccess,
             denied_target: capture_target(&caps),
             evidence: caps
                 .get(0)
@@ -219,9 +219,9 @@ pub fn classify_permission_denial(sources: &[Option<&str>]) -> Option<Permission
         });
     }
 
-    if let Some(caps) = tool_denied_pattern().captures(&combined) {
+    if let Some(caps) = file_read_denied_pattern().captures(&combined) {
         return Some(PermissionDenial {
-            category: PermissionDenialCategory::ToolAccess,
+            category: PermissionDenialCategory::FileRead,
             denied_target: capture_target(&caps),
             evidence: caps
                 .get(0)

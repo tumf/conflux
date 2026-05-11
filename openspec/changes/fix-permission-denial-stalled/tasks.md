@@ -19,3 +19,8 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-permission-denial-stalled --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] `cargo test permission` が失敗しており、実装タスクで要求された permission 関連ユニット検証が通っていません。実行コマンド: `agent-exec run -- cargo test permission`（job_id `05b839d9eabd9fd48bb2c2a1f1b6dc08`, exit_code 101）。失敗1: `src/permission.rs:356` の `permission::tests::test_classifies_tool_access_denied` で `Tool access denied: Bash` が `ToolAccess` ではなく `FileRead` に分類されています（stdout.log lines 22-28）。`file_read_denied_pattern` が広すぎて tool denial を先に捕捉しているため、分類順序または正規表現境界を修正してください。
+- [x] `cargo test permission` の失敗2: `src/orchestration/state.rs:2384` の `orchestration::state::tests::test_execution_blocked_permission_denial_transitions_to_stalled_with_operator_guidance` で `metadata.contains("operator action")` が false です（stdout.log lines 30-34）。`PermissionDenial::format_guidance()` は `Operator action required` と大文字で返している一方、テストは小文字の `operator action` を要求しています。実際の operator guidance メタデータが仕様どおり検証されるよう、出力またはテスト期待値を整合させてください。
+- [x] 提案の明示完了条件では `cflx openspec validate fix-permission-denial-stalled --strict --evidence warn` と関連 Rust tests の成功が要求されています。OpenSpec strict/evidence warn と archive-gate は通過しましたが、関連 Rust tests が失敗しているため archive-ready ではありません。
