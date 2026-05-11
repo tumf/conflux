@@ -103,7 +103,9 @@ pub struct PermissionDenialTracker {
 
 impl PermissionDenialTracker {
     pub fn new() -> Self {
-        Self { last_signature: None }
+        Self {
+            last_signature: None,
+        }
     }
 
     pub fn observe(
@@ -135,12 +137,14 @@ pub struct PermissionDenialObservation {
 }
 
 /// Result of permission auto-reject detection
+#[allow(dead_code)] // Legacy compatibility API; new flows use PermissionDenial directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionReject {
     /// The path or command that was denied
     pub denied_path: String,
 }
 
+#[allow(dead_code)] // Legacy compatibility API; exercised by tests and external callers.
 impl PermissionReject {
     /// Create a new PermissionReject
     pub fn new(denied_path: String) -> Self {
@@ -183,7 +187,11 @@ fn capture_target(caps: &regex::Captures<'_>) -> String {
 }
 
 fn normalize_signature_target(target: &str) -> String {
-    target.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    target
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 pub fn classify_permission_denial(sources: &[Option<&str>]) -> Option<PermissionDenial> {
@@ -240,6 +248,7 @@ pub fn classify_permission_denial(sources: &[Option<&str>]) -> Option<Permission
 ///
 /// Searches for the pattern "permission requested" + "auto-rejecting" in the
 /// combined stdout/stderr tail output.
+#[allow(dead_code)] // Legacy compatibility API; new flows use classify_permission_denial.
 pub fn detect_permission_reject(
     stdout_tail: Option<&str>,
     stderr_tail: Option<&str>,

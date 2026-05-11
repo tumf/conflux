@@ -241,7 +241,10 @@ fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
 }
 
 impl StalledBlocker {
-    pub fn permission_denial(phase: impl Into<String>, denial: &crate::permission::PermissionDenial) -> Self {
+    pub fn permission_denial(
+        phase: impl Into<String>,
+        denial: &crate::permission::PermissionDenial,
+    ) -> Self {
         Self {
             category: format!("permission:{}", denial.category.as_str()),
             phase: phase.into(),

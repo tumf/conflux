@@ -62,6 +62,8 @@ pub enum OrchestratorError {
     NoVcsBackend,
 
     #[error("Permission auto-rejected: {denied_path}\n{guidance}")]
+    #[allow(dead_code)]
+    // Legacy soft-block variant retained for older serial/parallel apply paths.
     PermissionBlocked {
         denied_path: String,
         guidance: String,

@@ -1459,7 +1459,8 @@ pub async fn execute_acceptance_in_workspace(
                 acceptance_history.lock().await.record(change_id, attempt);
                 acceptance_tail_injected.lock().await.remove(change_id);
 
-                let blocker = crate::events::StalledBlocker::permission_denial("acceptance", denial);
+                let blocker =
+                    crate::events::StalledBlocker::permission_denial("acceptance", denial);
                 if let Some(ref tx) = event_tx {
                     let _ = tx
                         .send(ParallelEvent::ExecutionBlocked {
@@ -1684,7 +1685,8 @@ pub async fn execute_acceptance_in_workspace(
                     acceptance_history.lock().await.record(change_id, attempt);
                     acceptance_tail_injected.lock().await.remove(change_id);
 
-                    let blocker = crate::events::StalledBlocker::permission_denial("acceptance", denial);
+                    let blocker =
+                        crate::events::StalledBlocker::permission_denial("acceptance", denial);
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .send(ParallelEvent::ExecutionBlocked {

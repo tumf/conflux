@@ -1023,10 +1023,6 @@ where
             output_collector.stdout_tail().as_deref(),
             output_collector.stderr_tail().as_deref(),
         ]);
-        let permission_reject = permission_denial.as_ref().and_then(|denial| {
-            (denial.category == crate::permission::PermissionDenialCategory::AutoReject)
-                .then(|| crate::permission::PermissionReject::new(denial.denied_target.clone()))
-        });
 
         if let Some(denial) = &permission_denial {
             warn!(
