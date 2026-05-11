@@ -1,8 +1,4 @@
-## Purpose
-
-TUI における resolve 操作のライフサイクル（自動トリガー、直列化、キューイング）を定義し、resolve 操作同士の排他制御と apply/accept/archive パイプラインの非ブロック保証を規定する。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: auto-resumable-merge-deferred-triggers-resolve
 
@@ -43,41 +39,3 @@ When a scheduler is already running because other changes are applying, acceptin
 **Then**: the row remains visible as `resolve pending`
 **And**: the scheduler-owned retry intent remains available for dispatch
 **And**: the row returns to `merge wait` only after explicit failure or manual-deferral evidence
-
-### Requirement: resolve-merge-exclusive-execution
-
-`resolve_merge()` が即時開始パスを取る際、システムは Project スコープの `is_resolving` フラグを即座に `true` に設定しなければならず（MUST）、同一 Project 内の後続の M キー操作がキュー追加パスに入ることを保証しなければならない（MUST）。
-
-このフラグの影響範囲は **resolve 操作同士の直列化のみ** である。`start_processing`、`resume_processing`、`retry_error_changes` 等の apply/accept/archive パイプライン操作はこのフラグによってブロックされてはならない（MUST NOT）。
-
-本 Requirement は旧 spec 内で 2 回重複していた同名 Requirement を 1 つに統合したものである。
-
-#### Scenario: consecutive-m-key-press-during-resolve
-
-**Given**: change-a が `MergeWait` 状態で、同一 Project 内で resolve が実行中でない（`is_resolving` が `false`）
-**When**: change-a に対して M キーを押す
-**Then**: `is_resolving` が即座に `true` になり、`TuiCommand::ResolveMerge(change-a)` が返される
-
-#### Scenario: second-m-key-queues-when-first-resolving
-
-**Given**: change-a の `resolve_merge()` が即時開始され `is_resolving` が `true`
-**When**: 同一 Project 内の `MergeWait` 状態の change-b に対して M キーを押す
-**Then**: change-b は `ResolveWait` に遷移し、resolve キューに追加される（即時開始されない）
-
-#### Scenario: start-processing-not-blocked-by-resolving
-
-**Given**: 同一 Project 内のある Change が Resolving 状態である（`is_resolving` が `true`）
-**When**: ユーザーが `start_processing` を実行する
-**Then**: 選択された Change のキュー追加と処理開始が正常に行われる（`is_resolving` はチェックされない）
-
-#### Scenario: resume-processing-not-blocked-by-resolving
-
-**Given**: 同一 Project 内のある Change が Resolving 状態である（`is_resolving` が `true`）、`AppMode` が `Stopped`
-**When**: ユーザーが `resume_processing` を実行する
-**Then**: マークされた Change が `Queued` に遷移し処理が再開される（`is_resolving` はチェックされない）
-
-#### Scenario: retry-error-not-blocked-by-resolving
-
-**Given**: 同一 Project 内のある Change が Resolving 状態である（`is_resolving` が `true`）、`AppMode` が `Error`
-**When**: ユーザーが `retry_error_changes` を実行する
-**Then**: エラー状態の Change が `Queued` にリセットされリトライが開始される（`is_resolving` はチェックされない）
