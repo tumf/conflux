@@ -23,7 +23,10 @@ Expected archive gate: `cflx openspec validate fix-permission-denial-stalled --a
 ## Acceptance #1 Failure Follow-up
 - [x] `cargo test permission` が失敗しており、実装タスクで要求された permission 関連ユニット検証が通っていません。実行コマンド: `agent-exec run -- cargo test permission`（job_id `05b839d9eabd9fd48bb2c2a1f1b6dc08`, exit_code 101）。失敗1: `src/permission.rs:356` の `permission::tests::test_classifies_tool_access_denied` で `Tool access denied: Bash` が `ToolAccess` ではなく `FileRead` に分類されています（stdout.log lines 22-28）。`file_read_denied_pattern` が広すぎて tool denial を先に捕捉しているため、分類順序または正規表現境界を修正してください。
 - [x] `cargo test permission` の失敗2: `src/orchestration/state.rs:2384` の `orchestration::state::tests::test_execution_blocked_permission_denial_transitions_to_stalled_with_operator_guidance` で `metadata.contains("operator action")` が false です（stdout.log lines 30-34）。`PermissionDenial::format_guidance()` は `Operator action required` と大文字で返している一方、テストは小文字の `operator action` を要求しています。実際の operator guidance メタデータが仕様どおり検証されるよう、出力またはテスト期待値を整合させてください。
-- [x] 提案の明示完了条件では `cflx openspec validate fix-permission-denial-stalled --strict --evidence warn` と関連 Rust tests の成功が要求されています。OpenSpec strict/evidence warn と archive-gate は通過しましたが、関連 Rust tests が失敗しているため archive-ready ではありません。
+
+## Acceptance #1 Resolution Notes
+
+Acceptance #1 時点では、提案の明示完了条件である OpenSpec strict/evidence warn と関連 Rust tests の成功が未達だった。該当記録は履歴メモであり、behavior-bearing task として扱わない。
 
 ## Acceptance #2 Resolution Notes
 
@@ -44,3 +47,7 @@ Acceptance #5 の archive gate 指摘は、`tasks.md:29` の Acceptance #2 Failu
 ## Acceptance #6 Resolution Notes
 
 Acceptance #6 の archive gate 指摘2件は、Acceptance #2 と Acceptance #5 の失敗記録をチェックボックスではない Resolution Notes へ移すことで解消する。これにより、過去の archive gate コマンド文字列が自己参照 final validation checkbox として解釈されず、最終 OpenSpec 検証は非チェックボックスの `## Final Validation` セクションだけに残る。
+
+## Acceptance #7 Resolution Notes
+
+Acceptance #7 の archive gate 指摘は、Acceptance #1 Failure Follow-up の3件目が behavior-bearing checkbox として検出されたことが原因だった。対応として当該履歴記録を非チェックボックスの `Acceptance #1 Resolution Notes` へ移し、archive gate が自己参照的な最終検証履歴を実装タスクとして扱わない形に整理した。
