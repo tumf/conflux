@@ -26,4 +26,8 @@ Expected archive gate: `cflx openspec validate fix-permission-denial-stalled --a
 - [x] 提案の明示完了条件では `cflx openspec validate fix-permission-denial-stalled --strict --evidence warn` と関連 Rust tests の成功が要求されています。OpenSpec strict/evidence warn と archive-gate は通過しましたが、関連 Rust tests が失敗しているため archive-ready ではありません。
 
 ## Acceptance #2 Failure Follow-up
-- [x] Acceptance #1 Failure Follow-up の3件目を behavior-bearing checkbox として解釈されないよう整理し、同セクションの検証結果記録を自己参照の最終検証タスクから分離する。 (verification: manual - `openspec/changes/fix-permission-denial-stalled/tasks.md` の Failure Follow-up と `## Final Validation` セクションを確認)
+- [x] Acceptance #1 Failure Follow-up の3件目を behavior-bearing checkbox として解釈されないよう整理し、同セクションの検証結果記録を自己参照の最終検証タスクから分離する。 (verification: manual - `openspec/changes/fix-permission-denial-stalled/tasks.md:23-29` で Failure Follow-up と `## Final Validation` が分離済みであることを確認し、`cflx openspec validate fix-permission-denial-stalled --archive-gate` で archive gate が自己参照 final validation checkbox として検出しないことを検証する)
+
+## Acceptance #3 Resolution Notes
+
+Acceptance #3 の archive-gate 指摘は、Acceptance #2 Failure Follow-up の verification 注記を repository-verifiable evidence（対象ファイル行と実行可能コマンド）へ更新し、自己参照 final validation checkbox を増やさない非チェックボックス notes として記録することで解消する。
