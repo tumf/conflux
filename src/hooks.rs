@@ -914,10 +914,14 @@ impl HookRunner {
                         );
                         return Ok(());
                     } else {
-                        error!(
-                            "{} hook failed after {} attempt(s): {}",
-                            hook_type, max_attempts, e
-                        );
+                        self.emit_runner_log(
+                            HookRunnerLogLevel::Error,
+                            format!(
+                                "{} hook failed after {} attempt(s): {}",
+                                hook_type, max_attempts, e
+                            ),
+                        )
+                        .await;
                         return Err(e);
                     }
                 }
