@@ -6,7 +6,9 @@ TUI 固有のステータス enum（旧 `QueueStatus`）を保持してはなら
 
 TUI はログ表示の重複抑制のために transient な観測用状態を保持してよい（MAY）が、その状態を reducer-derived display status、scheduler dispatch、resume routing、acceptance、archive、または next-action decision の入力として使ってはならない（MUST NOT）。
 
-Refresh-time `merge_wait_ids` は、archived-but-not-merged workspace evidence から導出された TUI display synchronization input として扱ってよい（MAY）。TUI はこれを scheduler dispatch、resume routing、acceptance、archive、または next-action decision の入力として使ってはならない（MUST NOT）。
+Refresh-time `merge_wait_ids` は、archived-but-not-merged workspace evidence から導出された TUI display synchronization input として扱ってよい（MAY）。TUI はこれを scheduler dispatch、resume routing、acceptance、archive、または next-action decision の入力として使ってはならない（MUST NOT）。Refresh-time `merge_wait_ids` は、同じ Change の reducer-derived display status が `resolve pending` である場合、その accepted manual resolve intent を `merge wait` 表示へ降格してはならない（MUST NOT）。
+
+<!-- Expected canonical result after archive: `tui-state` will distinguish stale display-only merge-wait refresh correction from reducer-owned manual resolve pending preservation. -->
 
 #### Scenario: TUI が Reducer からステータスを読み取る
 
@@ -24,10 +26,20 @@ Refresh-time `merge_wait_ids` は、archived-but-not-merged workspace evidence �
 #### Scenario: refresh-derived merge wait corrects stale resolve pending display
 
 - **GIVEN** change `alpha` is displayed as `resolve pending`
+- **AND** the reducer snapshot does not report `alpha` as `resolve pending`
 - **AND** the refresh loop observes `alpha` as archive-complete but not merged into base
 - **WHEN** the TUI handles `OrchestratorEvent::ChangesRefreshed` with `alpha` in `merge_wait_ids`
 - **THEN** `alpha` is displayed as `merge wait`
 - **AND** the display correction does not enqueue, dispatch, archive, accept, or otherwise route workflow execution
+
+#### Scenario: refresh-derived merge wait does not overwrite accepted manual resolve pending
+
+- **GIVEN** change `alpha` is displayed as `resolve pending`
+- **AND** the reducer snapshot reports `alpha` as `resolve pending` because `ResolveMerge(alpha)` was accepted
+- **AND** the refresh loop still observes `alpha` as archive-complete but not merged into base
+- **WHEN** the TUI handles `OrchestratorEvent::ChangesRefreshed` with `alpha` in `merge_wait_ids`
+- **THEN** `alpha` remains displayed as `resolve pending`
+- **AND** the row is not reverted to `merge wait` solely from refresh-derived merge-wait evidence
 
 #### Scenario: stale merge wait refresh does not regress terminal display
 
