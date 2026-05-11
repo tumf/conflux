@@ -63,12 +63,17 @@ impl AppState {
         merge_wait_ids: HashSet<String>,
     ) {
         let terminal_merge_wait_statuses = self.terminal_merge_wait_statuses(&merge_wait_ids);
+        let reducer_resolve_wait_ids = self.reducer_resolve_wait_ids(&merge_wait_ids);
 
         self.worktree_paths = worktree_paths;
         self.update_changes(changes);
         self.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
         self.apply_worktree_status(&worktree_change_ids);
-        self.apply_refresh_merge_wait_status(&merge_wait_ids, &terminal_merge_wait_statuses);
+        self.apply_refresh_merge_wait_status(
+            &merge_wait_ids,
+            &terminal_merge_wait_statuses,
+            &reducer_resolve_wait_ids,
+        );
     }
 
     fn terminal_merge_wait_statuses(
@@ -85,10 +90,24 @@ impl AppState {
             .collect()
     }
 
+    fn reducer_resolve_wait_ids(&self, merge_wait_ids: &HashSet<String>) -> HashSet<String> {
+        merge_wait_ids
+            .iter()
+            .filter(|change_id| {
+                matches!(
+                    self.reducer_display_status_snapshot.get(change_id.as_str()),
+                    Some(&"resolve pending")
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     fn apply_refresh_merge_wait_status(
         &mut self,
         merge_wait_ids: &HashSet<String>,
         terminal_merge_wait_statuses: &HashMap<String, String>,
+        reducer_resolve_wait_ids: &HashSet<String>,
     ) {
         if merge_wait_ids.is_empty() {
             return;
@@ -105,6 +124,14 @@ impl AppState {
             }
 
             if is_refresh_merge_wait_terminal_status(&change.display_status_cache) {
+                continue;
+            }
+
+            if reducer_resolve_wait_ids.contains(&change.id) {
+                tracing::debug!(
+                    change_id = %change.id,
+                    "Preserving reducer-owned resolve pending display over refresh merge-wait evidence"
+                );
                 continue;
             }
 
@@ -167,6 +194,11 @@ mod tests {
     fn merge_wait_refresh_corrects_stale_resolve_pending_row() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         app.changes[0].set_display_status_cache("resolve pending");
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "change-a".to_string(),
+            "merge wait",
+        )]));
+        app.changes[0].set_display_status_cache("resolve pending");
 
         let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
         app.handle_changes_refreshed(
@@ -180,6 +212,28 @@ mod tests {
         );
 
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
+    }
+
+    #[test]
+    fn merge_wait_refresh_preserves_reducer_owned_resolve_pending_row() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "change-a".to_string(),
+            "resolve pending",
+        )]));
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![create_test_change("change-a")],
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from(["change-a".to_string()]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
     }
 
     #[test]
