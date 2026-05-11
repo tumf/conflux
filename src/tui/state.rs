@@ -252,6 +252,12 @@ pub struct AppState {
     pub resolve_queue_set: HashSet<String>,
     /// Whether the log panel is visible in Changes view
     pub logs_panel_enabled: bool,
+    /// Latest reducer-derived display status snapshot observed by the TUI.
+    ///
+    /// This is presentation-only state used to order display synchronization evidence:
+    /// reducer-owned lifecycle intent is stronger than refresh-derived display hints.
+    /// It must not be used as scheduler dispatch, resume routing, or workflow-control input.
+    reducer_display_status_snapshot: HashMap<String, &'static str>,
     /// Last merge-deferred diagnostic shown in the TUI.
     ///
     /// Runtime-only observability dedupe; it is not workflow-control state.
@@ -424,6 +430,7 @@ impl AppState {
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
             logs_panel_enabled: true, // Default: logs panel visible
+            reducer_display_status_snapshot: HashMap::new(),
             last_merge_deferred_diagnostic: None,
             last_logged_analysis_remaining: None,
         }
@@ -955,6 +962,8 @@ impl AppState {
         &mut self,
         display_map: &HashMap<String, &'static str>,
     ) {
+        self.reducer_display_status_snapshot = display_map.clone();
+
         for change in &mut self.changes {
             if change.display_status_cache == "rejected"
                 && !matches!(display_map.get(&change.id).copied(), Some("rejected"))
@@ -2645,13 +2654,25 @@ mod tests {
             });
         }
 
-        // apply_display_statuses_from_reducer should preserve ResolveWait
+        // The actual TUI path applies reducer display first, then local ChangesRefreshed handling.
         let display_map = shared.blocking_read().all_display_statuses();
         app.apply_display_statuses_from_reducer(&display_map);
+        app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
+            changes: vec![
+                create_test_change("change-a", 0, 1),
+                create_test_change("change-b", 0, 1),
+            ],
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: ["change-b".to_string()].into_iter().collect(),
+        });
 
         assert_eq!(
             app.changes[1].display_status_cache, "resolve pending",
-            "ResolveWait must survive ChangesRefreshed + apply_display_statuses_from_reducer"
+            "ResolveWait must survive reducer sync followed by ChangesRefreshed handling"
         );
     }
 
@@ -2803,13 +2824,22 @@ mod tests {
             });
         }
 
-        // apply_display_statuses_from_reducer should preserve ResolveWait
+        // The actual TUI path applies reducer display first, then local ChangesRefreshed handling.
         let display_map = shared.blocking_read().all_display_statuses();
         app.apply_display_statuses_from_reducer(&display_map);
+        app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
+            changes: vec![create_test_change("change-a", 0, 1)],
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: ["change-a".to_string()].into_iter().collect(),
+        });
 
         assert_eq!(
             app.changes[0].display_status_cache, "resolve pending",
-            "ResolveWait must survive ChangesRefreshed after immediate resolve"
+            "ResolveWait must survive reducer sync followed by ChangesRefreshed handling after immediate resolve"
         );
     }
 
