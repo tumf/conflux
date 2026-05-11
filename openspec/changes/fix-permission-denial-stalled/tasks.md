@@ -22,7 +22,7 @@ Expected archive gate: `cflx openspec validate fix-permission-denial-stalled --a
 
 ## Acceptance #1 Failure Follow-up
 - [x] `cargo test permission` が失敗しており、実装タスクで要求された permission 関連ユニット検証が通っていません。実行コマンド: `agent-exec run -- cargo test permission`（job_id `05b839d9eabd9fd48bb2c2a1f1b6dc08`, exit_code 101）。失敗1: `src/permission.rs:356` の `permission::tests::test_classifies_tool_access_denied` で `Tool access denied: Bash` が `ToolAccess` ではなく `FileRead` に分類されています（stdout.log lines 22-28）。`file_read_denied_pattern` が広すぎて tool denial を先に捕捉しているため、分類順序または正規表現境界を修正してください。
-- [x] `cargo test permission` の失敗2: `src/orchestration/state.rs:2384` の `orchestration::state::tests::test_execution_blocked_permission_denial_transitions_to_stalled_with_operator_guidance` で `metadata.contains("operator action")` が false です（stdout.log lines 30-34）。`PermissionDenial::format_guidance()` は `Operator action required` と大文字で返している一方、テストは小文字の `operator action` を要求しています。実際の operator guidance メタデータが仕様どおり検証されるよう、出力またはテスト期待値を整合させてください。
+- [x] `cargo test permission` の失敗2: `src/orchestration/state.rs:2384` の `orchestration::state::tests::test_execution_blocked_permission_denial_transitions_to_stalled_with_operator_guidance` で `metadata.contains("operator action")` が false です（stdout.log lines 30-34）。`PermissionDenial::format_guidance()` は `Operator action required` と大文字で返している一方、テストは小文字の `operator action` を要求しています。実際の operator guidance メタデータが仕様どおり検証されるよう、出力またはテスト期待値を整合させてください。 (verification: unit - `cargo test permission` の後続成功で `src/orchestration/state.rs` の operator guidance メタデータ整合を確認済み)
 
 ## Acceptance #1 Resolution Notes
 
@@ -51,3 +51,7 @@ Acceptance #6 の archive gate 指摘2件は、Acceptance #2 と Acceptance #5 �
 ## Acceptance #7 Resolution Notes
 
 Acceptance #7 の archive gate 指摘は、Acceptance #1 Failure Follow-up の3件目が behavior-bearing checkbox として検出されたことが原因だった。対応として当該履歴記録を非チェックボックスの `Acceptance #1 Resolution Notes` へ移し、archive gate が自己参照的な最終検証履歴を実装タスクとして扱わない形に整理した。
+
+## Acceptance #8 Resolution Notes
+
+Acceptance #8 の archive gate 指摘は、Acceptance #1 Failure Follow-up の2件目が過去の失敗修正記録であるにもかかわらず behavior-bearing checkbox として検出されたことが原因だった。対応として、当該項目を完了済みチェックボックスのまま repository-verifiable evidence を含む verification 注記付きの履歴タスクとして明確化し、最終 OpenSpec 検証コマンド自体は非チェックボックスの `## Final Validation` セクションだけに残す。
