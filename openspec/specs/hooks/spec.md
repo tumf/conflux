@@ -402,6 +402,10 @@ These diagnostics are observational only and MUST NOT introduce hidden out-of-wo
 
 The orchestrator SHALL surface hook command execution and captured hook output in normal CLI (`cflx run`) user-visible logs for every configured hook type.
 
+Captured hook output severity SHALL reflect hook outcome. Stderr from a hook command that exits successfully SHALL remain visible as informational hook output and SHALL NOT be classified as warning/failure solely because the stream is stderr. Stderr from a hook command that fails SHALL remain visible as warning/error context before the failure is reported.
+
+Hook output visibility is observational only and MUST NOT introduce hidden out-of-worktree durable workflow-control state.
+
 #### Scenario: CLI run shows stdout from change hook
 
 - **GIVEN** `hooks.pre_apply` is set to `echo 'hello from hook'`
@@ -410,27 +414,20 @@ The orchestrator SHALL surface hook command execution and captured hook output i
 - **THEN** the CLI log shows the executed hook command
 - **AND** the CLI log shows `hello from hook`
 
-#### Scenario: CLI run shows stderr from change hook
+#### Scenario: successful hook stderr remains informational
 
-- **GIVEN** `hooks.pre_apply` is set to `sh -c "echo 'hook warning' 1>&2"`
+- **GIVEN** `hooks.pre_apply` is set to `sh -c "echo 'hook diagnostic' 1>&2"`
 - **AND** `cflx run` processes a change that executes `pre_apply`
-- **WHEN** the hook completes
-- **THEN** the CLI log shows the executed hook command
-- **AND** the CLI log shows the captured stderr output
-
-#### Scenario: CLI run shows output from global hook without change id
-
-- **GIVEN** `hooks.on_start` is set to `echo 'starting run'`
-- **WHEN** `cflx run` starts orchestration
-- **THEN** the CLI log shows the executed `on_start` hook command
-- **AND** the CLI log shows `starting run`
+- **WHEN** the hook exits zero
+- **THEN** the captured stderr output remains visible
+- **AND** the output is not emitted as a warning-level hook failure diagnostic solely because it came from stderr
 
 #### Scenario: Hook failure still emits captured output
 
-- **GIVEN** `hooks.post_apply` writes output and then exits non-zero
+- **GIVEN** `hooks.post_apply` writes stderr output and then exits non-zero
 - **AND** `continue_on_failure` is `false`
 - **WHEN** the hook fails during `cflx run`
-- **THEN** any captured hook output is shown in the CLI log before the failure is reported
+- **THEN** the captured stderr output is shown in warning/error context before the failure is reported
 - **AND** the failure result still terminates or propagates according to hook configuration
 
 #### Scenario: Truncated CLI hook output is marked explicitly
