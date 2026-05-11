@@ -96,6 +96,23 @@ describe('ChangeRow', () => {
     expect(screen.queryByRole('button', { name: 'Stop and dequeue change-a' })).toBeNull();
   });
 
+  it('allows stalled changes to be selected again', () => {
+    const onOptimisticSelectionChange = vi.fn();
+    const change = { ...makeChange('stalled'), selected: false };
+
+    render(
+      <ChangeRow
+        change={change}
+        onOptimisticSelectionChange={onOptimisticSelectionChange}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select change change-a' }));
+
+    expect(onOptimisticSelectionChange).toHaveBeenCalledWith(change, true);
+    expect(toggleChangeSelectionMock).toHaveBeenCalledWith('project-1', 'change-a');
+  });
+
   it('applies optimistic selection immediately when toggled', () => {
     const onOptimisticSelectionChange = vi.fn();
     const change = { ...makeChange('error'), selected: false };

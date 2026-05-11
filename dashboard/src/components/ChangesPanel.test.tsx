@@ -66,6 +66,16 @@ function buildProject(): RemoteProject {
         selected: false,
       },
       {
+        id: 'change-stalled',
+        project: 'project-1',
+        completed_tasks: 1,
+        total_tasks: 2,
+        last_modified: '2026-01-01T00:00:00Z',
+        status: 'stalled',
+        iteration_number: null,
+        selected: false,
+      },
+      {
         id: 'change-c',
         project: 'project-1',
         completed_tasks: 0,
@@ -100,13 +110,17 @@ describe('ChangesPanel bulk toggle', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Select all changes' }));
 
-    expect(onOptimisticSelectionChange).toHaveBeenCalledTimes(2);
+    expect(onOptimisticSelectionChange).toHaveBeenCalledTimes(3);
     expect(onOptimisticSelectionChange).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'change-a' }),
       true,
     );
     expect(onOptimisticSelectionChange).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'change-b' }),
+      true,
+    );
+    expect(onOptimisticSelectionChange).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'change-stalled' }),
       true,
     );
     expect(toggleAllChangeSelectionMock).toHaveBeenCalledWith('project-1');
@@ -129,7 +143,7 @@ describe('ChangesPanel bulk toggle', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Select all changes' }));
 
     await waitFor(() => {
-      expect(onOptimisticSelectionRollback).toHaveBeenCalledTimes(2);
+      expect(onOptimisticSelectionRollback).toHaveBeenCalledTimes(3);
     });
     expect(toastErrorMock).toHaveBeenCalled();
   });

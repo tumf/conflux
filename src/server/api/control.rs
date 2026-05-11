@@ -574,6 +574,10 @@ pub(super) async fn list_selected_change_ids_in_worktree(
                 return false;
             }
 
+            if change.status == "stalled" {
+                return explicit_selection.unwrap_or(false);
+            }
+
             if change.status == "error" {
                 explicit_selection.unwrap_or(false)
             } else {
@@ -634,8 +638,10 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
     use crate::server::api::test_support::{create_local_git_repo, make_state as make_base_state};
     use crate::server::api::{build_router, AppState};
+    use crate::server::registry::OrchestrationStatus;
 
     fn make_state(temp_dir: &TempDir, auth_token: Option<&str>) -> AppState {
         let mut state = make_base_state(temp_dir, auth_token);
@@ -821,6 +827,95 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
         assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn test_stalled_change_must_be_explicitly_selected_for_global_run() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = make_state(&temp_dir, None);
+        let entry = state
+            .registry
+            .write()
+            .await
+            .add("https://github.com/foo/bar".to_string(), "main".to_string())
+            .unwrap();
+
+        let change_dir = temp_dir
+            .path()
+            .join("worktrees")
+            .join(&entry.id)
+            .join(&entry.branch)
+            .join("openspec/changes/fix-stalled");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# proposal\n").unwrap();
+
+        {
+            let mut shared = state.shared_orchestrator_state.write().await;
+            *shared = OrchestratorState::with_mode(
+                vec!["fix-stalled".to_string()],
+                0,
+                ExecutionMode::Parallel,
+            );
+            shared.mark_stalled("fix-stalled".to_string());
+            shared.apply_execution_event(&crate::events::ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "fix-stalled".to_string(),
+                workspace_name: "fix-stalled".to_string(),
+                status: crate::vcs::WorkspaceStatus::Blocked,
+            });
+            assert_eq!(shared.display_status("fix-stalled"), "stalled");
+        }
+
+        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+
+        let router = build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 0);
+        assert_eq!(json["skipped"], 1);
+
+        {
+            let mut registry = state.registry.write().await;
+            registry.toggle_change_selected(&entry.id, "fix-stalled");
+            registry.toggle_change_selected(&entry.id, "fix-stalled");
+        }
+        {
+            let mut shared = state.shared_orchestrator_state.write().await;
+            let outcome =
+                shared.apply_command(ReducerCommand::AddToQueue("fix-stalled".to_string()));
+            assert!(matches!(
+                outcome,
+                crate::orchestration::state::ReduceOutcome::Changed(_)
+            ));
+        }
+
+        {
+            let mut status = state.orchestration_status.write().await;
+            *status = OrchestrationStatus::Idle;
+        }
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/control/run")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["started"], 1);
+        assert_eq!(json["skipped"], 0);
     }
 
     #[tokio::test]

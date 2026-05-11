@@ -8,6 +8,7 @@ export type ChangeStatus =
   | 'idle'
   | 'not queued'
   | 'queued'
+  | 'stalled'
   | 'applying'
   | 'accepting'
   | 'archiving'

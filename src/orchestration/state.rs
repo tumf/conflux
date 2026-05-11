@@ -524,6 +524,7 @@ impl OrchestratorState {
 
     /// Clear transient counters for a stalled change.
     pub fn clear_stalled_change(&mut self, change_id: &str) {
+        self.stalled_change_ids.remove(change_id);
         self.skipped_change_ids.remove(change_id);
         self.apply_counts.remove(change_id);
         if self.current_change_id.as_deref() == Some(change_id) {
@@ -983,6 +984,7 @@ impl OrchestratorState {
     pub fn apply_command(&mut self, cmd: ReducerCommand) -> ReduceOutcome {
         match cmd {
             ReducerCommand::AddToQueue(change_id) => {
+                self.clear_stalled_change(&change_id);
                 {
                     let rt = self.runtime_entry(&change_id);
                     if matches!(
@@ -995,6 +997,7 @@ impl OrchestratorState {
                     }
                     if !rt.is_terminal()
                         && !rt.dequeued
+                        && !matches!(rt.wait_state, WaitState::Stalled)
                         && (rt.is_active() || rt.queue_intent == QueueIntent::Queued)
                     {
                         return ReduceOutcome::NoOp;
@@ -2079,6 +2082,13 @@ mod tests {
         // AddToQueue again → NoOp (idempotent).
         let outcome2 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(matches!(outcome2, ReduceOutcome::NoOp));
+
+        state.mark_stalled("c".to_string());
+        state.runtime_entry("c").wait_state = WaitState::Stalled;
+        let outcome_from_stalled = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(outcome_from_stalled, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "queued");
+        assert!(!state.stalled_change_ids().contains("c"));
 
         // RemoveFromQueue.
         let outcome3 = state.apply_command(ReducerCommand::RemoveFromQueue("c".to_string()));
