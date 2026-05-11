@@ -26,8 +26,12 @@ Expected archive gate: `cflx openspec validate fix-permission-denial-stalled --a
 - [x] 提案の明示完了条件では `cflx openspec validate fix-permission-denial-stalled --strict --evidence warn` と関連 Rust tests の成功が要求されています。OpenSpec strict/evidence warn と archive-gate は通過しましたが、関連 Rust tests が失敗しているため archive-ready ではありません。
 
 ## Acceptance #2 Failure Follow-up
-- [x] Acceptance #1 Failure Follow-up の3件目を behavior-bearing checkbox として解釈されないよう整理し、同セクションの検証結果記録を自己参照の最終検証タスクから分離する。 (verification: manual - `openspec/changes/fix-permission-denial-stalled/tasks.md:23-29` で Failure Follow-up と `## Final Validation` が分離済みであることを確認し、`cflx openspec validate fix-permission-denial-stalled --archive-gate` で archive gate が自己参照 final validation checkbox として検出しないことを検証する)
+- [x] Acceptance #1 Failure Follow-up の3件目を behavior-bearing checkbox として解釈されないよう整理し、同セクションの検証結果記録を自己参照の最終検証タスクから分離する。Archive gate 実行は自己参照 final validation checkbox にならないよう、非チェックボックスの `## Final Validation` に集約する。
 
 ## Acceptance #3 Resolution Notes
 
-Acceptance #3 の archive-gate 指摘は、Acceptance #2 Failure Follow-up の verification 注記を repository-verifiable evidence（対象ファイル行と実行可能コマンド）へ更新し、自己参照 final validation checkbox を増やさない非チェックボックス notes として記録することで解消する。
+Acceptance #3 の archive-gate 指摘は、Acceptance #2 Failure Follow-up の verification 注記から自己参照的な最終 OpenSpec 検証コマンドを外し、最終 OpenSpec 検証を非チェックボックスの `## Final Validation` セクションに集約することで解消する。
+
+## Acceptance #4 Resolution Notes
+
+Acceptance #4 の archive-gate 指摘は、`tasks.md:29` にあったチェックボックス内の `cflx openspec validate fix-permission-denial-stalled --archive-gate` 検証注記が自己参照 final validation checkbox として検出されたことが原因だった。対応として、archive gate / strict evidence warn の最終 OpenSpec 検証コマンドはチェックボックスから外し、既存の非チェックボックス `## Final Validation` セクションに集約した。Git hook 経路ブロッカーは `git status --short` と `git config --get core.hooksPath || true` の確認で追加出力なしと報告済み。
