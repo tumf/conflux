@@ -61,9 +61,16 @@ pub enum OrchestratorError {
     #[allow(dead_code)] // Reserved for future use when git is unavailable
     NoVcsBackend,
 
-    #[allow(dead_code)] // Kept for future use; currently using soft-error logging instead
     #[error("Permission auto-rejected: {denied_path}\n{guidance}")]
+    #[allow(dead_code)]
+    // Legacy soft-block variant retained for older serial/parallel apply paths.
     PermissionBlocked {
+        denied_path: String,
+        guidance: String,
+    },
+
+    #[error("Repeated unresolved permission/tool policy denial: {guidance}")]
+    PermissionStalled {
         denied_path: String,
         guidance: String,
     },

@@ -735,6 +735,7 @@ where
     let mut first_apply = true;
     let stall_config = config.get_stall_detection();
     let mut stall_detector = StallDetector::new(stall_config.clone());
+    let mut permission_denial_tracker = crate::permission::PermissionDenialTracker::new();
     let mut apply_escalation_uses_for_current_stall = 0_u32;
     let mut apply_escalation_started = false;
 
@@ -1018,19 +1019,21 @@ where
             output_collector.stderr_tail(),
         );
 
-        let permission_reject = crate::permission::detect_permission_reject(
+        let permission_denial = crate::permission::classify_permission_denial(&[
             output_collector.stdout_tail().as_deref(),
             output_collector.stderr_tail().as_deref(),
-        );
+        ]);
 
-        if let Some(reject) = &permission_reject {
+        if let Some(denial) = &permission_denial {
             warn!(
-                "Permission auto-reject detected for {}: {}",
-                change_id, reject.denied_path
+                change_id = change_id,
+                category = denial.category.as_str(),
+                denied_target = %denial.denied_target,
+                "Permission/tool policy denial detected during apply"
             );
         }
 
-        if !status.success() && permission_reject.is_none() && !completion_finalized_run {
+        if !status.success() && permission_denial.is_none() && !completion_finalized_run {
             let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
 
             // Run on_error hook
@@ -1090,30 +1093,41 @@ where
             break false;
         }
 
-        // Permission auto-reject is handled as a soft error.
-        // Log the error and continue the loop to give the agent another iteration.
-        // The stall detector will catch repeated failures if no progress is made.
-        if let Some(reject) = permission_reject {
+        if let Some(denial) = permission_denial {
             let task_state_changed =
                 new_progress.completed > progress.completed || new_progress.total != progress.total;
+            let observation = permission_denial_tracker.observe(&denial, task_state_changed);
+
+            if observation.stalled {
+                warn!(
+                    change_id = change_id,
+                    category = denial.category.as_str(),
+                    denied_target = %denial.denied_target,
+                    "Repeated unresolved permission/tool policy denial detected; stopping apply loop as non-terminal stalled hold"
+                );
+                return Err(OrchestratorError::PermissionStalled {
+                    denied_path: denial.denied_target.clone(),
+                    guidance: denial.format_guidance(),
+                });
+            }
 
             if !task_state_changed {
                 warn!(
-                    "Permission auto-reject detected for {} but task state unchanged; continuing to next iteration",
+                    "Permission/tool policy denial detected for {} but task state unchanged; continuing to next iteration for first or changed denial signature",
                     change_id
                 );
-                warn!("Denied path: {}", reject.denied_path);
-                warn!("Guidance: {}", reject.format_error_message());
+                warn!("Denied target: {}", denial.denied_target);
+                warn!("Guidance: {}", denial.format_guidance());
             } else {
                 info!(
-                    "Permission auto-reject detected for {} but task state changed; continuing",
+                    "Permission/tool policy denial detected for {} but task state changed; continuing",
                     change_id
                 );
             }
 
             if !status.success() {
                 warn!(
-                    "Apply command for {} exited non-zero after permission auto-reject; continuing to next iteration",
+                    "Apply command for {} exited non-zero after permission/tool policy denial; continuing unless repeated unresolved",
                     change_id
                 );
             }

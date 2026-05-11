@@ -1586,6 +1586,19 @@ impl OrchestratorState {
                     );
                 }
             }
+            ExecutionEvent::ExecutionBlocked { change_id, blocker } => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    rt.activity = ActivityState::Idle;
+                    rt.wait_state = WaitState::Stalled;
+                    rt.terminal = TerminalState::None;
+                    rt.set_blocked_metadata(
+                        format!("execution-blocked:{}", blocker.category),
+                        blocker.summary(),
+                        blocker.worktree_snapshot(),
+                    );
+                }
+            }
 
             // Stop/dequeue events
             ExecutionEvent::ChangeDequeued { change_id }
@@ -2336,6 +2349,40 @@ mod tests {
                 "metadata should preserve observed error summary for {message}"
             );
         }
+    }
+
+    #[test]
+    fn test_execution_blocked_permission_denial_transitions_to_stalled_with_operator_guidance() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let denial = crate::permission::classify_permission_denial(&[Some(
+            "Read permission denied for /private/secret.txt",
+        )])
+        .expect("denial should classify");
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: "c".to_string(),
+            command: "accept".to_string(),
+        });
+
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker::permission_denial("acceptance", &denial),
+        });
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert_eq!(state.display_status("c"), "stalled");
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        let metadata = runtime
+            .blocked_metadata
+            .unblock_metadata
+            .as_deref()
+            .expect("operator guidance metadata");
+        assert!(metadata.contains("permission/tool policy denial"));
+        assert!(metadata.contains("operator action"));
+        assert!(!metadata.to_ascii_lowercase().contains("dependency blocked"));
     }
 
     #[test]

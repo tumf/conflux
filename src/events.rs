@@ -241,6 +241,26 @@ fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
 }
 
 impl StalledBlocker {
+    pub fn permission_denial(
+        phase: impl Into<String>,
+        denial: &crate::permission::PermissionDenial,
+    ) -> Self {
+        Self {
+            category: format!("permission:{}", denial.category.as_str()),
+            phase: phase.into(),
+            gate: "permission_policy".to_string(),
+            error_summary: format!(
+                "repeated unresolved permission/tool policy denial for {}: {}; evidence: {}",
+                denial.category.as_str(),
+                denial.denied_target,
+                denial.evidence
+            ),
+            next_action: denial.format_guidance(),
+            resumable: true,
+            worktree_preserved: true,
+        }
+    }
+
     pub fn acceptance_infrastructure(error_summary: impl Into<String>) -> Self {
         let error_summary = error_summary.into();
         Self {
@@ -467,6 +487,11 @@ pub enum ExecutionEvent {
 
     /// Acceptance observed a compatibility gated token that becomes a non-terminal stalled hold.
     AcceptanceGated {
+        change_id: String,
+        blocker: StalledBlocker,
+    },
+    /// Apply or acceptance observed a repeated unresolved permission/policy blocker.
+    ExecutionBlocked {
         change_id: String,
         blocker: StalledBlocker,
     },

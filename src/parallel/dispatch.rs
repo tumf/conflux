@@ -1229,6 +1229,29 @@ impl ParallelExecutor {
                                 }
                             }
                         }
+                        if matches!(e, OrchestratorError::PermissionStalled { .. }) {
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::warn(format!(
+                                            "Apply stalled on repeated unresolved permission/tool policy denial: {}",
+                                            e
+                                        ))
+                                        .with_change_id(&change_id)
+                                        .with_operation("apply"),
+                                    ))
+                                    .await;
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: None,
+                                rejected: None,
+                            };
+                        }
+
                         // Apply failed - return error immediately
                         cancel_monitor.abort();
                         return WorkspaceResult {
@@ -1706,6 +1729,45 @@ impl ParallelExecutor {
                                 .await;
                         }
                         continue;
+                    }
+                    Ok((
+                        crate::orchestration::AcceptanceResult::PermissionStalled { blocker },
+                        acceptance_iteration,
+                    )) => {
+                        warn!(
+                            "Acceptance stalled for {} on repeated unresolved permission/tool policy denial (cycle {}): {}",
+                            change_id,
+                            cycle_count,
+                            blocker.summary()
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::ExecutionBlocked {
+                                    change_id: change_id.clone(),
+                                    blocker: blocker.clone(),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::warn(format!(
+                                        "Acceptance stalled on repeated unresolved permission/tool policy denial (cycle {}): {}",
+                                        cycle_count,
+                                        blocker.summary()
+                                    ))
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
+                                ))
+                                .await;
+                        }
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: None,
+                            rejected: None,
+                        };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::CommandFailed {

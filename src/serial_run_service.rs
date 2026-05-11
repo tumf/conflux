@@ -689,6 +689,15 @@ impl SerialRunService {
                 // while command-level failures are surfaced without forcing local tasks.md updates.
                 ChangeProcessResult::AcceptanceCommandFailed { error }
             }
+            AcceptanceResult::PermissionStalled { blocker } => {
+                warn!(
+                    "Acceptance stalled for {} due to repeated unresolved permission/tool policy blocker: {}",
+                    change_id, blocker.next_action
+                );
+                ChangeProcessResult::Stalled {
+                    error: blocker.next_action,
+                }
+            }
             AcceptanceResult::Cancelled => {
                 // Check if this is a single-change stop or global cancel
                 if is_single_change_stopped() {
