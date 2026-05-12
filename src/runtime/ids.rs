@@ -89,6 +89,9 @@ mod tests {
         assert_eq!(orchestrator.to_string(), "orch-a");
         assert_eq!(project.to_string(), "project-a");
         assert_eq!(proposal.to_string(), "change-a");
-        assert_eq!(ProposalId::from_change_id("change-a").as_change_id(), "change-a");
+        assert_eq!(
+            ProposalId::from_change_id("change-a").as_change_id(),
+            "change-a"
+        );
     }
 }

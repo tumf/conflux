@@ -60,7 +60,9 @@ impl ProjectRuntimeState {
     }
 
     pub fn proposal_status(&self, proposal_id: &ProposalId) -> Option<&ProposalStatus> {
-        self.proposals.get(proposal_id).map(|proposal| &proposal.status)
+        self.proposals
+            .get(proposal_id)
+            .map(|proposal| &proposal.status)
     }
 
     pub fn queued_proposals(&self) -> Vec<ProposalId> {
@@ -166,7 +168,9 @@ pub mod dispatch_view {
         let mut project = ProjectRuntimeState::new("project-a");
         project.set_proposal_status(
             ProposalId::from_change_id("change-a"),
-            ProposalStatus::Queued { revision: RuntimeRevision(1) },
+            ProposalStatus::Queued {
+                revision: RuntimeRevision(1),
+            },
         );
         project.set_proposal_status(
             ProposalId::from_change_id("change-b"),
@@ -176,8 +180,14 @@ pub mod dispatch_view {
             },
         );
 
-        assert_eq!(project.dispatch_candidates(), vec![ProposalId::from_change_id("change-a")]);
-        assert_eq!(project.stalled_proposals(), vec![ProposalId::from_change_id("change-b")]);
+        assert_eq!(
+            project.dispatch_candidates(),
+            vec![ProposalId::from_change_id("change-a")]
+        );
+        assert_eq!(
+            project.stalled_proposals(),
+            vec![ProposalId::from_change_id("change-b")]
+        );
     }
 
     #[test]
@@ -185,7 +195,9 @@ pub mod dispatch_view {
         let mut project = ProjectRuntimeState::new("project-a");
         project.set_proposal_status(
             ProposalId::from_change_id("change-a"),
-            ProposalStatus::Queued { revision: RuntimeRevision(1) },
+            ProposalStatus::Queued {
+                revision: RuntimeRevision(1),
+            },
         );
         project.set_proposal_status(
             ProposalId::from_change_id("change-b"),
@@ -195,7 +207,15 @@ pub mod dispatch_view {
             },
         );
 
-        assert_eq!(project.base_lane_owner.as_ref().unwrap().proposal_id.as_change_id(), "change-b");
+        assert_eq!(
+            project
+                .base_lane_owner
+                .as_ref()
+                .unwrap()
+                .proposal_id
+                .as_change_id(),
+            "change-b"
+        );
         assert!(project.dispatch_candidates().is_empty());
     }
 }
@@ -208,11 +228,17 @@ mod tests {
     fn rejects_simultaneous_base_lane_ownership_within_project() {
         let mut project = ProjectRuntimeState::new("project-a");
         project
-            .try_claim_base_lane(ProposalId::from_change_id("change-a"), BaseLaneOwnerKind::Merge)
+            .try_claim_base_lane(
+                ProposalId::from_change_id("change-a"),
+                BaseLaneOwnerKind::Merge,
+            )
             .unwrap();
 
         let existing = project
-            .try_claim_base_lane(ProposalId::from_change_id("change-b"), BaseLaneOwnerKind::Resolve)
+            .try_claim_base_lane(
+                ProposalId::from_change_id("change-b"),
+                BaseLaneOwnerKind::Resolve,
+            )
             .unwrap_err();
 
         assert_eq!(existing.proposal_id.as_change_id(), "change-a");

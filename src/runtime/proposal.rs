@@ -49,28 +49,65 @@ impl BlockerInfo {
 }
 
 /// Single canonical lifecycle status for one proposal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ProposalStatus {
+    #[default]
     NotQueued,
-    Queued { revision: RuntimeRevision },
-    DependencyBlocked { blocker: BlockerInfo, revision: RuntimeRevision },
-    Applying { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    Accepting { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    Rejecting { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    Stalled { blocker: BlockerInfo, revision: RuntimeRevision },
-    Archiving { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    MergeWait { workspace: WorkspaceRef, revision: RuntimeRevision },
-    Resolving { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    Merged { revision: RuntimeRevision },
-    Rejected { reason: String, revision: RuntimeRevision },
-    Failed { error: String, revision: RuntimeRevision },
-    Stopped { reason: String, revision: RuntimeRevision },
-}
-
-impl Default for ProposalStatus {
-    fn default() -> Self {
-        Self::NotQueued
-    }
+    Queued {
+        revision: RuntimeRevision,
+    },
+    DependencyBlocked {
+        blocker: BlockerInfo,
+        revision: RuntimeRevision,
+    },
+    Applying {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    Accepting {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    Rejecting {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    Stalled {
+        blocker: BlockerInfo,
+        revision: RuntimeRevision,
+    },
+    Archiving {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    MergeWait {
+        workspace: WorkspaceRef,
+        revision: RuntimeRevision,
+    },
+    Resolving {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    Merged {
+        revision: RuntimeRevision,
+    },
+    Rejected {
+        reason: String,
+        revision: RuntimeRevision,
+    },
+    Failed {
+        error: String,
+        revision: RuntimeRevision,
+    },
+    Stopped {
+        reason: String,
+        revision: RuntimeRevision,
+    },
 }
 
 impl ProposalStatus {
@@ -113,11 +150,23 @@ impl ProposalStatus {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Merged { .. } | Self::Rejected { .. } | Self::Failed { .. } | Self::Stopped { .. })
+        matches!(
+            self,
+            Self::Merged { .. }
+                | Self::Rejected { .. }
+                | Self::Failed { .. }
+                | Self::Stopped { .. }
+        )
     }
 
     pub fn is_base_lane_status(&self) -> bool {
-        matches!(self, Self::Rejecting { .. } | Self::Archiving { .. } | Self::MergeWait { .. } | Self::Resolving { .. })
+        matches!(
+            self,
+            Self::Rejecting { .. }
+                | Self::Archiving { .. }
+                | Self::MergeWait { .. }
+                | Self::Resolving { .. }
+        )
     }
 }
 
@@ -137,7 +186,10 @@ impl ProposalRuntimeState {
     }
 
     pub fn with_status(id: impl Into<ProposalId>, status: ProposalStatus) -> Self {
-        Self { id: id.into(), status }
+        Self {
+            id: id.into(),
+            status,
+        }
     }
 }
 
@@ -151,38 +203,83 @@ mod tests {
         let blocker = BlockerInfo::new("dependency", "waiting for base");
         let statuses = vec![
             ProposalStatus::NotQueued,
-            ProposalStatus::Queued { revision: RuntimeRevision(1) },
-            ProposalStatus::DependencyBlocked { blocker: blocker.clone(), revision: RuntimeRevision(2) },
-            ProposalStatus::Applying { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(3) },
-            ProposalStatus::Accepting { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(4) },
-            ProposalStatus::Rejecting { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(5) },
-            ProposalStatus::Stalled { blocker: blocker.clone(), revision: RuntimeRevision(6) },
-            ProposalStatus::Archiving { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(7) },
-            ProposalStatus::MergeWait { workspace: workspace.clone(), revision: RuntimeRevision(8) },
-            ProposalStatus::Resolving { workspace, attempt: 1, revision: RuntimeRevision(9) },
-            ProposalStatus::Merged { revision: RuntimeRevision(10) },
-            ProposalStatus::Rejected { reason: "not acceptable".to_string(), revision: RuntimeRevision(11) },
-            ProposalStatus::Failed { error: "boom".to_string(), revision: RuntimeRevision(12) },
-            ProposalStatus::Stopped { reason: "operator".to_string(), revision: RuntimeRevision(13) },
+            ProposalStatus::Queued {
+                revision: RuntimeRevision(1),
+            },
+            ProposalStatus::DependencyBlocked {
+                blocker: blocker.clone(),
+                revision: RuntimeRevision(2),
+            },
+            ProposalStatus::Applying {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(3),
+            },
+            ProposalStatus::Accepting {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(4),
+            },
+            ProposalStatus::Rejecting {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(5),
+            },
+            ProposalStatus::Stalled {
+                blocker: blocker.clone(),
+                revision: RuntimeRevision(6),
+            },
+            ProposalStatus::Archiving {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(7),
+            },
+            ProposalStatus::MergeWait {
+                workspace: workspace.clone(),
+                revision: RuntimeRevision(8),
+            },
+            ProposalStatus::Resolving {
+                workspace,
+                attempt: 1,
+                revision: RuntimeRevision(9),
+            },
+            ProposalStatus::Merged {
+                revision: RuntimeRevision(10),
+            },
+            ProposalStatus::Rejected {
+                reason: "not acceptable".to_string(),
+                revision: RuntimeRevision(11),
+            },
+            ProposalStatus::Failed {
+                error: "boom".to_string(),
+                revision: RuntimeRevision(12),
+            },
+            ProposalStatus::Stopped {
+                reason: "operator".to_string(),
+                revision: RuntimeRevision(13),
+            },
         ];
 
         let labels: Vec<_> = statuses.iter().map(ProposalStatus::label).collect();
-        assert_eq!(labels, vec![
-            "not_queued",
-            "queued",
-            "dependency_blocked",
-            "applying",
-            "accepting",
-            "rejecting",
-            "stalled",
-            "archiving",
-            "merge_wait",
-            "resolving",
-            "merged",
-            "rejected",
-            "failed",
-            "stopped",
-        ]);
+        assert_eq!(
+            labels,
+            vec![
+                "not_queued",
+                "queued",
+                "dependency_blocked",
+                "applying",
+                "accepting",
+                "rejecting",
+                "stalled",
+                "archiving",
+                "merge_wait",
+                "resolving",
+                "merged",
+                "rejected",
+                "failed",
+                "stopped",
+            ]
+        );
         assert!(statuses[10].is_terminal());
         assert!(!statuses[3].is_terminal());
     }
@@ -191,7 +288,9 @@ mod tests {
     fn proposal_runtime_state_has_one_canonical_status_field() {
         let proposal = ProposalRuntimeState::with_status(
             "change-a",
-            ProposalStatus::Queued { revision: RuntimeRevision(1) },
+            ProposalStatus::Queued {
+                revision: RuntimeRevision(1),
+            },
         );
 
         assert_eq!(proposal.id.as_change_id(), "change-a");

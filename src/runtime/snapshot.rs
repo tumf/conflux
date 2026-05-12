@@ -67,7 +67,11 @@ impl From<&ProjectRuntimeState> for ProjectSnapshot {
         Self {
             id: project.id.clone(),
             status: project.status,
-            proposals: project.proposals.values().map(ProposalSnapshot::from).collect(),
+            proposals: project
+                .proposals
+                .values()
+                .map(ProposalSnapshot::from)
+                .collect(),
             base_lane_owner: project.base_lane_owner.clone(),
             compatibility: RuntimeCompatibilityView::from(project),
         }
@@ -79,7 +83,11 @@ impl From<&OrchestratorRuntimeState> for OrchestratorSnapshot {
         Self {
             id: orchestrator.id.clone(),
             status: orchestrator.status,
-            projects: orchestrator.projects.values().map(ProjectSnapshot::from).collect(),
+            projects: orchestrator
+                .projects
+                .values()
+                .map(ProjectSnapshot::from)
+                .collect(),
         }
     }
 }
@@ -95,7 +103,9 @@ mod tests {
         let project = orchestrator.ensure_project(ProjectId::from("project-a"));
         project.set_proposal_status(
             ProposalId::from_change_id("change-a"),
-            ProposalStatus::Queued { revision: RuntimeRevision(1) },
+            ProposalStatus::Queued {
+                revision: RuntimeRevision(1),
+            },
         );
         project.set_proposal_status(
             ProposalId::from_change_id("change-b"),
@@ -108,8 +118,17 @@ mod tests {
         let snapshot = OrchestratorSnapshot::from(&orchestrator);
         assert_eq!(snapshot.projects.len(), 1);
         assert_eq!(snapshot.projects[0].proposals.len(), 2);
-        assert_eq!(snapshot.projects[0].compatibility.queued, vec![ProposalId::from_change_id("change-a")]);
-        assert_eq!(snapshot.projects[0].compatibility.merge_wait, vec![ProposalId::from_change_id("change-b")]);
-        assert!(snapshot.projects[0].compatibility.dispatch_candidates.is_empty());
+        assert_eq!(
+            snapshot.projects[0].compatibility.queued,
+            vec![ProposalId::from_change_id("change-a")]
+        );
+        assert_eq!(
+            snapshot.projects[0].compatibility.merge_wait,
+            vec![ProposalId::from_change_id("change-b")]
+        );
+        assert!(snapshot.projects[0]
+            .compatibility
+            .dispatch_candidates
+            .is_empty());
     }
 }

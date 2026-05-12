@@ -38,13 +38,28 @@ impl OrchestratorRuntimeState {
     }
 
     pub fn derive_status_from_projects(&mut self) {
-        self.status = if self.projects.values().any(|project| project.status == ProjectStatus::Error) {
+        self.status = if self
+            .projects
+            .values()
+            .any(|project| project.status == ProjectStatus::Error)
+        {
             OrchestratorLifecycleStatus::Error
-        } else if self.projects.values().any(|project| project.status == ProjectStatus::Stopping) {
+        } else if self
+            .projects
+            .values()
+            .any(|project| project.status == ProjectStatus::Stopping)
+        {
             OrchestratorLifecycleStatus::Stopping
-        } else if self.projects.values().any(|project| project.status == ProjectStatus::Running) {
+        } else if self
+            .projects
+            .values()
+            .any(|project| project.status == ProjectStatus::Running)
+        {
             OrchestratorLifecycleStatus::Running
-        } else if self.projects.values().all(|project| project.status == ProjectStatus::Stopped)
+        } else if self
+            .projects
+            .values()
+            .all(|project| project.status == ProjectStatus::Stopped)
             && !self.projects.is_empty()
         {
             OrchestratorLifecycleStatus::Stopped
@@ -67,11 +82,15 @@ mod tests {
     #[test]
     fn orchestrator_snapshot_status_is_derived_from_project_events() {
         let mut orchestrator = OrchestratorRuntimeState::default();
-        orchestrator.ensure_project(ProjectId::from("project-a")).status = ProjectStatus::Running;
+        orchestrator
+            .ensure_project(ProjectId::from("project-a"))
+            .status = ProjectStatus::Running;
         orchestrator.derive_status_from_projects();
         assert_eq!(orchestrator.status, OrchestratorLifecycleStatus::Running);
 
-        orchestrator.ensure_project(ProjectId::from("project-a")).status = ProjectStatus::Error;
+        orchestrator
+            .ensure_project(ProjectId::from("project-a"))
+            .status = ProjectStatus::Error;
         orchestrator.derive_status_from_projects();
         assert_eq!(orchestrator.status, OrchestratorLifecycleStatus::Error);
     }

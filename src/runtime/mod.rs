@@ -24,6 +24,10 @@ pub mod snapshot;
 pub use ids::{OrchestratorId, ProjectId, ProposalId};
 pub use orchestrator::{OrchestratorLifecycleStatus, OrchestratorRuntimeState};
 pub use project::{BaseLaneOwner, BaseLaneOwnerKind, ProjectRuntimeState, ProjectStatus};
-pub use proposal::{BlockerInfo, ProposalRuntimeState, ProposalStatus, RuntimeRevision, WorkspaceRef};
+pub use proposal::{
+    BlockerInfo, ProposalRuntimeState, ProposalStatus, RuntimeRevision, WorkspaceRef,
+};
 pub use reducer::{OrchestratorEvent, ProjectEvent, ProposalEvent, RuntimeEvent};
-pub use snapshot::{OrchestratorSnapshot, ProjectSnapshot, ProposalSnapshot, RuntimeCompatibilityView};
+pub use snapshot::{
+    OrchestratorSnapshot, ProjectSnapshot, ProposalSnapshot, RuntimeCompatibilityView,
+};

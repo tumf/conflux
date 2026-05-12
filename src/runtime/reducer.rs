@@ -6,8 +6,15 @@ use crate::runtime::proposal::{BlockerInfo, ProposalStatus, RuntimeRevision, Wor
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     Orchestrator(OrchestratorEvent),
-    Project { project_id: ProjectId, event: ProjectEvent },
-    Proposal { project_id: ProjectId, proposal_id: ProposalId, event: ProposalEvent },
+    Project {
+        project_id: ProjectId,
+        event: ProjectEvent,
+    },
+    Proposal {
+        project_id: ProjectId,
+        proposal_id: ProposalId,
+        event: ProposalEvent,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,19 +36,61 @@ pub enum ProjectEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposalEvent {
-    Queue { revision: RuntimeRevision },
-    DependencyBlocked { blocker: BlockerInfo, revision: RuntimeRevision },
-    ApplyStarted { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    AcceptanceStarted { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    RejectingStarted { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    Stalled { blocker: BlockerInfo, revision: RuntimeRevision },
-    ArchiveStarted { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    MergeWait { workspace: WorkspaceRef, revision: RuntimeRevision },
-    ResolveStarted { workspace: WorkspaceRef, attempt: u32, revision: RuntimeRevision },
-    Merged { revision: RuntimeRevision },
-    Rejected { reason: String, revision: RuntimeRevision },
-    Failed { error: String, revision: RuntimeRevision },
-    Stopped { reason: String, revision: RuntimeRevision },
+    Queue {
+        revision: RuntimeRevision,
+    },
+    DependencyBlocked {
+        blocker: BlockerInfo,
+        revision: RuntimeRevision,
+    },
+    ApplyStarted {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    AcceptanceStarted {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    RejectingStarted {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    Stalled {
+        blocker: BlockerInfo,
+        revision: RuntimeRevision,
+    },
+    ArchiveStarted {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    MergeWait {
+        workspace: WorkspaceRef,
+        revision: RuntimeRevision,
+    },
+    ResolveStarted {
+        workspace: WorkspaceRef,
+        attempt: u32,
+        revision: RuntimeRevision,
+    },
+    Merged {
+        revision: RuntimeRevision,
+    },
+    Rejected {
+        reason: String,
+        revision: RuntimeRevision,
+    },
+    Failed {
+        error: String,
+        revision: RuntimeRevision,
+    },
+    Stopped {
+        reason: String,
+        revision: RuntimeRevision,
+    },
 }
 
 impl OrchestratorRuntimeState {
@@ -52,8 +101,13 @@ impl OrchestratorRuntimeState {
                 self.ensure_project(project_id).apply_project_event(event);
                 self.derive_status_from_projects();
             }
-            RuntimeEvent::Proposal { project_id, proposal_id, event } => {
-                self.ensure_project(project_id).apply_proposal_event(proposal_id, event);
+            RuntimeEvent::Proposal {
+                project_id,
+                proposal_id,
+                event,
+            } => {
+                self.ensure_project(project_id)
+                    .apply_proposal_event(proposal_id, event);
                 self.derive_status_from_projects();
             }
         }
@@ -89,27 +143,69 @@ impl ProjectRuntimeState {
             ProposalEvent::DependencyBlocked { blocker, revision } => {
                 ProposalStatus::DependencyBlocked { blocker, revision }
             }
-            ProposalEvent::ApplyStarted { workspace, attempt, revision } => {
-                ProposalStatus::Applying { workspace, attempt, revision }
+            ProposalEvent::ApplyStarted {
+                workspace,
+                attempt,
+                revision,
+            } => ProposalStatus::Applying {
+                workspace,
+                attempt,
+                revision,
+            },
+            ProposalEvent::AcceptanceStarted {
+                workspace,
+                attempt,
+                revision,
+            } => ProposalStatus::Accepting {
+                workspace,
+                attempt,
+                revision,
+            },
+            ProposalEvent::RejectingStarted {
+                workspace,
+                attempt,
+                revision,
+            } => ProposalStatus::Rejecting {
+                workspace,
+                attempt,
+                revision,
+            },
+            ProposalEvent::Stalled { blocker, revision } => {
+                ProposalStatus::Stalled { blocker, revision }
             }
-            ProposalEvent::AcceptanceStarted { workspace, attempt, revision } => {
-                ProposalStatus::Accepting { workspace, attempt, revision }
-            }
-            ProposalEvent::RejectingStarted { workspace, attempt, revision } => {
-                ProposalStatus::Rejecting { workspace, attempt, revision }
-            }
-            ProposalEvent::Stalled { blocker, revision } => ProposalStatus::Stalled { blocker, revision },
-            ProposalEvent::ArchiveStarted { workspace, attempt, revision } => {
-                ProposalStatus::Archiving { workspace, attempt, revision }
-            }
-            ProposalEvent::MergeWait { workspace, revision } => ProposalStatus::MergeWait { workspace, revision },
-            ProposalEvent::ResolveStarted { workspace, attempt, revision } => {
-                ProposalStatus::Resolving { workspace, attempt, revision }
-            }
+            ProposalEvent::ArchiveStarted {
+                workspace,
+                attempt,
+                revision,
+            } => ProposalStatus::Archiving {
+                workspace,
+                attempt,
+                revision,
+            },
+            ProposalEvent::MergeWait {
+                workspace,
+                revision,
+            } => ProposalStatus::MergeWait {
+                workspace,
+                revision,
+            },
+            ProposalEvent::ResolveStarted {
+                workspace,
+                attempt,
+                revision,
+            } => ProposalStatus::Resolving {
+                workspace,
+                attempt,
+                revision,
+            },
             ProposalEvent::Merged { revision } => ProposalStatus::Merged { revision },
-            ProposalEvent::Rejected { reason, revision } => ProposalStatus::Rejected { reason, revision },
+            ProposalEvent::Rejected { reason, revision } => {
+                ProposalStatus::Rejected { reason, revision }
+            }
             ProposalEvent::Failed { error, revision } => ProposalStatus::Failed { error, revision },
-            ProposalEvent::Stopped { reason, revision } => ProposalStatus::Stopped { reason, revision },
+            ProposalEvent::Stopped { reason, revision } => {
+                ProposalStatus::Stopped { reason, revision }
+            }
         };
 
         if self.should_ignore_transition(&proposal_id, &next_status) {
@@ -119,7 +215,11 @@ impl ProjectRuntimeState {
         self.set_proposal_status(proposal_id, next_status);
     }
 
-    fn should_ignore_transition(&self, proposal_id: &ProposalId, next_status: &ProposalStatus) -> bool {
+    fn should_ignore_transition(
+        &self,
+        proposal_id: &ProposalId,
+        next_status: &ProposalStatus,
+    ) -> bool {
         if let Some(owner) = &self.base_lane_owner {
             let same_owner = &owner.proposal_id == proposal_id;
             if next_status.is_base_lane_status() && !same_owner {
@@ -161,18 +261,71 @@ mod tests {
         let mut state = OrchestratorRuntimeState::new(OrchestratorId::from("orch"));
         let workspace = WorkspaceRef::new("/tmp/change-a");
 
-        state.apply_event(event("project", "change-a", ProposalEvent::Queue { revision: RuntimeRevision(1) }));
-        state.apply_event(event("project", "change-a", ProposalEvent::ApplyStarted { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(2) }));
-        state.apply_event(event("project", "change-a", ProposalEvent::AcceptanceStarted { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(3) }));
-        state.apply_event(event("project", "change-a", ProposalEvent::ArchiveStarted { workspace: workspace.clone(), attempt: 1, revision: RuntimeRevision(4) }));
-        state.apply_event(event("project", "change-a", ProposalEvent::MergeWait { workspace: workspace.clone(), revision: RuntimeRevision(5) }));
-        state.apply_event(event("project", "change-a", ProposalEvent::ResolveStarted { workspace, attempt: 1, revision: RuntimeRevision(6) }));
-        state.apply_event(event("project", "change-a", ProposalEvent::Merged { revision: RuntimeRevision(7) }));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::Queue {
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::ApplyStarted {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(2),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::AcceptanceStarted {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(3),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::ArchiveStarted {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(4),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::MergeWait {
+                workspace: workspace.clone(),
+                revision: RuntimeRevision(5),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::ResolveStarted {
+                workspace,
+                attempt: 1,
+                revision: RuntimeRevision(6),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::Merged {
+                revision: RuntimeRevision(7),
+            },
+        ));
 
         let project = state.projects.get(&ProjectId::from("project")).unwrap();
         assert!(matches!(
             project.proposal_status(&ProposalId::from_change_id("change-a")),
-            Some(ProposalStatus::Merged { revision: RuntimeRevision(7) })
+            Some(ProposalStatus::Merged {
+                revision: RuntimeRevision(7)
+            })
         ));
         assert!(project.base_lane_owner.is_none());
     }
@@ -180,68 +333,125 @@ mod tests {
     #[test]
     fn reducer_covers_stalled_rejected_failed_and_stopped_states() {
         let mut state = OrchestratorRuntimeState::default();
-        state.apply_event(event("project", "stalled", ProposalEvent::Stalled {
-            blocker: BlockerInfo::new("external", "needs operator"),
-            revision: RuntimeRevision(1),
-        }));
-        state.apply_event(event("project", "rejected", ProposalEvent::Rejected {
-            reason: "acceptance failed".to_string(),
-            revision: RuntimeRevision(1),
-        }));
-        state.apply_event(event("project", "failed", ProposalEvent::Failed {
-            error: "tool failed".to_string(),
-            revision: RuntimeRevision(1),
-        }));
-        state.apply_event(event("project", "stopped", ProposalEvent::Stopped {
-            reason: "operator".to_string(),
-            revision: RuntimeRevision(1),
-        }));
+        state.apply_event(event(
+            "project",
+            "stalled",
+            ProposalEvent::Stalled {
+                blocker: BlockerInfo::new("external", "needs operator"),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "rejected",
+            ProposalEvent::Rejected {
+                reason: "acceptance failed".to_string(),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "failed",
+            ProposalEvent::Failed {
+                error: "tool failed".to_string(),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "stopped",
+            ProposalEvent::Stopped {
+                reason: "operator".to_string(),
+                revision: RuntimeRevision(1),
+            },
+        ));
 
         let project = state.projects.get(&ProjectId::from("project")).unwrap();
-        assert_eq!(project.stalled_proposals(), vec![ProposalId::from_change_id("stalled")]);
-        assert!(matches!(project.proposal_status(&ProposalId::from_change_id("rejected")), Some(ProposalStatus::Rejected { .. })));
-        assert!(matches!(project.proposal_status(&ProposalId::from_change_id("failed")), Some(ProposalStatus::Failed { .. })));
-        assert!(matches!(project.proposal_status(&ProposalId::from_change_id("stopped")), Some(ProposalStatus::Stopped { .. })));
+        assert_eq!(
+            project.stalled_proposals(),
+            vec![ProposalId::from_change_id("stalled")]
+        );
+        assert!(matches!(
+            project.proposal_status(&ProposalId::from_change_id("rejected")),
+            Some(ProposalStatus::Rejected { .. })
+        ));
+        assert!(matches!(
+            project.proposal_status(&ProposalId::from_change_id("failed")),
+            Some(ProposalStatus::Failed { .. })
+        ));
+        assert!(matches!(
+            project.proposal_status(&ProposalId::from_change_id("stopped")),
+            Some(ProposalStatus::Stopped { .. })
+        ));
     }
 
     #[test]
     fn stale_non_terminal_events_do_not_regress_newer_state() {
         let mut state = OrchestratorRuntimeState::default();
         let workspace = WorkspaceRef::new("/tmp/change-a");
-        state.apply_event(event("project", "change-a", ProposalEvent::AcceptanceStarted {
-            workspace: workspace.clone(),
-            attempt: 1,
-            revision: RuntimeRevision(4),
-        }));
-        state.apply_event(event("project", "change-a", ProposalEvent::ApplyStarted {
-            workspace,
-            attempt: 1,
-            revision: RuntimeRevision(3),
-        }));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::AcceptanceStarted {
+                workspace: workspace.clone(),
+                attempt: 1,
+                revision: RuntimeRevision(4),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::ApplyStarted {
+                workspace,
+                attempt: 1,
+                revision: RuntimeRevision(3),
+            },
+        ));
 
         let project = state.projects.get(&ProjectId::from("project")).unwrap();
         assert!(matches!(
             project.proposal_status(&ProposalId::from_change_id("change-a")),
-            Some(ProposalStatus::Accepting { revision: RuntimeRevision(4), .. })
+            Some(ProposalStatus::Accepting {
+                revision: RuntimeRevision(4),
+                ..
+            })
         ));
     }
 
     #[test]
     fn base_lane_events_are_deferred_when_lane_is_owned_by_another_proposal() {
         let mut state = OrchestratorRuntimeState::default();
-        state.apply_event(event("project", "change-a", ProposalEvent::MergeWait {
-            workspace: WorkspaceRef::new("/tmp/change-a"),
-            revision: RuntimeRevision(1),
-        }));
-        state.apply_event(event("project", "change-b", ProposalEvent::ResolveStarted {
-            workspace: WorkspaceRef::new("/tmp/change-b"),
-            attempt: 1,
-            revision: RuntimeRevision(2),
-        }));
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::MergeWait {
+                workspace: WorkspaceRef::new("/tmp/change-a"),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "change-b",
+            ProposalEvent::ResolveStarted {
+                workspace: WorkspaceRef::new("/tmp/change-b"),
+                attempt: 1,
+                revision: RuntimeRevision(2),
+            },
+        ));
 
         let project = state.projects.get(&ProjectId::from("project")).unwrap();
-        assert!(project.proposal_status(&ProposalId::from_change_id("change-b")).is_none());
-        assert_eq!(project.base_lane_owner.as_ref().unwrap().proposal_id.as_change_id(), "change-a");
+        assert!(project
+            .proposal_status(&ProposalId::from_change_id("change-b"))
+            .is_none());
+        assert_eq!(
+            project
+                .base_lane_owner
+                .as_ref()
+                .unwrap()
+                .proposal_id
+                .as_change_id(),
+            "change-a"
+        );
     }
 }
 
@@ -253,7 +463,9 @@ pub mod terminal {
         let mut project = ProjectRuntimeState::new("project");
         project.apply_proposal_event(
             ProposalId::from_change_id("change-a"),
-            ProposalEvent::Merged { revision: RuntimeRevision(10) },
+            ProposalEvent::Merged {
+                revision: RuntimeRevision(10),
+            },
         );
         project
     }
@@ -264,17 +476,33 @@ pub mod terminal {
         let workspace = WorkspaceRef::new("/tmp/change-a");
 
         for event in [
-            ProposalEvent::ApplyStarted { workspace: workspace.clone(), attempt: 2, revision: RuntimeRevision(11) },
-            ProposalEvent::ArchiveStarted { workspace: workspace.clone(), attempt: 2, revision: RuntimeRevision(12) },
-            ProposalEvent::ResolveStarted { workspace, attempt: 2, revision: RuntimeRevision(13) },
-            ProposalEvent::Merged { revision: RuntimeRevision(14) },
+            ProposalEvent::ApplyStarted {
+                workspace: workspace.clone(),
+                attempt: 2,
+                revision: RuntimeRevision(11),
+            },
+            ProposalEvent::ArchiveStarted {
+                workspace: workspace.clone(),
+                attempt: 2,
+                revision: RuntimeRevision(12),
+            },
+            ProposalEvent::ResolveStarted {
+                workspace,
+                attempt: 2,
+                revision: RuntimeRevision(13),
+            },
+            ProposalEvent::Merged {
+                revision: RuntimeRevision(14),
+            },
         ] {
             project.apply_proposal_event(ProposalId::from_change_id("change-a"), event);
         }
 
         assert!(matches!(
             project.proposal_status(&ProposalId::from_change_id("change-a")),
-            Some(ProposalStatus::Merged { revision: RuntimeRevision(10) })
+            Some(ProposalStatus::Merged {
+                revision: RuntimeRevision(10)
+            })
         ));
     }
 
@@ -299,7 +527,10 @@ pub mod terminal {
 
         assert!(matches!(
             project.proposal_status(&ProposalId::from_change_id("change-a")),
-            Some(ProposalStatus::Rejected { revision: RuntimeRevision(5), .. })
+            Some(ProposalStatus::Rejected {
+                revision: RuntimeRevision(5),
+                ..
+            })
         ));
     }
 }
