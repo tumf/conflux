@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(
             recorded_calls,
             vec![("_global_".to_string(), "run".to_string())],
-            "project-level run must not start when only rejected changes are present"
+            "project-level run must not start a per-project run when only rejected changes are present"
         );
     }
 

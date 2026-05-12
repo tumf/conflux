@@ -6,6 +6,7 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
+use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
 use crate::parallel::executor::{
     execute_acceptance_in_workspace, execute_archive_finalization_in_workspace,
     execute_archive_in_workspace,
@@ -25,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 trait TestAssertionExt<T> {
     fn or_fail(self, context: &str) -> T;
@@ -404,6 +405,52 @@ async fn test_dependency_blocker_diagnostics_dedupe_and_reemit_on_signature_chan
         }
     }
     assert_eq!(rejected_errors, 1, "changed blocker class should re-emit");
+}
+
+#[tokio::test]
+async fn test_terminal_error_change_is_not_selected_until_explicit_retry() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        temp.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let analysis = crate::analyzer::AnalysisResult {
+        order: vec!["alpha".to_string()],
+        dependencies: HashMap::new(),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let blocked = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+    assert!(blocked.is_empty());
+
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::RetryError("alpha".to_string()));
+    let selected = executor
+        .select_changes_for_dispatch(&analysis, 1, &in_flight)
+        .await;
+    assert_eq!(selected, vec!["alpha".to_string()]);
 }
 
 #[tokio::test]
@@ -3824,9 +3871,7 @@ async fn test_attempt_merge_succeeds_when_change_archived() {
 /// Test that the has_resolve_wait helper correctly tracks ResolveWait state.
 #[tokio::test]
 async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
-    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
@@ -3865,11 +3910,10 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
 
 #[tokio::test]
 async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
     use crate::parallel::WorkspaceResult;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_dir = TempDir::new().or_fail("create temp workspace");
@@ -3954,9 +3998,8 @@ async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
 
 #[tokio::test]
 async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_work() {
-    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
@@ -4023,10 +4066,9 @@ async fn test_scheduler_dispatches_synced_manual_resolve_wait_without_queued_wor
 #[tokio::test(flavor = "current_thread")]
 async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_bounded() {
     use crate::events::{ExecutionEvent, LogLevel};
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex as StdMutex};
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone)]
@@ -4165,9 +4207,8 @@ async fn test_scheduler_reconciliation_missing_candidate_warn_is_observable_but_
 
 #[tokio::test]
 async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_base() {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_dir = TempDir::new().or_fail("create temp workspace");
@@ -4243,11 +4284,9 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
 }
 
 #[tokio::test]
-async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_failed_terminal_state(
-) {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_retry() {
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_dir = TempDir::new().or_fail("create temp workspace");
@@ -4328,27 +4367,21 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
         .await;
 
     assert_eq!(
-        added.queued_added, 0,
-        "terminal-invisible reducer state must not be classified as a normal queued addition"
-    );
-    assert_eq!(
-        added.repair_added, 1,
-        "archived dirty workspace should be rediscovered even after ArchiveFailed made reducer queue intent terminal-invisible"
+        added.total_added(),
+        0,
+        "terminal-error reducer state must not be rediscovered as ordinary archived-dirty repair work"
     );
     assert_eq!(
         rediscovered.total_added(),
         0,
-        "unchanged archived dirty repair rediscovery should not claim new scheduler progress"
+        "unchanged terminal-error rediscovery should remain stopped"
     );
     assert_eq!(
         *executor.last_queue_change_at.lock().await,
         last_queue_change_after_repair,
-        "repair discovery and rediscovery must not refresh normal queue debounce"
+        "terminal-error reconciliation must not refresh normal queue debounce"
     );
-    assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].id, change_id);
-    assert_eq!(queued[0].completed_tasks, 1);
-    assert_eq!(queued[0].total_tasks, 2);
+    assert!(queued.is_empty());
 
     let reducer_queued = shared.read().await.queued_change_ids();
     assert!(
@@ -4356,17 +4389,22 @@ async fn test_archived_dirty_reconciliation_discovers_workspace_after_archive_fa
         "test must exercise the real post-failure reducer shape: terminal ArchiveFailed excludes queued_change_ids"
     );
 
-    let mut archived_dirty_diagnostic_count = 0usize;
+    let mut retry_required_diagnostic_count = 0usize;
     while let Ok(event) = rx.try_recv() {
         if let crate::events::ExecutionEvent::Log(log) = event {
-            if log.message.contains("archived_dirty_repair_candidate") {
-                archived_dirty_diagnostic_count += 1;
+            assert!(
+                !log.message.contains("archived_dirty_repair_candidate"),
+                "terminal-error worktree must not emit archived-dirty repair diagnostics: {}",
+                log.message
+            );
+            if log.message.contains("terminal_error_retry_required") {
+                retry_required_diagnostic_count += 1;
             }
         }
     }
     assert_eq!(
-        archived_dirty_diagnostic_count, 1,
-        "reconciliation should emit the first archived dirty repair diagnostic while bounding unchanged repeats"
+        retry_required_diagnostic_count, 1,
+        "reconciliation should emit one retry-required diagnostic while bounding unchanged repeats"
     );
 }
 
@@ -4567,11 +4605,10 @@ fn test_stale_retry_reason_allows_existing_workspace_path() {
 #[tokio::test]
 async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {
     use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use crate::vcs::GitWorkspaceManager;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
@@ -4742,11 +4779,10 @@ async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_on
 #[tokio::test]
 async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
     use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use crate::vcs::GitWorkspaceManager;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let temp_dir = TempDir::new().or_fail("unexpected error");
     let repo_root = temp_dir.path();
@@ -4846,10 +4882,9 @@ async fn test_stale_already_merged_resolve_wait_skips_merge_and_hook() {
 
 #[tokio::test]
 async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
     use tokio::task::JoinSet;
 
     let repo_dir = TempDir::new().or_fail("create temp repo");
@@ -5000,11 +5035,10 @@ async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
 #[tokio::test]
 async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
     use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let workspace_dir = TempDir::new().or_fail("unexpected error");
     let change_id = "change-rejected";
@@ -5097,10 +5131,9 @@ async fn test_reject_wait_lane_clear_promotion_starts_rejection_review() {
 #[tokio::test]
 async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
     use crate::events::ExecutionEvent;
-    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::mpsc;
 
     let first_workspace = TempDir::new().or_fail("unexpected error");
     let second_workspace = TempDir::new().or_fail("unexpected error");
@@ -5184,9 +5217,7 @@ async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
 
 #[tokio::test]
 async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
-    use crate::orchestration::state::{OrchestratorState, ReducerCommand};
     use std::sync::Arc;
-    use tokio::sync::RwLock;
 
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");

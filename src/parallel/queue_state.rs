@@ -372,6 +372,18 @@ impl ParallelExecutor {
         let rejected_ids = self.rejected_dependency_ids();
 
         for change_id in &analysis_result.order {
+            if let Some(shared) = &self.shared_orchestrator_state {
+                if let Ok(guard) = shared.try_read() {
+                    if guard.is_terminal_error_change(change_id) {
+                        info!(
+                            change_id = %change_id,
+                            "Skipping ordinary apply dispatch because terminal error requires explicit retry"
+                        );
+                        continue;
+                    }
+                }
+            }
+
             // Check if change has unresolved dependencies
             if let Some(deps) = analysis_result.dependencies.get(change_id) {
                 let mut unresolved_deps = Vec::new();
@@ -1351,10 +1363,23 @@ impl ParallelExecutor {
             return QueueReconciliationOutcome::default();
         };
 
-        let (mut queued_intent_ids, active_ids_from_reducer) = match shared_state.try_read() {
-            Ok(state) => (state.queued_change_ids(), state.active_change_ids()),
-            Err(_) => return QueueReconciliationOutcome::default(),
-        };
+        let (mut queued_intent_ids, active_ids_from_reducer, terminal_error_ids) =
+            match shared_state.try_read() {
+                Ok(state) => {
+                    let terminal_error_ids = state
+                        .initial_change_ids()
+                        .iter()
+                        .filter(|id| state.is_terminal_error_change(id))
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>();
+                    (
+                        state.queued_change_ids(),
+                        state.active_change_ids(),
+                        terminal_error_ids,
+                    )
+                }
+                Err(_) => return QueueReconciliationOutcome::default(),
+            };
 
         let reducer_active_set: std::collections::HashSet<String> =
             active_ids_from_reducer.into_iter().collect();
@@ -1385,6 +1410,15 @@ impl ParallelExecutor {
         match self.workspace_manager.list_worktree_change_ids().await {
             Ok(worktree_change_ids) => {
                 for worktree_change_id in worktree_change_ids {
+                    if terminal_error_ids.contains(&worktree_change_id) {
+                        self.emit_queue_reconciliation_diagnostic(
+                            QueueReconciliationDiagnosticLevel::Info,
+                            &worktree_change_id,
+                            "terminal_error_retry_required",
+                        )
+                        .await;
+                        continue;
+                    }
                     if queued_intent_ids.iter().any(|id| id == &worktree_change_id)
                         || in_flight.contains(&worktree_change_id)
                         || reducer_active_set.contains(&worktree_change_id)
@@ -1479,6 +1513,15 @@ impl ParallelExecutor {
         let mut outcome = QueueReconciliationOutcome::default();
 
         for queued_id in queued_intent_ids {
+            if terminal_error_ids.contains(&queued_id) {
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    &queued_id,
+                    "terminal_error_retry_required",
+                )
+                .await;
+                continue;
+            }
             if queued.iter().any(|change| change.id == queued_id) {
                 continue;
             }

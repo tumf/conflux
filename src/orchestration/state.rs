@@ -340,6 +340,8 @@ impl ChangeRuntimeState {
 pub enum ReducerCommand {
     /// Request a change to be added to the execution queue.
     AddToQueue(String),
+    /// Explicitly retry a recoverable terminal-error change.
+    RetryError(String),
     /// Request a change to be removed from the execution queue.
     RemoveFromQueue(String),
     /// Request merge resolution for a change in MergeWait or ResolveWait.
@@ -974,6 +976,43 @@ impl OrchestratorState {
         self.error_histories.remove(change_id);
     }
 
+    /// Return true when a recoverable terminal error is currently gating ordinary apply dispatch.
+    pub fn is_terminal_error_change(&self, change_id: &str) -> bool {
+        self.change_runtime
+            .get(change_id)
+            .map(|rt| matches!(rt.terminal, TerminalState::Error(_)))
+            .unwrap_or(false)
+    }
+
+    /// Clear a recoverable terminal error and restore ordinary queued retry intent.
+    ///
+    /// This is the only reducer-owned transition that may turn `TerminalState::Error`
+    /// back into apply-dispatch eligibility. Final terminal states remain immutable.
+    pub fn retry_terminal_error(&mut self, change_id: &str) -> ReduceOutcome {
+        {
+            let rt = self.runtime_entry(change_id);
+            if !matches!(rt.terminal, TerminalState::Error(_)) {
+                return ReduceOutcome::NoOp;
+            }
+            rt.terminal = TerminalState::None;
+            rt.activity = ActivityState::Idle;
+            rt.wait_state = WaitState::None;
+            rt.queue_intent = QueueIntent::Queued;
+            rt.dequeued = false;
+            rt.clear_blocked_metadata();
+            rt.observation = WorkspaceObservation::None;
+        }
+        self.clear_stalled_change(change_id);
+        self.clear_error_history(change_id);
+        self.resolve_wait_queue.retain(|id| id != change_id);
+        self.reject_wait_queue.retain(|id| id != change_id);
+        self.add_dynamic_change(change_id.to_string());
+        ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
+            change_id: change_id.to_string(),
+            intent: QueueIntent::Queued,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Reducer API (Phase 2)
     // -----------------------------------------------------------------------
@@ -987,26 +1026,14 @@ impl OrchestratorState {
                 self.clear_stalled_change(&change_id);
                 {
                     let rt = self.runtime_entry(&change_id);
-                    if matches!(
-                        rt.terminal,
-                        TerminalState::Archived
-                            | TerminalState::Merged
-                            | TerminalState::Rejected(_)
-                    ) {
+                    if rt.is_terminal() {
                         return ReduceOutcome::NoOp;
                     }
-                    if !rt.is_terminal()
-                        && !rt.dequeued
+                    if !rt.dequeued
                         && !matches!(rt.wait_state, WaitState::Stalled)
                         && (rt.is_active() || rt.queue_intent == QueueIntent::Queued)
                     {
                         return ReduceOutcome::NoOp;
-                    }
-                    if rt.is_terminal() {
-                        rt.terminal = TerminalState::None;
-                        rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::None;
-                        rt.clear_blocked_metadata();
                     }
                     rt.dequeued = false;
                     rt.queue_intent = QueueIntent::Queued;
@@ -1021,6 +1048,7 @@ impl OrchestratorState {
                     intent: QueueIntent::Queued,
                 })
             }
+            ReducerCommand::RetryError(change_id) => self.retry_terminal_error(&change_id),
             ReducerCommand::RemoveFromQueue(change_id) => {
                 let rt = self.runtime_entry(&change_id);
                 if rt.queue_intent == QueueIntent::NotQueued {
@@ -1168,6 +1196,9 @@ impl OrchestratorState {
         match event {
             // Processing lifecycle
             ExecutionEvent::ProcessingStarted(change_id) => {
+                if self.is_terminal_error_change(change_id) {
+                    return;
+                }
                 self.set_current_change(Some(change_id.clone()));
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
@@ -2136,12 +2167,25 @@ mod tests {
         assert!(matches!(outcome6, ReduceOutcome::Changed(_)));
         assert_eq!(state.display_status("c"), "not queued");
 
+        // Terminal errors require the explicit retry transition, not ordinary queue intent.
+        state.runtime_entry("c").terminal = TerminalState::Error("boom".to_string());
+        let outcome_error_queue = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(outcome_error_queue, ReduceOutcome::NoOp));
+        assert_eq!(state.display_status("c"), "error");
+        let outcome_error_retry = state.apply_command(ReducerCommand::RetryError("c".to_string()));
+        assert!(matches!(outcome_error_retry, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "queued");
+
         // Rejected cannot be re-queued until a refresh reactivates the change.
         state.runtime_entry("c").terminal = TerminalState::Rejected("blocked".to_string());
         let outcome7 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(matches!(outcome7, ReduceOutcome::NoOp));
+        let outcome_rejected_retry =
+            state.apply_command(ReducerCommand::RetryError("c".to_string()));
+        assert!(matches!(outcome_rejected_retry, ReduceOutcome::NoOp));
 
         // Reactivation path: when the change reappears in active listing after
+
         // REJECTED.md removal, ChangesRefreshed clears rejected terminal state.
         use crate::events::ExecutionEvent;
         use crate::openspec::{Change, ProposalMetadata};
@@ -2168,6 +2212,67 @@ mod tests {
         let outcome8 = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(matches!(outcome8, ReduceOutcome::Changed(_)));
         assert_eq!(state.display_status("c"), "queued");
+    }
+
+    #[test]
+    fn retry_terminal_error_clears_error_gate_and_stale_retry_metadata() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        state.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+            change_id: "c".to_string(),
+            command: "apply".to_string(),
+        });
+        state.record_error_and_check_circuit_breaker(
+            "c",
+            "boom",
+            CircuitBreakerConfig {
+                enabled: true,
+                threshold: 2,
+            },
+        );
+        state.mark_stalled("c".to_string());
+        state.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+            id: "c".to_string(),
+            error: "boom".to_string(),
+        });
+
+        assert_eq!(state.display_status("c"), "error");
+        assert!(state.queued_change_ids().is_empty());
+        assert!(state.last_error("c").is_some());
+
+        let outcome = state.apply_command(ReducerCommand::RetryError("c".to_string()));
+
+        assert!(matches!(outcome, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "queued");
+        assert_eq!(state.queued_change_ids(), vec!["c".to_string()]);
+        assert!(state.last_error("c").is_none());
+        assert!(!state.stalled_change_ids().contains("c"));
+        let runtime = state.change_runtime("c").expect("runtime should exist");
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        assert_eq!(runtime.wait_state, WaitState::None);
+        assert_eq!(runtime.blocked_metadata, BlockedMetadata::default());
+    }
+
+    #[test]
+    fn late_success_supersedes_recoverable_error_without_requeueing_apply() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 0, ExecutionMode::Parallel);
+        state.apply_execution_event(&crate::events::ExecutionEvent::ApplyFailed {
+            change_id: "c".to_string(),
+            error: "boom".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "error");
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "c".to_string(),
+            revision: "rev".to_string(),
+        });
+
+        assert_eq!(state.display_status("c"), "merged");
+        assert!(state.queued_change_ids().is_empty());
+        let runtime = state.change_runtime("c").expect("runtime should exist");
+        assert_eq!(runtime.queue_intent, QueueIntent::NotQueued);
     }
 
     #[test]
@@ -4079,10 +4184,10 @@ mod tests {
     // Fix: parallel TUI queued/blocked state regression – reducer unit tests
     // -----------------------------------------------------------------------
 
-    /// AddToQueue on a change in Error terminal state must clear the terminal and
+    /// Explicit RetryError on a change in Error terminal state must clear the terminal and
     /// set queue_intent = Queued so that the TUI retry path works correctly.
     #[test]
-    fn test_add_to_queue_retries_error_terminal() {
+    fn test_explicit_retry_retries_error_terminal() {
         use crate::events::ExecutionEvent;
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
@@ -4095,11 +4200,16 @@ mod tests {
         assert_eq!(state.display_status("c"), "error");
         assert!(state.is_terminal_change("c"));
 
-        // AddToQueue (retry) must clear the error terminal.
-        let outcome = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        // Ordinary AddToQueue must not clear the error terminal.
+        let ordinary_outcome = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(ordinary_outcome, ReduceOutcome::NoOp));
+        assert_eq!(state.display_status("c"), "error");
+
+        // Explicit RetryError must clear the error terminal.
+        let outcome = state.apply_command(ReducerCommand::RetryError("c".to_string()));
         assert!(
             matches!(outcome, ReduceOutcome::Changed(_)),
-            "AddToQueue on error change must be Changed, not NoOp"
+            "RetryError on error change must be Changed, not NoOp"
         );
         assert_eq!(
             state.display_status("c"),

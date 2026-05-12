@@ -720,6 +720,17 @@ mod tests {
         error_app.mode = AppMode::Error;
         error_app.is_resolving = true;
         error_app.changes[0].set_error_message_cache("boom".to_string());
+        error_app.changes[0].selected = true;
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec!["error-a".to_string()], 0),
+        ));
+        shared.blocking_write().apply_execution_event(
+            &crate::events::ExecutionEvent::ProcessingError {
+                id: "error-a".to_string(),
+                error: "boom".to_string(),
+            },
+        );
+        error_app.set_shared_state(shared);
         let command = handle_f5_key_inner(&mut error_app, &graceful_stop, &handle);
         assert!(matches!(
             command,

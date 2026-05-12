@@ -535,6 +535,26 @@ impl ParallelExecutor {
             }
         }
 
+        if let Some(shared) = &self.shared_orchestrator_state {
+            if let Ok(guard) = shared.try_read() {
+                if guard.is_terminal_error_change(&change_id) {
+                    info!(
+                        change_id = %change_id,
+                        "Skipping workspace dispatch because terminal error requires explicit retry"
+                    );
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(LogEntry::info(format!(
+                            "Change {} remains error until explicitly retried",
+                            change_id
+                        ))),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+
         // Check if already in-flight (avoid duplicate dispatch)
         if in_flight.contains(&change_id) {
             warn!(

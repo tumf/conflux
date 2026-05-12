@@ -144,15 +144,23 @@ pub(super) fn retry_error_changes(state: &mut AppState) -> Option<TuiCommand> {
         return None;
     }
 
-    processing_logic::mark_changes_queued(&mut state.changes, &error_ids);
-    processing_logic::sync_queue_intent(state.shared_orchestrator_state.as_ref(), &error_ids);
-    for entry in processing_logic::emit_retry_logs(&error_ids) {
+    let retry_ids = processing_logic::sync_retry_error_intent(
+        state.shared_orchestrator_state.as_ref(),
+        &error_ids,
+    );
+    if retry_ids.is_empty() {
+        state.warning_message = Some("No marked error changes are retryable".to_string());
+        return None;
+    }
+
+    processing_logic::mark_changes_queued(&mut state.changes, &retry_ids);
+    for entry in processing_logic::emit_retry_logs(&retry_ids) {
         state.add_log(entry);
     }
 
     state.reset_for_run();
     state.mode = AppMode::Running;
-    Some(processing_logic::build_start_command(error_ids))
+    Some(processing_logic::build_start_command(retry_ids))
 }
 
 #[cfg(test)]
