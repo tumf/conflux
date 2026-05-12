@@ -348,6 +348,16 @@ impl ParallelizationAnalyzer {
                         }
                     }
                 }
+                // Codex `exec --json` emits the final assistant text as an item.completed event.
+                if json.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
+                    if let Some(item) = json.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                return text.to_string();
+                            }
+                        }
+                    }
+                }
             }
         }
         // Fallback: return entire output if not stream-json format

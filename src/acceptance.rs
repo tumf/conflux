@@ -8,8 +8,8 @@
 //! - **Primary**: a strict JSON verdict object of the form
 //!   `{"acceptance":"pass|fail|continue|gated","findings":[...]}` emitted as
 //!   the final machine-readable verdict payload. JSON verdicts may appear
-//!   directly as a line on stdout, or wrapped inside an
-//!   `opencode run --format json` event (assistant / result / stream_event
+//!   directly as a line on stdout, or wrapped inside a supported agent JSONL
+//!   event (assistant / result / stream_event / Codex item.completed
 //!   text payloads). In either case the runtime unwraps the payload and
 //!   evaluates the JSON verdict.
 //! - **Fallback**: legacy plain-text standalone verdict markers of the form
@@ -91,8 +91,8 @@ pub(crate) fn parse_json_verdict(text: &str) -> Option<(&'static str, Vec<String
 /// Preference order:
 ///
 /// 1. Strict JSON verdict object on the line itself (primary contract).
-/// 2. Strict JSON verdict object inside an unwrapped
-///    `opencode run --format json` event text payload.
+/// 2. Strict JSON verdict object inside an unwrapped supported agent JSONL
+///    event text payload.
 /// 3. Legacy plain-text standalone canonical marker on the line itself, or
 ///    inside the unwrapped event payload (backward-compatible fallback).
 ///
@@ -140,8 +140,8 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
 ///
 /// - Primary: a strict JSON verdict object
 ///   `{"acceptance":"pass|fail|continue|gated","findings":[...]}` emitted
-///   either directly as a line, or wrapped inside an `opencode run
-///   --format json` event payload (assistant / stream_event / result text).
+///   either directly as a line, or wrapped inside a supported agent JSONL event
+///   payload (assistant / stream_event / result / Codex item.completed text).
 ///   The first JSON verdict encountered wins, regardless of any earlier text
 ///   marker.
 /// - Fallback: a standalone legacy line equal to one of `ACCEPTANCE: PASS`,
@@ -172,8 +172,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
         }
 
         // Collect scan candidates: the raw line, plus unwrapped event text when
-        // the line is a stream-json event wrapper (from `opencode run
-        // --format json` and similar event streams).
+        // the line is a supported JSONL event wrapper from an agent runtime.
         let mut candidates: Vec<String> = vec![trimmed.to_string()];
         if let Some(text) = crate::stream_json_textifier::extract_text_from_stream_json(trimmed) {
             for inner in text.lines() {
@@ -938,8 +937,8 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     }
 
     #[test]
-    fn test_parse_acceptance_output_json_inside_opencode_format_json_assistant_event() {
-        // `opencode run --format json` wraps final text in an assistant event.
+    fn test_parse_acceptance_output_json_inside_agent_assistant_event() {
+        // Some agent JSONL formats wrap final text in an assistant event.
         // The parser must unwrap the text payload and still find the JSON verdict.
         let event = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"acceptance\":\"pass\"}"}]}}"#;
         let output = format!("{}\n", event);
@@ -947,10 +946,9 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     }
 
     #[test]
-    fn test_parse_acceptance_output_json_inside_opencode_format_json_result_event() {
-        // Final result event from `opencode run --format json` / Claude Code
-        // stream-json carries the assistant's final text in `result`. Parser
-        // must unwrap and accept the JSON verdict.
+    fn test_parse_acceptance_output_json_inside_agent_result_event() {
+        // Some agent JSONL formats carry the assistant's final text in `result`.
+        // Parser must unwrap and accept the JSON verdict.
         let event = r#"{"type":"result","subtype":"success","result":"{\"acceptance\":\"fail\",\"findings\":[\"a\"]}","is_error":false}"#;
         let output = format!("{}\n", event);
         match parse_acceptance_output(&output) {
@@ -959,6 +957,13 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             }
             other => panic!("expected Fail, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_json_inside_codex_item_completed_event() {
+        let event = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"acceptance\":\"pass\"}"}}"#;
+        let output = format!("{}\n", event);
+        assert_eq!(parse_acceptance_output(&output), AcceptanceResult::Pass);
     }
 
     #[test]

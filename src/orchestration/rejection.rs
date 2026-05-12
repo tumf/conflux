@@ -41,8 +41,8 @@ fn rejection_review_prompt(change_id: &str) -> String {
 
 fn rejection_review_prompt_with_skill(rejecting_skill: &str, change_id: &str) -> String {
     format!(
-        "load skills: {}\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
-        rejecting_skill, change_id, change_id, change_id, change_id, change_id
+        "{}\n\nRejecting review id:{}\n\nchange_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nrejected_path: openspec/changes/{}/REJECTED.md",
+        crate::agent::prompt::skill_prelude(rejecting_skill), change_id, change_id, change_id, change_id, change_id
     )
 }
 
@@ -525,8 +525,9 @@ mod tests {
     #[test]
     fn test_rejection_review_prompt_uses_custom_skill_prelude() {
         let prompt = rejection_review_prompt_with_skill("team-rejecting", "change-a");
+        assert!(prompt.contains("$team-rejecting"));
         assert!(prompt.contains("load skills: team-rejecting"));
-        assert!(!prompt.contains("load skills: cflx-rejecting"));
+        assert!(!prompt.contains("$cflx-rejecting"));
         assert!(prompt.contains("Rejecting review id:change-a"));
     }
 

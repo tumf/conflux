@@ -1,6 +1,6 @@
-//! Stream-JSON output textification for Claude Code `--output-format stream-json`.
+//! Stream-JSON output textification for AI agent JSONL output.
 //!
-//! Converts NDJSON event lines emitted by Claude Code into human-readable text
+//! Converts NDJSON event lines emitted by AI agents into human-readable text
 //! with line-oriented buffering.  Each JSON event that carries text is decoded;
 //! tool-related events are converted to one-line summaries;
 //! other non-text events (system init messages, thinking, …) are suppressed
@@ -35,6 +35,7 @@ pub fn is_stream_json_event(line: &str) -> bool {
 /// - `stream_event` with `event.delta.type = "text_delta"`: streaming text chunk
 /// - `assistant` with `message.content[].type = "text"`: full assistant text block
 /// - `result` with a non-empty, non-error `result` field: final result text
+/// - `item.completed` with `item.type = "agent_message"`: Codex final assistant text
 pub fn extract_text_from_stream_json(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {
@@ -47,6 +48,7 @@ pub fn extract_text_from_stream_json(line: &str) -> Option<String> {
         "stream_event" => extract_from_stream_event(&value),
         "assistant" => extract_from_assistant(&value),
         "result" => extract_from_result(&value),
+        "item.completed" => extract_from_codex_item_completed(&value),
         _ => None,
     }
 }
@@ -102,6 +104,20 @@ fn extract_from_result(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn extract_from_codex_item_completed(value: &serde_json::Value) -> Option<String> {
+    // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    let item = value.get("item")?;
+    if item.get("type")?.as_str()? != "agent_message" {
+        return None;
+    }
+    let text = item.get("text")?.as_str()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 /// Extract a one-line summary from tool-related stream-json events.
 ///
 /// Returns `Some(summary)` for `tool_use` and `tool_result` events.
@@ -119,11 +135,43 @@ pub fn extract_tool_summary_from_stream_json(line: &str) -> Option<String> {
     let event_type = value.get("type")?.as_str()?;
 
     match event_type {
+        "item.completed" => extract_codex_item_summary(&value),
         "tool_use" => extract_tool_use_summary(&value),
         "tool_result" => extract_tool_result_summary(&value),
         "assistant" => extract_assistant_tool_summary(&value),
         _ => None,
     }
+}
+
+fn extract_codex_item_summary(value: &serde_json::Value) -> Option<String> {
+    let item = value.get("item")?;
+    let item_type = item.get("type")?.as_str()?;
+    match item_type {
+        "file_change" => extract_codex_file_change_summary(item),
+        _ => None,
+    }
+}
+
+fn extract_codex_file_change_summary(item: &serde_json::Value) -> Option<String> {
+    let changes = item.get("changes")?.as_array()?;
+    if changes.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for change in changes.iter().take(5) {
+        let path = change.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let kind = change
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("change");
+        parts.push(format!("{}:{}", kind, path));
+    }
+    if changes.len() > 5 {
+        parts.push(format!("+{} more", changes.len() - 5));
+    }
+
+    Some(format!("[file_change] {}", parts.join(", ")))
 }
 
 fn extract_tool_use_summary(value: &serde_json::Value) -> Option<String> {
@@ -473,6 +521,21 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_codex_item_completed_agent_message() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello from Codex"}}"#;
+        assert_eq!(
+            extract_text_from_stream_json(line),
+            Some("Hello from Codex".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_codex_item_completed_non_message_suppressed() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"tool_call","text":"ignore"}}"#;
+        assert_eq!(extract_text_from_stream_json(line), None);
+    }
+
+    #[test]
     fn test_non_json_returns_none() {
         assert_eq!(extract_text_from_stream_json("plain text"), None);
         assert_eq!(extract_text_from_stream_json(""), None);
@@ -567,6 +630,26 @@ mod tests {
         let line = r#"{"type":"system","subtype":"init"}"#;
         let result = process_stdout_line(line, &mut buf);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_process_codex_item_completed_buffers_text() {
+        let mut buf = StreamJsonTextBuffer::new();
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"line1\nline2"}}"#;
+        let result = process_stdout_line(line, &mut buf);
+        assert_eq!(result, vec!["line1".to_string()]);
+        assert_eq!(buf.finalize(), Some("line2".to_string()));
+    }
+
+    #[test]
+    fn test_process_codex_file_change_summary() {
+        let mut buf = StreamJsonTextBuffer::new();
+        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"file_change","changes":[{"path":"src/main.rs","kind":"modify"},{"path":"README.md","kind":"add"}],"status":"completed"}}"#;
+        let result = process_stdout_line(line, &mut buf);
+        assert_eq!(
+            result,
+            vec!["[file_change] modify:src/main.rs, add:README.md".to_string()]
+        );
     }
 
     #[test]

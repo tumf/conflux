@@ -1245,8 +1245,7 @@ impl AgentRunner {
         Ok((child, rx))
     }
 
-    /// Extract the result from stream-json output format
-    /// stream-json outputs multiple JSON lines, the last one with type="result" contains the actual result
+    /// Extract final assistant text from supported agent JSONL output formats.
     fn extract_stream_json_result(&self, output: &str) -> String {
         // Try to find and parse the result line from stream-json output
         for line in output.lines().rev() {
@@ -1271,6 +1270,16 @@ impl AgentRunner {
                                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                                     return text.to_string();
                                 }
+                            }
+                        }
+                    }
+                }
+                // Codex `exec --json` emits the final assistant text as an item.completed event.
+                if json.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
+                    if let Some(item) = json.get("item") {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("agent_message") {
+                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                return text.to_string();
                             }
                         }
                     }
