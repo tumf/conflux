@@ -263,22 +263,56 @@ fn render_select_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
     render_footer_select(frame, app, chunks[2]);
 }
 
+const TUI_HEADER_HEIGHT: u16 = 3;
+const TUI_STATUS_HEIGHT: u16 = 3;
+const RUNNING_CHANGES_MIN_HEIGHT: u16 = 5;
+const RUNNING_LOGS_TARGET_HEIGHT: u16 = 20;
+const PANEL_BORDER_HEIGHT: u16 = 2;
+
+fn running_changes_visual_row_count(app: &AppState) -> u16 {
+    let (rows, _) = build_change_rows(&app.changes);
+    rows.len().min(u16::MAX as usize) as u16
+}
+
+fn running_logs_enabled_layout_heights(area_height: u16, changes_visual_rows: u16) -> (u16, u16) {
+    let available = area_height.saturating_sub(TUI_HEADER_HEIGHT + TUI_STATUS_HEIGHT);
+    let desired_changes_height = changes_visual_rows
+        .saturating_add(PANEL_BORDER_HEIGHT)
+        .max(RUNNING_CHANGES_MIN_HEIGHT);
+
+    if available <= RUNNING_CHANGES_MIN_HEIGHT {
+        return (available, 0);
+    }
+
+    if available <= RUNNING_CHANGES_MIN_HEIGHT + RUNNING_LOGS_TARGET_HEIGHT {
+        let changes_height = RUNNING_CHANGES_MIN_HEIGHT.min(available);
+        return (changes_height, available.saturating_sub(changes_height));
+    }
+
+    let max_changes_with_target_logs = available.saturating_sub(RUNNING_LOGS_TARGET_HEIGHT);
+    let changes_height = desired_changes_height.min(max_changes_with_target_logs);
+    let logs_height = available.saturating_sub(changes_height);
+    (changes_height, logs_height)
+}
+
 /// Render running mode
 fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
     // Show logs panel only if logs_panel_enabled is true
     let chunks = if app.logs_panel_enabled {
+        let (changes_height, logs_height) =
+            running_logs_enabled_layout_heights(area.height, running_changes_visual_row_count(app));
         Layout::vertical([
-            Constraint::Length(3),  // Header
-            Constraint::Min(5),     // Changes list
-            Constraint::Length(3),  // Status
-            Constraint::Length(20), // Logs (2x height for better visibility)
+            Constraint::Length(TUI_HEADER_HEIGHT), // Header
+            Constraint::Length(changes_height),    // Changes list
+            Constraint::Length(TUI_STATUS_HEIGHT), // Status
+            Constraint::Length(logs_height),       // Logs, expanded with unused changes-list space
         ])
         .split(area)
     } else {
         Layout::vertical([
-            Constraint::Length(3), // Header
-            Constraint::Min(5),    // Changes list
-            Constraint::Length(3), // Status
+            Constraint::Length(TUI_HEADER_HEIGHT),       // Header
+            Constraint::Min(RUNNING_CHANGES_MIN_HEIGHT), // Changes list
+            Constraint::Length(TUI_STATUS_HEIGHT),       // Status
         ])
         .split(area)
     };
@@ -1889,6 +1923,61 @@ mod tests {
             lines.push(line);
         }
         lines.join("\n")
+    }
+
+    fn find_row_containing(buffer: &Buffer, needle: &str) -> Option<u16> {
+        for y in 0..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            if line.contains(needle) {
+                return Some(y);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn running_logs_enabled_layout_expands_logs_for_few_changes() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.add_log(LogEntry::info("expanded log area"));
+
+        let buffer = render_buffer(&mut app, 100, 50);
+
+        assert_eq!(find_row_containing(&buffer, " Logs"), Some(11));
+        assert_eq!(find_row_containing(&buffer, " Status"), Some(8));
+    }
+
+    #[test]
+    fn running_logs_enabled_layout_keeps_target_logs_height_for_many_changes() {
+        let changes = (0..30)
+            .map(|index| create_test_change(&format!("change-{index:02}")))
+            .collect();
+        let mut app = create_test_app(changes);
+        app.mode = AppMode::Running;
+        app.add_log(LogEntry::info("target log area"));
+
+        let buffer = render_buffer(&mut app, 100, 50);
+
+        assert_eq!(find_row_containing(&buffer, " Logs"), Some(30));
+        assert_eq!(find_row_containing(&buffer, " Status"), Some(27));
+    }
+
+    #[test]
+    fn running_logs_disabled_layout_does_not_render_logs_panel() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.logs_panel_enabled = false;
+        app.add_log(LogEntry::info("hidden log area"));
+
+        let buffer = render_buffer(&mut app, 100, 50);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains(" Status"));
+        assert!(!content.contains(" Logs"));
+        assert!(!content.contains("hidden log area"));
     }
 
     #[test]
