@@ -1,0 +1,10 @@
+## Implementation Tasks
+
+- [ ] Expand native evidence hints in `src/openspec_cmd.rs` for generic repository-evidence vocabulary that Conflux diagnostics and proposal guidance already recommend. (verification: unit - add/update validation tests in `src/openspec_cmd.rs` covering `source paths`, `test files`, and `runnable command` wording; runnable command: `cargo test validation_tests --lib`; completion condition: those notes pass only when they also include a valid ownership marker)
+- [ ] Add concrete artifact/command evidence coverage for common repository build forms not currently recognized. (verification: unit - add/update validation tests in `src/openspec_cmd.rs` covering `Dockerfile`, `.toml`, and `docker build`; runnable command: `cargo test validation_tests --lib`; completion condition: archive-gate evidence detection accepts these concrete forms without weakening existing rejection tests)
+- [ ] Preserve strict failure behavior for weak verification notes and ownership-free notes. (verification: unit - existing weak-verification tests in `src/openspec_cmd.rs` remain passing and include at least one assertion that narrative-only `manual review` still produces an evidence finding; runnable command: `cargo test validation_tests --lib`; completion condition: invalid notes remain rejected or warned according to evidence mode)
+- [ ] Update the canonical `cflx-proposal-validation` spec to document accepted generic evidence vocabulary without making logs or private project data part of the public contract. (verification: manual - spec delta `openspec/changes/fix-archive-gate-evidence-vocabulary/specs/cflx-proposal-validation/spec.md` contains only generic scenarios and no private identifiers; source path `src/openspec_cmd.rs` remains the validator implementation reference; runnable commands: `cflx openspec validate fix-archive-gate-evidence-vocabulary --strict --evidence warn` and `cargo test validation_tests --lib`; completion condition: the proposal validates cleanly)
+
+## Final Validation
+
+Expected archive gate: `cflx openspec validate fix-archive-gate-evidence-vocabulary --archive-gate`
