@@ -44,7 +44,7 @@ impl AppState {
             OrchestratorEvent::MergeCompleted {
                 change_id,
                 revision: _,
-            } => self.handle_merge_completed(change_id),
+            } => return self.handle_merge_completed(change_id),
             OrchestratorEvent::BranchMergeStarted { branch_name } => {
                 self.handle_branch_merge_started(branch_name)
             }
