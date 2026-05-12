@@ -36,6 +36,7 @@ mod openspec;
 pub mod openspec_cmd;
 pub mod orchestration;
 mod orchestrator;
+pub mod runtime;
 mod parallel;
 mod parallel_run_service;
 mod permission;
