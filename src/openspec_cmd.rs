@@ -731,11 +731,41 @@ impl OpenSpecManager {
                             change_id, spec_name
                         ));
                     }
+
+                    errors.extend(
+                        self.validate_delta_targets_against_canonical(
+                            &spec_name, &content, change_id,
+                        ),
+                    );
                 }
             }
         }
 
         errors
+    }
+
+    fn validate_delta_targets_against_canonical(
+        &self,
+        spec_name: &str,
+        delta_content: &str,
+        change_id: &str,
+    ) -> Vec<String> {
+        let canonical_spec = self.specs_dir.join(spec_name).join("spec.md");
+        let canonical_content = if canonical_spec.exists() {
+            fs::read_to_string(&canonical_spec).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let (_, promotion_errors) = merge_spec_delta(&canonical_content, delta_content);
+        promotion_errors
+            .into_iter()
+            .filter(|err| {
+                err.contains("MODIFIED target not found in canonical spec")
+                    || err.contains("REMOVED target not found in canonical spec")
+            })
+            .map(|err| format!("{}: {}: {}", change_id, spec_name, err))
+            .collect()
     }
 
     // ─── Archive ─────────────────────────────────────────────────────────
@@ -2361,6 +2391,29 @@ mod openspec_list_show_tests {
         .unwrap();
     }
 
+    fn create_strict_change_with_spec_delta(dir: &Path, spec_name: &str, delta: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("proposal.md"),
+            "# Strict validation fixture\n\n**Change Type**: implementation\n\n## Problem\nvalidator fixture\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("tasks.md"),
+            "- [ ] 1. validator update (verification: unit - cargo test openspec_cmd --lib)\n",
+        )
+        .unwrap();
+        let spec_dir = dir.join("specs").join(spec_name);
+        fs::create_dir_all(&spec_dir).unwrap();
+        fs::write(spec_dir.join("spec.md"), delta).unwrap();
+    }
+
+    fn create_canonical_spec(root: &Path, spec_name: &str, content: &str) {
+        let spec_dir = root.join("openspec/specs").join(spec_name);
+        fs::create_dir_all(&spec_dir).unwrap();
+        fs::write(spec_dir.join("spec.md"), content).unwrap();
+    }
+
     #[test]
     fn test_list_changes_excludes_archived_entries() {
         let temp = TempDir::new().unwrap();
@@ -2875,6 +2928,167 @@ mod openspec_list_show_tests {
         assert!(info
             .path
             .contains("openspec/changes/archive/2026-04-28-archived-change"));
+    }
+
+    #[test]
+    fn test_strict_validate_accepts_matching_modified_target() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "target-check",
+            "# Target Check\n\n### Requirement: Existing Feature\n\nOld behavior.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/valid-modified-target"),
+            "target-check",
+            "## MODIFIED Requirements\n\n### Requirement: Existing Feature\n\nUpdated behavior.\n\n#### Scenario: Existing feature updates\n- WHEN validation runs\n- THEN the matching canonical target is accepted\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, _warnings) =
+            mgr.validate_change(Some("valid-modified-target"), true, "off");
+
+        assert!(is_valid, "matching modified target should pass: {errors:?}");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_strict_validate_rejects_missing_modified_target() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "target-check",
+            "# Target Check\n\n### Requirement: Existing Feature\n\nOld behavior.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/missing-modified-target"),
+            "target-check",
+            "## MODIFIED Requirements\n\n### Requirement: Missing Feature\n\nUpdated behavior.\n\n#### Scenario: Missing feature updates\n- WHEN validation runs\n- THEN the missing target is rejected\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, _warnings) =
+            mgr.validate_change(Some("missing-modified-target"), true, "off");
+
+        assert!(!is_valid);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("target-check")
+                    && error.contains("MODIFIED target not found in canonical spec")
+                    && error.contains("### Requirement: Missing Feature")
+            }),
+            "missing modified target diagnostic should include capability and heading: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_strict_validate_rejects_missing_removed_target() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "target-check",
+            "# Target Check\n\n### Requirement: Existing Feature\n\nOld behavior.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/missing-removed-target"),
+            "target-check",
+            "## REMOVED Requirements\n\n### Requirement: Missing Feature\n\nRemoved behavior.\n\n#### Scenario: Missing feature removal\n- WHEN validation runs\n- THEN the missing target is rejected\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, _warnings) =
+            mgr.validate_change(Some("missing-removed-target"), true, "off");
+
+        assert!(!is_valid);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("target-check")
+                    && error.contains("REMOVED target not found in canonical spec")
+                    && error.contains("### Requirement: Missing Feature")
+            }),
+            "missing removed target diagnostic should include capability and heading: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_strict_validate_allows_added_only_delta_without_canonical_target() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/added-only-target"),
+            "brand-new-capability",
+            "## ADDED Requirements\n\n### Requirement: New Feature\n\nNew behavior.\n\n#### Scenario: New feature\n- WHEN validation runs\n- THEN no canonical target is required\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, _warnings) =
+            mgr.validate_change(Some("added-only-target"), true, "off");
+
+        assert!(is_valid, "added-only delta should pass: {errors:?}");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_archive_gate_validation_rejects_missing_delta_target() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "target-check",
+            "# Target Check\n\n### Requirement: Existing Feature\n\nOld behavior.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/archive-gate-missing-target"),
+            "target-check",
+            "## MODIFIED Requirements\n\n### Requirement: Missing Feature\n\nUpdated behavior.\n\n#### Scenario: Missing feature updates\n- WHEN archive gate validation runs\n- THEN the missing target is rejected before archive\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, _warnings) =
+            mgr.validate_change(Some("archive-gate-missing-target"), true, "error");
+
+        assert!(!is_valid);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("MODIFIED target not found in canonical spec")
+                    && error.contains("### Requirement: Missing Feature")
+            }),
+            "archive-gate-equivalent validation should fail before archive: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_archive_change_surfaces_missing_delta_target_during_validation() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "target-check",
+            "# Target Check\n\n### Requirement: Existing Feature\n\nOld behavior.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/archive-missing-target"),
+            "target-check",
+            "## REMOVED Requirements\n\n### Requirement: Missing Feature\n\nRemoved behavior.\n\n#### Scenario: Missing feature removal\n- WHEN archive runs\n- THEN validation fails before promotion simulation\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let err = mgr
+            .archive_change("archive-missing-target", false)
+            .expect_err("archive should stop at validation for missing canonical target");
+
+        assert!(err.contains("Validation failed"));
+        assert!(err.contains("REMOVED target not found in canonical spec"));
+        assert!(err.contains("### Requirement: Missing Feature"));
     }
 
     #[test]

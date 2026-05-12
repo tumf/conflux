@@ -134,7 +134,9 @@ ls <relevant-directory>
 **Strict validation note (common gotcha)**:
 
 - In strict mode, include at least one spec delta under `openspec/changes/<id>/specs/<capability>/spec.md`.
-- For bugfix-only proposals (no intended new behavior), add a minimal `## MODIFIED Requirements` delta with at least one `### Requirement:` and one `#### Scenario:`.
+- Before writing `## MODIFIED Requirements` or `## REMOVED Requirements`, inspect the matching canonical `openspec/specs/<capability>/spec.md` and copy an existing `### Requirement:` heading exactly. These sections target existing canonical requirement identities; strict validation fails when the canonical heading is absent.
+- Use `## ADDED Requirements` when no matching canonical `### Requirement:` heading exists yet.
+- For bugfix-only proposals (no intended new behavior), add a minimal `## MODIFIED Requirements` delta only when the target requirement heading already exists in the canonical spec; otherwise use `## ADDED Requirements` for the new tracked behavior.
 
 ### 2. Classify Change Type
 
@@ -344,17 +346,21 @@ Create `openspec/changes/<id>/specs/<capability>/spec.md`:
 
 - Each requirement must have at least one scenario
 - Use ADDED/MODIFIED/REMOVED sections
+- Before selecting MODIFIED or REMOVED, open `openspec/specs/<capability>/spec.md` and verify the canonical `### Requirement:` heading exists; copy that heading exactly into the delta.
+- If the canonical heading does not exist, use ADDED instead of MODIFIED/REMOVED.
 - Be specific and testable
 
 **Discuss with user**: "Should we add these requirements to the spec?"
 
 ### 8. Validate Proposal
 
-Run validation:
+Run validation after authoring proposal, tasks, and spec deltas:
 
 ```bash
 cflx openspec validate <id> --strict
 ```
+
+Strict validation checks MODIFIED/REMOVED target headings against canonical specs, so fix any missing-target diagnostics before handoff.
 
 **If validation fails**:
 
