@@ -5242,6 +5242,35 @@ fn test_resolve_wait_helper_tracks_state() {
     assert!(!executor.has_resolve_wait());
 }
 
+#[test]
+fn test_auto_resumable_deferral_uses_resolve_pending_not_manual_merge_wait() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    executor.resolve_wait_changes.insert("change-a".to_string());
+    executor.merge_wait_changes.remove("change-a");
+
+    assert!(executor.resolve_wait_changes.contains("change-a"));
+    assert!(executor.merge_wait_changes.is_empty());
+    assert!(executor.has_resolve_wait());
+}
+
+#[test]
+fn test_manual_deferral_uses_merge_wait_not_resolve_pending() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    executor.resolve_wait_changes.insert("change-a".to_string());
+    executor.resolve_wait_changes.remove("change-a");
+    executor.merge_wait_changes.insert("change-a".to_string());
+
+    assert!(!executor.resolve_wait_changes.contains("change-a"));
+    assert!(executor.merge_wait_changes.contains("change-a"));
+    assert!(!executor.has_resolve_wait());
+}
+
 /// Test that changes in MergeWait state are correctly filtered during loop iteration.
 /// This test validates the spec requirement:
 /// "The loop continues processing runnable changes and MergeWait is not treated as a terminal completion reason."

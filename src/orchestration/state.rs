@@ -1378,6 +1378,32 @@ impl OrchestratorState {
                             self.resolve_wait_queue.retain(|id| id != change_id);
                         }
                     }
+                    crate::vcs::WorkspaceStatus::MergeWait => {
+                        let rt = self.runtime_entry(change_id);
+                        // WorkspaceStatus::MergeWait is manual-blocker evidence only when
+                        // the reducer does not already own a stronger active/pending state.
+                        // Auto-resumable deferrals are represented by MergeDeferred(true)
+                        // and scheduler ResolveWait; stale workspace display hints must not
+                        // downgrade that retry intent to manual merge wait.
+                        if matches!(
+                            rt.activity,
+                            ActivityState::Resolving | ActivityState::Rejecting
+                        ) || matches!(
+                            rt.wait_state,
+                            WaitState::ResolveWait | WaitState::RejectWait
+                        ) {
+                            tracing::debug!(
+                                change_id = %change_id,
+                                current_status = rt.display_status(),
+                                "Ignoring workspace MergeWait status because reducer owns stronger post-archive state"
+                            );
+                        } else {
+                            rt.activity = ActivityState::Idle;
+                            rt.wait_state = WaitState::MergeWait;
+                            rt.queue_intent = QueueIntent::NotQueued;
+                            self.resolve_wait_queue.retain(|id| id != change_id);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1481,9 +1507,9 @@ impl OrchestratorState {
                         // truthful visible state until completion or manual deferral.
                         if !rt.is_active() {
                             rt.wait_state = WaitState::ResolveWait;
-                            if !self.resolve_wait_queue.contains(change_id) {
-                                self.resolve_wait_queue.push(change_id.clone());
-                            }
+                        }
+                        if !self.resolve_wait_queue.contains(change_id) {
+                            self.resolve_wait_queue.push(change_id.clone());
                         }
                     } else {
                         // Manual intervention required: the change must remain visible

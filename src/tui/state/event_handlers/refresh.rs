@@ -11,6 +11,19 @@ fn is_refresh_merge_wait_terminal_status(status: &str) -> bool {
     matches!(status, "archived" | "merged" | "rejected")
 }
 
+fn is_reducer_owned_refresh_merge_wait_protected_status(status: &str) -> bool {
+    matches!(
+        status,
+        "resolving"
+            | "resolve pending"
+            | "rejecting"
+            | "reject pending"
+            | "merged"
+            | "rejected"
+            | "error"
+    )
+}
+
 impl AppState {
     pub(crate) fn handle_dependency_blocked(&mut self, change_id: String) {
         let was_already_blocked = self
@@ -79,7 +92,8 @@ impl AppState {
         merge_wait_ids: HashSet<String>,
     ) {
         let terminal_merge_wait_statuses = self.terminal_merge_wait_statuses(&merge_wait_ids);
-        let reducer_resolve_wait_ids = self.reducer_resolve_wait_ids(&merge_wait_ids);
+        let reducer_protected_merge_wait_ids =
+            self.reducer_protected_merge_wait_ids(&merge_wait_ids);
 
         self.worktree_paths = worktree_paths;
         self.update_changes(changes);
@@ -88,7 +102,7 @@ impl AppState {
         self.apply_refresh_merge_wait_status(
             &merge_wait_ids,
             &terminal_merge_wait_statuses,
-            &reducer_resolve_wait_ids,
+            &reducer_protected_merge_wait_ids,
         );
     }
 
@@ -106,14 +120,18 @@ impl AppState {
             .collect()
     }
 
-    fn reducer_resolve_wait_ids(&self, merge_wait_ids: &HashSet<String>) -> HashSet<String> {
+    fn reducer_protected_merge_wait_ids(
+        &self,
+        merge_wait_ids: &HashSet<String>,
+    ) -> HashSet<String> {
         merge_wait_ids
             .iter()
             .filter(|change_id| {
-                matches!(
-                    self.reducer_display_status_snapshot.get(change_id.as_str()),
-                    Some(&"resolve pending")
-                )
+                self.reducer_display_status_snapshot
+                    .get(change_id.as_str())
+                    .is_some_and(|status| {
+                        is_reducer_owned_refresh_merge_wait_protected_status(status)
+                    })
             })
             .cloned()
             .collect()
@@ -123,7 +141,7 @@ impl AppState {
         &mut self,
         merge_wait_ids: &HashSet<String>,
         terminal_merge_wait_statuses: &HashMap<String, String>,
-        reducer_resolve_wait_ids: &HashSet<String>,
+        reducer_protected_merge_wait_ids: &HashSet<String>,
     ) {
         if merge_wait_ids.is_empty() {
             return;
@@ -143,10 +161,11 @@ impl AppState {
                 continue;
             }
 
-            if reducer_resolve_wait_ids.contains(&change.id) {
+            if reducer_protected_merge_wait_ids.contains(&change.id) {
                 tracing::debug!(
                     change_id = %change.id,
-                    "Preserving reducer-owned resolve pending display over refresh merge-wait evidence"
+                    reducer_status = ?self.reducer_display_status_snapshot.get(change.id.as_str()),
+                    "Preserving reducer-owned active, pending, terminal, or error display over refresh merge-wait evidence"
                 );
                 continue;
             }
@@ -250,6 +269,57 @@ mod tests {
         );
 
         assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+    }
+
+    #[test]
+    fn merge_wait_refresh_preserves_reducer_owned_resolving_row() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "change-a".to_string(),
+            "resolving",
+        )]));
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![create_test_change("change-a")],
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from(["change-a".to_string()]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "resolving");
+    }
+
+    #[test]
+    fn merge_wait_refresh_preserves_reducer_owned_reject_pending_and_error_rows() {
+        let mut app = AppState::new(vec![
+            create_test_change("reject-pending"),
+            create_test_change("error-change"),
+        ]);
+        app.apply_display_statuses_from_reducer(&HashMap::from([
+            ("reject-pending".to_string(), "reject pending"),
+            ("error-change".to_string(), "error"),
+        ]));
+
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+        app.handle_changes_refreshed(
+            vec![
+                create_test_change("reject-pending"),
+                create_test_change("error-change"),
+            ],
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::from(["reject-pending".to_string(), "error-change".to_string()]),
+        );
+
+        assert_eq!(app.changes[0].display_status_cache, "reject pending");
+        assert_eq!(app.changes[1].display_status_cache, "error");
     }
 
     #[test]
