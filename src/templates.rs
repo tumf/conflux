@@ -186,23 +186,23 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Template: Codex
 
   // Command to analyze dependencies and select next change
-  "analyze_command": "codex --json {prompt}",
+  "analyze_command": "codex -a never exec --json --sandbox workspace-write '{prompt}'",
 
   // Command to apply a change (supports {change_id} and {prompt} placeholders)
-  "apply_command": "codex '{prompt}'",
+  "apply_command": "codex -a never exec --sandbox workspace-write '{prompt}'",
 
   // Command to archive a completed change (supports {change_id} and {prompt} placeholders)
-  "archive_command": "codex '{prompt}'",
+  "archive_command": "codex -a never exec --sandbox workspace-write '{prompt}'",
 
   // Command to run acceptance tests after apply (supports {change_id} and {prompt} placeholders)
-  "acceptance_command": "codex '{prompt}'",
+  "acceptance_command": "codex -a never exec --sandbox workspace-write '{prompt}'",
 
   // Operation skill for acceptance prompts (defaults to cflx-accept).
   // Opt into SPECA-style property review without changing acceptance_command:
   // "accept_skill": "cflx-accept-with-speca",
 
   // Command to resolve conflicts (supports {prompt} placeholder)
-  "resolve_command": "codex {prompt}",
+  "resolve_command": "codex -a never exec --sandbox workspace-write '{prompt}'",
 
   // Operation skill preludes loaded into generated prompts (all optional; shown with defaults)
   // Example: set accept_skill to "cflx-accept-with-speca" to customize acceptance guidance only.
@@ -359,9 +359,18 @@ mod tests {
 
     #[test]
     fn test_codex_template_matches_sample_style() {
-        assert!(CODEX_TEMPLATE.contains("\"apply_command\": \"codex '{prompt}'\""));
-        assert!(CODEX_TEMPLATE.contains("\"archive_command\": \"codex '{prompt}'\""));
-        assert!(CODEX_TEMPLATE.contains("\"acceptance_command\": \"codex '{prompt}'\""));
+        assert!(CODEX_TEMPLATE.contains(
+            "\"analyze_command\": \"codex -a never exec --json --sandbox workspace-write '{prompt}'\""
+        ));
+        assert!(CODEX_TEMPLATE.contains(
+            "\"apply_command\": \"codex -a never exec --sandbox workspace-write '{prompt}'\""
+        ));
+        assert!(CODEX_TEMPLATE.contains(
+            "\"archive_command\": \"codex -a never exec --sandbox workspace-write '{prompt}'\""
+        ));
+        assert!(CODEX_TEMPLATE.contains(
+            "\"acceptance_command\": \"codex -a never exec --sandbox workspace-write '{prompt}'\""
+        ));
         assert!(CODEX_TEMPLATE.contains("\"worktree_command\": \"tmux new-window -n wt \""));
         assert!(!CODEX_TEMPLATE.contains("\"acceptance_prompt_mode\""));
         assert!(CODEX_TEMPLATE.contains("\"accept_skill\": \"cflx-accept-with-speca\""));
