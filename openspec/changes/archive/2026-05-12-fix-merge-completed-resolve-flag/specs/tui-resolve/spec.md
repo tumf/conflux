@@ -59,7 +59,7 @@ When a manual merge retry starts through the resolve lifecycle and the successfu
 **And**: the TUI sets `beta` to `resolve pending`
 **And**: the event handler returns `TuiCommand::ResolveMerge(beta)` so the scheduler can be notified
 
-### Requirement: resolve-merge-queue-persistence
+### Requirement: resolve-merge-exclusive-execution
 
 When a user requests merge resolution (`M` key) on a `MergeWait` change while another resolve is in progress, the change must transition to `ResolveWait` and remain in that state until the resolve is actually started or explicitly cancelled. The transition must be synchronized to both the TUI-local state and the shared orchestrator reducer.
 

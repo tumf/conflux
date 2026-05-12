@@ -14,7 +14,9 @@ Manual resolve intent is reducer-owned scheduler work. When a user starts resolv
 
 When a scheduler is already running because other changes are applying, accepting, or archiving, pressing `M` on a `MergeWait` row MUST notify the existing scheduler only after reducer-owned retry intent is accepted. The row may display `resolve pending` while waiting on scheduler/base-lane capacity, but it MUST eventually transition through scheduler events to `resolving` / `merged` or back to `merge wait` with visible failure/defer evidence.
 
-<!-- Expected canonical result after archive: `tui-resolve` will explicitly protect accepted manual ResolveWait from periodic refresh display rollback. -->
+When a manual merge retry starts through the resolve lifecycle and the successful repository integration is reported as `MergeCompleted` rather than `ResolveCompleted`, the TUI MUST treat that `MergeCompleted` event as closing the local resolve lifecycle. It MUST clear any stale `is_resolving` reservation and MUST dispatch the next queued resolve retry intent, if one exists.
+
+<!-- Expected canonical result after archive: `tui-resolve` will explicitly close local resolve lifecycle state on MergeCompleted success paths used by manual merge retry, preventing stale resolve reservations from blocking later M-key scheduler notifications. -->
 
 #### Scenario: manual resolve pending remains scheduler-consumable after archived merge wait
 
@@ -44,40 +46,46 @@ When a scheduler is already running because other changes are applying, acceptin
 **And**: the scheduler-owned retry intent remains available for dispatch
 **And**: the row returns to `merge wait` only after explicit failure or manual-deferral evidence
 
+#### Scenario: merge-completed-closes-manual-resolve-lifecycle
+
+**Given**: change `alpha` started a manual merge retry from a `merge wait` row through the TUI resolve lifecycle
+**And**: the TUI local `is_resolving` flag is reserved for that retry
+**When**: `alpha` emits `MergeCompleted` after successful repository integration
+**Then**: the TUI clears the local `is_resolving` reservation
+**And**: a later `M` press on another `merge wait` row can emit `TuiCommand::ResolveMerge` instead of becoming display-only `resolve pending`
+
+#### Scenario: merge-completed-dispatches-next-queued-resolve
+
+**Given**: change `alpha` started a manual merge retry through the TUI resolve lifecycle
+**And**: change `beta` is queued in the TUI local resolve queue
+**When**: `alpha` emits `MergeCompleted`
+**Then**: the TUI marks `alpha` as `merged`
+**And**: the TUI sets `beta` to `resolve pending`
+**And**: the event handler returns `TuiCommand::ResolveMerge(beta)` so the scheduler can be notified
+
 ### Requirement: resolve-merge-exclusive-execution
 
-`resolve_merge()` が即時開始パスを取る際、システムは Project スコープの `is_resolving` フラグを即座に `true` に設定しなければならず（MUST）、同一 Project 内の後続の M キー操作がキュー追加パスに入ることを保証しなければならない（MUST）。
+When a user requests merge resolution (`M` key) on a `MergeWait` change while another resolve is in progress, the change must transition to `ResolveWait` and remain in that state until the resolve is actually started or explicitly cancelled. The transition must be synchronized to both the TUI-local state and the shared orchestrator reducer.
 
-このフラグの影響範囲は **resolve 操作同士の直列化のみ** である。`start_processing`、`resume_processing`、`retry_error_changes` 等の apply/accept/archive パイプライン操作はこのフラグによってブロックされてはならない（MUST NOT）。
+A queued resolve MUST be advanced when the active resolve lifecycle completes through either `ResolveCompleted` or `MergeCompleted`, because parallel manual merge retry reports successful repository integration with `MergeCompleted`.
 
-本 Requirement は旧 spec 内で 2 回重複していた同名 Requirement を 1 つに統合したものである。
+<!-- Expected canonical result after archive: `tui-resolve-queue` will specify that queued resolve advancement is triggered by both ResolveCompleted and MergeCompleted success events when they close an active resolve lifecycle. -->
 
-#### Scenario: consecutive-m-key-press-during-resolve
+#### Scenario: queued-resolve-survives-refresh
 
-**Given**: change-a が `MergeWait` 状態で、同一 Project 内で resolve が実行中でない（`is_resolving` が `false`）
-**When**: change-a に対して M キーを押す
-**Then**: `is_resolving` が即座に `true` になり、`TuiCommand::ResolveMerge(change-a)` が返される
+**Given**: Change A is in `Resolving` state and Change B is in `MergeWait` state in the TUI
+**When**: The user presses `M` on Change B, then a `ChangesRefreshed` event fires with Change B's workspace still in `Archived` state
+**Then**: Change B remains in `ResolveWait` ("resolve pending") in both the TUI display and the shared reducer state
 
-#### Scenario: second-m-key-queues-when-first-resolving
+#### Scenario: queued-resolve-eventually-executes
 
-**Given**: change-a の `resolve_merge()` が即時開始され `is_resolving` が `true`
-**When**: 同一 Project 内の `MergeWait` 状態の change-b に対して M キーを押す
-**Then**: change-b は `ResolveWait` に遷移し、resolve キューに追加される（即時開始されない）
+**Given**: Change B has been queued for resolve via `M` key while Change A was resolving
+**When**: Change A's resolve completes
+**Then**: Change B's resolve is started from the queue
 
-#### Scenario: start-processing-not-blocked-by-resolving
+#### Scenario: queued-resolve-advances-after-merge-completed
 
-**Given**: 同一 Project 内のある Change が Resolving 状態である（`is_resolving` が `true`）
-**When**: ユーザーが `start_processing` を実行する
-**Then**: 選択された Change のキュー追加と処理開始が正常に行われる（`is_resolving` はチェックされない）
-
-#### Scenario: resume-processing-not-blocked-by-resolving
-
-**Given**: 同一 Project 内のある Change が Resolving 状態である（`is_resolving` が `true`）、`AppMode` が `Stopped`
-**When**: ユーザーが `resume_processing` を実行する
-**Then**: マークされた Change が `Queued` に遷移し処理が再開される（`is_resolving` はチェックされない）
-
-#### Scenario: retry-error-not-blocked-by-resolving
-
-**Given**: 同一 Project 内のある Change が Resolving 状態である（`is_resolving` が `true`）、`AppMode` が `Error`
-**When**: ユーザーが `retry_error_changes` を実行する
-**Then**: エラー状態の Change が `Queued` にリセットされリトライが開始される（`is_resolving` はチェックされない）
+**Given**: Change A was started from the TUI resolve lifecycle and has Change B queued behind it
+**When**: Change A emits `MergeCompleted` instead of `ResolveCompleted`
+**Then**: Change B's resolve retry command is emitted from the queue
+**And**: Change B does not remain indefinitely in `resolve pending` because the prior resolve lifecycle ended with a merge completion event
