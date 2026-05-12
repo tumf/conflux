@@ -99,13 +99,13 @@ DynamicQueue SHALL support the following operations:
 
 The system SHALL always synchronize the queue state displayed in the UI with the DynamicQueue state.
 
-`ResolveWait` is a state waiting for resolve completion, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for queue operations.
+`ResolveWait` is a state waiting for scheduler-owned resolve retry work, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for normal queue operations.
 
 However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 - Space operation SHALL toggle only the execution mark (`selected`) and MUST NOT modify `queue_status` or DynamicQueue.
 - @ operation SHALL be ignored and MUST NOT modify any state.
 
-The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is not a target for queue operations.
+The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is scheduler-owned retry work and not normal queue work.
 
 In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via `F5` after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
 - execution for that change actually starts,
@@ -114,44 +114,27 @@ In parallel mode, once the user explicitly queues a `NotQueued` change for execu
 
 Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
 
-#### Scenario: Remove from queue with Space key
-- **WHEN** the user dequeues a [x] change with the Space key in Running mode
-- **THEN** the status changes to `QueueStatus::NotQueued` and is removed from DynamicQueue
+`F5` SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause `F5` to emit `ResolveMerge` or transition that row to `resolve pending`.
 
-#### Scenario: Log removal operations
-- **WHEN** a change is removed from DynamicQueue
-- **THEN** the removal operation is logged
+<!-- Expected canonical result after archive: `tui-architecture` will remove the historical rule that F5 resolves cursor-local MergeWait rows and will define F5 as cursor-independent orchestration control. -->
 
-#### Scenario: Cannot change queue state during ResolveWait
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `ResolveWait`
-- **WHEN** the user presses Space or `@`
-- **THEN** the change status SHALL remain `ResolveWait`
-- **AND** DynamicQueue SHALL NOT be modified for the change
-- **AND** Space operation toggles only the execution mark
+#### Scenario: F5 on MergeWait does not resolve cursor row
 
-#### Scenario: Cannot change queue state during MergeWait
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `MergeWait`
-- **WHEN** the user presses Space or `@`
-- **THEN** the change status SHALL remain `MergeWait`
-- **AND** DynamicQueue SHALL NOT be modified for the change
-- **AND** Space operation toggles only the execution mark
+- **GIVEN** the TUI cursor is on change `alpha`
+- **AND** `alpha` is in `MergeWait`
+- **AND** change `beta` is marked runnable work in `NotQueued`
+- **WHEN** the user presses `F5`
+- **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
+- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `F5`
+- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
 
-#### Scenario: Queued row is preserved before analysis starts
-- **GIVEN** the TUI is in parallel mode
-- **AND** a change is marked for execution from `NotQueued`
-- **AND** the user presses `F5`
-- **WHEN** the initial refresh-driven reducer display synchronization runs before backend analysis starts
-- **THEN** the change status SHALL remain `Queued`
-- **AND** the row SHALL NOT return to `not queued`
+#### Scenario: F5 is not blocked by unrelated resolving
 
-#### Scenario: Startup rejection can clear queued row before execution
-- **GIVEN** the TUI is in parallel mode
-- **AND** a change was explicitly queued by the user
-- **WHEN** backend startup rejects that change before execution begins
-- **THEN** the change status MAY return to `NotQueued`
-- **AND** the rejection reason SHALL be logged
+- **GIVEN** change `alpha` is resolving
+- **AND** change `beta` is marked runnable work in `NotQueued`
+- **WHEN** the user presses `F5`
+- **THEN** normal orchestration for `beta` SHALL be allowed to start/resume/retry
+- **AND** resolve serialization SHALL remain limited to merge resolve operations
 
 ### Requirement: Event-Driven State Updates
 
@@ -356,32 +339,43 @@ The TUI change list MUST display a single-line preview of the latest log entry f
 - **AND** the TUI continues rendering without panicking
 
 ### Requirement: MergeDeferred の待ち状態判定
-TUI は `MergeDeferred` を受信したとき、resolve 実行中であり対象 change が現在 resolve 中の change ではない場合、対象 change を `ResolveWait` として扱い、resolve 待ち行列に追加しなければならない（SHALL）。
-resolve 実行中で対象 change が現在 resolve 中の change と同一である場合、対象 change は `Resolving` のまま維持され、resolve 待ち行列に追加されてはならない（SHALL NOT）。
-resolve が実行中でない場合、対象 change は `MergeWait` のまま保持されなければならない（SHALL）。
 
-#### Scenario: resolve 実行中の MergeDeferred は ResolveWait になる
-- **GIVEN** resolve 操作が進行中である
-- **AND** change A が `MergeDeferred` を受信する
-- **AND** change A は現在 resolve 中の change ではない
-- **WHEN** TUI がイベントを処理する
-- **THEN** change A のステータスは `ResolveWait` となる
-- **AND** change A の change_id が resolve 待ち行列に追加される
-- **AND** 表示語彙は `resolve pending` となる
+TUI and scheduler-visible state SHALL classify merge deferrals by first evaluating active resolve/base-mutating lane occupancy and only then evaluating workspace/base dirty state.
 
-#### Scenario: resolve 実行中の MergeDeferred が現在 resolve 中の change の場合は自己キューしない
-- **GIVEN** resolve 操作が進行中である
-- **AND** change A が現在 resolve 中の change である
-- **AND** change A が `MergeDeferred` を受信する
-- **WHEN** TUI がイベントを処理する
-- **THEN** change A のステータスは `Resolving` のまま維持される
-- **AND** change A の change_id は resolve 待ち行列に追加されない
+If a `MergeDeferred` or merge retry classification occurs while another resolve/base-mutating operation is active, and the deferred change is not the currently resolving change itself, the change SHALL be represented as `ResolveWait` / `resolve pending` and SHALL remain scheduler-owned retry work. Dirty workspace/base evidence observed during the active resolve/base-mutating operation MUST NOT by itself cause manual `MergeWait`.
 
-#### Scenario: resolve 非実行時の MergeDeferred は MergeWait を維持する
-- **GIVEN** resolve 操作が進行中ではない
-- **AND** change A が `MergeDeferred` を受信する
-- **WHEN** TUI がイベントを処理する
-- **THEN** change A のステータスは `MergeWait` のまま維持される
+If no resolve/base-mutating operation is active, dirty workspace/base evidence SHALL be classified as manual `MergeWait` with scheduler-owned `ResolveWait` membership cleared until explicit retry intent is accepted.
+
+If no resolve/base-mutating operation is active and retry preconditions are clean, a scheduler-owned retry MAY be promoted to `Resolving` by the scheduler.
+
+<!-- Expected canonical result after archive: `tui-architecture` will require active resolve/base-mutating occupancy to be evaluated before dirty state when deciding between `resolve pending` and `merge wait`. -->
+
+#### Scenario: Active resolve takes precedence over dirty evidence
+
+- **GIVEN** change `alpha` is currently resolving or otherwise owns the base-mutating lane
+- **AND** base/workspace state appears dirty because of `alpha`
+- **AND** change `beta` receives merge deferral or retry classification
+- **WHEN** the TUI/scheduler classifies `beta`
+- **THEN** active resolve/base-mutating occupancy SHALL be evaluated before dirty state
+- **AND** `beta` SHALL be represented as `ResolveWait` / `resolve pending`
+- **AND** `beta` SHALL NOT be represented as manual `MergeWait` solely because the base/workspace appears dirty
+
+#### Scenario: Dirty without active resolve becomes manual MergeWait
+
+- **GIVEN** no resolve/base-mutating operation is active
+- **AND** base/workspace state is dirty or manually blocked
+- **AND** change `beta` receives merge retry classification
+- **WHEN** the TUI/scheduler classifies `beta`
+- **THEN** `beta` SHALL be represented as manual `MergeWait`
+- **AND** scheduler-owned `ResolveWait(beta)` SHALL be cleared until explicit retry intent is accepted
+
+#### Scenario: Clean pending retry can start resolving
+
+- **GIVEN** no resolve/base-mutating operation is active
+- **AND** change `beta` is scheduler-owned `ResolveWait`
+- **AND** retry preconditions for `beta` are clean
+- **WHEN** the scheduler evaluates pending base-mutating lane waiters
+- **THEN** `beta` MAY transition from `resolve pending` to `resolving`
 
 ### Requirement: Bulk Execution Mark Toggle
 
@@ -478,25 +472,42 @@ This requirement applies to the Changes list in both Select and Running views, i
 
 ### Requirement: MergeDeferred の待ち状態判定
 
-TUI は `MergeDeferred` を受信したとき、resolve 実行中であり対象 change が現在 resolve 中の change ではない場合、対象 change を `ResolveWait` として扱い、resolve 待ち行列に追加しなければならない（SHALL）。
+TUI and scheduler-visible state SHALL classify merge deferrals by first evaluating active resolve/base-mutating lane occupancy and only then evaluating workspace/base dirty state.
 
-resolve が実行中でない場合でも、`MergeDeferred` の理由が先行 merge / resolve 完了後に自動再評価すべき待機であると判定されている場合、TUI は対象 change を手動専用の `MergeWait` として固定表示してはならない（MUST NOT）。
-その場合、先行 merge / resolve 完了後の再評価で対象 change が `ResolveWait` / `Resolving` / merge 再試行のいずれかへ自動遷移したことを表示に反映しなければならない（MUST）。
+If a `MergeDeferred` or merge retry classification occurs while another resolve/base-mutating operation is active, and the deferred change is not the currently resolving change itself, the change SHALL be represented as `ResolveWait` / `resolve pending` and SHALL remain scheduler-owned retry work. Dirty workspace/base evidence observed during the active resolve/base-mutating operation MUST NOT by itself cause manual `MergeWait`.
 
-resolve 非実行時の `MergeDeferred` は、手動介入が必要と分類された場合のみ `MergeWait` のまま保持されなければならない（SHALL）。
+If no resolve/base-mutating operation is active, dirty workspace/base evidence SHALL be classified as manual `MergeWait` with scheduler-owned `ResolveWait` membership cleared until explicit retry intent is accepted.
 
-#### Scenario: 先行 merge 完了で自動昇格した change は MergeWait に戻らない
-- **GIVEN** change B が先行 merge 完了待ちの `MergeDeferred` として表示されている
-- **WHEN** 先行 change の merge または resolve が完了して change B が自動再評価される
-- **THEN** change B の表示は `MergeWait` のまま放置されない
-- **AND** `ResolveWait` `Resolving` または再試行中の状態へ更新される
+If no resolve/base-mutating operation is active and retry preconditions are clean, a scheduler-owned retry MAY be promoted to `Resolving` by the scheduler.
 
-#### Scenario: 手動介入が必要な MergeDeferred は MergeWait を維持する
-- **GIVEN** change B が `MergeDeferred` を受信している
-- **AND** その理由分類が手動介入必要である
-- **WHEN** TUI が状態を更新する
-- **THEN** change B のステータスは `MergeWait` のまま維持される
-- **AND** `M: resolve` ヒントが表示される
+<!-- Expected canonical result after archive: `tui-architecture` will require active resolve/base-mutating occupancy to be evaluated before dirty state when deciding between `resolve pending` and `merge wait`. -->
+
+#### Scenario: Active resolve takes precedence over dirty evidence
+
+- **GIVEN** change `alpha` is currently resolving or otherwise owns the base-mutating lane
+- **AND** base/workspace state appears dirty because of `alpha`
+- **AND** change `beta` receives merge deferral or retry classification
+- **WHEN** the TUI/scheduler classifies `beta`
+- **THEN** active resolve/base-mutating occupancy SHALL be evaluated before dirty state
+- **AND** `beta` SHALL be represented as `ResolveWait` / `resolve pending`
+- **AND** `beta` SHALL NOT be represented as manual `MergeWait` solely because the base/workspace appears dirty
+
+#### Scenario: Dirty without active resolve becomes manual MergeWait
+
+- **GIVEN** no resolve/base-mutating operation is active
+- **AND** base/workspace state is dirty or manually blocked
+- **AND** change `beta` receives merge retry classification
+- **WHEN** the TUI/scheduler classifies `beta`
+- **THEN** `beta` SHALL be represented as manual `MergeWait`
+- **AND** scheduler-owned `ResolveWait(beta)` SHALL be cleared until explicit retry intent is accepted
+
+#### Scenario: Clean pending retry can start resolving
+
+- **GIVEN** no resolve/base-mutating operation is active
+- **AND** change `beta` is scheduler-owned `ResolveWait`
+- **AND** retry preconditions for `beta` are clean
+- **WHEN** the scheduler evaluates pending base-mutating lane waiters
+- **THEN** `beta` MAY transition from `resolve pending` to `resolving`
 
 ### Requirement: TUI Module Structure
 
@@ -532,15 +543,16 @@ Running mode の logs panel が有効な場合、TUI は changes list の現在�
 - **AND** the changes list continues to receive the flexible remaining area
 
 ### Requirement: Queue State Synchronization
+
 The system SHALL always synchronize the queue state displayed in the UI with the DynamicQueue state.
 
-`ResolveWait` is a state waiting for resolve completion, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for queue operations.
+`ResolveWait` is a state waiting for scheduler-owned resolve retry work, and Space queue operations MUST NOT modify DynamicQueue. `MergeWait` similarly MUST NOT be a target for normal queue operations.
 
 However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 - Space operation SHALL toggle only the execution mark (`selected`) and MUST NOT modify `queue_status` or DynamicQueue.
 - @ operation SHALL be ignored and MUST NOT modify any state.
 
-The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is not a target for queue operations.
+The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is scheduler-owned retry work and not normal queue work.
 
 In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via `F5` after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
 - execution for that change actually starts,
@@ -549,80 +561,24 @@ In parallel mode, once the user explicitly queues a `NotQueued` change for execu
 
 Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
 
-For active rows (`applying`, `accepting`, `archiving`, `resolving`), `Space` MUST remain reserved for queue/selection semantics and MUST NOT trigger force kill. A dedicated `K` key action MUST enter a confirmation mode for the current active change, and only an explicit `y` confirmation from that mode MAY request a force kill of the in-flight execution for that change. The TUI MUST keep the active display state until kill completion is confirmed. Only after successful kill completion MAY the row transition to `not queued` and clear `selected`. If force kill fails, the TUI MUST keep the row in its current execution state and surface the failure.
+`F5` SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause `F5` to emit `ResolveMerge` or transition that row to `resolve pending`.
 
-#### Scenario: Remove from queue with Space key
-- **WHEN** the user dequeues a [x] change with the Space key in Running mode
-- **THEN** the status changes to `QueueStatus::NotQueued` and is removed from DynamicQueue
+<!-- Expected canonical result after archive: `tui-architecture` will remove the historical rule that F5 resolves cursor-local MergeWait rows and will define F5 as cursor-independent orchestration control. -->
 
-#### Scenario: Log removal operations
-- **WHEN** a change is removed from DynamicQueue
-- **THEN** the removal operation is logged
+#### Scenario: F5 on MergeWait does not resolve cursor row
 
-#### Scenario: Cannot change queue state during ResolveWait
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `ResolveWait`
-- **WHEN** the user presses Space or `@`
-- **THEN** the change status SHALL remain `ResolveWait`
-- **AND** DynamicQueue SHALL NOT be modified for the change
-- **AND** Space operation toggles only the execution mark
+- **GIVEN** the TUI cursor is on change `alpha`
+- **AND** `alpha` is in `MergeWait`
+- **AND** change `beta` is marked runnable work in `NotQueued`
+- **WHEN** the user presses `F5`
+- **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
+- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `F5`
+- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
 
-#### Scenario: Cannot change queue state during MergeWait
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change in `MergeWait`
-- **WHEN** the user presses Space or `@`
-- **THEN** the change status SHALL remain `MergeWait`
-- **AND** DynamicQueue SHALL NOT be modified for the change
-- **AND** Space operation toggles only the execution mark
+#### Scenario: F5 is not blocked by unrelated resolving
 
-#### Scenario: Queued row is preserved before analysis starts
-- **GIVEN** the TUI is in parallel mode
-- **AND** a change is marked for execution from `NotQueued`
-- **AND** the user presses `F5`
-- **WHEN** the initial refresh-driven reducer display synchronization runs before backend analysis starts
-- **THEN** the change status SHALL remain `Queued`
-- **AND** the row SHALL NOT return to `not queued`
-
-#### Scenario: Startup rejection can clear queued row before execution
-- **GIVEN** the TUI is in parallel mode
-- **AND** a change was explicitly queued by the user
-- **WHEN** backend startup rejects that change before execution begins
-- **THEN** the change status MAY return to `NotQueued`
-- **AND** the rejection reason SHALL be logged
-
-#### Scenario: Active change enters confirmation on K
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on a change with status `applying`, `accepting`, `archiving`, or `resolving`
-- **WHEN** the user presses `K`
-- **THEN** the TUI SHALL enter a confirmation mode for that change
-- **AND** the backend SHALL NOT issue a force-kill request yet
-- **AND** the UI SHALL show confirmation hints for `y` and cancel
-
-#### Scenario: Active change force-kills only after Y confirmation
-- **GIVEN** the TUI is showing force-kill confirmation for an active change
-- **WHEN** the user presses `y`
-- **THEN** the backend SHALL issue a force kill for the in-flight execution of that change
-- **AND** the row SHALL remain active until kill completion is confirmed
-- **AND** after successful kill completion the row SHALL become `not queued`
-- **AND** `selected` SHALL be cleared
-
-#### Scenario: Active change kill confirmation can be canceled
-- **GIVEN** the TUI is showing force-kill confirmation for an active change
-- **WHEN** the user presses `n` or `Esc`
-- **THEN** the confirmation mode SHALL close
-- **AND** the backend SHALL NOT issue a force-kill request
-- **AND** the row SHALL remain in its current active status
-
-#### Scenario: Active change ignores Space for force-kill
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on an active change
-- **WHEN** the user presses `Space`
-- **THEN** the TUI SHALL NOT issue a force-kill request
-- **AND** the row SHALL remain in its current active status unless another allowed queue/selection rule applies
-
-#### Scenario: Active change stop failure preserves active state
-- **GIVEN** the TUI is in running mode
-- **AND** the cursor is on an active change
-- **WHEN** the force-kill request fails
-- **THEN** the row SHALL remain in its current active status
-- **AND** the UI SHALL surface a stop failure message
+- **GIVEN** change `alpha` is resolving
+- **AND** change `beta` is marked runnable work in `NotQueued`
+- **WHEN** the user presses `F5`
+- **THEN** normal orchestration for `beta` SHALL be allowed to start/resume/retry
+- **AND** resolve serialization SHALL remain limited to merge resolve operations

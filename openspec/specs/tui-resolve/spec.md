@@ -10,58 +10,46 @@ TUI は `MergeDeferred(auto_resumable=true)` イベントを受信し、かつ�
 
 `is_resolving` は Project スコープの resolve 直列化フラグであり、同一 Project 内で resolve 操作が同時に 1 つしか実行されないことを保証する。このフラグは resolve 操作同士の直列化のみに使用し、apply/accept/archive パイプラインの開始・再開・リトライをブロックしてはならない（MUST NOT）。
 
-Manual resolve intent is reducer-owned scheduler work. When a user starts resolve from a `MergeWait` row, any visible `resolve pending` state MUST correspond to reducer-owned retry membership that the scheduler can consume. The TUI MUST NOT leave a row at `resolve pending` solely because a local display transition occurred while the reducer rejected or dropped the same retry intent. Conversely, after the reducer accepts manual resolve intent, refresh-derived `merge_wait_ids` MUST NOT revert the visible row from `resolve pending` to `merge wait` while the scheduler-owned retry remains pending.
+Manual resolve intent is reducer-owned scheduler work. When a user starts resolve from a `MergeWait` row with `M`, any visible `resolve pending` state MUST correspond to reducer-owned retry membership that the scheduler can consume. The TUI MUST NOT leave a row at `resolve pending` solely because a local display transition occurred while the reducer rejected or dropped the same retry intent. Conversely, after the reducer accepts manual resolve intent, refresh-derived `merge_wait_ids` MUST NOT revert the visible row from `resolve pending` to `merge wait` while the scheduler-owned retry remains pending.
+
+Manual retry classification MUST evaluate active resolve/base-mutating lane occupancy before dirty workspace/base evidence. Dirty state observed while another resolve/base-mutating operation is active SHALL keep the retry auto-resumable (`resolve pending`). Dirty state observed when no resolve/base-mutating operation is active SHALL become manual `merge wait` and clear scheduler-owned `ResolveWait` membership until explicit retry intent is accepted again.
 
 When a scheduler is already running because other changes are applying, accepting, or archiving, pressing `M` on a `MergeWait` row MUST notify the existing scheduler only after reducer-owned retry intent is accepted. The row may display `resolve pending` while waiting on scheduler/base-lane capacity, but it MUST eventually transition through scheduler events to `resolving` / `merged` or back to `merge wait` with visible failure/defer evidence.
 
 When a manual merge retry starts through the resolve lifecycle and the successful repository integration is reported as `MergeCompleted` rather than `ResolveCompleted`, the TUI MUST treat that `MergeCompleted` event as closing the local resolve lifecycle. It MUST clear any stale `is_resolving` reservation and MUST dispatch the next queued resolve retry intent, if one exists.
 
-<!-- Expected canonical result after archive: `tui-resolve` will explicitly close local resolve lifecycle state on MergeCompleted success paths used by manual merge retry, preventing stale resolve reservations from blocking later M-key scheduler notifications. -->
+<!-- Expected canonical result after archive: `tui-resolve` will explicitly require M-key retry classification to check active resolve/base-mutating occupancy before dirty state. -->
 
-#### Scenario: manual resolve pending remains scheduler-consumable after archived merge wait
+#### Scenario: M during active resolve remains resolve pending despite dirty evidence
 
-**Given**: a TUI row for change `alpha` is visible as `merge wait`
-**And**: `alpha` is archive-complete, not yet merged into the base branch, and remains repository-visible merge-retry work
+**Given**: change `alpha` is currently resolving or owns the base-mutating lane
+**And**: the base/workspace appears dirty because of `alpha`
+**And**: change `beta` is visible as `merge wait`
+**When**: the user presses `M` on `beta`
+**Then**: the reducer records scheduler-consumable `ResolveWait` for `beta`
+**And**: `beta` remains visible as `resolve pending` while waiting for the active resolve/base-mutating lane to clear
+**And**: `beta` is not demoted to manual `merge wait` solely because the workspace/base appears dirty during `alpha`
+
+#### Scenario: M with dirty state and no active resolve returns to merge wait
+
+**Given**: no resolve/base-mutating operation is active
+**And**: change `alpha` is visible as `merge wait`
+**And**: base/workspace state is dirty or manually blocked
+**When**: the user presses `M` on `alpha`
+**Then**: the row may transition briefly to `resolve pending` while retry intent is evaluated
+**And**: after scheduler classification, `alpha` is visible as `merge wait`
+**And**: scheduler-owned `ResolveWait(alpha)` is cleared
+**And**: no `ResolveStarted(alpha)` event is emitted
+
+#### Scenario: M with clean state and no active resolve starts scheduler-owned retry
+
+**Given**: no resolve/base-mutating operation is active
+**And**: change `alpha` is visible as `merge wait`
+**And**: base/workspace retry preconditions are clean
 **When**: the user presses `M` on `alpha`
 **Then**: the reducer records scheduler-consumable `ResolveWait` for `alpha`
-**And**: the scheduler can later consume that retry intent after queue notification or slot release
-**And**: `alpha` does not remain indefinitely in `resolve pending` solely because the pending state was display-only
-
-#### Scenario: reducer-rejected manual resolve does not become false pending
-
-**Given**: a TUI row for change `alpha` appears retryable locally
-**And**: reducer-owned state determines `alpha` is not actually eligible for `ResolveMerge`
-**When**: the user presses `M` on `alpha`
-**Then**: the command does not leave `alpha` in a persistent `resolve pending` state
-**And**: scheduler notification is not treated as accepted retry work for `alpha`
-**And**: the user-visible state returns to a truthful blocker or terminal status with visible evidence
-
-#### Scenario: accepted manual resolve pending survives refresh merge-wait evidence
-
-**Given**: a TUI row for change `alpha` is visible as `resolve pending`
-**And**: reducer-owned state contains scheduler-consumable `ResolveWait` for `alpha`
-**And**: no `ResolveFailed`, `MergeDeferred(auto_resumable=false)`, `ResolveCompleted`, or `MergeCompleted` event has cleared that intent
-**When**: the periodic refresh reports `alpha` in `merge_wait_ids`
-**Then**: the row remains visible as `resolve pending`
-**And**: the scheduler-owned retry intent remains available for dispatch
-**And**: the row returns to `merge wait` only after explicit failure or manual-deferral evidence
-
-#### Scenario: merge-completed-closes-manual-resolve-lifecycle
-
-**Given**: change `alpha` started a manual merge retry from a `merge wait` row through the TUI resolve lifecycle
-**And**: the TUI local `is_resolving` flag is reserved for that retry
-**When**: `alpha` emits `MergeCompleted` after successful repository integration
-**Then**: the TUI clears the local `is_resolving` reservation
-**And**: a later `M` press on another `merge wait` row can emit `TuiCommand::ResolveMerge` instead of becoming display-only `resolve pending`
-
-#### Scenario: merge-completed-dispatches-next-queued-resolve
-
-**Given**: change `alpha` started a manual merge retry through the TUI resolve lifecycle
-**And**: change `beta` is queued in the TUI local resolve queue
-**When**: `alpha` emits `MergeCompleted`
-**Then**: the TUI marks `alpha` as `merged`
-**And**: the TUI sets `beta` to `resolve pending`
-**And**: the event handler returns `TuiCommand::ResolveMerge(beta)` so the scheduler can be notified
+**And**: the scheduler starts one resolve retry for `alpha`
+**And**: `alpha` transitions from `resolve pending` to `resolving` via scheduler event
 
 ### Requirement: resolve-merge-exclusive-execution
 

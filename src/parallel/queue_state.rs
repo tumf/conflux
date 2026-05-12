@@ -773,7 +773,7 @@ impl ParallelExecutor {
     }
 
     async fn retry_deferred_merges_for(&mut self, deferred: Vec<String>) {
-        for change_id in deferred {
+        for change_id in deferred.into_iter().take(1) {
             if self.is_change_already_merged_to_base(&change_id).await {
                 info!(
                     "Skipping stale deferred merge retry for '{}' because it is already merged to base",

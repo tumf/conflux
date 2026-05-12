@@ -191,56 +191,47 @@ pub fn handle_esc_key(ctx: &mut KeyEventContext<'_>) {
     }
 }
 
-/// Handle F5 key: Start, resume, or retry processing; or cancel stop
-/// Prioritizes resolve for MergeWait changes over starting/resuming processing
-pub fn handle_f5_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
-    // Handle F5 in Stopping mode to cancel graceful stop
-    if ctx.app.mode == AppMode::Stopping {
-        // Check if orchestrator is still running
-        if ctx
-            .orchestrator_handle
+fn handle_f5_key_inner(
+    app: &mut AppState,
+    graceful_stop_flag: &AtomicBool,
+    orchestrator_handle: &Option<tokio::task::JoinHandle<Result<()>>>,
+) -> Option<TuiCommand> {
+    // Handle F5 in Stopping mode to cancel graceful stop.
+    if app.mode == AppMode::Stopping {
+        // Check if orchestrator is still running.
+        if orchestrator_handle
             .as_ref()
             .is_some_and(|h| !h.is_finished())
         {
-            // Cancel graceful stop and return to Running mode
-            ctx.graceful_stop_flag.store(false, Ordering::SeqCst);
-            ctx.app.stop_mode = StopMode::None;
-            ctx.app.mode = AppMode::Running;
-            ctx.app
-                .add_log(LogEntry::info("Stop canceled, continuing..."));
+            // Cancel graceful stop and return to Running mode.
+            graceful_stop_flag.store(false, Ordering::SeqCst);
+            app.stop_mode = StopMode::None;
+            app.mode = AppMode::Running;
+            app.add_log(LogEntry::info("Stop canceled, continuing..."));
         } else {
-            // Already stopped, cannot cancel
-            ctx.app.add_log(LogEntry::warn(
+            // Already stopped, cannot cancel.
+            app.add_log(LogEntry::warn(
                 "Cannot cancel stop: processing already completed",
             ));
         }
         return None;
     }
 
-    // Prioritize resolve for MergeWait changes
-    // Check if cursor is on a MergeWait change
-    if !ctx.app.changes.is_empty() && ctx.app.cursor_index < ctx.app.changes.len() {
-        let change = &ctx.app.changes[ctx.app.cursor_index];
-        if change.display_status_cache == "merge wait" {
-            // F5 on MergeWait change triggers resolve, not start processing
-            return ctx.app.resolve_merge();
-        }
-    }
-
-    if ctx.app.is_resolving {
-        ctx.app.warning_message =
-            Some("Cannot start processing while merge resolve is in progress".to_string());
-        return None;
-    }
-
-    // Determine which command to use based on mode
-    if ctx.app.mode == AppMode::Error {
-        ctx.app.retry_error_changes()
-    } else if ctx.app.mode == AppMode::Stopped {
-        ctx.app.resume_processing()
+    // F5 is a cursor-independent orchestration control. It must not inspect the
+    // selected row for MergeWait/ResolveWait and must not resolve cursor-local
+    // merge waits; Changes-view M is the cursor-local resolve-intent key.
+    if app.mode == AppMode::Error {
+        app.retry_error_changes()
+    } else if app.mode == AppMode::Stopped {
+        app.resume_processing()
     } else {
-        ctx.app.start_processing()
+        app.start_processing()
     }
+}
+
+/// Handle F5 key: start, resume, or retry orchestration; or cancel stop.
+pub fn handle_f5_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
+    handle_f5_key_inner(ctx.app, ctx.graceful_stop_flag, ctx.orchestrator_handle)
 }
 
 /// Handle Enter key: Execute worktree command in selected worktree
@@ -665,6 +656,92 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn inert_stop_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    #[test]
+    fn f5_on_merge_wait_row_does_not_emit_resolve_merge() {
+        let mut app = AppState::new(vec![
+            create_test_change("merge-wait"),
+            create_test_change("run-me"),
+        ]);
+        app.mode = AppMode::Select;
+        app.cursor_index = 0;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.changes[1].selected = true;
+        let graceful_stop = inert_stop_flag();
+        let handle = None;
+
+        let command = handle_f5_key_inner(&mut app, &graceful_stop, &handle);
+
+        assert!(
+            !matches!(command, Some(TuiCommand::ResolveMerge(_))),
+            "F5 must not dispatch cursor-local ResolveMerge for MergeWait rows"
+        );
+        assert!(matches!(
+            command,
+            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["run-me".to_string()]
+        ));
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert_eq!(app.changes[1].display_status_cache, "queued");
+    }
+
+    #[test]
+    fn f5_delegates_start_resume_and_retry_while_resolving() {
+        let graceful_stop = inert_stop_flag();
+        let handle = None;
+
+        let mut select_app = AppState::new(vec![create_test_change("select-a")]);
+        select_app.mode = AppMode::Select;
+        select_app.is_resolving = true;
+        select_app.changes[0].selected = true;
+        let command = handle_f5_key_inner(&mut select_app, &graceful_stop, &handle);
+        assert!(matches!(
+            command,
+            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["select-a".to_string()]
+        ));
+        assert!(select_app.warning_message.is_none());
+
+        let mut stopped_app = AppState::new(vec![create_test_change("stopped-a")]);
+        stopped_app.mode = AppMode::Stopped;
+        stopped_app.is_resolving = true;
+        stopped_app.changes[0].selected = true;
+        let command = handle_f5_key_inner(&mut stopped_app, &graceful_stop, &handle);
+        assert!(matches!(
+            command,
+            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["stopped-a".to_string()]
+        ));
+        assert!(stopped_app.warning_message.is_none());
+
+        let mut error_app = AppState::new(vec![create_test_change("error-a")]);
+        error_app.mode = AppMode::Error;
+        error_app.is_resolving = true;
+        error_app.changes[0].set_error_message_cache("boom".to_string());
+        let command = handle_f5_key_inner(&mut error_app, &graceful_stop, &handle);
+        assert!(matches!(
+            command,
+            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string()]
+        ));
+        assert!(error_app.warning_message.is_none());
+    }
+
+    #[test]
+    fn f5_on_merge_wait_with_no_runnable_work_is_noop_not_resolve() {
+        let mut app = AppState::new(vec![create_test_change("merge-wait")]);
+        app.mode = AppMode::Select;
+        app.cursor_index = 0;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        let graceful_stop = inert_stop_flag();
+        let handle = None;
+
+        let command = handle_f5_key_inner(&mut app, &graceful_stop, &handle);
+
+        assert!(command.is_none());
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert_eq!(app.warning_message.as_deref(), Some("No changes selected"));
     }
 
     #[test]

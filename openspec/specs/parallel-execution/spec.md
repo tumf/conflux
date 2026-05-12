@@ -2071,9 +2071,13 @@ When execution slots remain available, queued changes and retry-eligible `MergeW
 
 Completion of a scheduler-owned merge / resolve retry MUST feed back into the same completion semantics used for ordinary scheduler progress, so that re-analysis and dispatch resume from scheduler state rather than from a TUI-only notify side effect.
 
-When a user registers manual retry intent while other apply/archive work is in flight, the scheduler MUST preserve the reducer-owned `ResolveWait`, continue unrelated apply/archive progress, and retry the pending merge after the in-flight work releases scheduler/base-lane capacity. The pending change MUST NOT remain indefinitely in `ResolveWait` solely because unrelated apply/archive work was active at the time of the `M` keypress.
+When a user registers manual retry intent while other apply/archive/resolve work is in flight, the scheduler MUST preserve the reducer-owned `ResolveWait`, continue unrelated apply/archive progress, and retry the pending merge after the in-flight work releases scheduler/base-lane capacity. The pending change MUST NOT remain indefinitely in `ResolveWait` solely because unrelated apply/archive work was active at the time of the `M` keypress.
 
-Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer state), scheduler loop is the **sole execution owner** for merge/resolve retry start, and reducer completion events (`ResolveCompleted`/`ResolveFailed`/`MergeDeferred`) are the **sole authority** for clearing or transitioning wait state.
+When the scheduler is running, no resolve/base-mutating operation is active, and one or more reducer-owned `ResolveWait` changes are retry-clean, the scheduler SHALL promote exactly one eligible pending retry to `resolving` during a scheduling evaluation. Other pending retries SHALL remain pending until the base-mutating lane clears again.
+
+Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer state), scheduler loop is the **sole execution owner** for merge/resolve retry start, and reducer completion events (`ResolveCompleted`/`ResolveFailed`/`MergeDeferred`/`MergeCompleted`) are the **sole authority** for clearing or transitioning wait state.
+
+<!-- Expected canonical result after archive: `parallel-execution` will require a running scheduler to promote one clean ResolveWait retry when the base-mutating lane is free. -->
 
 #### Scenario: M key registers retry intent instead of direct execution
 
@@ -2092,13 +2096,15 @@ Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer 
 - **THEN** the scheduler may dispatch `beta` using the remaining available slot
 - **AND** retry intent for `gamma` does not by itself suppress `beta` analysis or dispatch
 
-#### Scenario: retry completion resumes scheduler semantics
+#### Scenario: running scheduler promotes one clean ResolveWait retry
 
-- **GIVEN** change `alpha` has scheduler-owned retry intent and the scheduler starts its merge / resolve retry
-- **AND** another queued change `beta` remains waiting
-- **WHEN** the retry for `alpha` completes or clears its queued resolve wait
-- **THEN** the scheduler resumes evaluation using its normal completion semantics
-- **AND** `beta` is reconsidered for analysis / dispatch without requiring a TUI-only direct execution callback path
+- **GIVEN** the scheduler is running
+- **AND** no resolve/base-mutating operation is active
+- **AND** changes `alpha` and `beta` are in reducer-owned `ResolveWait`
+- **AND** retry preconditions for both are clean
+- **WHEN** the scheduler evaluates pending base-mutating lane waiters
+- **THEN** exactly one of `alpha` or `beta` SHALL start resolving
+- **AND** the other SHALL remain `resolve pending`
 
 #### Scenario: manual resolve intent progresses after unrelated apply completes
 
