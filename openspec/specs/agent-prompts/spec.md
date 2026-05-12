@@ -103,30 +103,26 @@ acceptance プロンプトは Git の作業ツリーが完全にクリーンで�
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. Archive-side guidance and bundled proposal guidance MUST NOT instruct agents to create final OpenSpec validation as a checkbox implementation task.
+Archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. Archive-side guidance and bundled proposal guidance MUST NOT instruct agents to create final OpenSpec validation as a checkbox implementation task.
+
+Bundled proposal guidance MUST instruct authors to inspect canonical spec requirement headings before creating `MODIFIED Requirements` or `REMOVED Requirements` deltas. If the target canonical heading does not exist, authors MUST use `ADDED Requirements` for a new requirement identity or correct the target name before validation.
 
 Final validation guidance, when present, MUST be represented as non-checkbox archive-gate text, such as a `## Final Validation` section.
 
-#### Scenario: archive validation uses native evidence enum
+#### Scenario: proposal guidance requires canonical heading lookup
 
-**Given**: the archive path invokes native `cflx openspec validate`
-**When**: evidence mode is requested during archive-side validation
-**Then**: the command uses only `off`, `warn`, or `error`
-**And**: it never emits `--evidence strict`
+**Given**: bundled `cflx-proposal` guidance is used to author a spec delta
+**When**: the requested delta modifies or removes an existing requirement
+**Then**: the guidance tells the author to inspect `openspec/specs/<capability>/spec.md` for the canonical `### Requirement:` heading
+**And**: it tells the author to use the canonical target heading for `MODIFIED` or `REMOVED`
+**And**: it tells the author to use `ADDED` when no canonical target exists
 
-#### Scenario: prompts avoid final validation checkbox tasks
+#### Scenario: proposal guidance validates target selection before handoff
 
-**Given**: an agent prompt or bundled proposal guidance instructs authors to include final OpenSpec validation guidance
-**When**: the guidance is rendered or inspected
-**Then**: it does not instruct the author to create a checkbox task for final validation of the same change
-**And**: it uses non-checkbox archive-gate guidance instead
-
-#### Scenario: self-referential validation blocker is explained
-
-**Given**: archive-side validation detects a checkbox task that asks for final validation of the same change
-**When**: archive reports the failure
-**Then**: the prompt/error text identifies the self-referential final validation checkbox pattern
-**And**: it tells the user to move final validation to a non-checkbox `Final Validation` section
+**Given**: a proposal with spec deltas has been authored
+**When**: proposal authoring is complete
+**Then**: bundled guidance requires running `cflx openspec validate <id> --strict`
+**And**: missing `MODIFIED` or `REMOVED` targets are treated as proposal authoring errors rather than deferred archive blockers
 
 ### Requirement: acceptance システムプロンプトは差分レビューの優先指示を含める
 acceptance システムプロンプトは、`<acceptance_diff_context>` が存在する場合に変更ファイルの確認を優先するよう明示的に指示しなければならない（MUST）。
@@ -325,30 +321,26 @@ unit test の主張と実際の test scope が一致しない場合、acceptance
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. Archive-side guidance and bundled proposal guidance MUST NOT instruct agents to create final OpenSpec validation as a checkbox implementation task.
+Archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. Archive-side guidance and bundled proposal guidance MUST NOT instruct agents to create final OpenSpec validation as a checkbox implementation task.
+
+Bundled proposal guidance MUST instruct authors to inspect canonical spec requirement headings before creating `MODIFIED Requirements` or `REMOVED Requirements` deltas. If the target canonical heading does not exist, authors MUST use `ADDED Requirements` for a new requirement identity or correct the target name before validation.
 
 Final validation guidance, when present, MUST be represented as non-checkbox archive-gate text, such as a `## Final Validation` section.
 
-#### Scenario: archive validation uses native evidence enum
+#### Scenario: proposal guidance requires canonical heading lookup
 
-**Given**: the archive path invokes native `cflx openspec validate`
-**When**: evidence mode is requested during archive-side validation
-**Then**: the command uses only `off`, `warn`, or `error`
-**And**: it never emits `--evidence strict`
+**Given**: bundled `cflx-proposal` guidance is used to author a spec delta
+**When**: the requested delta modifies or removes an existing requirement
+**Then**: the guidance tells the author to inspect `openspec/specs/<capability>/spec.md` for the canonical `### Requirement:` heading
+**And**: it tells the author to use the canonical target heading for `MODIFIED` or `REMOVED`
+**And**: it tells the author to use `ADDED` when no canonical target exists
 
-#### Scenario: prompts avoid final validation checkbox tasks
+#### Scenario: proposal guidance validates target selection before handoff
 
-**Given**: an agent prompt or bundled proposal guidance instructs authors to include final OpenSpec validation guidance
-**When**: the guidance is rendered or inspected
-**Then**: it does not instruct the author to create a checkbox task for final validation of the same change
-**And**: it uses non-checkbox archive-gate guidance instead
-
-#### Scenario: self-referential validation blocker is explained
-
-**Given**: archive-side validation detects a checkbox task that asks for final validation of the same change
-**When**: archive reports the failure
-**Then**: the prompt/error text identifies the self-referential final validation checkbox pattern
-**And**: it tells the user to move final validation to a non-checkbox `Final Validation` section
+**Given**: a proposal with spec deltas has been authored
+**When**: proposal authoring is complete
+**Then**: bundled guidance requires running `cflx openspec validate <id> --strict`
+**And**: missing `MODIFIED` or `REMOVED` targets are treated as proposal authoring errors rather than deferred archive blockers
 
 ### Requirement: cflx-workflow MUST support cleanup-review operation prompts
 
@@ -378,30 +370,26 @@ Conflux の orchestrator は、managed worktree apply の post-apply handoff cle
 
 ### Requirement: acceptance プロンプトは差分コンテキストを提示する
 
-archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. Archive-side guidance and bundled proposal guidance MUST NOT instruct agents to create final OpenSpec validation as a checkbox implementation task.
+Archive-side guidance MAY reference the native validator during archive readiness checks, but when it does so it MUST use only the supported evidence enum values `off`, `warn`, or `error`. Archive-side guidance and bundled proposal guidance MUST NOT instruct agents to create final OpenSpec validation as a checkbox implementation task.
+
+Bundled proposal guidance MUST instruct authors to inspect canonical spec requirement headings before creating `MODIFIED Requirements` or `REMOVED Requirements` deltas. If the target canonical heading does not exist, authors MUST use `ADDED Requirements` for a new requirement identity or correct the target name before validation.
 
 Final validation guidance, when present, MUST be represented as non-checkbox archive-gate text, such as a `## Final Validation` section.
 
-#### Scenario: archive validation uses native evidence enum
+#### Scenario: proposal guidance requires canonical heading lookup
 
-**Given**: the archive path invokes native `cflx openspec validate`
-**When**: evidence mode is requested during archive-side validation
-**Then**: the command uses only `off`, `warn`, or `error`
-**And**: it never emits `--evidence strict`
+**Given**: bundled `cflx-proposal` guidance is used to author a spec delta
+**When**: the requested delta modifies or removes an existing requirement
+**Then**: the guidance tells the author to inspect `openspec/specs/<capability>/spec.md` for the canonical `### Requirement:` heading
+**And**: it tells the author to use the canonical target heading for `MODIFIED` or `REMOVED`
+**And**: it tells the author to use `ADDED` when no canonical target exists
 
-#### Scenario: prompts avoid final validation checkbox tasks
+#### Scenario: proposal guidance validates target selection before handoff
 
-**Given**: an agent prompt or bundled proposal guidance instructs authors to include final OpenSpec validation guidance
-**When**: the guidance is rendered or inspected
-**Then**: it does not instruct the author to create a checkbox task for final validation of the same change
-**And**: it uses non-checkbox archive-gate guidance instead
-
-#### Scenario: self-referential validation blocker is explained
-
-**Given**: archive-side validation detects a checkbox task that asks for final validation of the same change
-**When**: archive reports the failure
-**Then**: the prompt/error text identifies the self-referential final validation checkbox pattern
-**And**: it tells the user to move final validation to a non-checkbox `Final Validation` section
+**Given**: a proposal with spec deltas has been authored
+**When**: proposal authoring is complete
+**Then**: bundled guidance requires running `cflx openspec validate <id> --strict`
+**And**: missing `MODIFIED` or `REMOVED` targets are treated as proposal authoring errors rather than deferred archive blockers
 
 ### Requirement: Operation-specific prompts MUST load dedicated skills
 
