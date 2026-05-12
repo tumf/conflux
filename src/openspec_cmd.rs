@@ -2112,9 +2112,8 @@ mod validation_tests {
             "ownership-free generic evidence notes should still warn: {warnings:?}"
         );
         assert!(
-            !warnings
-                .iter()
-                .any(|warning| warning.contains("Verification note should cite repository-verifiable evidence")),
+            !warnings.iter().any(|warning| warning
+                .contains("Verification note should cite repository-verifiable evidence")),
             "generic evidence vocabulary itself should be recognized: {warnings:?}"
         );
     }
