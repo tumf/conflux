@@ -1,38 +1,66 @@
 ### Requirement: merge-attempt-resolve-priority
 
-archive 完了後の parallel merge 最終検証は、`Merge change: <change_id>` という merge commit subject が存在しない場合でも、対象 change が fast-forward により base branch へ統合済みなら成功として扱わなければならない（MUST）。
+Parallel merge handling SHALL distinguish auto-resumable deferrals from manual merge-wait deferrals in both reducer events and externally visible workspace/display status.
 
-#### Scenario: parallel merge verification accepts fast-forward integration
+When a post-archive merge attempt is deferred with `auto_resumable=true`, the change SHALL remain scheduler-owned retry work and SHALL be represented as `resolve pending`, not manual `merge wait`. When a post-archive merge attempt is deferred with `auto_resumable=false`, the change SHALL be represented as manual `merge wait` and removed from scheduler-owned resolve retry membership until explicit retry intent is accepted.
 
-**Given** archive が完了した change が parallel merge 経路で base branch に fast-forward されている
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** merge commit subject が存在しなくても検証は成功する
-**And** change は merge error にならない
+<!-- Expected canonical result after archive: `parallel-merge` will require auto-resumable deferrals to avoid publishing contradictory manual `MergeWait` evidence. -->
 
-#### Scenario: missing merge commit error only applies to unintegrated change
+#### Scenario: auto-resumable deferral is resolve pending
 
-**Given** archive が完了した change に `Merge change: <change_id>` という merge commit subject が存在しない
-**And** 対象 change は base branch にも統合されていない
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** `Missing merge commit message containing change_id(s)` エラーを返してよい
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=true`
+**Then**: the reducer-visible display status for `alpha` is `resolve pending`
+**And**: `alpha` remains in scheduler-owned resolve retry membership
+**And**: parallel merge handling does not publish manual `MergeWait` evidence for `alpha`
+
+#### Scenario: manual deferral is merge wait
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=false`
+**Then**: the reducer-visible display status for `alpha` is `merge wait`
+**And**: `alpha` is removed from scheduler-owned resolve retry membership
+**And**: `alpha` is visible as requiring manual retry
+
+#### Scenario: retry promotion preserves classification
+
+**Given**: change `alpha` is in `resolve pending`
+**When**: the base-mutating lane clears and the scheduler retries the deferred merge
+**Then**: successful merge transitions `alpha` to `merged`
+**And**: another `auto_resumable=true` deferral keeps `alpha` in `resolve pending`
+**And**: an `auto_resumable=false` deferral changes `alpha` to `merge wait`
 
 ### Requirement: merge-attempt-resolve-priority
 
-archive 完了後の parallel merge 最終検証は、`Merge change: <change_id>` という merge commit subject が存在しない場合でも、対象 change が fast-forward により base branch へ統合済みなら成功として扱わなければならない（MUST）。
+Parallel merge handling SHALL distinguish auto-resumable deferrals from manual merge-wait deferrals in both reducer events and externally visible workspace/display status.
 
-#### Scenario: parallel merge verification accepts fast-forward integration
+When a post-archive merge attempt is deferred with `auto_resumable=true`, the change SHALL remain scheduler-owned retry work and SHALL be represented as `resolve pending`, not manual `merge wait`. When a post-archive merge attempt is deferred with `auto_resumable=false`, the change SHALL be represented as manual `merge wait` and removed from scheduler-owned resolve retry membership until explicit retry intent is accepted.
 
-**Given** archive が完了した change が parallel merge 経路で base branch に fast-forward されている
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** merge commit subject が存在しなくても検証は成功する
-**And** change は merge error にならない
+<!-- Expected canonical result after archive: `parallel-merge` will require auto-resumable deferrals to avoid publishing contradictory manual `MergeWait` evidence. -->
 
-#### Scenario: missing merge commit error only applies to unintegrated change
+#### Scenario: auto-resumable deferral is resolve pending
 
-**Given** archive が完了した change に `Merge change: <change_id>` という merge commit subject が存在しない
-**And** 対象 change は base branch にも統合されていない
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** `Missing merge commit message containing change_id(s)` エラーを返してよい
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=true`
+**Then**: the reducer-visible display status for `alpha` is `resolve pending`
+**And**: `alpha` remains in scheduler-owned resolve retry membership
+**And**: parallel merge handling does not publish manual `MergeWait` evidence for `alpha`
+
+#### Scenario: manual deferral is merge wait
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=false`
+**Then**: the reducer-visible display status for `alpha` is `merge wait`
+**And**: `alpha` is removed from scheduler-owned resolve retry membership
+**And**: `alpha` is visible as requiring manual retry
+
+#### Scenario: retry promotion preserves classification
+
+**Given**: change `alpha` is in `resolve pending`
+**When**: the base-mutating lane clears and the scheduler retries the deferred merge
+**Then**: successful merge transitions `alpha` to `merged`
+**And**: another `auto_resumable=true` deferral keeps `alpha` in `resolve pending`
+**And**: an `auto_resumable=false` deferral changes `alpha` to `merge wait`
 
 ### Requirement: is-dirty-reason-auto-resumable
 
@@ -40,54 +68,96 @@ archive 完了後の parallel merge 最終検証は、`Merge change: <change_id>
 
 ### Requirement: merge-attempt-resolve-priority
 
-archive 完了後の parallel merge 最終検証は、`Merge change: <change_id>` という merge commit subject が存在しない場合でも、対象 change が fast-forward により base branch へ統合済みなら成功として扱わなければならない（MUST）。
+Parallel merge handling SHALL distinguish auto-resumable deferrals from manual merge-wait deferrals in both reducer events and externally visible workspace/display status.
 
-#### Scenario: parallel merge verification accepts fast-forward integration
+When a post-archive merge attempt is deferred with `auto_resumable=true`, the change SHALL remain scheduler-owned retry work and SHALL be represented as `resolve pending`, not manual `merge wait`. When a post-archive merge attempt is deferred with `auto_resumable=false`, the change SHALL be represented as manual `merge wait` and removed from scheduler-owned resolve retry membership until explicit retry intent is accepted.
 
-**Given** archive が完了した change が parallel merge 経路で base branch に fast-forward されている
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** merge commit subject が存在しなくても検証は成功する
-**And** change は merge error にならない
+<!-- Expected canonical result after archive: `parallel-merge` will require auto-resumable deferrals to avoid publishing contradictory manual `MergeWait` evidence. -->
 
-#### Scenario: missing merge commit error only applies to unintegrated change
+#### Scenario: auto-resumable deferral is resolve pending
 
-**Given** archive が完了した change に `Merge change: <change_id>` という merge commit subject が存在しない
-**And** 対象 change は base branch にも統合されていない
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** `Missing merge commit message containing change_id(s)` エラーを返してよい
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=true`
+**Then**: the reducer-visible display status for `alpha` is `resolve pending`
+**And**: `alpha` remains in scheduler-owned resolve retry membership
+**And**: parallel merge handling does not publish manual `MergeWait` evidence for `alpha`
 
-### Requirement: merge-attempt-resolve-priority
+#### Scenario: manual deferral is merge wait
 
-archive 完了後の parallel merge 最終検証は、`Merge change: <change_id>` という merge commit subject が存在しない場合でも、対象 change が fast-forward により base branch へ統合済みなら成功として扱わなければならない（MUST）。
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=false`
+**Then**: the reducer-visible display status for `alpha` is `merge wait`
+**And**: `alpha` is removed from scheduler-owned resolve retry membership
+**And**: `alpha` is visible as requiring manual retry
 
-#### Scenario: parallel merge verification accepts fast-forward integration
+#### Scenario: retry promotion preserves classification
 
-**Given** archive が完了した change が parallel merge 経路で base branch に fast-forward されている
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** merge commit subject が存在しなくても検証は成功する
-**And** change は merge error にならない
-
-#### Scenario: missing merge commit error only applies to unintegrated change
-
-**Given** archive が完了した change に `Merge change: <change_id>` という merge commit subject が存在しない
-**And** 対象 change は base branch にも統合されていない
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** `Missing merge commit message containing change_id(s)` エラーを返してよい
+**Given**: change `alpha` is in `resolve pending`
+**When**: the base-mutating lane clears and the scheduler retries the deferred merge
+**Then**: successful merge transitions `alpha` to `merged`
+**And**: another `auto_resumable=true` deferral keeps `alpha` in `resolve pending`
+**And**: an `auto_resumable=false` deferral changes `alpha` to `merge wait`
 
 ### Requirement: merge-attempt-resolve-priority
 
-archive 完了後の parallel merge 最終検証は、`Merge change: <change_id>` という merge commit subject が存在しない場合でも、対象 change が fast-forward により base branch へ統合済みなら成功として扱わなければならない（MUST）。
+Parallel merge handling SHALL distinguish auto-resumable deferrals from manual merge-wait deferrals in both reducer events and externally visible workspace/display status.
 
-#### Scenario: parallel merge verification accepts fast-forward integration
+When a post-archive merge attempt is deferred with `auto_resumable=true`, the change SHALL remain scheduler-owned retry work and SHALL be represented as `resolve pending`, not manual `merge wait`. When a post-archive merge attempt is deferred with `auto_resumable=false`, the change SHALL be represented as manual `merge wait` and removed from scheduler-owned resolve retry membership until explicit retry intent is accepted.
 
-**Given** archive が完了した change が parallel merge 経路で base branch に fast-forward されている
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** merge commit subject が存在しなくても検証は成功する
-**And** change は merge error にならない
+<!-- Expected canonical result after archive: `parallel-merge` will require auto-resumable deferrals to avoid publishing contradictory manual `MergeWait` evidence. -->
 
-#### Scenario: missing merge commit error only applies to unintegrated change
+#### Scenario: auto-resumable deferral is resolve pending
 
-**Given** archive が完了した change に `Merge change: <change_id>` という merge commit subject が存在しない
-**And** 対象 change は base branch にも統合されていない
-**When** `verify_merge_commits()` が merge 完了を検証する
-**Then** `Missing merge commit message containing change_id(s)` エラーを返してよい
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=true`
+**Then**: the reducer-visible display status for `alpha` is `resolve pending`
+**And**: `alpha` remains in scheduler-owned resolve retry membership
+**And**: parallel merge handling does not publish manual `MergeWait` evidence for `alpha`
+
+#### Scenario: manual deferral is merge wait
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=false`
+**Then**: the reducer-visible display status for `alpha` is `merge wait`
+**And**: `alpha` is removed from scheduler-owned resolve retry membership
+**And**: `alpha` is visible as requiring manual retry
+
+#### Scenario: retry promotion preserves classification
+
+**Given**: change `alpha` is in `resolve pending`
+**When**: the base-mutating lane clears and the scheduler retries the deferred merge
+**Then**: successful merge transitions `alpha` to `merged`
+**And**: another `auto_resumable=true` deferral keeps `alpha` in `resolve pending`
+**And**: an `auto_resumable=false` deferral changes `alpha` to `merge wait`
+
+### Requirement: merge-attempt-resolve-priority
+
+Parallel merge handling SHALL distinguish auto-resumable deferrals from manual merge-wait deferrals in both reducer events and externally visible workspace/display status.
+
+When a post-archive merge attempt is deferred with `auto_resumable=true`, the change SHALL remain scheduler-owned retry work and SHALL be represented as `resolve pending`, not manual `merge wait`. When a post-archive merge attempt is deferred with `auto_resumable=false`, the change SHALL be represented as manual `merge wait` and removed from scheduler-owned resolve retry membership until explicit retry intent is accepted.
+
+<!-- Expected canonical result after archive: `parallel-merge` will require auto-resumable deferrals to avoid publishing contradictory manual `MergeWait` evidence. -->
+
+#### Scenario: auto-resumable deferral is resolve pending
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=true`
+**Then**: the reducer-visible display status for `alpha` is `resolve pending`
+**And**: `alpha` remains in scheduler-owned resolve retry membership
+**And**: parallel merge handling does not publish manual `MergeWait` evidence for `alpha`
+
+#### Scenario: manual deferral is merge wait
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the merge attempt returns `MergeAttempt::Deferred` with `auto_resumable=false`
+**Then**: the reducer-visible display status for `alpha` is `merge wait`
+**And**: `alpha` is removed from scheduler-owned resolve retry membership
+**And**: `alpha` is visible as requiring manual retry
+
+#### Scenario: retry promotion preserves classification
+
+**Given**: change `alpha` is in `resolve pending`
+**When**: the base-mutating lane clears and the scheduler retries the deferred merge
+**Then**: successful merge transitions `alpha` to `merged`
+**And**: another `auto_resumable=true` deferral keeps `alpha` in `resolve pending`
+**And**: an `auto_resumable=false` deferral changes `alpha` to `merge wait`
