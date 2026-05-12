@@ -685,7 +685,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             }
         }
     }
-    if has_queue && !app.is_resolving {
+    if has_queue {
         keys.push("F5: run");
     }
     if app.has_bulk_toggle_targets() {
@@ -2171,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_merge_wait_hides_resolve_key_hint_when_resolving() {
+    fn test_render_merge_wait_shows_queue_resolve_key_hint_when_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.is_resolving = true; // Currently resolving
@@ -2179,21 +2179,22 @@ mod tests {
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
         assert!(
-            !content.contains("M: resolve"),
-            "Should NOT show M key hint when resolve is in progress"
+            content.contains("M: queue resolve"),
+            "Should show M queue-resolve intent hint while resolve is in progress"
         );
     }
 
     #[test]
-    fn test_render_hides_f5_run_hint_while_resolving() {
+    fn test_render_keeps_f5_run_hint_while_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
         app.is_resolving = true;
         app.cursor_index = 0;
+        app.changes[0].selected = true;
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
-        assert!(!content.contains("F5: run"));
+        assert!(content.contains("F5: run"));
     }
 
     // === Tests for update-tui-error-mode-continuation ===
