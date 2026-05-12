@@ -8,27 +8,43 @@ Defines parallel change execution using jj workspaces or Git worktrees.
 
 Parallel merge retry dispatch SHALL handle deferred merge attempts as pending/deferred outcomes rather than successful completed background merge tasks. A background merge task MUST report successful completion only when the merge attempt actually integrated the change into base or determined from repository-visible evidence that the change was already integrated.
 
-#### Scenario: deferred merge is not logged as completed successfully
+Parallel ordinary apply dispatch MUST treat reducer terminal-error state as a stop gate. After a change emits an apply, acceptance, archive, dispatch, or workspace execution error, scheduler reanalysis, queue reconciliation, and workspace resume scans MUST NOT dispatch that same change to apply again unless explicit retry intent has cleared the recoverable error terminal state. Existing workspaces MAY remain available for operator inspection or explicit retry.
 
-- **GIVEN** a post-archive merge attempt for change `alpha` returns `MergeAttempt::Deferred`
-- **WHEN** queue state handles the background merge task result
-- **THEN** operator-visible logs do not say `Background merge task completed successfully for 'alpha'`
-- **AND** the task is logged or surfaced as deferred/pending with the deferral reason
-- **AND** `alpha` remains in the appropriate merge-wait or resolve-wait state for later retry or operator action
+Dependency analysis MUST continue to treat an errored dependency as a dispatch blocker for dependents until the dependency is explicitly retried and reaches repository-visible success.
 
-#### Scenario: success follow-up is limited to actual merged outcomes
+<!-- Expected canonical result after archive: `parallel-execution` will require terminal-error changes to stay stopped across reanalysis/resume until explicit retry clears the reducer error. -->
 
-- **GIVEN** a post-archive merge attempt for change `alpha` returns `MergeAttempt::Deferred`
-- **WHEN** queue state processes the result
-- **THEN** success-only follow-up behavior for completed merges is not triggered solely because the async task returned without a Rust error
-- **AND** no workflow decision is made from log text
+#### Scenario: parallel apply error is not automatically redispatched
 
-#### Scenario: already-integrated change remains successful
+**Given**: change `alpha` is running in parallel apply
+**When**: the workspace task emits `ProcessingError` or `ApplyFailed` for `alpha`
+**Then**: `alpha` is recorded as `error`
+**And**: the next scheduler reanalysis does not select `alpha` for ordinary apply dispatch
+**And**: `alpha` remains available for explicit retry rather than being removed silently
 
-- **GIVEN** archive verification or merge verification determines from repository-visible base state that change `alpha` is already integrated
-- **WHEN** the merge attempt returns a merged/idempotent success outcome
-- **THEN** queue state may log background merge completion for `alpha`
-- **AND** success-only follow-up behavior may run
+#### Scenario: workspace resume does not resurrect errored change
+
+**Given**: change `alpha` has terminal state `Error`
+**And**: an existing workspace for `alpha` remains on disk
+**When**: parallel workspace resume or repair-candidate scanning runs
+**Then**: `alpha` is not dispatched to ordinary apply solely because the workspace exists
+**And**: `alpha` remains displayed as `error` until explicit retry or delayed repository-visible success
+
+#### Scenario: explicit retry restores parallel dispatch eligibility
+
+**Given**: change `alpha` has terminal state `Error`
+**And**: the operator explicitly marks `alpha` for retry
+**When**: the retry transition clears the recoverable error terminal state
+**Then**: `alpha` may be selected by normal parallel dependency analysis and dispatch rules
+**And**: unmarked error changes remain excluded from ordinary apply dispatch
+
+#### Scenario: errored dependency blocks dependent dispatch
+
+**Given**: queued change `beta` depends on change `alpha`
+**And**: `alpha` has terminal state `Error`
+**When**: parallel dependency analysis selects dispatch candidates
+**Then**: `beta` is not dispatched
+**And**: after `alpha` is explicitly retried and reaches repository-visible success, `beta` may be re-evaluated by normal dependency analysis
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1500,27 +1516,43 @@ When acceptance returns a stalled-hold compatibility verdict for infrastructure,
 
 Parallel merge retry dispatch SHALL handle deferred merge attempts as pending/deferred outcomes rather than successful completed background merge tasks. A background merge task MUST report successful completion only when the merge attempt actually integrated the change into base or determined from repository-visible evidence that the change was already integrated.
 
-#### Scenario: deferred merge is not logged as completed successfully
+Parallel ordinary apply dispatch MUST treat reducer terminal-error state as a stop gate. After a change emits an apply, acceptance, archive, dispatch, or workspace execution error, scheduler reanalysis, queue reconciliation, and workspace resume scans MUST NOT dispatch that same change to apply again unless explicit retry intent has cleared the recoverable error terminal state. Existing workspaces MAY remain available for operator inspection or explicit retry.
 
-- **GIVEN** a post-archive merge attempt for change `alpha` returns `MergeAttempt::Deferred`
-- **WHEN** queue state handles the background merge task result
-- **THEN** operator-visible logs do not say `Background merge task completed successfully for 'alpha'`
-- **AND** the task is logged or surfaced as deferred/pending with the deferral reason
-- **AND** `alpha` remains in the appropriate merge-wait or resolve-wait state for later retry or operator action
+Dependency analysis MUST continue to treat an errored dependency as a dispatch blocker for dependents until the dependency is explicitly retried and reaches repository-visible success.
 
-#### Scenario: success follow-up is limited to actual merged outcomes
+<!-- Expected canonical result after archive: `parallel-execution` will require terminal-error changes to stay stopped across reanalysis/resume until explicit retry clears the reducer error. -->
 
-- **GIVEN** a post-archive merge attempt for change `alpha` returns `MergeAttempt::Deferred`
-- **WHEN** queue state processes the result
-- **THEN** success-only follow-up behavior for completed merges is not triggered solely because the async task returned without a Rust error
-- **AND** no workflow decision is made from log text
+#### Scenario: parallel apply error is not automatically redispatched
 
-#### Scenario: already-integrated change remains successful
+**Given**: change `alpha` is running in parallel apply
+**When**: the workspace task emits `ProcessingError` or `ApplyFailed` for `alpha`
+**Then**: `alpha` is recorded as `error`
+**And**: the next scheduler reanalysis does not select `alpha` for ordinary apply dispatch
+**And**: `alpha` remains available for explicit retry rather than being removed silently
 
-- **GIVEN** archive verification or merge verification determines from repository-visible base state that change `alpha` is already integrated
-- **WHEN** the merge attempt returns a merged/idempotent success outcome
-- **THEN** queue state may log background merge completion for `alpha`
-- **AND** success-only follow-up behavior may run
+#### Scenario: workspace resume does not resurrect errored change
+
+**Given**: change `alpha` has terminal state `Error`
+**And**: an existing workspace for `alpha` remains on disk
+**When**: parallel workspace resume or repair-candidate scanning runs
+**Then**: `alpha` is not dispatched to ordinary apply solely because the workspace exists
+**And**: `alpha` remains displayed as `error` until explicit retry or delayed repository-visible success
+
+#### Scenario: explicit retry restores parallel dispatch eligibility
+
+**Given**: change `alpha` has terminal state `Error`
+**And**: the operator explicitly marks `alpha` for retry
+**When**: the retry transition clears the recoverable error terminal state
+**Then**: `alpha` may be selected by normal parallel dependency analysis and dispatch rules
+**And**: unmarked error changes remain excluded from ordinary apply dispatch
+
+#### Scenario: errored dependency blocks dependent dispatch
+
+**Given**: queued change `beta` depends on change `alpha`
+**And**: `alpha` has terminal state `Error`
+**When**: parallel dependency analysis selects dispatch candidates
+**Then**: `beta` is not dispatched
+**And**: after `alpha` is explicitly retried and reaches repository-visible success, `beta` may be re-evaluated by normal dependency analysis
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 

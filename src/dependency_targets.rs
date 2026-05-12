@@ -16,6 +16,7 @@ pub(crate) enum DependencyTargetClass {
     InFlight,
     Archived,
     Rejected,
+    Error,
     Missing,
 }
 
@@ -26,6 +27,7 @@ impl DependencyTargetClass {
             Self::InFlight => "in-flight",
             Self::Archived => "archived",
             Self::Rejected => "rejected",
+            Self::Error => "errored",
             Self::Missing => "missing",
         }
     }
@@ -200,6 +202,7 @@ mod tests {
             ),
             DependencyTargetClass::Missing
         );
+        assert_eq!(DependencyTargetClass::Error.as_str(), "errored");
     }
 
     #[test]

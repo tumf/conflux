@@ -258,10 +258,21 @@ pub async fn handle_tui_command(
         }
         TuiCommand::AddToQueue(id) => {
             // Apply reducer command first, then push to dynamic queue.
-            shared_state
-                .write()
-                .await
-                .apply_command(ReducerCommand::AddToQueue(id.clone()));
+            let outcome = {
+                let mut guard = shared_state.write().await;
+                if guard.is_terminal_error_change(&id) {
+                    guard.apply_command(ReducerCommand::RetryError(id.clone()))
+                } else {
+                    guard.apply_command(ReducerCommand::AddToQueue(id.clone()))
+                }
+            };
+            if matches!(outcome, crate::orchestration::state::ReduceOutcome::NoOp) {
+                ctx.app.add_log(LogEntry::warn(format!(
+                    "Queue add ignored by reducer: {}",
+                    id
+                )));
+                return Ok(None);
+            }
             // Push to dynamic queue for orchestrator to pick up
             if ctx.dynamic_queue.push(id.clone()).await {
                 ctx.app

@@ -10,47 +10,40 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, or archived terminal states.
+
 Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
 
-#### Scenario: archive success clears prior acceptance error in parallel mode
+<!-- Expected canonical result after archive: `orchestration-state` will state that recoverable error can be superseded by delayed success events, but cannot be ordinary apply-dispatched again until explicit retry clears the error. -->
 
-- **GIVEN** change `alpha` is in parallel execution mode
-- **AND** `alpha` previously received an `AcceptanceFailed` event
-- **WHEN** `alpha` later receives a `ChangeArchived` event
-- **THEN** `alpha` SHALL NOT display as `error`
-- **AND** parallel-mode archived handling SHALL continue toward merge wait or resolve wait as appropriate
+#### Scenario: error terminal gates ordinary apply dispatch
 
-#### Scenario: merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: reducer-owned queued dispatch candidates are requested
+**Then**: `alpha` is not returned as ordinary apply dispatch work
+**And**: `alpha` remains displayed as `error`
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **AND** `alpha` later archives successfully
-- **WHEN** `alpha` receives `MergeCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry clears recoverable error
 
-#### Scenario: resolved merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: an explicit retry transition is applied to `alpha`
+**Then**: `alpha` has terminal state `None`
+**And**: `alpha` has queued intent for ordinary apply dispatch
+**And**: stale wait/blocker metadata for `alpha` is cleared
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **WHEN** `alpha` receives `ResolveCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry does not requeue final states
 
-#### Scenario: rejected state remains final
+**Given**: change `alpha` has terminal state `Rejected`, `Merged`, or `Archived`
+**When**: an explicit retry transition is requested for `alpha`
+**Then**: `alpha` keeps its existing terminal state
+**And**: `alpha` is not reintroduced as ordinary apply dispatch work
 
-- **GIVEN** change `alpha` has terminal state `Rejected`
-- **WHEN** stale or unrelated success observations are processed
-- **THEN** `alpha` SHALL remain rejected
-- **AND** no success event SHALL silently turn rejected into merged or archived
+#### Scenario: late success still supersedes recoverable error without retry
 
-#### Scenario: stalled infrastructure hold remains resumable
-
-- **GIVEN** change `alpha` has a valid active proposal
-- **AND** a required verification gate cannot complete because infrastructure is unavailable
-- **WHEN** the reducer receives the stalled-hold event or workspace status
-- **THEN** `alpha` SHALL have terminal state `None`
-- **AND** `alpha` SHALL have wait state `Stalled`
-- **AND** `alpha` SHALL display as `stalled`
-- **AND** `alpha` SHALL NOT display as `rejected`
+**Given**: change `alpha` has terminal state `Error`
+**When**: `alpha` receives a repository-visible `ChangeArchived`, `MergeCompleted`, or `ResolveCompleted` success event from already-running work
+**Then**: the success event may supersede the error according to existing success precedence rules
+**And**: no new ordinary apply dispatch is created solely because the error was superseded
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -284,47 +277,40 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, or archived terminal states.
+
 Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
 
-#### Scenario: archive success clears prior acceptance error in parallel mode
+<!-- Expected canonical result after archive: `orchestration-state` will state that recoverable error can be superseded by delayed success events, but cannot be ordinary apply-dispatched again until explicit retry clears the error. -->
 
-- **GIVEN** change `alpha` is in parallel execution mode
-- **AND** `alpha` previously received an `AcceptanceFailed` event
-- **WHEN** `alpha` later receives a `ChangeArchived` event
-- **THEN** `alpha` SHALL NOT display as `error`
-- **AND** parallel-mode archived handling SHALL continue toward merge wait or resolve wait as appropriate
+#### Scenario: error terminal gates ordinary apply dispatch
 
-#### Scenario: merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: reducer-owned queued dispatch candidates are requested
+**Then**: `alpha` is not returned as ordinary apply dispatch work
+**And**: `alpha` remains displayed as `error`
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **AND** `alpha` later archives successfully
-- **WHEN** `alpha` receives `MergeCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry clears recoverable error
 
-#### Scenario: resolved merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: an explicit retry transition is applied to `alpha`
+**Then**: `alpha` has terminal state `None`
+**And**: `alpha` has queued intent for ordinary apply dispatch
+**And**: stale wait/blocker metadata for `alpha` is cleared
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **WHEN** `alpha` receives `ResolveCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry does not requeue final states
 
-#### Scenario: rejected state remains final
+**Given**: change `alpha` has terminal state `Rejected`, `Merged`, or `Archived`
+**When**: an explicit retry transition is requested for `alpha`
+**Then**: `alpha` keeps its existing terminal state
+**And**: `alpha` is not reintroduced as ordinary apply dispatch work
 
-- **GIVEN** change `alpha` has terminal state `Rejected`
-- **WHEN** stale or unrelated success observations are processed
-- **THEN** `alpha` SHALL remain rejected
-- **AND** no success event SHALL silently turn rejected into merged or archived
+#### Scenario: late success still supersedes recoverable error without retry
 
-#### Scenario: stalled infrastructure hold remains resumable
-
-- **GIVEN** change `alpha` has a valid active proposal
-- **AND** a required verification gate cannot complete because infrastructure is unavailable
-- **WHEN** the reducer receives the stalled-hold event or workspace status
-- **THEN** `alpha` SHALL have terminal state `None`
-- **AND** `alpha` SHALL have wait state `Stalled`
-- **AND** `alpha` SHALL display as `stalled`
-- **AND** `alpha` SHALL NOT display as `rejected`
+**Given**: change `alpha` has terminal state `Error`
+**When**: `alpha` receives a repository-visible `ChangeArchived`, `MergeCompleted`, or `ResolveCompleted` success event from already-running work
+**Then**: the success event may supersede the error according to existing success precedence rules
+**And**: no new ordinary apply dispatch is created solely because the error was superseded
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -361,47 +347,40 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, or archived terminal states.
+
 Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
 
-#### Scenario: archive success clears prior acceptance error in parallel mode
+<!-- Expected canonical result after archive: `orchestration-state` will state that recoverable error can be superseded by delayed success events, but cannot be ordinary apply-dispatched again until explicit retry clears the error. -->
 
-- **GIVEN** change `alpha` is in parallel execution mode
-- **AND** `alpha` previously received an `AcceptanceFailed` event
-- **WHEN** `alpha` later receives a `ChangeArchived` event
-- **THEN** `alpha` SHALL NOT display as `error`
-- **AND** parallel-mode archived handling SHALL continue toward merge wait or resolve wait as appropriate
+#### Scenario: error terminal gates ordinary apply dispatch
 
-#### Scenario: merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: reducer-owned queued dispatch candidates are requested
+**Then**: `alpha` is not returned as ordinary apply dispatch work
+**And**: `alpha` remains displayed as `error`
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **AND** `alpha` later archives successfully
-- **WHEN** `alpha` receives `MergeCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry clears recoverable error
 
-#### Scenario: resolved merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: an explicit retry transition is applied to `alpha`
+**Then**: `alpha` has terminal state `None`
+**And**: `alpha` has queued intent for ordinary apply dispatch
+**And**: stale wait/blocker metadata for `alpha` is cleared
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **WHEN** `alpha` receives `ResolveCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry does not requeue final states
 
-#### Scenario: rejected state remains final
+**Given**: change `alpha` has terminal state `Rejected`, `Merged`, or `Archived`
+**When**: an explicit retry transition is requested for `alpha`
+**Then**: `alpha` keeps its existing terminal state
+**And**: `alpha` is not reintroduced as ordinary apply dispatch work
 
-- **GIVEN** change `alpha` has terminal state `Rejected`
-- **WHEN** stale or unrelated success observations are processed
-- **THEN** `alpha` SHALL remain rejected
-- **AND** no success event SHALL silently turn rejected into merged or archived
+#### Scenario: late success still supersedes recoverable error without retry
 
-#### Scenario: stalled infrastructure hold remains resumable
-
-- **GIVEN** change `alpha` has a valid active proposal
-- **AND** a required verification gate cannot complete because infrastructure is unavailable
-- **WHEN** the reducer receives the stalled-hold event or workspace status
-- **THEN** `alpha` SHALL have terminal state `None`
-- **AND** `alpha` SHALL have wait state `Stalled`
-- **AND** `alpha` SHALL display as `stalled`
-- **AND** `alpha` SHALL NOT display as `rejected`
+**Given**: change `alpha` has terminal state `Error`
+**When**: `alpha` receives a repository-visible `ChangeArchived`, `MergeCompleted`, or `ResolveCompleted` success event from already-running work
+**Then**: the success event may supersede the error according to existing success precedence rules
+**And**: no new ordinary apply dispatch is created solely because the error was superseded
 
 ### Requirement: Rejection Flow Execution
 
@@ -614,47 +593,40 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, or archived terminal states.
+
 Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
 
-#### Scenario: archive success clears prior acceptance error in parallel mode
+<!-- Expected canonical result after archive: `orchestration-state` will state that recoverable error can be superseded by delayed success events, but cannot be ordinary apply-dispatched again until explicit retry clears the error. -->
 
-- **GIVEN** change `alpha` is in parallel execution mode
-- **AND** `alpha` previously received an `AcceptanceFailed` event
-- **WHEN** `alpha` later receives a `ChangeArchived` event
-- **THEN** `alpha` SHALL NOT display as `error`
-- **AND** parallel-mode archived handling SHALL continue toward merge wait or resolve wait as appropriate
+#### Scenario: error terminal gates ordinary apply dispatch
 
-#### Scenario: merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: reducer-owned queued dispatch candidates are requested
+**Then**: `alpha` is not returned as ordinary apply dispatch work
+**And**: `alpha` remains displayed as `error`
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **AND** `alpha` later archives successfully
-- **WHEN** `alpha` receives `MergeCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry clears recoverable error
 
-#### Scenario: resolved merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: an explicit retry transition is applied to `alpha`
+**Then**: `alpha` has terminal state `None`
+**And**: `alpha` has queued intent for ordinary apply dispatch
+**And**: stale wait/blocker metadata for `alpha` is cleared
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **WHEN** `alpha` receives `ResolveCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry does not requeue final states
 
-#### Scenario: rejected state remains final
+**Given**: change `alpha` has terminal state `Rejected`, `Merged`, or `Archived`
+**When**: an explicit retry transition is requested for `alpha`
+**Then**: `alpha` keeps its existing terminal state
+**And**: `alpha` is not reintroduced as ordinary apply dispatch work
 
-- **GIVEN** change `alpha` has terminal state `Rejected`
-- **WHEN** stale or unrelated success observations are processed
-- **THEN** `alpha` SHALL remain rejected
-- **AND** no success event SHALL silently turn rejected into merged or archived
+#### Scenario: late success still supersedes recoverable error without retry
 
-#### Scenario: stalled infrastructure hold remains resumable
-
-- **GIVEN** change `alpha` has a valid active proposal
-- **AND** a required verification gate cannot complete because infrastructure is unavailable
-- **WHEN** the reducer receives the stalled-hold event or workspace status
-- **THEN** `alpha` SHALL have terminal state `None`
-- **AND** `alpha` SHALL have wait state `Stalled`
-- **AND** `alpha` SHALL display as `stalled`
-- **AND** `alpha` SHALL NOT display as `rejected`
+**Given**: change `alpha` has terminal state `Error`
+**When**: `alpha` receives a repository-visible `ChangeArchived`, `MergeCompleted`, or `ResolveCompleted` success event from already-running work
+**Then**: the success event may supersede the error according to existing success precedence rules
+**And**: no new ordinary apply dispatch is created solely because the error was superseded
 
 ### Requirement: Rejected terminal state remains distinct from errors
 
@@ -700,47 +672,40 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, or archived terminal states.
+
 Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
 
-#### Scenario: archive success clears prior acceptance error in parallel mode
+<!-- Expected canonical result after archive: `orchestration-state` will state that recoverable error can be superseded by delayed success events, but cannot be ordinary apply-dispatched again until explicit retry clears the error. -->
 
-- **GIVEN** change `alpha` is in parallel execution mode
-- **AND** `alpha` previously received an `AcceptanceFailed` event
-- **WHEN** `alpha` later receives a `ChangeArchived` event
-- **THEN** `alpha` SHALL NOT display as `error`
-- **AND** parallel-mode archived handling SHALL continue toward merge wait or resolve wait as appropriate
+#### Scenario: error terminal gates ordinary apply dispatch
 
-#### Scenario: merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: reducer-owned queued dispatch candidates are requested
+**Then**: `alpha` is not returned as ordinary apply dispatch work
+**And**: `alpha` remains displayed as `error`
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **AND** `alpha` later archives successfully
-- **WHEN** `alpha` receives `MergeCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry clears recoverable error
 
-#### Scenario: resolved merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: an explicit retry transition is applied to `alpha`
+**Then**: `alpha` has terminal state `None`
+**And**: `alpha` has queued intent for ordinary apply dispatch
+**And**: stale wait/blocker metadata for `alpha` is cleared
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **WHEN** `alpha` receives `ResolveCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry does not requeue final states
 
-#### Scenario: rejected state remains final
+**Given**: change `alpha` has terminal state `Rejected`, `Merged`, or `Archived`
+**When**: an explicit retry transition is requested for `alpha`
+**Then**: `alpha` keeps its existing terminal state
+**And**: `alpha` is not reintroduced as ordinary apply dispatch work
 
-- **GIVEN** change `alpha` has terminal state `Rejected`
-- **WHEN** stale or unrelated success observations are processed
-- **THEN** `alpha` SHALL remain rejected
-- **AND** no success event SHALL silently turn rejected into merged or archived
+#### Scenario: late success still supersedes recoverable error without retry
 
-#### Scenario: stalled infrastructure hold remains resumable
-
-- **GIVEN** change `alpha` has a valid active proposal
-- **AND** a required verification gate cannot complete because infrastructure is unavailable
-- **WHEN** the reducer receives the stalled-hold event or workspace status
-- **THEN** `alpha` SHALL have terminal state `None`
-- **AND** `alpha` SHALL have wait state `Stalled`
-- **AND** `alpha` SHALL display as `stalled`
-- **AND** `alpha` SHALL NOT display as `rejected`
+**Given**: change `alpha` has terminal state `Error`
+**When**: `alpha` receives a repository-visible `ChangeArchived`, `MergeCompleted`, or `ResolveCompleted` success event from already-running work
+**Then**: the success event may supersede the error according to existing success precedence rules
+**And**: no new ordinary apply dispatch is created solely because the error was superseded
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -777,47 +742,40 @@ Reducer-owned orchestration state SHALL reflect the latest repository-visible te
 
 Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
 
+A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, or archived terminal states.
+
 Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
 
-#### Scenario: archive success clears prior acceptance error in parallel mode
+<!-- Expected canonical result after archive: `orchestration-state` will state that recoverable error can be superseded by delayed success events, but cannot be ordinary apply-dispatched again until explicit retry clears the error. -->
 
-- **GIVEN** change `alpha` is in parallel execution mode
-- **AND** `alpha` previously received an `AcceptanceFailed` event
-- **WHEN** `alpha` later receives a `ChangeArchived` event
-- **THEN** `alpha` SHALL NOT display as `error`
-- **AND** parallel-mode archived handling SHALL continue toward merge wait or resolve wait as appropriate
+#### Scenario: error terminal gates ordinary apply dispatch
 
-#### Scenario: merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: reducer-owned queued dispatch candidates are requested
+**Then**: `alpha` is not returned as ordinary apply dispatch work
+**And**: `alpha` remains displayed as `error`
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **AND** `alpha` later archives successfully
-- **WHEN** `alpha` receives `MergeCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry clears recoverable error
 
-#### Scenario: resolved merge success clears prior recoverable error
+**Given**: change `alpha` has terminal state `Error`
+**When**: an explicit retry transition is applied to `alpha`
+**Then**: `alpha` has terminal state `None`
+**And**: `alpha` has queued intent for ordinary apply dispatch
+**And**: stale wait/blocker metadata for `alpha` is cleared
 
-- **GIVEN** change `alpha` previously received a recoverable error event
-- **WHEN** `alpha` receives `ResolveCompleted`
-- **THEN** `alpha` SHALL have terminal state `Merged`
-- **AND** `alpha` SHALL display as `merged`, not `error`
+#### Scenario: explicit retry does not requeue final states
 
-#### Scenario: rejected state remains final
+**Given**: change `alpha` has terminal state `Rejected`, `Merged`, or `Archived`
+**When**: an explicit retry transition is requested for `alpha`
+**Then**: `alpha` keeps its existing terminal state
+**And**: `alpha` is not reintroduced as ordinary apply dispatch work
 
-- **GIVEN** change `alpha` has terminal state `Rejected`
-- **WHEN** stale or unrelated success observations are processed
-- **THEN** `alpha` SHALL remain rejected
-- **AND** no success event SHALL silently turn rejected into merged or archived
+#### Scenario: late success still supersedes recoverable error without retry
 
-#### Scenario: stalled infrastructure hold remains resumable
-
-- **GIVEN** change `alpha` has a valid active proposal
-- **AND** a required verification gate cannot complete because infrastructure is unavailable
-- **WHEN** the reducer receives the stalled-hold event or workspace status
-- **THEN** `alpha` SHALL have terminal state `None`
-- **AND** `alpha` SHALL have wait state `Stalled`
-- **AND** `alpha` SHALL display as `stalled`
-- **AND** `alpha` SHALL NOT display as `rejected`
+**Given**: change `alpha` has terminal state `Error`
+**When**: `alpha` receives a repository-visible `ChangeArchived`, `MergeCompleted`, or `ResolveCompleted` success event from already-running work
+**Then**: the success event may supersede the error according to existing success precedence rules
+**And**: no new ordinary apply dispatch is created solely because the error was superseded
 
 ### Requirement: WebSocket change status consistency with TUI
 

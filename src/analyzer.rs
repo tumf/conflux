@@ -746,6 +746,9 @@ Rules:
                     rejected_ids,
                 ) {
                     DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                    DependencyTargetClass::Error => unreachable!(
+                        "repository-visible dependency classification cannot produce terminal-error state"
+                    ),
                     DependencyTargetClass::Archived => {
                         debug!(
                             change_id,

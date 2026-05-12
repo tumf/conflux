@@ -596,6 +596,9 @@ impl OpenSpecManager {
                         }
                         DependencyTargetClass::Archived => warnings.push(diagnostic.message),
                         DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                        DependencyTargetClass::Error => unreachable!(
+                            "proposal dependency classification cannot produce terminal-error state"
+                        ),
                     }
                 }
             }
@@ -1033,6 +1036,9 @@ impl DependencyStatusContext {
             DependencyTargetClass::InFlight => DependencyListStatus::Running,
             DependencyTargetClass::Queued => DependencyListStatus::Pending,
             DependencyTargetClass::Rejected => DependencyListStatus::Rejected,
+            DependencyTargetClass::Error => {
+                unreachable!("dependency list classification cannot produce terminal-error state")
+            }
             DependencyTargetClass::Missing => DependencyListStatus::Missing,
         }
     }
@@ -1169,6 +1175,9 @@ fn classify_proposal_dependency_targets(
                 DependencyTargetClass::Rejected => format!(
                     "{}: proposal dependency '{}' is invalid: classified as rejected dependency target",
                     change_id, dependency
+                ),
+                DependencyTargetClass::Error => unreachable!(
+                    "proposal dependency classification cannot produce terminal-error state"
                 ),
                 DependencyTargetClass::Missing => format!(
                     "{}: proposal dependency '{}' is invalid: not found in active, in-flight, archived, or rejected change targets",

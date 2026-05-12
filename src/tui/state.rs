@@ -2159,7 +2159,19 @@ mod tests {
         let mut app = AppState::new(changes);
         app.mode = AppMode::Error;
         app.changes[0].set_error_message_cache("boom".to_string());
+        app.changes[0].selected = true;
         app.is_resolving = true;
+
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec!["a".to_string()], 0),
+        ));
+        shared.blocking_write().apply_execution_event(
+            &crate::events::ExecutionEvent::ProcessingError {
+                id: "a".to_string(),
+                error: "boom".to_string(),
+            },
+        );
+        app.set_shared_state(shared);
 
         let command = app.retry_error_changes();
         assert!(
@@ -2180,6 +2192,26 @@ mod tests {
         app.mode = AppMode::Error;
         app.changes[0].set_error_message_cache("boom-a".to_string());
         app.changes[1].set_error_message_cache("boom-b".to_string());
+        app.changes[0].selected = true;
+        app.changes[1].selected = true;
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(
+                vec!["error-a".to_string(), "error-b".to_string()],
+                0,
+            ),
+        ));
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+                id: "error-a".to_string(),
+                error: "boom-a".to_string(),
+            });
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+                id: "error-b".to_string(),
+                error: "boom-b".to_string(),
+            });
+        }
+        app.set_shared_state(shared);
 
         let command = app.retry_error_changes();
 
@@ -2190,6 +2222,49 @@ mod tests {
         assert_eq!(app.changes[0].display_status_cache, "queued");
         assert_eq!(app.changes[1].display_status_cache, "queued");
         assert_eq!(app.changes[2].display_status_cache, "not queued");
+    }
+
+    #[test]
+    fn test_retry_error_changes_requeues_only_marked_error_rows_through_reducer() {
+        let change_a = create_test_change("error-a", 0, 1);
+        let change_b = create_test_change("error-b", 0, 1);
+        let mut app = AppState::new(vec![change_a, change_b]);
+        app.mode = AppMode::Error;
+        app.changes[0].set_error_message_cache("boom-a".to_string());
+        app.changes[1].set_error_message_cache("boom-b".to_string());
+        app.changes[0].selected = true;
+        app.changes[1].selected = false;
+
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(
+                vec!["error-a".to_string(), "error-b".to_string()],
+                0,
+            ),
+        ));
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+                id: "error-a".to_string(),
+                error: "boom-a".to_string(),
+            });
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+                id: "error-b".to_string(),
+                error: "boom-b".to_string(),
+            });
+        }
+        app.set_shared_state(shared.clone());
+
+        let command = app.retry_error_changes();
+
+        assert!(
+            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string()])
+        );
+        assert_eq!(app.changes[0].display_status_cache, "queued");
+        assert_eq!(app.changes[1].display_status_cache, "error");
+        let guard = shared.blocking_read();
+        assert_eq!(guard.display_status("error-a"), "queued");
+        assert_eq!(guard.display_status("error-b"), "error");
+        assert_eq!(guard.queued_change_ids(), vec!["error-a".to_string()]);
     }
 
     #[test]

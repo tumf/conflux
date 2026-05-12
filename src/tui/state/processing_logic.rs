@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::{
     openspec::Change,
-    orchestration::state::{OrchestratorState, ReducerCommand},
+    orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand},
     task_parser,
     tui::events::{LogEntry, LogLevel},
 };
@@ -67,7 +67,7 @@ pub(super) fn collect_resume_processing_targets(
 pub(super) fn collect_retry_error_targets(changes: &[ChangeState]) -> Vec<String> {
     changes
         .iter()
-        .filter(|c| c.display_status_cache == "error")
+        .filter(|c| c.selected && c.display_status_cache == "error")
         .map(|c| c.id.clone())
         .collect()
 }
@@ -92,6 +92,27 @@ pub(super) fn sync_queue_intent(shared: Option<&Arc<RwLock<OrchestratorState>>>,
             }
         }
     }
+}
+
+pub(super) fn sync_retry_error_intent(
+    shared: Option<&Arc<RwLock<OrchestratorState>>>,
+    ids: &[String],
+) -> Vec<String> {
+    let Some(shared) = shared else {
+        return ids.to_vec();
+    };
+    let Ok(mut guard) = shared.try_write() else {
+        return Vec::new();
+    };
+
+    ids.iter()
+        .filter_map(
+            |id| match guard.apply_command(ReducerCommand::RetryError(id.clone())) {
+                ReduceOutcome::Changed(_) => Some(id.clone()),
+                ReduceOutcome::NoOp => None,
+            },
+        )
+        .collect()
 }
 
 pub(super) fn emit_retry_logs(ids: &[String]) -> Vec<LogEntry> {
