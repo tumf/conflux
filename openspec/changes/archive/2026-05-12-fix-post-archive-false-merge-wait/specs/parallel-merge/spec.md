@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: merge-deferred-status-classification
+### Requirement: merge-attempt-resolve-priority
 
 Parallel merge handling SHALL distinguish auto-resumable deferrals from manual merge-wait deferrals in both reducer events and externally visible workspace/display status.
 

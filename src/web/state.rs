@@ -1795,6 +1795,53 @@ mod tests {
     }
 
     #[test]
+    fn test_web_snapshot_exposes_post_archive_statuses_from_reducer() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+
+        let mut shared = OrchestratorState::with_mode(
+            vec![
+                "resolving-a".to_string(),
+                "resolve-b".to_string(),
+                "merge-c".to_string(),
+            ],
+            0,
+            ExecutionMode::Parallel,
+        );
+        let changes = vec![
+            create_test_change("resolving-a", 0, 1),
+            create_test_change("resolve-b", 0, 1),
+            create_test_change("merge-c", 0, 1),
+        ];
+
+        shared.apply_execution_event(&ExecutionEvent::ChangeArchived("resolving-a".to_string()));
+        shared.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "resolve-b".to_string(),
+            reason: "another merge is active".to_string(),
+            auto_resumable: true,
+        });
+        shared.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "merge-c".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+
+        let snapshot =
+            OrchestratorStateSnapshot::from_changes_with_shared_state(&changes, Some(&shared));
+        let status = |id: &str| {
+            snapshot
+                .changes
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.queue_status.as_deref())
+        };
+
+        assert_eq!(status("resolving-a"), Some("resolving"));
+        assert_eq!(status("resolve-b"), Some("resolve pending"));
+        assert_eq!(status("merge-c"), Some("merge wait"));
+    }
+
+    #[test]
     fn test_web_snapshot_exposes_reject_pending_from_reducer() {
         use crate::orchestration::state::OrchestratorState;
 

@@ -446,10 +446,24 @@ impl ParallelExecutor {
                             .remove(&workspace_result.change_id);
                     }
 
-                    // Update workspace status to MergeWait so it's no longer counted as active
+                    let workspace_status = if auto_resumable {
+                        crate::vcs::WorkspaceStatus::Resolving
+                    } else {
+                        crate::vcs::WorkspaceStatus::MergeWait
+                    };
+                    tracing::info!(
+                        change_id = %workspace_result.change_id,
+                        workspace = %workspace_result.workspace_name,
+                        auto_resumable,
+                        status = ?workspace_status,
+                        "Classifying deferred post-archive merge for reducer/display synchronization"
+                    );
+                    // Auto-resumable deferrals are scheduler-owned retry work. They must
+                    // not publish manual MergeWait evidence; only concrete manual
+                    // deferrals are exposed as MergeWait.
                     self.workspace_manager.update_workspace_status(
                         &workspace_result.workspace_name,
-                        crate::vcs::WorkspaceStatus::MergeWait,
+                        workspace_status.clone(),
                     );
 
                     send_event(
@@ -467,7 +481,7 @@ impl ParallelExecutor {
                         ParallelEvent::WorkspaceStatusUpdated {
                             change_id: workspace_result.change_id.clone(),
                             workspace_name: workspace_result.workspace_name.clone(),
-                            status: crate::vcs::WorkspaceStatus::MergeWait,
+                            status: workspace_status,
                         },
                     )
                     .await;

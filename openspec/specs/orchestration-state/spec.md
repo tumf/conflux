@@ -54,15 +54,32 @@ Non-terminal execution blockers that preserve the change for later resume SHALL 
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
-Workspace observations SHALL NOT regress a change from terminal `Merged` back to `MergeWait` when the change has already been integrated into the base branch, including fast-forward integration.
+Workspace observations and refresh-derived archive-complete evidence SHALL NOT regress reducer-owned active, pending, or terminal lifecycle states to `MergeWait` without concrete manual deferral evidence.
 
-#### Scenario: Archived workspace observation does not regress fast-forward merged change
+A `ChangesRefreshed` event containing a change in `merge_wait_ids` represents archived-but-not-yet-merged workspace evidence. That evidence MAY preserve or restore an already-established manual `MergeWait`, but it MUST NOT override `ActivityState::Resolving`, `WaitState::ResolveWait`, `WaitState::RejectWait`, `ActivityState::Rejecting`, or terminal states.
 
-- **GIVEN** a change has already reached terminal `Merged`
-- **AND** the integration happened via fast-forward rather than a merge commit
-- **WHEN** a later `ChangesRefreshed` event observes the workspace as archived
-- **THEN** the reducer keeps the terminal state as `Merged`
-- **AND** the derived display status does not regress to `merge wait`
+<!-- Expected canonical result after archive: `orchestration-state` will treat refresh-derived merge-wait evidence as lower precedence than reducer-owned active/pending/terminal state. -->
+
+#### Scenario: refresh evidence does not regress resolving
+
+**Given**: change `alpha` has `ActivityState::Resolving`
+**When**: a `ChangesRefreshed` event includes `alpha` in `merge_wait_ids`
+**Then**: `alpha` remains `resolving`
+**And**: `alpha` is not changed to `merge wait`
+
+#### Scenario: refresh evidence does not regress resolve pending
+
+**Given**: change `alpha` has `WaitState::ResolveWait`
+**When**: a `ChangesRefreshed` event includes `alpha` in `merge_wait_ids`
+**Then**: `alpha` remains `resolve pending`
+**And**: reducer-owned scheduler retry membership remains available
+
+#### Scenario: refresh evidence can preserve concrete manual merge wait
+
+**Given**: change `alpha` has already received concrete manual deferral evidence and is in `WaitState::MergeWait`
+**When**: a `ChangesRefreshed` event includes `alpha` in `merge_wait_ids`
+**Then**: `alpha` remains `merge wait`
+**And**: no normal queue intent is reintroduced for `alpha`
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -95,35 +112,52 @@ After a change has reached repository-visible base integration, later stale dupl
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
-The system SHALL support two execution modes — Serial and Parallel — that determine how `ChangeArchived` events affect terminal state.
+In Serial mode, `ChangeArchived` SHALL set the terminal state to `Archived`.
 
-In Serial mode, `ChangeArchived` SHALL set the terminal state to `Archived` (a terminal state from which no further transitions occur).
+In Parallel mode, `ChangeArchived` SHALL NOT by itself set `MergeWait`. Parallel archive completion SHALL enter post-archive merge handling according to reducer-owned base-mutating lane state:
 
-In Parallel mode, `ChangeArchived` SHALL set the wait state to `MergeWait` (a non-terminal state) to allow the subsequent merge step to transition the change to `Merged`.
+- when another non-terminal change occupies the base-mutating lane with `Resolving` or `Rejecting`, the archived change SHALL become `ResolveWait` and remain scheduler-consumable;
+- when no base-mutating lane blocker exists and no concrete manual blocker has been observed, the archived change SHALL become active `Resolving`;
+- only concrete manual deferral evidence, such as `MergeDeferred(auto_resumable=false)`, SHALL set `MergeWait`.
 
-#### Scenario: Serial mode treats archive as terminal
+<!-- Expected canonical result after archive: `orchestration-state` will no longer say parallel `ChangeArchived` unconditionally becomes `MergeWait`; it will describe resolving / resolve pending / merge wait as distinct reducer-owned outcomes. -->
 
-- **GIVEN** the orchestrator is running in Serial execution mode
-- **WHEN** a change receives a `ChangeArchived` event
-- **THEN** the terminal state becomes `Archived`
-- **AND** the derived display status is `archived`
-- **AND** subsequent `MergeCompleted` events for this change are ignored
+#### Scenario: parallel archive without blocker enters resolving
 
-#### Scenario: Parallel mode treats archive as merge-wait
+**Given**: the orchestrator is running in Parallel execution mode
+**And**: no other non-terminal change is `Resolving` or `Rejecting`
+**When**: change `alpha` receives a `ChangeArchived` event
+**Then**: `alpha` has `ActivityState::Resolving`
+**And**: `alpha` does not have `WaitState::MergeWait`
+**And**: the derived display status is `resolving`
 
-- **GIVEN** the orchestrator is running in Parallel execution mode
-- **WHEN** a change receives a `ChangeArchived` event
-- **THEN** the wait state becomes `MergeWait`
-- **AND** the terminal state remains `None`
-- **AND** the derived display status is `merge wait`
+#### Scenario: parallel archive waits behind active base-mutating lane
 
-#### Scenario: Parallel mode archive then merge completes lifecycle
+**Given**: the orchestrator is running in Parallel execution mode
+**And**: change `beta` is non-terminal and actively `Resolving` or `Rejecting`
+**When**: change `alpha` receives a `ChangeArchived` event
+**Then**: `alpha` has `WaitState::ResolveWait`
+**And**: `alpha` is returned by reducer-owned resolve-wait membership
+**And**: the derived display status is `resolve pending`
+**And**: `alpha` is not displayed as `merge wait`
 
-- **GIVEN** the orchestrator is running in Parallel execution mode
-- **AND** a change has received a `ChangeArchived` event (currently in `MergeWait`)
-- **WHEN** a `MergeCompleted` event is received for the change
-- **THEN** the terminal state becomes `Merged`
-- **AND** the derived display status is `merged`
+#### Scenario: manual merge deferral enters merge wait
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the reducer receives `MergeDeferred(alpha, auto_resumable=false)`
+**Then**: `alpha` has `WaitState::MergeWait`
+**And**: normal queue intent for `alpha` is removed
+**And**: `alpha` is not returned by reducer-owned resolve-wait membership
+**And**: the derived display status is `merge wait`
+
+#### Scenario: auto-resumable merge deferral remains resolve pending
+
+**Given**: change `alpha` is in post-archive merge handling
+**When**: the reducer receives `MergeDeferred(alpha, auto_resumable=true)` while `alpha` is not already active
+**Then**: `alpha` has `WaitState::ResolveWait`
+**And**: `alpha` remains scheduler-consumable retry work
+**And**: the derived display status is `resolve pending`
+**And**: `alpha` is not classified as manual `merge wait`
 
 ### Requirement: Parallel Resume Applies Archive-Complete Wait Semantics
 
@@ -710,15 +744,32 @@ Non-terminal execution blockers that preserve the change for later resume SHALL 
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
-Workspace observations SHALL NOT regress a change from terminal `Merged` back to `MergeWait` when the change has already been integrated into the base branch, including fast-forward integration.
+Workspace observations and refresh-derived archive-complete evidence SHALL NOT regress reducer-owned active, pending, or terminal lifecycle states to `MergeWait` without concrete manual deferral evidence.
 
-#### Scenario: Archived workspace observation does not regress fast-forward merged change
+A `ChangesRefreshed` event containing a change in `merge_wait_ids` represents archived-but-not-yet-merged workspace evidence. That evidence MAY preserve or restore an already-established manual `MergeWait`, but it MUST NOT override `ActivityState::Resolving`, `WaitState::ResolveWait`, `WaitState::RejectWait`, `ActivityState::Rejecting`, or terminal states.
 
-- **GIVEN** a change has already reached terminal `Merged`
-- **AND** the integration happened via fast-forward rather than a merge commit
-- **WHEN** a later `ChangesRefreshed` event observes the workspace as archived
-- **THEN** the reducer keeps the terminal state as `Merged`
-- **AND** the derived display status does not regress to `merge wait`
+<!-- Expected canonical result after archive: `orchestration-state` will treat refresh-derived merge-wait evidence as lower precedence than reducer-owned active/pending/terminal state. -->
+
+#### Scenario: refresh evidence does not regress resolving
+
+**Given**: change `alpha` has `ActivityState::Resolving`
+**When**: a `ChangesRefreshed` event includes `alpha` in `merge_wait_ids`
+**Then**: `alpha` remains `resolving`
+**And**: `alpha` is not changed to `merge wait`
+
+#### Scenario: refresh evidence does not regress resolve pending
+
+**Given**: change `alpha` has `WaitState::ResolveWait`
+**When**: a `ChangesRefreshed` event includes `alpha` in `merge_wait_ids`
+**Then**: `alpha` remains `resolve pending`
+**And**: reducer-owned scheduler retry membership remains available
+
+#### Scenario: refresh evidence can preserve concrete manual merge wait
+
+**Given**: change `alpha` has already received concrete manual deferral evidence and is in `WaitState::MergeWait`
+**When**: a `ChangesRefreshed` event includes `alpha` in `merge_wait_ids`
+**Then**: `alpha` remains `merge wait`
+**And**: no normal queue intent is reintroduced for `alpha`
 
 ### Requirement: Reducer-Owned Change Runtime State
 
