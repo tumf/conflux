@@ -246,9 +246,9 @@ impl ParallelExecutor {
                 dep_id
             );
             match class {
-                DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
-                    warn!("{}", message)
-                }
+                DependencyTargetClass::Missing
+                | DependencyTargetClass::Rejected
+                | DependencyTargetClass::Error => warn!("{}", message),
                 DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {
                     info!("{}", message)
                 }
@@ -256,7 +256,9 @@ impl ParallelExecutor {
             }
             if matches!(
                 class,
-                DependencyTargetClass::Missing | DependencyTargetClass::Rejected
+                DependencyTargetClass::Missing
+                    | DependencyTargetClass::Rejected
+                    | DependencyTargetClass::Error
             ) {
                 send_event(&self.event_tx, ParallelEvent::Error { message }).await;
             }
@@ -410,6 +412,24 @@ impl ParallelExecutor {
                             continue;
                         }
                         DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                        DependencyTargetClass::Error => unreachable!(
+                            "error dependency class is derived from reducer state, not repository classification"
+                        ),
+                    }
+
+                    if let Some(shared) = &self.shared_orchestrator_state {
+                        if let Ok(guard) = shared.try_read() {
+                            if guard.is_terminal_error_change(dep_id) {
+                                warn!(
+                                    change_id = %change_id,
+                                    dependency = %dep_id,
+                                    "Blocking dispatch because dependency is in terminal error and requires explicit retry"
+                                );
+                                unresolved_deps.push(dep_id.clone());
+                                blockers.push((dep_id.clone(), DependencyTargetClass::Error));
+                                continue;
+                            }
+                        }
                     }
 
                     match self.is_dependency_resolved(dep_id).await {

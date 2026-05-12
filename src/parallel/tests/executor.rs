@@ -454,6 +454,87 @@ async fn test_terminal_error_change_is_not_selected_until_explicit_retry() {
 }
 
 #[tokio::test]
+async fn test_dependency_on_terminal_error_is_blocked_until_retry_and_success() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        temp.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string(), "beta".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("beta".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "alpha".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let analysis = crate::analyzer::AnalysisResult {
+        order: vec!["alpha".to_string(), "beta".to_string()],
+        dependencies: HashMap::from([("beta".to_string(), vec!["alpha".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let blocked = executor
+        .select_changes_for_dispatch(&analysis, 2, &in_flight)
+        .await;
+    assert!(blocked.is_empty());
+
+    let mut saw_error_dependency_block = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let ParallelEvent::Error { message } = event {
+            if message.contains("blocked by errored dependency 'alpha'") {
+                saw_error_dependency_block = true;
+            }
+        }
+    }
+    assert!(
+        saw_error_dependency_block,
+        "errored dependency should emit a diagnostic"
+    );
+
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::RetryError("alpha".to_string()));
+    let retry_selected = executor
+        .select_changes_for_dispatch(&analysis, 2, &in_flight)
+        .await;
+    assert_eq!(retry_selected, vec!["alpha".to_string()]);
+
+    let archive_dir = temp
+        .path()
+        .join("openspec/changes/archive/2026-05-12-alpha");
+    std::fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    std::fs::write(archive_dir.join("proposal.md"), "# Alpha Archived\n")
+        .or_fail("unexpected error");
+    shared
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::ChangeArchived("alpha".to_string()));
+
+    let after_success_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["beta".to_string()],
+        dependencies: HashMap::from([("beta".to_string(), vec!["alpha".to_string()])]),
+        groups: None,
+    };
+    let after_success = executor
+        .select_changes_for_dispatch(&after_success_analysis, 2, &in_flight)
+        .await;
+    assert_eq!(after_success, vec!["beta".to_string()]);
+}
+
+#[tokio::test]
 async fn test_dependency_blocker_archived_unblocks_dispatch_after_terminal_marker_removed() {
     let temp = TempDir::new().or_fail("unexpected error");
     let rejected_dir = temp.path().join("openspec/changes/dep-a");
