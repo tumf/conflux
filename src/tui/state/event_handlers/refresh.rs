@@ -39,11 +39,27 @@ impl AppState {
     }
 
     pub(crate) fn handle_dependency_resolved(&mut self, change_id: String) {
-        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-            if change.display_status_cache == "blocked" {
-                change.set_display_status_cache("queued");
-            }
+        let was_blocked = self
+            .changes
+            .iter_mut()
+            .find(|c| c.id == change_id)
+            .map(|change| {
+                let was_blocked = change.display_status_cache == "blocked";
+                if was_blocked {
+                    change.set_display_status_cache("queued");
+                }
+                was_blocked
+            })
+            .unwrap_or(false);
+
+        if !was_blocked {
+            tracing::debug!(
+                change_id = %change_id,
+                "Suppressing repeated dependency-resolved TUI log"
+            );
+            return;
         }
+
         self.reset_analysis_log_dedupe();
         self.add_log(LogEntry::info(format!(
             "Change '{}' dependencies resolved",

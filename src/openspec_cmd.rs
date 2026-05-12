@@ -2248,7 +2248,7 @@ mod validation_tests {
 mod openspec_list_show_tests {
     use super::*;
     use std::env;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     struct CwdTestGuard {
@@ -2276,9 +2276,8 @@ mod openspec_list_show_tests {
         }
     }
 
-    fn cwd_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    fn cwd_lock() -> &'static std::sync::Mutex<()> {
+        crate::test_support::cwd_lock()
     }
 
     fn create_change(dir: &Path, proposal_title: &str, tasks: &str) {
