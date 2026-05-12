@@ -69,7 +69,6 @@ impl AppState {
         worktree_change_ids: Option<HashSet<String>>,
     ) -> Option<TuiCommand> {
         self.reset_analysis_log_dedupe();
-        self.is_resolving = false;
         let mut already_merged = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             already_merged = change.display_status_cache == "merged";
@@ -97,22 +96,10 @@ impl AppState {
             )));
         }
 
-        if let Some(next_change_id) = self.pop_from_resolve_queue() {
-            self.add_log(LogEntry::info(format!(
-                "Queueing scheduler retry intent for '{}' from resolve queue",
-                next_change_id
-            )));
-            if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {
-                change.set_display_status_cache("resolve pending");
-            }
-            Some(TuiCommand::ResolveMerge(next_change_id))
-        } else {
-            self.try_transition_to_select();
-            None
-        }
+        self.complete_resolve_lifecycle()
     }
 
-    pub(crate) fn handle_merge_completed(&mut self, change_id: String) {
+    pub(crate) fn handle_merge_completed(&mut self, change_id: String) -> Option<TuiCommand> {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("merged");
@@ -133,6 +120,30 @@ impl AppState {
             "Merge completed for '{}'",
             change_id
         )));
+
+        if self.is_resolving || !self.resolve_queue.is_empty() {
+            self.complete_resolve_lifecycle()
+        } else {
+            None
+        }
+    }
+
+    fn complete_resolve_lifecycle(&mut self) -> Option<TuiCommand> {
+        self.is_resolving = false;
+
+        if let Some(next_change_id) = self.pop_from_resolve_queue() {
+            self.add_log(LogEntry::info(format!(
+                "Queueing scheduler retry intent for '{}' from resolve queue",
+                next_change_id
+            )));
+            if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {
+                change.set_display_status_cache("resolve pending");
+            }
+            Some(TuiCommand::ResolveMerge(next_change_id))
+        } else {
+            self.try_transition_to_select();
+            None
+        }
     }
 
     pub(crate) fn handle_branch_merge_started(&mut self, branch_name: String) {
@@ -304,5 +315,66 @@ mod tests {
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(app.changes[1].display_status_cache, "not queued");
         assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn merge_completed_closes_active_resolve_lifecycle() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.is_resolving = true;
+        app.changes[0].set_display_status_cache("resolving");
+
+        let cmd = app.handle_merge_completed("change-a".to_string());
+
+        assert!(cmd.is_none());
+        assert!(!app.is_resolving);
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message == "Merge completed for 'change-a'"));
+    }
+
+    #[test]
+    fn merge_completed_drains_resolve_queue() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.is_resolving = true;
+        app.changes[0].set_display_status_cache("resolving");
+        app.changes[1].set_display_status_cache("resolve pending");
+        app.add_to_resolve_queue("change-b");
+
+        let cmd = app.handle_merge_completed("change-a".to_string());
+
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
+        assert!(!app.is_resolving);
+        assert!(app.resolve_queue.is_empty());
+        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+    }
+
+    #[test]
+    fn merge_completed_preserves_non_resolve_behavior() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].set_display_status_cache("merge wait");
+        app.changes[0].started_at = Some(std::time::Instant::now());
+
+        let cmd = app.handle_merge_completed("change-a".to_string());
+
+        assert!(cmd.is_none());
+        assert!(!app.is_resolving);
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert!(app.changes[0].elapsed_time.is_some());
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message == "Merge completed for 'change-a'"));
     }
 }

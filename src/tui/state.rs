@@ -2881,6 +2881,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_resolve_merge_after_merge_completed_takes_immediate_path() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.changes[1].display_status_cache = "merge wait".to_string();
+
+        app.cursor_index = 0;
+        let first_cmd = app.resolve_merge();
+        assert!(matches!(first_cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        assert!(app.is_resolving);
+
+        let completion_cmd = app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
+            change_id: "change-a".to_string(),
+            revision: "abc123".to_string(),
+        });
+        assert!(completion_cmd.is_none());
+        assert!(!app.is_resolving);
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+
+        app.cursor_index = 1;
+        let second_cmd = app.resolve_merge();
+
+        assert!(matches!(second_cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
+        assert!(app.is_resolving);
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        assert!(!app.resolve_queue_set.contains("change-b"));
+    }
+
+    #[test]
+    fn test_handle_orchestrator_event_merge_completed_returns_queued_resolve() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        app.is_resolving = true;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "resolve pending".to_string();
+        app.add_to_resolve_queue("change-b");
+
+        let cmd = app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
+            change_id: "change-a".to_string(),
+            revision: "abc123".to_string(),
+        });
+
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
+        assert!(!app.is_resolving);
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+    }
+
     /// Regression: reducer-driven display must not demote a Merged change to MergeWait.
     #[test]
     fn test_apply_merge_wait_status_does_not_demote_merged() {
