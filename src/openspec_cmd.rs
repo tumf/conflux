@@ -1036,9 +1036,9 @@ impl DependencyStatusContext {
             DependencyTargetClass::InFlight => DependencyListStatus::Running,
             DependencyTargetClass::Queued => DependencyListStatus::Pending,
             DependencyTargetClass::Rejected => DependencyListStatus::Rejected,
-            DependencyTargetClass::Error => unreachable!(
-                "dependency list classification cannot produce terminal-error state"
-            ),
+            DependencyTargetClass::Error => {
+                unreachable!("dependency list classification cannot produce terminal-error state")
+            }
             DependencyTargetClass::Missing => DependencyListStatus::Missing,
         }
     }
