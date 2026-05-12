@@ -1240,6 +1240,12 @@ const EVIDENCE_HINTS: &[&str] = &[
     "src/",
     "tests/",
     "test/",
+    "source path",
+    "source paths",
+    "test file",
+    "test files",
+    "runnable command",
+    "runnable commands",
     "uv run ",
     "pytest",
     "make ",
@@ -1251,8 +1257,10 @@ const EVIDENCE_HINTS: &[&str] = &[
     ".js",
     ".rs",
     ".go",
+    ".toml",
     ".spec",
     ".test",
+    "dockerfile",
     " --once",
     "npm test",
     "npm run ",
@@ -1261,6 +1269,7 @@ const EVIDENCE_HINTS: &[&str] = &[
     "pnpm ",
     "cargo test",
     "cargo build",
+    "docker build",
     "go test",
 ];
 
@@ -2075,6 +2084,42 @@ mod validation_tests {
     }
 
     #[test]
+    fn test_validate_tasks_accepts_generic_evidence_vocabulary_with_ownership() {
+        let content = "- [ ] Update source evidence wording (verification: unit - source paths document the changed implementation)\n- [ ] Update test evidence wording (verification: unit - test files cover the validator behavior)\n- [ ] Update command evidence wording (verification: manual - runnable command is provided by the task note)\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "error", Some("implementation"), None);
+
+        assert!(
+            errors.is_empty(),
+            "generic repository evidence vocabulary should pass: {errors:?}"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_validate_tasks_rejects_generic_evidence_vocabulary_without_ownership() {
+        let content = "- [ ] Update source evidence wording (verification: source paths document the changed implementation)\n- [ ] Update test evidence wording (verification: test files cover the validator behavior)\n- [ ] Update command evidence wording (verification: runnable command is provided by the task note)\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
+
+        assert!(errors.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .filter(|warning| warning.contains("Verification ownership missing"))
+                .count()
+                >= 3,
+            "ownership-free generic evidence notes should still warn: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("Verification note should cite repository-verifiable evidence")),
+            "generic evidence vocabulary itself should be recognized: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_tasks_with_standalone_verification_hint() {
         let content =
             "- [ ] Add a new feature\n  verification: unit - cargo test covers the feature\n";
@@ -2176,8 +2221,12 @@ mod validation_tests {
         let (errors, warnings) =
             validate_tasks_content(content, "test", true, "warn", Some("implementation"), None);
         assert!(errors.is_empty());
-        // "manual review" lacks repository-verifiable hints
-        assert!(!warnings.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Verification note should cite repository-verifiable evidence")),
+            "narrative-only manual review should still produce an evidence finding: {warnings:?}"
+        );
     }
 
     #[test]
@@ -2234,6 +2283,19 @@ mod validation_tests {
             warnings.is_empty(),
             "ordinary evidence should not warn: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn test_validate_tasks_accepts_common_repository_artifacts_and_build_commands() {
+        let content = "- [ ] Add Docker packaging evidence (verification: manual - Dockerfile documents the runtime image)\n- [ ] Add TOML configuration evidence (verification: unit - Cargo.toml and .toml configuration fixtures cover the change)\n- [ ] Add container build evidence (verification: integration - docker build validates the repository build artifact)\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "error", Some("implementation"), None);
+
+        assert!(
+            errors.is_empty(),
+            "common repository artifacts and commands should pass: {errors:?}"
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 
     #[test]
