@@ -209,6 +209,34 @@ impl ChangeRuntimeState {
         };
     }
 
+    /// Reset transient execution state for non-terminal idle/wait transitions.
+    fn clear_activity_wait_and_blocker(&mut self) {
+        self.activity = ActivityState::Idle;
+        self.wait_state = WaitState::None;
+        self.clear_blocked_metadata();
+    }
+
+    /// Set a final terminal outcome and clear transient activity/wait metadata.
+    fn transition_to_terminal(&mut self, terminal: TerminalState) {
+        self.terminal = terminal;
+        self.activity = ActivityState::Idle;
+        self.wait_state = WaitState::None;
+        self.clear_blocked_metadata();
+    }
+
+    /// Record a recoverable stalled/blocker state with structured operator guidance.
+    fn transition_to_stalled(
+        &mut self,
+        blocker_reason: impl Into<String>,
+        unblock_metadata: impl Into<String>,
+        worktree_snapshot: impl Into<String>,
+    ) {
+        self.activity = ActivityState::Idle;
+        self.wait_state = WaitState::Stalled;
+        self.terminal = TerminalState::None;
+        self.set_blocked_metadata(blocker_reason, unblock_metadata, worktree_snapshot);
+    }
+
     /// Check whether this runtime state represents active execution
     /// (applying, accepting, archiving, or resolving).
     pub fn is_active(&self) -> bool {
@@ -777,6 +805,31 @@ impl OrchestratorState {
             .collect()
     }
 
+    fn remove_from_resolve_wait_queue(&mut self, change_id: &str) {
+        self.resolve_wait_queue.retain(|id| id != change_id);
+    }
+
+    fn remove_from_reject_wait_queue(&mut self, change_id: &str) {
+        self.reject_wait_queue.retain(|id| id != change_id);
+    }
+
+    fn clear_base_mutating_wait_queues(&mut self, change_id: &str) {
+        self.remove_from_resolve_wait_queue(change_id);
+        self.remove_from_reject_wait_queue(change_id);
+    }
+
+    fn enqueue_unique_resolve_wait(&mut self, change_id: &str) {
+        if !self.resolve_wait_queue.iter().any(|id| id == change_id) {
+            self.resolve_wait_queue.push(change_id.to_string());
+        }
+    }
+
+    fn enqueue_unique_reject_wait(&mut self, change_id: &str) {
+        if !self.reject_wait_queue.iter().any(|id| id == change_id) {
+            self.reject_wait_queue.push(change_id.to_string());
+        }
+    }
+
     /// Clear reducer-owned resolve retry intent for a change after repository-visible
     /// merge success or stale already-merged detection.
     pub fn clear_resolve_wait_intent(&mut self, change_id: &str) {
@@ -785,7 +838,7 @@ impl OrchestratorState {
             rt.wait_state = WaitState::None;
             rt.clear_blocked_metadata();
         }
-        self.resolve_wait_queue.retain(|id| id != change_id);
+        self.remove_from_resolve_wait_queue(change_id);
     }
 
     /// Return change IDs that are currently waiting for scheduler-owned rejection review.
@@ -820,13 +873,11 @@ impl OrchestratorState {
             WaitState::None
         };
         rt.clear_blocked_metadata();
-        self.resolve_wait_queue.retain(|id| id != change_id);
+        self.remove_from_resolve_wait_queue(change_id);
         if lane_blocked {
-            if !self.reject_wait_queue.iter().any(|id| id == change_id) {
-                self.reject_wait_queue.push(change_id.to_string());
-            }
+            self.enqueue_unique_reject_wait(change_id);
         } else {
-            self.reject_wait_queue.retain(|id| id != change_id);
+            self.remove_from_reject_wait_queue(change_id);
         }
     }
 
@@ -837,7 +888,7 @@ impl OrchestratorState {
             rt.wait_state = WaitState::None;
             rt.clear_blocked_metadata();
         }
-        self.reject_wait_queue.retain(|id| id != change_id);
+        self.remove_from_reject_wait_queue(change_id);
     }
 
     /// Promote exactly one pending base-mutating operation when the lane is free.
@@ -995,17 +1046,14 @@ impl OrchestratorState {
                 return ReduceOutcome::NoOp;
             }
             rt.terminal = TerminalState::None;
-            rt.activity = ActivityState::Idle;
-            rt.wait_state = WaitState::None;
+            rt.clear_activity_wait_and_blocker();
             rt.queue_intent = QueueIntent::Queued;
             rt.dequeued = false;
-            rt.clear_blocked_metadata();
             rt.observation = WorkspaceObservation::None;
         }
         self.clear_stalled_change(change_id);
         self.clear_error_history(change_id);
-        self.resolve_wait_queue.retain(|id| id != change_id);
-        self.reject_wait_queue.retain(|id| id != change_id);
+        self.clear_base_mutating_wait_queues(change_id);
         self.add_dynamic_change(change_id.to_string());
         ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
             change_id: change_id.to_string(),
@@ -1016,6 +1064,61 @@ impl OrchestratorState {
     // -----------------------------------------------------------------------
     // Reducer API (Phase 2)
     // -----------------------------------------------------------------------
+
+    fn transition_change_to_dequeued(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        rt.terminal = TerminalState::None;
+        rt.clear_activity_wait_and_blocker();
+        rt.queue_intent = QueueIntent::NotQueued;
+        rt.dequeued = true;
+        self.clear_base_mutating_wait_queues(change_id);
+    }
+
+    fn transition_change_to_stopped(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        rt.transition_to_terminal(TerminalState::Stopped);
+        rt.queue_intent = QueueIntent::NotQueued;
+        self.clear_base_mutating_wait_queues(change_id);
+    }
+
+    fn transition_change_to_error(&mut self, change_id: &str, error: String) {
+        let rt = self.runtime_entry(change_id);
+        if !rt.is_terminal() {
+            rt.transition_to_terminal(TerminalState::Error(error));
+        }
+        self.clear_base_mutating_wait_queues(change_id);
+    }
+
+    fn transition_change_to_merged(&mut self, change_id: &str) {
+        let rt = self.runtime_entry(change_id);
+        rt.transition_to_terminal(TerminalState::Merged);
+        rt.queue_intent = QueueIntent::NotQueued;
+        self.clear_base_mutating_wait_queues(change_id);
+    }
+
+    fn transition_change_to_stalled(
+        &mut self,
+        change_id: &str,
+        blocker_reason: impl Into<String>,
+        unblock_metadata: impl Into<String>,
+        worktree_snapshot: impl Into<String>,
+    ) {
+        self.runtime_entry(change_id).transition_to_stalled(
+            blocker_reason,
+            unblock_metadata,
+            worktree_snapshot,
+        );
+    }
+
+    fn clear_recoverable_terminal_for_success(rt: &mut ChangeRuntimeState) -> bool {
+        if rt.can_success_supersede_terminal() {
+            rt.terminal = TerminalState::None;
+            rt.clear_activity_wait_and_blocker();
+            true
+        } else {
+            false
+        }
+    }
 
     /// Apply a reducer command that expresses user intent (queue add/remove, resolve, stop).
     ///
@@ -1040,8 +1143,7 @@ impl OrchestratorState {
                     rt.wait_state = WaitState::None;
                     rt.clear_blocked_metadata();
                 }
-                self.resolve_wait_queue.retain(|id| id != &change_id);
-                self.reject_wait_queue.retain(|id| id != &change_id);
+                self.clear_base_mutating_wait_queues(&change_id);
                 self.add_dynamic_change(change_id.clone());
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
                     change_id,
@@ -1081,16 +1183,14 @@ impl OrchestratorState {
                             return ReduceOutcome::NoOp;
                         }
                     }
-                    rt.activity = ActivityState::Idle;
                     rt.terminal = TerminalState::None;
+                    rt.activity = ActivityState::Idle;
                     rt.wait_state = WaitState::ResolveWait;
                     rt.queue_intent = QueueIntent::NotQueued;
                     rt.clear_blocked_metadata();
                 }
-                self.reject_wait_queue.retain(|id| id != &change_id);
-                if !self.resolve_wait_queue.contains(&change_id) {
-                    self.resolve_wait_queue.push(change_id.clone());
-                }
+                self.remove_from_reject_wait_queue(&change_id);
+                self.enqueue_unique_resolve_wait(&change_id);
                 ReduceOutcome::Changed(ReducerEffect::WaitStateSet {
                     change_id,
                     wait: WaitState::ResolveWait,
@@ -1104,14 +1204,7 @@ impl OrchestratorState {
                 ) {
                     return ReduceOutcome::NoOp;
                 }
-                rt.terminal = TerminalState::None;
-                rt.activity = ActivityState::Idle;
-                rt.wait_state = WaitState::None;
-                rt.clear_blocked_metadata();
-                rt.queue_intent = QueueIntent::NotQueued;
-                rt.dequeued = true;
-                self.resolve_wait_queue.retain(|id| id != &change_id);
-                self.reject_wait_queue.retain(|id| id != &change_id);
+                self.transition_change_to_dequeued(&change_id);
                 ReduceOutcome::Changed(ReducerEffect::QueueIntentSet {
                     change_id,
                     intent: QueueIntent::NotQueued,
@@ -1122,13 +1215,7 @@ impl OrchestratorState {
                 if rt.is_terminal() {
                     return ReduceOutcome::NoOp;
                 }
-                rt.terminal = TerminalState::Stopped;
-                rt.activity = ActivityState::Idle;
-                rt.wait_state = WaitState::None;
-                rt.clear_blocked_metadata();
-                rt.queue_intent = QueueIntent::NotQueued;
-                self.resolve_wait_queue.retain(|id| id != &change_id);
-                self.reject_wait_queue.retain(|id| id != &change_id);
+                self.transition_change_to_stopped(&change_id);
                 ReduceOutcome::Changed(ReducerEffect::TerminalStateSet {
                     change_id,
                     terminal: TerminalState::Stopped,
@@ -1213,10 +1300,7 @@ impl OrchestratorState {
                 self.remove_from_pending(id);
                 let rt = self.runtime_entry(id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.terminal = TerminalState::Error(error.clone());
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
-                    rt.clear_blocked_metadata();
+                    rt.transition_to_terminal(TerminalState::Error(error.clone()));
                 }
             }
 
@@ -1248,15 +1332,7 @@ impl OrchestratorState {
             }
             ExecutionEvent::ApplyFailed { change_id, error } => {
                 self.remove_from_pending(change_id);
-                let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
-                    rt.terminal = TerminalState::Error(error.clone());
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
-                    rt.clear_blocked_metadata();
-                }
-                self.resolve_wait_queue.retain(|id| id != change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.transition_change_to_error(change_id, error.clone());
             }
 
             // Acceptance events
@@ -1273,23 +1349,14 @@ impl OrchestratorState {
                 }
             }
             ExecutionEvent::AcceptanceFailed { change_id, error } => {
-                let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
-                    rt.terminal = TerminalState::Error(error.clone());
-                    rt.activity = ActivityState::Idle;
-                }
-                self.resolve_wait_queue.retain(|id| id != change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.transition_change_to_error(change_id, error.clone());
             }
             ExecutionEvent::ChangeRejected { change_id, reason } => {
                 self.remove_from_pending(change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.remove_from_reject_wait_queue(change_id);
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() {
-                    rt.terminal = TerminalState::Rejected(reason.clone());
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
-                    rt.clear_blocked_metadata();
+                    rt.transition_to_terminal(TerminalState::Rejected(reason.clone()));
                     rt.queue_intent = QueueIntent::NotQueued;
                 }
             }
@@ -1299,7 +1366,7 @@ impl OrchestratorState {
                 if should_mark_pending_removed {
                     self.remove_from_pending(change_id);
                 }
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.remove_from_reject_wait_queue(change_id);
 
                 let rt = self.runtime_entry(change_id);
                 if rt.is_terminal() || rt.dequeued {
@@ -1307,13 +1374,10 @@ impl OrchestratorState {
                 }
                 match *outcome {
                     crate::events::RejectionOutcome::Confirm => {
-                        rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::None;
-                        rt.clear_blocked_metadata();
-                        rt.queue_intent = QueueIntent::NotQueued;
-                        rt.terminal = TerminalState::Rejected(
+                        rt.transition_to_terminal(TerminalState::Rejected(
                             "rejecting review confirmed rejection".to_string(),
-                        );
+                        ));
+                        rt.queue_intent = QueueIntent::NotQueued;
                     }
                     crate::events::RejectionOutcome::Resume => {
                         rt.activity = ActivityState::Applying;
@@ -1322,10 +1386,7 @@ impl OrchestratorState {
                         rt.terminal = TerminalState::None;
                     }
                     crate::events::RejectionOutcome::Block => {
-                        rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::Stalled;
-                        rt.terminal = TerminalState::None;
-                        rt.set_blocked_metadata(
+                        rt.transition_to_stalled(
                             "rejection review returned block; unresolved blocker remains",
                             "resolve unresolved blocker tasks in openspec/changes/<change_id>/tasks.md, then trigger explicit resume",
                             "existing worktree and WIP context are preserved for stalled rejection review",
@@ -1335,12 +1396,10 @@ impl OrchestratorState {
             }
             ExecutionEvent::RejectionReviewFailed { change_id, error } => {
                 self.remove_from_pending(change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.remove_from_reject_wait_queue(change_id);
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
-                    rt.terminal = TerminalState::Error(error.clone());
+                    rt.transition_to_terminal(TerminalState::Error(error.clone()));
                 }
             }
 
@@ -1361,11 +1420,8 @@ impl OrchestratorState {
                     crate::vcs::WorkspaceStatus::Blocked
                         if self.stalled_change_ids.contains(change_id) =>
                     {
-                        let rt = self.runtime_entry(change_id);
-                        rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::Stalled;
-                        rt.terminal = TerminalState::None;
-                        rt.set_blocked_metadata(
+                        self.transition_change_to_stalled(
+                            change_id,
                             "serial change stalled with recoverable blocker",
                             "resolve blocker evidence and retry explicitly",
                             "serial workflow state is preserved in the workspace",
@@ -1381,10 +1437,8 @@ impl OrchestratorState {
                         self.runtime_entry(change_id).activity = ActivityState::Accepting;
                     }
                     crate::vcs::WorkspaceStatus::Blocked => {
-                        let rt = self.runtime_entry(change_id);
-                        rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::Stalled;
-                        rt.set_blocked_metadata(
+                        self.transition_change_to_stalled(
+                            change_id,
                             "apply reported recoverable blocker; workspace remains stalled",
                             "resolve implementation blocker section and pending unblock tasks before explicit retry",
                             "existing worktree and WIP context are preserved while stalled",
@@ -1400,13 +1454,11 @@ impl OrchestratorState {
                         if has_other_lane_blocker {
                             rt.activity = ActivityState::Idle;
                             rt.wait_state = WaitState::ResolveWait;
-                            if !self.resolve_wait_queue.iter().any(|id| id == change_id) {
-                                self.resolve_wait_queue.push(change_id.clone());
-                            }
+                            self.enqueue_unique_resolve_wait(change_id);
                         } else {
                             rt.activity = ActivityState::Resolving;
                             rt.wait_state = WaitState::None;
-                            self.resolve_wait_queue.retain(|id| id != change_id);
+                            self.remove_from_resolve_wait_queue(change_id);
                         }
                     }
                     crate::vcs::WorkspaceStatus::MergeWait => {
@@ -1432,7 +1484,7 @@ impl OrchestratorState {
                             rt.activity = ActivityState::Idle;
                             rt.wait_state = WaitState::MergeWait;
                             rt.queue_intent = QueueIntent::NotQueued;
-                            self.resolve_wait_queue.retain(|id| id != change_id);
+                            self.remove_from_resolve_wait_queue(change_id);
                         }
                     }
                     _ => {}
@@ -1476,11 +1528,7 @@ impl OrchestratorState {
                             && !runtime.is_terminal()
                     });
                 let rt = self.runtime_entry(change_id);
-                if rt.can_success_supersede_terminal() {
-                    rt.activity = ActivityState::Idle;
-                    rt.terminal = TerminalState::None;
-                    rt.clear_blocked_metadata();
-
+                if Self::clear_recoverable_terminal_for_success(rt) {
                     match mode {
                         ExecutionMode::Serial => {
                             // Serial: archive is terminal.
@@ -1495,16 +1543,14 @@ impl OrchestratorState {
                                 // after the active merge/reject lane clears.
                                 rt.activity = ActivityState::Idle;
                                 rt.wait_state = WaitState::ResolveWait;
-                                if !self.resolve_wait_queue.contains(change_id) {
-                                    self.resolve_wait_queue.push(change_id.clone());
-                                }
+                                self.enqueue_unique_resolve_wait(change_id);
                             } else {
                                 // No blocker known yet: make active merge handling truthful in the
                                 // reducer. Manual MergeWait is set only by a later concrete
                                 // MergeDeferred(auto_resumable=false) event from merge readiness.
                                 rt.activity = ActivityState::Resolving;
                                 rt.wait_state = WaitState::None;
-                                self.resolve_wait_queue.retain(|id| id != change_id);
+                                self.remove_from_resolve_wait_queue(change_id);
                             }
                         }
                     }
@@ -1513,13 +1559,7 @@ impl OrchestratorState {
             ExecutionEvent::ArchiveFailed {
                 change_id, error, ..
             } => {
-                let rt = self.runtime_entry(change_id);
-                if !rt.is_terminal() {
-                    rt.terminal = TerminalState::Error(error.clone());
-                    rt.activity = ActivityState::Idle;
-                }
-                self.resolve_wait_queue.retain(|id| id != change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.transition_change_to_error(change_id, error.clone());
             }
 
             // Merge / resolve events (parallel mode)
@@ -1539,9 +1579,7 @@ impl OrchestratorState {
                         if !rt.is_active() {
                             rt.wait_state = WaitState::ResolveWait;
                         }
-                        if !self.resolve_wait_queue.contains(change_id) {
-                            self.resolve_wait_queue.push(change_id.clone());
-                        }
+                        self.enqueue_unique_resolve_wait(change_id);
                     } else {
                         // Manual intervention required: the change must remain visible
                         // as merge-wait only, not as ordinary queued work. Manual
@@ -1550,21 +1588,14 @@ impl OrchestratorState {
                         rt.activity = ActivityState::Idle;
                         rt.wait_state = WaitState::MergeWait;
                         rt.queue_intent = QueueIntent::NotQueued;
-                        self.resolve_wait_queue.retain(|id| id != change_id);
+                        self.remove_from_resolve_wait_queue(change_id);
                     }
                 }
             }
             ExecutionEvent::MergeCompleted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
                 if rt.can_success_supersede_terminal() {
-                    rt.terminal = TerminalState::Merged;
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
-                    rt.queue_intent = QueueIntent::NotQueued;
-                    rt.clear_blocked_metadata();
-                    // Remove from base-lane wait queues if present.
-                    self.resolve_wait_queue.retain(|id| id != change_id);
-                    self.reject_wait_queue.retain(|id| id != change_id);
+                    self.transition_change_to_merged(change_id);
                 }
             }
             ExecutionEvent::ResolveStarted { change_id, .. } => {
@@ -1582,17 +1613,13 @@ impl OrchestratorState {
                         || matches!(rt.activity, ActivityState::Resolving)
                         || matches!(rt.wait_state, WaitState::ResolveWait))
                 {
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::None;
                     // Successful resolve means the change is now merged. Setting terminal
                     // prevents a subsequent ChangesRefreshed from resurrecting ResolveWait
                     // via apply_observation (which skips terminal entries).
-                    rt.terminal = TerminalState::Merged;
-                    rt.queue_intent = QueueIntent::NotQueued;
-                    rt.clear_blocked_metadata();
+                    self.transition_change_to_merged(change_id);
+                } else {
+                    self.clear_base_mutating_wait_queues(change_id);
                 }
-                self.resolve_wait_queue.retain(|id| id != change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
             }
             ExecutionEvent::ResolveFailed { change_id, .. } => {
                 // Resolve failure does NOT regress a terminal state.
@@ -1609,7 +1636,7 @@ impl OrchestratorState {
                         && matches!(rt.wait_state, WaitState::ResolveWait | WaitState::None)
                     {
                         rt.wait_state = WaitState::MergeWait;
-                        self.resolve_wait_queue.retain(|id| id != change_id);
+                        self.remove_from_resolve_wait_queue(change_id);
                     }
                 }
             }
@@ -1636,10 +1663,7 @@ impl OrchestratorState {
             ExecutionEvent::AcceptanceGated { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::Stalled;
-                    rt.terminal = TerminalState::None;
-                    rt.set_blocked_metadata(
+                    rt.transition_to_stalled(
                         format!("acceptance-gated:{}", blocker.category),
                         blocker.summary(),
                         blocker.worktree_snapshot(),
@@ -1649,10 +1673,7 @@ impl OrchestratorState {
             ExecutionEvent::ExecutionBlocked { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.activity = ActivityState::Idle;
-                    rt.wait_state = WaitState::Stalled;
-                    rt.terminal = TerminalState::None;
-                    rt.set_blocked_metadata(
+                    rt.transition_to_stalled(
                         format!("execution-blocked:{}", blocker.category),
                         blocker.summary(),
                         blocker.worktree_snapshot(),
@@ -1670,14 +1691,7 @@ impl OrchestratorState {
                 ) {
                     return;
                 }
-                rt.terminal = TerminalState::None;
-                rt.activity = ActivityState::Idle;
-                rt.wait_state = WaitState::None;
-                rt.clear_blocked_metadata();
-                rt.queue_intent = QueueIntent::NotQueued;
-                rt.dequeued = true;
-                self.resolve_wait_queue.retain(|id| id != change_id);
-                self.reject_wait_queue.retain(|id| id != change_id);
+                self.transition_change_to_dequeued(change_id);
             }
 
             // Dynamic queue support
@@ -1706,9 +1720,7 @@ impl OrchestratorState {
                     let rt = self.runtime_entry(&change.id);
                     if matches!(rt.terminal, TerminalState::Rejected(_)) {
                         rt.terminal = TerminalState::None;
-                        rt.activity = ActivityState::Idle;
-                        rt.wait_state = WaitState::None;
-                        rt.clear_blocked_metadata();
+                        rt.clear_activity_wait_and_blocker();
                         rt.queue_intent = QueueIntent::NotQueued;
                     }
                 }
@@ -2356,6 +2368,111 @@ mod tests {
         });
         assert_eq!(state.display_status("b"), "rejected");
         assert!(state.reject_wait_change_ids().is_empty());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn command_side_effects_update_terminal_wait_and_base_lane_queues() {
+        let mut state = OrchestratorState::with_mode(
+            vec!["c".to_string(), "d".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.resolve_wait_queue.push("c".to_string());
+        state.reject_wait_queue.push("c".to_string());
+        let add_outcome = state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(matches!(add_outcome, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "queued");
+        assert!(state.resolve_wait_queue.is_empty());
+        assert!(state.reject_wait_queue.is_empty());
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "c".to_string(),
+            reason: "manual conflict".to_string(),
+            auto_resumable: false,
+        });
+        let resolve_outcome = state.apply_command(ReducerCommand::ResolveMerge("c".to_string()));
+        assert!(matches!(
+            resolve_outcome,
+            ReduceOutcome::Changed(ReducerEffect::WaitStateSet {
+                wait: WaitState::ResolveWait,
+                ..
+            })
+        ));
+        assert_eq!(state.display_status("c"), "resolve pending");
+        assert_eq!(state.resolve_wait_queue, vec!["c".to_string()]);
+        assert!(state.reject_wait_queue.is_empty());
+
+        let dequeue_outcome = state.apply_command(ReducerCommand::DequeueChange("c".to_string()));
+        assert!(matches!(dequeue_outcome, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("c"), "not queued");
+        assert!(state.resolve_wait_queue.is_empty());
+        assert!(state.reject_wait_queue.is_empty());
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert!(matches!(runtime.terminal, TerminalState::None));
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert_eq!(runtime.wait_state, WaitState::None);
+        assert_eq!(runtime.queue_intent, QueueIntent::NotQueued);
+        assert!(runtime.dequeued);
+
+        state.apply_command(ReducerCommand::AddToQueue("d".to_string()));
+        let stop_outcome = state.apply_command(ReducerCommand::StopChange("d".to_string()));
+        assert!(matches!(stop_outcome, ReduceOutcome::Changed(_)));
+        assert_eq!(state.display_status("d"), "stopped");
+        let runtime = state.change_runtime("d").expect("runtime for d");
+        assert!(matches!(runtime.terminal, TerminalState::Stopped));
+        assert_eq!(runtime.queue_intent, QueueIntent::NotQueued);
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn execution_event_side_effects_update_wait_queues_and_blocked_metadata() {
+        use crate::events::{ExecutionEvent, RejectionOutcome};
+
+        let mut state = OrchestratorState::with_mode(
+            vec![
+                "resolving".to_string(),
+                "archived".to_string(),
+                "reject".to_string(),
+            ],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "resolving".to_string(),
+            command: "resolve".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("archived".to_string()));
+        assert_eq!(state.display_status("archived"), "resolve pending");
+        assert_eq!(state.resolve_wait_queue, vec!["archived".to_string()]);
+
+        state.apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "archived".to_string(),
+            error: "base dirty".to_string(),
+        });
+        assert_eq!(state.display_status("archived"), "merge wait");
+        assert!(state.resolve_wait_queue.is_empty());
+
+        state.mark_reject_wait("reject");
+        assert_eq!(state.reject_wait_queue, vec!["reject".to_string()]);
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "reject".to_string(),
+            outcome: RejectionOutcome::Block,
+        });
+        assert!(state.reject_wait_queue.is_empty());
+        let runtime = state.change_runtime("reject").expect("runtime for reject");
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert!(runtime.blocked_metadata.blocker_reason.is_some());
+        assert!(matches!(runtime.terminal, TerminalState::None));
+
+        state.apply_execution_event(&ExecutionEvent::RejectionReviewCompleted {
+            change_id: "reject".to_string(),
+            outcome: RejectionOutcome::Confirm,
+        });
+        assert_eq!(state.display_status("reject"), "rejected");
+        assert!(state.reject_wait_queue.is_empty());
         assert!(state.global_invariants_hold());
     }
 

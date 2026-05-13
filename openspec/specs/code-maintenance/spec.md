@@ -20,7 +20,35 @@ Defines code maintenance guidelines and codebase health requirements.
 
 ### Requirement: リファクタリング安全性の担保
 
-オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。タスク進捗解決のリファクタリングでは、worktree/base/archive の探索順序と acceptance follow-up の更新結果を characterization test で固定しなければならない。
+オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。OpenSpec コマンドエンジンの責務分離では、list/show/validate/archive の CLI contract と spec promotion の結果を characterization test で固定しなければならない。状態 reducer の副作用整理では、terminal/activity/wait state と resolve/reject wait queue の組み合わせを characterization test で固定しなければならない。加えて、タスク進捗解決のリファクタリングでは、worktree/base/archive の探索順序と acceptance follow-up の更新結果を characterization test で固定しなければならない。
+
+#### Scenario: OpenSpec validate の contract が維持される
+
+- **GIVEN** 妥当な変更提案と不正な変更提案が存在する
+- **WHEN** strict validation を実行する
+- **THEN** proposal、tasks、spec delta、scenario、change type の必須チェック結果はリファクタリング前と同等である
+- **AND** exit code とエラー/警告の分類は同等である
+
+#### Scenario: archive 前 promotion safety が維持される
+
+- **GIVEN** ADDED、MODIFIED、REMOVED、または no-op になる spec delta が存在する
+- **WHEN** archive 前の promotion simulation を実行する
+- **THEN** canonical spec へ適用可能な delta だけが成功する
+- **AND** missing target や no-op promotion は既存と同じ安全側の失敗として扱われる
+
+#### Scenario: reducer command の状態遷移が維持される
+
+- **GIVEN** 既存の `OrchestratorState` と代表的な `ReducerCommand` がある
+- **WHEN** command を適用する
+- **THEN** `ReduceOutcome`、terminal state、activity state、wait state、queue intent はリファクタリング前と同等である
+- **AND** resolve/reject wait queue の更新結果も同等である
+
+#### Scenario: execution event の副作用が維持される
+
+- **GIVEN** archive、merge、rejection review、resolve failure の代表的な `ExecutionEvent` がある
+- **WHEN** event を reducer に適用する
+- **THEN** display status と global invariant はリファクタリング前と同等である
+- **AND** base-mutating lane の待機 queue は既存と同じ条件で追加・削除される
 
 #### Scenario: タスク進捗解決の探索順序が維持される
 
@@ -359,7 +387,35 @@ archive ループの実装は、フック実行・コマンド実行・検証・
 
 ### Requirement: リファクタリング安全性の担保
 
-オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。タスク進捗解決のリファクタリングでは、worktree/base/archive の探索順序と acceptance follow-up の更新結果を characterization test で固定しなければならない。
+オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。OpenSpec コマンドエンジンの責務分離では、list/show/validate/archive の CLI contract と spec promotion の結果を characterization test で固定しなければならない。状態 reducer の副作用整理では、terminal/activity/wait state と resolve/reject wait queue の組み合わせを characterization test で固定しなければならない。加えて、タスク進捗解決のリファクタリングでは、worktree/base/archive の探索順序と acceptance follow-up の更新結果を characterization test で固定しなければならない。
+
+#### Scenario: OpenSpec validate の contract が維持される
+
+- **GIVEN** 妥当な変更提案と不正な変更提案が存在する
+- **WHEN** strict validation を実行する
+- **THEN** proposal、tasks、spec delta、scenario、change type の必須チェック結果はリファクタリング前と同等である
+- **AND** exit code とエラー/警告の分類は同等である
+
+#### Scenario: archive 前 promotion safety が維持される
+
+- **GIVEN** ADDED、MODIFIED、REMOVED、または no-op になる spec delta が存在する
+- **WHEN** archive 前の promotion simulation を実行する
+- **THEN** canonical spec へ適用可能な delta だけが成功する
+- **AND** missing target や no-op promotion は既存と同じ安全側の失敗として扱われる
+
+#### Scenario: reducer command の状態遷移が維持される
+
+- **GIVEN** 既存の `OrchestratorState` と代表的な `ReducerCommand` がある
+- **WHEN** command を適用する
+- **THEN** `ReduceOutcome`、terminal state、activity state、wait state、queue intent はリファクタリング前と同等である
+- **AND** resolve/reject wait queue の更新結果も同等である
+
+#### Scenario: execution event の副作用が維持される
+
+- **GIVEN** archive、merge、rejection review、resolve failure の代表的な `ExecutionEvent` がある
+- **WHEN** event を reducer に適用する
+- **THEN** display status と global invariant はリファクタリング前と同等である
+- **AND** base-mutating lane の待機 queue は既存と同じ条件で追加・削除される
 
 #### Scenario: タスク進捗解決の探索順序が維持される
 
