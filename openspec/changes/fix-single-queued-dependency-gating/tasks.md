@@ -17,4 +17,8 @@
 Expected archive gate: `cflx openspec validate fix-single-queued-dependency-gating --archive-gate`
 
 ## Acceptance #1 Failure Follow-up
-- [x] コミットパスの pre-commit hook が失敗します。実行コマンド: `$(git rev-parse --git-path hooks/pre-commit)`。hook 内の clippy が `-D warnings` により `src/openspec_cmd.rs:1034` と `src/openspec_cmd.rs:1163` の `[].into_iter()` を `clippy::useless_conversion` としてエラーにしていたため、空の queued dependency iterator を `std::iter::empty::<&str>()` に置き換えました。検証: pre-commit hook と最終検証コマンドを再実行する。
+- [x] コミットパスの pre-commit hook が失敗します。実行コマンド: `$(git rev-parse --git-path hooks/pre-commit)`。hook 内の clippy が `-D warnings` により `src/openspec_cmd.rs:1034` と `src/openspec_cmd.rs:1163` の `[].into_iter()` を `clippy::useless_conversion` としてエラーにしていたため、空の queued dependency iterator を `std::iter::empty::<&str>()` に置き換えました。 (verification: manual - `$(git rev-parse --git-path hooks/pre-commit)` を再実行する; completion condition: hook が exit_code 0 で完了し、`src/openspec_cmd.rs:1034` と `src/openspec_cmd.rs:1163` の `clippy::useless_conversion` が再発しない。)
+
+## Acceptance #2 Failure Follow-up
+
+Acceptance #1 follow-up に repository-verifiable な verification note を追加し、archive gate の自己参照チェックリスト化を避けるため、最終 OpenSpec validation は非チェックボックスの `## Final Validation` に保持する。
