@@ -14,10 +14,12 @@
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-resolve-pending-dirty-clean-transition --archive-gate`
 
-Implementation validation should include:
+Implementation validation should include these commands:
 
-- `cargo test orchestration::state`
-- `cargo test parallel::tests::executor`
-- `cargo test tui::state`
-- `cargo fmt --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
+```bash
+cargo test orchestration::state
+cargo test parallel::tests::executor
+cargo test tui::state
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+```
