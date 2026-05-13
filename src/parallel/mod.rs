@@ -170,6 +170,11 @@ pub struct ParallelExecutor {
     last_dispatched_reject_wait_changes: HashSet<String>,
     /// One-shot flag to allow retry dispatch on explicit wake/completion triggers.
     resolve_wait_retry_triggered: bool,
+    /// Last scheduler-observed base dirtiness while reducer-owned base-lane waiters existed.
+    ///
+    /// This is runtime-only dedupe state. It is not durable workflow state; retry routing is
+    /// recalculated from reducer state plus current base git/workspace state on each scheduler run.
+    last_resolve_wait_base_dirty: Option<bool>,
     /// Runtime-only observability dedupe for queue reconciliation diagnostics.
     ///
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.

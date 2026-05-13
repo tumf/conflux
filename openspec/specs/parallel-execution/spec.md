@@ -2107,9 +2107,13 @@ When a user registers manual retry intent while other apply/archive/resolve work
 
 When the scheduler is running, no resolve/base-mutating operation is active, and one or more reducer-owned `ResolveWait` changes are retry-clean, the scheduler SHALL promote exactly one eligible pending retry to `resolving` during a scheduling evaluation. Other pending retries SHALL remain pending until the base-mutating lane clears again.
 
+When a reducer-owned `ResolveWait` retry is evaluated while the base repository is dirty and no other non-terminal change is actively `Resolving` or `Rejecting`, the scheduler SHALL classify the retry as manual-intervention merge wait and feed a concrete manual deferral back into the reducer. The change MUST transition from `resolve pending` to `merge wait`, and it MUST be removed from reducer-owned resolve-wait queues.
+
+When a reducer-owned `ResolveWait` retry is evaluated after the base repository becomes clean and the base-mutating lane is free, the scheduler SHALL retry or promote the pending merge without requiring another `M` keypress. The change MUST NOT remain indefinitely in `resolve pending` solely because the previous evaluation observed a dirty base repository.
+
 Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer state), scheduler loop is the **sole execution owner** for merge/resolve retry start, and reducer completion events (`ResolveCompleted`/`ResolveFailed`/`MergeDeferred`/`MergeCompleted`) are the **sole authority** for clearing or transitioning wait state.
 
-<!-- Expected canonical result after archive: `parallel-execution` will require a running scheduler to promote one clean ResolveWait retry when the base-mutating lane is free. -->
+<!-- Expected canonical result after archive: `parallel-execution` will require dirty-base `ResolveWait` retries to demote to `MergeWait`, and dirty-to-clean base transitions to trigger scheduler-owned retry promotion without another keypress. -->
 
 #### Scenario: M key registers retry intent instead of direct execution
 
@@ -2148,6 +2152,25 @@ Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer 
 - **WHEN** `beta` completes and the base-mutating lane is free
 - **THEN** the scheduler retries the preserved merge for `alpha` without requiring another `M` keypress
 - **AND** `alpha` does not remain indefinitely in `resolve pending` solely because `beta` was active when retry intent was registered
+
+#### Scenario: dirty base demotes ResolveWait to MergeWait when no lane occupant exists
+
+- **GIVEN** change `alpha` is in reducer-owned `ResolveWait`
+- **AND** no other change is actively `Resolving` or `Rejecting`
+- **AND** the base repository has uncommitted changes or a merge-in-progress marker requiring manual cleanup
+- **WHEN** the scheduler evaluates pending base-mutating lane waiters for `alpha`
+- **THEN** the scheduler emits a concrete manual deferral for `alpha`
+- **AND** the reducer display status for `alpha` becomes `merge wait`
+- **AND** `alpha` is not returned by `resolve_wait_change_ids()`
+
+#### Scenario: dirty-to-clean base transition retries ResolveWait without another keypress
+
+- **GIVEN** change `alpha` is in reducer-owned `ResolveWait`
+- **AND** a prior scheduler evaluation observed the base repository as dirty
+- **AND** the operator cleans the base repository without pressing `M` again
+- **WHEN** the scheduler next evaluates pending base-mutating lane waiters with a clean base and free lane
+- **THEN** `alpha` is promoted to `resolving` or successfully merged through scheduler-owned retry execution
+- **AND** `alpha` does not remain indefinitely in `resolve pending`
 
 ### Requirement: Managed worktree apply MUST run post-apply cleanup review before acceptance handoff
 
@@ -2322,6 +2345,10 @@ A deferred merge caused by active `Applying`, `Accepting`, `Archiving`, terminal
 
 The implementation MUST NOT infer auto-resumable versus manual-wait behavior by parsing a human-readable deferred reason string.
 
+A change already in reducer-owned `ResolveWait` MUST follow the same classification rules when its retry is evaluated: active `Resolving` or `Rejecting` by another change remains auto-resumable, while dirty base without an active base-mutating lane occupant demotes to manual `MergeWait`.
+
+<!-- Expected canonical result after archive: `parallel-execution` will explicitly require retry-time `ResolveWait` classification to match post-archive merge deferral classification. -->
+
 #### Scenario: active resolving deferred archive promotes to resolve wait
 
 **Given**: a change is archived in parallel mode
@@ -2345,6 +2372,15 @@ The implementation MUST NOT infer auto-resumable versus manual-wait behavior by 
 **When**: the deferred merge result is processed
 **Then**: the change remains in manual merge wait handling (`MergeWait`)
 **And**: it is not classified as auto-resumable
+
+#### Scenario: dirty-base ResolveWait retry demotes to merge wait
+
+**Given**: change `alpha` is already in reducer-owned `ResolveWait`
+**And**: no other change is actively `Resolving` or `Rejecting`
+**And**: merge retry is deferred because the base branch is dirty
+**When**: the deferred retry result is processed
+**Then**: `alpha` transitions to manual merge wait handling (`MergeWait`)
+**And**: `alpha` is no longer treated as auto-resumable retry work
 
 #### Scenario: root index lock contention blocks merged transition
 

@@ -53,6 +53,7 @@ use super::cleanup::WorkspaceCleanupGuard;
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
+use super::merge::base_dirty_reason;
 use super::{MergeResult, MergeTaskOutcome, ParallelEvent, ParallelExecutor, WorkspaceResult};
 
 fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
@@ -160,7 +161,12 @@ impl ParallelExecutor {
     }
 
     pub(super) async fn maybe_dispatch_resolve_wait_retry(&mut self) {
-        if !self.should_dispatch_resolve_wait_retry() {
+        let base_dirty_changed_to_clean = self
+            .resolve_wait_base_dirty_changed_to_clean()
+            .await
+            .unwrap_or(false);
+
+        if !self.should_dispatch_resolve_wait_retry() && !base_dirty_changed_to_clean {
             return;
         }
 
@@ -168,6 +174,27 @@ impl ParallelExecutor {
         self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
         self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
         self.resolve_wait_retry_triggered = false;
+    }
+
+    async fn resolve_wait_base_dirty_changed_to_clean(&mut self) -> Result<bool> {
+        if self.resolve_wait_changes.is_empty() && self.reject_wait_changes.is_empty() {
+            self.last_resolve_wait_base_dirty = None;
+            return Ok(false);
+        }
+
+        let base_dirty = base_dirty_reason(&self.repo_root).await?.is_some();
+        let changed_to_clean =
+            matches!(self.last_resolve_wait_base_dirty, Some(true)) && !base_dirty;
+        if changed_to_clean {
+            info!(
+                repo_root = %self.repo_root.display(),
+                resolve_wait_count = self.resolve_wait_changes.len(),
+                reject_wait_count = self.reject_wait_changes.len(),
+                "Base repository transitioned from dirty to clean while base-lane waiters exist; waking retry dispatch"
+            );
+        }
+        self.last_resolve_wait_base_dirty = Some(base_dirty);
+        Ok(changed_to_clean)
     }
 
     pub(crate) fn has_resolve_wait(&self) -> bool {
