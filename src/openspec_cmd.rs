@@ -595,7 +595,9 @@ impl OpenSpecManager {
                             errors.push(diagnostic.message)
                         }
                         DependencyTargetClass::Archived => warnings.push(diagnostic.message),
-                        DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                        DependencyTargetClass::Queued
+                        | DependencyTargetClass::InFlight
+                        | DependencyTargetClass::ActiveButNotQueued => {}
                         DependencyTargetClass::Error => unreachable!(
                             "proposal dependency classification cannot produce terminal-error state"
                         ),
@@ -1029,12 +1031,15 @@ impl DependencyStatusContext {
             dependency,
             self.active_ids.iter().map(String::as_str),
             self.in_flight_ids.iter().map(String::as_str),
+            [].into_iter(),
             &self.archived_ids,
             &self.rejected_ids,
         ) {
             DependencyTargetClass::Archived => DependencyListStatus::Done,
             DependencyTargetClass::InFlight => DependencyListStatus::Running,
-            DependencyTargetClass::Queued => DependencyListStatus::Pending,
+            DependencyTargetClass::Queued | DependencyTargetClass::ActiveButNotQueued => {
+                DependencyListStatus::Pending
+            }
             DependencyTargetClass::Rejected => DependencyListStatus::Rejected,
             DependencyTargetClass::Error => {
                 unreachable!("dependency list classification cannot produce terminal-error state")
@@ -1155,12 +1160,13 @@ fn classify_proposal_dependency_targets(
                 &dependency,
                 active_ids.iter().map(String::as_str),
                 in_flight_ids.iter().map(String::as_str),
+                [].into_iter(),
                 &archived_ids,
                 &rejected_ids,
             );
 
             let message = match classification {
-                DependencyTargetClass::Queued => format!(
+                DependencyTargetClass::Queued | DependencyTargetClass::ActiveButNotQueued => format!(
                     "{}: proposal dependency '{}' classified as queued (active change)",
                     change_id, dependency
                 ),

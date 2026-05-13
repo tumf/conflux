@@ -8,8 +8,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::dependency_targets::{
-    classify_dependency_target, collect_archived_change_ids, collect_rejected_change_ids,
-    DependencyTargetClass,
+    classify_dependency_target, collect_active_change_ids, collect_archived_change_ids,
+    collect_rejected_change_ids, DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
@@ -190,6 +190,10 @@ impl ParallelExecutor {
         None
     }
 
+    fn active_dependency_ids(&self) -> HashSet<String> {
+        collect_active_change_ids(&self.repo_root)
+    }
+
     fn archived_dependency_ids(&self) -> HashSet<String> {
         collect_archived_change_ids(&self.repo_root)
     }
@@ -249,9 +253,9 @@ impl ParallelExecutor {
                 DependencyTargetClass::Missing
                 | DependencyTargetClass::Rejected
                 | DependencyTargetClass::Error => warn!("{}", message),
-                DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {
-                    info!("{}", message)
-                }
+                DependencyTargetClass::Queued
+                | DependencyTargetClass::InFlight
+                | DependencyTargetClass::ActiveButNotQueued => info!("{}", message),
                 DependencyTargetClass::Archived => debug!("{}", message),
             }
             if matches!(
@@ -370,6 +374,8 @@ impl ParallelExecutor {
 
         let queued_ids: HashSet<&str> = analysis_result.order.iter().map(String::as_str).collect();
         let in_flight_ids: HashSet<&str> = in_flight.iter().map(String::as_str).collect();
+        let active_ids = self.active_dependency_ids();
+        let active_refs: HashSet<&str> = active_ids.iter().map(String::as_str).collect();
         let archived_ids = self.archived_dependency_ids();
         let rejected_ids = self.rejected_dependency_ids();
 
@@ -395,6 +401,7 @@ impl ParallelExecutor {
                         dep_id,
                         queued_ids.iter().copied(),
                         in_flight_ids.iter().copied(),
+                        active_refs.iter().copied(),
                         &archived_ids,
                         &rejected_ids,
                     );
@@ -411,7 +418,9 @@ impl ParallelExecutor {
                             blockers.push((dep_id.clone(), class));
                             continue;
                         }
-                        DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                        DependencyTargetClass::Queued
+                        | DependencyTargetClass::InFlight
+                        | DependencyTargetClass::ActiveButNotQueued => {}
                         DependencyTargetClass::Error => unreachable!(
                             "error dependency class is derived from reducer state, not repository classification"
                         ),
