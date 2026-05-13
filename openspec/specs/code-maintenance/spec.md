@@ -19,11 +19,22 @@ Defines code maintenance guidelines and codebase health requirements.
 - **THEN** `cargo build` が成功する
 
 ### Requirement: リファクタリング安全性の担保
-オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。
 
-#### Scenario: 既存の検証が通過する
-- **WHEN** `cargo fmt` / `cargo clippy -- -D warnings` / `cargo test` を実行する
-- **THEN** すべて成功する
+オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。OpenSpec コマンドエンジンの責務分離では、list/show/validate/archive の CLI contract と spec promotion の結果を characterization test で固定しなければならない。
+
+#### Scenario: OpenSpec validate の contract が維持される
+
+- **GIVEN** 妥当な変更提案と不正な変更提案が存在する
+- **WHEN** strict validation を実行する
+- **THEN** proposal、tasks、spec delta、scenario、change type の必須チェック結果はリファクタリング前と同等である
+- **AND** exit code とエラー/警告の分類は同等である
+
+#### Scenario: archive 前 promotion safety が維持される
+
+- **GIVEN** ADDED、MODIFIED、REMOVED、または no-op になる spec delta が存在する
+- **WHEN** archive 前の promotion simulation を実行する
+- **THEN** canonical spec へ適用可能な delta だけが成功する
+- **AND** missing target や no-op promotion は既存と同じ安全側の失敗として扱われる
 
 ### Requirement: Config Module Structure
 
@@ -348,21 +359,21 @@ archive ループの実装は、フック実行・コマンド実行・検証・
 
 ### Requirement: リファクタリング安全性の担保
 
-オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。
+オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。OpenSpec コマンドエンジンの責務分離では、list/show/validate/archive の CLI contract と spec promotion の結果を characterization test で固定しなければならない。
 
-#### Scenario: 既存の検証が通過する
+#### Scenario: OpenSpec validate の contract が維持される
 
-- **WHEN** `cargo fmt` / `cargo clippy -- -D warnings` / `cargo test` を実行する
-- **THEN** すべて成功する
+- **GIVEN** 妥当な変更提案と不正な変更提案が存在する
+- **WHEN** strict validation を実行する
+- **THEN** proposal、tasks、spec delta、scenario、change type の必須チェック結果はリファクタリング前と同等である
+- **AND** exit code とエラー/警告の分類は同等である
 
-#### Scenario: 固定パターン正規表現は静的初期化される
+#### Scenario: archive 前 promotion safety が維持される
 
-- **GIVEN** `src/spec_test_annotations.rs` 内に固定パターンの正規表現がある
-- **WHEN** 当該モジュールがロードされる
-- **THEN** 正規表現は `std::sync::LazyLock<Regex>` でモジュールスコープに一度だけ初期化される
-- **AND** 関数本体に `Regex::new().unwrap()` が存在しない
-
-## Requirements
+- **GIVEN** ADDED、MODIFIED、REMOVED、または no-op になる spec delta が存在する
+- **WHEN** archive 前の promotion simulation を実行する
+- **THEN** canonical spec へ適用可能な delta だけが成功する
+- **AND** missing target や no-op promotion は既存と同じ安全側の失敗として扱われる
 
 ### Requirement: Server API モジュールの責務分割
 
