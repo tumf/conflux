@@ -10,7 +10,6 @@ mod promotion;
 mod rendering;
 mod validation;
 
-pub use self::promotion::{delta_to_canonical, merge_spec_delta, simulate_promotion};
 use archive::ArchiveEngine;
 use model::{ChangeInfo, DependencyStatusContext, ShowInfo, SpecInfo};
 use regex::Regex;
@@ -399,8 +398,9 @@ fn check_obsolete_artifacts() {
 
 #[cfg(test)]
 mod spec_promotion_tests {
-    use super::*;
-    use crate::openspec_cmd::promotion::{parse_delta_sections, split_spec};
+    use crate::openspec_cmd::promotion::{
+        delta_to_canonical, merge_spec_delta, parse_delta_sections, simulate_promotion, split_spec,
+    };
 
     #[test]
     fn test_split_spec_empty() {

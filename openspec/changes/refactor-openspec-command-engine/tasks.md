@@ -19,3 +19,7 @@
 ## Final Validation
 
 実装後の OpenSpec 最終確認は `cflx openspec validate refactor-openspec-command-engine --strict` を使用する。
+
+## Acceptance #1 Failure Follow-up
+- [x] Archive commit path pre-commit blocker is fixed. The unused promotion public re-export was removed from `src/openspec_cmd.rs`, promotion tests now import the helpers directly from `crate::openspec_cmd::promotion`, and `agent-exec run -- cargo clippy --locked --all-targets --all-features -- -D warnings` completed successfully in job `edfdb113aea17c828e9a9708365b9cda`.
+- [x] The implementation otherwise has relevant evidence: `cflx openspec validate refactor-openspec-command-engine --strict` passed, `cargo fmt --check` passed, `cargo test openspec_cmd` passed 66 tests, `cflx openspec list --specs` succeeded, and a rerun of the full `cargo test` passed after an initial flaky/concurrent failure. The remaining clippy blocker from Acceptance #1 has now been resolved.
