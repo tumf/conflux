@@ -206,6 +206,16 @@ impl ParallelExecutor {
         self.shared_orchestrator_state = Some(shared_state);
     }
 
+    /// Set the service-owned reducer only when the caller did not already provide one.
+    pub(crate) fn ensure_shared_orchestrator_state(
+        &mut self,
+        shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    ) {
+        if self.shared_orchestrator_state.is_none() {
+            self.shared_orchestrator_state = Some(shared_state);
+        }
+    }
+
     /// Set the cancellation token for force stop cleanup.
     pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
         self.cancel_token = Some(cancel_token);

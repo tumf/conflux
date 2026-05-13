@@ -503,8 +503,11 @@ impl ParallelRunService {
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
     ) -> Result<()> {
-        // Prepare changes using the common helper (sends warning event if needed)
-        executor.set_shared_orchestrator_state(self.shared_orchestrator_state.clone());
+        // Prepare changes using the common helper (sends warning event if needed).
+        // Preserve caller-provided reducer state: manual TUI retry startup records
+        // ResolveWait/RejectWait in the reducer before constructing the executor, and
+        // replacing that reducer here creates split-brain retry ownership.
+        executor.ensure_shared_orchestrator_state(self.shared_orchestrator_state.clone());
         let allow_empty_when_resolve_wait = changes.is_empty() && executor.has_resolve_wait();
         let changes = match self
             .prepare_parallel_execution(changes, &event_tx, allow_empty_when_resolve_wait)

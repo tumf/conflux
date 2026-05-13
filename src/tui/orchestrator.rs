@@ -990,8 +990,11 @@ pub async fn run_orchestrator_parallel(
     // Get repo root
     let repo_root = std::env::current_dir()?;
 
-    // Create ParallelRunService
-    let service = ParallelRunService::new(repo_root.clone(), config.clone());
+    // Create ParallelRunService and bind it to the caller-owned reducer so empty
+    // manual resolve startup observes the same ResolveWait/RejectWait intent that
+    // accepted the TUI command.
+    let mut service = ParallelRunService::new(repo_root.clone(), config.clone());
+    service.set_shared_orchestrator_state(shared_state.clone());
 
     // Check if Git is available for parallel execution
     service.check_vcs_available().await?;
@@ -1171,6 +1174,13 @@ pub async fn run_orchestrator_parallel(
         stopped_or_cancelled = true;
     }
 
+    let has_reducer_owned_lane_wait_or_active = {
+        let state = shared_state.read().await;
+        !state.resolve_wait_change_ids().is_empty()
+            || !state.reject_wait_change_ids().is_empty()
+            || state.is_base_mutating_lane_occupied()
+    };
+
     match result {
         Ok(_) => {
             if merge_deferred_stop.load(Ordering::SeqCst) {
@@ -1180,6 +1190,14 @@ pub async fn run_orchestrator_parallel(
                         changes_to_process.len()
                     ))))
                     .await;
+            } else if has_reducer_owned_lane_wait_or_active {
+                let _ = tx
+                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                        "Execution paused with reducer-owned lane retry work still pending or active ({} changes processed)",
+                        changes_to_process.len()
+                    ))))
+                    .await;
+                stopped_or_cancelled = true;
             } else {
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::success(format!(
