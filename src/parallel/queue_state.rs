@@ -183,7 +183,8 @@ impl ParallelExecutor {
         }
 
         let base_dirty = base_dirty_reason(&self.repo_root).await?.is_some();
-        let changed_to_clean = matches!(self.last_resolve_wait_base_dirty, Some(true)) && !base_dirty;
+        let changed_to_clean =
+            matches!(self.last_resolve_wait_base_dirty, Some(true)) && !base_dirty;
         if changed_to_clean {
             info!(
                 repo_root = %self.repo_root.display(),
