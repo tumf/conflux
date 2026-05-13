@@ -12,72 +12,17 @@ The specification covers:
 
 ### Requirement: REQ-OBS-001 Command Execution Logging
 
-The bundled Conflux log mining helper MUST be able to scan marker-selected runtime logs incrementally for actionable errors, manual operation markers, and resolve/merge timeline markers without requiring whole-file buffering. The helper output MUST remain observability-only and MUST NOT be used as a workflow-control input.
+Conflux observability MUST distinguish recoverable degraded execution paths from terminal workflow failures. The bundled log mining helper MUST remain observability-only and MUST NOT influence scheduler decisions, resume routing, acceptance, archive, merge, or next-action behavior.
 
-#### Scenario: large marker-selected log is mined without whole-file buffering
+#### Scenario: recoverable analysis fallback is not mined as terminal error
 
-- **GIVEN** a log root contains `.last-checked` and a large `.log` file whose mtime is newer than the marker
-- **WHEN** an operator runs `python3 scripts/cflx-log-mine.py --log-root <log-root> --top 30`
-- **THEN** the helper emits the standard report sections for top error/warning groups, manual operation markers, action timeline markers, and recommended follow-up queries
-- **AND** the scanner does not need to read the entire log file into memory before processing hits
-- **AND** no mined log output affects scheduling, resume routing, acceptance, archive, merge, or next-action behavior
-
-#### Scenario: change-id filtering remains compatible under streaming scan
-
-- **GIVEN** a marker-selected log contains events for change `alpha` and unrelated events for change `beta`
-- **WHEN** an operator runs `python3 scripts/cflx-log-mine.py --log-root <log-root> --change-id alpha --format json`
-- **THEN** returned grouped examples, manual events, and action events are limited to hits whose text or captured context includes `alpha`
-- **AND** the JSON report keeps the existing top-level keys used by consumers
-
-#### Scenario: grouped diagnostics continue to normalize volatile local details
-
-- **GIVEN** a marker-selected log line contains volatile values such as local absolute paths, process ids, project ids, branch names, or change ids
-- **WHEN** the helper groups the diagnostic
-- **THEN** the group key normalizes those volatile values consistently with existing behavior
-- **AND** the helper does not write confidential mined log content into repository-tracked proposal or test artifacts
-
-TUI Logs View は、依存未解決のまま進展しない queued change に対する repeated `AnalysisStarted` / `DependencyBlocked` event を受け取っても、同一状態の `Re-analyzing queued changes for dispatch` および `Change '<id>' blocked by dependencies` entries を無制限に追加してはならない（MUST NOT）。
-
-#### Scenario: repetitive scheduler diagnostics are bounded in TUI logs and debug files
-
-- **GIVEN** a scheduler diagnostic has the same change id, reason, and message across repeated loop iterations
-- **WHEN** the diagnostic is emitted repeatedly without any relevant state change
-- **THEN** the TUI Logs View does not show an unbounded sequence of identical entries
-- **AND** the debug log file does not show an unbounded sequence of identical WARN-level entries for the same scheduler diagnostic
-- **AND** the diagnostic remains available at least once or through a summary/rate-limited entry
-- **AND** suppression state is not used to decide scheduling, resume routing, acceptance, archive, or next-action behavior
-
-#### Scenario: unchanged scheduler observations do not create new diagnostics
-
-- **GIVEN** a scheduler loop repeatedly observes the same dependency blocker, worktree status, or merge-wait diagnostic state
-- **AND** the comparable observation fingerprint has not changed since the previous emitted diagnostic
-- **WHEN** the scheduler loop runs again
-- **THEN** Conflux does not emit another user-visible TUI log entry for that unchanged observation
-- **AND** Conflux does not emit another repeated info/warn debug log entry for that unchanged observation
-- **AND** any suppression or fingerprint state remains non-authoritative and is not used for workflow-control decisions
-
-#### Scenario: changed scheduler observations remain visible
-
-- **GIVEN** a scheduler diagnostic was previously emitted for a dependency blocker, worktree status, or merge-wait observation
-- **WHEN** the comparable observation fingerprint changes
-- **THEN** Conflux emits a new diagnostic/log entry that makes the changed state visible
-- **AND** the new diagnostic includes enough context to distinguish it from the prior observation
-
-#### Scenario: dependency-blocked TUI logs are bounded while blocked state is unchanged
-
-- **GIVEN** queued change `alpha` has already been displayed as `blocked`
-- **AND** the TUI has already appended `Change 'alpha' blocked by dependencies`
-- **WHEN** repeated `DependencyBlocked` events for `alpha` arrive without an intervening dependency resolution or display-state change
-- **THEN** the TUI keeps `alpha` displayed as `blocked`
-- **AND** the TUI does not append additional identical blocked log entries for `alpha`
-- **AND** the suppression state is not used to decide scheduler dispatch, resume routing, acceptance, archive, or next-action behavior
-
-#### Scenario: analysis-started TUI logs are bounded while remaining work is unchanged
-
-- **GIVEN** the TUI has already appended `Re-analyzing queued changes for dispatch (remaining: 1)`
-- **WHEN** repeated `AnalysisStarted { remaining_changes: 1 }` events arrive without relevant progress or state reset
-- **THEN** the TUI does not append additional identical re-analysis log entries
-- **AND** a changed remaining count or meaningful progress/reset event can make a later analysis-started log visible again
+- **GIVEN** dependency analysis rejects an LLM-produced graph
+- **AND** Conflux successfully falls back to metadata-dependency-only analysis
+- **WHEN** runtime logs are emitted and later mined by `scripts/cflx-log-mine.py`
+- **THEN** the fallback remains visible as degraded analysis evidence
+- **AND** the recoverable fallback is not emitted as an ERROR-level terminal workflow failure
+- **AND** missing or rejected dependency blockers remain visible as actionable diagnostics
+- **AND** mined log output does not affect workflow-control decisions
 
 ### Requirement: REQ-OBS-002 Appropriate Log Level Classification
 
