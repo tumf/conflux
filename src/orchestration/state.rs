@@ -3548,6 +3548,69 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_wait_manual_merge_deferred_demotes_to_merge_wait() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["change-a".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+        assert_eq!(state.display_status("change-a"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["change-a".to_string()]);
+
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "Working tree has uncommitted changes".to_string(),
+            auto_resumable: false,
+        });
+
+        assert_eq!(state.display_status("change-a"), "merge wait");
+        assert!(
+            state.resolve_wait_change_ids().is_empty(),
+            "manual retry deferral must remove reducer-owned ResolveWait membership"
+        );
+        assert!(state.queued_change_ids().is_empty());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn test_resolve_wait_clean_lane_promotion_promotes_exactly_one_waiter() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = OrchestratorState::with_mode(
+            vec!["alpha".to_string(), "beta".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        for change_id in ["alpha", "beta"] {
+            state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+                change_id: change_id.to_string(),
+                reason: "base dirty".to_string(),
+                auto_resumable: false,
+            });
+            state.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()));
+        }
+
+        let promoted = state.promote_next_base_mutating_lane_waiter();
+
+        assert_eq!(promoted, Some(("alpha".to_string(), WaitState::ResolveWait)));
+        assert_eq!(state.display_status("alpha"), "resolving");
+        assert_eq!(state.display_status("beta"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["beta".to_string()]);
+        assert_eq!(state.promote_next_base_mutating_lane_waiter(), None);
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
     fn test_resolve_failed_restores_merge_wait() {
         use crate::events::ExecutionEvent;
 

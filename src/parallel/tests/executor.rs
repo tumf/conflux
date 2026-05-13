@@ -677,6 +677,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -795,6 +796,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -904,6 +906,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1062,6 +1065,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1275,6 +1279,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1480,6 +1485,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1691,6 +1697,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
+        last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -5537,6 +5544,58 @@ async fn test_scheduler_does_not_busy_retry_unchanged_resolve_wait() {
         !executor.should_dispatch_resolve_wait_retry(),
         "unchanged resolve-wait intent must not be retried again without a new trigger"
     );
+}
+
+#[tokio::test]
+async fn test_dirty_to_clean_resolve_wait_wakes_retry_without_new_trigger() {
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    init_git_repo(repo_dir.path()).await;
+    std::fs::write(repo_dir.path().join("dirty.txt"), "dirty").or_fail("dirty base");
+
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("change-a", workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "base dirty".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    executor.last_dispatched_resolve_wait_changes = executor.resolve_wait_changes.clone();
+
+    executor.maybe_dispatch_resolve_wait_retry().await;
+    assert!(
+        !executor.should_dispatch_resolve_wait_retry(),
+        "dirty observation should be deduped after the first scheduler evaluation"
+    );
+
+    std::fs::remove_file(repo_dir.path().join("dirty.txt")).or_fail("clean base");
+
+    executor.maybe_dispatch_resolve_wait_retry().await;
+
+    assert_eq!(
+        executor.last_dispatched_resolve_wait_changes, executor.resolve_wait_changes,
+        "dirty-to-clean transition should wake scheduler-owned ResolveWait retry without another M keypress"
+    );
+    assert!(!executor.resolve_wait_retry_triggered);
 }
 
 #[test]
