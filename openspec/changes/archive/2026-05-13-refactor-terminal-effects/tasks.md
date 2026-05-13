@@ -8,7 +8,7 @@
 
 - [x] 4. terminal/activity/wait transition の共通処理を内部 helper に抽出する。verification: unit - `cargo test orchestration::state` で `invariants_hold` / `global_invariants_hold` を含む既存テストが成功する。completion: terminal 化、stalled 化、success completion の代表処理が helper 化され、公開挙動は変わっていない。
 
-- [x] 5. 最終回帰確認を実行する。verification: integration - `cargo fmt --check` と `cargo test` が成功する。completion: 既定テストスイートが成功し、CLI/TUI/Web の仕様上の状態表示変更がないことを確認している。
+- [x] 5. 最終回帰確認を実行する。(verification: integration - `cargo fmt --check` と `cargo test` が成功する。) completion: 既定テストスイートが成功し、CLI/TUI/Web の仕様上の状態表示変更がないことを確認している。
 
 ## Future Work
 
