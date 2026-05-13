@@ -15,3 +15,6 @@
 ## Final Validation
 
 Expected archive gate: `cflx openspec validate fix-single-queued-dependency-gating --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] コミットパスの pre-commit hook が失敗します。実行コマンド: `$(git rev-parse --git-path hooks/pre-commit)`。hook 内の clippy が `-D warnings` により `src/openspec_cmd.rs:1034` と `src/openspec_cmd.rs:1163` の `[].into_iter()` を `clippy::useless_conversion` としてエラーにしていたため、空の queued dependency iterator を `std::iter::empty::<&str>()` に置き換えました。検証: pre-commit hook と最終検証コマンドを再実行する。

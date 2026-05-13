@@ -1031,7 +1031,7 @@ impl DependencyStatusContext {
             dependency,
             self.active_ids.iter().map(String::as_str),
             self.in_flight_ids.iter().map(String::as_str),
-            [].into_iter(),
+            std::iter::empty::<&str>(),
             &self.archived_ids,
             &self.rejected_ids,
         ) {
@@ -1160,7 +1160,7 @@ fn classify_proposal_dependency_targets(
                 &dependency,
                 active_ids.iter().map(String::as_str),
                 in_flight_ids.iter().map(String::as_str),
-                [].into_iter(),
+                std::iter::empty::<&str>(),
                 &archived_ids,
                 &rejected_ids,
             );
