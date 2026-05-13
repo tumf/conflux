@@ -571,7 +571,7 @@ impl ParallelRunService {
     /// Analyze changes and return order-based result with optional event sender.
     ///
     /// If `use_llm_analysis` is enabled (default), uses LLM to analyze dependencies.
-    /// Otherwise, returns all changes in a single order (no dependency inference).
+    /// Otherwise, returns changes in listed order with proposal metadata dependencies preserved.
     /// When a sender is provided, AnalysisOutput events are sent for streaming output.
     ///
     /// # Arguments
@@ -601,10 +601,7 @@ impl ParallelRunService {
                     return result;
                 }
                 Err(e) => {
-                    error!("LLM analysis failed: {}", e);
-                    warn!(
-                        "Falling back to metadata-dependency-only analysis after LLM analysis failure"
-                    );
+                    Self::log_recoverable_analysis_fallback(&e);
                 }
             }
         } else {
@@ -612,6 +609,13 @@ impl ParallelRunService {
         }
 
         Self::metadata_dependency_analysis_result(changes)
+    }
+
+    fn log_recoverable_analysis_fallback(error: &dyn std::fmt::Display) {
+        warn!(
+            error = %error,
+            "LLM analysis failed; falling back to metadata-dependency-only analysis"
+        );
     }
 
     fn metadata_dependency_analysis_result(changes: &[Change]) -> crate::analyzer::AnalysisResult {
@@ -765,7 +769,7 @@ mod tests {
         OrchestratorConfig {
             apply_command: Some("echo apply {change_id}".to_string()),
             archive_command: Some("echo archive {change_id}".to_string()),
-            analyze_command: Some("echo analyze".to_string()),
+            analyze_command: Some("echo '{\"order\":[\"route\",\"policy\"],\"dependencies\":{\"route\":[\"ghost\"]}}'".to_string()),
             acceptance_command: Some("echo acceptance".to_string()),
             resolve_command: Some("echo resolve".to_string()),
             ..Default::default()
@@ -1099,6 +1103,106 @@ mod tests {
         assert_eq!(
             result.dependencies.get("route"),
             Some(&vec!["policy".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_analyze_order_recoverable_fallback_preserves_metadata_dependencies() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut config = create_test_config();
+        config.use_llm_analysis = Some(true);
+        config.analyze_command = Some("printf 'not json'".to_string());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), config);
+        let changes = vec![
+            create_test_change("route", vec!["policy"]),
+            create_test_change("policy", vec![]),
+        ];
+
+        let result = service
+            .analyze_order_with_sender(&changes, &[], None, 1)
+            .await;
+
+        assert_eq!(
+            result.order,
+            vec!["route".to_string(), "policy".to_string()]
+        );
+        assert_eq!(
+            result.dependencies.get("route"),
+            Some(&vec!["policy".to_string()])
+        );
+        assert!(
+            !result.dependencies.is_empty(),
+            "recoverable fallback must not degrade to dependency-free analysis"
+        );
+    }
+
+    #[test]
+    fn test_recoverable_fallback_log_uses_warn_level_only() {
+        use tracing::Level;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        #[derive(Clone, Default)]
+        struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(Level, String)>>>);
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor {
+                    fields: String,
+                }
+
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.fields
+                            .push_str(&format!("{}={:?};", field.name(), value));
+                    }
+                }
+
+                let mut visitor = Visitor {
+                    fields: String::new(),
+                };
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .expect("capture layer mutex")
+                    .push((*event.metadata().level(), visitor.fields));
+            }
+        }
+
+        let capture = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            ParallelRunService::log_recoverable_analysis_fallback(&"invalid dependency graph");
+        });
+
+        let events = capture.0.lock().expect("capture layer mutex");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, Level::WARN);
+        assert!(
+            events[0]
+                .1
+                .contains("falling back to metadata-dependency-only analysis"),
+            "fallback diagnostic should remain operator-visible"
+        );
+        assert!(
+            events[0].1.contains("invalid dependency graph"),
+            "original LLM analysis failure should remain visible as warning context"
+        );
+        assert!(
+            events.iter().all(|(level, _)| *level != Level::ERROR),
+            "recoverable fallback must not emit ERROR-level records"
         );
     }
 
