@@ -16,9 +16,11 @@ Manual retry classification MUST evaluate active resolve/base-mutating lane occu
 
 When a scheduler is already running because other changes are applying, accepting, or archiving, pressing `M` on a `MergeWait` row MUST notify the existing scheduler only after reducer-owned retry intent is accepted. The row may display `resolve pending` while waiting on scheduler/base-lane capacity, but it MUST eventually transition through scheduler events to `resolving` / `merged` or back to `merge wait` with visible failure/defer evidence.
 
+When no scheduler is running, pressing `M` on a `MergeWait` row MAY start a scheduler with zero normal queued changes, but that run MUST be classified as a manual retry run rather than ordinary empty execution. The TUI MUST NOT report `Execution completed (0 changes processed)`, `All parallel changes completed`, or equivalent success while the shared reducer still contains accepted retry intent for that row. The row MUST leave `resolve pending` through scheduler-owned events or visible retry-prerequisite failure evidence.
+
 When a manual merge retry starts through the resolve lifecycle and the successful repository integration is reported as `MergeCompleted` rather than `ResolveCompleted`, the TUI MUST treat that `MergeCompleted` event as closing the local resolve lifecycle. It MUST clear any stale `is_resolving` reservation and MUST dispatch the next queued resolve retry intent, if one exists.
 
-<!-- Expected canonical result after archive: `tui-resolve` will explicitly require M-key retry classification to check active resolve/base-mutating occupancy before dirty state. -->
+<!-- Expected canonical result after archive: `tui-resolve` will treat empty manual resolve scheduler startup as retry work, not successful zero-change execution. -->
 
 #### Scenario: M during active resolve remains resolve pending despite dirty evidence
 
@@ -50,6 +52,15 @@ When a manual merge retry starts through the resolve lifecycle and the successfu
 **Then**: the reducer records scheduler-consumable `ResolveWait` for `alpha`
 **And**: the scheduler starts one resolve retry for `alpha`
 **And**: `alpha` transitions from `resolve pending` to `resolving` via scheduler event
+
+#### Scenario: restarted M does not complete as zero-change success
+
+**Given**: no scheduler is currently running
+**And**: change `alpha` is visible as `merge wait`
+**When**: the user presses `M` on `alpha`
+**Then**: the TUI starts or schedules manual retry work
+**And**: the TUI does not log successful zero-change completion while `ResolveWait(alpha)` remains in shared reducer state
+**And**: `alpha` eventually becomes `resolving`, `merged`, `merge wait` with visible reason, or explicit error/stalled state
 
 ### Requirement: resolve-merge-exclusive-execution
 

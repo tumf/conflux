@@ -86,6 +86,10 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
+The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
+
+<!-- Expected canonical result after archive: `orchestration-state` will make reducer state ownership explicit so manual retry cannot be accepted in one reducer and consumed from another empty reducer. -->
+
 #### Scenario: archived merge-wait manual retry becomes reducer-owned resolve wait
 
 **Given**: change `alpha` is archive-complete and not yet merged into the base branch
@@ -102,6 +106,21 @@ After a change has reached repository-visible base integration, later stale dupl
 **Then**: the reducer rejects that retry intent
 **And**: `alpha` is not reintroduced into resolve-wait membership
 **And**: later refreshes do not regress `alpha` to `MergeWait` or `ResolveWait`
+
+#### Scenario: manual retry scheduler uses the accepting reducer
+
+**Given**: the TUI shared reducer accepts `ResolveMerge(alpha)` and records `ResolveWait(alpha)`
+**And**: the scheduler was not running, so the TUI starts a manual resolve scheduler with no normal queued changes
+**When**: the parallel run service constructs or configures the scheduler executor
+**Then**: the executor observes `ResolveWait(alpha)` from the same shared reducer state that accepted the command
+**And**: no construction path replaces that shared reducer with an empty reducer before retry evaluation
+
+#### Scenario: executor-local cache cannot outlive reducer truth
+
+**Given**: executor-local retry sets were synchronized from shared reducer state
+**When**: reducer events clear `ResolveWait(alpha)` by merge completion, manual deferral, rejection, or stale-prerequisite handling
+**Then**: executor-local retry sets and TUI display are reconciled to the reducer-cleared state
+**And**: `alpha` is not left visible as `resolve pending` solely because an executor-local cache still contained `alpha`
 
 ### Requirement: Execution Mode Determines Archive Terminal Semantics
 
@@ -180,6 +199,10 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
+The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
+
+<!-- Expected canonical result after archive: `orchestration-state` will make reducer state ownership explicit so manual retry cannot be accepted in one reducer and consumed from another empty reducer. -->
+
 #### Scenario: archived merge-wait manual retry becomes reducer-owned resolve wait
 
 **Given**: change `alpha` is archive-complete and not yet merged into the base branch
@@ -196,6 +219,21 @@ After a change has reached repository-visible base integration, later stale dupl
 **Then**: the reducer rejects that retry intent
 **And**: `alpha` is not reintroduced into resolve-wait membership
 **And**: later refreshes do not regress `alpha` to `MergeWait` or `ResolveWait`
+
+#### Scenario: manual retry scheduler uses the accepting reducer
+
+**Given**: the TUI shared reducer accepts `ResolveMerge(alpha)` and records `ResolveWait(alpha)`
+**And**: the scheduler was not running, so the TUI starts a manual resolve scheduler with no normal queued changes
+**When**: the parallel run service constructs or configures the scheduler executor
+**Then**: the executor observes `ResolveWait(alpha)` from the same shared reducer state that accepted the command
+**And**: no construction path replaces that shared reducer with an empty reducer before retry evaluation
+
+#### Scenario: executor-local cache cannot outlive reducer truth
+
+**Given**: executor-local retry sets were synchronized from shared reducer state
+**When**: reducer events clear `ResolveWait(alpha)` by merge completion, manual deferral, rejection, or stale-prerequisite handling
+**Then**: executor-local retry sets and TUI display are reconciled to the reducer-cleared state
+**And**: `alpha` is not left visible as `resolve pending` solely because an executor-local cache still contained `alpha`
 
 ### Requirement: merge-deferred-reducer-sync
 
@@ -324,6 +362,10 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
+The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
+
+<!-- Expected canonical result after archive: `orchestration-state` will make reducer state ownership explicit so manual retry cannot be accepted in one reducer and consumed from another empty reducer. -->
+
 #### Scenario: archived merge-wait manual retry becomes reducer-owned resolve wait
 
 **Given**: change `alpha` is archive-complete and not yet merged into the base branch
@@ -340,6 +382,21 @@ After a change has reached repository-visible base integration, later stale dupl
 **Then**: the reducer rejects that retry intent
 **And**: `alpha` is not reintroduced into resolve-wait membership
 **And**: later refreshes do not regress `alpha` to `MergeWait` or `ResolveWait`
+
+#### Scenario: manual retry scheduler uses the accepting reducer
+
+**Given**: the TUI shared reducer accepts `ResolveMerge(alpha)` and records `ResolveWait(alpha)`
+**And**: the scheduler was not running, so the TUI starts a manual resolve scheduler with no normal queued changes
+**When**: the parallel run service constructs or configures the scheduler executor
+**Then**: the executor observes `ResolveWait(alpha)` from the same shared reducer state that accepted the command
+**And**: no construction path replaces that shared reducer with an empty reducer before retry evaluation
+
+#### Scenario: executor-local cache cannot outlive reducer truth
+
+**Given**: executor-local retry sets were synchronized from shared reducer state
+**When**: reducer events clear `ResolveWait(alpha)` by merge completion, manual deferral, rejection, or stale-prerequisite handling
+**Then**: executor-local retry sets and TUI display are reconciled to the reducer-cleared state
+**And**: `alpha` is not left visible as `resolve pending` solely because an executor-local cache still contained `alpha`
 
 ### Requirement: Reducer-Owned Change Runtime State
 
@@ -910,6 +967,10 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
+The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
+
+<!-- Expected canonical result after archive: `orchestration-state` will make reducer state ownership explicit so manual retry cannot be accepted in one reducer and consumed from another empty reducer. -->
+
 #### Scenario: archived merge-wait manual retry becomes reducer-owned resolve wait
 
 **Given**: change `alpha` is archive-complete and not yet merged into the base branch
@@ -926,6 +987,21 @@ After a change has reached repository-visible base integration, later stale dupl
 **Then**: the reducer rejects that retry intent
 **And**: `alpha` is not reintroduced into resolve-wait membership
 **And**: later refreshes do not regress `alpha` to `MergeWait` or `ResolveWait`
+
+#### Scenario: manual retry scheduler uses the accepting reducer
+
+**Given**: the TUI shared reducer accepts `ResolveMerge(alpha)` and records `ResolveWait(alpha)`
+**And**: the scheduler was not running, so the TUI starts a manual resolve scheduler with no normal queued changes
+**When**: the parallel run service constructs or configures the scheduler executor
+**Then**: the executor observes `ResolveWait(alpha)` from the same shared reducer state that accepted the command
+**And**: no construction path replaces that shared reducer with an empty reducer before retry evaluation
+
+#### Scenario: executor-local cache cannot outlive reducer truth
+
+**Given**: executor-local retry sets were synchronized from shared reducer state
+**When**: reducer events clear `ResolveWait(alpha)` by merge completion, manual deferral, rejection, or stale-prerequisite handling
+**Then**: executor-local retry sets and TUI display are reconciled to the reducer-cleared state
+**And**: `alpha` is not left visible as `resolve pending` solely because an executor-local cache still contained `alpha`
 
 ### Requirement: post-archive-status-idempotency
 
