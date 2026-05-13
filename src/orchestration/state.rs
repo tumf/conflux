@@ -3551,11 +3551,8 @@ mod tests {
     fn test_resolve_wait_manual_merge_deferred_demotes_to_merge_wait() {
         use crate::events::ExecutionEvent;
 
-        let mut state = OrchestratorState::with_mode(
-            vec!["change-a".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        );
+        let mut state =
+            OrchestratorState::with_mode(vec!["change-a".to_string()], 0, ExecutionMode::Parallel);
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "change-a".to_string(),
@@ -3564,7 +3561,10 @@ mod tests {
         });
         state.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
         assert_eq!(state.display_status("change-a"), "resolve pending");
-        assert_eq!(state.resolve_wait_change_ids(), vec!["change-a".to_string()]);
+        assert_eq!(
+            state.resolve_wait_change_ids(),
+            vec!["change-a".to_string()]
+        );
 
         state.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "change-a".to_string(),
@@ -3602,7 +3602,10 @@ mod tests {
 
         let promoted = state.promote_next_base_mutating_lane_waiter();
 
-        assert_eq!(promoted, Some(("alpha".to_string(), WaitState::ResolveWait)));
+        assert_eq!(
+            promoted,
+            Some(("alpha".to_string(), WaitState::ResolveWait))
+        );
         assert_eq!(state.display_status("alpha"), "resolving");
         assert_eq!(state.display_status("beta"), "resolve pending");
         assert_eq!(state.resolve_wait_change_ids(), vec!["beta".to_string()]);

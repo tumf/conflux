@@ -23,3 +23,6 @@ cargo test tui::state
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## Acceptance #1 Failure Follow-up
+- [x] `cargo fmt --check` が commit-path/archive readiness をブロックします。実行コマンド: `agent-exec run -- cargo fmt --check`（job_id: 930a06e6e7c8fe02e409994ecd1caa12）。失敗箇所は `src/orchestration/state.rs:3551`, `src/orchestration/state.rs:3564`, `src/orchestration/state.rs:3602` のテスト追加部で、rustfmt が複数行フォーマット差分を要求しています。作業ツリー自体は `git status --short` で clean でしたが、フォーマットチェックが失敗するため最終 archive commit 前に `cargo fmt` 相当の整形を反映する必要があります。（解決: 指摘箇所を rustfmt 期待形式へ整形し、`agent-exec run -- cargo fmt --check` で再検証）
