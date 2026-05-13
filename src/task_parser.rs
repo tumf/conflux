@@ -7,7 +7,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::tui::log_deduplicator;
 use regex::Regex;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::debug;
 
@@ -97,20 +97,161 @@ pub fn parse_content(content: &str, change_id: Option<&str>) -> TaskProgress {
 /// Reads the file content and parses it for task checkboxes.
 /// When change_id is provided, emits deduplicated debug logs.
 pub fn parse_file(path: &Path, change_id: Option<&str>) -> Result<TaskProgress> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", path, e))
-    })?;
-
+    let content = read_tasks_file(path)?;
     Ok(parse_content(&content, change_id))
+}
+
+fn read_tasks_file(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", path, e))
+    })
+}
+
+fn write_tasks_file(path: &Path, content: String) -> Result<()> {
+    std::fs::write(path, content).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to write tasks file {:?}: {}", path, e))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskProgressLocationKind {
+    WorktreeActive,
+    WorktreeArchive,
+    BaseArchive,
+    BaseActive,
+}
+
+impl TaskProgressLocationKind {
+    fn log_label(self) -> &'static str {
+        match self {
+            Self::WorktreeActive => "worktree active location",
+            Self::WorktreeArchive => "worktree archive location",
+            Self::BaseArchive => "base tree archive location",
+            Self::BaseActive => "base tree active location",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskProgressLocation {
+    kind: TaskProgressLocationKind,
+    tasks_path: PathBuf,
+}
+
+impl TaskProgressLocation {
+    fn new(kind: TaskProgressLocationKind, tasks_path: PathBuf) -> Self {
+        Self { kind, tasks_path }
+    }
+}
+
+fn active_tasks_path(root: Option<&Path>, change_id: &str) -> PathBuf {
+    root.unwrap_or_else(|| Path::new(""))
+        .join("openspec/changes")
+        .join(change_id)
+        .join("tasks.md")
+}
+
+fn archived_tasks_path(change_id: &str, root: Option<&Path>) -> Option<PathBuf> {
+    find_archive_directory(change_id, root)
+        .map(|archive_path| archive_path.join("tasks.md"))
+        .filter(|tasks_path| tasks_path.exists())
+}
+
+fn resolve_progress_location(
+    change_id: &str,
+    worktree_path: Option<&Path>,
+) -> Option<TaskProgressLocation> {
+    progress_location_candidates(change_id, worktree_path)
+        .into_iter()
+        .find(|candidate| candidate.tasks_path.exists())
+}
+
+fn progress_location_candidates(
+    change_id: &str,
+    worktree_path: Option<&Path>,
+) -> Vec<TaskProgressLocation> {
+    let mut candidates = Vec::new();
+
+    if let Some(wt_path) = worktree_path {
+        candidates.push(TaskProgressLocation::new(
+            TaskProgressLocationKind::WorktreeActive,
+            active_tasks_path(Some(wt_path), change_id),
+        ));
+        if let Some(tasks_path) = archived_tasks_path(change_id, Some(wt_path)) {
+            candidates.push(TaskProgressLocation::new(
+                TaskProgressLocationKind::WorktreeArchive,
+                tasks_path,
+            ));
+        }
+    }
+
+    if let Some(tasks_path) = archived_tasks_path(change_id, None) {
+        candidates.push(TaskProgressLocation::new(
+            TaskProgressLocationKind::BaseArchive,
+            tasks_path,
+        ));
+    }
+
+    candidates.push(TaskProgressLocation::new(
+        TaskProgressLocationKind::BaseActive,
+        active_tasks_path(None, change_id),
+    ));
+
+    candidates
+}
+
+fn resolve_active_progress_location(
+    change_id: &str,
+    worktree_path: Option<&Path>,
+) -> Option<TaskProgressLocation> {
+    worktree_path
+        .map(|wt_path| {
+            TaskProgressLocation::new(
+                TaskProgressLocationKind::WorktreeActive,
+                active_tasks_path(Some(wt_path), change_id),
+            )
+        })
+        .filter(|candidate| candidate.tasks_path.exists())
+        .or_else(|| {
+            let candidate = TaskProgressLocation::new(
+                TaskProgressLocationKind::BaseActive,
+                active_tasks_path(None, change_id),
+            );
+            candidate.tasks_path.exists().then_some(candidate)
+        })
+}
+
+fn resolve_archived_progress_location(
+    change_id: &str,
+    worktree_path: Option<&Path>,
+) -> Option<TaskProgressLocation> {
+    if let Some(wt_path) = worktree_path {
+        if let Some(tasks_path) = archived_tasks_path(change_id, Some(wt_path)) {
+            return Some(TaskProgressLocation::new(
+                TaskProgressLocationKind::WorktreeArchive,
+                tasks_path,
+            ));
+        }
+
+        let active_candidate = TaskProgressLocation::new(
+            TaskProgressLocationKind::WorktreeActive,
+            active_tasks_path(Some(wt_path), change_id),
+        );
+        if active_candidate.tasks_path.exists() {
+            return Some(active_candidate);
+        }
+    }
+
+    archived_tasks_path(change_id, None).map(|tasks_path| {
+        TaskProgressLocation::new(TaskProgressLocationKind::BaseArchive, tasks_path)
+    })
 }
 
 /// Parse task progress for a change by its ID.
 ///
 /// Looks for tasks.md at `openspec/changes/{change_id}/tasks.md`.
 pub fn parse_change(change_id: &str) -> Result<TaskProgress> {
-    let tasks_path = Path::new("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
+    let tasks_path = active_tasks_path(None, change_id);
 
     if !tasks_path.exists() {
         return Err(OrchestratorError::ConfigLoad(format!(
@@ -143,21 +284,20 @@ pub fn parse_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
-    // Try worktree first (uncommitted changes)
-    if let Some(wt_path) = worktree_path {
-        let wt_tasks = wt_path
-            .join("openspec/changes")
-            .join(change_id)
-            .join("tasks.md");
-
-        if wt_tasks.exists() {
-            debug!("Reading tasks from worktree: {:?}", wt_tasks);
-            return parse_file(&wt_tasks, Some(change_id));
-        }
+    if let Some(location) = resolve_active_progress_location(change_id, worktree_path) {
+        debug!(
+            "Reading tasks from {}: {:?}",
+            location.kind.log_label(),
+            location.tasks_path
+        );
+        return parse_file(&location.tasks_path, Some(change_id));
     }
 
-    // Fallback to base tree
-    parse_change(change_id)
+    let tasks_path = active_tasks_path(None, change_id);
+    Err(OrchestratorError::ConfigLoad(format!(
+        "Tasks file not found: {:?}",
+        tasks_path
+    )))
 }
 
 /// Find the archive directory entry for a change.
@@ -214,23 +354,27 @@ fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<s
 )]
 #[allow(dead_code)]
 pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
-    let archive_path = find_archive_directory(change_id, None).ok_or_else(|| {
-        OrchestratorError::ConfigLoad(format!(
-            "Archived directory not found for change '{}' in openspec/changes/archive/",
-            change_id
-        ))
+    let location = resolve_archived_progress_location(change_id, None).ok_or_else(|| {
+        let archive_root = Path::new("openspec/changes/archive");
+        if find_archive_directory(change_id, None).is_some() {
+            OrchestratorError::ConfigLoad(format!(
+                "Archived tasks file not found for change '{}' in {:?}",
+                change_id, archive_root
+            ))
+        } else {
+            OrchestratorError::ConfigLoad(format!(
+                "Archived directory not found for change '{}' in openspec/changes/archive/",
+                change_id
+            ))
+        }
     })?;
 
-    let tasks_path = archive_path.join("tasks.md");
-
-    if !tasks_path.exists() {
-        return Err(OrchestratorError::ConfigLoad(format!(
-            "Archived tasks file not found: {:?}",
-            tasks_path
-        )));
-    }
-
-    parse_file(&tasks_path, Some(change_id))
+    debug!(
+        "Reading tasks from {}: {:?}",
+        location.kind.log_label(),
+        location.tasks_path
+    );
+    parse_file(&location.tasks_path, Some(change_id))
 }
 
 /// Parse task progress with worktree priority for archived changes.
@@ -259,37 +403,20 @@ pub fn parse_archived_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
-    // Try worktree first (uncommitted archive or pre-archive state)
-    if let Some(wt_path) = worktree_path {
-        // Try archived location in worktree (supports date-prefixed directories)
-        if let Some(archive_path) = find_archive_directory(change_id, Some(wt_path)) {
-            let wt_archive_tasks = archive_path.join("tasks.md");
-            if wt_archive_tasks.exists() {
-                debug!(
-                    "Reading archived tasks from worktree archive: {:?}",
-                    wt_archive_tasks
-                );
-                return parse_file(&wt_archive_tasks, Some(change_id));
-            }
-        }
+    let location =
+        resolve_archived_progress_location(change_id, worktree_path).ok_or_else(|| {
+            OrchestratorError::ConfigLoad(format!(
+                "Archived directory not found for change '{}' in openspec/changes/archive/",
+                change_id
+            ))
+        })?;
 
-        // Try active location in worktree (archive not yet committed)
-        let wt_tasks = wt_path
-            .join("openspec/changes")
-            .join(change_id)
-            .join("tasks.md");
-
-        if wt_tasks.exists() {
-            debug!(
-                "Reading archived tasks from worktree (pre-archive): {:?}",
-                wt_tasks
-            );
-            return parse_file(&wt_tasks, Some(change_id));
-        }
-    }
-
-    // Fallback to base tree archive (supports date-prefixed directories)
-    parse_archived_change(change_id)
+    debug!(
+        "Reading archived tasks from {}: {:?}",
+        location.kind.log_label(),
+        location.tasks_path
+    );
+    parse_file(&location.tasks_path, Some(change_id))
 }
 
 /// Parse task progress with comprehensive fallback order: worktree → archive → base.
@@ -332,60 +459,15 @@ pub fn parse_progress_with_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
-    // 1. Try worktree active location first (most recent uncommitted changes)
-    if let Some(wt_path) = worktree_path {
-        let wt_active = wt_path
-            .join("openspec/changes")
-            .join(change_id)
-            .join("tasks.md");
-
-        if wt_active.exists() {
-            debug!(
-                "Reading progress from worktree active location: {:?}",
-                wt_active
-            );
-            return parse_file(&wt_active, Some(change_id));
-        }
-
-        // 2. Try worktree archive location (archived but not yet committed)
-        if let Some(archive_path) = find_archive_directory(change_id, Some(wt_path)) {
-            let wt_archive_tasks = archive_path.join("tasks.md");
-            if wt_archive_tasks.exists() {
-                debug!(
-                    "Reading progress from worktree archive location: {:?}",
-                    wt_archive_tasks
-                );
-                return parse_file(&wt_archive_tasks, Some(change_id));
-            }
-        }
-    }
-
-    // 3. Try base tree archive location (committed archive)
-    if let Some(archive_path) = find_archive_directory(change_id, None) {
-        let base_archive_tasks = archive_path.join("tasks.md");
-        if base_archive_tasks.exists() {
-            debug!(
-                "Reading progress from base tree archive location: {:?}",
-                base_archive_tasks
-            );
-            return parse_file(&base_archive_tasks, Some(change_id));
-        }
-    }
-
-    // 4. Fallback to base tree active location (committed active change)
-    let base_active = Path::new("openspec/changes")
-        .join(change_id)
-        .join("tasks.md");
-
-    if base_active.exists() {
+    if let Some(location) = resolve_progress_location(change_id, worktree_path) {
         debug!(
-            "Reading progress from base tree active location: {:?}",
-            base_active
+            "Reading progress from {}: {:?}",
+            location.kind.log_label(),
+            location.tasks_path
         );
-        return parse_file(&base_active, Some(change_id));
+        return parse_file(&location.tasks_path, Some(change_id));
     }
 
-    // Not found in any location
     Err(OrchestratorError::ConfigLoad(format!(
         "Tasks file not found for change '{}' in any location (worktree, archive, or base tree)",
         change_id
@@ -394,6 +476,60 @@ pub fn parse_progress_with_fallback(
 
 fn acceptance_follow_up_heading(attempt: u32) -> String {
     format!("## Acceptance #{} Failure Follow-up", attempt)
+}
+
+fn normalize_acceptance_findings(findings: &[String]) -> Vec<String> {
+    let mut normalized_findings = findings
+        .iter()
+        .map(|finding| finding.trim())
+        .filter(|finding| !finding.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    normalized_findings.sort();
+    normalized_findings.dedup();
+
+    if normalized_findings.is_empty() {
+        normalized_findings
+            .push("Investigate acceptance failure and apply the required fix".to_string());
+    }
+
+    normalized_findings
+}
+
+fn render_acceptance_follow_up_section(findings: &[String]) -> String {
+    let mut section = String::new();
+    for finding in findings {
+        let _ = writeln!(&mut section, "- [ ] {}", finding);
+    }
+    section
+}
+
+fn upsert_acceptance_follow_up_section(content: &mut String, heading: &str, findings: &[String]) {
+    let new_section = render_acceptance_follow_up_section(findings);
+
+    if let Some(section_start) = content.find(heading) {
+        let section_body_start = content[section_start..]
+            .find('\n')
+            .map(|offset| section_start + offset + 1)
+            .unwrap_or(content.len());
+        let section_end = content[section_body_start..]
+            .find("\n## ")
+            .map(|offset| section_body_start + offset + 1)
+            .unwrap_or(content.len());
+        let existing_section = &content[section_body_start..section_end];
+        if existing_section.trim() != new_section.trim() {
+            content.replace_range(section_body_start..section_end, &new_section);
+        }
+    } else {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.ends_with("\n\n") {
+            content.push('\n');
+        }
+        let _ = writeln!(content, "{}", heading);
+        content.push_str(&new_section);
+    }
 }
 
 pub fn resolve_acceptance_follow_up_tasks_path(
@@ -429,68 +565,28 @@ pub fn record_acceptance_follow_up(
     attempt: u32,
     findings: &[String],
 ) -> Result<()> {
-    let mut content = std::fs::read_to_string(tasks_path).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!("Failed to read tasks file {:?}: {}", tasks_path, e))
-    })?;
-
+    let mut content = read_tasks_file(tasks_path)?;
     let heading = acceptance_follow_up_heading(attempt);
-    let mut normalized_findings = findings
-        .iter()
-        .map(|finding| finding.trim())
-        .filter(|finding| !finding.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    normalized_findings.sort();
-    normalized_findings.dedup();
+    let normalized_findings = normalize_acceptance_findings(findings);
 
-    if normalized_findings.is_empty() {
-        normalized_findings
-            .push("Investigate acceptance failure and apply the required fix".to_string());
-    }
-
-    if let Some(section_start) = content.find(&heading) {
-        let section_body_start = content[section_start..]
-            .find('\n')
-            .map(|offset| section_start + offset + 1)
-            .unwrap_or(content.len());
-        let section_end = content[section_body_start..]
-            .find("\n## ")
-            .map(|offset| section_body_start + offset + 1)
-            .unwrap_or(content.len());
-        let existing_section = &content[section_body_start..section_end];
-        let mut new_section = String::new();
-        for finding in normalized_findings {
-            let _ = writeln!(&mut new_section, "- [ ] {}", finding);
-        }
-        if existing_section.trim() != new_section.trim() {
-            content.replace_range(section_body_start..section_end, &new_section);
-        }
-    } else {
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        if !content.ends_with("\n\n") {
-            content.push('\n');
-        }
-        let _ = writeln!(&mut content, "{}", heading);
-        for finding in normalized_findings {
-            let _ = writeln!(&mut content, "- [ ] {}", finding);
-        }
-    }
-
-    std::fs::write(tasks_path, content).map_err(|e| {
-        OrchestratorError::ConfigLoad(format!(
-            "Failed to write tasks file {:?}: {}",
-            tasks_path, e
-        ))
-    })?;
-
-    Ok(())
+    upsert_acceptance_follow_up_section(&mut content, &heading, &normalized_findings);
+    write_tasks_file(tasks_path, content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_tasks(path: &Path, content: &str) {
+        std::fs::create_dir_all(path.parent().expect("tasks path has a parent")).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn checked_tasks(count: u32) -> String {
+        (1..=count)
+            .map(|index| format!("- [x] Task {}\n", index))
+            .collect()
+    }
 
     // ====================
     // Bullet list format tests
@@ -580,7 +676,7 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(
             &tasks_path,
-            "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] stale\n",
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] stale\n\n## Final Validation\n- [ ] run tests\n",
         )
         .unwrap();
 
@@ -589,7 +685,36 @@ mod tests {
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert!(content.contains("## Acceptance #1 Failure Follow-up"));
         assert!(content.contains("- [ ] fresh finding"));
+        assert!(content.contains("## Final Validation\n- [ ] run tests"));
         assert!(!content.contains("- [x] stale"));
+    }
+
+    #[test]
+    fn test_record_acceptance_follow_up_uses_default_finding_for_empty_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
+
+        record_acceptance_follow_up(&tasks_path, 3, &[" ".to_string(), "\t".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Acceptance #3 Failure Follow-up"));
+        assert!(content.contains("- [ ] Investigate acceptance failure and apply the required fix"));
+    }
+
+    #[test]
+    fn test_record_acceptance_follow_up_adds_missing_trailing_newline_before_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done").unwrap();
+
+        record_acceptance_follow_up(&tasks_path, 4, &["fresh finding".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert_eq!(
+            content,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #4 Failure Follow-up\n- [ ] fresh finding\n"
+        );
     }
 
     #[test]
@@ -1291,42 +1416,224 @@ mod tests {
         // Create all locations with different progress values
         let worktree_path = base_path.join("worktree");
 
-        // Worktree active (highest priority)
-        let wt_active = worktree_path.join("openspec/changes/test-priority");
-        std::fs::create_dir_all(&wt_active).unwrap();
-        std::fs::write(
-            wt_active.join("tasks.md"),
-            "- [x] WT Active 1\n- [x] WT Active 2\n- [x] WT Active 3",
-        )
-        .unwrap();
+        write_tasks(
+            &worktree_path.join("openspec/changes/test-priority/tasks.md"),
+            &checked_tasks(4),
+        );
+        write_tasks(
+            &worktree_path.join("openspec/changes/archive/test-priority/tasks.md"),
+            &checked_tasks(3),
+        );
+        write_tasks(
+            &base_path.join("openspec/changes/archive/test-priority/tasks.md"),
+            &checked_tasks(2),
+        );
+        write_tasks(
+            &base_path.join("openspec/changes/test-priority/tasks.md"),
+            &checked_tasks(1),
+        );
 
-        // Worktree archive
-        let wt_archive = worktree_path.join("openspec/changes/archive/test-priority");
-        std::fs::create_dir_all(&wt_archive).unwrap();
-        std::fs::write(
-            wt_archive.join("tasks.md"),
-            "- [x] WT Archive 1\n- [x] WT Archive 2",
-        )
-        .unwrap();
+        let scenarios = [
+            (true, true, true, true, 4),
+            (false, true, true, true, 3),
+            (false, false, true, true, 2),
+            (false, false, false, true, 1),
+        ];
 
-        // Base archive
-        let base_archive = base_path.join("openspec/changes/archive/test-priority");
-        std::fs::create_dir_all(&base_archive).unwrap();
-        std::fs::write(base_archive.join("tasks.md"), "- [x] Base Archive 1").unwrap();
+        for (worktree_active, worktree_archive, base_archive, base_active, expected_completed) in
+            scenarios
+        {
+            let case_dir = TempDir::new().unwrap();
+            let case_base = case_dir.path();
+            env::set_current_dir(case_base).unwrap();
+            let case_worktree = case_base.join("worktree");
 
-        // Base active (lowest priority)
-        let base_active = base_path.join("openspec/changes/test-priority");
-        std::fs::create_dir_all(&base_active).unwrap();
-        std::fs::write(base_active.join("tasks.md"), "- [ ] Base Active 1").unwrap();
+            if worktree_active {
+                write_tasks(
+                    &case_worktree.join("openspec/changes/test-priority/tasks.md"),
+                    &checked_tasks(4),
+                );
+            }
+            if worktree_archive {
+                write_tasks(
+                    &case_worktree.join("openspec/changes/archive/test-priority/tasks.md"),
+                    &checked_tasks(3),
+                );
+            }
+            if base_archive {
+                write_tasks(
+                    &case_base.join("openspec/changes/archive/test-priority/tasks.md"),
+                    &checked_tasks(2),
+                );
+            }
+            if base_active {
+                write_tasks(
+                    &case_base.join("openspec/changes/test-priority/tasks.md"),
+                    &checked_tasks(1),
+                );
+            }
 
-        // Parse should find worktree active location (highest priority)
-        let result = parse_progress_with_fallback("test-priority", Some(&worktree_path));
-        assert!(result.is_ok());
-        let progress = result.unwrap();
-        assert_eq!(progress.completed, 3); // From worktree active
-        assert_eq!(progress.total, 3);
+            let progress = parse_progress_with_fallback("test-priority", Some(&case_worktree))
+                .expect("progress should resolve from the first available fallback location");
+            assert_eq!(progress.completed, expected_completed);
+            assert_eq!(progress.total, expected_completed);
+        }
 
         // Restore directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_parse_change_with_worktree_fallback_preserves_success_and_not_found() {
+        use std::env;
+        use tempfile::TempDir;
+
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        let worktree_path = base_path.join("worktree");
+        write_tasks(
+            &worktree_path.join("openspec/changes/compat-change/tasks.md"),
+            "- [x] Worktree\n- [ ] Worktree pending\n",
+        );
+        write_tasks(
+            &base_path.join("openspec/changes/compat-change/tasks.md"),
+            "- [ ] Base\n",
+        );
+
+        let progress = parse_change_with_worktree_fallback("compat-change", Some(&worktree_path))
+            .expect("worktree active tasks should be preferred");
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 2);
+
+        let base_progress = parse_change_with_worktree_fallback("compat-change", None)
+            .expect("base active tasks should be used without a worktree");
+        assert_eq!(base_progress.completed, 0);
+        assert_eq!(base_progress.total, 1);
+
+        let missing = parse_change_with_worktree_fallback("missing-change", Some(&worktree_path));
+        assert!(missing.is_err());
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("Tasks file not found"));
+
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_parse_archived_change_preserves_exact_match_and_not_found() {
+        use std::env;
+        use tempfile::TempDir;
+
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        write_tasks(
+            &base_path.join("openspec/changes/archive/archived-compat/tasks.md"),
+            "- [x] Exact archive\n",
+        );
+        write_tasks(
+            &base_path.join("openspec/changes/archive/2026-05-13-archived-compat/tasks.md"),
+            "- [ ] Date archive\n",
+        );
+
+        let progress = parse_archived_change("archived-compat")
+            .expect("exact archived tasks should be preferred");
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.total, 1);
+
+        let missing = parse_archived_change("missing-archive");
+        assert!(missing.is_err());
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("Archived directory not found"));
+
+        env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_deprecated_parse_archived_change_with_worktree_fallback_preserves_order() {
+        use std::env;
+        use tempfile::TempDir;
+
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path();
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(base_path).unwrap();
+
+        let worktree_path = base_path.join("worktree");
+        write_tasks(
+            &worktree_path.join("openspec/changes/archive/compat-archived/tasks.md"),
+            &checked_tasks(3),
+        );
+        write_tasks(
+            &worktree_path.join("openspec/changes/compat-archived/tasks.md"),
+            &checked_tasks(2),
+        );
+        write_tasks(
+            &base_path.join("openspec/changes/archive/compat-archived/tasks.md"),
+            &checked_tasks(1),
+        );
+
+        let progress =
+            parse_archived_change_with_worktree_fallback("compat-archived", Some(&worktree_path))
+                .expect("worktree archive should be preferred");
+        assert_eq!(progress.completed, 3);
+        assert_eq!(progress.total, 3);
+
+        let prearchive_dir = TempDir::new().unwrap();
+        let prearchive_base = prearchive_dir.path();
+        env::set_current_dir(prearchive_base).unwrap();
+        let prearchive_worktree = prearchive_base.join("worktree");
+        write_tasks(
+            &prearchive_worktree.join("openspec/changes/compat-archived/tasks.md"),
+            &checked_tasks(2),
+        );
+        write_tasks(
+            &prearchive_base.join("openspec/changes/archive/compat-archived/tasks.md"),
+            &checked_tasks(1),
+        );
+
+        let prearchive_progress = parse_archived_change_with_worktree_fallback(
+            "compat-archived",
+            Some(&prearchive_worktree),
+        )
+        .expect("worktree active pre-archive tasks should be used before base archive");
+        assert_eq!(prearchive_progress.completed, 2);
+        assert_eq!(prearchive_progress.total, 2);
+
+        let base_only_dir = TempDir::new().unwrap();
+        let base_only = base_only_dir.path();
+        env::set_current_dir(base_only).unwrap();
+        write_tasks(
+            &base_only.join("openspec/changes/archive/compat-archived/tasks.md"),
+            &checked_tasks(1),
+        );
+
+        let base_progress = parse_archived_change_with_worktree_fallback("compat-archived", None)
+            .expect("base archive should be used without a worktree");
+        assert_eq!(base_progress.completed, 1);
+        assert_eq!(base_progress.total, 1);
+
+        let missing = parse_archived_change_with_worktree_fallback("missing-archive", None);
+        assert!(missing.is_err());
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("Archived directory not found"));
+
         env::set_current_dir(original_dir).unwrap();
     }
 
