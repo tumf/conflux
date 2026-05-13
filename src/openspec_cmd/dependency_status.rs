@@ -31,12 +31,15 @@ impl DependencyStatusContext {
             dependency,
             self.active_ids.iter().map(String::as_str),
             self.in_flight_ids.iter().map(String::as_str),
+            self.active_ids.iter().map(String::as_str),
             &self.archived_ids,
             &self.rejected_ids,
         ) {
             DependencyTargetClass::Archived => DependencyListStatus::Done,
             DependencyTargetClass::InFlight => DependencyListStatus::Running,
-            DependencyTargetClass::Queued => DependencyListStatus::Pending,
+            DependencyTargetClass::Queued | DependencyTargetClass::ActiveButNotQueued => {
+                DependencyListStatus::Pending
+            }
             DependencyTargetClass::Rejected => DependencyListStatus::Rejected,
             DependencyTargetClass::Error => {
                 unreachable!("dependency list classification cannot produce terminal-error state")
@@ -74,6 +77,7 @@ pub(super) fn classify_proposal_dependency_targets(
                 &dependency,
                 active_ids.iter().map(String::as_str),
                 in_flight_ids.iter().map(String::as_str),
+                active_ids.iter().map(String::as_str),
                 &archived_ids,
                 &rejected_ids,
             );
@@ -85,6 +89,10 @@ pub(super) fn classify_proposal_dependency_targets(
                 ),
                 DependencyTargetClass::InFlight => format!(
                     "{}: proposal dependency '{}' classified as in-flight (workspace execution marker)",
+                    change_id, dependency
+                ),
+                DependencyTargetClass::ActiveButNotQueued => format!(
+                    "{}: proposal dependency '{}' classified as active-but-not-queued (active change exists outside the queued set)",
                     change_id, dependency
                 ),
                 DependencyTargetClass::Archived => format!(

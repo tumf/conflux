@@ -352,8 +352,6 @@ async fn commit_workspace_change(
 async fn test_dependency_blocker_diagnostics_dedupe_and_reemit_on_signature_change() {
     let temp = TempDir::new().or_fail("unexpected error");
     let rejected_dir = temp.path().join("openspec/changes/dep-a");
-    std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
-    std::fs::write(rejected_dir.join("proposal.md"), "# Dep A\n").or_fail("unexpected error");
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
     let mut executor = ParallelExecutor::new(
@@ -390,6 +388,8 @@ async fn test_dependency_blocker_diagnostics_dedupe_and_reemit_on_signature_chan
         "unchanged missing blocker should emit once"
     );
 
+    std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
+    std::fs::write(rejected_dir.join("proposal.md"), "# Dep A\n").or_fail("unexpected error");
     std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED\n").or_fail("unexpected error");
     let third = executor
         .select_changes_for_dispatch(&analysis, 1, &in_flight)
@@ -2360,6 +2360,22 @@ fn selective_dependency_analysis_result<'a>(
     })
 }
 
+fn single_queued_route_depends_on_policy_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+            groups: None,
+        }
+    })
+}
+
 fn dependency_on_inflight_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     in_flight: &'a [String],
@@ -2591,6 +2607,194 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     );
 
     while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
+async fn test_single_queued_active_not_queued_dependency_blocks_dispatch_selection() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let policy_dir = repo_dir.path().join("openspec/changes/policy");
+    std::fs::create_dir_all(&policy_dir).or_fail("unexpected error");
+    std::fs::write(policy_dir.join("proposal.md"), "# Policy\n").or_fail("unexpected error");
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
+    assert!(
+        selected.is_empty(),
+        "route must not dispatch while policy is active but not queued"
+    );
+    let dependency_events = drain_dependency_events(&mut rx, "route");
+    assert_eq!(dependency_events, vec!["blocked:policy".to_string()]);
+}
+
+#[tokio::test]
+async fn test_single_queued_archived_dependency_can_dispatch() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let archived_dir = repo_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-13-policy");
+    std::fs::create_dir_all(&archived_dir).or_fail("unexpected error");
+    std::fs::write(archived_dir.join("proposal.md"), "# Policy\n").or_fail("unexpected error");
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
+    assert_eq!(selected, vec!["route".to_string()]);
+    assert!(
+        drain_dependency_events(&mut rx, "route").is_empty(),
+        "archived dependency should be satisfied without dependency-blocked events"
+    );
+}
+
+#[tokio::test]
+async fn test_single_queued_dependency_block_classes_fail_closed() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let rejected_dir = repo_dir.path().join("openspec/changes/rejected-policy");
+    std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
+    std::fs::write(rejected_dir.join("proposal.md"), "# Rejected Policy\n")
+        .or_fail("unexpected error");
+    std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED\n").or_fail("unexpected error");
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let in_flight = HashSet::from(["inflight-policy".to_string()]);
+
+    for dep_id in ["ghost", "rejected-policy", "inflight-policy"] {
+        let analysis_result = crate::analyzer::AnalysisResult {
+            order: vec![format!("route-{dep_id}")],
+            dependencies: HashMap::from([(format!("route-{dep_id}"), vec![dep_id.to_string()])]),
+            groups: None,
+        };
+        let selected = executor
+            .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+            .await;
+        assert!(
+            selected.is_empty(),
+            "dependency {dep_id} must fail closed before dispatch"
+        );
+    }
+
+    let mut blocked_events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::DependencyBlocked {
+            change_id,
+            dependency_ids,
+        } = event
+        {
+            blocked_events.push(format!("{change_id}:{}", dependency_ids.join(",")));
+        }
+    }
+    blocked_events.sort();
+    assert_eq!(
+        blocked_events,
+        vec![
+            "route-ghost:ghost".to_string(),
+            "route-inflight-policy:inflight-policy".to_string(),
+            "route-rejected-policy:rejected-policy".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_single_queued_active_dependency_does_not_emit_apply_started() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let policy_dir = repo_dir.path().join("openspec/changes/policy");
+    std::fs::create_dir_all(&policy_dir).or_fail("unexpected error");
+    std::fs::write(policy_dir.join("proposal.md"), "# Policy\n").or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut queued = vec![make_test_change("route")];
+    let mut in_flight = HashSet::new();
+
+    let (_should_break, _iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            1,
+            ReanalysisReason::QueueNotification,
+            &single_queued_route_depends_on_policy_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    assert!(
+        !in_flight.contains("route"),
+        "route must not enter in-flight while policy is active but not queued"
+    );
+
+    let mut saw_dependency_blocked = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::DependencyBlocked {
+                change_id,
+                dependency_ids,
+            } if change_id == "route" && dependency_ids == vec!["policy".to_string()] => {
+                saw_dependency_blocked = true;
+            }
+            ExecutionEvent::ApplyStarted { change_id, .. } if change_id == "route" => {
+                panic!("route must not emit ApplyStarted before policy resolves")
+            }
+            ExecutionEvent::ProcessingStarted(change_id) if change_id == "route" => {
+                panic!("route must not emit ProcessingStarted before policy resolves")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_dependency_blocked,
+        "active-but-not-queued dependency should emit DependencyBlocked"
+    );
 }
 
 #[tokio::test]

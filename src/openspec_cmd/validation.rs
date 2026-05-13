@@ -123,7 +123,9 @@ impl<'a> ValidationEngine<'a> {
                             errors.push(diagnostic.message)
                         }
                         DependencyTargetClass::Archived => warnings.push(diagnostic.message),
-                        DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                        DependencyTargetClass::Queued
+                        | DependencyTargetClass::InFlight
+                        | DependencyTargetClass::ActiveButNotQueued => {}
                         DependencyTargetClass::Error => unreachable!(
                             "proposal dependency classification cannot produce terminal-error state"
                         ),

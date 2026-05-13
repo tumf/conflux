@@ -5,8 +5,8 @@
 
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::dependency_targets::{
-    classify_dependency_target, collect_archived_change_ids, collect_rejected_change_ids,
-    union_metadata_dependencies, DependencyTargetClass,
+    classify_dependency_target, collect_active_change_ids, collect_archived_change_ids,
+    collect_rejected_change_ids, union_metadata_dependencies, DependencyTargetClass,
 };
 use crate::error::{OrchestratorError, Result};
 use crate::openspec::{Change, ProposalFrontmatterMetadata};
@@ -728,6 +728,8 @@ Rules:
     ) -> Result<()> {
         let queued_ids: Vec<&str> = changes.iter().map(|change| change.id.as_str()).collect();
         let in_flight_refs: Vec<&str> = in_flight_ids.iter().map(String::as_str).collect();
+        let active_ids = self.collect_active_change_ids();
+        let active_refs: Vec<&str> = active_ids.iter().map(String::as_str).collect();
 
         for (change_id, deps) in &result.dependencies {
             if deps.contains(change_id) {
@@ -742,10 +744,13 @@ Rules:
                     dep_id,
                     queued_ids.iter().copied(),
                     in_flight_refs.iter().copied(),
+                    active_refs.iter().copied(),
                     archived_ids,
                     rejected_ids,
                 ) {
-                    DependencyTargetClass::Queued | DependencyTargetClass::InFlight => {}
+                    DependencyTargetClass::Queued
+                    | DependencyTargetClass::InFlight
+                    | DependencyTargetClass::ActiveButNotQueued => {}
                     DependencyTargetClass::Error => unreachable!(
                         "repository-visible dependency classification cannot produce terminal-error state"
                     ),
@@ -759,17 +764,19 @@ Rules:
                     DependencyTargetClass::Rejected => {
                         let mut allowed_ids: Vec<String> = result.order.clone();
                         allowed_ids.extend(in_flight_ids.iter().cloned());
+                        allowed_ids.extend(active_ids.iter().cloned());
                         allowed_ids.extend(archived_ids.iter().cloned());
                         allowed_ids.extend(rejected_ids.iter().cloned());
                         allowed_ids.sort();
                         allowed_ids.dedup();
 
                         return Err(OrchestratorError::Parse(format!(
-                            "Rejected dependency reference: change '{}' depends on '{}' classified as rejected dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_archived_ids={:?}, allowed_rejected_ids={:?}, allowed_ids={:?}",
+                            "Rejected dependency reference: change '{}' depends on '{}' classified as rejected dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_active_ids={:?}, allowed_archived_ids={:?}, allowed_rejected_ids={:?}, allowed_ids={:?}",
                             change_id,
                             dep_id,
                             result.order,
                             in_flight_ids,
+                            active_ids,
                             archived_ids,
                             rejected_ids,
                             allowed_ids
@@ -778,17 +785,19 @@ Rules:
                     DependencyTargetClass::Missing => {
                         let mut allowed_ids: Vec<String> = result.order.clone();
                         allowed_ids.extend(in_flight_ids.iter().cloned());
+                        allowed_ids.extend(active_ids.iter().cloned());
                         allowed_ids.extend(archived_ids.iter().cloned());
                         allowed_ids.extend(rejected_ids.iter().cloned());
                         allowed_ids.sort();
                         allowed_ids.dedup();
 
                         return Err(OrchestratorError::Parse(format!(
-                            "Missing dependency reference: change '{}' depends on '{}' classified as missing dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_archived_ids={:?}, allowed_rejected_ids={:?}, allowed_ids={:?}",
+                            "Missing dependency reference: change '{}' depends on '{}' classified as missing dependency target. allowed_queued_ids={:?}, allowed_in_flight_ids={:?}, allowed_active_ids={:?}, allowed_archived_ids={:?}, allowed_rejected_ids={:?}, allowed_ids={:?}",
                             change_id,
                             dep_id,
                             result.order,
                             in_flight_ids,
+                            active_ids,
                             archived_ids,
                             rejected_ids,
                             allowed_ids
@@ -801,6 +810,10 @@ Rules:
         self.detect_cycles_from_dependencies(&result.dependencies)?;
 
         Ok(())
+    }
+
+    fn collect_active_change_ids(&self) -> HashSet<String> {
+        collect_active_change_ids(Path::new("."))
     }
 
     fn collect_archived_change_ids(&self) -> HashSet<String> {
@@ -836,12 +849,15 @@ Rules:
 
         let queued_ids: Vec<&str> = changes.iter().map(|c| c.id.as_str()).collect();
         let in_flight_set: HashSet<&str> = in_flight_ids.iter().map(|id| id.as_str()).collect();
+        let active_ids = self.collect_active_change_ids();
+        let active_refs: Vec<&str> = active_ids.iter().map(String::as_str).collect();
 
         let rejected_ids = self.collect_rejected_change_ids();
         let classification = classify_dependency_target(
             dep_id,
             queued_ids.iter().copied(),
             in_flight_set.iter().copied(),
+            active_refs.iter().copied(),
             archived_ids,
             &rejected_ids,
         );
@@ -1536,6 +1552,33 @@ That's all."#;
 
         assert_eq!(
             result.dependencies.get("route"),
+            Some(&vec!["policy".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_validate_dependency_graph_accepts_active_but_not_queued_dependency() {
+        let analyzer = create_test_analyzer();
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let policy_dir = temp_dir.path().join("openspec/changes/policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("proposal.md"), "# Policy").unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+
+        let mut route = create_test_change("route");
+        route.dependencies = vec!["policy".to_string()];
+        let result =
+            analyzer.parse_response(r#"{"order":["route"],"dependencies":{}}"#, &[route], &[]);
+
+        std::env::set_current_dir(original_dir).unwrap();
+        assert!(
+            result.is_ok(),
+            "active-but-not-queued metadata dependency should be retained for scheduler gating"
+        );
+        assert_eq!(
+            result.unwrap().dependencies.get("route"),
             Some(&vec!["policy".to_string()])
         );
     }

@@ -14,6 +14,7 @@ use tracing::warn;
 pub(crate) enum DependencyTargetClass {
     Queued,
     InFlight,
+    ActiveButNotQueued,
     Archived,
     Rejected,
     Error,
@@ -25,6 +26,7 @@ impl DependencyTargetClass {
         match self {
             Self::Queued => "queued",
             Self::InFlight => "in-flight",
+            Self::ActiveButNotQueued => "active-but-not-queued",
             Self::Archived => "archived",
             Self::Rejected => "rejected",
             Self::Error => "errored",
@@ -55,6 +57,7 @@ pub(crate) fn classify_dependency_target<'a>(
     dep_id: &str,
     queued_ids: impl IntoIterator<Item = &'a str>,
     in_flight_ids: impl IntoIterator<Item = &'a str>,
+    active_ids: impl IntoIterator<Item = &'a str>,
     archived_ids: &HashSet<String>,
     rejected_ids: &HashSet<String>,
 ) -> DependencyTargetClass {
@@ -66,9 +69,35 @@ pub(crate) fn classify_dependency_target<'a>(
         DependencyTargetClass::InFlight
     } else if queued_ids.into_iter().any(|id| id == dep_id) {
         DependencyTargetClass::Queued
+    } else if active_ids.into_iter().any(|id| id == dep_id) {
+        DependencyTargetClass::ActiveButNotQueued
     } else {
         DependencyTargetClass::Missing
     }
+}
+
+/// Collect active, non-archived change IDs under `openspec/changes`.
+pub(crate) fn collect_active_change_ids(repo_root: &Path) -> HashSet<String> {
+    let changes_dir = repo_root.join("openspec/changes");
+    let Ok(entries) = std::fs::read_dir(changes_dir) else {
+        return HashSet::new();
+    };
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "archive"
+                || name.starts_with('.')
+                || !path.is_dir()
+                || !path.join("proposal.md").exists()
+            {
+                return None;
+            }
+            Some(name)
+        })
+        .collect()
 }
 
 /// Collect archive IDs from `openspec/changes/archive` under a repository root.
@@ -157,6 +186,7 @@ mod tests {
                 "queued-a",
                 ["queued-a"].into_iter(),
                 [].into_iter(),
+                [].into_iter(),
                 &archived,
                 &rejected,
             ),
@@ -167,6 +197,7 @@ mod tests {
                 "flight-a",
                 [].into_iter(),
                 ["flight-a"].into_iter(),
+                [].into_iter(),
                 &archived,
                 &rejected,
             ),
@@ -174,7 +205,19 @@ mod tests {
         );
         assert_eq!(
             classify_dependency_target(
+                "active-a",
+                [].into_iter(),
+                [].into_iter(),
+                ["active-a"].into_iter(),
+                &archived,
+                &rejected,
+            ),
+            DependencyTargetClass::ActiveButNotQueued
+        );
+        assert_eq!(
+            classify_dependency_target(
                 "archived-a",
+                [].into_iter(),
                 [].into_iter(),
                 [].into_iter(),
                 &archived,
@@ -187,6 +230,7 @@ mod tests {
                 "rejected-a",
                 ["rejected-a"].into_iter(),
                 [].into_iter(),
+                [].into_iter(),
                 &archived,
                 &rejected,
             ),
@@ -195,6 +239,7 @@ mod tests {
         assert_eq!(
             classify_dependency_target(
                 "missing-a",
+                [].into_iter(),
                 [].into_iter(),
                 [].into_iter(),
                 &archived,
@@ -219,6 +264,28 @@ mod tests {
 
         assert!(rejected.contains("rejected-a"));
         assert!(!rejected.contains("active-a"));
+    }
+
+    #[test]
+    fn collects_active_change_ids_from_repository_markers() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let changes_dir = temp_dir.path().join("openspec/changes");
+        std::fs::create_dir_all(changes_dir.join("active-a")).unwrap();
+        std::fs::write(changes_dir.join("active-a/proposal.md"), "# Active\n").unwrap();
+        std::fs::create_dir_all(changes_dir.join("archive/2026-05-13-done-a")).unwrap();
+        std::fs::write(
+            changes_dir.join("archive/2026-05-13-done-a/proposal.md"),
+            "# Done\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(changes_dir.join("no-proposal")).unwrap();
+
+        let active = collect_active_change_ids(temp_dir.path());
+
+        assert!(active.contains("active-a"));
+        assert!(!active.contains("archive"));
+        assert!(!active.contains("no-proposal"));
+        assert!(!active.contains("done-a"));
     }
 
     #[test]
