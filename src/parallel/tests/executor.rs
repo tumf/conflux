@@ -4893,6 +4893,117 @@ fn test_stale_retry_reason_allows_existing_workspace_path() {
     assert!(ParallelExecutor::stale_retry_reason(&workspace).is_none());
 }
 
+#[tokio::test]
+async fn test_missing_workspace_retry_clears_resolve_wait_in_reducer() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "manual retry requested".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    executor.retry_deferred_merges().await;
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(
+        executor.resolve_wait_changes.is_empty(),
+        "missing archived workspace must not leave executor-local ResolveWait pending"
+    );
+    assert!(
+        shared.read().await.resolve_wait_change_ids().is_empty(),
+        "missing archived workspace must clear reducer-owned ResolveWait"
+    );
+    assert_ne!(
+        shared.read().await.display_status("alpha"),
+        "resolve pending",
+        "TUI display must not remain indefinitely resolve pending after missing workspace handling"
+    );
+
+    let mut saw_retry_dispatch = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log
+                .message
+                .contains("ResolveWait retry dispatch started for 'alpha'")
+            {
+                saw_retry_dispatch = true;
+            }
+        }
+    }
+    assert!(
+        saw_retry_dispatch,
+        "missing workspace path must still prove retry evaluation ran"
+    );
+}
+
+#[tokio::test]
+async fn test_stale_workspace_retry_clears_resolve_wait_in_reducer() {
+    use std::sync::Arc;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    let stale_path = workspace_dir.path().join("deleted-workspace");
+    init_git_repo(repo_dir.path()).await;
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("alpha", stale_path),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "manual retry requested".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    executor.retry_deferred_merges().await;
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+
+    assert!(executor.resolve_wait_changes.is_empty());
+    assert!(shared.read().await.resolve_wait_change_ids().is_empty());
+    assert_ne!(
+        shared.read().await.display_status("alpha"),
+        "resolve pending"
+    );
+}
+
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_once() {
