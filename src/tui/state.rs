@@ -973,6 +973,10 @@ impl AppState {
                 continue;
             }
 
+            if matches!(display_map.get(&change.id).copied(), Some("queued")) {
+                change.selected = true;
+            }
+
             if let Some(&status_str) = display_map.get(&change.id) {
                 let normalized = match status_str {
                     "stopped" => "not queued",
@@ -2373,6 +2377,85 @@ mod tests {
         assert!(app.logs.iter().any(|log| log
             .message
             .contains("Retry mark cleared and removed from queue: test-change")));
+    }
+
+    #[test]
+    fn running_not_queued_toggle_survives_reducer_sync_and_changes_refreshed() {
+        let changes = vec![create_test_change("dynamic-change", 0, 1)];
+        let mut app = AppState::new(changes.clone());
+        app.mode = AppMode::Running;
+
+        let command = app.toggle_selection();
+        assert!(matches!(command, Some(TuiCommand::AddToQueue(ref id)) if id == "dynamic-change"));
+        assert!(app.changes[0].selected);
+
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "dynamic-change".to_string(),
+            "queued",
+        )]));
+        app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
+            changes,
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+
+        assert!(
+            app.changes[0].selected,
+            "execution mark must survive refresh"
+        );
+        assert_eq!(app.changes[0].display_status_cache, "queued");
+    }
+
+    #[test]
+    fn reducer_sync_marks_queued_rows_selected_for_running_unqueue() {
+        let changes = vec![create_test_change("queued-change", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "queued-change".to_string(),
+            "queued",
+        )]));
+
+        assert!(
+            app.changes[0].selected,
+            "queued reducer intent should show as marked"
+        );
+        let command = app.toggle_selection();
+        assert!(
+            matches!(command, Some(TuiCommand::RemoveFromQueue(ref id)) if id == "queued-change")
+        );
+        assert!(!app.changes[0].selected);
+    }
+
+    #[test]
+    fn active_status_survives_reducer_sync_and_changes_refreshed() {
+        let changes = vec![create_test_change("active-change", 0, 1)];
+        let mut app = AppState::new(changes.clone());
+        app.mode = AppMode::Running;
+        app.changes[0].set_display_status_cache("queued");
+        app.changes[0].selected = true;
+
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "active-change".to_string(),
+            "applying",
+        )]));
+        app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
+            changes,
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+
+        assert_eq!(app.changes[0].display_status_cache, "applying");
+        assert!(app.changes[0].selected);
     }
 
     #[test]
