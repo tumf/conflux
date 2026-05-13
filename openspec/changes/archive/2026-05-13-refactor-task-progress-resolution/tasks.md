@@ -8,7 +8,7 @@
 
 - [x] 4. acceptance follow-up 書き込みの既存挙動を保持したまま、進捗 path resolution から責務を分離する。verification: unit - `cargo test record_acceptance_follow_up` が成功し、既存 section の置換、空 findings の既定文言、末尾改行処理が維持されている。completion: follow-up 書き込みロジックが進捗ファイル探索の helper と混ざらず、テストで追跡可能になっている。
 
-- [x] 5. 最終回帰確認を実行する。verification: integration - `cargo fmt --check` と `cargo test` が成功する。completion: 既定テストスイートが成功し、CLI/API の公開挙動変更がないことを確認している。
+- [x] 5. 最終回帰確認を実行する。(verification: integration - `cargo fmt --check` と `cargo test` が成功する。) completion: 既定テストスイートが成功し、CLI/API の公開挙動変更がないことを確認している。
 
 ## Future Work
 
