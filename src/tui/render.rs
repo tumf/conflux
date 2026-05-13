@@ -2731,6 +2731,32 @@ mod tests {
     }
 
     #[test]
+    fn running_header_count_reflects_reducer_synced_active_status_after_refresh() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.changes[0].selected = true;
+        app.apply_display_statuses_from_reducer(&std::collections::HashMap::from([(
+            "change-a".to_string(),
+            "accepting",
+        )]));
+
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(
+            content.contains("[Running 1]"),
+            "header should count reducer-synced accepting row, but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("[Running 2]"),
+            "header should not count queued rows in addition to active row, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
     fn test_select_mode_shows_ready_even_when_resolving_exists() {
         let mut app = create_test_app(vec![
             create_test_change("change-a"),

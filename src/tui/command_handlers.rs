@@ -273,6 +273,9 @@ pub async fn handle_tui_command(
                 )));
                 return Ok(None);
             }
+            ctx.app.apply_display_statuses_from_reducer(
+                &shared_state.read().await.all_display_statuses(),
+            );
             // Push to dynamic queue for orchestrator to pick up
             if ctx.dynamic_queue.push(id.clone()).await {
                 ctx.app
@@ -288,6 +291,9 @@ pub async fn handle_tui_command(
                 .write()
                 .await
                 .apply_command(ReducerCommand::RemoveFromQueue(id.clone()));
+            ctx.app.apply_display_statuses_from_reducer(
+                &shared_state.read().await.all_display_statuses(),
+            );
             // Remove from dynamic queue so orchestrator won't process it
             let removed_from_dynamic = ctx.dynamic_queue.remove(&id).await;
             let removed_from_pending = ctx.dynamic_queue.mark_removed(id.clone()).await;
@@ -1197,6 +1203,65 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("Already in dynamic queue: change-a")));
+    }
+
+    #[tokio::test]
+    async fn remove_from_queue_updates_reducer_snapshot_and_dynamic_queue() {
+        let (tx, _rx) = mpsc::channel(16);
+        let dynamic_queue = DynamicQueue::new();
+        let config = create_test_config();
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+
+        dynamic_queue.push("change-a".to_string()).await;
+        shared_state
+            .write()
+            .await
+            .apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
+        app.apply_display_statuses_from_reducer(&shared_state.read().await.all_display_statuses());
+        assert!(app.changes[0].selected);
+        assert_eq!(app.changes[0].display_status_cache, "queued");
+
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle = handle_tui_command(
+            TuiCommand::RemoveFromQueue("change-a".to_string()),
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("remove-from-queue command should succeed");
+
+        assert!(handle.is_none());
+        assert_eq!(
+            shared_state.read().await.display_status("change-a"),
+            "not queued"
+        );
+        assert_eq!(ctx.app.changes[0].display_status_cache, "not queued");
+        assert!(!dynamic_queue.contains("change-a").await);
+        assert_eq!(
+            dynamic_queue.drain_removed().await,
+            vec!["change-a".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -80,6 +80,82 @@ fn should_bypass_local_refresh(is_remote_mode: bool) -> bool {
     is_remote_mode
 }
 
+fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> bool {
+    use crate::events::ExecutionEvent;
+
+    match event {
+        // Reducer-visible lifecycle and workspace observations that derive TUI display status,
+        // queue intent, active counts, wait states, or terminal state.
+        ExecutionEvent::ProcessingStarted(_)
+        | ExecutionEvent::ProcessingCompleted(_)
+        | ExecutionEvent::ProcessingError { .. }
+        | ExecutionEvent::ApplyStarted { .. }
+        | ExecutionEvent::ApplyCompleted { .. }
+        | ExecutionEvent::ApplyFailed { .. }
+        | ExecutionEvent::ArchiveStarted { .. }
+        | ExecutionEvent::ArchiveResumed { .. }
+        | ExecutionEvent::ArchiveRetryScheduled { .. }
+        | ExecutionEvent::ChangeArchived(_)
+        | ExecutionEvent::ArchiveFailed { .. }
+        | ExecutionEvent::AcceptanceStarted { .. }
+        | ExecutionEvent::AcceptanceCompleted { .. }
+        | ExecutionEvent::AcceptanceFailed { .. }
+        | ExecutionEvent::ChangeRejected { .. }
+        | ExecutionEvent::RejectionReviewCompleted { .. }
+        | ExecutionEvent::RejectionReviewFailed { .. }
+        | ExecutionEvent::WorkspaceStatusUpdated { .. }
+        | ExecutionEvent::MergeCompleted { .. }
+        | ExecutionEvent::MergeDeferred { .. }
+        | ExecutionEvent::ResolveStarted { .. }
+        | ExecutionEvent::ResolveCompleted { .. }
+        | ExecutionEvent::ResolveFailed { .. }
+        | ExecutionEvent::DependencyBlocked { .. }
+        | ExecutionEvent::DependencyResolved { .. }
+        | ExecutionEvent::AcceptanceGated { .. }
+        | ExecutionEvent::ExecutionBlocked { .. }
+        | ExecutionEvent::ChangeDequeued { .. }
+        | ExecutionEvent::ChangeStopped { .. }
+        | ExecutionEvent::ChangesRefreshed { .. } => true,
+
+        // Presentation-only or unrelated TUI events do not affect reducer display state.
+        ExecutionEvent::ApplyOutput { .. }
+        | ExecutionEvent::ArchiveOutput { .. }
+        | ExecutionEvent::AcceptanceOutput { .. }
+        | ExecutionEvent::ProgressUpdated { .. }
+        | ExecutionEvent::WorkspaceCreated { .. }
+        | ExecutionEvent::WorkspaceResumed { .. }
+        | ExecutionEvent::WorkspacePreserved { .. }
+        | ExecutionEvent::CleanupStarted { .. }
+        | ExecutionEvent::CleanupCompleted { .. }
+        | ExecutionEvent::MergeStarted { .. }
+        | ExecutionEvent::MergeConflict { .. }
+        | ExecutionEvent::ConflictResolutionStarted
+        | ExecutionEvent::ConflictResolutionCompleted
+        | ExecutionEvent::ConflictResolutionFailed { .. }
+        | ExecutionEvent::ChangeSkipped { .. }
+        | ExecutionEvent::AnalysisStarted { .. }
+        | ExecutionEvent::AnalysisOutput { .. }
+        | ExecutionEvent::AnalysisCompleted { .. }
+        | ExecutionEvent::ResolveOutput { .. }
+        | ExecutionEvent::HookStarted { .. }
+        | ExecutionEvent::HookCompleted { .. }
+        | ExecutionEvent::HookFailed { .. }
+        | ExecutionEvent::Warning { .. }
+        | ExecutionEvent::ParallelStartRejected { .. }
+        | ExecutionEvent::Log(_)
+        | ExecutionEvent::Stopping
+        | ExecutionEvent::Stopped
+        | ExecutionEvent::AllCompleted
+        | ExecutionEvent::Error { .. }
+        | ExecutionEvent::WorktreesRefreshed { .. }
+        | ExecutionEvent::BranchMergeStarted { .. }
+        | ExecutionEvent::BranchMergeCompleted { .. }
+        | ExecutionEvent::BranchMergeFailed { .. }
+        | ExecutionEvent::ChangeStopFailed { .. }
+        | ExecutionEvent::RemoteChangeUpdate { .. } => false,
+    }
+}
+
 pub async fn run_tui_with_remote(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
@@ -780,28 +856,13 @@ async fn run_tui_loop(
 
         // Handle orchestrator events
         while let Ok(event) = rx.try_recv() {
-            // Apply resolve lifecycle events and ChangesRefreshed to shared state.
+            // Apply reducer-visible events to shared state before syncing display caches.
             //
             // Phase 5.1: workspace observations drive the shared reducer (ChangesRefreshed).
-            // Phase 5.2: manual resolve lifecycle events must also update shared reducer so
-            //   that ResolveWait is cleared before the next ChangesRefreshed sync; otherwise
-            //   apply_observation keeps the stale ResolveWait and apply_display_statuses_from_reducer
-            //   regresses a locally-Merged row back to "resolve pending".
+            // Phase 5.2: lifecycle events must also update shared reducer so active, wait,
+            //   terminal, and queue states cannot be regressed by the next display snapshot.
             // Phase 6.1: TUI derives queue_status from the reducer display snapshot.
-            let apply_to_reducer = matches!(
-                &event,
-                crate::events::ExecutionEvent::ChangesRefreshed { .. }
-                    | crate::events::ExecutionEvent::ResolveStarted { .. }
-                    | crate::events::ExecutionEvent::ResolveCompleted { .. }
-                    | crate::events::ExecutionEvent::ResolveFailed { .. }
-                    | crate::events::ExecutionEvent::MergeDeferred { .. }
-                    | crate::events::ExecutionEvent::ChangeArchived(_)
-                    | crate::events::ExecutionEvent::MergeCompleted { .. }
-                    | crate::events::ExecutionEvent::WorkspaceStatusUpdated { .. }
-                    | crate::events::ExecutionEvent::RejectionReviewCompleted { .. }
-                    | crate::events::ExecutionEvent::RejectionReviewFailed { .. }
-            );
-            if apply_to_reducer {
+            if should_apply_event_to_tui_reducer(&event) {
                 let display_map = {
                     let mut state = shared_state.write().await;
                     state.apply_execution_event(&event);
@@ -915,7 +976,192 @@ async fn run_tui_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::is_refresh_root_usable;
+    use super::{is_refresh_root_usable, should_apply_event_to_tui_reducer};
+    use crate::events::{ExecutionEvent, RejectionOutcome, StalledBlocker};
+    use crate::openspec::{Change, ProposalMetadata};
+    use crate::vcs::WorkspaceStatus;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+
+    fn sample_change() -> Change {
+        Change {
+            id: "change-a".to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: ProposalMetadata::default(),
+        }
+    }
+
+    fn empty_changes_refreshed_event() -> ExecutionEvent {
+        ExecutionEvent::ChangesRefreshed {
+            changes: vec![sample_change()],
+            committed_change_ids: HashSet::new(),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::new(),
+            worktree_paths: HashMap::<String, PathBuf>::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        }
+    }
+
+    fn stalled_blocker() -> StalledBlocker {
+        StalledBlocker::acceptance_infrastructure("managed verification job still running")
+    }
+
+    #[test]
+    fn tui_reducer_sync_includes_running_lifecycle_display_events() {
+        let reducer_visible_events = vec![
+            ExecutionEvent::ProcessingStarted("change-a".to_string()),
+            ExecutionEvent::ProcessingCompleted("change-a".to_string()),
+            ExecutionEvent::ProcessingError {
+                id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            },
+            ExecutionEvent::ApplyCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-a".to_string(),
+            },
+            ExecutionEvent::ApplyFailed {
+                change_id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::AcceptanceStarted {
+                change_id: "change-a".to_string(),
+                command: "accept".to_string(),
+            },
+            ExecutionEvent::AcceptanceCompleted {
+                change_id: "change-a".to_string(),
+            },
+            ExecutionEvent::AcceptanceFailed {
+                change_id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::ArchiveStarted {
+                change_id: "change-a".to_string(),
+                command: "archive".to_string(),
+            },
+            ExecutionEvent::ArchiveResumed {
+                change_id: "change-a".to_string(),
+                reason: Some("resume".to_string()),
+                summary: Some("resume archive".to_string()),
+            },
+            ExecutionEvent::ArchiveRetryScheduled {
+                change_id: "change-a".to_string(),
+                attempt: 1,
+                max_attempts: 2,
+                reason: Some("retry".to_string()),
+                summary: Some("retry archive".to_string()),
+            },
+            ExecutionEvent::ChangeArchived("change-a".to_string()),
+            ExecutionEvent::ArchiveFailed {
+                change_id: "change-a".to_string(),
+                error: "boom".to_string(),
+                reason: Some("failed".to_string()),
+                summary: Some("archive failed".to_string()),
+            },
+            ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "dirty base".to_string(),
+                auto_resumable: true,
+            },
+            ExecutionEvent::MergeCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-a".to_string(),
+            },
+            ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "resolve".to_string(),
+            },
+            ExecutionEvent::ResolveCompleted {
+                change_id: "change-a".to_string(),
+                worktree_change_ids: None,
+            },
+            ExecutionEvent::ResolveFailed {
+                change_id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-a".to_string(),
+                status: WorkspaceStatus::Applying,
+            },
+            ExecutionEvent::RejectionReviewCompleted {
+                change_id: "change-a".to_string(),
+                outcome: RejectionOutcome::Resume,
+            },
+            ExecutionEvent::RejectionReviewFailed {
+                change_id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::DependencyBlocked {
+                change_id: "change-a".to_string(),
+                dependency_ids: vec!["dep".to_string()],
+            },
+            ExecutionEvent::DependencyResolved {
+                change_id: "change-a".to_string(),
+            },
+            ExecutionEvent::AcceptanceGated {
+                change_id: "change-a".to_string(),
+                blocker: stalled_blocker(),
+            },
+            ExecutionEvent::ExecutionBlocked {
+                change_id: "change-a".to_string(),
+                blocker: stalled_blocker(),
+            },
+            ExecutionEvent::ChangeDequeued {
+                change_id: "change-a".to_string(),
+            },
+            ExecutionEvent::ChangeStopped {
+                change_id: "change-a".to_string(),
+            },
+            empty_changes_refreshed_event(),
+        ];
+
+        for event in reducer_visible_events {
+            assert!(
+                should_apply_event_to_tui_reducer(&event),
+                "event should sync to TUI reducer before display snapshot: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_reducer_sync_excludes_presentation_only_events() {
+        let presentation_events = vec![
+            ExecutionEvent::ApplyOutput {
+                change_id: "change-a".to_string(),
+                output: "chunk".to_string(),
+                iteration: Some(1),
+            },
+            ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 1,
+                total: 2,
+            },
+            ExecutionEvent::Log(crate::events::LogEntry::info("hello")),
+            ExecutionEvent::WorktreesRefreshed { worktrees: vec![] },
+            ExecutionEvent::RemoteChangeUpdate {
+                id: "change-a".to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                status: Some("applying".to_string()),
+                iteration_number: Some(1),
+            },
+        ];
+
+        for event in presentation_events {
+            assert!(
+                !should_apply_event_to_tui_reducer(&event),
+                "presentation-only event should not sync to TUI reducer: {event:?}"
+            );
+        }
+    }
 
     #[test]
     fn refresh_root_usable_for_existing_directory() {
