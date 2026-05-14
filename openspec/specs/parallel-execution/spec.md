@@ -2115,9 +2115,11 @@ When a scheduler is started with zero normal queued changes solely to consume re
 
 If retry evaluation observes stale, missing, or manually blocked retry prerequisites, the scheduler MUST feed visible reducer evidence that clears scheduler-owned pending membership and transitions the change to `merge wait` or an explicit error/stalled state with a reason. It MUST NOT leave a change indefinitely visible as `resolve pending` when no scheduler-consumable retry work remains.
 
+Internal helper names or comments used by this retry-clearing path SHOULD describe stale, missing, already-merged, and success outcomes neutrally. They MUST NOT make stale or missing workspace cleanup look like successful merge completion.
+
 Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer state), scheduler loop is the **sole execution owner** for merge/resolve retry start, and reducer completion events (`ResolveCompleted`/`ResolveFailed`/`MergeDeferred`/`MergeCompleted`) are the **sole authority** for clearing or transitioning wait state.
 
-<!-- Expected canonical result after archive: `parallel-execution` will require zero-change manual resolve scheduler startup to consume shared reducer lane-wait work before completion and to demote stale retry evidence visibly. -->
+<!-- Expected canonical result after archive: `parallel-execution` will clarify that retry intent clearing helpers should describe outcome semantics rather than success-only semantics. -->
 
 #### Scenario: M key registers retry intent instead of direct execution
 
@@ -2125,74 +2127,6 @@ Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer 
 - **WHEN** the user presses `M`
 - **THEN** the system records scheduler-visible retry intent for `alpha`
 - **AND** the TUI command path does not directly execute `resolve_deferred_merge(...)`
-
-#### Scenario: queued change still dispatches while another change is resolving
-
-- **GIVEN** change `alpha` is already in `Resolving` and consumes one execution slot
-- **AND** `max_parallelism` is greater than one so at least one slot remains available
-- **AND** change `beta` is newly queued
-- **AND** change `gamma` has scheduler-visible retry intent from `MergeWait`
-- **WHEN** the scheduler evaluates re-analysis and dispatch from observable state
-- **THEN** the scheduler may dispatch `beta` using the remaining available slot
-- **AND** retry intent for `gamma` does not by itself suppress `beta` analysis or dispatch
-
-#### Scenario: running scheduler promotes one clean ResolveWait retry
-
-- **GIVEN** the scheduler is running
-- **AND** no resolve/base-mutating operation is active
-- **AND** changes `alpha` and `beta` are in reducer-owned `ResolveWait`
-- **AND** retry preconditions for both are clean
-- **WHEN** the scheduler evaluates pending base-mutating lane waiters
-- **THEN** exactly one of `alpha` or `beta` SHALL start resolving
-- **AND** the other SHALL remain `resolve pending`
-
-#### Scenario: manual resolve intent progresses after unrelated apply completes
-
-- **GIVEN** change `alpha` is in `MergeWait`
-- **AND** change `beta` is applying or archiving in the same scheduler run
-- **WHEN** the user presses `M` for `alpha`
-- **THEN** the reducer records `alpha` in `ResolveWait`
-- **AND** the scheduler continues `beta` apply/archive progress
-- **WHEN** `beta` completes and the base-mutating lane is free
-- **THEN** the scheduler retries the preserved merge for `alpha` without requiring another `M` keypress
-- **AND** `alpha` does not remain indefinitely in `resolve pending` solely because `beta` was active when retry intent was registered
-
-#### Scenario: dirty base demotes ResolveWait to MergeWait when no lane occupant exists
-
-- **GIVEN** change `alpha` is in reducer-owned `ResolveWait`
-- **AND** no other change is actively `Resolving` or `Rejecting`
-- **AND** the base repository has uncommitted changes or a merge-in-progress marker requiring manual cleanup
-- **WHEN** the scheduler evaluates pending base-mutating lane waiters for `alpha`
-- **THEN** the scheduler emits a concrete manual deferral for `alpha`
-- **AND** the reducer display status for `alpha` becomes `merge wait`
-- **AND** `alpha` is not returned by `resolve_wait_change_ids()`
-
-#### Scenario: dirty-to-clean base transition retries ResolveWait without another keypress
-
-- **GIVEN** change `alpha` is in reducer-owned `ResolveWait`
-- **AND** a prior scheduler evaluation observed the base repository as dirty
-- **AND** the operator cleans the base repository without pressing `M` again
-- **WHEN** the scheduler next evaluates pending base-mutating lane waiters with a clean base and free lane
-- **THEN** `alpha` is promoted to `resolving` or successfully merged through scheduler-owned retry execution
-- **AND** `alpha` does not remain indefinitely in `resolve pending`
-
-#### Scenario: zero-change manual retry startup consumes ResolveWait
-
-- **GIVEN** change `alpha` is archive-complete and visible as `merge wait`
-- **AND** cflx has been restarted so no scheduler is currently running
-- **WHEN** the user presses `M` for `alpha`
-- **THEN** the TUI records reducer-owned `ResolveWait(alpha)` and starts a scheduler with zero normal queued changes
-- **AND** the scheduler synchronizes `ResolveWait(alpha)` from the same shared reducer state
-- **AND** the scheduler evaluates the retry instead of completing as `0 changes processed`
-- **AND** `alpha` transitions to `resolving`, `merged`, `merge wait` with visible reason, or an explicit error/stalled state
-
-#### Scenario: zero-change startup cannot report success while ResolveWait remains
-
-- **GIVEN** a scheduler run has zero normal queued changes
-- **AND** shared reducer state still contains `ResolveWait(alpha)` or `RejectWait(alpha)`
-- **WHEN** the run reaches an idle/completion decision
-- **THEN** it MUST NOT emit successful completion or `AllCompleted`
-- **AND** it MUST continue retry evaluation or surface visible reducer evidence that clears the pending membership
 
 #### Scenario: stale retry evidence clears resolve pending visibly
 
@@ -2202,6 +2136,13 @@ Canonical rule: `M` is **intent-only** (`ResolveWait` request in shared reducer 
 - **THEN** scheduler-owned `ResolveWait(alpha)` is cleared
 - **AND** `alpha` becomes visible as `merge wait` or explicit error/stalled state with a reason
 - **AND** `alpha` does not remain indefinitely in `resolve pending`
+
+#### Scenario: retry-clearing helper wording is outcome-neutral
+
+- **GIVEN** the scheduler clears `ResolveWait` for an already-merged, missing-workspace, stale-workspace, or successful-merge outcome
+- **WHEN** a maintainer reads the helper name or comments in the retry-clearing path
+- **THEN** the wording indicates a terminal/no-longer-retryable outcome
+- **AND** it does not describe stale or missing workspace cleanup as success
 
 ### Requirement: Managed worktree apply MUST run post-apply cleanup review before acceptance handoff
 
