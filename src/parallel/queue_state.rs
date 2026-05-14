@@ -96,7 +96,7 @@ impl ParallelExecutor {
         }
     }
 
-    pub(super) async fn clear_resolve_wait_intent_for_success(&mut self, change_id: &str) {
+    pub(super) async fn clear_resolve_wait_intent_for_outcome(&mut self, change_id: &str) {
         self.resolve_wait_changes.remove(change_id);
         self.last_dispatched_resolve_wait_changes.remove(change_id);
         if let Some(shared) = &self.shared_orchestrator_state {
@@ -847,7 +847,7 @@ impl ParallelExecutor {
                     "Skipping stale deferred merge retry for '{}' because it is already merged to base",
                     change_id
                 );
-                self.clear_resolve_wait_intent_for_success(&change_id).await;
+                self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                 continue;
             }
 
@@ -873,7 +873,7 @@ impl ParallelExecutor {
                         change_id
                     );
                     // Remove from deferred set; the workspace is gone, nothing to retry.
-                    self.clear_resolve_wait_intent_for_success(&change_id).await;
+                    self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                     continue;
                 }
                 Err(e) => {
@@ -893,7 +893,7 @@ impl ParallelExecutor {
                     stale_reason = %stale_reason,
                     "Deferred merge retry workspace path is stale; clearing retry intent"
                 );
-                self.clear_resolve_wait_intent_for_success(&change_id).await;
+                self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                 continue;
             }
 
@@ -938,7 +938,7 @@ impl ParallelExecutor {
                         {
                             let message = on_merged_failure_message(&change_id, &e);
                             error!("{}", message);
-                            self.clear_resolve_wait_intent_for_success(&change_id).await;
+                            self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                             self.mark_on_merged_failure_in_shared_state(&change_id, &message)
                                 .await;
                             send_event(
@@ -962,7 +962,7 @@ impl ParallelExecutor {
                         }
                     }
 
-                    self.clear_resolve_wait_intent_for_success(&change_id).await;
+                    self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                     self.mark_deferred_merge_completed_in_shared_state(&change_id, &revision)
                         .await;
 
