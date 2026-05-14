@@ -4576,6 +4576,106 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
 }
 
 #[tokio::test]
+async fn test_archived_dirty_reconciliation_skips_manual_merge_wait() {
+    use crate::events::ExecutionEvent;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    init_git_repo(workspace_dir.path()).await;
+
+    let change_id = "add-session-signers";
+    let archive_dir = workspace_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-14-add-session-signers");
+    std::fs::write(workspace_dir.path().join("base-only.txt"), "base\n")
+        .or_fail("write base content");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(workspace_dir.path())
+        .output()
+        .await
+        .or_fail("git add base content");
+    Command::new("git")
+        .args(["commit", "-m", "base before archived workspace"])
+        .current_dir(workspace_dir.path())
+        .output()
+        .await
+        .or_fail("git commit base content");
+    std::fs::create_dir_all(&archive_dir).or_fail("create archived change dir");
+    std::fs::write(archive_dir.join("proposal.md"), "# Add session signers\n")
+        .or_fail("write archived proposal");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Archive move completed\n",
+    )
+    .or_fail("write archived tasks");
+    std::fs::write(
+        archive_dir.join("report.md"),
+        "# uncommitted archive report\n",
+    )
+    .or_fail("leave archived workspace dirty");
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let config = create_test_config();
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived(change_id.to_string()));
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: change_id.to_string(),
+            reason: "base has unresolved conflicts".to_string(),
+            auto_resumable: false,
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    let added = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+    let rediscovered = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(added.total_added(), 0);
+    assert_eq!(rediscovered.total_added(), 0);
+    assert!(queued.is_empty());
+    assert!(shared.read().await.queued_change_ids().is_empty());
+    assert_eq!(
+        shared.read().await.merge_wait_change_ids(),
+        vec![change_id.to_string()]
+    );
+
+    let mut manual_wait_diagnostic_count = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::events::ExecutionEvent::Log(log) = event {
+            assert!(
+                !log.message.contains("archived_dirty_repair_candidate"),
+                "manual merge-wait worktree must not be requeued as archived-dirty repair: {}",
+                log.message
+            );
+            if log.message.contains("manual_merge_wait") {
+                manual_wait_diagnostic_count += 1;
+            }
+        }
+    }
+    assert_eq!(manual_wait_diagnostic_count, 1);
+}
+
+#[tokio::test]
 async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_retry() {
     use tempfile::TempDir;
     use tokio::sync::mpsc;

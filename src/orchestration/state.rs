@@ -791,6 +791,20 @@ impl OrchestratorState {
                 .all(ChangeRuntimeState::invariants_hold)
     }
 
+    /// Return change IDs that are currently waiting for manual merge resolution.
+    pub fn merge_wait_change_ids(&self) -> Vec<String> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| {
+                if matches!(rt.wait_state, WaitState::MergeWait) && !rt.is_terminal() {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Return change IDs that are currently waiting for scheduler-owned resolve/merge retry.
     pub fn resolve_wait_change_ids(&self) -> Vec<String> {
         self.change_runtime

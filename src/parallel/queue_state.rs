@@ -1419,7 +1419,7 @@ impl ParallelExecutor {
             return QueueReconciliationOutcome::default();
         };
 
-        let (mut queued_intent_ids, active_ids_from_reducer, terminal_error_ids) =
+        let (mut queued_intent_ids, active_ids_from_reducer, terminal_error_ids, merge_wait_ids) =
             match shared_state.try_read() {
                 Ok(state) => {
                     let terminal_error_ids = state
@@ -1432,6 +1432,7 @@ impl ParallelExecutor {
                         state.queued_change_ids(),
                         state.active_change_ids(),
                         terminal_error_ids,
+                        state.merge_wait_change_ids(),
                     )
                 }
                 Err(_) => return QueueReconciliationOutcome::default(),
@@ -1439,6 +1440,8 @@ impl ParallelExecutor {
 
         let reducer_active_set: std::collections::HashSet<String> =
             active_ids_from_reducer.into_iter().collect();
+        let reducer_merge_wait_set: std::collections::HashSet<String> =
+            merge_wait_ids.into_iter().collect();
 
         let base_branch_for_archived_dirty_scan = match self
             .workspace_manager
@@ -1471,6 +1474,15 @@ impl ParallelExecutor {
                             QueueReconciliationDiagnosticLevel::Info,
                             &worktree_change_id,
                             "terminal_error_retry_required",
+                        )
+                        .await;
+                        continue;
+                    }
+                    if reducer_merge_wait_set.contains(&worktree_change_id) {
+                        self.emit_queue_reconciliation_diagnostic(
+                            QueueReconciliationDiagnosticLevel::Info,
+                            &worktree_change_id,
+                            "manual_merge_wait",
                         )
                         .await;
                         continue;
@@ -1574,6 +1586,15 @@ impl ParallelExecutor {
                     QueueReconciliationDiagnosticLevel::Info,
                     &queued_id,
                     "terminal_error_retry_required",
+                )
+                .await;
+                continue;
+            }
+            if reducer_merge_wait_set.contains(&queued_id) {
+                self.emit_queue_reconciliation_diagnostic(
+                    QueueReconciliationDiagnosticLevel::Info,
+                    &queued_id,
+                    "manual_merge_wait",
                 )
                 .await;
                 continue;
