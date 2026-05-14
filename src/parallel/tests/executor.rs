@@ -5113,7 +5113,7 @@ async fn test_deferred_merge_success_clears_shared_resolve_wait_and_runs_hook_on
     }) {
         MergeAttempt::Merged { revision } => {
             executor
-                .clear_resolve_wait_intent_for_success("alpha")
+                .clear_resolve_wait_intent_for_outcome("alpha")
                 .await;
             if let Some(ref hooks) = executor.hooks {
                 let hook_ctx = crate::hooks::HookContext::new(0, 0, 0, false)

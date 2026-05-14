@@ -22,6 +22,10 @@ Defines code maintenance guidelines and codebase health requirements.
 
 オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。OpenSpec コマンドエンジンの責務分離では、list/show/validate/archive の CLI contract と spec promotion の結果を characterization test で固定しなければならない。状態 reducer の副作用整理では、terminal/activity/wait state と resolve/reject wait queue の組み合わせを characterization test で固定しなければならない。加えて、タスク進捗解決のリファクタリングでは、worktree/base/archive の探索順序と acceptance follow-up の更新結果を characterization test で固定しなければならない。
 
+ResolveWait retry helper naming and comments SHALL reflect the full set of outcomes that clear scheduler-owned retry membership. A helper used for successful merge, already-merged detection, missing workspace cleanup, and stale workspace cleanup MUST NOT be named or documented as success-only in a way that suggests stale cleanup is a successful merge.
+
+<!-- Expected canonical result after archive: `code-maintenance` will require helper names/comments around retry intent clearing to describe outcome semantics accurately when used by both success and stale-cleanup paths. -->
+
 #### Scenario: OpenSpec validate の contract が維持される
 
 - **GIVEN** 妥当な変更提案と不正な変更提案が存在する
@@ -63,6 +67,13 @@ Defines code maintenance guidelines and codebase health requirements.
 - **WHEN** acceptance failure findings を記録する
 - **THEN** 既存 section は同じ見出し単位で置換される
 - **AND** 空 findings の場合は既定の未完了タスクが追加される
+
+#### Scenario: ResolveWait clear helper describes outcome semantics
+
+- **GIVEN** a helper clears scheduler-owned `ResolveWait` membership for success and stale cleanup paths
+- **WHEN** a developer reads the helper name or adjacent comments
+- **THEN** the code communicates that the helper applies to no-longer-retryable outcomes, not only successful merges
+- **AND** stale or missing workspace cleanup is not described as merge success
 
 ### Requirement: Config Module Structure
 
@@ -389,6 +400,10 @@ archive ループの実装は、フック実行・コマンド実行・検証・
 
 オーケストレーターはリファクタリング後も既存仕様の挙動を保ち、検証手順で後退がないことを示すために SHALL 検証を通過しなければならない。OpenSpec コマンドエンジンの責務分離では、list/show/validate/archive の CLI contract と spec promotion の結果を characterization test で固定しなければならない。状態 reducer の副作用整理では、terminal/activity/wait state と resolve/reject wait queue の組み合わせを characterization test で固定しなければならない。加えて、タスク進捗解決のリファクタリングでは、worktree/base/archive の探索順序と acceptance follow-up の更新結果を characterization test で固定しなければならない。
 
+ResolveWait retry helper naming and comments SHALL reflect the full set of outcomes that clear scheduler-owned retry membership. A helper used for successful merge, already-merged detection, missing workspace cleanup, and stale workspace cleanup MUST NOT be named or documented as success-only in a way that suggests stale cleanup is a successful merge.
+
+<!-- Expected canonical result after archive: `code-maintenance` will require helper names/comments around retry intent clearing to describe outcome semantics accurately when used by both success and stale-cleanup paths. -->
+
 #### Scenario: OpenSpec validate の contract が維持される
 
 - **GIVEN** 妥当な変更提案と不正な変更提案が存在する
@@ -430,6 +445,13 @@ archive ループの実装は、フック実行・コマンド実行・検証・
 - **WHEN** acceptance failure findings を記録する
 - **THEN** 既存 section は同じ見出し単位で置換される
 - **AND** 空 findings の場合は既定の未完了タスクが追加される
+
+#### Scenario: ResolveWait clear helper describes outcome semantics
+
+- **GIVEN** a helper clears scheduler-owned `ResolveWait` membership for success and stale cleanup paths
+- **WHEN** a developer reads the helper name or adjacent comments
+- **THEN** the code communicates that the helper applies to no-longer-retryable outcomes, not only successful merges
+- **AND** stale or missing workspace cleanup is not described as merge success
 
 ### Requirement: Server API モジュールの責務分割
 
