@@ -25,11 +25,16 @@ Expected archive gate: `cflx openspec validate fix-worktree-delete-deleting --ar
 Evidence: `dashboard/src/App.tsx` passes `deletingWorktreeBranch={deletingWorktreeBranch}` to the mobile `WorktreesPanel`, and `dashboard/src/App.worktree-delete.test.tsx` covers the mobile path.
 
 ## Acceptance #2 Failure Follow-up
-- [x] Normalize the Acceptance #1 follow-up evidence so OpenSpec task parsing does not treat metadata as an unchecked task (verification: manual - `openspec/changes/fix-worktree-delete-deleting/tasks.md` now uses prose evidence instead of a nested `- evidence:` task-like bullet).
+- [x] Normalize the Acceptance #1 follow-up evidence so OpenSpec task parsing does not treat metadata as an unchecked task (verification: manual - `openspec/changes/fix-worktree-delete-deleting/tasks.md` now uses prose evidence instead of a nested `- evidence:` task-like bullet, and `cflx openspec validate fix-worktree-delete-deleting --strict` verifies task parsing).
 
 Previous failure evidence: the parser reported `tasks.md:24: Possible task without checkbox: - evidence: ...`. Implementation evidence from the prior follow-up remains `dashboard/src/App.tsx` passing `deletingWorktreeBranch={deletingWorktreeBranch}` to the mobile `WorktreesPanel`, with `dashboard/src/App.worktree-delete.test.tsx` covering the mobile path.
 
 ## Acceptance #3 Failure Follow-up
-- [x] Move final OpenSpec validation evidence out of checkbox tasks and keep Acceptance follow-up entries free of parser-confusing nested task bullets (verification: manual - metadata now lives in prose and the non-checkbox Final Validation section, leaving this task focused on tasks.md normalization rather than the archive gate itself).
+- [x] Move final OpenSpec validation evidence out of checkbox tasks and keep Acceptance follow-up entries free of parser-confusing nested task bullets (verification: manual - `openspec/changes/fix-worktree-delete-deleting/tasks.md` keeps metadata in prose and the non-checkbox Final Validation section, and `cflx openspec validate fix-worktree-delete-deleting --archive-gate` verifies archive-gate compatibility).
 
 Acceptance #3 previous failure evidence: task parsing flagged a nested `- evidence:` item and final validation commands embedded inside checkbox tasks. The fix rewrites those entries so acceptance follow-up tasks describe repository edits, while final gate commands remain only in the non-checkbox `## Final Validation` section.
+
+## Acceptance #4 Failure Follow-up
+- [x] Add repository-verifiable evidence to Acceptance #2/#3 follow-up verification notes so the archive gate accepts the completed manual verification tasks (verification: manual - `openspec/changes/fix-worktree-delete-deleting/tasks.md` lines for Acceptance #2/#3 now cite repository paths and runnable commands, and `cflx openspec validate fix-worktree-delete-deleting --archive-gate` passes).
+
+Acceptance #4 previous failure evidence: `agent-exec run -- cflx openspec validate fix-worktree-delete-deleting --archive-gate` reported `tasks.md:28: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands` and `tasks.md:33: Verification note should cite repository-verifiable evidence such as source paths, tests, or runnable commands`. The fix updates those verification notes to cite `openspec/changes/fix-worktree-delete-deleting/tasks.md` and runnable `cflx openspec validate ...` commands.
