@@ -83,6 +83,7 @@ function App() {
   const [isAddProjectOpen, setIsAddProjectOpen] = useState(false);
   const [isCreateWorktreeOpen, setIsCreateWorktreeOpen] = useState(false);
   const [deleteWorktreeTarget, setDeleteWorktreeTarget] = useState<string | null>(null);
+  const [deletingWorktreeBranch, setDeletingWorktreeBranch] = useState<string | null>(null);
   const [closeSessionTarget, setCloseSessionTarget] = useState<string | null>(null);
 
   const selectDesktopCenterTab = useCallback((tab: DesktopCenterTab) => {
@@ -290,6 +291,7 @@ function App() {
     const projectId = store.state.selectedProjectId;
     if (!projectId || !deleteWorktreeTarget) return;
     setIsLoading(true);
+    setDeletingWorktreeBranch(deleteWorktreeTarget);
     try {
       await deleteWorktreeAPI(projectId, deleteWorktreeTarget);
       toast.success('Worktree deleted');
@@ -304,9 +306,10 @@ function App() {
     } catch (err) {
       toast.error(`Failed to delete worktree: ${err instanceof APIError ? err.message : String(err)}`);
     } finally {
+      setDeletingWorktreeBranch(null);
       setIsLoading(false);
     }
-  }, [store, deleteWorktreeTarget]);
+  }, [clearPersistedBrowseState, store, deleteWorktreeTarget]);
 
   const handleMergeWorktree = useCallback(async (branchName: string) => {
     const projectId = store.state.selectedProjectId;
@@ -636,6 +639,7 @@ function App() {
                       onRefresh={handleRefreshWorktrees}
                       onClickWorktree={handleClickWorktree}
                       selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
+                      deletingWorktreeBranch={deletingWorktreeBranch}
                       isLoading={isLoading}
                       activeCommands={selectedProjectActiveCommands}
                     />
@@ -764,6 +768,7 @@ function App() {
                     onRefresh={handleRefreshWorktrees}
                     onClickWorktree={handleClickWorktree}
                     selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
+                    deletingWorktreeBranch={deletingWorktreeBranch}
                     isLoading={isLoading}
                     activeCommands={selectedProjectActiveCommands}
                   />

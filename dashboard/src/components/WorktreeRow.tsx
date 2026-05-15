@@ -8,27 +8,28 @@ interface WorktreeRowProps {
   onDelete?: (branchName: string) => void;
   onClickWorktree?: (branch: string) => void;
   isSelected?: boolean;
+  isDeleting?: boolean;
   isLoading?: boolean;
   /** Active command for this worktree root, if any */
   activeCommand?: ActiveCommand;
 }
 
-export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSelected, isLoading, activeCommand }: WorktreeRowProps) {
-  const isBusy = !!activeCommand;
+export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSelected, isDeleting = false, isLoading, activeCommand }: WorktreeRowProps) {
+  const isBusy = !!activeCommand || isDeleting;
 
-  const canMerge =
+  const showMergeAction =
     !worktree.is_main &&
     !worktree.is_detached &&
     worktree.has_commits_ahead &&
     !worktree.merge_conflict &&
-    !worktree.is_merging &&
-    !isBusy;
+    !worktree.is_merging;
 
-  const canDelete = !worktree.is_main && !isBusy;
+  const showDeleteAction = !worktree.is_main;
 
   const label = worktree.branch || worktree.head;
 
   const handleRowClick = () => {
+    if (isDeleting) return;
     onClickWorktree?.(worktree.branch);
   };
 
@@ -39,7 +40,7 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
         isSelected
           ? 'border-[#6366f1] bg-[#1e1b4b]/30'
           : 'border-[#27272a] bg-[#111113] hover:border-[#3f3f46]'
-      } cursor-pointer`}
+      } ${isDeleting ? 'cursor-wait opacity-75' : 'cursor-pointer'}`}
     >
       <div className="flex min-w-0 flex-1 items-center gap-2">
         <GitBranch className="size-3.5 shrink-0 text-[#52525b]" />
@@ -71,7 +72,13 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
               {worktree.merge_conflict.conflict_files.length} conflict{worktree.merge_conflict.conflict_files.length !== 1 ? 's' : ''}
             </span>
           )}
-          {isBusy && (
+          {isDeleting && (
+            <span className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[#f59e0b] bg-[#451a03]/50" aria-label={`Deleting ${label}`}>
+              <Loader2 className="size-3 animate-spin" />
+              Deleting...
+            </span>
+          )}
+          {!isDeleting && activeCommand && (
             <span className="flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-[#f59e0b] bg-[#451a03]/50">
               <Loader2 className="size-3 animate-spin" />
               {activeCommand.operation}
@@ -81,21 +88,21 @@ export function WorktreeRow({ worktree, onMerge, onDelete, onClickWorktree, isSe
       </div>
 
       <div className="flex shrink-0 items-center gap-1">
-        {canMerge && onMerge && (
+        {showMergeAction && onMerge && (
           <button
             onClick={() => onMerge(worktree.branch)}
             disabled={isLoading || isBusy}
-            title={isBusy ? `Busy: ${activeCommand.operation}` : 'Merge branch'}
+            title={isDeleting ? 'Deleting worktree' : isBusy && activeCommand ? `Busy: ${activeCommand.operation}` : 'Merge branch'}
             className="rounded p-1.5 text-[#52525b] transition-colors hover:bg-[#27272a] hover:text-[#22c55e] disabled:opacity-50"
           >
             <GitMerge className="size-3.5" />
           </button>
         )}
-        {canDelete && onDelete && (
+        {showDeleteAction && onDelete && (
           <button
             onClick={() => onDelete(worktree.branch)}
             disabled={isLoading || isBusy}
-            title={isBusy ? `Busy: ${activeCommand.operation}` : 'Delete worktree'}
+            title={isDeleting ? 'Deleting worktree' : isBusy && activeCommand ? `Busy: ${activeCommand.operation}` : 'Delete worktree'}
             className="rounded p-1.5 text-[#52525b] transition-colors hover:bg-[#27272a] hover:text-[#ef4444] disabled:opacity-50"
           >
             <Trash2 className="size-3.5" />
