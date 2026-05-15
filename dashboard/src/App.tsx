@@ -768,6 +768,7 @@ function App() {
                     onRefresh={handleRefreshWorktrees}
                     onClickWorktree={handleClickWorktree}
                     selectedWorktreeBranch={store.state.fileBrowseContext?.type === 'worktree' ? store.state.fileBrowseContext.worktreeBranch : null}
+                    deletingWorktreeBranch={deletingWorktreeBranch}
                     isLoading={isLoading}
                     activeCommands={selectedProjectActiveCommands}
                   />

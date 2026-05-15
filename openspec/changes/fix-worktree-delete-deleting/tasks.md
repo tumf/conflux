@@ -18,3 +18,7 @@ If users later want progress that survives browser reloads, define a separate se
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-worktree-delete-deleting --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] dashboard/src/App.tsx:761-773 のモバイル用 WorktreesPanel 呼び出しに deletingWorktreeBranch={deletingWorktreeBranch} が渡されていません。提案の明示条件（proposal.md:52）とタスク（tasks.md:5）は desktop/mobile 両方の render path に delete progress branch を通すことを要求していますが、現状は desktop 側 App.tsx:633-645 のみ渡しているため、モバイルの Worktrees タブでは削除リクエスト pending 中でも該当行に deleting indicator が表示されません。修正として mobile 側 WorktreesPanel に同じ deletingWorktreeBranch prop を追加し、モバイル経路を検証するテストを追加してください。
+  - evidence: `dashboard/src/App.tsx` のモバイル `WorktreesPanel` に `deletingWorktreeBranch={deletingWorktreeBranch}` を追加し、`dashboard/src/App.worktree-delete.test.tsx` にモバイル経路で pending 中の全 WorktreesPanel が対象 branch を受け取るテストを追加。

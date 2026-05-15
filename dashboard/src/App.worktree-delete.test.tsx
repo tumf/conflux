@@ -260,4 +260,29 @@ describe('App worktree deletion pending state', () => {
     expect(refreshWorktreesMock).not.toHaveBeenCalled();
     expect(screen.getAllByTestId('worktree-feature-a').length).toBeGreaterThan(0);
   });
+
+  it('passes the deleting branch through the mobile worktrees render path while pending', async () => {
+    const user = userEvent.setup();
+    const deleteDeferred = deferred<void>();
+    deleteWorktreeMock.mockReturnValue(deleteDeferred.promise);
+
+    await renderHydratedApp({
+      mobile_active_tab: 'worktrees',
+    });
+
+    await user.click(screen.getAllByText('delete-feature-a')[0]);
+    await user.click(screen.getByText('confirm-delete-worktree'));
+
+    await waitFor(() => {
+      const renderedWorktreesPanels = screen.getAllByTestId('deleting-worktree-branch');
+      expect(renderedWorktreesPanels.length).toBeGreaterThanOrEqual(2);
+      expect(renderedWorktreesPanels.every((node) => node.textContent === 'feature-a')).toBe(true);
+    });
+
+    deleteDeferred.resolve(undefined);
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId('deleting-worktree-branch').every((node) => node.textContent === 'none')).toBe(true);
+    });
+  });
 });
