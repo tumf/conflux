@@ -11,16 +11,23 @@ documentation = "https://github.com/tumf/conflux#readme"
 keywords = ["ai", "codegen", "orchestration", "git", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
-  "src/**",
-  "tests/**",
-  "skills/**",
-  "web/**",
-  "dashboard/dist/**",
-  "Cargo.toml",
-  "Cargo.lock",
-  "build.rs",
-  "README.md",
-  "LICENSE*",
+  "/src/**",
+  "!/src/.tldr/**",
+  "!/src/.tldrignore",
+  "!/src/server/.tldr/**",
+  "!/src/server/.tldrignore",
+  "!/src/tui/.tldr/**",
+  "!/src/tui/.tldrignore",
+  "/tests/**",
+  "/skills/**",
+  "!/skills/.pytest_cache/**",
+  "/web/**",
+  "/dashboard/dist/**",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/build.rs",
+  "/README.md",
+  "/LICENSE*",
 ]
 
 [lib]
