@@ -12,6 +12,7 @@ interface WorktreesPanelProps {
   onRefresh: () => void;
   onClickWorktree?: (branch: string) => void;
   selectedWorktreeBranch?: string | null;
+  deletingWorktreeBranch?: string | null;
   isLoading: boolean;
   /** Active commands for the selected project */
   activeCommands?: ActiveCommand[];
@@ -26,6 +27,7 @@ export function WorktreesPanel({
   onRefresh,
   onClickWorktree,
   selectedWorktreeBranch,
+  deletingWorktreeBranch,
   isLoading,
   activeCommands = [],
 }: WorktreesPanelProps) {
@@ -77,6 +79,7 @@ export function WorktreesPanel({
               onDelete={onDelete}
               onClickWorktree={onClickWorktree}
               isSelected={selectedWorktreeBranch === wt.branch}
+              isDeleting={deletingWorktreeBranch === wt.branch}
               isLoading={isLoading}
               activeCommand={activeCommands.find(
                 (cmd) =>
