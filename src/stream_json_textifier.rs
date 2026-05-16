@@ -53,6 +53,25 @@ pub fn extract_text_from_stream_json(line: &str) -> Option<String> {
     }
 }
 
+/// Extract the final assistant text from supported agent JSONL output.
+///
+/// Scans from the end so final `result` / `assistant` / Codex `item.completed`
+/// events win over earlier streaming or progress events. Falls back to the
+/// original output when no supported final text event is found.
+pub fn extract_final_text_from_stream_json_output(output: &str) -> String {
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(text) = extract_text_from_stream_json(line) {
+            return text;
+        }
+    }
+
+    output.to_string()
+}
+
 fn extract_from_stream_event(value: &serde_json::Value) -> Option<String> {
     // {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}}
     let delta = value.get("event")?.get("delta")?;
@@ -533,6 +552,27 @@ mod tests {
     fn test_extract_codex_item_completed_non_message_suppressed() {
         let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"tool_call","text":"ignore"}}"#;
         assert_eq!(extract_text_from_stream_json(line), None);
+    }
+
+    #[test]
+    fn test_extract_final_text_from_stream_json_output_prefers_last_text_event() {
+        let output = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"earlier"}]}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"file_change","changes":[]}}"#,
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"final from Codex"}}"#,
+        ]
+        .join("\n");
+
+        assert_eq!(
+            extract_final_text_from_stream_json_output(&output),
+            "final from Codex"
+        );
+    }
+
+    #[test]
+    fn test_extract_final_text_from_stream_json_output_falls_back_to_raw_output() {
+        let output = "plain output";
+        assert_eq!(extract_final_text_from_stream_json_output(output), output);
     }
 
     #[test]
