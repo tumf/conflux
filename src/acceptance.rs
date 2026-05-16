@@ -8,10 +8,9 @@
 //! - **Primary**: a strict JSON verdict object of the form
 //!   `{"acceptance":"pass|fail|continue|gated","findings":[...]}` emitted as
 //!   the final machine-readable verdict payload. JSON verdicts may appear
-//!   directly as a line on stdout, or wrapped inside a supported agent JSONL
-//!   event (assistant / result / stream_event / Codex item.completed
-//!   text payloads). In either case the runtime unwraps the payload and
-//!   evaluates the JSON verdict.
+//!   directly as a line on stdout, or wrapped inside a supported JSONL event
+//!   text payload. In either case the runtime unwraps the payload and evaluates
+//!   the JSON verdict.
 //! - **Fallback**: legacy plain-text standalone verdict markers of the form
 //!   `ACCEPTANCE: PASS|FAIL|CONTINUE|GATED` remain supported for backward
 //!   compatibility, but JSON takes priority whenever both are present.
@@ -140,8 +139,8 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
 ///
 /// - Primary: a strict JSON verdict object
 ///   `{"acceptance":"pass|fail|continue|gated","findings":[...]}` emitted
-///   either directly as a line, or wrapped inside a supported agent JSONL event
-///   payload (assistant / stream_event / result / Codex item.completed text).
+///   either directly as a line, or wrapped inside a supported JSONL event text
+///   payload unwrapped by the runtime.
 ///   The first JSON verdict encountered wins, regardless of any earlier text
 ///   marker.
 /// - Fallback: a standalone legacy line equal to one of `ACCEPTANCE: PASS`,
