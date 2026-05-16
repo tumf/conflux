@@ -128,10 +128,11 @@ fn build_analysis_prompt_with_skill(analyze_skill: &str, changes: &[Change]) -> 
         .join("\n");
 
     format!(
-        "load skills: {}\n\n\
+        "{}\n\n\
          Queued changes:\n\
          {}\n",
-        analyze_skill, change_list
+        crate::agent::prompt::skill_prelude(analyze_skill),
+        change_list
     )
 }
 
@@ -205,6 +206,7 @@ mod tests {
         let prompt = build_analysis_prompt(&changes);
 
         // Verify skill prelude
+        assert!(prompt.contains("$cflx-analyze"));
         assert!(prompt.contains("load skills: cflx-analyze"));
 
         // Verify prompt contains variable context (change IDs and progress)
@@ -224,8 +226,9 @@ mod tests {
         let changes = vec![test_change("add-feature", 2, 5)];
         let prompt = build_analysis_prompt_with_skill("team-analyze", &changes);
 
+        assert!(prompt.contains("$team-analyze"));
         assert!(prompt.contains("load skills: team-analyze"));
-        assert!(!prompt.contains("load skills: cflx-analyze"));
+        assert!(!prompt.contains("$cflx-analyze"));
         assert!(prompt.contains("add-feature"));
     }
 
@@ -235,6 +238,7 @@ mod tests {
         let prompt = build_analysis_prompt(&changes);
 
         // Prompt should still have skill prelude and structure
+        assert!(prompt.contains("$cflx-analyze"));
         assert!(prompt.contains("load skills: cflx-analyze"));
         assert!(prompt.contains("Queued changes:"));
     }

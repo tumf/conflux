@@ -1245,41 +1245,9 @@ impl AgentRunner {
         Ok((child, rx))
     }
 
-    /// Extract the result from stream-json output format
-    /// stream-json outputs multiple JSON lines, the last one with type="result" contains the actual result
+    /// Extract final assistant text from supported agent JSONL output formats.
     fn extract_stream_json_result(&self, output: &str) -> String {
-        // Try to find and parse the result line from stream-json output
-        for line in output.lines().rev() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            // Try to parse as JSON
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-                // Check if this is a result message
-                if json.get("type").and_then(|t| t.as_str()) == Some("result") {
-                    if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
-                        return result.to_string();
-                    }
-                }
-                // Also check for assistant message content
-                if json.get("type").and_then(|t| t.as_str()) == Some("assistant") {
-                    if let Some(message) = json.get("message") {
-                        if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
-                            for item in content {
-                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                    return text.to_string();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // If not stream-json format, return as-is
-        output.to_string()
+        crate::stream_json_textifier::extract_final_text_from_stream_json_output(output)
     }
 
     /// Execute a shell command with output streaming and automatic retry

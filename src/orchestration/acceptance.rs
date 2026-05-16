@@ -132,7 +132,7 @@ where
     let mut full_stdout = String::new();
 
     // Grace period after detecting an acceptance marker before terminating the process.
-    // This handles the case where the agent process (e.g., opencode) does not exit
+    // This handles the case where the agent process (or its child processes) does not exit
     // promptly after emitting ACCEPTANCE: PASS/FAIL/etc., for example because
     // child processes (MCP servers) keep stdout/stderr pipes open.
     const MARKER_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
@@ -188,8 +188,8 @@ where
                 // period. This prevents indefinite blocking when the agent
                 // process does not exit after emitting the verdict. The
                 // detector recognises the primary strict JSON verdict (as a
-                // standalone line or wrapped in an opencode `--format json`
-                // event) and, as fallback, the legacy standalone plain-text
+                // standalone line or wrapped in a supported agent JSONL event)
+                // and, as fallback, the legacy standalone plain-text
                 // marker. Malformed markers with trailing text (for example
                 // "ACCEPTANCE: PASSAll ...") do NOT trigger early completion.
                 if !marker_detected && crate::acceptance::detect_verdict_in_line(&s).is_some() {
