@@ -663,6 +663,38 @@ mod tests {
     }
 
     #[test]
+    fn log_navigation_state_methods_preserve_existing_key_semantics() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        for index in 0..12 {
+            app.add_log(LogEntry::info(format!("log {index}")));
+        }
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+
+        app.scroll_logs_up(5);
+        assert_eq!(app.log_scroll_offset, 5);
+        assert!(!app.log_auto_scroll);
+
+        app.scroll_logs_down(5);
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+
+        app.scroll_logs_to_top();
+        assert_eq!(app.log_scroll_offset, 11);
+        assert!(!app.log_auto_scroll);
+
+        app.scroll_logs_to_bottom();
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+
+        assert!(app.logs_panel_enabled);
+        app.toggle_logs_panel();
+        assert!(!app.logs_panel_enabled);
+        app.toggle_logs_panel();
+        assert!(app.logs_panel_enabled);
+    }
+
+    #[test]
     fn f5_on_merge_wait_row_does_not_emit_resolve_merge() {
         let mut app = AppState::new(vec![
             create_test_change("merge-wait"),
