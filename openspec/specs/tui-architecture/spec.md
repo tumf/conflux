@@ -107,34 +107,35 @@ However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 
 The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is scheduler-owned retry work and not normal queue work.
 
-In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via `F5` after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
+In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via the configured start key after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
 - execution for that change actually starts,
 - the backend explicitly rejects startup for that change, or
 - the user explicitly dequeues the change.
 
 Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
 
-`F5` SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause `F5` to emit `ResolveMerge` or transition that row to `resolve pending`.
+The configured start keybindings SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause any configured start key to emit `ResolveMerge` or transition that row to `resolve pending`.
 
-<!-- Expected canonical result after archive: `tui-architecture` will remove the historical rule that F5 resolves cursor-local MergeWait rows and will define F5 as cursor-independent orchestration control. -->
+<!-- Expected canonical result after archive: `tui-architecture` will generalize the historical F5-specific orchestration control rule to all configured start keybindings. -->
 
-#### Scenario: F5 on MergeWait does not resolve cursor row
+#### Scenario: Configured start key on MergeWait does not resolve cursor row
 
 - **GIVEN** the TUI cursor is on change `alpha`
 - **AND** `alpha` is in `MergeWait`
 - **AND** change `beta` is marked runnable work in `NotQueued`
-- **WHEN** the user presses `F5`
+- **AND** the resolved TUI start keybindings include `r`
+- **WHEN** the user presses `r`
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `F5`
+- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `r`
 - **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
 
-#### Scenario: F5 is not blocked by unrelated resolving
+#### Scenario: Default F5 remains an app-level start key
 
-- **GIVEN** change `alpha` is resolving
-- **AND** change `beta` is marked runnable work in `NotQueued`
+- **GIVEN** no TUI config override exists
+- **AND** the TUI cursor is on change `alpha` in `MergeWait`
 - **WHEN** the user presses `F5`
-- **THEN** normal orchestration for `beta` SHALL be allowed to start/resume/retry
-- **AND** resolve serialization SHALL remain limited to merge resolve operations
+- **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
+- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work
 
 ### Requirement: Event-Driven State Updates
 
@@ -554,31 +555,32 @@ However, for `ResolveWait`/`MergeWait` rows, the following SHALL be satisfied:
 
 The TUI MUST display `ResolveWait` as `resolve pending` to clearly indicate it is scheduler-owned retry work and not normal queue work.
 
-In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via `F5` after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
+In parallel mode, once the user explicitly queues a `NotQueued` change for execution (for example via the configured start key after marking it), refresh-derived state reconciliation MUST preserve the queued display state until one of the following occurs:
 - execution for that change actually starts,
 - the backend explicitly rejects startup for that change, or
 - the user explicitly dequeues the change.
 
 Auto-refresh, reducer display synchronization, and eligibility reconciliation MUST NOT regress such a queued row back to `not queued` before backend analysis/dispatch begins.
 
-`F5` SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause `F5` to emit `ResolveMerge` or transition that row to `resolve pending`.
+The configured start keybindings SHALL be treated as app-level orchestration control and MUST NOT perform cursor-local merge resolve actions. A cursor row in `MergeWait` MUST NOT cause any configured start key to emit `ResolveMerge` or transition that row to `resolve pending`.
 
-<!-- Expected canonical result after archive: `tui-architecture` will remove the historical rule that F5 resolves cursor-local MergeWait rows and will define F5 as cursor-independent orchestration control. -->
+<!-- Expected canonical result after archive: `tui-architecture` will generalize the historical F5-specific orchestration control rule to all configured start keybindings. -->
 
-#### Scenario: F5 on MergeWait does not resolve cursor row
+#### Scenario: Configured start key on MergeWait does not resolve cursor row
 
 - **GIVEN** the TUI cursor is on change `alpha`
 - **AND** `alpha` is in `MergeWait`
 - **AND** change `beta` is marked runnable work in `NotQueued`
-- **WHEN** the user presses `F5`
+- **AND** the resolved TUI start keybindings include `r`
+- **WHEN** the user presses `r`
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `F5`
+- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `r`
 - **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
 
-#### Scenario: F5 is not blocked by unrelated resolving
+#### Scenario: Default F5 remains an app-level start key
 
-- **GIVEN** change `alpha` is resolving
-- **AND** change `beta` is marked runnable work in `NotQueued`
+- **GIVEN** no TUI config override exists
+- **AND** the TUI cursor is on change `alpha` in `MergeWait`
 - **WHEN** the user presses `F5`
-- **THEN** normal orchestration for `beta` SHALL be allowed to start/resume/retry
-- **AND** resolve serialization SHALL remain limited to merge resolve operations
+- **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
+- **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work

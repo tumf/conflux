@@ -91,7 +91,8 @@ pub enum Commands {
 
     /// Launch the interactive TUI dashboard
     ///
-    /// Key bindings: Space (select), F5 (start), Esc (stop), Tab (switch view), q (quit)
+    /// Key bindings: Space (select), F5 (start by default), Esc (stop), Tab (switch view), q (quit).
+    /// Override the default start key in ~/.config/cflx/tui.jsonc.
     Tui(TuiArgs),
 
     /// Initialize a new configuration file
@@ -297,10 +298,15 @@ The TUI provides real-time visualization of change processing with:
 
 KEY BINDINGS:
   Space     Toggle change selection/queue status
-  F5        Start/resume processing
+  F5        Start/resume processing (default; override in ~/.config/cflx/tui.jsonc)
   Esc       Stop processing (press twice to force)
   Tab       Switch between Changes/Worktrees view
   q         Quit
+
+TUI USER CONFIG:
+  Set keybindings.start in ~/.config/cflx/tui.jsonc, for example:
+    { \"keybindings\": { \"start\": [\"F5\", \"r\"] } }
+  The help text documents defaults only and does not render dynamic user config values.
 
 WEB MONITORING:
   --web enables simultaneous web-based monitoring alongside the TUI.
@@ -1781,6 +1787,10 @@ mod tests {
         // Verify key bindings are documented
         assert!(help_text.contains("Space"), "Help should mention Space key");
         assert!(help_text.contains("F5"), "Help should mention F5 key");
+        assert!(
+            help_text.contains("~/.config/cflx/tui.jsonc"),
+            "Help should mention TUI user config path"
+        );
         assert!(help_text.contains("Esc"), "Help should mention Esc key");
         assert!(help_text.contains("Tab"), "Help should mention Tab key");
         assert!(help_text.contains("q"), "Help should mention q key");

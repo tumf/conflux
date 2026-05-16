@@ -452,7 +452,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let change = &app.changes[i];
                 // Checkbox display (Select mode):
                 // [ ] - not selected (ready to select)
-                // [x] - selected (will become Queued when F5 is pressed)
+                // [x] - selected (will become Queued when the start key is pressed)
                 // [x] (gray) - archived (processing complete, no longer actionable)
                 // Note: 'selected' field indicates selection for next run
                 let is_archived =
@@ -644,8 +644,9 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
     } else {
         None
     };
+    let start_key_label = app.start_key_label();
 
-    let mut keys = vec!["↑↓/jk: move"];
+    let mut keys = vec!["↑↓/jk: move".to_string()];
     if let Some(item) = current_item {
         // Show "K: kill" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
@@ -655,20 +656,20 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             "applying" | "accepting" | "archiving" | "resolving"
         ) {
             if let AppMode::ConfirmForceKill { .. } = app.mode {
-                keys.push("Y: confirm kill");
-                keys.push("N: cancel");
+                keys.push("Y: confirm kill".to_string());
+                keys.push("N: cancel".to_string());
             } else {
-                keys.push("K: kill");
+                keys.push("K: kill".to_string());
             }
         } else if !is_parallel_blocked {
             keys.push(match (item.display_status_cache.as_str(), item.selected) {
-                ("error", true) => "Space: clear retry",
-                ("error", false) => "Space: retry mark",
-                (_, true) => "Space: unqueue",
-                (_, false) => "Space: queue",
+                ("error", true) => "Space: clear retry".to_string(),
+                ("error", false) => "Space: retry mark".to_string(),
+                (_, true) => "Space: unqueue".to_string(),
+                (_, false) => "Space: queue".to_string(),
             });
         }
-        keys.push("e: edit");
+        keys.push("e: edit".to_string());
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
@@ -679,33 +680,33 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
             )
         {
             if app.is_resolving {
-                keys.push("M: queue resolve");
+                keys.push("M: queue resolve".to_string());
             } else {
-                keys.push("M: resolve");
+                keys.push("M: resolve".to_string());
             }
         }
     }
     if has_queue {
-        keys.push("F5: run");
+        keys.push(format!("{start_key_label}: run"));
     }
     if app.has_bulk_toggle_targets() {
-        keys.push("x: toggle all");
+        keys.push("x: toggle all".to_string());
     }
-    keys.push("Tab: worktrees");
+    keys.push("Tab: worktrees".to_string());
     // Show parallel toggle hint only if parallel execution is available
     if app.parallel_available {
         keys.push(if app.parallel_mode {
-            "=: sequential"
+            "=: sequential".to_string()
         } else {
-            "=: parallel"
+            "=: parallel".to_string()
         });
     }
     // Show QR code hint if web server is enabled
     if app.web_url.is_some() {
-        keys.push("w: QR");
+        keys.push("w: QR".to_string());
     }
     // Show log panel toggle hint
-    keys.push("l: logs");
+    keys.push("l: logs".to_string());
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -1008,7 +1009,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
         None
     };
 
-    let mut keys = vec!["↑↓/jk: move"];
+    let mut keys = vec!["↑↓/jk: move".to_string()];
     if let Some(item) = current_item {
         // Show "K: kill" for active changes, otherwise describe the mark action.
         // In parallel mode, don't show Space hints for uncommitted changes.
@@ -1018,20 +1019,20 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             "applying" | "accepting" | "archiving" | "resolving"
         ) {
             if let AppMode::ConfirmForceKill { .. } = app.mode {
-                keys.push("Y: confirm kill");
-                keys.push("N: cancel");
+                keys.push("Y: confirm kill".to_string());
+                keys.push("N: cancel".to_string());
             } else {
-                keys.push("K: kill");
+                keys.push("K: kill".to_string());
             }
         } else if !is_parallel_blocked {
             keys.push(match (item.display_status_cache.as_str(), item.selected) {
-                ("error", true) => "Space: clear retry",
-                ("error", false) => "Space: retry mark",
-                (_, true) => "Space: unqueue",
-                (_, false) => "Space: queue",
+                ("error", true) => "Space: clear retry".to_string(),
+                ("error", false) => "Space: retry mark".to_string(),
+                (_, true) => "Space: unqueue".to_string(),
+                (_, false) => "Space: queue".to_string(),
             });
         }
-        keys.push("e: edit");
+        keys.push("e: edit".to_string());
         // Show M key hint based on resolve state (only in Select, Running, Stopped modes)
         // - When resolve is NOT running and current item is MergeWait: "M: resolve"
         // - When resolve IS running and current item is MergeWait: "M: queue resolve"
@@ -1042,22 +1043,22 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
             )
         {
             if app.is_resolving {
-                keys.push("M: queue resolve");
+                keys.push("M: queue resolve".to_string());
             } else {
-                keys.push("M: resolve");
+                keys.push("M: resolve".to_string());
             }
         }
     }
     if app.has_bulk_toggle_targets() {
-        keys.push("x: toggle all");
+        keys.push("x: toggle all".to_string());
     }
-    keys.push("Tab: worktrees");
+    keys.push("Tab: worktrees".to_string());
     // Show QR code hint if web server is enabled
     if app.web_url.is_some() {
-        keys.push("w: QR");
+        keys.push("w: QR".to_string());
     }
     // Show log panel toggle hint
-    keys.push("l: logs");
+    keys.push("l: logs".to_string());
 
     let title = format!(" Changes ({}) ", keys.join(", "));
 
@@ -1138,11 +1139,15 @@ fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
     let content = Line::from(spans);
 
     // Build title with app control keys based on mode
+    let start_key_label = app.start_key_label();
     let title = match app.mode {
         AppMode::Running => " Status (Esc: stop, Ctrl+C: quit) ".to_string(),
-        AppMode::Stopping => " Status (F5: continue, Esc: force stop, Ctrl+C: quit) ".to_string(),
-        AppMode::Stopped => " Status (F5: resume, Ctrl+C: quit) ".to_string(),
+        AppMode::Stopping => {
+            format!(" Status ({start_key_label}: continue, Esc: force stop, Ctrl+C: quit) ")
+        }
+        AppMode::Stopped => format!(" Status ({start_key_label}: resume, Ctrl+C: quit) "),
         AppMode::ConfirmWorktreeDelete => " Status (Y/N: confirm, Ctrl+C: quit) ".to_string(),
+        AppMode::Error => format!(" Status ({start_key_label}: retry, Ctrl+C: quit) "),
         _ => " Status (Ctrl+C: quit) ".to_string(),
     };
 
@@ -1464,6 +1469,7 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
 fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
     let selected = app.selected_count();
     let new_count = app.new_change_count;
+    let start_key_label = app.start_key_label();
 
     let mut spans = vec![
         Span::styled(
@@ -1509,7 +1515,7 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
     } else {
         // Changes selected and ready to process
         spans.push(Span::styled(
-            "Press F5 to start processing",
+            format!("Press {start_key_label} to start processing"),
             Style::default().fg(Color::Cyan),
         ));
     }
@@ -1891,6 +1897,7 @@ mod tests {
     use super::*;
     use crate::openspec::Change;
     use crate::openspec::ProposalMetadata;
+    use crate::tui::config::TuiConfig;
     use crate::tui::events::LogEntry;
     use crate::tui::types::{ViewMode, WorktreeInfo};
     use ratatui::backend::TestBackend;
@@ -2210,7 +2217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_keeps_f5_run_hint_while_resolving() {
+    fn test_render_keeps_start_run_hint_while_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
         app.is_resolving = true;
@@ -2220,6 +2227,23 @@ mod tests {
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("F5: run"));
+
+        let mut configured_app = create_test_app(vec![create_test_change("change-a")]);
+        configured_app.set_tui_config(
+            TuiConfig::parse_jsonc(
+                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                std::path::Path::new("/tmp/tui.jsonc"),
+            )
+            .unwrap(),
+        );
+        configured_app.mode = AppMode::Select;
+        configured_app.is_resolving = true;
+        configured_app.cursor_index = 0;
+        configured_app.changes[0].selected = true;
+
+        let buffer = render_buffer(&mut configured_app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("F5/r: run"));
     }
 
     // === Tests for update-tui-error-mode-continuation ===
@@ -2485,12 +2509,54 @@ mod tests {
     #[test]
     fn test_render_select_mode_footer_message() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
-        // Select the change to trigger "Press F5 to start processing" message
+        // Select the change to trigger start processing guidance.
         app.changes[0].selected = true;
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("Conflux"));
         assert!(content.contains("Press F5 to start processing"));
+
+        app.set_tui_config(
+            TuiConfig::parse_jsonc(
+                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                std::path::Path::new("/tmp/tui.jsonc"),
+            )
+            .unwrap(),
+        );
+        let buffer = render_buffer(&mut app, 80, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("Press F5/r to start processing"));
+    }
+
+    #[test]
+    fn test_render_status_uses_configured_start_label() {
+        let mut stopped_app = create_test_app(vec![create_test_change("change-a")]);
+        stopped_app.set_tui_config(
+            TuiConfig::parse_jsonc(
+                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                std::path::Path::new("/tmp/tui.jsonc"),
+            )
+            .unwrap(),
+        );
+        stopped_app.mode = AppMode::Stopped;
+        stopped_app.logs.push(LogEntry::info("show status"));
+        let buffer = render_buffer(&mut stopped_app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("F5/r: resume"));
+
+        let mut stopping_app = create_test_app(vec![create_test_change("change-a")]);
+        stopping_app.set_tui_config(
+            TuiConfig::parse_jsonc(
+                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                std::path::Path::new("/tmp/tui.jsonc"),
+            )
+            .unwrap(),
+        );
+        stopping_app.mode = AppMode::Stopping;
+        stopping_app.logs.push(LogEntry::info("show status"));
+        let buffer = render_buffer(&mut stopping_app, 100, 24);
+        let content = buffer_to_string(&buffer);
+        assert!(content.contains("F5/r: continue"));
     }
 
     #[test]

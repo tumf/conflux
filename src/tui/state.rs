@@ -15,6 +15,7 @@
 //! Both TUI and Web states are updated via `ExecutionEvent` messages, ensuring consistency.
 
 use crate::openspec::Change;
+use crate::tui::config::TuiConfig;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
 use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
 use ratatui::style::Color;
@@ -252,6 +253,11 @@ pub struct AppState {
     pub resolve_queue_set: HashSet<String>,
     /// Whether the log panel is visible in Changes view
     pub logs_panel_enabled: bool,
+    /// Client-local TUI preferences such as keybindings.
+    ///
+    /// This is presentation/input mapping state only and must not be used for
+    /// resume routing, acceptance gating, archive routing, or scheduling.
+    pub tui_config: TuiConfig,
     /// Latest reducer-derived display status snapshot observed by the TUI.
     ///
     /// This is presentation-only state used to order display synchronization evidence:
@@ -430,10 +436,19 @@ impl AppState {
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
             logs_panel_enabled: true, // Default: logs panel visible
+            tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
             last_merge_deferred_diagnostic: None,
             last_logged_analysis_remaining: None,
         }
+    }
+
+    pub fn set_tui_config(&mut self, tui_config: TuiConfig) {
+        self.tui_config = tui_config;
+    }
+
+    pub fn start_key_label(&self) -> String {
+        self.tui_config.start_key_label()
     }
 
     /// Show a warning popup and reset popup-local presentation state.
@@ -1553,6 +1568,21 @@ mod guards {
 mod tests {
     use super::*;
     use crate::tui::events::OrchestratorEvent;
+
+    #[test]
+    fn tui_config_defaults_and_configured_labels_are_available_in_app_state() {
+        let mut app = AppState::new(vec![]);
+        assert_eq!(app.start_key_label(), "F5");
+
+        let custom = TuiConfig::parse_jsonc(
+            r#"{"keybindings":{"start":["F5","r"]}}"#,
+            std::path::Path::new("/tmp/tui.jsonc"),
+        )
+        .unwrap();
+        app.set_tui_config(custom);
+
+        assert_eq!(app.start_key_label(), "F5/r");
+    }
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {

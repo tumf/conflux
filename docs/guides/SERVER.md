@@ -12,6 +12,8 @@ cflx server
 
 Server mode exposes the Web UI and APIs for connected clients. A TUI can connect to a remote server with `--server`.
 
+Remote TUI key input is still handled by the local client. The default start/resume/retry/continue key is `F5`; local clients can add bindings such as `r` in `~/.config/cflx/tui.jsonc` with `{"keybindings":{"start":["F5","r"]}}`. This file is a TUI-only user preference and is not read from project `.cflx.jsonc`.
+
 ## Web UI and Remote Monitoring
 
 - In normal mode, enable the dashboard with `--web` on `cflx` or `cflx run`

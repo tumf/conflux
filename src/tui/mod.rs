@@ -7,6 +7,7 @@
 //! - Auto-refresh of change list
 
 mod command_handlers;
+pub mod config;
 mod events;
 mod key_handlers;
 pub mod log_deduplicator;
