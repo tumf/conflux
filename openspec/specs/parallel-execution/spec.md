@@ -12,39 +12,40 @@ Parallel ordinary apply dispatch MUST treat reducer terminal-error state as a st
 
 Dependency analysis MUST continue to treat an errored dependency as a dispatch blocker for dependents until the dependency is explicitly retried and reaches repository-visible success.
 
-<!-- Expected canonical result after archive: `parallel-execution` will require terminal-error changes to stay stopped across reanalysis/resume until explicit retry clears the reducer error. -->
+When configured for persistent lifetime and fully drained, the scheduler MUST remain alive without timer-driven repository/worktree polling. A fully drained persistent scheduler means there is no local queued work, no in-flight workspace task, no reducer-owned resolve/reject waiter, no active manual resolve, and no pending merge task. In that state, the scheduler SHALL wait for explicit wake events such as dynamic queue notifications or scheduler retry notifications before running queue reconciliation, worktree scans, or base-branch merge-state checks again.
 
-#### Scenario: parallel apply error is not automatically redispatched
+The fully drained persistent idle wait MUST NOT introduce durable workflow-control state. It MUST preserve finite scheduler behavior, where finite execution exits once drained.
 
-**Given**: change `alpha` is running in parallel apply
-**When**: the workspace task emits `ProcessingError` or `ApplyFailed` for `alpha`
-**Then**: `alpha` is recorded as `error`
-**And**: the next scheduler reanalysis does not select `alpha` for ordinary apply dispatch
-**And**: `alpha` remains available for explicit retry rather than being removed silently
+#### Scenario: persistent idle does not poll worktree scans
 
-#### Scenario: workspace resume does not resurrect errored change
+**Given**: a parallel scheduler is running with persistent lifetime
+**And**: there is no queued work, no in-flight work, no resolve/reject waiter, no active manual resolve, and no pending merge task
+**When**: no dynamic queue or scheduler notification is received
+**Then**: the scheduler remains alive
+**And**: it does not repeatedly run worktree discovery, queue reconciliation, or base-branch merge-state checks on a timer
+**And**: repeated debug log bursts for idle scan commands are not emitted
 
-**Given**: change `alpha` has terminal state `Error`
-**And**: an existing workspace for `alpha` remains on disk
-**When**: parallel workspace resume or repair-candidate scanning runs
-**Then**: `alpha` is not dispatched to ordinary apply solely because the workspace exists
-**And**: `alpha` remains displayed as `error` until explicit retry or delayed repository-visible success
+#### Scenario: queue notification wakes persistent idle
 
-#### Scenario: explicit retry restores parallel dispatch eligibility
+**Given**: a parallel scheduler is waiting in fully drained persistent idle
+**When**: a change is added through the dynamic queue
+**Then**: the scheduler wakes
+**And**: it checks the dynamic queue
+**And**: the queued change can enter normal reanalysis and dispatch flow
 
-**Given**: change `alpha` has terminal state `Error`
-**And**: the operator explicitly marks `alpha` for retry
-**When**: the retry transition clears the recoverable error terminal state
-**Then**: `alpha` may be selected by normal parallel dependency analysis and dispatch rules
-**And**: unmarked error changes remain excluded from ordinary apply dispatch
+#### Scenario: scheduler retry notification wakes persistent idle
 
-#### Scenario: errored dependency blocks dependent dispatch
+**Given**: a parallel scheduler is waiting in fully drained persistent idle
+**And**: reducer-owned retry work becomes eligible without adding an ordinary queued change
+**When**: the scheduler is explicitly notified
+**Then**: the scheduler wakes
+**And**: it re-evaluates reducer-owned wait/retry state without requiring another user keypress
 
-**Given**: queued change `beta` depends on change `alpha`
-**And**: `alpha` has terminal state `Error`
-**When**: parallel dependency analysis selects dispatch candidates
-**Then**: `beta` is not dispatched
-**And**: after `alpha` is explicitly retried and reaches repository-visible success, `beta` may be re-evaluated by normal dependency analysis
+#### Scenario: finite scheduler still exits when drained
+
+**Given**: a parallel scheduler is running with finite lifetime
+**When**: queued work, in-flight work, resolve/reject waiters, manual resolve activity, and pending merge tasks are all drained
+**Then**: the scheduler exits instead of waiting persistently
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1520,39 +1521,40 @@ Parallel ordinary apply dispatch MUST treat reducer terminal-error state as a st
 
 Dependency analysis MUST continue to treat an errored dependency as a dispatch blocker for dependents until the dependency is explicitly retried and reaches repository-visible success.
 
-<!-- Expected canonical result after archive: `parallel-execution` will require terminal-error changes to stay stopped across reanalysis/resume until explicit retry clears the reducer error. -->
+When configured for persistent lifetime and fully drained, the scheduler MUST remain alive without timer-driven repository/worktree polling. A fully drained persistent scheduler means there is no local queued work, no in-flight workspace task, no reducer-owned resolve/reject waiter, no active manual resolve, and no pending merge task. In that state, the scheduler SHALL wait for explicit wake events such as dynamic queue notifications or scheduler retry notifications before running queue reconciliation, worktree scans, or base-branch merge-state checks again.
 
-#### Scenario: parallel apply error is not automatically redispatched
+The fully drained persistent idle wait MUST NOT introduce durable workflow-control state. It MUST preserve finite scheduler behavior, where finite execution exits once drained.
 
-**Given**: change `alpha` is running in parallel apply
-**When**: the workspace task emits `ProcessingError` or `ApplyFailed` for `alpha`
-**Then**: `alpha` is recorded as `error`
-**And**: the next scheduler reanalysis does not select `alpha` for ordinary apply dispatch
-**And**: `alpha` remains available for explicit retry rather than being removed silently
+#### Scenario: persistent idle does not poll worktree scans
 
-#### Scenario: workspace resume does not resurrect errored change
+**Given**: a parallel scheduler is running with persistent lifetime
+**And**: there is no queued work, no in-flight work, no resolve/reject waiter, no active manual resolve, and no pending merge task
+**When**: no dynamic queue or scheduler notification is received
+**Then**: the scheduler remains alive
+**And**: it does not repeatedly run worktree discovery, queue reconciliation, or base-branch merge-state checks on a timer
+**And**: repeated debug log bursts for idle scan commands are not emitted
 
-**Given**: change `alpha` has terminal state `Error`
-**And**: an existing workspace for `alpha` remains on disk
-**When**: parallel workspace resume or repair-candidate scanning runs
-**Then**: `alpha` is not dispatched to ordinary apply solely because the workspace exists
-**And**: `alpha` remains displayed as `error` until explicit retry or delayed repository-visible success
+#### Scenario: queue notification wakes persistent idle
 
-#### Scenario: explicit retry restores parallel dispatch eligibility
+**Given**: a parallel scheduler is waiting in fully drained persistent idle
+**When**: a change is added through the dynamic queue
+**Then**: the scheduler wakes
+**And**: it checks the dynamic queue
+**And**: the queued change can enter normal reanalysis and dispatch flow
 
-**Given**: change `alpha` has terminal state `Error`
-**And**: the operator explicitly marks `alpha` for retry
-**When**: the retry transition clears the recoverable error terminal state
-**Then**: `alpha` may be selected by normal parallel dependency analysis and dispatch rules
-**And**: unmarked error changes remain excluded from ordinary apply dispatch
+#### Scenario: scheduler retry notification wakes persistent idle
 
-#### Scenario: errored dependency blocks dependent dispatch
+**Given**: a parallel scheduler is waiting in fully drained persistent idle
+**And**: reducer-owned retry work becomes eligible without adding an ordinary queued change
+**When**: the scheduler is explicitly notified
+**Then**: the scheduler wakes
+**And**: it re-evaluates reducer-owned wait/retry state without requiring another user keypress
 
-**Given**: queued change `beta` depends on change `alpha`
-**And**: `alpha` has terminal state `Error`
-**When**: parallel dependency analysis selects dispatch candidates
-**Then**: `beta` is not dispatched
-**And**: after `alpha` is explicitly retried and reaches repository-visible success, `beta` may be re-evaluated by normal dependency analysis
+#### Scenario: finite scheduler still exits when drained
+
+**Given**: a parallel scheduler is running with finite lifetime
+**When**: queued work, in-flight work, resolve/reject waiters, manual resolve activity, and pending merge tasks are all drained
+**Then**: the scheduler exits instead of waiting persistently
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
