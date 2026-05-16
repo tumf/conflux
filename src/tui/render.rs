@@ -1192,6 +1192,41 @@ fn take_chars_by_display_width(s: &str, max_width: usize) -> (&str, &str) {
     (&s[..byte_pos], &s[byte_pos..])
 }
 
+fn log_navigation_hint() -> &'static str {
+    "PgUp/PgDn: older/newer Home/End: oldest/newest l: hide"
+}
+
+fn logs_panel_title(
+    log_scroll_offset: usize,
+    log_auto_scroll: bool,
+    total_display_lines: usize,
+    visible_height: usize,
+    start_line: usize,
+    end_line: usize,
+) -> String {
+    let auto_scroll_indicator = if log_auto_scroll { "▼" } else { "⏸" };
+    let help = log_navigation_hint();
+
+    if total_display_lines > visible_height {
+        let visible_start = start_line + 1;
+        let visible_end = end_line;
+        format!(
+            " Logs [{}-{}/{}] logs_off={} {} ({}) ",
+            visible_start,
+            visible_end,
+            total_display_lines,
+            log_scroll_offset,
+            auto_scroll_indicator,
+            help
+        )
+    } else {
+        format!(
+            " Logs logs_off={} {} ({}) ",
+            log_scroll_offset, auto_scroll_indicator, help
+        )
+    }
+}
+
 fn wrap_log_message(
     message: &str,
     available_width: usize,
@@ -1404,25 +1439,15 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         current_line = entry_end;
     }
 
-    // Build title with scroll position indicator and auto-scroll status
-    let auto_scroll_indicator = if app.log_auto_scroll { "▼" } else { "⏸" };
-    let title = if total_display_lines > visible_height {
-        let visible_start = start_line + 1;
-        let visible_end = end_line;
-        format!(
-            " Logs [{}-{}/{}] logs_off={} {} ",
-            visible_start,
-            visible_end,
-            total_display_lines,
-            app.log_scroll_offset,
-            auto_scroll_indicator
-        )
-    } else {
-        format!(
-            " Logs logs_off={} {} ",
-            app.log_scroll_offset, auto_scroll_indicator
-        )
-    };
+    // Build title with scroll position indicator, auto-scroll status, and compact navigation help.
+    let title = logs_panel_title(
+        app.log_scroll_offset,
+        app.log_auto_scroll,
+        total_display_lines,
+        visible_height,
+        start_line,
+        end_line,
+    );
 
     // Do NOT use Paragraph::wrap - we handle wrapping manually
     let logs = Paragraph::new(log_items).block(
@@ -2874,6 +2899,32 @@ mod tests {
             content.contains("Test log message"),
             "Log message should be visible when logs panel is enabled"
         );
+    }
+
+    #[test]
+    fn logs_panel_title_preserves_position_and_shows_navigation_guidance() {
+        let title = logs_panel_title(3, false, 42, 10, 20, 30);
+
+        assert!(title.contains("Logs [21-30/42]"));
+        assert!(title.contains("logs_off=3"));
+        assert!(title.contains("⏸"));
+        assert!(title.contains("PgUp/PgDn: older/newer"));
+        assert!(title.contains("Home/End: oldest/newest"));
+        assert!(title.contains("l: hide"));
+    }
+
+    #[test]
+    fn logs_panel_visible_buffer_shows_navigation_guidance() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.add_log(LogEntry::info("Test log message"));
+
+        let buffer = render_buffer(&mut app, 120, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("PgUp/PgDn"));
+        assert!(content.contains("Home/End"));
+        assert!(content.contains("l: hide"));
     }
 
     #[test]
