@@ -286,7 +286,9 @@ async fn run_tui_loop(
         crate::orchestration::state::OrchestratorState::new(change_ids, max_iterations),
     ));
 
+    let tui_config = crate::tui::config::TuiConfig::load_user_config()?;
     let mut app = AppState::new(initial_changes);
+    app.set_tui_config(tui_config);
     app.worktree_paths = initial_worktree_paths;
     // Inject shared state reference into TUI for unified tracking
     app.set_shared_state(shared_state.clone());

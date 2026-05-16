@@ -191,12 +191,12 @@ pub fn handle_esc_key(ctx: &mut KeyEventContext<'_>) {
     }
 }
 
-fn handle_f5_key_inner(
+fn handle_start_key_inner(
     app: &mut AppState,
     graceful_stop_flag: &AtomicBool,
     orchestrator_handle: &Option<tokio::task::JoinHandle<Result<()>>>,
 ) -> Option<TuiCommand> {
-    // Handle F5 in Stopping mode to cancel graceful stop.
+    // Handle the configured start key in Stopping mode to cancel graceful stop.
     if app.mode == AppMode::Stopping {
         // Check if orchestrator is still running.
         if orchestrator_handle
@@ -217,9 +217,10 @@ fn handle_f5_key_inner(
         return None;
     }
 
-    // F5 is a cursor-independent orchestration control. It must not inspect the
-    // selected row for MergeWait/ResolveWait and must not resolve cursor-local
-    // merge waits; Changes-view M is the cursor-local resolve-intent key.
+    // The configured start key is a cursor-independent orchestration control.
+    // It must not inspect the selected row for MergeWait/ResolveWait and must
+    // not resolve cursor-local merge waits; Changes-view M is the cursor-local
+    // resolve-intent key.
     if app.mode == AppMode::Error {
         app.retry_error_changes()
     } else if app.mode == AppMode::Stopped {
@@ -229,9 +230,9 @@ fn handle_f5_key_inner(
     }
 }
 
-/// Handle F5 key: start, resume, or retry orchestration; or cancel stop.
-pub fn handle_f5_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
-    handle_f5_key_inner(ctx.app, ctx.graceful_stop_flag, ctx.orchestrator_handle)
+/// Handle the configured start key: start, resume, or retry orchestration; or cancel stop.
+pub fn handle_start_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
+    handle_start_key_inner(ctx.app, ctx.graceful_stop_flag, ctx.orchestrator_handle)
 }
 
 /// Handle Enter key: Execute worktree command in selected worktree
@@ -452,7 +453,7 @@ pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> boo
 
 /// Handle main key events
 ///
-/// Returns Some(TuiCommand) if the key event should trigger an orchestrator start (F5 key)
+/// Returns Some(TuiCommand) if the key event should trigger the configured start control
 pub async fn handle_key_event(
     key: KeyEvent,
     ctx: &mut KeyEventContext<'_>,
@@ -562,8 +563,8 @@ pub async fn handle_key_event(
         (KeyCode::Esc, _) => {
             handle_esc_key(ctx);
         }
-        (KeyCode::F(5), _) => {
-            cmd_to_start = handle_f5_key(ctx);
+        _ if ctx.app.tui_config.matches_start_key(&key) => {
+            cmd_to_start = handle_start_key(ctx);
         }
         (KeyCode::PageUp, _) => {
             // Scroll logs up (show older entries)
@@ -641,6 +642,7 @@ pub async fn handle_key_event(
 mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
+    use crate::tui::config::TuiConfig;
     use crossterm::event::KeyCode;
 
     fn create_test_change(id: &str) -> Change {
@@ -663,6 +665,61 @@ mod tests {
     }
 
     #[test]
+    fn configured_start_key_matches_default_and_custom_bindings() {
+        let mut app = AppState::new(vec![create_test_change("run-me")]);
+        app.changes[0].selected = true;
+
+        assert!(app.tui_config.matches_start_key(&key(KeyCode::F(5))));
+        assert!(!app.tui_config.matches_start_key(&key(KeyCode::Char('r'))));
+
+        let custom = TuiConfig::parse_jsonc(
+            r#"{"keybindings":{"start":["F5","r"]}}"#,
+            std::path::Path::new("/tmp/tui.jsonc"),
+        )
+        .unwrap();
+        app.set_tui_config(custom);
+
+        assert!(app.tui_config.matches_start_key(&key(KeyCode::F(5))));
+        assert!(app.tui_config.matches_start_key(&key(KeyCode::Char('r'))));
+        assert!(!app.tui_config.matches_start_key(&key(KeyCode::Char('x'))));
+    }
+
+    #[test]
+    fn configured_start_key_triggers_same_command_as_f5() {
+        let graceful_stop = inert_stop_flag();
+        let handle = None;
+        let custom = TuiConfig::parse_jsonc(
+            r#"{"keybindings":{"start":["F5","r"]}}"#,
+            std::path::Path::new("/tmp/tui.jsonc"),
+        )
+        .unwrap();
+
+        let mut f5_app = AppState::new(vec![create_test_change("run-me")]);
+        f5_app.set_tui_config(custom.clone());
+        f5_app.changes[0].selected = true;
+        let f5_command = if f5_app.tui_config.matches_start_key(&key(KeyCode::F(5))) {
+            handle_start_key_inner(&mut f5_app, &graceful_stop, &handle)
+        } else {
+            None
+        };
+
+        let mut r_app = AppState::new(vec![create_test_change("run-me")]);
+        r_app.set_tui_config(custom);
+        r_app.changes[0].selected = true;
+        let r_command = if r_app.tui_config.matches_start_key(&key(KeyCode::Char('r'))) {
+            handle_start_key_inner(&mut r_app, &graceful_stop, &handle)
+        } else {
+            None
+        };
+
+        assert_eq!(format!("{:?}", f5_command), format!("{:?}", r_command));
+        assert!(matches!(
+            r_command,
+            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["run-me".to_string()]
+        ));
+    }
+
+    #[test]
     fn f5_on_merge_wait_row_does_not_emit_resolve_merge() {
         let mut app = AppState::new(vec![
             create_test_change("merge-wait"),
@@ -675,7 +732,7 @@ mod tests {
         let graceful_stop = inert_stop_flag();
         let handle = None;
 
-        let command = handle_f5_key_inner(&mut app, &graceful_stop, &handle);
+        let command = handle_start_key_inner(&mut app, &graceful_stop, &handle);
 
         assert!(
             !matches!(command, Some(TuiCommand::ResolveMerge(_))),
@@ -698,7 +755,7 @@ mod tests {
         select_app.mode = AppMode::Select;
         select_app.is_resolving = true;
         select_app.changes[0].selected = true;
-        let command = handle_f5_key_inner(&mut select_app, &graceful_stop, &handle);
+        let command = handle_start_key_inner(&mut select_app, &graceful_stop, &handle);
         assert!(matches!(
             command,
             Some(TuiCommand::StartProcessing(ids)) if ids == vec!["select-a".to_string()]
@@ -709,7 +766,7 @@ mod tests {
         stopped_app.mode = AppMode::Stopped;
         stopped_app.is_resolving = true;
         stopped_app.changes[0].selected = true;
-        let command = handle_f5_key_inner(&mut stopped_app, &graceful_stop, &handle);
+        let command = handle_start_key_inner(&mut stopped_app, &graceful_stop, &handle);
         assert!(matches!(
             command,
             Some(TuiCommand::StartProcessing(ids)) if ids == vec!["stopped-a".to_string()]
@@ -731,7 +788,7 @@ mod tests {
             },
         );
         error_app.set_shared_state(shared);
-        let command = handle_f5_key_inner(&mut error_app, &graceful_stop, &handle);
+        let command = handle_start_key_inner(&mut error_app, &graceful_stop, &handle);
         assert!(matches!(
             command,
             Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string()]
@@ -748,7 +805,7 @@ mod tests {
         let graceful_stop = inert_stop_flag();
         let handle = None;
 
-        let command = handle_f5_key_inner(&mut app, &graceful_stop, &handle);
+        let command = handle_start_key_inner(&mut app, &graceful_stop, &handle);
 
         assert!(command.is_none());
         assert_eq!(app.changes[0].display_status_cache, "merge wait");

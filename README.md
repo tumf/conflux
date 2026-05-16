@@ -77,6 +77,16 @@ The configuration file format is JSONC.
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
+TUI user preferences are intentionally separate from orchestration config. The default start/resume/retry/continue key is `F5`; override only the local TUI start binding in `~/.config/cflx/tui.jsonc`:
+
+```jsonc
+{
+  "keybindings": {
+    "start": ["F5", "r"]
+  }
+}
+```
+
 Generate templates:
 
 ```bash
