@@ -24,7 +24,7 @@ use super::ParallelExecutor;
 use super::SchedulerLifetime;
 
 impl ParallelExecutor {
-    pub(super) fn should_exit_when_idle(
+    pub(super) fn is_fully_drained(
         &self,
         join_set_empty: bool,
         queued_empty: bool,
@@ -37,7 +37,26 @@ impl ParallelExecutor {
             && self.reject_wait_changes.is_empty()
             && self.manual_resolve_active() == 0
             && self.pending_merge_count.load(Ordering::Relaxed) == 0
+    }
+
+    pub(super) fn should_exit_when_idle(
+        &self,
+        join_set_empty: bool,
+        queued_empty: bool,
+        in_flight_empty: bool,
+    ) -> bool {
+        self.is_fully_drained(join_set_empty, queued_empty, in_flight_empty)
             && self.scheduler_lifetime == SchedulerLifetime::Finite
+    }
+
+    pub(super) fn should_enter_persistent_idle_wait(
+        &self,
+        join_set_empty: bool,
+        queued_empty: bool,
+        in_flight_empty: bool,
+    ) -> bool {
+        self.scheduler_lifetime == SchedulerLifetime::Persistent
+            && self.is_fully_drained(join_set_empty, queued_empty, in_flight_empty)
     }
 
     /// Execute changes with order-based dependency analysis and concurrent re-analysis.
@@ -200,12 +219,6 @@ impl ParallelExecutor {
                 );
                 break;
             }
-            if work_drained && self.scheduler_lifetime == SchedulerLifetime::Persistent {
-                info!(
-                    "Scheduler idle with no work; waiting for dynamic queue notifications (persistent lifetime)"
-                );
-            }
-
             if !queued.is_empty() {
                 let available_slots = self.calculate_available_slots(max_parallelism, &in_flight);
                 let should_attempt_reanalysis = available_slots > 0;
@@ -252,64 +265,25 @@ impl ParallelExecutor {
                 break;
             }
 
-            // Step 4: Wait for events using tokio::select!
-            // This makes the loop non-blocking and responsive to multiple triggers
-            tokio::select! {
-                // Join completion: task finished (apply+archive)
-                Some(result) = join_set.join_next() => {
-                    match result {
-                        Ok(workspace_result) => {
-                            self.handle_workspace_completion(workspace_result, max_parallelism, &mut in_flight, &merge_result_tx).await;
-
-                            // Re-analysis is state-derived each loop.
-                            // If a manual resolve is still active, keep the generic completion reason;
-                            // otherwise treat the slot release as resolve-aware capacity recovery.
-                            let manual_resolves_active = self
-                                .manual_resolve_count
-                                .as_ref()
-                                .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
-                                .unwrap_or(0);
-                            reanalysis_reason = if manual_resolves_active == 0 {
-                                ReanalysisReason::ResolveCompletion
-                            } else {
-                                ReanalysisReason::Completion
-                            };
-                            self.trigger_resolve_wait_retry_dispatch();
-                        }
-                        Err(e) => {
-                            error!("Task panicked: {:?}", e);
-                        }
-                    }
-                }
-
-                // Background merge completion: merge+cleanup finished asynchronously
-                Some(merge_result) = merge_result_rx.recv() => {
-                    let merged = self.handle_merge_result(merge_result).await;
-                    if merged {
-                        self.trigger_resolve_wait_retry_dispatch();
-                        reanalysis_reason = ReanalysisReason::ResolveCompletion;
-                    }
-                }
-
-                // Queue notification: dynamic queue has new items
-                Some(_) = async {
-                    if let Some(queue) = &self.dynamic_queue {
-                        queue.notified().await;
-                        Some(())
-                    } else {
-                        std::future::pending().await
-                    }
-                } => {
-                    info!("Queue notification received, will check queue on next iteration");
-                    self.trigger_resolve_wait_retry_dispatch();
-                    // Queue check happens at loop start
-                }
-
-                // Debounce timer: wait before allowing re-analysis
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                    // Timer expired; next loop derives re-analysis from current scheduler state.
-                }
+            if self.should_enter_persistent_idle_wait(
+                join_set.is_empty(),
+                queued.is_empty(),
+                in_flight.is_empty(),
+            ) {
+                self.wait_for_persistent_idle_wake(&mut reanalysis_reason, &mut merge_result_rx)
+                    .await;
+                continue;
             }
+
+            self.wait_for_scheduler_event(
+                &mut join_set,
+                &mut in_flight,
+                max_parallelism,
+                &merge_result_tx,
+                &mut merge_result_rx,
+                &mut reanalysis_reason,
+            )
+            .await;
         }
 
         // Drop cleanup guard without calling commit()
@@ -324,5 +298,112 @@ impl ParallelExecutor {
             send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         }
         Ok(())
+    }
+
+    async fn wait_for_scheduler_event(
+        &mut self,
+        join_set: &mut JoinSet<WorkspaceResult>,
+        in_flight: &mut HashSet<String>,
+        max_parallelism: usize,
+        merge_result_tx: &tokio::sync::mpsc::Sender<super::MergeResult>,
+        merge_result_rx: &mut tokio::sync::mpsc::Receiver<super::MergeResult>,
+        reanalysis_reason: &mut ReanalysisReason,
+    ) {
+        tokio::select! {
+            // Join completion: task finished (apply+archive)
+            Some(result) = join_set.join_next() => {
+                match result {
+                    Ok(workspace_result) => {
+                        self.handle_workspace_completion(workspace_result, max_parallelism, in_flight, merge_result_tx).await;
+
+                        // Re-analysis is state-derived each loop.
+                        // If a manual resolve is still active, keep the generic completion reason;
+                        // otherwise treat the slot release as resolve-aware capacity recovery.
+                        let manual_resolves_active = self
+                            .manual_resolve_count
+                            .as_ref()
+                            .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0);
+                        *reanalysis_reason = if manual_resolves_active == 0 {
+                            ReanalysisReason::ResolveCompletion
+                        } else {
+                            ReanalysisReason::Completion
+                        };
+                        self.trigger_resolve_wait_retry_dispatch();
+                    }
+                    Err(e) => {
+                        error!("Task panicked: {:?}", e);
+                    }
+                }
+            }
+
+            // Background merge completion: merge+cleanup finished asynchronously
+            Some(merge_result) = merge_result_rx.recv() => {
+                let merged = self.handle_merge_result(merge_result).await;
+                if merged {
+                    self.trigger_resolve_wait_retry_dispatch();
+                    *reanalysis_reason = ReanalysisReason::ResolveCompletion;
+                }
+            }
+
+            // Queue notification: dynamic queue has new items or scheduler-owned retry work
+            Some(_) = self.wait_for_dynamic_queue_notification() => {
+                info!("Queue notification received, will check queue on next iteration");
+                self.trigger_resolve_wait_retry_dispatch();
+                *reanalysis_reason = ReanalysisReason::QueueNotification;
+            }
+
+            // Debounce timer: wait before allowing re-analysis
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // Timer expired; next loop derives re-analysis from current scheduler state.
+            }
+        }
+    }
+
+    pub(super) async fn wait_for_persistent_idle_wake(
+        &mut self,
+        reanalysis_reason: &mut ReanalysisReason,
+        merge_result_rx: &mut tokio::sync::mpsc::Receiver<super::MergeResult>,
+    ) {
+        info!(
+            "Scheduler idle with no work; waiting for dynamic queue notifications (persistent lifetime)"
+        );
+
+        tokio::select! {
+            Some(merge_result) = merge_result_rx.recv() => {
+                let merged = self.handle_merge_result(merge_result).await;
+                if merged {
+                    self.trigger_resolve_wait_retry_dispatch();
+                    *reanalysis_reason = ReanalysisReason::ResolveCompletion;
+                }
+            }
+
+            Some(_) = self.wait_for_dynamic_queue_notification() => {
+                info!("Queue notification received while scheduler idle; resuming scheduler loop");
+                self.trigger_resolve_wait_retry_dispatch();
+                *reanalysis_reason = ReanalysisReason::QueueNotification;
+            }
+
+            _ = self.wait_for_cancellation(), if self.cancel_token.is_some() => {
+                info!("Cancellation received while scheduler idle; resuming scheduler loop");
+            }
+        }
+    }
+
+    async fn wait_for_dynamic_queue_notification(&self) -> Option<()> {
+        if let Some(queue) = &self.dynamic_queue {
+            queue.notified().await;
+            Some(())
+        } else {
+            std::future::pending().await
+        }
+    }
+
+    async fn wait_for_cancellation(&self) {
+        if let Some(token) = &self.cancel_token {
+            token.cancelled().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
     }
 }
