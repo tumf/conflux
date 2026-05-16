@@ -206,6 +206,7 @@ impl WorkspaceManager for TestWorkspaceManager {
     }
 
     async fn list_worktree_change_ids(&self) -> VcsResult<HashSet<String>> {
+        self.merge_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.existing_workspaces.keys().cloned().collect())
     }
 
@@ -3824,6 +3825,124 @@ async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
         !finite_executor.should_exit_when_idle(false, true, true),
         "scheduler must not exit when active join tasks remain"
     );
+}
+
+#[tokio::test]
+async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+
+    assert!(
+        !executor.should_enter_persistent_idle_wait(true, true, true),
+        "finite scheduler must not enter persistent idle wait"
+    );
+
+    executor.set_persistent_lifetime();
+    assert!(
+        executor.should_enter_persistent_idle_wait(true, true, true),
+        "persistent scheduler should enter event-driven idle wait only when fully drained"
+    );
+    assert!(
+        !executor.should_enter_persistent_idle_wait(false, true, true),
+        "active join tasks must keep the scheduler on the normal event path"
+    );
+    assert!(
+        !executor.should_enter_persistent_idle_wait(true, false, true),
+        "queued work must keep debounce/reanalysis behavior active"
+    );
+    assert!(
+        !executor.should_enter_persistent_idle_wait(true, true, false),
+        "in-flight work must keep completion handling active"
+    );
+
+    executor
+        .resolve_wait_changes
+        .insert("needs-resolve".to_string());
+    assert!(
+        !executor.should_enter_persistent_idle_wait(true, true, true),
+        "resolve waiters are scheduler-owned work and must not be treated as fully idle"
+    );
+}
+
+#[tokio::test]
+async fn test_persistent_idle_wait_does_not_poll_worktree_reconciliation_without_wake() {
+    use crate::tui::queue::DynamicQueue;
+    use tokio::sync::mpsc;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let queue = Arc::new(DynamicQueue::new());
+    let scan_calls = Arc::new(AtomicUsize::new(0));
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    executor.workspace_manager = Box::new(TestWorkspaceManager::new(scan_calls.clone()));
+    executor.set_persistent_lifetime();
+    executor.set_dynamic_queue(queue);
+    let (_merge_result_tx, mut merge_result_rx) = mpsc::channel(1);
+    let mut reason = crate::parallel::dynamic_queue::ReanalysisReason::Initial;
+
+    let wait = executor.wait_for_persistent_idle_wake(&mut reason, &mut merge_result_rx);
+    tokio::pin!(wait);
+
+    tokio::select! {
+        _ = &mut wait => panic!("persistent idle wait should not complete without a wake event"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    assert_eq!(
+        scan_calls.load(Ordering::SeqCst),
+        0,
+        "event-driven persistent idle wait must not poll worktree reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn test_persistent_idle_wait_wakes_on_queue_push_and_notify_scheduler() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::tui::queue::DynamicQueue;
+    use tokio::sync::mpsc;
+
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let queue = Arc::new(DynamicQueue::new());
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    executor.set_persistent_lifetime();
+    executor.set_dynamic_queue(queue.clone());
+    let (_merge_result_tx, mut merge_result_rx) = mpsc::channel(1);
+
+    let mut reason = ReanalysisReason::Initial;
+    {
+        let wait = executor.wait_for_persistent_idle_wake(&mut reason, &mut merge_result_rx);
+        tokio::pin!(wait);
+
+        tokio::select! {
+            _ = &mut wait => panic!("persistent idle wait should not complete before a wake event"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        assert!(queue.push("queued-change".to_string()).await);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+            .await
+            .or_fail("queue push should wake persistent idle wait");
+    }
+    assert_eq!(reason.to_string(), "queue");
+
+    let mut reason = ReanalysisReason::Initial;
+    {
+        let wait = executor.wait_for_persistent_idle_wake(&mut reason, &mut merge_result_rx);
+        tokio::pin!(wait);
+
+        tokio::select! {
+            _ = &mut wait => panic!("persistent idle wait should not complete before scheduler notification"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        queue.notify_scheduler();
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait)
+            .await
+            .or_fail("notify_scheduler should wake persistent idle wait");
+    }
+    assert_eq!(reason.to_string(), "queue");
 }
 
 #[tokio::test]
