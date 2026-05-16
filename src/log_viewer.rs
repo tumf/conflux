@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -339,9 +339,7 @@ pub fn follow_appended_lines<W: Write>(
 /// read-only behavior.
 #[cfg(test)]
 pub fn read_file_for_size_check(path: &Path) -> io::Result<String> {
-    let mut content = String::new();
-    File::open(path)?.read_to_string(&mut content)?;
-    Ok(content)
+    fs::read_to_string(path)
 }
 
 #[cfg(test)]
