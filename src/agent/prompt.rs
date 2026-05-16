@@ -4,6 +4,14 @@
 /// Kept only for compatibility in tests; actual prompt is sourced from OpenCode command files.
 pub const APPLY_SYSTEM_PROMPT: &str = "";
 
+/// Build an explicit, portable skill mention.
+///
+/// `load skills:` stays first for compatibility with Claude/OpenCode-style
+/// prompts; Codex activates local skills from the `$skill-name` mention.
+pub(crate) fn skill_prelude(skill: &str) -> String {
+    format!("load skills: {}\n\n${}", skill, skill)
+}
+
 /// Build apply prompt from change metadata, user prompt, history context, and acceptance tail
 /// Format: fixed prelude + user_prompt + APPLY_SYSTEM_PROMPT + acceptance_tail_context + history_context
 ///
@@ -43,7 +51,7 @@ pub fn build_apply_prompt_with_skill(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push(format!("load skills: {}", apply_skill));
+    parts.push(skill_prelude(apply_skill));
     parts.push(format!("Apply change id: {}", change_id));
 
     if !user_prompt.is_empty() {
@@ -83,7 +91,7 @@ pub fn build_archive_prompt_with_skill(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push(format!("load skills: {}", archive_skill));
+    parts.push(skill_prelude(archive_skill));
     parts.push(format!("Archive change id: {}", change_id));
 
     if !user_prompt.is_empty() {
@@ -117,7 +125,7 @@ pub fn build_cleanup_review_prompt_with_skill(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push(format!("load skills: {}", cleanup_review_skill));
+    parts.push(skill_prelude(cleanup_review_skill));
     parts.push(format!("Cleanup-review change id: {}", change_id));
     parts.push(format!(
         "change_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nworkspace_path: .",
@@ -251,7 +259,7 @@ pub fn build_acceptance_prompt_context_only_with_skill(
 ) -> String {
     let mut parts = Vec::new();
 
-    parts.push(format!("load skills: {}", accept_skill));
+    parts.push(skill_prelude(accept_skill));
     parts.push(format!("Acceptance id:{}", change_id));
 
     // Change metadata first so downstream templates can reference it.
@@ -525,8 +533,9 @@ pub(crate) mod tests {
             "",
         );
 
+        assert!(result.contains("$cflx-accept-with-speca"));
         assert!(result.contains("load skills: cflx-accept-with-speca"));
-        assert!(!result.contains("load skills: cflx-accept\n"));
+        assert!(!result.contains("$cflx-accept\n"));
         assert!(result.contains("Acceptance id:test-change"));
     }
 
@@ -548,6 +557,7 @@ pub(crate) mod tests {
         );
 
         // Should contain prelude, change metadata and user prompt
+        assert!(result.contains("$cflx-accept"));
         assert!(result.contains("load skills: cflx-accept"));
         assert!(result.contains("Acceptance id:test-change"));
         assert!(result.contains("change_id: test-change"));
@@ -563,17 +573,20 @@ pub(crate) mod tests {
     fn test_operation_prompt_builders_use_custom_skill_preludes() {
         let apply =
             build_apply_prompt_with_skill("team-apply", "change-123", "user", "history", "");
+        assert!(apply.contains("$team-apply"));
         assert!(apply.contains("load skills: team-apply"));
-        assert!(!apply.contains("load skills: cflx-apply"));
+        assert!(!apply.contains("$cflx-apply"));
 
         let archive =
             build_archive_prompt_with_skill("team-archive", "change-123", "user", "history");
+        assert!(archive.contains("$team-archive"));
         assert!(archive.contains("load skills: team-archive"));
-        assert!(!archive.contains("load skills: cflx-archive"));
+        assert!(!archive.contains("$cflx-archive"));
 
         let cleanup = build_cleanup_review_prompt_with_skill("team-cleanup-review", "change-123");
+        assert!(cleanup.contains("$team-cleanup-review"));
         assert!(cleanup.contains("load skills: team-cleanup-review"));
-        assert!(!cleanup.contains("load skills: cflx-cleanup-review"));
+        assert!(!cleanup.contains("$cflx-cleanup-review"));
 
         let acceptance = build_acceptance_prompt_context_only_with_skill(
             "cflx-accept-with-speca",
@@ -583,8 +596,9 @@ pub(crate) mod tests {
             "last",
             "diff",
         );
+        assert!(acceptance.contains("$cflx-accept-with-speca"));
         assert!(acceptance.contains("load skills: cflx-accept-with-speca"));
-        assert!(!acceptance.contains("load skills: cflx-accept\n"));
+        assert!(!acceptance.contains("$cflx-accept\n"));
         assert!(acceptance.contains("change_id: change-123"));
     }
 
@@ -592,6 +606,7 @@ pub(crate) mod tests {
     fn test_build_cleanup_review_prompt_contains_required_context() {
         let prompt = build_cleanup_review_prompt("change-123");
 
+        assert!(prompt.contains("$cflx-cleanup-review"));
         assert!(prompt.contains("load skills: cflx-cleanup-review"));
         assert!(prompt.contains("Cleanup-review change id: change-123"));
         assert!(prompt.contains("change_id: change-123"));

@@ -1296,7 +1296,7 @@ pub async fn execute_acceptance_in_workspace(
 
     // Grace period after detecting a canonical standalone verdict before
     // terminating the acceptance child process. This handles the case where
-    // the agent process (e.g. opencode + MCP child processes) does not exit
+    // the agent process (or its child processes) does not exit
     // promptly after emitting the verdict but keeps stdout/stderr pipes open,
     // which previously left acceptance to wait for inactivity timeout retry.
     let verdict_grace_period = acceptance_verdict_grace_period();
@@ -1357,7 +1357,7 @@ pub async fn execute_acceptance_in_workspace(
 
                 // Detect canonical verdict and start grace period.
                 // Primary: strict JSON verdict object (standalone or wrapped in
-                // an opencode `--format json` event). Fallback: strict plain-text
+                // a supported agent JSONL event). Fallback: strict plain-text
                 // standalone canonical marker. Trailing-text concatenation on
                 // the plain-text marker does NOT count.
                 if !verdict_detected && crate::acceptance::detect_verdict_in_line(&s).is_some() {

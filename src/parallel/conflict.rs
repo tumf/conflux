@@ -1025,7 +1025,7 @@ fn build_conflict_resolve_prompt(
     conflict_files_str: &str,
 ) -> String {
     format!(
-        "load skills: {}\n\n\
+        "{}\n\n\
          {}\n\n\
          Conflicting revisions: {}\n\n\
          VCS error output:\n\
@@ -1035,7 +1035,7 @@ fn build_conflict_resolve_prompt(
          VCS log for conflicting changes:\n\
          {}\n\n\
          Conflicting files: {}",
-        resolve_skill,
+        crate::agent::prompt::skill_prelude(resolve_skill),
         vcs_prompt_prefix,
         revisions.join(", "),
         vcs_error,
@@ -1059,7 +1059,7 @@ fn build_sequential_merge_resolve_prompt(
     conflict_files_str: &str,
 ) -> String {
     format!(
-        "load skills: {}\n\n\
+        "{}\n\n\
          {}\n\n\
          Operation: sequential merge\n\n\
          Target branch: {}\n\
@@ -1069,7 +1069,7 @@ fn build_sequential_merge_resolve_prompt(
          Current VCS status:\n{}\n\n\
          VCS log for branches:\n{}\n\n\
          Conflicting files (repo root, if any): {}",
-        resolve_skill,
+        crate::agent::prompt::skill_prelude(resolve_skill),
         vcs_prompt_prefix,
         target_branch,
         base_revision,
@@ -1096,6 +1096,7 @@ mod tests {
             "commit log here",
             "file.rs",
         );
+        assert!(prompt.contains("$cflx-resolve"));
         assert!(prompt.contains("load skills: cflx-resolve"));
         // Variable context present
         assert!(prompt.contains("branch-a, branch-b"));
@@ -1113,8 +1114,9 @@ mod tests {
             "log",
             "files",
         );
+        assert!(prompt.contains("$team-resolve"));
         assert!(prompt.contains("load skills: team-resolve"));
-        assert!(!prompt.contains("load skills: cflx-resolve"));
+        assert!(!prompt.contains("$cflx-resolve"));
     }
 
     #[test]
@@ -1156,6 +1158,7 @@ mod tests {
             "log entries",
             "(none)",
         );
+        assert!(prompt.contains("$cflx-resolve"));
         assert!(prompt.contains("load skills: cflx-resolve"));
         assert!(prompt.contains("Operation: sequential merge"));
         // Variable context present
@@ -1177,8 +1180,9 @@ mod tests {
             "log",
             "files",
         );
+        assert!(prompt.contains("$team-resolve"));
         assert!(prompt.contains("load skills: team-resolve"));
-        assert!(!prompt.contains("load skills: cflx-resolve"));
+        assert!(!prompt.contains("$cflx-resolve"));
     }
 
     #[test]
