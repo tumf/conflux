@@ -41,8 +41,10 @@ KEY OPTIONS:
   --vcs BACKEND         VCS backend: auto, git (default: auto)
   --web                 Enable web monitoring server
   --web-port PORT       Web server port (default: 0 = auto-assign)
-  --web-bind ADDR       Web server bind address (default: 127.0.0.1)
-  --server URL          Connect TUI to a remote Conflux server
+    --web-bind ADDR       Web server bind address (default: 127.0.0.1)
+    logs                 View persistent Conflux log files without mutating them
+    --server URL          Connect TUI to a remote Conflux server
+
   --server-token TOKEN  Bearer token for remote server authentication
   --server-token-env VAR  Environment variable holding the bearer token
 
@@ -150,6 +152,15 @@ pub enum Commands {
     #[command(name = "install-skills")]
     InstallSkills(InstallSkillsArgs),
 
+    /// View persistent Conflux logs without creating, appending, or cleaning log files
+    ///
+    /// EXAMPLES:
+    ///   cflx logs --path                    # Print selected log file path
+    ///   cflx logs --last 50                 # Print the last 50 log lines
+    ///   cflx logs --follow                  # Print recent lines, then stream appended lines
+    ///   cflx logs --today --project my-slug # Select today's log for an explicit project
+    Logs(LogsArgs),
+
     /// OpenSpec utility commands for repository-scoped operations
     ///
     /// Provides native subcommands for listing, inspecting, validating, and
@@ -163,6 +174,42 @@ pub enum Commands {
     ///   cflx openspec validate --strict             # Validate all changes
     ///   cflx openspec archive my-change --yes       # Archive a change
     Openspec(OpenspecArgs),
+}
+
+/// Arguments for the logs subcommand
+#[derive(Parser, Debug)]
+#[command(
+    long_about = "View persistent Conflux log files without initializing runtime logging.
+
+By default, prints the last 200 lines from the latest existing log for the current project.
+Use --path to inspect the selected path without requiring the file to exist.
+
+EXAMPLES:
+  cflx logs --path
+  cflx logs --last 50
+  cflx logs --follow
+  cflx logs --today --project conflux-a1b2c3d4"
+)]
+pub struct LogsArgs {
+    /// Print the selected log path instead of reading log content
+    #[arg(long)]
+    pub path: bool,
+
+    /// Print at most the last N lines from the selected log file
+    #[arg(long, value_name = "N")]
+    pub last: Option<usize>,
+
+    /// Print the selected tail and then stream appended lines until interrupted
+    #[arg(long)]
+    pub follow: bool,
+
+    /// Prefer today's log file instead of the latest existing dated log file
+    #[arg(long)]
+    pub today: bool,
+
+    /// Select an explicit log project slug under the Conflux log root
+    #[arg(long, value_name = "SLUG")]
+    pub project: Option<String>,
 }
 
 /// Arguments for the run subcommand
@@ -694,6 +741,60 @@ pub fn check_parallel_available() -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn test_logs_subcommand_flags() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "logs",
+            "--path",
+            "--last",
+            "50",
+            "--follow",
+            "--today",
+            "--project",
+            "conflux-test",
+        ]);
+
+        match cli.command {
+            Some(Commands::Logs(args)) => {
+                assert!(args.path);
+                assert_eq!(args.last, Some(50));
+                assert!(args.follow);
+                assert!(args.today);
+                assert_eq!(args.project.as_deref(), Some("conflux-test"));
+            }
+            _ => panic!("Expected Logs subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_logs_help_documents_flags() {
+        let err = Cli::try_parse_from(["cflx", "logs", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(help.contains("--path"));
+        assert!(help.contains("--last <N>"));
+        assert!(help.contains("--follow"));
+        assert!(help.contains("--today"));
+        assert!(help.contains("--project <SLUG>"));
+    }
+
+    #[test]
+    fn test_logs_subcommand_default_mode() {
+        let cli = Cli::parse_from(["cflx", "logs"]);
+
+        match cli.command {
+            Some(Commands::Logs(args)) => {
+                assert!(!args.path);
+                assert_eq!(args.last, None);
+                assert!(!args.follow);
+                assert!(!args.today);
+                assert!(args.project.is_none());
+            }
+            _ => panic!("Expected Logs subcommand"),
+        }
+    }
 
     #[test]
     fn test_run_subcommand_config_option() {

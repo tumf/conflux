@@ -17,6 +17,7 @@ mod events;
 mod execution;
 mod history;
 mod hooks;
+mod log_viewer;
 mod openspec;
 mod openspec_cmd;
 mod orchestration;
@@ -52,8 +53,8 @@ mod test_support;
 
 use clap::Parser;
 use cli::{
-    install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, ProjectCommands, TuiArgs,
-    VERSION_WITH_BUILD,
+    install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, LogsArgs, ProjectCommands,
+    TuiArgs, VERSION_WITH_BUILD,
 };
 use config::OrchestratorConfig;
 use error::Result;
@@ -224,6 +225,22 @@ fn init_logging(enable_stdout: bool) -> Result<()> {
 
 fn log_startup(mode: &str) {
     info!("Starting cflx {} mode={}.", VERSION_WITH_BUILD, mode);
+}
+
+fn run_logs_subcommand(args: LogsArgs) {
+    let options = log_viewer::LogViewerOptions {
+        print_path: args.path,
+        last: args.last,
+        follow: args.follow,
+        today: args.today,
+        project: args.project,
+        repo_root: std::env::current_dir().ok(),
+    };
+
+    if let Err(e) = log_viewer::run_logs_command(&options, &mut std::io::stdout()) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
 }
 
 #[tokio::main]
@@ -713,6 +730,12 @@ async fn main() -> Result<()> {
             if let Some(handle) = web_bridge_handle {
                 handle.abort();
             }
+        }
+
+        // Logs subcommand: read-only persistent log viewer. Intentionally runs before
+        // init_logging() so viewing logs never creates, appends, or cleans log files.
+        Some(Commands::Logs(args)) => {
+            run_logs_subcommand(args);
         }
 
         // Init subcommand: generate configuration file

@@ -211,7 +211,7 @@ pub fn default_server_data_dir() -> std::path::PathBuf {
 /// of the absolute repository path.
 ///
 /// Example: `/Users/alice/projects/conflux` → `conflux-a1b2c3d4`
-fn generate_project_slug(repo_root: &std::path::Path) -> String {
+pub fn generate_project_slug(repo_root: &std::path::Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

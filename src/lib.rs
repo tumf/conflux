@@ -13,6 +13,7 @@
 pub mod embedded_skills;
 pub mod events;
 pub mod install_skills;
+pub mod log_viewer;
 pub mod tui;
 
 #[cfg(feature = "web-monitoring")]
