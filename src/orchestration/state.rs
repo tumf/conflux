@@ -1712,6 +1712,7 @@ impl OrchestratorState {
             ExecutionEvent::ChangesRefreshed {
                 changes,
                 merge_wait_ids,
+                rejected_changes: _,
                 worktree_not_ahead_ids,
                 ..
             } => {
@@ -2225,6 +2226,7 @@ mod tests {
                 dependencies: Vec::new(),
                 metadata: ProposalMetadata::default(),
             }],
+            rejected_changes: Vec::new(),
             committed_change_ids: HashSet::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
@@ -2839,6 +2841,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -2894,6 +2897,7 @@ mod tests {
                 dependencies: Vec::new(),
                 metadata: ProposalMetadata::default(),
             }],
+            rejected_changes: Vec::new(),
             committed_change_ids: HashSet::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
@@ -2932,6 +2936,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -2988,6 +2993,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -3143,6 +3149,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::from(["c".to_string()]),
             worktree_paths: HashMap::new(),
@@ -3182,6 +3189,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::from(["c".to_string()]),
             worktree_paths: HashMap::new(),
@@ -3523,6 +3531,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: std::collections::HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: std::collections::HashSet::new(),
             worktree_change_ids: std::collections::HashSet::from(["c".to_string()]),
             worktree_paths: std::collections::HashMap::new(),
@@ -3547,6 +3556,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: std::collections::HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: std::collections::HashSet::new(),
             worktree_change_ids: std::collections::HashSet::from(["c".to_string()]),
             worktree_paths: std::collections::HashMap::new(),
@@ -4230,6 +4240,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: Default::default(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: Default::default(),
             worktree_change_ids: Default::default(),
             worktree_paths: Default::default(),
@@ -4520,6 +4531,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -4571,6 +4583,7 @@ mod tests {
         state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
             changes: vec![],
             committed_change_ids: Default::default(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: Default::default(),
             worktree_change_ids: Default::default(),
             worktree_paths: Default::default(),

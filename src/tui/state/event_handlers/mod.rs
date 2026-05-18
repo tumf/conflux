@@ -88,6 +88,7 @@ impl AppState {
             }
             OrchestratorEvent::ChangesRefreshed {
                 changes,
+                rejected_changes,
                 committed_change_ids,
                 uncommitted_file_change_ids,
                 worktree_change_ids,
@@ -96,6 +97,7 @@ impl AppState {
                 merge_wait_ids,
             } => self.handle_changes_refreshed(
                 changes,
+                rejected_changes,
                 committed_change_ids,
                 uncommitted_file_change_ids,
                 worktree_change_ids,

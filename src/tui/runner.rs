@@ -80,6 +80,12 @@ fn should_bypass_local_refresh(is_remote_mode: bool) -> bool {
     is_remote_mode
 }
 
+fn refresh_local_changes(repo_root: &Path) -> Result<(Vec<Change>, Vec<Change>)> {
+    let active_changes = crate::openspec::list_changes_native_from(repo_root)?;
+    let rejected_changes = crate::openspec::list_rejected_changes_native_from(repo_root)?;
+    Ok((active_changes, rejected_changes))
+}
+
 fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> bool {
     use crate::events::ExecutionEvent;
 
@@ -202,8 +208,6 @@ async fn run_tui_loop(
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
 ) -> Result<()> {
-    use crate::openspec;
-
     let repo_root = std::env::current_dir()?;
 
     // Parallel eligibility is a local-worktree concept.
@@ -493,6 +497,7 @@ async fn run_tui_loop(
                         let _ = translate_tx
                             .send(super::events::OrchestratorEvent::ChangesRefreshed {
                                 changes,
+                                rejected_changes: Vec::new(),
                                 committed_change_ids: std::collections::HashSet::new(),
                                 uncommitted_file_change_ids: std::collections::HashSet::new(),
                                 worktree_change_ids: std::collections::HashSet::new(),
@@ -619,8 +624,8 @@ async fn run_tui_loop(
                         continue;
                     }
 
-                    match openspec::list_changes_native() {
-                        Ok(mut changes) => {
+                    match refresh_local_changes(&refresh_repo_root) {
+                        Ok((mut changes, rejected_changes)) => {
                             let committed_change_ids: HashSet<String> =
                                 match crate::vcs::git::commands::list_changes_in_head(&refresh_repo_root).await {
                                     Ok(ids) => ids.into_iter().collect(),
@@ -740,6 +745,7 @@ async fn run_tui_loop(
                             if refresh_tx
                                 .send(OrchestratorEvent::ChangesRefreshed {
                                     changes,
+                                    rejected_changes,
                                     committed_change_ids,
                                     uncommitted_file_change_ids,
                                     worktree_change_ids,
@@ -978,7 +984,7 @@ async fn run_tui_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_refresh_root_usable, should_apply_event_to_tui_reducer};
+    use super::{is_refresh_root_usable, refresh_local_changes, should_apply_event_to_tui_reducer};
     use crate::events::{ExecutionEvent, RejectionOutcome, StalledBlocker};
     use crate::openspec::{Change, ProposalMetadata};
     use crate::vcs::WorkspaceStatus;
@@ -999,6 +1005,7 @@ mod tests {
     fn empty_changes_refreshed_event() -> ExecutionEvent {
         ExecutionEvent::ChangesRefreshed {
             changes: vec![sample_change()],
+            rejected_changes: Vec::new(),
             committed_change_ids: HashSet::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
@@ -1209,6 +1216,41 @@ mod tests {
         assert!(
             !warned,
             "existing root should not trigger stale warning suppression"
+        );
+    }
+
+    #[test]
+    fn refresh_local_changes_uses_explicit_repo_root_for_active_and_rejected_rows() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let repo_dir = tempfile::tempdir().expect("repo tempdir");
+        let other_dir = tempfile::tempdir().expect("cwd tempdir");
+        let changes_dir = repo_dir.path().join("openspec").join("changes");
+
+        let active_dir = changes_dir.join("change-active");
+        std::fs::create_dir_all(&active_dir).expect("active dir");
+        std::fs::write(active_dir.join("proposal.md"), "# proposal").expect("active proposal");
+        std::fs::write(active_dir.join("tasks.md"), "- [ ] task").expect("active tasks");
+
+        let rejected_dir = changes_dir.join("change-rejected");
+        std::fs::create_dir_all(&rejected_dir).expect("rejected dir");
+        std::fs::write(rejected_dir.join("proposal.md"), "# proposal").expect("rejected proposal");
+        std::fs::write(rejected_dir.join("tasks.md"), "- [ ] task").expect("rejected tasks");
+        std::fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED").expect("rejected marker");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(other_dir.path()).expect("set cwd elsewhere");
+
+        let (active, rejected) = refresh_local_changes(repo_dir.path()).expect("refresh succeeds");
+
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+
+        assert_eq!(
+            active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["change-active"]
+        );
+        assert_eq!(
+            rejected.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["change-rejected"]
         );
     }
 

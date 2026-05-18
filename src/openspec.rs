@@ -335,10 +335,6 @@ fn parse_body_dependencies(content: &str, path: &Path) -> Vec<String> {
     dependencies
 }
 
-fn parse_dependencies(change_id: &str) -> ProposalMetadata {
-    parse_dependencies_from_base(Path::new("."), change_id)
-}
-
 fn parse_dependencies_from_base(base_path: &Path, change_id: &str) -> ProposalMetadata {
     let proposal_path = base_path
         .join("openspec/changes")
@@ -486,7 +482,11 @@ pub fn list_changes_native_from(base_path: &Path) -> Result<Vec<Change>> {
 /// Unlike [`list_changes_native`], this function intentionally returns only
 /// marker-bearing rows and is not used for execution candidate discovery.
 pub fn list_rejected_changes_native() -> Result<Vec<Change>> {
-    let changes_dir = Path::new("openspec/changes");
+    list_rejected_changes_native_from(Path::new("."))
+}
+
+pub fn list_rejected_changes_native_from(base_path: &Path) -> Result<Vec<Change>> {
+    let changes_dir = base_path.join("openspec/changes");
 
     if !changes_dir.exists() {
         debug!("Changes directory does not exist: {:?}", changes_dir);
@@ -522,18 +522,20 @@ pub fn list_rejected_changes_native() -> Result<Vec<Change>> {
             continue;
         }
 
-        let (completed_tasks, total_tasks) = match task_parser::parse_change(dir_name) {
-            Ok(progress) => (progress.completed, progress.total),
-            Err(_) => {
-                debug!(
-                    "Could not parse tasks for rejected change '{}', using 0/0",
-                    dir_name
-                );
-                (0, 0)
-            }
-        };
+        let tasks_path = path.join("tasks.md");
+        let (completed_tasks, total_tasks) =
+            match task_parser::parse_file(&tasks_path, Some(dir_name)) {
+                Ok(progress) => (progress.completed, progress.total),
+                Err(_) => {
+                    debug!(
+                        "Could not parse tasks for rejected change '{}', using 0/0",
+                        dir_name
+                    );
+                    (0, 0)
+                }
+            };
 
-        let metadata = parse_dependencies(dir_name);
+        let metadata = parse_dependencies_from_base(base_path, dir_name);
         let dependencies = metadata.dependencies.clone();
 
         changes.push(Change {
@@ -696,6 +698,46 @@ mod tests {
         assert!(
             result.iter().all(|change| change.id != "change-rejected"),
             "changes with REJECTED.md marker must be excluded from active change list"
+        );
+    }
+
+    #[test]
+    fn test_list_changes_and_rejected_native_from_use_explicit_base_when_cwd_differs() {
+        let _lock = crate::test_support::cwd_lock().lock().unwrap();
+        let repo_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+        let base = repo_dir.path().join("openspec").join("changes");
+
+        let active_dir = base.join("change-active");
+        fs::create_dir_all(&active_dir).unwrap();
+        fs::write(active_dir.join("proposal.md"), "# proposal").unwrap();
+        fs::write(active_dir.join("tasks.md"), "- [ ] active task").unwrap();
+
+        let rejected_dir = base.join("change-rejected");
+        fs::create_dir_all(&rejected_dir).unwrap();
+        fs::write(rejected_dir.join("proposal.md"), "# proposal").unwrap();
+        fs::write(rejected_dir.join("tasks.md"), "- [x] rejected task").unwrap();
+        fs::write(rejected_dir.join("REJECTED.md"), "# REJECTED").unwrap();
+
+        let original_dir = env::current_dir().unwrap();
+        env::set_current_dir(other_dir.path()).unwrap();
+
+        let active = list_changes_native_from(repo_dir.path()).unwrap();
+        let rejected = list_rejected_changes_native_from(repo_dir.path()).unwrap();
+
+        env::set_current_dir(original_dir).unwrap();
+
+        assert_eq!(
+            active.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["change-active"]
+        );
+        assert_eq!(
+            rejected.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["change-rejected"]
+        );
+        assert_eq!(
+            (rejected[0].completed_tasks, rejected[0].total_tasks),
+            (1, 1)
         );
     }
 
