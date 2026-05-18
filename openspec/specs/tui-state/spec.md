@@ -76,6 +76,10 @@ When a change directory contains both `openspec/changes/<change_id>/proposal.md`
 
 A rejected row SHALL NOT participate in execution mark, queue, or resume controls. The TUI MUST keep its frontend-visible execution mark cleared (`selected = false`), MUST ignore queue-oriented key operations for that row, MUST NOT label the row with the `NEW` badge, and MUST visibly present the row's terminal status as `rejected` in both Select and Running mode.
 
+Rejected row discovery during local TUI auto-refresh MUST use the same captured repository root as active change discovery. It MUST NOT depend on ambient process current working directory after TUI startup.
+
+<!-- Expected canonical result after archive: `tui-state` will state that rejected marker row discovery is repo-root based during local TUI refresh and still never produces NEW badges or queue intent. -->
+
 #### Scenario: Rejected change is shown in TUI list
 
 - **GIVEN** `openspec/changes/fix-auth/proposal.md` exists
@@ -119,6 +123,17 @@ A rejected row SHALL NOT participate in execution mark, queue, or resume control
 - **WHEN** the TUI refreshes after `fix-auth` reappears in the active listing
 - **THEN** `fix-auth` is shown as `not queued`
 - **AND** `fix-auth` remains `selected = false` until explicitly marked again
+
+#### Scenario: Rejected row refresh uses captured repository root
+
+- **GIVEN** local TUI mode started from repository root `/repo`
+- **AND** the process current working directory later differs from `/repo`
+- **AND** `/repo/openspec/changes/rejected-visible/proposal.md` exists
+- **AND** `/repo/openspec/changes/rejected-visible/REJECTED.md` exists
+- **WHEN** the TUI refreshes rejected marker rows
+- **THEN** `rejected-visible` is displayed as a rejected row from `/repo/openspec/changes`
+- **AND** the row does NOT show the `NEW` badge
+- **AND** no queue or selection intent is created for `rejected-visible`
 
 ### Requirement: TUI rejected row is visible but not selectable
 
@@ -126,6 +141,10 @@ When a change directory contains both `openspec/changes/<change_id>/proposal.md`
 
 A rejected row SHALL NOT participate in execution mark, queue, or resume controls. The TUI MUST keep its frontend-visible execution mark cleared (`selected = false`), MUST ignore queue-oriented key operations for that row, MUST NOT label the row with the `NEW` badge, and MUST visibly present the row's terminal status as `rejected` in both Select and Running mode.
 
+Rejected row discovery during local TUI auto-refresh MUST use the same captured repository root as active change discovery. It MUST NOT depend on ambient process current working directory after TUI startup.
+
+<!-- Expected canonical result after archive: `tui-state` will state that rejected marker row discovery is repo-root based during local TUI refresh and still never produces NEW badges or queue intent. -->
+
 #### Scenario: Rejected change is shown in TUI list
 
 - **GIVEN** `openspec/changes/fix-auth/proposal.md` exists
@@ -169,6 +188,17 @@ A rejected row SHALL NOT participate in execution mark, queue, or resume control
 - **WHEN** the TUI refreshes after `fix-auth` reappears in the active listing
 - **THEN** `fix-auth` is shown as `not queued`
 - **AND** `fix-auth` remains `selected = false` until explicitly marked again
+
+#### Scenario: Rejected row refresh uses captured repository root
+
+- **GIVEN** local TUI mode started from repository root `/repo`
+- **AND** the process current working directory later differs from `/repo`
+- **AND** `/repo/openspec/changes/rejected-visible/proposal.md` exists
+- **AND** `/repo/openspec/changes/rejected-visible/REJECTED.md` exists
+- **WHEN** the TUI refreshes rejected marker rows
+- **THEN** `rejected-visible` is displayed as a rejected row from `/repo/openspec/changes`
+- **AND** the row does NOT show the `NEW` badge
+- **AND** no queue or selection intent is created for `rejected-visible`
 
 ### Requirement: Scheduler dependency diagnostics are state-transition driven
 

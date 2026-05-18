@@ -1060,7 +1060,12 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
     // Show log panel toggle hint
     keys.push("l: logs".to_string());
 
-    let title = format!(" Changes ({}) ", keys.join(", "));
+    let new_indicator = if app.new_change_count > 0 {
+        format!(" New: {} |", app.new_change_count)
+    } else {
+        String::new()
+    };
+    let title = format!(" Changes ({} {}) ", new_indicator, keys.join(", "));
 
     let list = List::new(items)
         .block(
@@ -1995,6 +2000,25 @@ mod tests {
 
         assert_eq!(find_row_containing(&buffer, " Logs"), Some(30));
         assert_eq!(find_row_containing(&buffer, " Status"), Some(27));
+    }
+
+    #[test]
+    fn running_mode_shows_new_change_indicator_with_logs_and_many_changes() {
+        let changes = (0..30)
+            .map(|index| create_test_change(&format!("change-{index:02}")))
+            .collect();
+        let mut app = create_test_app(changes);
+        app.mode = AppMode::Running;
+        app.logs_panel_enabled = true;
+        app.new_change_count = 1;
+        app.changes[29].is_new = true;
+        app.add_log(LogEntry::info("log area"));
+
+        let buffer = render_buffer(&mut app, 100, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("New: 1"));
+        assert!(content.contains(" Logs"));
     }
 
     #[test]
