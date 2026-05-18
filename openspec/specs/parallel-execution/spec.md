@@ -16,6 +16,12 @@ When configured for persistent lifetime and fully drained, the scheduler MUST re
 
 The fully drained persistent idle wait MUST NOT introduce durable workflow-control state. It MUST preserve finite scheduler behavior, where finite execution exits once drained.
 
+When every remaining local queued candidate is non-dispatchable without explicit external intent, the scheduler SHALL treat the run as blocked-only drained rather than continuing timer-driven reanalysis. Non-dispatchable remaining candidates include manual `MergeWait`, recoverable terminal-error changes requiring explicit retry, dependency-blocked changes, and candidates that cannot be reconstructed from repository-visible OpenSpec/workspace evidence. Blocked-only drain MUST NOT mark those changes accepted, archived, merged, or rejected; it only means the scheduler has no automatic ordinary apply work to perform.
+
+In finite lifetime, blocked-only drain SHALL exit the scheduler loop. In persistent lifetime, blocked-only drain SHALL enter notification-driven idle wait and MUST NOT repeatedly run dependency analysis, worktree discovery, or queue reconciliation until an explicit queue/retry/merge/cancel wake event occurs.
+
+<!-- Expected canonical result after archive: `parallel-execution` will define blocked-only drain as a first-class scheduler idle/exit condition, preserving existing success semantics while preventing endless analyze loops. -->
+
 #### Scenario: persistent idle does not poll worktree scans
 
 **Given**: a parallel scheduler is running with persistent lifetime
@@ -46,6 +52,26 @@ The fully drained persistent idle wait MUST NOT introduce durable workflow-contr
 **Given**: a parallel scheduler is running with finite lifetime
 **When**: queued work, in-flight work, resolve/reject waiters, manual resolve activity, and pending merge tasks are all drained
 **Then**: the scheduler exits instead of waiting persistently
+
+#### Scenario: finite scheduler exits with blocked-only queued work
+
+**Given**: a parallel scheduler is running with finite lifetime
+**And**: there are no in-flight workspace tasks, reducer-owned resolve/reject waiters, active manual resolves, or pending merge tasks
+**And**: the only remaining queued candidates are manual `MergeWait`, terminal-error retry-required, dependency-blocked, or candidate-unavailable rows
+**When**: the scheduler evaluates the next loop iteration
+**Then**: the scheduler exits the running loop without invoking dependency analysis again
+**And**: the remaining changes keep their reducer-visible wait/error/blocked states
+**And**: no remaining change is marked accepted, archived, merged, or rejected solely because of blocked-only drain
+
+#### Scenario: persistent scheduler idles with blocked-only queued work
+
+**Given**: a parallel scheduler is running with persistent lifetime
+**And**: there are no in-flight workspace tasks, reducer-owned resolve/reject waiters, active manual resolves, or pending merge tasks
+**And**: the only remaining queued candidates are manual `MergeWait`, terminal-error retry-required, dependency-blocked, or candidate-unavailable rows
+**When**: no explicit queue/retry/merge/cancel wake event is received
+**Then**: the scheduler remains alive in notification-driven idle wait
+**And**: it does not repeatedly invoke dependency analysis
+**And**: it does not repeatedly run worktree discovery or queue reconciliation on a timer
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1525,6 +1551,12 @@ When configured for persistent lifetime and fully drained, the scheduler MUST re
 
 The fully drained persistent idle wait MUST NOT introduce durable workflow-control state. It MUST preserve finite scheduler behavior, where finite execution exits once drained.
 
+When every remaining local queued candidate is non-dispatchable without explicit external intent, the scheduler SHALL treat the run as blocked-only drained rather than continuing timer-driven reanalysis. Non-dispatchable remaining candidates include manual `MergeWait`, recoverable terminal-error changes requiring explicit retry, dependency-blocked changes, and candidates that cannot be reconstructed from repository-visible OpenSpec/workspace evidence. Blocked-only drain MUST NOT mark those changes accepted, archived, merged, or rejected; it only means the scheduler has no automatic ordinary apply work to perform.
+
+In finite lifetime, blocked-only drain SHALL exit the scheduler loop. In persistent lifetime, blocked-only drain SHALL enter notification-driven idle wait and MUST NOT repeatedly run dependency analysis, worktree discovery, or queue reconciliation until an explicit queue/retry/merge/cancel wake event occurs.
+
+<!-- Expected canonical result after archive: `parallel-execution` will define blocked-only drain as a first-class scheduler idle/exit condition, preserving existing success semantics while preventing endless analyze loops. -->
+
 #### Scenario: persistent idle does not poll worktree scans
 
 **Given**: a parallel scheduler is running with persistent lifetime
@@ -1555,6 +1587,26 @@ The fully drained persistent idle wait MUST NOT introduce durable workflow-contr
 **Given**: a parallel scheduler is running with finite lifetime
 **When**: queued work, in-flight work, resolve/reject waiters, manual resolve activity, and pending merge tasks are all drained
 **Then**: the scheduler exits instead of waiting persistently
+
+#### Scenario: finite scheduler exits with blocked-only queued work
+
+**Given**: a parallel scheduler is running with finite lifetime
+**And**: there are no in-flight workspace tasks, reducer-owned resolve/reject waiters, active manual resolves, or pending merge tasks
+**And**: the only remaining queued candidates are manual `MergeWait`, terminal-error retry-required, dependency-blocked, or candidate-unavailable rows
+**When**: the scheduler evaluates the next loop iteration
+**Then**: the scheduler exits the running loop without invoking dependency analysis again
+**And**: the remaining changes keep their reducer-visible wait/error/blocked states
+**And**: no remaining change is marked accepted, archived, merged, or rejected solely because of blocked-only drain
+
+#### Scenario: persistent scheduler idles with blocked-only queued work
+
+**Given**: a parallel scheduler is running with persistent lifetime
+**And**: there are no in-flight workspace tasks, reducer-owned resolve/reject waiters, active manual resolves, or pending merge tasks
+**And**: the only remaining queued candidates are manual `MergeWait`, terminal-error retry-required, dependency-blocked, or candidate-unavailable rows
+**When**: no explicit queue/retry/merge/cancel wake event is received
+**Then**: the scheduler remains alive in notification-driven idle wait
+**And**: it does not repeatedly invoke dependency analysis
+**And**: it does not repeatedly run worktree discovery or queue reconciliation on a timer
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
