@@ -169,6 +169,8 @@ impl ParallelExecutor {
             last_resolve_wait_base_dirty: None,
             queue_reconciliation_diagnostics_seen: HashSet::new(),
             no_analysis_diagnostics_seen: HashSet::new(),
+            #[cfg(test)]
+            analyze_failure_diagnostics_seen: HashSet::new(),
             dependency_blocker_diagnostics_seen: HashSet::new(),
         }
     }
