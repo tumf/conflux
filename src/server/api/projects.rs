@@ -612,8 +612,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let state = make_state(&temp_dir, None);
 
-        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+        let _control_calls_guard = crate::server::api::control::lock_control_calls_for_test().await;
 
         let entry = state
             .registry

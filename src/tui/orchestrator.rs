@@ -1046,6 +1046,7 @@ pub async fn run_orchestrator_parallel(
     let _ = tx
         .send(OrchestratorEvent::ChangesRefreshed {
             changes: all_changes,
+            rejected_changes: crate::openspec::list_rejected_changes_native().unwrap_or_default(),
             committed_change_ids,
             uncommitted_file_change_ids,
             worktree_change_ids: HashSet::new(),

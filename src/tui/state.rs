@@ -1258,8 +1258,12 @@ impl AppState {
     /// When changes are fetched from openspec CLI, their task progress is written
     /// to OrchestratorState::task_progress(). When updating UI state, progress is
     /// read from shared state to ensure consistency across TUI and orchestrator.
-    fn update_changes(&mut self, fetched_changes: Vec<Change>) {
-        processing_logic::update_changes(self, fetched_changes);
+    fn update_changes_with_rejected(
+        &mut self,
+        fetched_changes: Vec<Change>,
+        rejected_changes: Vec<Change>,
+    ) {
+        processing_logic::update_changes_with_rejected(self, fetched_changes, rejected_changes);
     }
 
     #[cfg(test)]
@@ -1268,7 +1272,7 @@ impl AppState {
         fetched_changes: Vec<Change>,
         rejected_changes: Vec<Change>,
     ) {
-        processing_logic::update_changes_with_rejected(self, fetched_changes, rejected_changes);
+        self.update_changes_with_rejected(fetched_changes, rejected_changes);
     }
 }
 // Note: auto_clear_merge_wait() and apply_merge_wait_status() have been removed in Phase 5.3.
@@ -2426,6 +2430,7 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
             changes,
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -2477,6 +2482,7 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
             changes,
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -2834,6 +2840,7 @@ mod tests {
             guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
                 changes: vec![],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
@@ -2850,6 +2857,7 @@ mod tests {
                 create_test_change("change-a", 0, 1),
                 create_test_change("change-b", 0, 1),
             ],
+            rejected_changes: Vec::new(),
             committed_change_ids: HashSet::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
@@ -3004,6 +3012,7 @@ mod tests {
             guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
                 changes: vec![],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
@@ -3018,6 +3027,7 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::ChangesRefreshed {
             changes: vec![create_test_change("change-a", 0, 1)],
             committed_change_ids: HashSet::new(),
+            rejected_changes: Vec::new(),
             uncommitted_file_change_ids: HashSet::new(),
             worktree_change_ids: HashSet::new(),
             worktree_paths: HashMap::new(),
@@ -3192,7 +3202,7 @@ mod tests {
         app.changes[0].display_status_cache = "rejected".to_string();
         app.changes[0].selected = true;
 
-        app.update_changes(changes);
+        app.update_changes_with_rejected_for_test(changes, Vec::new());
 
         assert_eq!(
             app.changes[0].display_status_cache, "not queued",
@@ -3680,6 +3690,7 @@ mod tests {
             guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
                 changes: vec![],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
@@ -3742,6 +3753,7 @@ mod tests {
             guard.apply_execution_event(&crate::events::ExecutionEvent::ChangesRefreshed {
                 changes: vec![],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),

@@ -560,6 +560,8 @@ pub enum ExecutionEvent {
     /// Changes list refreshed
     ChangesRefreshed {
         changes: Vec<crate::openspec::Change>,
+        /// Rejected marker rows derived from the same refresh source as `changes`.
+        rejected_changes: Vec<crate::openspec::Change>,
         committed_change_ids: std::collections::HashSet<String>,
         /// Set of change_ids with uncommitted or untracked files under openspec/changes/<change_id>/
         uncommitted_file_change_ids: std::collections::HashSet<String>,

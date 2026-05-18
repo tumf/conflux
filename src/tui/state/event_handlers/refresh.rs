@@ -84,6 +84,7 @@ impl AppState {
     pub(crate) fn handle_changes_refreshed(
         &mut self,
         changes: Vec<Change>,
+        rejected_changes: Vec<Change>,
         committed_change_ids: HashSet<String>,
         uncommitted_file_change_ids: HashSet<String>,
         worktree_change_ids: HashSet<String>,
@@ -96,7 +97,7 @@ impl AppState {
             self.reducer_protected_merge_wait_ids(&merge_wait_ids);
 
         self.worktree_paths = worktree_paths;
-        self.update_changes(changes);
+        self.update_changes_with_rejected(changes, rejected_changes);
         self.apply_parallel_eligibility(&committed_change_ids, &uncommitted_file_change_ids);
         self.apply_worktree_status(&worktree_change_ids);
         self.apply_refresh_merge_wait_status(
@@ -226,6 +227,56 @@ mod tests {
     }
 
     #[test]
+    fn changes_refreshed_adds_new_active_log_and_rejected_non_new_without_moving_cursor() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.cursor_index = 0;
+        app.list_state.select(Some(0));
+        let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
+
+        app.handle_changes_refreshed(
+            vec![
+                create_test_change("change-a"),
+                create_test_change("change-new"),
+            ],
+            vec![create_test_change("change-rejected")],
+            committed,
+            uncommitted,
+            worktrees,
+            paths,
+            not_ahead,
+            HashSet::new(),
+        );
+
+        let active = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-new")
+            .expect("active new row");
+        assert_eq!(active.display_status_cache, "not queued");
+        assert!(active.is_new);
+        assert!(!active.selected);
+
+        let rejected = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-rejected")
+            .expect("rejected row");
+        assert_eq!(rejected.display_status_cache, "rejected");
+        assert!(!rejected.is_new);
+        assert!(!rejected.selected);
+
+        assert_eq!(app.cursor_index, 0, "refresh must not steal cursor focus");
+        assert_eq!(app.new_change_count, 1);
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|entry| entry.message == "Detected new change: change-new")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn merge_wait_refresh_corrects_stale_resolve_pending_row() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         app.changes[0].set_display_status_cache("resolve pending");
@@ -238,6 +289,7 @@ mod tests {
         let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
         app.handle_changes_refreshed(
             vec![create_test_change("change-a")],
+            Vec::new(),
             committed,
             uncommitted,
             worktrees,
@@ -260,6 +312,7 @@ mod tests {
         let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
         app.handle_changes_refreshed(
             vec![create_test_change("change-a")],
+            Vec::new(),
             committed,
             uncommitted,
             worktrees,
@@ -282,6 +335,7 @@ mod tests {
         let (committed, uncommitted, worktrees, paths, not_ahead) = empty_refresh_sets();
         app.handle_changes_refreshed(
             vec![create_test_change("change-a")],
+            Vec::new(),
             committed,
             uncommitted,
             worktrees,
@@ -310,6 +364,7 @@ mod tests {
                 create_test_change("reject-pending"),
                 create_test_change("error-change"),
             ],
+            Vec::new(),
             committed,
             uncommitted,
             worktrees,
@@ -337,6 +392,7 @@ mod tests {
                 create_test_change("merged-change"),
                 create_test_change("rejected-change"),
             ],
+            Vec::new(),
             committed,
             uncommitted,
             worktrees,

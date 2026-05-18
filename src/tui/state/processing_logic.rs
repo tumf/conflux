@@ -2,8 +2,6 @@ use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use tokio::sync::RwLock;
 
-use tracing::warn;
-
 use crate::{
     openspec::Change,
     orchestration::state::{OrchestratorState, ReduceOutcome, ReducerCommand},
@@ -129,15 +127,6 @@ pub(super) fn build_start_command(ids: Vec<String>) -> TuiCommand {
     TuiCommand::StartProcessing(ids)
 }
 
-pub(super) fn update_changes(state: &mut AppState, fetched_changes: Vec<Change>) {
-    let rejected_changes = crate::openspec::list_rejected_changes_native().unwrap_or_else(|err| {
-        warn!(error = %err, "Failed to list rejected changes for TUI refresh");
-        Vec::new()
-    });
-
-    update_changes_with_rejected(state, fetched_changes, rejected_changes);
-}
-
 pub(super) fn update_changes_with_rejected(
     state: &mut AppState,
     fetched_changes: Vec<Change>,
@@ -172,6 +161,11 @@ pub(super) fn update_changes_with_rejected(
     let new_ids: Vec<String> = fetched_changes
         .iter()
         .chain(rejected_changes.iter())
+        .filter(|c| !state.known_change_ids.contains(&c.id))
+        .map(|c| c.id.clone())
+        .collect();
+    let new_active_ids: Vec<String> = fetched_changes
+        .iter()
         .filter(|c| !state.known_change_ids.contains(&c.id))
         .map(|c| c.id.clone())
         .collect();
@@ -277,6 +271,10 @@ pub(super) fn update_changes_with_rejected(
             rejected_state.set_display_status_cache("rejected");
             state.changes.push(rejected_state);
         }
+    }
+
+    for id in &new_active_ids {
+        state.add_log(LogEntry::info(format!("Detected new change: {}", id)));
     }
 
     state.known_change_ids.extend(new_ids);
