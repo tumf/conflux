@@ -649,6 +649,20 @@ pub enum AcceptancePromptMode {
 
 // ── OrchestratorConfig impls ───────────────────────────────────────────────
 
+fn overwrite_if_some<T>(target: &mut Option<T>, source: Option<T>) {
+    if source.is_some() {
+        *target = source;
+    }
+}
+
+fn merge_hooks_config(target: &mut Option<HooksConfig>, source: Option<HooksConfig>) {
+    match (target.as_mut(), source) {
+        (Some(target_hooks), Some(source_hooks)) => target_hooks.merge(source_hooks),
+        (None, Some(source_hooks)) => *target = Some(source_hooks),
+        (_, None) => {}
+    }
+}
+
 impl OrchestratorConfig {
     /// Create a new empty configuration
     #[allow(dead_code)]
@@ -659,186 +673,148 @@ impl OrchestratorConfig {
     /// Merge another config into this one, with the other config taking priority
     /// for fields that are `Some`.
     pub fn merge(&mut self, other: Self) {
-        // Server config
-        if other.server.is_some() {
-            self.server = other.server;
-        }
+        let Self {
+            server,
+            apply_command,
+            apply_escalation_command,
+            apply_stall_diagnose_command,
+            archive_command,
+            apply_skill,
+            archive_skill,
+            analyze_skill,
+            accept_skill,
+            rejecting_skill,
+            cleanup_review_skill,
+            resolve_skill,
+            analyze_command,
+            acceptance_command,
+            apply_prompt,
+            acceptance_prompt,
+            acceptance_prompt_mode,
+            archive_prompt,
+            hooks,
+            logging,
+            stall_detection,
+            error_circuit_breaker,
+            completion_check_delay_ms,
+            completion_check_max_retries,
+            max_iterations,
+            parallel_mode,
+            max_concurrent_workspaces,
+            workspace_base_dir,
+            resolve_command,
+            use_llm_analysis,
+            vcs_backend,
+            propose_command,
+            worktree_command,
+            command_queue_stagger_delay_ms,
+            command_queue_max_retries,
+            command_queue_retry_delay_ms,
+            command_queue_retry_patterns,
+            command_queue_retry_if_duration_under_secs,
+            acceptance_max_continues,
+            command_inactivity_timeout_secs,
+            command_inactivity_kill_grace_secs,
+            command_inactivity_timeout_max_retries,
+            stream_json_textify,
+            command_strict_process_cleanup,
+            proposal_session,
+        } = other;
 
-        // Command fields
-        if other.apply_command.is_some() {
-            self.apply_command = other.apply_command;
-        }
-        if other.apply_escalation_command.is_some() {
-            self.apply_escalation_command = other.apply_escalation_command;
-        }
-        if other.apply_stall_diagnose_command.is_some() {
-            self.apply_stall_diagnose_command = other.apply_stall_diagnose_command;
-        }
-        if other.archive_command.is_some() {
-            self.archive_command = other.archive_command;
-        }
-        if other.apply_skill.is_some() {
-            self.apply_skill = other.apply_skill;
-        }
-        if other.archive_skill.is_some() {
-            self.archive_skill = other.archive_skill;
-        }
-        if other.analyze_skill.is_some() {
-            self.analyze_skill = other.analyze_skill;
-        }
-        if other.accept_skill.is_some() {
-            self.accept_skill = other.accept_skill;
-        }
-        if other.rejecting_skill.is_some() {
-            self.rejecting_skill = other.rejecting_skill;
-        }
-        if other.cleanup_review_skill.is_some() {
-            self.cleanup_review_skill = other.cleanup_review_skill;
-        }
-        if other.resolve_skill.is_some() {
-            self.resolve_skill = other.resolve_skill;
-        }
-        if other.analyze_command.is_some() {
-            self.analyze_command = other.analyze_command;
-        }
-        if other.acceptance_command.is_some() {
-            self.acceptance_command = other.acceptance_command;
-        }
-        if other.resolve_command.is_some() {
-            self.resolve_command = other.resolve_command;
-        }
+        // Plain Option fields use the standard config precedence rule:
+        // a higher-priority Some value overwrites, while None preserves the existing value.
+        overwrite_if_some(&mut self.server, server);
+        overwrite_if_some(&mut self.apply_command, apply_command);
+        overwrite_if_some(&mut self.apply_escalation_command, apply_escalation_command);
+        overwrite_if_some(
+            &mut self.apply_stall_diagnose_command,
+            apply_stall_diagnose_command,
+        );
+        overwrite_if_some(&mut self.archive_command, archive_command);
+        overwrite_if_some(&mut self.apply_skill, apply_skill);
+        overwrite_if_some(&mut self.archive_skill, archive_skill);
+        overwrite_if_some(&mut self.analyze_skill, analyze_skill);
+        overwrite_if_some(&mut self.accept_skill, accept_skill);
+        overwrite_if_some(&mut self.rejecting_skill, rejecting_skill);
+        overwrite_if_some(&mut self.cleanup_review_skill, cleanup_review_skill);
+        overwrite_if_some(&mut self.resolve_skill, resolve_skill);
+        overwrite_if_some(&mut self.analyze_command, analyze_command);
+        overwrite_if_some(&mut self.acceptance_command, acceptance_command);
+        overwrite_if_some(&mut self.resolve_command, resolve_command);
 
-        // Prompt fields
-        if other.apply_prompt.is_some() {
-            self.apply_prompt = other.apply_prompt;
-        }
-        if other.acceptance_prompt.is_some() {
-            self.acceptance_prompt = other.acceptance_prompt;
-        }
-        if other.archive_prompt.is_some() {
-            self.archive_prompt = other.archive_prompt;
-        }
+        overwrite_if_some(&mut self.apply_prompt, apply_prompt);
+        overwrite_if_some(&mut self.acceptance_prompt, acceptance_prompt);
+        overwrite_if_some(&mut self.archive_prompt, archive_prompt);
+        overwrite_if_some(&mut self.acceptance_prompt_mode, acceptance_prompt_mode);
 
-        // Hooks - deep merge each field individually
-        if other.hooks.is_some() {
-            match (&mut self.hooks, other.hooks) {
-                (Some(self_hooks), Some(other_hooks)) => {
-                    self_hooks.merge(other_hooks);
-                }
-                (None, Some(other_hooks)) => {
-                    self.hooks = Some(other_hooks);
-                }
-                _ => {}
-            }
-        }
+        merge_hooks_config(&mut self.hooks, hooks);
 
-        // Logging config
-        if other.logging.is_some() {
-            self.logging = other.logging;
-        }
+        overwrite_if_some(&mut self.logging, logging);
+        overwrite_if_some(&mut self.stall_detection, stall_detection);
+        overwrite_if_some(&mut self.error_circuit_breaker, error_circuit_breaker);
 
-        // Stall detection
-        if other.stall_detection.is_some() {
-            self.stall_detection = other.stall_detection;
-        }
+        overwrite_if_some(
+            &mut self.completion_check_delay_ms,
+            completion_check_delay_ms,
+        );
+        overwrite_if_some(
+            &mut self.completion_check_max_retries,
+            completion_check_max_retries,
+        );
+        overwrite_if_some(&mut self.max_iterations, max_iterations);
 
-        // Error circuit breaker
-        if other.error_circuit_breaker.is_some() {
-            self.error_circuit_breaker = other.error_circuit_breaker;
-        }
+        overwrite_if_some(&mut self.parallel_mode, parallel_mode);
+        overwrite_if_some(
+            &mut self.max_concurrent_workspaces,
+            max_concurrent_workspaces,
+        );
+        overwrite_if_some(&mut self.workspace_base_dir, workspace_base_dir);
+        overwrite_if_some(&mut self.use_llm_analysis, use_llm_analysis);
+        overwrite_if_some(&mut self.vcs_backend, vcs_backend);
 
-        // Completion check config
-        if other.completion_check_delay_ms.is_some() {
-            self.completion_check_delay_ms = other.completion_check_delay_ms;
-        }
-        if other.completion_check_max_retries.is_some() {
-            self.completion_check_max_retries = other.completion_check_max_retries;
-        }
+        overwrite_if_some(&mut self.propose_command, propose_command);
+        overwrite_if_some(&mut self.worktree_command, worktree_command);
 
-        // Iteration limit
-        if other.max_iterations.is_some() {
-            self.max_iterations = other.max_iterations;
-        }
+        overwrite_if_some(
+            &mut self.command_queue_stagger_delay_ms,
+            command_queue_stagger_delay_ms,
+        );
+        overwrite_if_some(
+            &mut self.command_queue_max_retries,
+            command_queue_max_retries,
+        );
+        overwrite_if_some(
+            &mut self.command_queue_retry_delay_ms,
+            command_queue_retry_delay_ms,
+        );
+        overwrite_if_some(
+            &mut self.command_queue_retry_patterns,
+            command_queue_retry_patterns,
+        );
+        overwrite_if_some(
+            &mut self.command_queue_retry_if_duration_under_secs,
+            command_queue_retry_if_duration_under_secs,
+        );
 
-        // Parallel execution config
-        if other.parallel_mode.is_some() {
-            self.parallel_mode = other.parallel_mode;
-        }
-        if other.max_concurrent_workspaces.is_some() {
-            self.max_concurrent_workspaces = other.max_concurrent_workspaces;
-        }
-        if other.workspace_base_dir.is_some() {
-            self.workspace_base_dir = other.workspace_base_dir;
-        }
-        if other.use_llm_analysis.is_some() {
-            self.use_llm_analysis = other.use_llm_analysis;
-        }
-        if other.vcs_backend.is_some() {
-            self.vcs_backend = other.vcs_backend;
-        }
-
-        // TUI commands
-        if other.propose_command.is_some() {
-            self.propose_command = other.propose_command;
-        }
-        if other.worktree_command.is_some() {
-            self.worktree_command = other.worktree_command;
-        }
-
-        // Command queue config
-        if other.command_queue_stagger_delay_ms.is_some() {
-            self.command_queue_stagger_delay_ms = other.command_queue_stagger_delay_ms;
-        }
-        if other.command_queue_max_retries.is_some() {
-            self.command_queue_max_retries = other.command_queue_max_retries;
-        }
-        if other.command_queue_retry_delay_ms.is_some() {
-            self.command_queue_retry_delay_ms = other.command_queue_retry_delay_ms;
-        }
-        if other.command_queue_retry_patterns.is_some() {
-            self.command_queue_retry_patterns = other.command_queue_retry_patterns;
-        }
-        if other.command_queue_retry_if_duration_under_secs.is_some() {
-            self.command_queue_retry_if_duration_under_secs =
-                other.command_queue_retry_if_duration_under_secs;
-        }
-
-        // Acceptance config
-        if other.acceptance_max_continues.is_some() {
-            self.acceptance_max_continues = other.acceptance_max_continues;
-        }
-
-        // Inactivity timeout config
-        if other.command_inactivity_timeout_secs.is_some() {
-            self.command_inactivity_timeout_secs = other.command_inactivity_timeout_secs;
-        }
-        if other.command_inactivity_kill_grace_secs.is_some() {
-            self.command_inactivity_kill_grace_secs = other.command_inactivity_kill_grace_secs;
-        }
-        if other.command_inactivity_timeout_max_retries.is_some() {
-            self.command_inactivity_timeout_max_retries =
-                other.command_inactivity_timeout_max_retries;
-        }
-
-        // Stream-JSON textification
-        if other.stream_json_textify.is_some() {
-            self.stream_json_textify = other.stream_json_textify;
-        }
-
-        // Strict process cleanup
-        if other.command_strict_process_cleanup.is_some() {
-            self.command_strict_process_cleanup = other.command_strict_process_cleanup;
-        }
-
-        // acceptance_prompt_mode
-        if other.acceptance_prompt_mode.is_some() {
-            self.acceptance_prompt_mode = other.acceptance_prompt_mode;
-        }
-
-        // Proposal session config
-        if other.proposal_session.is_some() {
-            self.proposal_session = other.proposal_session;
-        }
+        overwrite_if_some(&mut self.acceptance_max_continues, acceptance_max_continues);
+        overwrite_if_some(
+            &mut self.command_inactivity_timeout_secs,
+            command_inactivity_timeout_secs,
+        );
+        overwrite_if_some(
+            &mut self.command_inactivity_kill_grace_secs,
+            command_inactivity_kill_grace_secs,
+        );
+        overwrite_if_some(
+            &mut self.command_inactivity_timeout_max_retries,
+            command_inactivity_timeout_max_retries,
+        );
+        overwrite_if_some(&mut self.stream_json_textify, stream_json_textify);
+        overwrite_if_some(
+            &mut self.command_strict_process_cleanup,
+            command_strict_process_cleanup,
+        );
+        overwrite_if_some(&mut self.proposal_session, proposal_session);
     }
 
     /// Get the apply command (required, returns error if not set)

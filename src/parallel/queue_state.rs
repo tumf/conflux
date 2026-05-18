@@ -42,6 +42,72 @@ impl QueueReconciliationOutcome {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueuedWorkClass {
+    DispatchableApply,
+    ManualMergeWait,
+    SchedulerLaneWait,
+    TerminalErrorRetryRequired,
+    DependencyBlocked,
+    CandidateUnavailable,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct BlockedOnlyQueueClassification {
+    pub dispatchable: Vec<crate::openspec::Change>,
+    pub manual_merge_wait: Vec<String>,
+    pub scheduler_lane_wait: Vec<String>,
+    pub terminal_error_retry_required: Vec<String>,
+    pub dependency_blocked: Vec<String>,
+    pub candidate_unavailable: Vec<String>,
+}
+
+impl BlockedOnlyQueueClassification {
+    pub fn has_dispatchable_apply(&self) -> bool {
+        !self.dispatchable.is_empty()
+    }
+
+    pub fn has_blocked_or_waiting_work(&self) -> bool {
+        !self.manual_merge_wait.is_empty()
+            || !self.scheduler_lane_wait.is_empty()
+            || !self.terminal_error_retry_required.is_empty()
+            || !self.dependency_blocked.is_empty()
+            || !self.candidate_unavailable.is_empty()
+    }
+
+    pub fn is_blocked_only(&self) -> bool {
+        !self.has_dispatchable_apply() && self.has_blocked_or_waiting_work()
+    }
+
+    #[cfg(test)]
+    pub fn class_for(&self, change_id: &str) -> Option<QueuedWorkClass> {
+        if self
+            .dispatchable
+            .iter()
+            .any(|change| change.id == change_id)
+        {
+            Some(QueuedWorkClass::DispatchableApply)
+        } else if self.manual_merge_wait.iter().any(|id| id == change_id) {
+            Some(QueuedWorkClass::ManualMergeWait)
+        } else if self.scheduler_lane_wait.iter().any(|id| id == change_id) {
+            Some(QueuedWorkClass::SchedulerLaneWait)
+        } else if self
+            .terminal_error_retry_required
+            .iter()
+            .any(|id| id == change_id)
+        {
+            Some(QueuedWorkClass::TerminalErrorRetryRequired)
+        } else if self.dependency_blocked.iter().any(|id| id == change_id) {
+            Some(QueuedWorkClass::DependencyBlocked)
+        } else if self.candidate_unavailable.iter().any(|id| id == change_id) {
+            Some(QueuedWorkClass::CandidateUnavailable)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueueReconciliationDiagnosticLevel {
     Info,
@@ -1707,6 +1773,198 @@ impl ParallelExecutor {
         outcome
     }
 
+    pub(super) async fn classify_queued_work(
+        &self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+    ) -> BlockedOnlyQueueClassification {
+        let mut classification = BlockedOnlyQueueClassification::default();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        let queued_local_ids: HashSet<&str> =
+            queued.iter().map(|change| change.id.as_str()).collect();
+        let in_flight_ids: HashSet<&str> = in_flight.iter().map(String::as_str).collect();
+        let active_ids = self.active_dependency_ids();
+        let active_refs: HashSet<&str> = active_ids.iter().map(String::as_str).collect();
+        let archived_ids = self.archived_dependency_ids();
+        let rejected_ids = self.rejected_dependency_ids();
+
+        let (reducer_queued, merge_wait_ids, resolve_wait_ids, reject_wait_ids, terminal_error_ids) =
+            self.shared_orchestrator_state
+                .as_ref()
+                .and_then(|state| state.try_read().ok())
+                .map(|state| {
+                    let terminal_error_ids = state
+                        .initial_change_ids()
+                        .iter()
+                        .filter(|id| state.is_terminal_error_change(id))
+                        .cloned()
+                        .collect::<HashSet<_>>();
+                    (
+                        state.queued_change_ids(),
+                        state.merge_wait_change_ids(),
+                        state.resolve_wait_change_ids(),
+                        state.reject_wait_change_ids(),
+                        terminal_error_ids,
+                    )
+                })
+                .unwrap_or_default();
+
+        let merge_wait_set: HashSet<String> = merge_wait_ids.into_iter().collect();
+        let resolve_wait_set: HashSet<String> = resolve_wait_ids.into_iter().collect();
+        let reject_wait_set: HashSet<String> = reject_wait_ids.into_iter().collect();
+
+        for change in queued {
+            seen_ids.insert(change.id.clone());
+            if merge_wait_set.contains(&change.id) || self.merge_wait_changes.contains(&change.id) {
+                classification.manual_merge_wait.push(change.id.clone());
+                continue;
+            }
+            if resolve_wait_set.contains(&change.id)
+                || reject_wait_set.contains(&change.id)
+                || self.resolve_wait_changes.contains(&change.id)
+                || self.reject_wait_changes.contains(&change.id)
+            {
+                classification.scheduler_lane_wait.push(change.id.clone());
+                continue;
+            }
+            if terminal_error_ids.contains(&change.id) {
+                classification
+                    .terminal_error_retry_required
+                    .push(change.id.clone());
+                continue;
+            }
+            if self.failed_tracker.should_skip(&change.id).is_some() {
+                classification.dependency_blocked.push(change.id.clone());
+                continue;
+            }
+
+            let mut blocked = false;
+            for dep_id in &change.dependencies {
+                let class = classify_dependency_target(
+                    dep_id,
+                    queued_local_ids.iter().copied(),
+                    in_flight_ids.iter().copied(),
+                    active_refs.iter().copied(),
+                    &archived_ids,
+                    &rejected_ids,
+                );
+                match class {
+                    DependencyTargetClass::Archived => {}
+                    DependencyTargetClass::Missing
+                    | DependencyTargetClass::Rejected
+                    | DependencyTargetClass::Queued
+                    | DependencyTargetClass::InFlight
+                    | DependencyTargetClass::ActiveButNotQueued
+                    | DependencyTargetClass::Error => {
+                        blocked = true;
+                    }
+                }
+                if terminal_error_ids.contains(dep_id) {
+                    blocked = true;
+                }
+                if blocked {
+                    break;
+                }
+            }
+
+            if blocked {
+                classification.dependency_blocked.push(change.id.clone());
+            } else {
+                classification.dispatchable.push(change.clone());
+            }
+        }
+
+        for queued_id in reducer_queued {
+            if !seen_ids.insert(queued_id.clone()) {
+                continue;
+            }
+            if merge_wait_set.contains(&queued_id) || self.merge_wait_changes.contains(&queued_id) {
+                classification.manual_merge_wait.push(queued_id);
+            } else if resolve_wait_set.contains(&queued_id)
+                || reject_wait_set.contains(&queued_id)
+                || self.resolve_wait_changes.contains(&queued_id)
+                || self.reject_wait_changes.contains(&queued_id)
+            {
+                classification.scheduler_lane_wait.push(queued_id);
+            } else if terminal_error_ids.contains(&queued_id) {
+                classification.terminal_error_retry_required.push(queued_id);
+            } else {
+                classification.candidate_unavailable.push(queued_id);
+            }
+        }
+
+        for change_id in merge_wait_set
+            .into_iter()
+            .chain(self.merge_wait_changes.iter().cloned())
+        {
+            if seen_ids.insert(change_id.clone()) {
+                classification.manual_merge_wait.push(change_id);
+            }
+        }
+        for change_id in resolve_wait_set
+            .into_iter()
+            .chain(reject_wait_set.into_iter())
+            .chain(self.resolve_wait_changes.iter().cloned())
+            .chain(self.reject_wait_changes.iter().cloned())
+        {
+            if seen_ids.insert(change_id.clone()) {
+                classification.scheduler_lane_wait.push(change_id);
+            }
+        }
+
+        classification
+    }
+
+    pub(super) async fn is_blocked_only_scheduler_state(
+        &self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+    ) -> bool {
+        in_flight.is_empty()
+            && self.manual_resolve_active() == 0
+            && self.pending_merge_count.load(Ordering::Relaxed) == 0
+            && self
+                .classify_queued_work(queued, in_flight)
+                .await
+                .is_blocked_only()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn emit_analysis_failure_diagnostic_once(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        error: &str,
+    ) {
+        let mut queued_ids: Vec<String> = queued.iter().map(|change| change.id.clone()).collect();
+        queued_ids.sort();
+        let mut in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
+        in_flight_ids.sort();
+        let normalized_error = error.trim().to_string();
+        let key = (
+            queued_ids.clone(),
+            in_flight_ids.clone(),
+            normalized_error.clone(),
+        );
+        if !self.analyze_failure_diagnostics_seen.insert(key) {
+            debug!(
+                queued = ?queued_ids,
+                in_flight = ?in_flight_ids,
+                error = %normalized_error,
+                "Suppressing repeated analysis failure diagnostic"
+            );
+            return;
+        }
+
+        let message = format!(
+            "Dependency analysis failed: error={}, queued={:?}, in_flight={:?}",
+            normalized_error, queued_ids, in_flight_ids
+        );
+        warn!("{}", message);
+        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
+        send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+    }
+
     pub(super) async fn emit_no_analysis_diagnostic(
         &mut self,
         queued: &[crate::openspec::Change],
@@ -1788,6 +2046,44 @@ impl ParallelExecutor {
             > + Send
             + Sync,
     {
+        let classification = self.classify_queued_work(queued, in_flight).await;
+        if classification.is_blocked_only() {
+            info!(
+                dispatchable = classification.dispatchable.len(),
+                manual_merge_wait = classification.manual_merge_wait.len(),
+                scheduler_lane_wait = classification.scheduler_lane_wait.len(),
+                terminal_error_retry_required = classification.terminal_error_retry_required.len(),
+                dependency_blocked = classification.dependency_blocked.len(),
+                candidate_unavailable = classification.candidate_unavailable.len(),
+                "Skipping dependency analysis because queued work is blocked-only"
+            );
+            self.emit_no_analysis_diagnostic(
+                queued,
+                in_flight,
+                max_parallelism,
+                "blocked_only_no_dispatchable_candidates",
+            )
+            .await;
+            return Ok((false, iteration));
+        }
+        if !classification.has_dispatchable_apply() && !queued.is_empty() {
+            info!(
+                queued = queued.len(),
+                "Skipping dependency analysis because no ordinary dispatchable candidates are available"
+            );
+            self.emit_no_analysis_diagnostic(
+                queued,
+                in_flight,
+                max_parallelism,
+                "no_dispatchable_apply_candidates",
+            )
+            .await;
+            return Ok((false, iteration));
+        }
+        if queued.len() != classification.dispatchable.len() {
+            *queued = classification.dispatchable;
+        }
+
         // Gate re-analysis by available execution slots.
         // Track zero->positive transitions so queue-edit debounce can be bypassed when
         // capacity is restored and queued work can run immediately.

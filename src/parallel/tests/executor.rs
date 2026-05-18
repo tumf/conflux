@@ -681,6 +681,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -800,6 +802,8 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -910,6 +914,8 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -1069,6 +1075,8 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -1283,6 +1291,8 @@ async fn test_merge_retries_when_merge_commit_missing() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -1489,6 +1499,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -1701,6 +1713,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        #[cfg(test)]
+        analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
     };
 
@@ -2366,6 +2380,213 @@ fn selective_dependency_analysis_result<'a>(
             groups: None,
         }
     })
+}
+
+#[tokio::test]
+async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let mut dependency_blocked = make_test_change("dependency-blocked");
+    dependency_blocked.dependencies = vec!["missing-dependency".to_string()];
+    let queued = vec![
+        make_test_change("dispatchable"),
+        make_test_change("manual-merge"),
+        make_test_change("resolve-wait"),
+        make_test_change("terminal-error"),
+        dependency_blocked,
+    ];
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            "dispatchable".to_string(),
+            "manual-merge".to_string(),
+            "resolve-wait".to_string(),
+            "terminal-error".to_string(),
+            "dependency-blocked".to_string(),
+            "candidate-missing".to_string(),
+        ],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("candidate-missing".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "manual-merge".to_string(),
+            reason: "manual merge required".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "resolve-wait".to_string(),
+            reason: "dirty base".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_command(ReducerCommand::ResolveMerge("resolve-wait".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "terminal-error".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.set_shared_orchestrator_state(shared);
+    let classification = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+
+    assert_eq!(
+        classification.class_for("dispatchable"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::DispatchableApply)
+    );
+    assert_eq!(
+        classification.class_for("manual-merge"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::ManualMergeWait)
+    );
+    assert_eq!(
+        classification.class_for("resolve-wait"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::SchedulerLaneWait)
+    );
+    assert_eq!(
+        classification.class_for("terminal-error"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::TerminalErrorRetryRequired)
+    );
+    assert_eq!(
+        classification.class_for("dependency-blocked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::DependencyBlocked)
+    );
+    assert_eq!(
+        classification.class_for("candidate-missing"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable)
+    );
+}
+
+#[tokio::test]
+async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal_error() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::VcsBackend;
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["manual-merge".to_string(), "terminal-error".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "manual-merge".to_string(),
+            reason: "manual merge required".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "terminal-error".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+
+    let analyzer_calls = Arc::new(AtomicUsize::new(0));
+    static BLOCKED_ONLY_ANALYZER_CALLS: std::sync::OnceLock<Arc<AtomicUsize>> =
+        std::sync::OnceLock::new();
+    let _ = BLOCKED_ONLY_ANALYZER_CALLS.set(analyzer_calls.clone());
+    fn should_not_call_analysis_result<'a>(
+        changes: &'a [crate::openspec::Change],
+        _in_flight: &'a [String],
+        _iteration: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+    > {
+        if let Some(calls) = BLOCKED_ONLY_ANALYZER_CALLS.get() {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+        let order: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+        Box::pin(async move {
+            crate::analyzer::AnalysisResult {
+                order,
+                dependencies: HashMap::new(),
+                groups: None,
+            }
+        })
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.set_shared_orchestrator_state(shared);
+    let mut queued = vec![
+        make_test_change("manual-merge"),
+        make_test_change("terminal-error"),
+    ];
+    let mut in_flight = HashSet::new();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(
+            &mut queued,
+            &mut in_flight,
+            1,
+            1,
+            ReanalysisReason::QueueNotification,
+            &should_not_call_analysis_result,
+            semaphore,
+            &mut join_set,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("unexpected error");
+
+    assert!(!should_break);
+    assert_eq!(iteration, 1);
+    assert_eq!(analyzer_calls.load(Ordering::SeqCst), 0);
+    assert!(in_flight.is_empty());
+    assert_eq!(queued.len(), 2);
+    assert!(
+        executor
+            .is_blocked_only_scheduler_state(&queued, &in_flight)
+            .await
+    );
+}
+
+#[tokio::test]
+async fn test_analyze_failure_diagnostic_dedupes_by_signature() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(
+        PathBuf::from("/tmp/test-repo"),
+        create_test_config(),
+        Some(tx),
+    );
+    let queued = vec![make_test_change("alpha")];
+    let in_flight = HashSet::new();
+
+    executor
+        .emit_analysis_failure_diagnostic_once(&queued, &in_flight, "InstanceRef not provided")
+        .await;
+    executor
+        .emit_analysis_failure_diagnostic_once(&queued, &in_flight, "InstanceRef not provided")
+        .await;
+    executor
+        .emit_analysis_failure_diagnostic_once(&queued, &in_flight, "different failure")
+        .await;
+
+    let mut error_count = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Error { message } = event {
+            if message.contains("Dependency analysis failed") {
+                error_count += 1;
+            }
+        }
+    }
+    assert_eq!(
+        error_count, 2,
+        "stable analysis failure signature should emit once"
+    );
 }
 
 fn single_queued_route_depends_on_policy_analysis_result<'a>(
@@ -3810,19 +4031,27 @@ async fn test_scheduler_lifetime_controls_idle_exit_behavior() {
     let mut finite_executor =
         ParallelExecutor::new(repo_dir.path().to_path_buf(), config.clone(), None);
 
+    let queued = Vec::new();
+    let in_flight = HashSet::new();
     assert!(
-        finite_executor.should_exit_when_idle(true, true, true),
+        finite_executor
+            .should_exit_when_idle(true, &queued, &in_flight)
+            .await,
         "finite scheduler must exit when all work is drained"
     );
 
     finite_executor.set_persistent_lifetime();
     assert!(
-        !finite_executor.should_exit_when_idle(true, true, true),
+        !finite_executor
+            .should_exit_when_idle(true, &queued, &in_flight)
+            .await,
         "persistent scheduler must remain alive while idle"
     );
 
     assert!(
-        !finite_executor.should_exit_when_idle(false, true, true),
+        !finite_executor
+            .should_exit_when_idle(false, &queued, &in_flight)
+            .await,
         "scheduler must not exit when active join tasks remain"
     );
 }
@@ -3833,26 +4062,40 @@ async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
 
+    let queued = Vec::new();
+    let in_flight = HashSet::new();
     assert!(
-        !executor.should_enter_persistent_idle_wait(true, true, true),
+        !executor
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight)
+            .await,
         "finite scheduler must not enter persistent idle wait"
     );
 
     executor.set_persistent_lifetime();
     assert!(
-        executor.should_enter_persistent_idle_wait(true, true, true),
+        executor
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight)
+            .await,
         "persistent scheduler should enter event-driven idle wait only when fully drained"
     );
     assert!(
-        !executor.should_enter_persistent_idle_wait(false, true, true),
+        !executor
+            .should_enter_persistent_idle_wait(false, &queued, &in_flight)
+            .await,
         "active join tasks must keep the scheduler on the normal event path"
     );
+    let queued_work = vec![make_test_change("queued-work")];
     assert!(
-        !executor.should_enter_persistent_idle_wait(true, false, true),
-        "queued work must keep debounce/reanalysis behavior active"
+        !executor
+            .should_enter_persistent_idle_wait(true, &queued_work, &in_flight)
+            .await,
+        "dispatchable queued work must keep debounce/reanalysis behavior active"
     );
+    let in_flight_work = HashSet::from(["in-flight-work".to_string()]);
     assert!(
-        !executor.should_enter_persistent_idle_wait(true, true, false),
+        !executor
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight_work)
+            .await,
         "in-flight work must keep completion handling active"
     );
 
@@ -3860,8 +4103,10 @@ async fn test_persistent_idle_wait_detection_requires_fully_drained_state() {
         .resolve_wait_changes
         .insert("needs-resolve".to_string());
     assert!(
-        !executor.should_enter_persistent_idle_wait(true, true, true),
-        "resolve waiters are scheduler-owned work and must not be treated as fully idle"
+        executor
+            .should_enter_persistent_idle_wait(true, &queued, &in_flight)
+            .await,
+        "stable ResolveWait-only work should use event-driven persistent idle wait"
     );
 }
 
@@ -4312,10 +4557,14 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
         "scheduler must mirror reducer-owned ResolveWait intent before idle/drained checks"
     );
 
-    let should_exit = executor.should_exit_when_idle(true, true, true);
+    let queued = Vec::new();
+    let in_flight = HashSet::new();
+    let should_exit = executor
+        .should_exit_when_idle(true, &queued, &in_flight)
+        .await;
     assert!(
-        !should_exit,
-        "scheduler must not report drained while shared reducer ResolveWait intent exists"
+        should_exit,
+        "finite scheduler should drain when only reducer-visible ResolveWait work remains"
     );
 }
 

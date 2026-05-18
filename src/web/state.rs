@@ -691,6 +691,7 @@ impl WebState {
                 ExecutionEvent::ChangesRefreshed {
                     changes,
                     committed_change_ids: _,
+                    rejected_changes: _,
                     uncommitted_file_change_ids: _,
                     worktree_change_ids: _,
                     worktree_paths: _,
@@ -1364,6 +1365,7 @@ mod tests {
                     dependencies: Vec::new(),
                     metadata: ProposalMetadata::default(),
                 }],
+                rejected_changes: Vec::new(),
                 committed_change_ids: HashSet::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
@@ -1396,6 +1398,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 9, 12)],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
@@ -1529,6 +1532,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 0, 0)],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
@@ -1569,6 +1573,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 0, 0)],
                 committed_change_ids: HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: HashSet::new(),
                 worktree_change_ids: HashSet::new(),
                 worktree_paths: HashMap::new(),
@@ -1902,6 +1907,7 @@ mod tests {
             guard.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 0, 1)],
                 committed_change_ids: std::collections::HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: std::collections::HashSet::new(),
                 worktree_change_ids: std::collections::HashSet::new(),
                 worktree_paths: std::collections::HashMap::new(),
@@ -1916,6 +1922,7 @@ mod tests {
             .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
                 changes: vec![create_test_change("change-a", 0, 1)],
                 committed_change_ids: std::collections::HashSet::new(),
+                rejected_changes: Vec::new(),
                 uncommitted_file_change_ids: std::collections::HashSet::new(),
                 worktree_change_ids: std::collections::HashSet::new(),
                 worktree_paths: std::collections::HashMap::new(),
