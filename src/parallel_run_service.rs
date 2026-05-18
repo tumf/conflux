@@ -19,7 +19,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+type AnalyzeFailureDiagnosticSignature = (Vec<String>, Vec<String>, String);
+type AnalyzeFailureDiagnosticStore = Arc<Mutex<HashSet<AnalyzeFailureDiagnosticSignature>>>;
 
 /// Service for parallel execution of changes.
 ///
@@ -43,7 +46,7 @@ pub struct ParallelRunService {
     /// AI command runner for analyze commands
     ai_runner: AiCommandRunner,
     /// Runtime-only observability dedupe for stable analyzer failure signatures.
-    analyze_failure_diagnostics_seen: Arc<Mutex<HashSet<(Vec<String>, Vec<String>, String)>>>,
+    analyze_failure_diagnostics_seen: AnalyzeFailureDiagnosticStore,
 }
 
 impl ParallelRunService {
@@ -654,6 +657,12 @@ impl ParallelRunService {
         );
         let mut seen = self.analyze_failure_diagnostics_seen.lock().await;
         if !seen.insert(key) {
+            debug!(
+                queued = ?queued_ids,
+                in_flight = ?in_flight,
+                error = %normalized_error,
+                "Suppressing repeated analysis failure diagnostic"
+            );
             return;
         }
         drop(seen);

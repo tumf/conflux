@@ -16,3 +16,6 @@
 
 Archive validation is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-blocked-only-analyze-loop --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] Archive commit path was blocked by the repository pre-commit hook. The real hook at `/Users/tumf/work/conflux/.git/hooks/pre-commit` runs `prek hook-impl`, and `.pre-commit-config.yaml:23-28` configures `clippy` as `cargo clippy --locked --all-targets --all-features -- -D warnings`. Manual commit-path equivalent command `agent-exec run -- prek run --all-files` failed with exit code 1. Evidence: `/Users/tumf/.local/share/agent-exec/jobs/6a9c9f9be7f79f1779aeae49b8240ea5/stdout.log:11-22` reported `clippy::type-complexity` at `src/parallel_run_service.rs:46:39` for `analyze_failure_diagnostics_seen: Arc<Mutex<HashSet<(Vec<String>, Vec<String>, String)>>>`. Fixed in-repo by introducing descriptive `AnalyzeFailureDiagnosticSignature` and `AnalyzeFailureDiagnosticStore` type aliases in `src/parallel_run_service.rs`; verification: `cargo clippy --locked --all-targets --all-features -- -D warnings`.
