@@ -15,3 +15,6 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-local-tui-live-change-visibility --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] `cargo test --lib` が失敗しており、実リポジトリの通常 Rust ライブラリ検証が通りません。agent-exec job `6b6c3f554ac56e65116ff0315db0e74b` / command `cargo test --lib` の結果: `test result: FAILED. 1873 passed; 1 failed; 6 ignored`。失敗箇所は `src/server/api/control.rs:1139` の `server::api::control::tests::test_global_control_run_skips_rejected_changes` で、期待値 `[("_global_", "run")]` に対し実値が `[("_global_", "run"), ("_global_", "run"), ("_global_", "run")]` でした。これはグローバルな `CONTROL_CALLS` が他テストからの呼び出しを混入しており、デフォルトの `cargo test --lib` 並列実行で不安定/失敗する状態です。`src/server/api/control.rs` にテスト専用の `lock_control_calls_for_test()` を追加し、`CONTROL_CALLS` を使う control/projects のテストを同じ async mutex で直列化・クリアすることで、並列実行中の呼び出し混入を隔離しました。検証: `cargo test --lib`、`cargo fmt --check`、`cflx openspec validate fix-local-tui-live-change-visibility --strict`、`cflx openspec validate fix-local-tui-live-change-visibility --archive-gate` を実行予定。

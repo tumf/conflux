@@ -254,6 +254,22 @@ pub async fn stop_and_dequeue_change(
 pub static CONTROL_CALLS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<(String, String)>>>> =
     std::sync::OnceLock::new();
 
+#[cfg(test)]
+static CONTROL_CALLS_TEST_LOCK: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) async fn lock_control_calls_for_test() -> tokio::sync::OwnedMutexGuard<()> {
+    let guard = CONTROL_CALLS_TEST_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
+    let calls = CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+    calls.lock().unwrap().clear();
+    guard
+}
+
 /// POST /api/v1/control/run - Start orchestration across all projects.
 ///
 /// For each project, collects changes that are currently selected and spawns a runner
@@ -797,8 +813,7 @@ mod tests {
         assert_eq!(json["projects"][0]["changes"][0]["selected"], true);
         assert_eq!(json["projects"][0]["changes"][0]["status"], "error");
 
-        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+        let _control_calls_guard = lock_control_calls_for_test().await;
 
         let req = Request::builder()
             .method(Method::POST)
@@ -865,8 +880,7 @@ mod tests {
             assert_eq!(shared.display_status("fix-stalled"), "stalled");
         }
 
-        CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        CONTROL_CALLS.get().unwrap().lock().unwrap().clear();
+        let _control_calls_guard = lock_control_calls_for_test().await;
 
         let router = build_router(state.clone());
         let req = Request::builder()
@@ -1112,8 +1126,8 @@ mod tests {
         std::fs::write(rejected_change_dir.join("proposal.md"), "# proposal\n").unwrap();
         std::fs::write(rejected_change_dir.join("REJECTED.md"), "# REJECTED\n").unwrap();
 
-        let calls = CONTROL_CALLS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-        calls.lock().unwrap().clear();
+        let _control_calls_guard = lock_control_calls_for_test().await;
+        let calls = CONTROL_CALLS.get().unwrap();
 
         let router = build_router(state.clone());
         let resp = router
