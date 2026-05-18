@@ -2168,6 +2168,140 @@ mod tests {
         assert_eq!(merged.archive_command, Some("global-archive".to_string()));
     }
 
+    // === Characterization tests: config merge semantics ===
+
+    #[test]
+    fn test_characterize_some_values_override_across_option_field_types() {
+        let mut base = OrchestratorConfig {
+            apply_command: Some("base-apply".to_string()),
+            max_iterations: Some(10),
+            parallel_mode: Some(false),
+            max_concurrent_workspaces: Some(2),
+            vcs_backend: Some(VcsBackend::Auto),
+            server: Some(ServerConfig {
+                port: 3000,
+                ..Default::default()
+            }),
+            proposal_session: Some(ProposalSessionConfig {
+                transport_command: "base-opencode".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        base.merge(OrchestratorConfig {
+            apply_command: Some("override-apply".to_string()),
+            max_iterations: Some(20),
+            parallel_mode: Some(true),
+            max_concurrent_workspaces: Some(4),
+            vcs_backend: Some(VcsBackend::Git),
+            server: Some(ServerConfig {
+                port: 4000,
+                ..Default::default()
+            }),
+            proposal_session: Some(ProposalSessionConfig {
+                transport_command: "override-opencode".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        assert_eq!(base.apply_command.as_deref(), Some("override-apply"));
+        assert_eq!(base.max_iterations, Some(20));
+        assert_eq!(base.parallel_mode, Some(true));
+        assert_eq!(base.max_concurrent_workspaces, Some(4));
+        assert_eq!(base.vcs_backend, Some(VcsBackend::Git));
+        assert_eq!(base.server.as_ref().map(|server| server.port), Some(4000));
+        assert_eq!(
+            base.proposal_session
+                .as_ref()
+                .map(|session| session.transport_command.as_str()),
+            Some("override-opencode")
+        );
+    }
+
+    #[test]
+    fn test_characterize_hooks_deep_merge_preserves_lower_priority_fields() {
+        use crate::hooks::HookType;
+
+        let mut base = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "hooks": {
+                    "on_start": "echo base start",
+                    "pre_apply": "echo base pre_apply"
+                }
+            }"#,
+        )
+        .unwrap();
+        let higher = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "hooks": {
+                    "on_finish": "echo higher finish",
+                    "pre_apply": "echo higher pre_apply"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        base.merge(higher);
+        let hooks = base.get_hooks();
+
+        assert_eq!(
+            hooks.get(HookType::OnStart).unwrap().command,
+            "echo base start",
+            "hooks merge must preserve lower-priority hook fields absent from higher-priority config"
+        );
+        assert_eq!(
+            hooks.get(HookType::OnFinish).unwrap().command,
+            "echo higher finish",
+            "hooks merge must add higher-priority hook fields"
+        );
+        assert_eq!(
+            hooks.get(HookType::PreApply).unwrap().command,
+            "echo higher pre_apply",
+            "hooks merge must let higher-priority hook fields override matching lower-priority fields"
+        );
+    }
+
+    #[test]
+    fn test_characterize_server_and_proposal_session_are_overwritten_not_deep_merged() {
+        let mut base = OrchestratorConfig {
+            server: Some(ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port: 3000,
+                ..Default::default()
+            }),
+            proposal_session: Some(ProposalSessionConfig {
+                transport_command: "base-opencode".to_string(),
+                transport_args: vec!["base".to_string()],
+                session_inactivity_timeout_secs: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        base.merge(OrchestratorConfig {
+            server: Some(ServerConfig {
+                port: 4000,
+                ..Default::default()
+            }),
+            proposal_session: Some(ProposalSessionConfig {
+                session_inactivity_timeout_secs: 20,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let server = base.server.unwrap();
+        assert_eq!(server.bind, "127.0.0.1");
+        assert_eq!(server.port, 4000);
+
+        let proposal_session = base.proposal_session.unwrap();
+        assert_eq!(proposal_session.transport_command, "opencode");
+        assert_eq!(proposal_session.transport_args, vec!["acp"]);
+        assert_eq!(proposal_session.session_inactivity_timeout_secs, 20);
+    }
+
     // === Characterization tests: JSONC deserialization and defaults (task 1.2) ===
 
     /// Characterizes default numeric/bool values exposed through getter methods.
