@@ -6,7 +6,7 @@
 - [x] `OrchestratorConfig::merge` の通常 Option フィールド上書きを共通ヘルパーへ集約する（verification: unit - merge characterization test がリファクタ前と同じ期待値で成功する）
 - [x] deep merge や特殊互換処理を通常 Option 上書きと読み分けられる構造へ分離する（verification: unit - hooks deep merge、operation skill merge、server config validation の既存テストが成功する）
 - [x] config テストの配置または命名を整理し、path precedence と merge priority の意図を追跡しやすくする（verification: unit - `cargo test config` または該当 config テストが成功する）
-- [x] 対象検証を実行する（verification: manual - `cargo test config` または該当 config テスト、`cargo fmt --check` を実行し、設定 contract の差分がないことを確認する）
+- [x] 対象検証を実行する (verification: manual - `cargo test config` または該当 config テスト、`cargo fmt --check` を実行し、設定 contract の差分がないことを確認する)
 
 ## Future Work
 
