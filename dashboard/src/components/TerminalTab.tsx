@@ -11,6 +11,14 @@ interface TerminalTabProps {
 
 const SHELL_CONTROL_KEYS = new Set(['a', 'e', 'k', 'u', 'l', 'r', 'd', 'w']);
 
+function shouldCloseWebSocket(ws: WebSocket): boolean {
+  return ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING;
+}
+
+function writeTerminalMessage(term: Terminal, message: string, colorCode: '31' | '33') {
+  term.write(`\r\n\x1b[${colorCode}m${message}\x1b[0m\r\n`);
+}
+
 export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -60,6 +68,15 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
     },
     [],
   );
+
+  const handleWebSocketError = useCallback((term: Terminal, event: Event) => {
+    console.error('Terminal WebSocket error:', event);
+    writeTerminalMessage(term, '[Terminal connection error]', '31');
+  }, []);
+
+  const handleWebSocketClose = useCallback((term: Terminal) => {
+    writeTerminalMessage(term, '[Terminal session ended]', '33');
+  }, []);
 
   // Initialize terminal
   useEffect(() => {
@@ -132,8 +149,8 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
     ws.onopen = () => {
       // Send initial size
       const dims = fitAddon.proposeDimensions();
-      if (dims) {
-        sendResize(dims.cols, dims.rows);
+      if (dims && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ rows: dims.rows, cols: dims.cols }));
       }
     };
 
@@ -146,12 +163,11 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
     };
 
     ws.onerror = (event) => {
-      console.error('Terminal WebSocket error:', event);
-      term.write('\r\n\x1b[31m[Terminal connection error]\x1b[0m\r\n');
+      handleWebSocketError(term, event);
     };
 
     ws.onclose = () => {
-      term.write('\r\n\x1b[33m[Terminal session ended]\x1b[0m\r\n');
+      handleWebSocketClose(term);
     };
 
     // Forward terminal input to WebSocket
@@ -164,20 +180,21 @@ export function TerminalTab({ sessionId, isActive }: TerminalTabProps) {
 
     // Handle terminal resize
     term.onResize(({ cols, rows }) => {
-      sendResize(cols, rows);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ rows, cols }));
+      }
     });
 
     // Cleanup
     return () => {
       helperTextAreaRef.current = null;
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      if (shouldCloseWebSocket(ws)) {
         ws.close();
       }
       term.dispose();
       initializedRef.current = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [clearHelperTextArea, fitTerminal, handleWebSocketClose, handleWebSocketError, sessionId]);
 
   // Refit when becoming active
   useEffect(() => {

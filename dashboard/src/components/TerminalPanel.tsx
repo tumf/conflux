@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef, useEffect } from 'react';
+import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { Plus, X, Terminal as TerminalIcon, ChevronUp, ChevronDown } from 'lucide-react';
 import { TerminalTab } from './TerminalTab';
 import {
@@ -36,6 +36,22 @@ function rootToLabel(root: string): string {
   return root || 'terminal';
 }
 
+function isSessionForContext(session: TerminalSessionInfo, projectId: string, root: string): boolean {
+  return session.project_id === projectId && session.root === root;
+}
+
+function toTabInfo(session: TerminalSessionInfo): TabInfo {
+  return { session, attached: false };
+}
+
+function selectFirstMatchingSessionId(
+  sessions: TerminalSessionInfo[],
+  projectId: string,
+  root: string,
+): string | null {
+  return sessions.find((session) => isSessionForContext(session, projectId, root))?.id ?? null;
+}
+
 export function TerminalPanel({ projectId, root, isExpanded, onToggleExpand }: TerminalPanelProps) {
   // allTabs stores every session we know about (across all roots).
   // We filter for display based on current root.
@@ -43,38 +59,43 @@ export function TerminalPanel({ projectId, root, isExpanded, onToggleExpand }: T
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [hasRestoredSessions, setHasRestoredSessions] = useState(false);
-  const allTabsRef = useRef(allTabs);
-  allTabsRef.current = allTabs;
 
   // Tabs visible for the current root context
-  const visibleTabs = allTabs.filter(
-    (t) => t.session.project_id === projectId && t.session.root === root,
+  const visibleTabs = useMemo(
+    () => allTabs.filter((tab) => isSessionForContext(tab.session, projectId, root)),
+    [allTabs, projectId, root],
   );
 
   // Count of all sessions (across all roots) for the badge
   const totalCount = allTabs.length;
 
-  // Restore existing sessions on mount
+  const handleCreateTab = useCallback(async () => {
+    if (isCreating) return;
+    setIsCreating(true);
+    try {
+      const session = await createTerminalSession({ project_id: projectId, root, rows: 24, cols: 80 });
+      setAllTabs((prev) => [...prev, toTabInfo(session)]);
+      setActiveTabId(session.id);
+    } catch (err) {
+      console.error('Failed to create terminal session:', err);
+    } finally {
+      setIsCreating(false);
+    }
+  }, [projectId, root, isCreating]);
+
+  // Restore existing sessions for the current project/root context.
   useEffect(() => {
     let cancelled = false;
+
     async function restoreSessions() {
       try {
         const sessions = await listTerminalSessions();
         if (cancelled) return;
-        if (sessions.length > 0) {
-          const restoredTabs: TabInfo[] = sessions.map((session) => ({
-            session,
-            attached: false,
-          }));
-          setAllTabs(restoredTabs);
 
-          // Set active tab to the first matching session for current context
-          const matching = sessions.filter(
-            (s) => s.project_id === projectId && s.root === root,
-          );
-          if (matching.length > 0) {
-            setActiveTabId(matching[0].id);
-          }
+        setAllTabs(sessions.map(toTabInfo));
+        const matchingSessionId = selectFirstMatchingSessionId(sessions, projectId, root);
+        if (matchingSessionId) {
+          setActiveTabId(matchingSessionId);
         }
       } catch (err) {
         console.error('Failed to restore terminal sessions:', err);
@@ -84,56 +105,44 @@ export function TerminalPanel({ projectId, root, isExpanded, onToggleExpand }: T
         }
       }
     }
+
+    setHasRestoredSessions(false);
     restoreSessions();
+
     return () => {
       cancelled = true;
     };
-    // Only run once on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [projectId, root]);
 
   // Auto-create a terminal session when panel expands and no matching session exists
   const hasAutoCreatedForContext = useRef<string | null>(null);
   useEffect(() => {
-    if (!hasRestoredSessions) return;
     const contextKey = `${projectId}:${root}`;
-    if (isExpanded && visibleTabs.length === 0 && hasAutoCreatedForContext.current !== contextKey && !isCreating) {
+    if (
+      hasRestoredSessions &&
+      isExpanded &&
+      visibleTabs.length === 0 &&
+      hasAutoCreatedForContext.current !== contextKey &&
+      !isCreating
+    ) {
       hasAutoCreatedForContext.current = contextKey;
       handleCreateTab();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isExpanded, hasRestoredSessions, visibleTabs.length, projectId, root]);
+  }, [handleCreateTab, hasRestoredSessions, isCreating, isExpanded, projectId, root, visibleTabs.length]);
 
-  // When root changes, switch active tab to a matching session if available
+  // When restored tabs or context changes, keep the active tab scoped to the current context.
   useEffect(() => {
-    const matching = allTabsRef.current.filter(
-      (t) => t.session.project_id === projectId && t.session.root === root,
-    );
-    if (matching.length > 0) {
-      // If active tab is already matching, keep it; otherwise switch to first match
-      const currentlyActive = matching.find((t) => t.session.id === activeTabId);
-      if (!currentlyActive) {
-        setActiveTabId(matching[0].session.id);
-      }
-    } else {
+    const matching = visibleTabs;
+    if (matching.length === 0) {
       setActiveTabId(null);
+      return;
     }
-  }, [projectId, root, activeTabId]);
 
-  const handleCreateTab = useCallback(async () => {
-    if (isCreating) return;
-    setIsCreating(true);
-    try {
-      const session = await createTerminalSession({ project_id: projectId, root, rows: 24, cols: 80 });
-      const newTab: TabInfo = { session, attached: false };
-      setAllTabs((prev) => [...prev, newTab]);
-      setActiveTabId(session.id);
-    } catch (err) {
-      console.error('Failed to create terminal session:', err);
-    } finally {
-      setIsCreating(false);
+    const currentlyActive = matching.some((tab) => tab.session.id === activeTabId);
+    if (!currentlyActive) {
+      setActiveTabId(matching[0].session.id);
     }
-  }, [projectId, root, isCreating]);
+  }, [activeTabId, visibleTabs]);
 
   const handleCloseTab = useCallback(
     async (sessionId: string) => {
@@ -145,15 +154,13 @@ export function TerminalPanel({ projectId, root, isExpanded, onToggleExpand }: T
       setAllTabs((prev) => prev.filter((t) => t.session.id !== sessionId));
       setActiveTabId((prev) => {
         if (prev === sessionId) {
-          const remaining = allTabsRef.current.filter(
-            (t) => t.session.id !== sessionId && t.session.project_id === projectId && t.session.root === root,
-          );
+          const remaining = visibleTabs.filter((tab) => tab.session.id !== sessionId);
           return remaining.length > 0 ? remaining[remaining.length - 1].session.id : null;
         }
         return prev;
       });
     },
-    [projectId, root],
+    [visibleTabs],
   );
 
   const handleSelectTab = useCallback((sessionId: string) => {
