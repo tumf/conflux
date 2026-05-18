@@ -5,7 +5,7 @@
 - [x] `TerminalPanel` の restore/auto-create effect を stale closure が起きにくい構造へ整理する（verification: unit - characterization test が同じ期待値で成功し、`react-hooks/exhaustive-deps` disable が削減される）
 - [x] `TerminalTab` の WebSocket/xterm lifecycle effect を安定 callback/ref または custom hook へ整理する（verification: unit - lifecycle characterization test が同じ期待値で成功し、cleanup が二重実行・漏れなく行われる）
 - [x] REST/WebSocket payload と表示メッセージが変わっていないことを確認する（verification: unit/manual - mock 呼び出し引数と terminal write 文字列を比較する）
-- [x] dashboard 検証を実行する（verification: manual - `dashboard` の既存 lint/type/test/build コマンドのうち利用可能なものを実行し、少なくとも対象 component test と lint が成功することを確認する）
+- [x] dashboard 検証を実行する (verification: manual - `dashboard` の既存 lint/type/test/build コマンドのうち利用可能なものを実行し、少なくとも対象 component test と lint が成功することを確認する)
 
 ## Future Work
 
