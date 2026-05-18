@@ -23,7 +23,7 @@ mod executor;
 mod merge;
 mod orchestration;
 mod output_bridge;
-mod queue_state;
+pub(super) mod queue_state;
 mod types;
 mod workspace;
 
@@ -180,6 +180,12 @@ pub struct ParallelExecutor {
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
     queue_reconciliation_diagnostics_seen: HashSet<(String, String)>,
     no_analysis_diagnostics_seen: HashSet<(Vec<String>, usize, usize, String)>,
+    /// Runtime-only observability dedupe for unchanged analysis failure signatures.
+    ///
+    /// This never controls routing; it only prevents stable analyzer failures from
+    /// spamming operator-visible diagnostics during a single process lifetime.
+    #[cfg(test)]
+    analyze_failure_diagnostics_seen: HashSet<(Vec<String>, Vec<String>, String)>,
     /// Runtime-only observability dedupe for unchanged dependency blocker signatures.
     ///
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.

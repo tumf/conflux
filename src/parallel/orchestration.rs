@@ -39,24 +39,34 @@ impl ParallelExecutor {
             && self.pending_merge_count.load(Ordering::Relaxed) == 0
     }
 
-    pub(super) fn should_exit_when_idle(
+    pub(super) async fn should_exit_when_idle(
         &self,
         join_set_empty: bool,
-        queued_empty: bool,
-        in_flight_empty: bool,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
     ) -> bool {
-        self.is_fully_drained(join_set_empty, queued_empty, in_flight_empty)
-            && self.scheduler_lifetime == SchedulerLifetime::Finite
+        if self.scheduler_lifetime != SchedulerLifetime::Finite || !join_set_empty {
+            return false;
+        }
+        self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty())
+            || self
+                .is_blocked_only_scheduler_state(queued, in_flight)
+                .await
     }
 
-    pub(super) fn should_enter_persistent_idle_wait(
+    pub(super) async fn should_enter_persistent_idle_wait(
         &self,
         join_set_empty: bool,
-        queued_empty: bool,
-        in_flight_empty: bool,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
     ) -> bool {
-        self.scheduler_lifetime == SchedulerLifetime::Persistent
-            && self.is_fully_drained(join_set_empty, queued_empty, in_flight_empty)
+        if self.scheduler_lifetime != SchedulerLifetime::Persistent || !join_set_empty {
+            return false;
+        }
+        self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty())
+            || self
+                .is_blocked_only_scheduler_state(queued, in_flight)
+                .await
     }
 
     /// Execute changes with order-based dependency analysis and concurrent re-analysis.
@@ -254,22 +264,20 @@ impl ParallelExecutor {
             }
 
             // Step 3: Check if all work is done (before waiting on select)
-            if self.should_exit_when_idle(
-                join_set.is_empty(),
-                queued.is_empty(),
-                in_flight.is_empty(),
-            ) {
+            if self
+                .should_exit_when_idle(join_set.is_empty(), &queued, &in_flight)
+                .await
+            {
                 info!(
-                    "All work completed (join_set/queued/resolve_wait/manual_resolve empty), exiting scheduler loop"
+                    "All automatic scheduler work completed or blocked-only, exiting scheduler loop"
                 );
                 break;
             }
 
-            if self.should_enter_persistent_idle_wait(
-                join_set.is_empty(),
-                queued.is_empty(),
-                in_flight.is_empty(),
-            ) {
+            if self
+                .should_enter_persistent_idle_wait(join_set.is_empty(), &queued, &in_flight)
+                .await
+            {
                 self.wait_for_persistent_idle_wake(&mut reanalysis_reason, &mut merge_result_rx)
                     .await;
                 continue;

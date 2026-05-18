@@ -42,6 +42,8 @@ pub struct ParallelRunService {
         Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     /// AI command runner for analyze commands
     ai_runner: AiCommandRunner,
+    /// Runtime-only observability dedupe for stable analyzer failure signatures.
+    analyze_failure_diagnostics_seen: Arc<Mutex<HashSet<(Vec<String>, Vec<String>, String)>>>,
 }
 
 impl ParallelRunService {
@@ -89,6 +91,7 @@ impl ParallelRunService {
             shared_stagger_state,
             shared_orchestrator_state,
             ai_runner,
+            analyze_failure_diagnostics_seen: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -139,6 +142,7 @@ impl ParallelRunService {
             shared_stagger_state,
             shared_orchestrator_state,
             ai_runner,
+            analyze_failure_diagnostics_seen: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -605,6 +609,13 @@ impl ParallelRunService {
                 }
                 Err(e) => {
                     Self::log_recoverable_analysis_fallback(&e);
+                    self.emit_analysis_failure_diagnostic_once(
+                        changes,
+                        in_flight_ids,
+                        event_tx,
+                        &e.to_string(),
+                    )
+                    .await;
                 }
             }
         } else {
@@ -619,6 +630,42 @@ impl ParallelRunService {
             error = %error,
             "LLM analysis failed; falling back to metadata-dependency-only analysis"
         );
+    }
+
+    async fn emit_analysis_failure_diagnostic_once(
+        &self,
+        changes: &[Change],
+        in_flight_ids: &[String],
+        event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+        error: &str,
+    ) {
+        let Some(tx) = event_tx else {
+            return;
+        };
+        let mut queued_ids: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+        queued_ids.sort();
+        let mut in_flight = in_flight_ids.to_vec();
+        in_flight.sort();
+        let normalized_error = error.trim().to_string();
+        let key = (
+            queued_ids.clone(),
+            in_flight.clone(),
+            normalized_error.clone(),
+        );
+        let mut seen = self.analyze_failure_diagnostics_seen.lock().await;
+        if !seen.insert(key) {
+            return;
+        }
+        drop(seen);
+
+        let message = format!(
+            "Dependency analysis failed: error={}, queued={:?}, in_flight={:?}",
+            normalized_error, queued_ids, in_flight
+        );
+        let _ = tx
+            .send(ParallelEvent::Log(crate::events::LogEntry::warn(&message)))
+            .await;
+        let _ = tx.send(ParallelEvent::Error { message }).await;
     }
 
     fn metadata_dependency_analysis_result(changes: &[Change]) -> crate::analyzer::AnalysisResult {
