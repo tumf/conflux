@@ -1903,7 +1903,7 @@ impl ParallelExecutor {
         }
         for change_id in resolve_wait_set
             .into_iter()
-            .chain(reject_wait_set.into_iter())
+            .chain(reject_wait_set)
             .chain(self.resolve_wait_changes.iter().cloned())
             .chain(self.reject_wait_changes.iter().cloned())
         {
