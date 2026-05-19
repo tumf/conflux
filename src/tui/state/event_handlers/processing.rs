@@ -43,11 +43,18 @@ impl AppState {
     pub(crate) fn handle_archive_started(&mut self, id: String, command: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-            if change.started_at.is_none() {
-                change.started_at = Some(Instant::now());
+            if change.display_status_cache == "merged" {
+                tracing::debug!(
+                    change_id = %id,
+                    "Ignoring stale ArchiveStarted event for row already displayed as merged"
+                );
+            } else {
+                if change.started_at.is_none() {
+                    change.started_at = Some(Instant::now());
+                }
+                change.set_display_status_cache("archiving");
+                change.iteration_number = None;
             }
-            change.set_display_status_cache("archiving");
-            change.iteration_number = None;
             let worktree_path = self.worktree_paths.get(&id).map(|p| p.as_path());
             if let Ok(progress) = task_parser::parse_progress_with_fallback(&id, worktree_path) {
                 if progress.total > 0 {

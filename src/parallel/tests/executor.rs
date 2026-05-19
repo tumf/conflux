@@ -2768,6 +2768,111 @@ async fn test_apply_time_rejected_handoff_enters_rejecting_review_and_emits_chan
 }
 
 #[tokio::test]
+async fn dynamic_queue_ingestion_skips_final_terminal_merged_change() {
+    use crate::tui::queue::DynamicQueue;
+
+    let queue = Arc::new(DynamicQueue::new());
+    queue.push("alpha".to_string()).await;
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev".to_string(),
+        });
+
+    let mut executor =
+        ParallelExecutor::new(PathBuf::from("/tmp/test-repo"), create_test_config(), None);
+    executor.set_dynamic_queue(queue);
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reason = crate::parallel::dynamic_queue::ReanalysisReason::Initial;
+
+    let changed = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+        .await;
+
+    assert!(!changed);
+    assert!(queued.is_empty());
+    assert_eq!(
+        reason,
+        crate::parallel::dynamic_queue::ReanalysisReason::Initial
+    );
+}
+
+#[tokio::test]
+async fn final_terminal_dispatch_preflight_skips_before_workspace_execution() {
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "rev".to_string(),
+        });
+
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_shared_orchestrator_state(shared);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            "alpha".to_string(),
+            "base".to_string(),
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch should skip cleanly");
+
+    assert!(in_flight.is_empty());
+    assert!(join_set.join_next().await.is_none());
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::ArchiveStarted { ref change_id, .. }
+            | ExecutionEvent::ApplyStarted { ref change_id, .. }
+            | ExecutionEvent::AcceptanceStarted { ref change_id, .. }
+                if change_id == "alpha" =>
+            {
+                panic!("final terminal dispatch must not emit execution event: {event:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     use crate::events::ExecutionEvent;
     use crate::parallel::dynamic_queue::ReanalysisReason;
