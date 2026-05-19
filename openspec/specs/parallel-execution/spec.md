@@ -1228,91 +1228,44 @@ re-analysis の `order` は依存関係の制約として扱い、依存解決�
 
 scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
 
-queued の change が空の場合、analysis を実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconcile を試みなければならない（MUST）。
-
 実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
 Archived-dirty repair candidate は workspace-derived repair trigger として扱われなければならない（MUST）。scheduler は同じ unchanged archived-dirty repair candidate の再発見を通常の user/reducer queue addition と同じ debounce 更新として扱ってはならない（MUST NOT）。
 
-#### Scenario: queuedのみがanalysis対象になる
+Reducer-terminal final states such as `merged`, `archived`, and `rejected` MUST be dispatch stop gates for ordinary apply/acceptance/archive work. A stale dynamic queue entry, stale scheduler-local candidate, or reducer reconciliation pass MUST NOT add a final terminal change to scheduler-local queued work or analysis candidates.
 
-- **GIVEN** queued に change が存在する
-- **AND** queued 以外に実行中の change が存在する
-- **WHEN** 並列実行が analysis を開始する
-- **THEN** analysis 対象は queued の change のみになる
+Recoverable terminal `error` remains distinct: it MUST NOT be dispatched through ordinary apply/acceptance/archive work unless explicit retry intent clears the terminal error according to reducer rules.
 
-#### Scenario: reducer queued intent が scheduler-local queued に反映される
+<!-- Expected canonical result after archive: `parallel-execution` will require scheduler queue ingestion, reconciliation, and dispatch selection to treat reducer-terminal final states as ordinary dispatch stop gates while preserving explicit retry semantics for terminal errors. -->
 
-- **GIVEN** change `beta` has reducer-visible queued intent
-- **AND** `beta` is not terminal
-- **AND** `beta` is not active or in-flight
-- **AND** `beta` can be loaded from active OpenSpec changes
-- **AND** scheduler-local queued list does not contain `beta`
-- **WHEN** the scheduler reconciles queued candidates before analysis
-- **THEN** `beta` is added to scheduler-local queued candidates
-- **AND** the next analysis includes `beta`
+#### Scenario: terminal merged dynamic queue entry is ignored
 
-#### Scenario: dynamic queue notification miss is recoverable
+- **GIVEN** change `alpha` is reducer-terminal `merged`
+- **AND** a stale dynamic queue entry for `alpha` is popped
+- **WHEN** scheduler dynamic queue ingestion evaluates `alpha`
+- **THEN** `alpha` is not added to scheduler-local `queued`
+- **AND** `alpha` is not included in dependency analysis candidates
+- **AND** apply, acceptance, and archive are not started for `alpha`
 
-- **GIVEN** change `beta` has reducer-visible queued intent
-- **AND** the dynamic queue notification for `beta` was missed or already popped
-- **AND** scheduler-local queued list does not contain `beta`
-- **WHEN** the scheduler loop next reconciles queued candidates
-- **THEN** `beta` is still eligible for analysis through reducer-visible queued intent
-- **AND** `beta` does not remain indefinitely queued without analysis solely because the notification was missed
+#### Scenario: terminal merged dispatch preflight stops archive path
 
-#### Scenario: candidate load failure is observable and retried
+- **GIVEN** change `alpha` is reducer-terminal `merged`
+- **AND** stale scheduler-local state attempts to dispatch `alpha`
+- **WHEN** `dispatch_change_to_workspace` evaluates preflight guards
+- **THEN** dispatch is skipped before workspace acquisition or reuse
+- **AND** `execute_archive_in_workspace` is not called for `alpha`
+- **AND** no `ArchiveStarted` event is emitted for `alpha`
 
-- **GIVEN** dynamic queue ingestion sees queued change id `beta`
-- **AND** active OpenSpec change loading does not currently return `beta`
-- **WHEN** scheduler ingestion skips `beta`
-- **THEN** the skip reason is logged or emitted as candidate not found
-- **AND** if reducer-visible queued intent for `beta` remains and `beta` later becomes loadable, reconciliation can add `beta` to analysis candidates
+#### Scenario: terminal error remains explicit retry only
 
-#### Scenario: queuedが空ならanalysisを実行しない
-
-- **GIVEN** queued の change が存在しない
-- **AND** reducer-visible queued intent も存在しない
-- **WHEN** 並列実行が analysis を開始しようとする
-- **THEN** analysis を実行しない
-
-#### Scenario: 実行中とqueuedが空なら終了する
-
-- **GIVEN** 実行中の change が存在しない
-- **AND** queued の change も空である
-- **AND** reducer-visible queued intent も存在しない
-- **WHEN** 並列実行ループが次の analysis を開始しようとする
-- **THEN** analysis を実行しない
-- **AND** オーケストレーションは完了状態になる
-
-#### Scenario: queued外のchangeはanalysis対象から除外される
-
-- **GIVEN** queued に含まれない change が存在する
-- **AND** queued には別の change が存在する
-- **WHEN** 並列実行が analysis を開始する
-- **THEN** queued 外の change は analysis 対象から除外される
-
-#### Scenario: archived dirty repair candidate does not extend debounce indefinitely
-
-- **GIVEN** reducer-visible queued intent is empty
-- **AND** an existing worktree for change `alpha` has no active `openspec/changes/alpha` directory
-- **AND** the same worktree has an archive entry for `alpha`
-- **AND** scheduler reconciliation discovers `alpha` as an archived-dirty repair candidate
-- **WHEN** scheduler reconciliation observes the same unchanged repair candidate repeatedly
-- **THEN** the scheduler MUST NOT refresh normal queue debounce on every loop for `alpha`
-- **AND** repair-driven analysis for `alpha` MUST either bypass debounce or run after one bounded debounce interval
-- **AND** analysis MUST NOT be postponed indefinitely by rediscovering `alpha` itself
-
-#### Scenario: repeated unchanged repair reconciliation is bounded
-
-- **GIVEN** scheduler reconciliation observes the same archived-dirty repair candidate set repeatedly
-- **AND** no dispatch, completion, merge, archive, resolve, queue addition, or worktree state change occurs
-- **WHEN** the scheduler loop evaluates queued candidates multiple times
-- **THEN** repeated user-visible repair reconciliation diagnostics MUST be deduped, rate-limited, or summarized
-- **AND** unchanged repair rediscovery MUST NOT be treated as new scheduler progress each time
-- **AND** the scheduler MUST remain capable of progressing analysis when execution capacity is available
+- **GIVEN** change `beta` is reducer-terminal `error`
+- **WHEN** ordinary scheduler dispatch evaluates `beta` without explicit retry intent
+- **THEN** `beta` is skipped as retry-required
+- **AND** apply, acceptance, and archive are not started for `beta`
+- **WHEN** explicit retry intent clears the terminal error
+- **THEN** `beta` can become eligible for ordinary queued dispatch again
 
 ### Requirement: Dispatch sequencing for queued changes
 キューに追加された change は analysis を経由せずに dispatch されてはならない（MUST NOT）。
@@ -1854,91 +1807,44 @@ When a reused worktree is not archive-complete:
 
 scheduler-local queued 集合は reducer-visible queued intent と reconcile されなければならない（MUST）。reconcile は dynamic queue notification の欠落、dynamic queue pop 後の一時的な candidate load failure、または stale local queue state によって reducer-visible queued change が永続的に analysis 対象外になることを防がなければならない（MUST）。
 
-queued の change が空の場合、analysis を実行してはならない（MUST）。ただし reducer-visible queued intent が存在する場合、scheduler は queued が空であると結論する前に reconcile を試みなければならない（MUST）。
-
 実行中の change が存在せず、queued の change も空の場合、オーケストレーションは完了状態にならなければならない（MUST）。ただし reducer-visible queued intent が存在する場合、その intent が terminal / active / missing などの理由で analysis 対象外であることが確認されるまで完了状態として扱ってはならない（MUST NOT）。
 
 queued に含まれない change（例: merged 済み change、実行済み change、削除済み change）は analysis 対象から除外されなければならない（MUST）。
 
 Archived-dirty repair candidate は workspace-derived repair trigger として扱われなければならない（MUST）。scheduler は同じ unchanged archived-dirty repair candidate の再発見を通常の user/reducer queue addition と同じ debounce 更新として扱ってはならない（MUST NOT）。
 
-#### Scenario: queuedのみがanalysis対象になる
+Reducer-terminal final states such as `merged`, `archived`, and `rejected` MUST be dispatch stop gates for ordinary apply/acceptance/archive work. A stale dynamic queue entry, stale scheduler-local candidate, or reducer reconciliation pass MUST NOT add a final terminal change to scheduler-local queued work or analysis candidates.
 
-- **GIVEN** queued に change が存在する
-- **AND** queued 以外に実行中の change が存在する
-- **WHEN** 並列実行が analysis を開始する
-- **THEN** analysis 対象は queued の change のみになる
+Recoverable terminal `error` remains distinct: it MUST NOT be dispatched through ordinary apply/acceptance/archive work unless explicit retry intent clears the terminal error according to reducer rules.
 
-#### Scenario: reducer queued intent が scheduler-local queued に反映される
+<!-- Expected canonical result after archive: `parallel-execution` will require scheduler queue ingestion, reconciliation, and dispatch selection to treat reducer-terminal final states as ordinary dispatch stop gates while preserving explicit retry semantics for terminal errors. -->
 
-- **GIVEN** change `beta` has reducer-visible queued intent
-- **AND** `beta` is not terminal
-- **AND** `beta` is not active or in-flight
-- **AND** `beta` can be loaded from active OpenSpec changes
-- **AND** scheduler-local queued list does not contain `beta`
-- **WHEN** the scheduler reconciles queued candidates before analysis
-- **THEN** `beta` is added to scheduler-local queued candidates
-- **AND** the next analysis includes `beta`
+#### Scenario: terminal merged dynamic queue entry is ignored
 
-#### Scenario: dynamic queue notification miss is recoverable
+- **GIVEN** change `alpha` is reducer-terminal `merged`
+- **AND** a stale dynamic queue entry for `alpha` is popped
+- **WHEN** scheduler dynamic queue ingestion evaluates `alpha`
+- **THEN** `alpha` is not added to scheduler-local `queued`
+- **AND** `alpha` is not included in dependency analysis candidates
+- **AND** apply, acceptance, and archive are not started for `alpha`
 
-- **GIVEN** change `beta` has reducer-visible queued intent
-- **AND** the dynamic queue notification for `beta` was missed or already popped
-- **AND** scheduler-local queued list does not contain `beta`
-- **WHEN** the scheduler loop next reconciles queued candidates
-- **THEN** `beta` is still eligible for analysis through reducer-visible queued intent
-- **AND** `beta` does not remain indefinitely queued without analysis solely because the notification was missed
+#### Scenario: terminal merged dispatch preflight stops archive path
 
-#### Scenario: candidate load failure is observable and retried
+- **GIVEN** change `alpha` is reducer-terminal `merged`
+- **AND** stale scheduler-local state attempts to dispatch `alpha`
+- **WHEN** `dispatch_change_to_workspace` evaluates preflight guards
+- **THEN** dispatch is skipped before workspace acquisition or reuse
+- **AND** `execute_archive_in_workspace` is not called for `alpha`
+- **AND** no `ArchiveStarted` event is emitted for `alpha`
 
-- **GIVEN** dynamic queue ingestion sees queued change id `beta`
-- **AND** active OpenSpec change loading does not currently return `beta`
-- **WHEN** scheduler ingestion skips `beta`
-- **THEN** the skip reason is logged or emitted as candidate not found
-- **AND** if reducer-visible queued intent for `beta` remains and `beta` later becomes loadable, reconciliation can add `beta` to analysis candidates
+#### Scenario: terminal error remains explicit retry only
 
-#### Scenario: queuedが空ならanalysisを実行しない
-
-- **GIVEN** queued の change が存在しない
-- **AND** reducer-visible queued intent も存在しない
-- **WHEN** 並列実行が analysis を開始しようとする
-- **THEN** analysis を実行しない
-
-#### Scenario: 実行中とqueuedが空なら終了する
-
-- **GIVEN** 実行中の change が存在しない
-- **AND** queued の change も空である
-- **AND** reducer-visible queued intent も存在しない
-- **WHEN** 並列実行ループが次の analysis を開始しようとする
-- **THEN** analysis を実行しない
-- **AND** オーケストレーションは完了状態になる
-
-#### Scenario: queued外のchangeはanalysis対象から除外される
-
-- **GIVEN** queued に含まれない change が存在する
-- **AND** queued には別の change が存在する
-- **WHEN** 並列実行が analysis を開始する
-- **THEN** queued 外の change は analysis 対象から除外される
-
-#### Scenario: archived dirty repair candidate does not extend debounce indefinitely
-
-- **GIVEN** reducer-visible queued intent is empty
-- **AND** an existing worktree for change `alpha` has no active `openspec/changes/alpha` directory
-- **AND** the same worktree has an archive entry for `alpha`
-- **AND** scheduler reconciliation discovers `alpha` as an archived-dirty repair candidate
-- **WHEN** scheduler reconciliation observes the same unchanged repair candidate repeatedly
-- **THEN** the scheduler MUST NOT refresh normal queue debounce on every loop for `alpha`
-- **AND** repair-driven analysis for `alpha` MUST either bypass debounce or run after one bounded debounce interval
-- **AND** analysis MUST NOT be postponed indefinitely by rediscovering `alpha` itself
-
-#### Scenario: repeated unchanged repair reconciliation is bounded
-
-- **GIVEN** scheduler reconciliation observes the same archived-dirty repair candidate set repeatedly
-- **AND** no dispatch, completion, merge, archive, resolve, queue addition, or worktree state change occurs
-- **WHEN** the scheduler loop evaluates queued candidates multiple times
-- **THEN** repeated user-visible repair reconciliation diagnostics MUST be deduped, rate-limited, or summarized
-- **AND** unchanged repair rediscovery MUST NOT be treated as new scheduler progress each time
-- **AND** the scheduler MUST remain capable of progressing analysis when execution capacity is available
+- **GIVEN** change `beta` is reducer-terminal `error`
+- **WHEN** ordinary scheduler dispatch evaluates `beta` without explicit retry intent
+- **THEN** `beta` is skipped as retry-required
+- **AND** apply, acceptance, and archive are not started for `beta`
+- **WHEN** explicit retry intent clears the terminal error
+- **THEN** `beta` can become eligible for ordinary queued dispatch again
 
 ### Requirement: Acceptance failure returns to apply loop
 

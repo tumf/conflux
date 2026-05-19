@@ -6,7 +6,9 @@ Specifically, refresh-derived `merge_wait_ids` MUST NOT overwrite reducer-derive
 
 TUI display caches remain non-authoritative observability state and MUST NOT be used as scheduler dispatch, resume routing, acceptance, archive, or next-action decision inputs.
 
-<!-- Expected canonical result after archive: `tui-state` will protect reducer-owned `resolving` and other active/pending/terminal statuses from refresh-derived false `merge wait`, while preserving stale display-only correction. -->
+Stale archive lifecycle events MUST NOT regress a row that is already displayed as `merged` back to `archiving`. Archive-start display updates MAY mark non-terminal rows as `archiving`, but MUST preserve reducer-owned terminal success display when a stale event arrives after merge completion.
+
+<!-- Expected canonical result after archive: `tui-state` will require stale archive-start events to preserve merged display status, in addition to protecting reducer-owned terminal states from refresh-derived merge-wait regressions. -->
 
 #### Scenario: refresh-derived merge wait does not overwrite resolving
 
@@ -41,6 +43,15 @@ TUI display caches remain non-authoritative observability state and MUST NOT be 
 **When**: the TUI handles `OrchestratorEvent::ChangesRefreshed` with `alpha` in `merge_wait_ids`
 **Then**: `alpha` may be displayed as `merge wait`
 **And**: the display correction does not enqueue, dispatch, archive, accept, or otherwise route workflow execution
+
+#### Scenario: stale archive start does not overwrite merged display
+
+**Given**: change `alpha` is displayed as `merged`
+**And**: a stale archive lifecycle event is received for `alpha`
+**When**: the TUI handles `OrchestratorEvent::ArchiveStarted` for `alpha`
+**Then**: `alpha` remains displayed as `merged`
+**And**: the row is not regressed to `archiving`
+**And**: this display protection does not enqueue, dispatch, archive, accept, or otherwise route workflow execution
 
 ### Requirement: is_resolving scope limitation
 
