@@ -536,22 +536,36 @@ impl ParallelExecutor {
         }
 
         if let Some(shared) = &self.shared_orchestrator_state {
-            if let Ok(guard) = shared.try_read() {
-                if guard.is_terminal_error_change(&change_id) {
-                    info!(
-                        change_id = %change_id,
-                        "Skipping workspace dispatch because terminal error requires explicit retry"
-                    );
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Log(LogEntry::info(format!(
+            let terminal_gate = shared.try_read().ok().and_then(|guard| {
+                if guard.is_final_terminal_dispatch_stop(&change_id) {
+                    Some((
+                        "final_terminal",
+                        format!(
+                            "Change {} is already in a final terminal state; skipping dispatch",
+                            change_id
+                        ),
+                    ))
+                } else if guard.is_terminal_error_change(&change_id) {
+                    Some((
+                        "terminal_error",
+                        format!(
                             "Change {} remains error until explicitly retried",
                             change_id
-                        ))),
-                    )
-                    .await;
-                    return Ok(());
+                        ),
+                    ))
+                } else {
+                    None
                 }
+            });
+
+            if let Some((gate, message)) = terminal_gate {
+                info!(
+                    change_id = %change_id,
+                    gate,
+                    "Skipping workspace dispatch because reducer terminal state blocks ordinary dispatch"
+                );
+                send_event(&self.event_tx, ParallelEvent::Log(LogEntry::info(message))).await;
+                return Ok(());
             }
         }
 

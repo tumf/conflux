@@ -53,7 +53,7 @@ pub async fn should_reanalyze_queue(
 }
 
 /// Reason for triggering re-analysis (for logging and diagnostics)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReanalysisReason {
     /// Initial analysis (first iteration)
     Initial,

@@ -1613,6 +1613,21 @@ mod tests {
     }
 
     #[test]
+    fn stale_archive_started_does_not_regress_merged_row() {
+        let change = create_test_change("alpha", 1, 1);
+        let mut app = AppState::new(vec![change]);
+        app.changes[0].set_display_status_cache("merged");
+
+        app.handle_orchestrator_event(OrchestratorEvent::ArchiveStarted {
+            change_id: "alpha".to_string(),
+            command: "archive alpha".to_string(),
+        });
+
+        assert_eq!(app.changes[0].display_status_cache, "merged");
+        assert_eq!(app.changes[0].display_color_cache, Color::LightBlue);
+    }
+
+    #[test]
     fn worktree_delete_progress_marker_marks_and_clears_path() {
         let mut app = AppState::new(vec![]);
         let path = PathBuf::from("/tmp/worktree-a");

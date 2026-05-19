@@ -1041,6 +1041,23 @@ impl OrchestratorState {
         self.error_histories.remove(change_id);
     }
 
+    /// Return true when a final terminal state must stop ordinary apply/archive dispatch.
+    ///
+    /// Recoverable terminal errors intentionally remain separate: they are terminal for
+    /// slot/accounting purposes, but can only become dispatchable through an explicit
+    /// `ReducerCommand::RetryError` transition.
+    pub fn is_final_terminal_dispatch_stop(&self, change_id: &str) -> bool {
+        self.change_runtime
+            .get(change_id)
+            .map(|rt| {
+                matches!(
+                    rt.terminal,
+                    TerminalState::Archived | TerminalState::Merged | TerminalState::Rejected(_)
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Return true when a recoverable terminal error is currently gating ordinary apply dispatch.
     pub fn is_terminal_error_change(&self, change_id: &str) -> bool {
         self.change_runtime
@@ -2207,6 +2224,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase 2.2: apply_command queue intent
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn final_terminal_dispatch_stop_excludes_recoverable_terminal_error() {
+        let mut state = OrchestratorState::with_mode(
+            vec![
+                "merged".to_string(),
+                "archived".to_string(),
+                "rejected".to_string(),
+                "error".to_string(),
+            ],
+            0,
+            ExecutionMode::Parallel,
+        );
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "merged".to_string(),
+            revision: "rev".to_string(),
+        });
+        state.runtime_entry("archived").terminal = TerminalState::Archived;
+        state.runtime_entry("rejected").terminal = TerminalState::Rejected("no".to_string());
+        state.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+            id: "error".to_string(),
+            error: "boom".to_string(),
+        });
+
+        assert!(state.is_final_terminal_dispatch_stop("merged"));
+        assert!(state.is_final_terminal_dispatch_stop("archived"));
+        assert!(state.is_final_terminal_dispatch_stop("rejected"));
+        assert!(!state.is_final_terminal_dispatch_stop("error"));
+        assert!(state.is_terminal_error_change("error"));
+        assert!(matches!(
+            state.apply_command(ReducerCommand::AddToQueue("error".to_string())),
+            ReduceOutcome::NoOp
+        ));
+        assert!(matches!(
+            state.apply_command(ReducerCommand::RetryError("error".to_string())),
+            ReduceOutcome::Changed(_)
+        ));
+        assert_eq!(state.display_status("error"), "queued");
+    }
 
     #[test]
     fn test_apply_command_queue_intent() {

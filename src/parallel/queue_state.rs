@@ -1357,6 +1357,27 @@ impl ParallelExecutor {
             let mut queue_changed = false;
             while let Some(dynamic_id) = queue.pop().await {
                 if !queued.iter().any(|c| c.id == dynamic_id) && !in_flight.contains(&dynamic_id) {
+                    if let Some(shared) = &self.shared_orchestrator_state {
+                        if let Ok(guard) = shared.try_read() {
+                            if guard.is_final_terminal_dispatch_stop(&dynamic_id) {
+                                info!(
+                                    change_id = %dynamic_id,
+                                    "Skipping dynamic queue ingestion because change is in a final terminal state"
+                                );
+                                drop(guard);
+                                send_event(
+                                    &self.event_tx,
+                                    ParallelEvent::Log(LogEntry::info(format!(
+                                        "Ignoring stale queue entry for final terminal change: {}",
+                                        dynamic_id
+                                    ))),
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                    }
+
                     match crate::openspec::list_changes_native() {
                         Ok(all_changes) => {
                             if let Some(new_change) =
