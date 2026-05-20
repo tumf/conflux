@@ -9,6 +9,7 @@ mod install_skills;
 
 mod cli;
 mod command_queue;
+mod completion;
 mod config;
 mod dependency_targets;
 mod error;
@@ -51,10 +52,10 @@ mod worktree_ops;
 #[cfg(test)]
 mod test_support;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use cli::{
-    install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, LogsArgs, ProjectCommands,
-    TuiArgs, VERSION_WITH_BUILD,
+    install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, InternalCompleteCommands,
+    LogsArgs, ProjectCommands, TuiArgs, VERSION_WITH_BUILD,
 };
 use config::OrchestratorConfig;
 use error::Result;
@@ -227,6 +228,213 @@ fn log_startup(mode: &str) {
     info!("Starting cflx {} mode={}.", VERSION_WITH_BUILD, mode);
 }
 
+fn run_completion_subcommand(args: cli::CompletionArgs) {
+    let shell = clap_complete::Shell::from(args.shell);
+    let mut command = Cli::command();
+    let mut stdout = std::io::stdout();
+    clap_complete::generate(shell, &mut command, "cflx", &mut stdout);
+    print_dynamic_completion_hooks(args.shell);
+}
+
+fn print_dynamic_completion_hooks(shell: cli::CompletionShell) {
+    match shell {
+        cli::CompletionShell::Bash => print!("{}", BASH_DYNAMIC_COMPLETION_HOOK),
+        cli::CompletionShell::Zsh => print!("{}", ZSH_DYNAMIC_COMPLETION_HOOK),
+        cli::CompletionShell::Fish => print!("{}", FISH_DYNAMIC_COMPLETION_HOOK),
+        cli::CompletionShell::PowerShell => print!("{}", POWERSHELL_DYNAMIC_COMPLETION_HOOK),
+    }
+}
+
+fn run_internal_complete_subcommand(args: cli::InternalCompleteArgs) {
+    match args.command {
+        InternalCompleteCommands::ChangeIds(change_args) => {
+            let scope = completion::ChangeIdCandidateScope::from_flags(
+                change_args.active,
+                change_args.archived,
+            );
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(_) => return,
+            };
+            for candidate in completion::discover_change_id_candidates(
+                &cwd,
+                scope,
+                change_args.prefix.as_deref(),
+            ) {
+                println!("{candidate}");
+            }
+        }
+    }
+}
+
+const BASH_DYNAMIC_COMPLETION_HOOK: &str = r#"
+
+# cflx dynamic OpenSpec change-id completion hook
+_cflx_static_completion() {
+    _cflx "$@"
+}
+_cflx_dynamic_change_ids() {
+    local scope="$1"
+    local prefix="$2"
+    local -a cmd=(cflx __complete change-ids --prefix "$prefix")
+    case "$scope" in
+        active) cmd+=(--active) ;;
+        all) cmd+=(--active --archived) ;;
+    esac
+    mapfile -t COMPREPLY < <("${cmd[@]}" 2>/dev/null)
+}
+_cflx_dynamic_run_change_ids() {
+    local current="${COMP_WORDS[COMP_CWORD]}"
+    local prefix="${current##*,}"
+    local before="${current%,*}"
+    _cflx_dynamic_change_ids active "$prefix"
+    if [[ "$before" != "$current" ]]; then
+        local i
+        for i in "${!COMPREPLY[@]}"; do COMPREPLY[$i]="$before,${COMPREPLY[$i]}"; done
+    fi
+}
+_cflx_dynamic_completion() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+    if [[ "$prev" == "--change" ]]; then
+        _cflx_dynamic_run_change_ids
+        return
+    fi
+    if [[ ${COMP_CWORD} -ge 3 && "${COMP_WORDS[1]}" == "openspec" ]]; then
+        case "${COMP_WORDS[2]}" in
+            show)
+                if [[ "$cur" != -* ]]; then
+                    _cflx_dynamic_change_ids all "$cur"
+                    return
+                fi
+                ;;
+            validate|archive)
+                if [[ "$cur" != -* ]]; then
+                    _cflx_dynamic_change_ids active "$cur"
+                    return
+                fi
+                ;;
+        esac
+    fi
+    _cflx_static_completion "$@"
+}
+complete -F _cflx_dynamic_completion -o bashdefault -o default cflx
+# Surfaces: cflx run --change -> _cflx_dynamic_run_change_ids; cflx openspec show -> active+archived;
+# cflx openspec validate/archive -> active. Candidate command: cflx __complete change-ids
+"#;
+
+const ZSH_DYNAMIC_COMPLETION_HOOK: &str = r#"
+
+# cflx dynamic OpenSpec change-id completion hook
+_cflx_static_completion() {
+    _cflx "$@"
+}
+_cflx_dynamic_change_ids() {
+    local scope="$1"
+    local prefix="$2"
+    local -a cmd=(cflx __complete change-ids --prefix "$prefix")
+    case "$scope" in
+        active) cmd+=(--active) ;;
+        all) cmd+=(--active --archived) ;;
+    esac
+    compadd -- "${(@f)$(${cmd[@]} 2>/dev/null)}"
+}
+_cflx_dynamic_run_change_ids() {
+    local current="${words[CURRENT]}"
+    local prefix="${current##*,}"
+    local before="${current%,*}"
+    local -a candidates
+    candidates=("${(@f)$(cflx __complete change-ids --active --prefix "$prefix" 2>/dev/null)}")
+    if [[ "$before" != "$current" ]]; then
+        candidates=("${(@)^candidates/#/$before,}")
+    fi
+    compadd -- "${candidates[@]}"
+}
+_cflx_dynamic_completion() {
+    if [[ "${words[CURRENT-1]}" == "--change" ]]; then
+        _cflx_dynamic_run_change_ids
+        return
+    fi
+    if [[ ${CURRENT} -ge 4 && "${words[2]}" == "openspec" ]]; then
+        case "${words[3]}" in
+            show)
+                [[ "${words[CURRENT]}" == -* ]] || { _cflx_dynamic_change_ids all "${words[CURRENT]}"; return; }
+                ;;
+            validate|archive)
+                [[ "${words[CURRENT]}" == -* ]] || { _cflx_dynamic_change_ids active "${words[CURRENT]}"; return; }
+                ;;
+        esac
+    fi
+    _cflx_static_completion "$@"
+}
+compdef _cflx_dynamic_completion cflx
+# Surfaces: cflx run --change -> _cflx_dynamic_run_change_ids; cflx openspec show -> active+archived;
+# cflx openspec validate/archive -> active. Candidate command: cflx __complete change-ids
+"#;
+
+const FISH_DYNAMIC_COMPLETION_HOOK: &str = r#"
+
+# cflx dynamic OpenSpec change-id completion hook
+function __cflx_dynamic_change_ids
+    set -l scope $argv[1]
+    set -l prefix $argv[2]
+    set -l cmd cflx __complete change-ids --prefix "$prefix"
+    switch $scope
+        case active
+            set cmd $cmd --active
+        case all
+            set cmd $cmd --active --archived
+    end
+    $cmd 2>/dev/null
+end
+complete -c cflx -n '__fish_seen_subcommand_from run; and __fish_seen_argument --change' -a '(__cflx_dynamic_change_ids active (string split -r -m1 , (commandline -ct))[-1])'
+complete -c cflx -n '__fish_seen_subcommand_from openspec; and __fish_seen_subcommand_from show' -a '(__cflx_dynamic_change_ids all (commandline -ct))'
+complete -c cflx -n '__fish_seen_subcommand_from openspec; and __fish_seen_subcommand_from validate archive' -a '(__cflx_dynamic_change_ids active (commandline -ct))'
+"#;
+
+const POWERSHELL_DYNAMIC_COMPLETION_HOOK: &str = r#"
+
+# cflx dynamic OpenSpec change-id completion hook
+function __CflxDynamicChangeIds($Scope, $Prefix) {
+    $args = @('__complete', 'change-ids', '--prefix', $Prefix)
+    if ($Scope -eq 'active') { $args += '--active' }
+    if ($Scope -eq 'all') { $args += @('--active', '--archived') }
+    & cflx @args 2>$null
+}
+function __CflxDynamicRunChangeIds($WordToComplete) {
+    $prefix = $WordToComplete -replace '^.*,', ''
+    $before = $WordToComplete -replace ',?[^,]*$', ''
+    foreach ($candidate in (__CflxDynamicChangeIds active $prefix)) {
+        if ($before) { "$before,$candidate" } else { $candidate }
+    }
+}
+Register-ArgumentCompleter -Native -CommandName 'cflx' -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $elements = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
+    $commandText = $elements -join ' '
+    if ($commandText -match '^cflx\s+run\b' -and ($elements -contains '--change')) {
+        __CflxDynamicRunChangeIds $wordToComplete | ForEach-Object {
+            [CompletionResult]::new($_, $_, [CompletionResultType]::ParameterValue, 'OpenSpec active change ID')
+        }
+        return
+    }
+    if ($commandText -match '^cflx\s+openspec\s+show\b' -and $wordToComplete -notlike '-*') {
+        __CflxDynamicChangeIds all $wordToComplete | ForEach-Object {
+            [CompletionResult]::new($_, $_, [CompletionResultType]::ParameterValue, 'OpenSpec change ID')
+        }
+        return
+    }
+    if ($commandText -match '^cflx\s+openspec\s+(validate|archive)\b' -and $wordToComplete -notlike '-*') {
+        __CflxDynamicChangeIds active $wordToComplete | ForEach-Object {
+            [CompletionResult]::new($_, $_, [CompletionResultType]::ParameterValue, 'OpenSpec active change ID')
+        }
+        return
+    }
+}
+# Surfaces: cflx run --change -> active comma-token candidates; cflx openspec show -> active+archived;
+# cflx openspec validate/archive -> active. Candidate command: cflx __complete change-ids
+"#;
+
 fn run_logs_subcommand(args: LogsArgs) {
     let options = log_viewer::LogViewerOptions {
         print_path: args.path,
@@ -248,6 +456,16 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // Completion commands intentionally run before logging/config/orchestration paths.
+        Some(Commands::Completion(args)) => {
+            run_completion_subcommand(args);
+        }
+
+        // Hidden candidate command intentionally runs before logging/config/orchestration paths.
+        Some(Commands::Complete(args)) => {
+            run_internal_complete_subcommand(args);
+        }
+
         // No subcommand: launch TUI (default behavior)
         None => {
             // Initialize logging: file only (avoid stdout noise in TUI)
