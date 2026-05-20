@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use tracing::debug;
 
 /// Build metadata included in versioned user-facing logs and output.
@@ -175,6 +176,50 @@ pub enum Commands {
     ///   cflx openspec validate --strict             # Validate all changes
     ///   cflx openspec archive my-change --yes       # Archive a change
     Openspec(OpenspecArgs),
+
+    /// Generate shell completion scripts
+    Completion(CompletionArgs),
+
+    /// Hidden internal completion candidate commands
+    #[command(name = "__complete", hide = true)]
+    Complete(InternalCompleteArgs),
+}
+
+/// Arguments for the completion subcommand
+#[derive(Parser, Debug)]
+pub struct CompletionArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: Shell,
+}
+
+/// Hidden internal completion candidate commands.
+#[derive(Parser, Debug)]
+pub struct InternalCompleteArgs {
+    #[command(subcommand)]
+    pub command: InternalCompleteCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum InternalCompleteCommands {
+    /// Print OpenSpec change ID completion candidates, one per line
+    #[command(name = "change-ids")]
+    ChangeIds(ChangeIdCompletionArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ChangeIdCompletionArgs {
+    /// Include active OpenSpec changes
+    #[arg(long)]
+    pub active: bool,
+
+    /// Include archived OpenSpec changes
+    #[arg(long)]
+    pub archived: bool,
+
+    /// Only include candidates beginning with this prefix
+    #[arg(long)]
+    pub prefix: Option<String>,
 }
 
 /// Arguments for the logs subcommand
@@ -747,6 +792,72 @@ pub fn check_parallel_available() -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn test_completion_subcommand_supported_shells() {
+        for (shell_name, expected) in [
+            ("zsh", Shell::Zsh),
+            ("bash", Shell::Bash),
+            ("fish", Shell::Fish),
+            ("powershell", Shell::PowerShell),
+        ] {
+            let cli = Cli::parse_from(["cflx", "completion", shell_name]);
+            match cli.command {
+                Some(Commands::Completion(args)) => assert_eq!(args.shell, expected),
+                _ => panic!("Expected Completion subcommand for {shell_name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_completion_subcommand_rejects_unsupported_shell() {
+        let err = Cli::try_parse_from(["cflx", "completion", "tcsh"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn test_internal_change_id_completion_defaults() {
+        let cli = Cli::parse_from(["cflx", "__complete", "change-ids"]);
+        match cli.command {
+            Some(Commands::Complete(args)) => match args.command {
+                InternalCompleteCommands::ChangeIds(change_args) => {
+                    assert!(!change_args.active);
+                    assert!(!change_args.archived);
+                    assert_eq!(change_args.prefix, None);
+                }
+            },
+            _ => panic!("Expected hidden Complete subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_internal_change_id_completion_flags() {
+        let cli = Cli::parse_from([
+            "cflx",
+            "__complete",
+            "change-ids",
+            "--active",
+            "--archived",
+            "--prefix",
+            "add-",
+        ]);
+        match cli.command {
+            Some(Commands::Complete(args)) => match args.command {
+                InternalCompleteCommands::ChangeIds(change_args) => {
+                    assert!(change_args.active);
+                    assert!(change_args.archived);
+                    assert_eq!(change_args.prefix.as_deref(), Some("add-"));
+                }
+            },
+            _ => panic!("Expected hidden Complete subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_internal_complete_rejects_invalid_mode() {
+        let err = Cli::try_parse_from(["cflx", "__complete", "spec-ids"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
 
     #[test]
     fn test_logs_subcommand_flags() {

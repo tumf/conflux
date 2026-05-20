@@ -26,6 +26,7 @@ mod ai_command_runner;
 mod analyzer;
 mod cli;
 mod command_queue;
+pub mod completion;
 pub mod config;
 mod dependency_targets;
 mod error;
