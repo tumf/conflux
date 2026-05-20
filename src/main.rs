@@ -271,12 +271,6 @@ const BASH_DYNAMIC_COMPLETION_HOOK: &str = r#"
 
 # cflx dynamic OpenSpec change-id completion hook
 _cflx_static_completion() {
-    local original_func
-    original_func=$(complete -p cflx 2>/dev/null | sed -n 's/.*-F \([^ ]*\).*/\1/p')
-    if [[ -n "$original_func" && "$original_func" != "_cflx_static_completion" && "$original_func" != "_cflx" ]]; then
-        "$original_func" "$@"
-        return
-    fi
     _cflx "$@"
 }
 _cflx_dynamic_change_ids() {
