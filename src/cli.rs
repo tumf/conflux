@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use tracing::debug;
 
@@ -185,12 +185,33 @@ pub enum Commands {
     Complete(InternalCompleteArgs),
 }
 
+/// Supported shells for generated completion scripts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Fish,
+    #[value(name = "powershell")]
+    PowerShell,
+    Zsh,
+}
+
+impl From<CompletionShell> for Shell {
+    fn from(shell: CompletionShell) -> Self {
+        match shell {
+            CompletionShell::Bash => Shell::Bash,
+            CompletionShell::Fish => Shell::Fish,
+            CompletionShell::PowerShell => Shell::PowerShell,
+            CompletionShell::Zsh => Shell::Zsh,
+        }
+    }
+}
+
 /// Arguments for the completion subcommand
 #[derive(Parser, Debug)]
 pub struct CompletionArgs {
     /// Shell to generate completions for
     #[arg(value_enum)]
-    pub shell: Shell,
+    pub shell: CompletionShell,
 }
 
 /// Hidden internal completion candidate commands.
@@ -796,10 +817,10 @@ mod tests {
     #[test]
     fn test_completion_subcommand_supported_shells() {
         for (shell_name, expected) in [
-            ("zsh", Shell::Zsh),
-            ("bash", Shell::Bash),
-            ("fish", Shell::Fish),
-            ("powershell", Shell::PowerShell),
+            ("zsh", CompletionShell::Zsh),
+            ("bash", CompletionShell::Bash),
+            ("fish", CompletionShell::Fish),
+            ("powershell", CompletionShell::PowerShell),
         ] {
             let cli = Cli::parse_from(["cflx", "completion", shell_name]);
             match cli.command {
@@ -811,8 +832,10 @@ mod tests {
 
     #[test]
     fn test_completion_subcommand_rejects_unsupported_shell() {
-        let err = Cli::try_parse_from(["cflx", "completion", "tcsh"]).unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        for shell in ["tcsh", "elvish"] {
+            let err = Cli::try_parse_from(["cflx", "completion", shell]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+        }
     }
 
     #[test]

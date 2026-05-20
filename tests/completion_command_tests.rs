@@ -27,6 +27,21 @@ fn stdout_string(output: std::process::Output) -> String {
 }
 
 #[test]
+fn unsupported_completion_shell_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_home = tmp.path().join("state");
+
+    let output = cflx_command(tmp.path(), &state_home)
+        .args(["completion", "elvish"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+    assert!(!state_home.join("cflx/logs").exists());
+}
+
+#[test]
 fn completion_generation_is_non_empty_and_does_not_create_logs() {
     let tmp = tempfile::tempdir().unwrap();
     let state_home = tmp.path().join("state");
@@ -108,6 +123,65 @@ fn hidden_candidate_command_missing_workspace_is_empty_success() {
     assert!(output.status.success());
     assert!(output.stdout.is_empty());
     assert!(!state_home.join("cflx/logs").exists());
+}
+
+#[test]
+fn generated_bash_script_wires_dynamic_change_id_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_home = tmp.path().join("state");
+
+    let stdout = stdout_string(
+        cflx_command(tmp.path(), &state_home)
+            .args(["completion", "bash"])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(stdout.contains("complete -F _cflx_dynamic_completion"));
+    assert!(stdout.contains("if [[ \"$prev\" == \"--change\" ]]"));
+    assert!(stdout.contains("_cflx_dynamic_change_ids all \"$cur\""));
+    assert!(stdout.contains("_cflx_dynamic_change_ids active \"$cur\""));
+    assert!(stdout.contains("_cflx_static_completion \"$@\""));
+}
+
+#[test]
+fn generated_zsh_script_wires_dynamic_change_id_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_home = tmp.path().join("state");
+
+    let stdout = stdout_string(
+        cflx_command(tmp.path(), &state_home)
+            .args(["completion", "zsh"])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(stdout.contains("compdef _cflx_dynamic_completion cflx"));
+    assert!(stdout.contains("if [[ \"${words[CURRENT-1]}\" == \"--change\" ]]"));
+    assert!(stdout.contains("_cflx_dynamic_change_ids all \"${words[CURRENT]}\""));
+    assert!(stdout.contains("_cflx_dynamic_change_ids active \"${words[CURRENT]}\""));
+    assert!(stdout.contains("_cflx_static_completion \"$@\""));
+}
+
+#[test]
+fn generated_powershell_script_registers_dynamic_change_id_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_home = tmp.path().join("state");
+
+    let stdout = stdout_string(
+        cflx_command(tmp.path(), &state_home)
+            .args(["completion", "powershell"])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(stdout.contains("function __CflxDynamicRunChangeIds($WordToComplete)"));
+    assert!(stdout.contains("$commandText -match '^cflx\\s+run\\b'"));
+    assert!(stdout.contains("$commandText -match '^cflx\\s+openspec\\s+show\\b'"));
+    assert!(stdout.contains("$commandText -match '^cflx\\s+openspec\\s+(validate|archive)\\b'"));
+    assert!(
+        stdout.contains("[CompletionResult]::new($_, $_, [CompletionResultType]::ParameterValue")
+    );
 }
 
 #[test]
