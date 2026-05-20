@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "conflux",
+  "project_id": "8583d485-2b5a-4bba-a6d6-1561743535ab"
+}

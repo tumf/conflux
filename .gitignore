@@ -19,3 +19,8 @@ src/.tldr/
 src/server/.tldr/
 src/tui/.tldr/
 src/tui/.tldrignore
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
