@@ -14,6 +14,12 @@ repos:
         exclude: ^(graphify-out/(graph\.html|graph\.json|GRAPH_REPORT\.md)|dashboard/dist/assets/index-.*\.js)$
   - repo: local
     hooks:
+      - id: beads-pre-commit
+        name: beads pre-commit
+        entry: sh -c 'if command -v bd >/dev/null 2>&1; then BD_GIT_HOOK=1 bd hooks run pre-commit; else echo "bd not installed; skipping beads pre-commit"; fi'
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: rustfmt
         name: rustfmt
         entry: cargo fmt --all
