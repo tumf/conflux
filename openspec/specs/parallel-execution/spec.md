@@ -20,7 +20,9 @@ When every remaining local queued candidate is non-dispatchable without explicit
 
 In finite lifetime, blocked-only drain SHALL exit the scheduler loop. In persistent lifetime, blocked-only drain SHALL enter notification-driven idle wait and MUST NOT repeatedly run dependency analysis, worktree discovery, or queue reconciliation until an explicit queue/retry/merge/cancel wake event occurs.
 
-<!-- Expected canonical result after archive: `parallel-execution` will define blocked-only drain as a first-class scheduler idle/exit condition, preserving existing success semantics while preventing endless analyze loops. -->
+When the parallel service receives runtime cancellation from its owner, it MUST stop scheduling new ordinary work, propagate cancellation to in-flight workspace tasks, and ensure owned agent child process groups are terminated through the command runner cleanup path before the cancelled local run is considered cleaned up.
+
+<!-- Expected canonical result after archive: `parallel-execution` will require runtime cancellation to stop new dispatch, notify in-flight workspace tasks, and clean up owned child process groups before cancelled local run cleanup completes. -->
 
 #### Scenario: persistent idle does not poll worktree scans
 
@@ -72,6 +74,22 @@ In finite lifetime, blocked-only drain SHALL exit the scheduler loop. In persist
 **Then**: the scheduler remains alive in notification-driven idle wait
 **And**: it does not repeatedly invoke dependency analysis
 **And**: it does not repeatedly run worktree discovery or queue reconciliation on a timer
+
+#### Scenario: cancellation stops new parallel dispatch
+
+**Given**: a parallel local run has received runtime cancellation from its owner
+**AND**: queued ordinary work remains undispatched
+**WHEN**: the scheduler evaluates the next dispatch opportunity
+**THEN**: it does not dispatch new ordinary apply/archive/acceptance work
+**AND**: it reports or returns a cancelled/stopped outcome rather than continuing normal scheduling
+
+#### Scenario: cancellation reaches in-flight workspace child commands
+
+**Given**: a parallel local run has an in-flight workspace task running an owned AI agent command
+**WHEN**: runtime cancellation is received
+**THEN**: cancellation is propagated to the in-flight workspace task
+**AND**: the owned AI agent process group is terminated through the command runner cleanup path
+**AND**: the cancelled local run is not considered cleaned up while the owned child process continues running
 
 ### Requirement: Archived dependency references are explicitly classified
 
@@ -1508,7 +1526,9 @@ When every remaining local queued candidate is non-dispatchable without explicit
 
 In finite lifetime, blocked-only drain SHALL exit the scheduler loop. In persistent lifetime, blocked-only drain SHALL enter notification-driven idle wait and MUST NOT repeatedly run dependency analysis, worktree discovery, or queue reconciliation until an explicit queue/retry/merge/cancel wake event occurs.
 
-<!-- Expected canonical result after archive: `parallel-execution` will define blocked-only drain as a first-class scheduler idle/exit condition, preserving existing success semantics while preventing endless analyze loops. -->
+When the parallel service receives runtime cancellation from its owner, it MUST stop scheduling new ordinary work, propagate cancellation to in-flight workspace tasks, and ensure owned agent child process groups are terminated through the command runner cleanup path before the cancelled local run is considered cleaned up.
+
+<!-- Expected canonical result after archive: `parallel-execution` will require runtime cancellation to stop new dispatch, notify in-flight workspace tasks, and clean up owned child process groups before cancelled local run cleanup completes. -->
 
 #### Scenario: persistent idle does not poll worktree scans
 
@@ -1560,6 +1580,22 @@ In finite lifetime, blocked-only drain SHALL exit the scheduler loop. In persist
 **Then**: the scheduler remains alive in notification-driven idle wait
 **And**: it does not repeatedly invoke dependency analysis
 **And**: it does not repeatedly run worktree discovery or queue reconciliation on a timer
+
+#### Scenario: cancellation stops new parallel dispatch
+
+**Given**: a parallel local run has received runtime cancellation from its owner
+**AND**: queued ordinary work remains undispatched
+**WHEN**: the scheduler evaluates the next dispatch opportunity
+**THEN**: it does not dispatch new ordinary apply/archive/acceptance work
+**AND**: it reports or returns a cancelled/stopped outcome rather than continuing normal scheduling
+
+#### Scenario: cancellation reaches in-flight workspace child commands
+
+**Given**: a parallel local run has an in-flight workspace task running an owned AI agent command
+**WHEN**: runtime cancellation is received
+**THEN**: cancellation is propagated to the in-flight workspace task
+**AND**: the owned AI agent process group is terminated through the command runner cleanup path
+**AND**: the cancelled local run is not considered cleaned up while the owned child process continues running
 
 ### Requirement: Non-blocking Merge in Scheduler Loop
 
