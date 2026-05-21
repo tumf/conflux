@@ -162,9 +162,18 @@ where
                 }
             }
         } else {
-            match recv_future.await {
-                Some(line) => line,
-                None => break, // Channel closed normally
+            match tokio::time::timeout(std::time::Duration::from_millis(50), recv_future).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break, // Channel closed normally
+                Err(_) => {
+                    if cancel_check() {
+                        warn!("Acceptance test cancelled while waiting for output");
+                        output.on_warn("Acceptance test cancelled");
+                        let _ = child.terminate();
+                        return Ok((AcceptanceResult::Cancelled, 0, command));
+                    }
+                    continue;
+                }
             }
         };
 

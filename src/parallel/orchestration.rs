@@ -190,6 +190,15 @@ impl ParallelExecutor {
                 )
                 .await;
                 cancelled = true;
+                join_set.abort_all();
+                while let Some(result) = join_set.join_next().await {
+                    if let Err(err) = result {
+                        if !err.is_cancelled() {
+                            warn!(error = %err, "In-flight workspace task failed while draining after cancellation");
+                        }
+                    }
+                }
+                in_flight.clear();
                 break;
             }
 
@@ -359,6 +368,11 @@ impl ParallelExecutor {
                 info!("Queue notification received, will check queue on next iteration");
                 self.trigger_resolve_wait_retry_dispatch();
                 *reanalysis_reason = ReanalysisReason::QueueNotification;
+            }
+
+            // Cancellation should wake promptly even while the scheduler is waiting for work.
+            _ = self.wait_for_cancellation(), if self.cancel_token.is_some() => {
+                info!("Cancellation received while scheduler is waiting for events");
             }
 
             // Debounce timer: wait before allowing re-analysis

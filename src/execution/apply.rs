@@ -948,7 +948,24 @@ where
                 None => next_check_at,
             };
 
-            let recv_result = tokio::time::timeout_at(wait_deadline, rx.recv()).await;
+            let recv_result = if let Some(token) = cancel_token {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        warn!(
+                            change_id = change_id,
+                            iteration = iteration,
+                            workspace = %workspace_path.display(),
+                            "Apply cancellation observed while waiting for streaming output; terminating child"
+                        );
+                        let _ = child.terminate();
+                        early_terminated = true;
+                        break;
+                    }
+                    result = tokio::time::timeout_at(wait_deadline, rx.recv()) => result,
+                }
+            } else {
+                tokio::time::timeout_at(wait_deadline, rx.recv()).await
+            };
 
             match recv_result {
                 Ok(Some(line)) => {
@@ -993,15 +1010,51 @@ where
         // Wait for child process. After an early grace-driven terminate this
         // returns the signalled exit status, which is success-equivalent only
         // when we observed a completion condition (see below).
-        let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!(
-                "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
+        let status = if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    warn!(
+                        change_id = change_id,
+                        iteration = iteration,
+                        workspace = %workspace_path.display(),
+                        "Apply cancellation observed while waiting for child status; terminating child"
+                    );
+                    let _ = child.terminate();
+                    return Err(OrchestratorError::AgentCommand(format!(
+                        "Cancelled apply for '{}' in workspace '{}'",
+                        change_id,
+                        workspace_path.display()
+                    )));
+                }
+                status = child.wait() => status.map_err(|e| {
+                    OrchestratorError::AgentCommand(format!(
+                        "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
+                        change_id,
+                        workspace_path.display(),
+                        iteration,
+                        e
+                    ))
+                })?,
+            }
+        } else {
+            child.wait().await.map_err(|e| {
+                OrchestratorError::AgentCommand(format!(
+                    "Failed to wait for apply command for '{}' in workspace '{}' (iteration {}): {}",
+                    change_id,
+                    workspace_path.display(),
+                    iteration,
+                    e
+                ))
+            })?
+        };
+
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            return Err(OrchestratorError::AgentCommand(format!(
+                "Cancelled apply for '{}' in workspace '{}'",
                 change_id,
-                workspace_path.display(),
-                iteration,
-                e
-            ))
-        })?;
+                workspace_path.display()
+            )));
+        }
 
         // Completion-finalized run: non-zero exit produced by our own terminate
         // after observing tasks-complete or blocked-handoff. Only this path is

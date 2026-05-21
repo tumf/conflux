@@ -2067,6 +2067,13 @@ impl ParallelExecutor {
             > + Send
             + Sync,
     {
+        if self.is_cancelled() {
+            info!(
+                "Skipping dependency analysis and dispatch because parallel execution is cancelled"
+            );
+            return Ok((true, iteration));
+        }
+
         let classification = self.classify_queued_work(queued, in_flight).await;
         if classification.is_blocked_only() {
             info!(
@@ -2272,6 +2279,10 @@ impl ParallelExecutor {
             );
 
             for change_id in &selected_changes {
+                if self.is_cancelled() {
+                    info!("Stopping selected-change dispatch loop because parallel execution is cancelled");
+                    break;
+                }
                 if let Err(e) = self
                     .dispatch_change_to_workspace(
                         change_id.clone(),

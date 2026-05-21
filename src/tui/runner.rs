@@ -162,6 +162,69 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalOrchestratorShutdownOutcome {
+    NoTask,
+    AlreadyFinished,
+    Graceful,
+    AbortedAfterTimeout,
+}
+
+pub(crate) async fn shutdown_local_orchestrator_task(
+    orchestrator_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    orchestrator_cancel: Option<CancellationToken>,
+    grace_period: Duration,
+) -> LocalOrchestratorShutdownOutcome {
+    if let Some(cancel) = orchestrator_cancel {
+        info!(
+            grace_ms = grace_period.as_millis(),
+            "Cancelling local TUI orchestrator during shutdown"
+        );
+        cancel.cancel();
+    }
+
+    let Some(handle) = orchestrator_handle else {
+        debug!("No local TUI orchestrator task to shut down");
+        return LocalOrchestratorShutdownOutcome::NoTask;
+    };
+
+    if handle.is_finished() {
+        let _ = handle.await;
+        info!("Local TUI orchestrator task was already finished during shutdown");
+        return LocalOrchestratorShutdownOutcome::AlreadyFinished;
+    }
+
+    tokio::pin!(handle);
+    tokio::select! {
+        join_result = &mut handle => {
+            match join_result {
+                Ok(Ok(())) => info!("Local TUI orchestrator task finished gracefully during shutdown"),
+                Ok(Err(err)) => warn!(error = %err, "Local TUI orchestrator task exited with error during shutdown"),
+                Err(err) => warn!(error = %err, "Local TUI orchestrator task join failed during shutdown"),
+            }
+            LocalOrchestratorShutdownOutcome::Graceful
+        }
+        _ = tokio::time::sleep(grace_period) => {
+            warn!(
+                grace_ms = grace_period.as_millis(),
+                "Local TUI orchestrator did not finish before shutdown grace period; aborting task to prevent detached local work"
+            );
+            handle.as_ref().abort_handle().abort();
+            match tokio::time::timeout(Duration::from_secs(1), &mut handle).await {
+                Ok(Ok(_)) => info!("Aborted local TUI orchestrator task joined after abort"),
+                Ok(Err(err)) if err.is_cancelled() => {
+                    info!("Local TUI orchestrator task aborted successfully")
+                }
+                Ok(Err(err)) => {
+                    warn!(error = %err, "Local TUI orchestrator task join failed after abort")
+                }
+                Err(_) => warn!("Timed out while joining aborted local TUI orchestrator task"),
+            }
+            LocalOrchestratorShutdownOutcome::AbortedAfterTimeout
+        }
+    }
+}
+
 pub async fn run_tui_with_remote(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
@@ -962,34 +1025,35 @@ async fn run_tui_loop(
         }
     }
 
-    // Cleanup: cancel all tasks and wait for them to finish
+    // Cleanup: cancel all TUI-scoped tasks and force-stop local orchestration launched by this TUI.
     cancel_token.cancel();
-    if let Some(cancel) = orchestrator_cancel {
-        cancel.cancel();
-    }
 
-    // Wait for tasks to finish gracefully
+    // Wait for tasks to finish gracefully. Remote mode has no local orchestrator handle here;
+    // remote server-side work is stopped only by explicit Stop/ForceStop commands.
     refresh_handle.abort();
-    if let Some(handle) = orchestrator_handle {
-        // Give orchestrator time to cleanup child processes
-        // Extended from 2s to 5s for more reliable cleanup (especially on Windows)
-        match tokio::time::timeout(Duration::from_secs(5), handle).await {
-            Ok(_) => tracing::info!("Orchestrator task finished gracefully"),
-            Err(_) => tracing::warn!("Orchestrator task timeout after 5 seconds"),
-        }
-    }
+    let _ = shutdown_local_orchestrator_task(
+        orchestrator_handle,
+        orchestrator_cancel,
+        Duration::from_secs(5),
+    )
+    .await;
 
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_refresh_root_usable, refresh_local_changes, should_apply_event_to_tui_reducer};
+    use super::{
+        is_refresh_root_usable, refresh_local_changes, should_apply_event_to_tui_reducer,
+        shutdown_local_orchestrator_task, LocalOrchestratorShutdownOutcome,
+    };
     use crate::events::{ExecutionEvent, RejectionOutcome, StalledBlocker};
     use crate::openspec::{Change, ProposalMetadata};
     use crate::vcs::WorkspaceStatus;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     fn sample_change() -> Change {
         Change {
@@ -1258,5 +1322,51 @@ mod tests {
     fn remote_mode_bypasses_local_refresh_path() {
         assert!(super::should_bypass_local_refresh(true));
         assert!(!super::should_bypass_local_refresh(false));
+    }
+    #[tokio::test]
+    async fn shutdown_local_orchestrator_cancels_and_aborts_non_finishing_task() {
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let (post_abort_tx, mut post_abort_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let handle = tokio::spawn(async move {
+            task_token.cancelled().await;
+            let _ = cancelled_tx.send(());
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                let _ = post_abort_tx.send(()).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let outcome =
+            shutdown_local_orchestrator_task(Some(handle), Some(token), Duration::from_millis(10))
+                .await;
+
+        assert_eq!(
+            outcome,
+            LocalOrchestratorShutdownOutcome::AbortedAfterTimeout
+        );
+        assert!(
+            cancelled_rx.await.is_ok(),
+            "shutdown should cancel orchestrator token"
+        );
+        tokio::task::yield_now().await;
+        let post_cleanup_event =
+            tokio::time::timeout(Duration::from_millis(80), post_abort_rx.recv()).await;
+        assert!(
+            !matches!(post_cleanup_event, Ok(Some(()))),
+            "aborted local orchestrator must not keep sending events after cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_local_orchestrator_without_handle_is_remote_client_safe_noop() {
+        let outcome = shutdown_local_orchestrator_task(None, None, Duration::from_millis(1)).await;
+
+        assert_eq!(outcome, LocalOrchestratorShutdownOutcome::NoTask);
     }
 }

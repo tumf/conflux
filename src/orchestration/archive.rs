@@ -312,7 +312,8 @@ where
     // Create output collector for history
     let mut output_collector = OutputCollector::new();
 
-    // Stream output
+    // Stream output. Poll cancellation while waiting for output so shutdown reaches the owned
+    // StreamingChildHandle even when the archive command is quiet.
     loop {
         if cancel_check() {
             let _ = child.terminate();
@@ -323,21 +324,26 @@ where
             ));
         }
 
-        match output_rx.try_recv() {
-            Ok(OutputLine::Stdout(s)) => {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(50), output_rx.recv()).await {
+            Ok(Some(OutputLine::Stdout(s))) => {
                 output_collector.add_stdout(&s);
                 output.on_stdout(&s);
             }
-            Ok(OutputLine::Stderr(s)) => {
+            Ok(Some(OutputLine::Stderr(s))) => {
                 output_collector.add_stderr(&s);
                 output.on_agent_stderr(&s);
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                // No data available, check if process is done
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            Ok(None) => break,
+            Err(_) => continue,
         }
+    }
+
+    if cancel_check() {
+        let _ = child.terminate();
+        output.on_warn("Archive command cancelled before child status wait");
+        return Err(OrchestratorError::AgentCommand(
+            "Archive command cancelled".to_string(),
+        ));
     }
 
     // Wait for child process to complete

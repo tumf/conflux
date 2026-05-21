@@ -514,6 +514,14 @@ impl ParallelExecutor {
         in_flight: &mut HashSet<String>,
         cleanup_guard: &mut WorkspaceCleanupGuard,
     ) -> Result<()> {
+        if self.is_cancelled() {
+            info!(
+                "Change '{}' skipped before dispatch because parallel execution is cancelled",
+                change_id
+            );
+            return Ok(());
+        }
+
         // Check if this change has been stopped (single-change stop)
         if let Some(ref queue) = self.dynamic_queue {
             if queue.is_stopped(&change_id).await {
@@ -578,10 +586,22 @@ impl ParallelExecutor {
             return Ok(());
         }
 
-        // Acquire semaphore permit
-        let permit = semaphore.clone().acquire_owned().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
-        })?;
+        // Acquire semaphore permit, but wake promptly if global cancellation arrives while waiting.
+        let permit = if let Some(token) = &self.cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    info!("Change '{}' skipped while waiting for parallel slot because execution was cancelled", change_id);
+                    return Ok(());
+                }
+                permit = semaphore.clone().acquire_owned() => permit.map_err(|e| {
+                    OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
+                })?,
+            }
+        } else {
+            semaphore.clone().acquire_owned().await.map_err(|e| {
+                OrchestratorError::AgentCommand(format!("Failed to acquire semaphore: {}", e))
+            })?
+        };
 
         let force_recreate = self.force_recreate_worktree.remove(&change_id);
         if force_recreate {
