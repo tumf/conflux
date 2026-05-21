@@ -218,13 +218,31 @@ where
         }
     }
 
-    // Child has exited, wait for status
-    let status = child.wait().await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!(
-            "Failed to wait for acceptance command for change '{}': {}",
-            change.id, e
-        ))
-    })?;
+    // Child has exited, wait for status. Keep this cancellation-aware because
+    // the output channel may close before the process status is reaped.
+    let status = loop {
+        if cancel_check() {
+            warn!(
+                "Acceptance test cancelled while waiting for child status for: {}",
+                change.id
+            );
+            output.on_warn("Acceptance test cancelled");
+            let _ = child.terminate();
+            return Ok((AcceptanceResult::Cancelled, 0, command));
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_millis(50), child.wait()).await {
+            Ok(status) => {
+                break status.map_err(|e| {
+                    OrchestratorError::AgentCommand(format!(
+                        "Failed to wait for acceptance command for change '{}': {}",
+                        change.id, e
+                    ))
+                })?;
+            }
+            Err(_) => continue,
+        }
+    };
 
     // Record attempt
     let stdout_tail = output_collector.stdout_tail();
