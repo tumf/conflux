@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 trait TestAssertionExt<T> {
     fn or_fail(self, context: &str) -> T;
@@ -7190,6 +7191,150 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
             .contains("command-failed-before-verdict"),
         "acceptance history should retain command-failure stdout tail, got {:?}",
         attempts[0].stdout_tail
+    );
+}
+
+#[tokio::test]
+async fn test_acceptance_cancels_while_waiting_for_silent_streaming_output() {
+    use std::time::{Duration, Instant};
+
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'sleep 30'".to_string()),
+        ..Default::default()
+    });
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel_clone.cancel();
+    });
+
+    let started = Instant::now();
+    let (result, _iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        None,
+        Some(&cancel),
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("acceptance cancellation should return a result");
+
+    assert!(
+        matches!(result, crate::orchestration::AcceptanceResult::Cancelled),
+        "silent acceptance command should cancel instead of waiting for output, got {:?}",
+        result
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cancellation should not wait for the 30s child sleep"
+    );
+}
+
+#[tokio::test]
+async fn test_archive_cancels_while_waiting_for_silent_streaming_output() {
+    use std::time::{Duration, Instant};
+
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    let change_id = "change-a";
+    let change_dir = repo_root.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] done\n",
+    )
+    .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Base"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        archive_command: Some("sh -c 'sleep 30'".to_string()),
+        ..Default::default()
+    });
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+    let archive_history = Arc::new(Mutex::new(crate::history::ArchiveHistory::new()));
+    let apply_history = Arc::new(Mutex::new(crate::history::ApplyHistory::new()));
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel_clone.cancel();
+    });
+
+    let started = Instant::now();
+    let result = execute_archive_in_workspace(
+        change_id,
+        repo_root.path(),
+        config.get_archive_command().or_fail("unexpected error"),
+        &config,
+        None,
+        VcsBackend::Git,
+        None,
+        None,
+        Some(&cancel),
+        &ai_runner,
+        &archive_history,
+        &apply_history,
+        &shared_stagger_state,
+    )
+    .await;
+
+    let err = result.expect_err("silent archive command should be cancelled");
+    assert!(
+        err.to_string().contains("Cancelled archive"),
+        "expected archive cancellation error, got {err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cancellation should not wait for the 30s child sleep"
     );
 }
 

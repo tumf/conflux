@@ -24,6 +24,63 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+async fn wait_for_streaming_child_with_cancel(
+    mut child: crate::process_manager::StreamingChildHandle,
+    cancel_token: Option<&CancellationToken>,
+    operation: &str,
+    change_id: &str,
+    workspace_path: &Path,
+    attempt: Option<u32>,
+) -> Result<std::process::ExitStatus> {
+    if let Some(token) = cancel_token {
+        tokio::select! {
+            _ = token.cancelled() => {
+                warn!(
+                    operation = operation,
+                    change_id = change_id,
+                    workspace = %workspace_path.display(),
+                    attempt = attempt,
+                    "Cancellation observed while waiting for child status; terminating child"
+                );
+                let _ = child.terminate();
+                Err(OrchestratorError::AgentCommand(format!(
+                    "Cancelled {} for '{}' in workspace '{}'",
+                    operation,
+                    change_id,
+                    workspace_path.display()
+                )))
+            }
+            status = child.wait() => status.map_err(|e| {
+                let attempt_context = attempt
+                    .map(|attempt| format!(" (attempt {})", attempt))
+                    .unwrap_or_default();
+                OrchestratorError::AgentCommand(format!(
+                    "Failed to wait for {} command for '{}' in workspace '{}'{}: {}",
+                    operation,
+                    change_id,
+                    workspace_path.display(),
+                    attempt_context,
+                    e
+                ))
+            }),
+        }
+    } else {
+        child.wait().await.map_err(|e| {
+            let attempt_context = attempt
+                .map(|attempt| format!(" (attempt {})", attempt))
+                .unwrap_or_default();
+            OrchestratorError::AgentCommand(format!(
+                "Failed to wait for {} command for '{}' in workspace '{}'{}: {}",
+                operation,
+                change_id,
+                workspace_path.display(),
+                attempt_context,
+                e
+            ))
+        })
+    }
+}
+
 /// Parallel execution context for hooks
 #[derive(Debug, Clone, Default)]
 pub struct ParallelHookContext {
@@ -710,11 +767,36 @@ pub async fn execute_archive_in_workspace(
         // Create output collector for history
         let mut output_collector = crate::history::OutputCollector::new();
 
-        // Forward output to event channel
+        // Forward output to event channel while observing cancellation even if
+        // the archive command stays quiet after startup.
         use crate::ai_command_runner::OutputLine as AiOutputLine;
         let change_id_clone = change_id.to_string();
         let event_tx_clone = event_tx.clone();
-        while let Some(line) = output_rx.recv().await {
+        loop {
+            let line = if let Some(token) = cancel_token {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        warn!(
+                            change_id = %change_id,
+                            workspace = %workspace_path.display(),
+                            attempt = attempt,
+                            "Archive cancellation observed while waiting for streaming output; terminating child"
+                        );
+                        let _ = child.terminate();
+                        return Err(OrchestratorError::AgentCommand(format!(
+                            "Cancelled archive for '{}' in workspace '{}'",
+                            change_id,
+                            workspace_path.display()
+                        )));
+                    }
+                    line = output_rx.recv() => line,
+                }
+            } else {
+                output_rx.recv().await
+            };
+
+            let Some(line) = line else { break };
+
             // Collect output for history
             match &line {
                 AiOutputLine::Stdout(s) => output_collector.add_stdout(s),
@@ -735,16 +817,17 @@ pub async fn execute_archive_in_workspace(
             }
         }
 
-        // Wait for process to complete
-        let status = child.wait().await.map_err(|e| {
-            OrchestratorError::AgentCommand(format!(
-                "Failed to wait for archive command for '{}' in workspace '{}' (attempt {}): {}",
-                change_id,
-                workspace_path.display(),
-                attempt,
-                e
-            ))
-        })?;
+        // Wait for process to complete. Keep this cancellation-aware because
+        // output pipes may close before the child process status is available.
+        let status = wait_for_streaming_child_with_cancel(
+            child,
+            cancel_token,
+            "archive",
+            change_id,
+            workspace_path,
+            Some(attempt),
+        )
+        .await?;
 
         if !status.success() {
             return Err(OrchestratorError::AgentCommand(format!(
@@ -1308,9 +1391,28 @@ pub async fn execute_acceptance_in_workspace(
     // Stream output until channel closes or verdict grace period expires.
     use crate::ai_command_runner::OutputLine as AiOutputLine;
     loop {
-        let recv_future = output_rx.recv();
         let line = if let Some(deadline) = verdict_deadline {
-            match tokio::time::timeout_at(deadline, recv_future).await {
+            let recv_future = output_rx.recv();
+            let recv_with_deadline = tokio::time::timeout_at(deadline, recv_future);
+            let recv_result = if let Some(token) = cancel_token {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        warn!(
+                            change_id = %change_id,
+                            workspace = %workspace_path.display(),
+                            iteration = acceptance_iteration,
+                            "Acceptance cancellation observed while waiting for streaming output; terminating child"
+                        );
+                        let _ = child.terminate();
+                        return Ok((crate::orchestration::AcceptanceResult::Cancelled, 0));
+                    }
+                    result = recv_with_deadline => result,
+                }
+            } else {
+                recv_with_deadline.await
+            };
+
+            match recv_result {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(_) => {
@@ -1324,14 +1426,32 @@ pub async fn execute_acceptance_in_workspace(
                     break;
                 }
             }
+        } else if let Some(token) = cancel_token {
+            tokio::select! {
+                _ = token.cancelled() => {
+                    warn!(
+                        change_id = %change_id,
+                        workspace = %workspace_path.display(),
+                        iteration = acceptance_iteration,
+                        "Acceptance cancellation observed while waiting for streaming output; terminating child"
+                    );
+                    let _ = child.terminate();
+                    return Ok((crate::orchestration::AcceptanceResult::Cancelled, 0));
+                }
+                line = output_rx.recv() => match line {
+                    Some(line) => line,
+                    None => break,
+                },
+            }
         } else {
-            match recv_future.await {
+            match output_rx.recv().await {
                 Some(line) => line,
                 None => break,
             }
         };
 
-        // Check for cancellation
+        // Check for cancellation after receiving a line as well, so cancellation
+        // wins before parsing or recording any later output.
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
             warn!("Acceptance test cancelled for: {}", change_id);
             let _ = child.terminate();
@@ -1389,15 +1509,31 @@ pub async fn execute_acceptance_in_workspace(
 
     // Wait for child process to complete. After early verdict-driven
     // termination this returns the terminated exit status, which we treat as
-    // success-equivalent for verdict-based result classification below.
-    let status = child.wait().await.map_err(|e| {
-        OrchestratorError::AgentCommand(format!(
-            "Failed to wait for acceptance command for change '{}' in workspace '{}': {}",
-            change_id,
-            workspace_path.display(),
-            e
-        ))
-    })?;
+    // success-equivalent for verdict-based result classification below. Keep
+    // status waiting cancellation-aware because output pipes can close before
+    // the child process is reaped.
+    let status = match wait_for_streaming_child_with_cancel(
+        child,
+        cancel_token,
+        "acceptance",
+        change_id,
+        workspace_path,
+        Some(acceptance_iteration),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) if cancel_token.is_some_and(|token| token.is_cancelled()) => {
+            warn!(
+                change_id = %change_id,
+                workspace = %workspace_path.display(),
+                "Acceptance cancelled while waiting for child status: {}",
+                err
+            );
+            return Ok((crate::orchestration::AcceptanceResult::Cancelled, 0));
+        }
+        Err(err) => return Err(err),
+    };
 
     // When the runtime terminated the child after a canonical verdict, the
     // terminated exit code is not a real failure — the acceptance result is

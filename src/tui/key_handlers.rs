@@ -35,6 +35,16 @@ pub struct KeyEventContext<'a> {
     pub orchestrator_handle: &'a Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
+fn request_local_tui_quit(app: &mut AppState, orchestrator_cancel: &Option<CancellationToken>) {
+    app.should_quit = true;
+    if let Some(cancel) = orchestrator_cancel {
+        cancel.cancel();
+        app.add_log(LogEntry::warn(
+            "Quit requested: cancelling local orchestration before TUI shutdown",
+        ));
+    }
+}
+
 /// Handle Tab key: Switch between Changes and Worktrees views
 pub async fn handle_tab_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
     use crate::tui::types::ViewMode;
@@ -516,7 +526,7 @@ pub async fn handle_key_event(
 
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            ctx.app.should_quit = true;
+            request_local_tui_quit(ctx.app, ctx.orchestrator_cancel);
         }
         (KeyCode::Tab, _) => {
             handle_tab_key(ctx).await?;
@@ -880,5 +890,28 @@ mod tests {
         assert_eq!(app.cursor_index, cursor_before);
         assert_eq!(app.warning_popup_scroll, 0);
         assert!(app.warning_popup.is_some());
+    }
+    #[test]
+    fn ctrl_c_quit_cancels_local_orchestrator_token() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        let token = CancellationToken::new();
+
+        request_local_tui_quit(&mut app, &Some(token.clone()));
+
+        assert!(app.should_quit);
+        assert!(token.is_cancelled());
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("cancelling local orchestration")));
+    }
+
+    #[test]
+    fn ctrl_c_quit_without_local_orchestrator_only_sets_quit() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+
+        request_local_tui_quit(&mut app, &None);
+
+        assert!(app.should_quit);
     }
 }
