@@ -23,6 +23,9 @@ Implement the approved change fully, updating `tasks.md` as progress is made, an
 - **COMPLETE ALL TRUTHFULLY** - A task may be marked `[x]` only when the corresponding repository change and required verification actually exist
 - **ESCALATE BLOCKERS** - If implementation is impossible, record an Implementation Blocker for acceptance review
 - **NO CHECKLIST-ONLY COMPLETION** - Do not mark implementation tasks complete based only on proposal/spec/tasks edits when the task requires code, tests, or runtime wiring
+- **TASK COMPLETION RESPONSIBILITY** - Marking every task `[x]` in tasks.md constitutes apply completion responsibility
+- **COMMIT WHEN INSTRUCTED** - If an explicit commit instruction exists in context or current task, perform the commit to finalize completion
+- **NO UNCHECKED TASKS** - Apply MUST NOT declare completion or exit while any `[ ]` unchecked tasks remain in tasks.md; all must be `[x]` or moved to Future Work before finishing
 
 ## Execution Steps
 
