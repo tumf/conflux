@@ -12,6 +12,28 @@ pub(crate) fn skill_prelude(skill: &str) -> String {
     format!("load skills: {}\n\n${}", skill, skill)
 }
 
+fn apply_completion_contract(change_id: &str) -> String {
+    format!(
+        "Apply change id: {change_id}\n\n\
+This is an implementation task, not a review or summary.\n\n\
+Required outcome:\n\
+1. Read openspec/changes/{change_id}/proposal.md and openspec/changes/{change_id}/tasks.md.\n\
+2. Modify repository source, test, or config files to implement unchecked active tasks.\n\
+3. After each real implementation and verification, update openspec/changes/{change_id}/tasks.md from [ ] to [x].\n\
+4. Internal agent todos do not count as OpenSpec task completion.\n\n\
+Forbidden:\n\
+- Do not only summarize, inspect, or plan.\n\
+- Do not treat reading files as implementation.\n\
+- Do not report complete while openspec/changes/{change_id}/tasks.md still has unchecked active tasks.\n\
+- Do not exit successfully when required implementation diff is empty.\n\
+- Do not confuse internal TODO/TodoWrite completion with tasks.md completion.\n\n\
+Before final response, verify:\n\
+- git diff --stat shows real non-OpenSpec implementation, test, or config changes when code tasks exist.\n\
+- openspec/changes/{change_id}/tasks.md has no unchecked [ ] items under active task sections.\n\n\
+If either check fails, report APPLY_INCOMPLETE with exact remaining tasks and evidence instead of saying complete."
+    )
+}
+
 /// Build apply prompt from change metadata, user prompt, history context, and acceptance tail
 /// Format: fixed prelude + user_prompt + APPLY_SYSTEM_PROMPT + acceptance_tail_context + history_context
 ///
@@ -52,7 +74,7 @@ pub fn build_apply_prompt_with_skill(
     let mut parts = Vec::new();
 
     parts.push(skill_prelude(apply_skill));
-    parts.push(format!("Apply change id: {}", change_id));
+    parts.push(apply_completion_contract(change_id));
 
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());

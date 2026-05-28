@@ -207,7 +207,22 @@ fn test_build_apply_prompt_with_only_system_prompt() {
     assert!(result.contains("$cflx-apply"));
     assert!(result.contains("load skills: cflx-apply"));
     assert!(result.contains("Apply change id: my-change"));
+    assert!(result.contains("This is an implementation task, not a review or summary."));
+    assert!(result.contains("Internal agent todos do not count as OpenSpec task completion."));
+    assert!(result.contains("openspec/changes/my-change/tasks.md has no unchecked [ ] items"));
+    assert!(result.contains("APPLY_INCOMPLETE"));
     assert!(result.contains(APPLY_SYSTEM_PROMPT));
+}
+
+#[test]
+fn test_build_apply_prompt_requires_real_diff_and_tasks_md_completion() {
+    let result = build_apply_prompt("real-change", "", "", "");
+
+    assert!(result.contains("Modify repository source, test, or config files"));
+    assert!(result.contains("git diff --stat shows real non-OpenSpec implementation"));
+    assert!(result.contains("Do not exit successfully when required implementation diff is empty."));
+    assert!(result
+        .contains("Do not confuse internal TODO/TodoWrite completion with tasks.md completion."));
 }
 
 #[test]
