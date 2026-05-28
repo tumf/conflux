@@ -34,6 +34,71 @@ If either check fails, report APPLY_INCOMPLETE with exact remaining tasks and ev
     )
 }
 
+fn archive_completion_contract(change_id: &str) -> String {
+    format!(
+        "Archive change id: {change_id}\n\n\
+This is an archive task, not implementation, acceptance, or summary.\n\n\
+Required outcome:\n\
+1. Read openspec/changes/{change_id}/proposal.md and openspec/changes/{change_id}/tasks.md.\n\
+2. Confirm every active task in tasks.md is already [x].\n\
+3. Archive the completed change and update canonical specs as required by the archive workflow.\n\
+4. Preserve implementation commits; only make archive/spec bookkeeping changes.\n\n\
+Forbidden:\n\
+- Do not perform new feature implementation.\n\
+- Do not archive while tasks.md still has unchecked [ ] items.\n\
+- Do not report archived without an archive/spec bookkeeping diff or confirmed no-op reason.\n\
+- Do not confuse acceptance PASS with archive completion.\n\n\
+Before final response, verify:\n\
+- openspec/changes/{change_id}/tasks.md has no unchecked [ ] items under active task sections.\n\
+- git diff --stat or git status shows the expected archive/spec state.\n\
+- The change is no longer left as an unarchived active change when archive work was required.\n\n\
+If any check fails, report ARCHIVE_INCOMPLETE with exact evidence instead of saying archived."
+    )
+}
+
+fn cleanup_review_completion_contract(change_id: &str) -> String {
+    format!(
+        "Cleanup-review change id: {change_id}\n\n\
+This is a post-apply dirty-worktree handoff task, not implementation, acceptance, or archive.\n\n\
+Required outcome:\n\
+1. Inspect the managed worktree for apply-generated dirty state for {change_id}.\n\
+2. Keep only intentional handoff cleanup needed to make the worktree clean.\n\
+3. Stage and commit only intentional cleanup files; never use blind staging.\n\
+4. On success, output exactly one final marker line: CLEANUP_REVIEW: CLEAN.\n\n\
+Forbidden:\n\
+- Do not perform new implementation.\n\
+- Do not use `git add -A` or `git add .`.\n\
+- Do not ask for human input.\n\
+- Do not emit CLEANUP_REVIEW: CLEAN unless the worktree is clean.\n\n\
+Before final response, verify:\n\
+- git status is clean.\n\
+- Any staged/committed files were selected explicitly, not by blind staging.\n\
+- Exactly one standalone CLEANUP_REVIEW: CLEAN marker will be emitted."
+    )
+}
+
+fn acceptance_completion_contract(change_id: &str) -> String {
+    format!(
+        "Acceptance id: {change_id}\n\n\
+This is an acceptance review task, not implementation, archive, or summary.\n\n\
+Required outcome:\n\
+1. Review proposal.md, tasks.md, spec deltas, and implementation diff for {change_id}.\n\
+2. Verify implemented behavior satisfies the OpenSpec requirements.\n\
+3. Verify all active tasks in tasks.md are [x].\n\
+4. Return a verdict using the acceptance skill's required format.\n\n\
+Forbidden:\n\
+- Do not perform new implementation during acceptance.\n\
+- Do not return PASS while tasks.md has unchecked [ ] items.\n\
+- Do not return PASS when diff/spec evidence is missing for required behavior.\n\
+- Do not confuse cleanup or archive readiness with acceptance correctness.\n\n\
+Before final response, verify:\n\
+- tasks.md has no unchecked [ ] items under active task sections.\n\
+- implementation diff and tests/evidence support every accepted requirement.\n\
+- archive commitability blockers from the real commit path are considered.\n\n\
+If checks fail, return a non-pass acceptance verdict with exact findings."
+    )
+}
+
 /// Build apply prompt from change metadata, user prompt, history context, and acceptance tail
 /// Format: fixed prelude + user_prompt + APPLY_SYSTEM_PROMPT + acceptance_tail_context + history_context
 ///
@@ -114,7 +179,7 @@ pub fn build_archive_prompt_with_skill(
     let mut parts = Vec::new();
 
     parts.push(skill_prelude(archive_skill));
-    parts.push(format!("Archive change id: {}", change_id));
+    parts.push(archive_completion_contract(change_id));
 
     if !user_prompt.is_empty() {
         parts.push(user_prompt.to_string());
@@ -148,7 +213,7 @@ pub fn build_cleanup_review_prompt_with_skill(
     let mut parts = Vec::new();
 
     parts.push(skill_prelude(cleanup_review_skill));
-    parts.push(format!("Cleanup-review change id: {}", change_id));
+    parts.push(cleanup_review_completion_contract(change_id));
     parts.push(format!(
         "change_id: {}\nproposal_path: openspec/changes/{}/proposal.md\ntasks_path: openspec/changes/{}/tasks.md\nworkspace_path: .",
         change_id, change_id, change_id
@@ -282,7 +347,7 @@ pub fn build_acceptance_prompt_context_only_with_skill(
     let mut parts = Vec::new();
 
     parts.push(skill_prelude(accept_skill));
-    parts.push(format!("Acceptance id:{}", change_id));
+    parts.push(acceptance_completion_contract(change_id));
 
     // Change metadata first so downstream templates can reference it.
     parts.push(format!("change_id: {}", change_id));
@@ -492,7 +557,7 @@ pub(crate) mod tests {
             .find("load skills: cflx-accept")
             .expect("Skill prelude should be present");
         let acceptance_id_pos = result
-            .find("Acceptance id:test-change")
+            .find("Acceptance id: test-change")
             .expect("Acceptance id prelude should be present");
         let metadata_pos = result
             .find("change_id: test-change")
@@ -558,7 +623,7 @@ pub(crate) mod tests {
         assert!(result.contains("$cflx-accept-with-speca"));
         assert!(result.contains("load skills: cflx-accept-with-speca"));
         assert!(!result.contains("$cflx-accept\n"));
-        assert!(result.contains("Acceptance id:test-change"));
+        assert!(result.contains("Acceptance id: test-change"));
     }
 
     #[test]
@@ -581,7 +646,7 @@ pub(crate) mod tests {
         // Should contain prelude, change metadata and user prompt
         assert!(result.contains("$cflx-accept"));
         assert!(result.contains("load skills: cflx-accept"));
-        assert!(result.contains("Acceptance id:test-change"));
+        assert!(result.contains("Acceptance id: test-change"));
         assert!(result.contains("change_id: test-change"));
         assert!(result.contains("proposal_path: openspec/changes/test-change/proposal.md"));
         assert!(result.contains("USER_PROMPT"));
@@ -589,6 +654,36 @@ pub(crate) mod tests {
         // Should NOT contain diff context section with actual content
         assert!(!result.contains("Files changed since last acceptance check:"));
         assert!(!result.contains("Previous acceptance findings:"));
+    }
+
+    #[test]
+    fn test_build_archive_prompt_requires_completion_contract() {
+        let prompt = build_archive_prompt("change-123", "", "");
+
+        assert!(prompt.contains("This is an archive task, not implementation"));
+        assert!(prompt.contains("Do not archive while tasks.md still has unchecked [ ] items"));
+        assert!(prompt.contains("ARCHIVE_INCOMPLETE"));
+        assert!(prompt.contains("openspec/changes/change-123/tasks.md"));
+    }
+
+    #[test]
+    fn test_build_acceptance_prompt_requires_review_contract() {
+        let prompt = build_acceptance_prompt("change-123", "", "", "", "");
+
+        assert!(prompt.contains("This is an acceptance review task"));
+        assert!(prompt.contains("Do not return PASS while tasks.md has unchecked [ ] items"));
+        assert!(prompt.contains("archive commitability blockers"));
+        assert!(prompt.contains("Acceptance id: change-123"));
+    }
+
+    #[test]
+    fn test_build_cleanup_review_prompt_requires_handoff_contract() {
+        let prompt = build_cleanup_review_prompt("change-123");
+
+        assert!(prompt.contains("This is a post-apply dirty-worktree handoff task"));
+        assert!(prompt.contains("Do not perform new implementation"));
+        assert!(prompt.contains("Do not use `git add -A` or `git add .`"));
+        assert!(prompt.contains("git status is clean"));
     }
 
     #[test]
