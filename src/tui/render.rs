@@ -224,43 +224,89 @@ pub fn render(frame: &mut Frame, app: &mut AppState) {
             }
         }
         ViewMode::Worktrees => {
-            render_worktree_view(frame, app, area);
+            worktree_view::render(frame, app, area);
         }
     }
 
     // Render QR popup on top if in QrPopup mode
     if app.mode == AppMode::QrPopup {
-        render_qr_popup(frame, app, area);
+        popups::render_qr(frame, app, area);
     }
 
     // Render worktree delete confirmation modal on top if needed
     if app.mode == AppMode::ConfirmWorktreeDelete {
-        render_worktree_delete_confirm(frame, app, area);
+        worktree_view::render_delete_confirm(frame, app, area);
     }
 
     // Render warning popup on top if present
     if app.warning_popup.is_some() {
-        render_warning_popup(frame, app, area);
+        popups::render_warning(frame, app, area);
     }
 }
 
-/// Render selection mode
+mod screens {
+    use super::*;
+
+    pub(super) fn render_select_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        let chunks = Layout::vertical([
+            Constraint::Length(3), // Header
+            Constraint::Min(5),    // Changes list
+            Constraint::Length(3), // Footer
+        ])
+        .split(area);
+
+        super::render_header(frame, app, chunks[0]);
+        super::changes_list::render_select(frame, app, chunks[1]);
+        super::render_footer_select(frame, app, chunks[2]);
+    }
+
+    pub(super) fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        let chunks = if app.logs_panel_enabled {
+            let (changes_height, logs_height) = super::running_logs_enabled_layout_heights(
+                area.height,
+                super::running_changes_visual_row_count(app),
+            );
+            Layout::vertical([
+                Constraint::Length(super::TUI_HEADER_HEIGHT), // Header
+                Constraint::Length(changes_height),           // Changes list
+                Constraint::Length(super::TUI_STATUS_HEIGHT), // Status
+                Constraint::Length(logs_height),              // Logs
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Length(super::TUI_HEADER_HEIGHT),
+                Constraint::Min(super::RUNNING_CHANGES_MIN_HEIGHT),
+                Constraint::Length(super::TUI_STATUS_HEIGHT),
+            ])
+            .split(area)
+        };
+
+        super::render_header(frame, app, chunks[0]);
+        super::changes_list::render_running(frame, app, chunks[1]);
+        super::status_logs::render_status(frame, app, chunks[2]);
+
+        if app.logs_panel_enabled && chunks.len() > 3 {
+            super::status_logs::render_logs(frame, app, chunks[3]);
+        }
+    }
+
+    pub(super) fn render_worktree_view(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        let chunks = Layout::vertical([
+            Constraint::Length(3), // Header
+            Constraint::Min(5),    // Worktree list
+            Constraint::Length(3), // Footer
+        ])
+        .split(area);
+
+        super::render_header(frame, app, chunks[0]);
+        super::worktree_view::render_list(frame, app, chunks[1]);
+        super::worktree_view::render_footer(frame, app, chunks[2]);
+    }
+}
+
 fn render_select_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(3), // Header
-        Constraint::Min(5),    // Changes list
-        Constraint::Length(3), // Footer
-    ])
-    .split(area);
-
-    // Header
-    render_header(frame, app, chunks[0]);
-
-    // Changes list
-    render_changes_list_select(frame, app, chunks[1]);
-
-    // Footer
-    render_footer_select(frame, app, chunks[2]);
+    screens::render_select_mode(frame, app, area);
 }
 
 const TUI_HEADER_HEIGHT: u16 = 3;
@@ -295,40 +341,63 @@ fn running_logs_enabled_layout_heights(area_height: u16, changes_visual_rows: u1
     (changes_height, logs_height)
 }
 
-/// Render running mode
 fn render_running_mode(frame: &mut Frame, app: &mut AppState, area: Rect) {
-    // Show logs panel only if logs_panel_enabled is true
-    let chunks = if app.logs_panel_enabled {
-        let (changes_height, logs_height) =
-            running_logs_enabled_layout_heights(area.height, running_changes_visual_row_count(app));
-        Layout::vertical([
-            Constraint::Length(TUI_HEADER_HEIGHT), // Header
-            Constraint::Length(changes_height),    // Changes list
-            Constraint::Length(TUI_STATUS_HEIGHT), // Status
-            Constraint::Length(logs_height),       // Logs, expanded with unused changes-list space
-        ])
-        .split(area)
-    } else {
-        Layout::vertical([
-            Constraint::Length(TUI_HEADER_HEIGHT),       // Header
-            Constraint::Min(RUNNING_CHANGES_MIN_HEIGHT), // Changes list
-            Constraint::Length(TUI_STATUS_HEIGHT),       // Status
-        ])
-        .split(area)
-    };
+    screens::render_running_mode(frame, app, area);
+}
 
-    // Header
-    render_header(frame, app, chunks[0]);
+mod changes_list {
+    use super::*;
 
-    // Changes list
-    render_changes_list_running(frame, app, chunks[1]);
+    pub(super) fn render_select(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        super::render_changes_list_select(frame, app, area);
+    }
 
-    // Status
-    render_status(frame, app, chunks[2]);
+    pub(super) fn render_running(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        super::render_changes_list_running(frame, app, area);
+    }
+}
 
-    // Logs (only if enabled)
-    if app.logs_panel_enabled && chunks.len() > 3 {
-        render_logs(frame, app, chunks[3]);
+mod status_logs {
+    use super::*;
+
+    pub(super) fn render_status(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_status(frame, app, area);
+    }
+
+    pub(super) fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_logs(frame, app, area);
+    }
+}
+
+mod worktree_view {
+    use super::*;
+
+    pub(super) fn render(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        super::screens::render_worktree_view(frame, app, area);
+    }
+
+    pub(super) fn render_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
+        super::render_worktree_list(frame, app, area);
+    }
+
+    pub(super) fn render_footer(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_footer_worktree(frame, app, area);
+    }
+
+    pub(super) fn render_delete_confirm(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_worktree_delete_confirm(frame, app, area);
+    }
+}
+
+mod popups {
+    use super::*;
+
+    pub(super) fn render_warning(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_warning_popup(frame, app, area);
+    }
+
+    pub(super) fn render_qr(frame: &mut Frame, app: &AppState, area: Rect) {
+        super::render_qr_popup(frame, app, area);
     }
 }
 
@@ -1533,25 +1602,6 @@ fn render_footer_select(frame: &mut Frame, app: &AppState, area: Rect) {
     frame.render_widget(footer, area);
 }
 
-/// Render worktree view
-fn render_worktree_view(frame: &mut Frame, app: &mut AppState, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(3), // Header
-        Constraint::Min(5),    // Worktree list
-        Constraint::Length(3), // Footer
-    ])
-    .split(area);
-
-    // Header
-    render_header(frame, app, chunks[0]);
-
-    // Worktree list
-    render_worktree_list(frame, app, chunks[1]);
-
-    // Footer
-    render_footer_worktree(frame, app, chunks[2]);
-}
-
 /// Render the worktree list
 fn render_worktree_list(frame: &mut Frame, app: &mut AppState, area: Rect) {
     use crate::tui::types::ViewMode;
@@ -2085,6 +2135,82 @@ mod tests {
 
         assert_eq!(modal.width, 85);
         assert_eq!(modal.height, 21);
+    }
+
+    #[test]
+    fn qr_popup_render_shows_url_and_close_hint() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::QrPopup;
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+
+        let buffer = render_buffer(&mut app, 100, 40);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("Web UI QR Code"));
+        assert!(content.contains("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn remote_grouping_characterization_shows_project_headers_and_bare_change_ids() {
+        let mut app = create_test_app(vec![
+            create_test_change("p1::alpha/change-one"),
+            create_test_change("p2::beta/change-two"),
+        ]);
+        app.cursor_index = 1;
+
+        let buffer = render_buffer(&mut app, 120, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("alpha"));
+        assert!(content.contains("beta"));
+        assert!(content.contains("change-one"));
+        assert!(content.contains("change-two"));
+        assert!(!content.contains("p1::alpha/change-one"));
+    }
+
+    #[test]
+    fn status_logs_characterization_shows_progress_elapsed_and_log_header() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.changes[0].selected = true;
+        app.changes[0].completed_tasks = 1;
+        app.changes[0].total_tasks = 4;
+        app.orchestration_started_at = Some(std::time::Instant::now());
+        app.add_log(
+            LogEntry::info("Applying patch")
+                .with_change_id("change-a")
+                .with_operation("apply")
+                .with_iteration(2),
+        );
+
+        let buffer = render_buffer(&mut app, 120, 24);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("25.0%"));
+        assert!(content.contains("Elapsed"));
+        assert!(content.contains("[change-a:apply:2]"));
+        assert!(content.contains("Applying patch"));
+    }
+
+    #[test]
+    fn worktree_view_characterization_shows_key_hints_and_delete_confirmation() {
+        use crate::tui::types::WorktreeAction;
+
+        let mut app = create_test_app(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![create_test_worktree("/tmp/worktree-a", "feature-a")];
+        app.pending_worktree_action = Some(("/tmp/worktree-a".to_string(), WorktreeAction::Delete));
+        app.mode = AppMode::ConfirmWorktreeDelete;
+
+        let buffer = render_buffer(&mut app, 120, 30);
+        let content = buffer_to_string(&buffer);
+
+        assert!(content.contains("Worktrees"));
+        assert!(content.contains("feature-a"));
+        assert!(content.contains("Tab: changes"));
+        assert!(content.contains("D: delete"));
+        assert!(content.contains("Delete Worktree"));
+        assert!(content.contains("Press Y to delete, N or Esc to cancel"));
     }
 
     #[test]
