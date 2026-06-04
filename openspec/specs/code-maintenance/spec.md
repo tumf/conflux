@@ -609,3 +609,14 @@ WebUI terminal component の hook 依存関係整理は、terminal session の r
 **When**: tab が mount、resize、入力送信、unmount、または `sessionId` 変更される
 **Then**: WebSocket 接続、resize 送信、入力送信、cleanup は分割前と同等である
 **And**: REST/WebSocket payload とユーザー向け terminal message は変更されない
+
+### Requirement: git sync API の責務分割安全性
+
+Git sync API の内部リファクタリングは、resolve command 実行、sync planning、pull/push/sync route contract を個別に検証可能な形で保持しなければならない。
+
+#### Scenario: git sync API の代表分岐が維持される
+
+- **GIVEN** local/remote SHA、resolve command 設定、git repository fixture が用意されている
+- **WHEN** pull、push、sync、resolve command の代表経路を実行する
+- **THEN** skip、non-fast-forward、auto-resolve、success response の判定はリファクタ前と同等である
+- **AND** API の route、status code、response body は変更されない
