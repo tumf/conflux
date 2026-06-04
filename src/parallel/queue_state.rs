@@ -499,17 +499,17 @@ impl ParallelExecutor {
                         &rejected_ids,
                     );
                     match class {
-                        DependencyTargetClass::Archived => {
-                            info!(
-                                "Change '{}' dependency '{}' is archived and already satisfied",
-                                change_id, dep_id
-                            );
-                            continue;
-                        }
                         DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
                             unresolved_deps.push(dep_id.clone());
                             blockers.push((dep_id.clone(), class));
                             continue;
+                        }
+                        DependencyTargetClass::Archived => {
+                            debug!(
+                                change_id = %change_id,
+                                dependency = %dep_id,
+                                "Archived dependency evidence found; verifying base-branch merge before dispatch"
+                            );
                         }
                         DependencyTargetClass::Queued
                         | DependencyTargetClass::InFlight

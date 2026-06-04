@@ -350,6 +350,30 @@ async fn commit_workspace_change(
         .await
         .or_fail("unexpected error");
 }
+
+async fn commit_archive_to_base(repo_root: &Path, archive_leaf: &str, change_id: &str) {
+    let archive_dir = repo_root
+        .join("openspec/changes/archive")
+        .join(archive_leaf);
+    std::fs::create_dir_all(&archive_dir).or_fail("unexpected error");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        format!("# Archived {change_id}\n"),
+    )
+    .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", &format!("Archive {change_id}")])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .or_fail("unexpected error");
+}
 #[tokio::test]
 async fn test_dependency_blocker_diagnostics_dedupe_and_reemit_on_signature_change() {
     let temp = TempDir::new().or_fail("unexpected error");
@@ -514,12 +538,7 @@ async fn test_dependency_on_terminal_error_is_blocked_until_retry_and_success() 
         .await;
     assert_eq!(retry_selected, vec!["alpha".to_string()]);
 
-    let archive_dir = temp
-        .path()
-        .join("openspec/changes/archive/2026-05-12-alpha");
-    std::fs::create_dir_all(&archive_dir).or_fail("unexpected error");
-    std::fs::write(archive_dir.join("proposal.md"), "# Alpha Archived\n")
-        .or_fail("unexpected error");
+    commit_archive_to_base(temp.path(), "2026-05-12-alpha", "alpha").await;
     shared
         .write()
         .await
@@ -537,8 +556,9 @@ async fn test_dependency_on_terminal_error_is_blocked_until_retry_and_success() 
 }
 
 #[tokio::test]
-async fn test_dependency_blocker_archived_unblocks_dispatch_after_terminal_marker_removed() {
+async fn test_dependency_blocker_archived_unblocks_dispatch_after_base_merge() {
     let temp = TempDir::new().or_fail("unexpected error");
+    init_git_repo(temp.path()).await;
     let rejected_dir = temp.path().join("openspec/changes/dep-a");
     std::fs::create_dir_all(&rejected_dir).or_fail("unexpected error");
     std::fs::write(rejected_dir.join("proposal.md"), "# Dep A\n").or_fail("unexpected error");
@@ -563,12 +583,7 @@ async fn test_dependency_blocker_archived_unblocks_dispatch_after_terminal_marke
     assert!(blocked.is_empty());
 
     std::fs::remove_file(rejected_dir.join("REJECTED.md")).or_fail("unexpected error");
-    let archive_dir = temp
-        .path()
-        .join("openspec/changes/archive/2026-05-09-dep-a");
-    std::fs::create_dir_all(&archive_dir).or_fail("unexpected error");
-    std::fs::write(archive_dir.join("proposal.md"), "# Dep A Archived\n")
-        .or_fail("unexpected error");
+    commit_archive_to_base(temp.path(), "2026-05-09-dep-a", "dep-a").await;
 
     let selected = executor
         .select_changes_for_dispatch(&analysis, 1, &in_flight)
@@ -2975,7 +2990,7 @@ async fn test_single_queued_active_not_queued_dependency_blocks_dispatch_selecti
 }
 
 #[tokio::test]
-async fn test_single_queued_archived_dependency_can_dispatch() {
+async fn test_single_queued_archived_dependency_waits_until_merged() {
     let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
     let archived_dir = repo_dir
@@ -2998,10 +3013,92 @@ async fn test_single_queued_archived_dependency_can_dispatch() {
         .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
         .await;
 
+    assert!(
+        selected.is_empty(),
+        "archived dependency must wait for base-branch merge evidence"
+    );
+    assert_eq!(
+        drain_dependency_events(&mut rx, "route"),
+        vec!["blocked:policy".to_string()],
+        "archived-but-not-merged dependency should emit one dependency-blocked event"
+    );
+}
+
+#[tokio::test]
+async fn test_single_queued_archived_dependency_can_dispatch_after_merge() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    commit_archive_to_base(repo_dir.path(), "2026-05-13-policy", "policy").await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
     assert_eq!(selected, vec!["route".to_string()]);
     assert!(
         drain_dependency_events(&mut rx, "route").is_empty(),
-        "archived dependency should be satisfied without dependency-blocked events"
+        "merged archived dependency should be satisfied without dependency-blocked events"
+    );
+}
+
+#[tokio::test]
+async fn dependency_resolving_dependents_wait_until_merged() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let archived_dir = repo_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-13-change-a");
+    std::fs::create_dir_all(&archived_dir).or_fail("unexpected error");
+    std::fs::write(archived_dir.join("proposal.md"), "# Change A\n").or_fail("unexpected error");
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["change-b".to_string(), "change-c".to_string()],
+        dependencies: HashMap::from([
+            ("change-b".to_string(), vec!["change-a".to_string()]),
+            ("change-c".to_string(), vec!["change-a".to_string()]),
+        ]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 2, &in_flight)
+        .await;
+
+    assert!(
+        selected.is_empty(),
+        "B/C dependents must not dispatch while A is archived locally but not merged to base"
+    );
+    let mut blocked_events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::DependencyBlocked {
+            change_id,
+            dependency_ids,
+        } = event
+        {
+            blocked_events.push(format!("{change_id}:{}", dependency_ids.join(",")));
+        }
+    }
+    blocked_events.sort();
+    assert_eq!(
+        blocked_events,
+        vec![
+            "change-b:change-a".to_string(),
+            "change-c:change-a".to_string(),
+        ]
     );
 }
 
@@ -3376,7 +3473,7 @@ fn drain_dependency_events(
 }
 
 #[tokio::test]
-async fn test_archived_dependency_is_satisfied_without_rejection() {
+async fn test_archived_dependency_is_blocked_without_rejection_until_merged() {
     let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
     let archived_dir = repo_dir
@@ -3402,7 +3499,9 @@ async fn test_archived_dependency_is_satisfied_without_rejection() {
         .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
         .await;
 
-    assert_eq!(selected, vec!["route".to_string()]);
+    assert!(selected.is_empty());
+    let dependency_events = drain_dependency_events(&mut rx, "route");
+    assert_eq!(dependency_events, vec!["blocked:contracts".to_string()]);
     while let Ok(event) = rx.try_recv() {
         assert!(
             !matches!(event, ExecutionEvent::ChangeRejected { .. }),
