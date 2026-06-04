@@ -609,3 +609,14 @@ WebUI terminal component の hook 依存関係整理は、terminal session の r
 **When**: tab が mount、resize、入力送信、unmount、または `sessionId` 変更される
 **Then**: WebSocket 接続、resize 送信、入力送信、cleanup は分割前と同等である
 **And**: REST/WebSocket payload とユーザー向け terminal message は変更されない
+
+### Requirement: TUI rendering の責務分割安全性
+
+TUI rendering の内部リファクタリングは、主要画面と popup の表示 contract を維持しながら、描画領域ごとに変更影響範囲を分離しなければならない。
+
+#### Scenario: TUI 表示 contract が維持される
+
+- **GIVEN** select mode、running mode、worktree view、warning popup、QR popup の代表的な `AppState` がある
+- **WHEN** `render(frame, app)` を実行する
+- **THEN** changes list、status、logs、footer、popup の代表テキストと選択状態はリファクタ前と同等である
+- **AND** public entry point と操作フローは変更されない
