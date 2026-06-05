@@ -26,7 +26,7 @@ Handles all keyboard input:
 - `handle_editor_launch()`: Launch editor with 'e' key
 - `handle_merge_key()`: Merge operations with 'M' key
 - `handle_esc_key()`: Graceful/force stop
-- `handle_f5_key()`: Start/resume/retry processing
+- `handle_start_key()`: Start/resume/retry processing via the resolved TUI start keybindings
 - `handle_enter_key()`: Execute worktree commands
 - `handle_plus_key()`: Create new worktrees with '+' key
 - `handle_key_event()`: Main key event dispatcher

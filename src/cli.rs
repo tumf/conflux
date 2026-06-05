@@ -371,7 +371,7 @@ KEY BINDINGS:
 
 TUI USER CONFIG:
   Set keybindings.start in ~/.config/cflx/tui.jsonc, for example:
-    { \"keybindings\": { \"start\": [\"F5\", \"r\"] } }
+    { \"keybindings\": { \"start\": [\"F5\", \"!\"] } }
   The help text documents defaults only and does not render dynamic user config values.
 
 WEB MONITORING:

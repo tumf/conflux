@@ -360,7 +360,7 @@ The selection mode footer SHALL display appropriate guidance messages based on a
 
 - **WHEN** TUI is in selection mode
 - **AND** one or more changes are selected
-- **THEN** the footer displays "Press F5 to start processing"
+- **THEN** the footer displays "Press F5/! to start processing" when no TUI config override exists
 
 ### Requirement: Running Footer Progress Bar Display
 

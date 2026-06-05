@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 const TUI_CONFIG_FILE: &str = "tui.jsonc";
 const GLOBAL_CONFIG_DIR: &str = "cflx";
-const DEFAULT_START_KEY: &str = "F5";
+const DEFAULT_START_KEYS: &[&str] = &["F5", "!"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiConfig {
@@ -47,8 +47,14 @@ impl TuiKeyBinding {
 impl TuiKeybindings {
     pub fn default_start() -> Self {
         Self {
-            start: vec![parse_key_binding(DEFAULT_START_KEY, "keybindings.start[0]")
-                .expect("built-in default start key must remain a valid TUI key binding")],
+            start: DEFAULT_START_KEYS
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    parse_key_binding(key, &format!("keybindings.start[{index}]"))
+                        .expect("built-in default start keys must remain valid TUI key bindings")
+                })
+                .collect(),
         }
     }
 
@@ -344,8 +350,9 @@ mod tests {
     #[test]
     fn default_config_uses_f5() {
         let config = TuiConfig::default();
-        assert_eq!(config.start_key_label(), "F5");
+        assert_eq!(config.start_key_label(), "F5/!");
         assert!(config.matches_start_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)));
+        assert!(config.matches_start_key(&KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)));
     }
 
     #[test]
@@ -353,14 +360,14 @@ mod tests {
         let config = parse_config(
             r#"{
               // user preference
-              "keybindings": { "start": ["F5", "r", "Space",], }
+              "keybindings": { "start": ["F5", "!", "Space",], }
             }"#,
         )
         .unwrap();
 
-        assert_eq!(config.start_key_label(), "F5/r/Space");
+        assert_eq!(config.start_key_label(), "F5/!/Space");
         assert!(config.matches_start_key(&KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)));
-        assert!(config.matches_start_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)));
+        assert!(config.matches_start_key(&KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE)));
         assert!(config.matches_start_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)));
     }
 
@@ -443,10 +450,10 @@ mod tests {
     fn load_from_file_does_not_require_orchestration_commands() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tui.jsonc");
-        std::fs::write(&path, r#"{"keybindings":{"start":["F5","r"]}}"#).unwrap();
+        std::fs::write(&path, r#"{"keybindings":{"start":["F5","!"]}}"#).unwrap();
 
         let config = TuiConfig::load_from_file(&path).unwrap();
 
-        assert_eq!(config.start_key_label(), "F5/r");
+        assert_eq!(config.start_key_label(), "F5/!");
     }
 }

@@ -82,7 +82,7 @@ TUI user preferences are intentionally separate from orchestration config. The d
 ```jsonc
 {
   "keybindings": {
-    "start": ["F5", "r"]
+    "start": ["F5", "!"]
   }
 }
 ```

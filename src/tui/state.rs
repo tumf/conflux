@@ -1576,16 +1576,16 @@ mod tests {
     #[test]
     fn tui_config_defaults_and_configured_labels_are_available_in_app_state() {
         let mut app = AppState::new(vec![]);
-        assert_eq!(app.start_key_label(), "F5");
+        assert_eq!(app.start_key_label(), "F5/!");
 
         let custom = TuiConfig::parse_jsonc(
-            r#"{"keybindings":{"start":["F5","r"]}}"#,
+            r#"{"keybindings":{"start":["F5","!"]}}"#,
             std::path::Path::new("/tmp/tui.jsonc"),
         )
         .unwrap();
         app.set_tui_config(custom);
 
-        assert_eq!(app.start_key_label(), "F5/r");
+        assert_eq!(app.start_key_label(), "F5/!");
     }
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {

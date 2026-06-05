@@ -989,34 +989,34 @@ Project `.cflx.jsonc` files SHALL NOT override TUI config values.
   ```jsonc
   {
     "keybindings": {
-      "start": ["F5", "r"]
+      "start": ["F5", "!"]
     }
   }
   ```
 - **WHEN** TUI config is loaded
 - **THEN** loading succeeds without requiring `apply_command`, `archive_command`, `analyze_command`, `acceptance_command`, or `resolve_command`
-- **AND** the resolved start keybindings are `F5` and `r`
+- **AND** the resolved start keybindings are `F5` and `!`
 
 #### Scenario: XDG environment path overrides default XDG path
 
-- **GIVEN** `~/.config/cflx/tui.jsonc` sets `keybindings.start` to `["F5", "r"]`
+- **GIVEN** `~/.config/cflx/tui.jsonc` sets `keybindings.start` to `["F5", "!"]`
 - **AND** `$XDG_CONFIG_HOME/cflx/tui.jsonc` sets `keybindings.start` to `["F6"]`
 - **WHEN** TUI config is loaded with `XDG_CONFIG_HOME` set
 - **THEN** the resolved start keybinding is `F6`
 
 #### Scenario: Project config does not override TUI keybindings
 
-- **GIVEN** `~/.config/cflx/tui.jsonc` sets `keybindings.start` to `["F5", "r"]`
+- **GIVEN** `~/.config/cflx/tui.jsonc` sets `keybindings.start` to `["F5", "!"]`
 - **AND** `.cflx.jsonc` contains a TUI-like keybinding field
 - **WHEN** `cflx tui` starts in that project
-- **THEN** the resolved start keybindings remain `F5` and `r`
+- **THEN** the resolved start keybindings remain `F5` and `!`
 - **AND** `.cflx.jsonc` does not affect TUI keybindings
 
 ### Requirement: TUI start keybinding validation
 
 The TUI config SHALL validate `keybindings.start` before entering the interactive TUI.
 
-When omitted, `keybindings.start` SHALL default to `["F5"]`.
+When omitted, `keybindings.start` SHALL default to `["F5", "!"]` without detecting whether the current terminal can send function keys.
 
 When present, `keybindings.start` SHALL contain at least one key and SHALL reject unknown or duplicate key entries with actionable errors.
 

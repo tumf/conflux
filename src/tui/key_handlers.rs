@@ -712,17 +712,17 @@ mod tests {
         app.changes[0].selected = true;
 
         assert!(app.tui_config.matches_start_key(&key(KeyCode::F(5))));
-        assert!(!app.tui_config.matches_start_key(&key(KeyCode::Char('r'))));
+        assert!(app.tui_config.matches_start_key(&key(KeyCode::Char('!'))));
 
         let custom = TuiConfig::parse_jsonc(
-            r#"{"keybindings":{"start":["F5","r"]}}"#,
+            r#"{"keybindings":{"start":["F5","!"]}}"#,
             std::path::Path::new("/tmp/tui.jsonc"),
         )
         .unwrap();
         app.set_tui_config(custom);
 
         assert!(app.tui_config.matches_start_key(&key(KeyCode::F(5))));
-        assert!(app.tui_config.matches_start_key(&key(KeyCode::Char('r'))));
+        assert!(app.tui_config.matches_start_key(&key(KeyCode::Char('!'))));
         assert!(!app.tui_config.matches_start_key(&key(KeyCode::Char('x'))));
     }
 
@@ -731,7 +731,7 @@ mod tests {
         let graceful_stop = inert_stop_flag();
         let handle = None;
         let custom = TuiConfig::parse_jsonc(
-            r#"{"keybindings":{"start":["F5","r"]}}"#,
+            r#"{"keybindings":{"start":["F5","!"]}}"#,
             std::path::Path::new("/tmp/tui.jsonc"),
         )
         .unwrap();
@@ -745,18 +745,21 @@ mod tests {
             None
         };
 
-        let mut r_app = AppState::new(vec![create_test_change("run-me")]);
-        r_app.set_tui_config(custom);
-        r_app.changes[0].selected = true;
-        let r_command = if r_app.tui_config.matches_start_key(&key(KeyCode::Char('r'))) {
-            handle_start_key_inner(&mut r_app, &graceful_stop, &handle)
+        let mut bang_app = AppState::new(vec![create_test_change("run-me")]);
+        bang_app.set_tui_config(custom);
+        bang_app.changes[0].selected = true;
+        let bang_command = if bang_app
+            .tui_config
+            .matches_start_key(&key(KeyCode::Char('!')))
+        {
+            handle_start_key_inner(&mut bang_app, &graceful_stop, &handle)
         } else {
             None
         };
 
-        assert_eq!(format!("{:?}", f5_command), format!("{:?}", r_command));
+        assert_eq!(format!("{:?}", f5_command), format!("{:?}", bang_command));
         assert!(matches!(
-            r_command,
+            bang_command,
             Some(TuiCommand::StartProcessing(ids)) if ids == vec!["run-me".to_string()]
         ));
     }
@@ -815,11 +818,11 @@ mod tests {
         ));
         assert!(stopped_app.warning_message.is_none());
 
-        let mut error_app = AppState::new(vec![create_test_change("error-a")]);
-        error_app.mode = AppMode::Error;
-        error_app.is_resolving = true;
-        error_app.changes[0].set_error_message_cache("boom".to_string());
-        error_app.changes[0].selected = true;
+        let mut errobang_app = AppState::new(vec![create_test_change("error-a")]);
+        errobang_app.mode = AppMode::Error;
+        errobang_app.is_resolving = true;
+        errobang_app.changes[0].set_error_message_cache("boom".to_string());
+        errobang_app.changes[0].selected = true;
         let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
             crate::orchestration::state::OrchestratorState::new(vec!["error-a".to_string()], 0),
         ));
@@ -829,13 +832,13 @@ mod tests {
                 error: "boom".to_string(),
             },
         );
-        error_app.set_shared_state(shared);
-        let command = handle_start_key_inner(&mut error_app, &graceful_stop, &handle);
+        errobang_app.set_shared_state(shared);
+        let command = handle_start_key_inner(&mut errobang_app, &graceful_stop, &handle);
         assert!(matches!(
             command,
             Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string()]
         ));
-        assert!(error_app.warning_message.is_none());
+        assert!(errobang_app.warning_message.is_none());
     }
 
     #[test]

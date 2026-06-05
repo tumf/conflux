@@ -12,7 +12,7 @@ resolve 実行中は `M: queue resolve` を表示し、resolve 未実行中は `
 
 `MergeWait` 以外の change が選択中の場合、TUI は `M` 操作ヒントを表示してはならない（SHALL NOT）。
 
-Configured start key hints SHALL describe app-level orchestration start/resume/retry only and MUST NOT imply cursor-local `MergeWait` resolve behavior. When no TUI config override exists, the configured start key label is `F5`.
+Configured start key hints SHALL describe app-level orchestration start/resume/retry only and MUST NOT imply cursor-local `MergeWait` resolve behavior. When no TUI config override exists, the configured start key label is `F5/!`.
 
 <!-- Expected canonical result after archive: `tui-key-hints` will describe start-control hints in terms of the resolved TUI start key label rather than hardcoded F5, while keeping M as the only cursor-local MergeWait resolve hint. -->
 
@@ -44,10 +44,10 @@ Configured start key hints SHALL describe app-level orchestration start/resume/r
 
 #### Scenario: Configured start key label is rendered
 
-- **GIVEN** the resolved TUI start keybindings are `F5` and `r`
+- **GIVEN** the resolved TUI start keybindings are `F5` and `!`
 - **AND** marked runnable work exists
 - **WHEN** the Changes panel key hints are rendered
-- **THEN** the start-control hint SHALL use the label `F5/r`
+- **THEN** the start-control hint SHALL use the label `F5/!`
 - **AND** the hint SHALL describe app-level run/resume/retry behavior
 
 ### Requirement: Context-Aware Key Hints in Running Mode
@@ -96,7 +96,7 @@ The TUI SHALL ignore `@` key presses and SHALL NOT change any selection or queue
 
 Status panel app-control hints SHALL use the resolved TUI start key label instead of hardcoded `F5` text.
 
-<!-- Expected canonical result after archive: `tui-key-hints` will require status panel titles to render resolved start key labels such as `F5` or `F5/r`. -->
+<!-- Expected canonical result after archive: `tui-key-hints` requires status panel titles to render resolved start key labels such as `F5/!` or a configured override. -->
 
 #### Scenario: `MergeWait` が存在しても自動再開のヒントは増やさない
 
@@ -107,17 +107,17 @@ Status panel app-control hints SHALL use the resolved TUI start key label instea
 
 #### Scenario: Stopped mode status title uses configured start label
 
-- **GIVEN** the resolved TUI start keybindings are `F5` and `r`
+- **GIVEN** the resolved TUI start keybindings are `F5` and `!`
 - **AND** the TUI is in stopped mode
 - **WHEN** the Status panel title is rendered
-- **THEN** the title SHALL include `F5/r: resume`
+- **THEN** the title SHALL include `F5/!: resume`
 
 #### Scenario: Stopping mode status title uses configured start label
 
-- **GIVEN** the resolved TUI start keybindings are `F5` and `r`
+- **GIVEN** the resolved TUI start keybindings are `F5` and `!`
 - **AND** the TUI is in stopping mode
 - **WHEN** the Status panel title is rendered
-- **THEN** the title SHALL include `F5/r: continue`
+- **THEN** the title SHALL include `F5/!: continue`
 
 ### Requirement: Approval State Transition in Stopped Mode
 

@@ -170,14 +170,15 @@ The configured start keybindings SHALL be treated as app-level orchestration con
 - **AND** the resolved TUI start keybindings include `r`
 - **WHEN** the user presses `r`
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `r`
+- **AND** `alpha` SHALL NOT transition to `resolve pending` because of the configured start key
 - **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
 
-#### Scenario: Default F5 remains an app-level start key
+#### Scenario: Default start keys remain app-level controls
 
 - **GIVEN** no TUI config override exists
+- **AND** the default resolved TUI start keybindings are `F5` and `!`
 - **AND** the TUI cursor is on change `alpha` in `MergeWait`
-- **WHEN** the user presses `F5`
+- **WHEN** the user presses `F5` or `!`
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
 - **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work
 
@@ -647,13 +648,14 @@ The configured start keybindings SHALL be treated as app-level orchestration con
 - **AND** the resolved TUI start keybindings include `r`
 - **WHEN** the user presses `r`
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
-- **AND** `alpha` SHALL NOT transition to `resolve pending` because of `r`
+- **AND** `alpha` SHALL NOT transition to `resolve pending` because of the configured start key
 - **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work such as `beta`
 
-#### Scenario: Default F5 remains an app-level start key
+#### Scenario: Default start keys remain app-level controls
 
 - **GIVEN** no TUI config override exists
+- **AND** the default resolved TUI start keybindings are `F5` and `!`
 - **AND** the TUI cursor is on change `alpha` in `MergeWait`
-- **WHEN** the user presses `F5`
+- **WHEN** the user presses `F5` or `!`
 - **THEN** the TUI SHALL NOT emit `ResolveMerge(alpha)`
 - **AND** normal orchestration start/resume/retry MAY proceed for marked runnable work

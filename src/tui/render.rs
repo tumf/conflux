@@ -2376,12 +2376,12 @@ mod tests {
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("F5: run"));
+        assert!(content.contains("F5/!: run"));
 
         let mut configured_app = create_test_app(vec![create_test_change("change-a")]);
         configured_app.set_tui_config(
             TuiConfig::parse_jsonc(
-                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                r#"{"keybindings":{"start":["F5","!"]}}"#,
                 std::path::Path::new("/tmp/tui.jsonc"),
             )
             .unwrap(),
@@ -2393,7 +2393,7 @@ mod tests {
 
         let buffer = render_buffer(&mut configured_app, 100, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("F5/r: run"));
+        assert!(content.contains("F5/!: run"));
     }
 
     // === Tests for update-tui-error-mode-continuation ===
@@ -2664,18 +2664,18 @@ mod tests {
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
         assert!(content.contains("Conflux"));
-        assert!(content.contains("Press F5 to start processing"));
+        assert!(content.contains("Press F5/! to start processing"));
 
         app.set_tui_config(
             TuiConfig::parse_jsonc(
-                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                r#"{"keybindings":{"start":["F5","!"]}}"#,
                 std::path::Path::new("/tmp/tui.jsonc"),
             )
             .unwrap(),
         );
         let buffer = render_buffer(&mut app, 80, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("Press F5/r to start processing"));
+        assert!(content.contains("Press F5/! to start processing"));
     }
 
     #[test]
@@ -2683,7 +2683,7 @@ mod tests {
         let mut stopped_app = create_test_app(vec![create_test_change("change-a")]);
         stopped_app.set_tui_config(
             TuiConfig::parse_jsonc(
-                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                r#"{"keybindings":{"start":["F5","!"]}}"#,
                 std::path::Path::new("/tmp/tui.jsonc"),
             )
             .unwrap(),
@@ -2692,12 +2692,12 @@ mod tests {
         stopped_app.logs.push(LogEntry::info("show status"));
         let buffer = render_buffer(&mut stopped_app, 100, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("F5/r: resume"));
+        assert!(content.contains("F5/!: resume"));
 
         let mut stopping_app = create_test_app(vec![create_test_change("change-a")]);
         stopping_app.set_tui_config(
             TuiConfig::parse_jsonc(
-                r#"{"keybindings":{"start":["F5","r"]}}"#,
+                r#"{"keybindings":{"start":["F5","!"]}}"#,
                 std::path::Path::new("/tmp/tui.jsonc"),
             )
             .unwrap(),
@@ -2706,7 +2706,7 @@ mod tests {
         stopping_app.logs.push(LogEntry::info("show status"));
         let buffer = render_buffer(&mut stopping_app, 100, 24);
         let content = buffer_to_string(&buffer);
-        assert!(content.contains("F5/r: continue"));
+        assert!(content.contains("F5/!: continue"));
     }
 
     #[test]
