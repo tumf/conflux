@@ -4,11 +4,13 @@
 
 The orchestrator SHALL accept optional top-level configuration fields named `apply_append_prompt`, `acceptance_append_prompt`, `archive_append_prompt`, `analyze_append_prompt`, and `resolve_append_prompt`.
 
-When one of these fields is unset or set to an empty string, the corresponding operation prompt SHALL remain unchanged from the existing generated prompt.
+When one of these fields is unset, set to an empty string, or set to a whitespace-only string, the corresponding operation prompt SHALL remain unchanged from the existing generated prompt.
 
-When one of these fields is set to a non-empty string, the orchestrator SHALL append that string to the end of the generated prompt for the matching operation before expanding `{prompt}` in the configured command template.
+When one of these fields is set to a non-blank string, the orchestrator SHALL append that raw string to the end of the final generated prompt for the matching operation before expanding `{prompt}` in the configured command template.
 
-The append prompt fields SHALL be additive only: they SHALL NOT replace, suppress, or reorder the built-in Conflux operation prompt contract.
+The append prompt fields SHALL be additive only: they SHALL NOT replace, suppress, or reorder the built-in Conflux operation prompt contract, operation history, retry context, diff context, or other generated operation context.
+
+Append prompt values SHALL be treated as raw guidance text. The orchestrator SHALL NOT expand `{change_id}`, `{prompt}`, or any other placeholder inside append prompt values.
 
 #### Scenario: acceptance append prompt is configured
 
@@ -38,6 +40,41 @@ The append prompt fields SHALL be additive only: they SHALL NOT replace, suppres
 - **WHEN** the apply command is prepared for execution
 - **THEN** the expanded prompt does not include an extra blank guidance section
 - **AND** the apply prompt is otherwise unchanged
+
+#### Scenario: whitespace-only append prompt is ignored
+
+- **GIVEN** `.cflx.jsonc` contains `"apply_append_prompt": "   \n\t  "`
+- **WHEN** the apply command is prepared for execution
+- **THEN** the expanded prompt does not include an extra blank guidance section
+- **AND** the apply prompt is otherwise unchanged
+
+#### Scenario: append prompt placeholders remain raw
+
+- **GIVEN** `.cflx.jsonc` contains `"acceptance_append_prompt": "Review {change_id} with optional local tools."`
+- **WHEN** the acceptance command is prepared for change `add-feature`
+- **THEN** the appended prompt text contains the literal string `{change_id}`
+- **AND** it does not contain `add-feature` as a result of append prompt placeholder expansion
+
+### Requirement: Append prompts must not change workflow control semantics
+
+Append prompt configuration SHALL affect only the prompt text substituted into operation command templates through `{prompt}`.
+
+Append prompt configuration SHALL NOT change command template parsing, verdict marker parsing, lifecycle state transitions, optional tool detection, hook execution, or command availability checks.
+
+#### Scenario: optional review guidance does not become an acceptance gate
+
+- **GIVEN** `.cflx.jsonc` contains `"acceptance_append_prompt": "If ocr review is locally available, use it as advisory evidence only."`
+- **WHEN** the acceptance command is executed
+- **THEN** Conflux does not itself execute `ocr review`
+- **AND** acceptance verdict parsing still depends on the acceptance command output markers
+- **AND** the configured guidance text alone cannot force PASS, CONTINUE, FAIL, gated, or blocked outcomes
+
+#### Scenario: append prompt does not affect hooks
+
+- **GIVEN** `.cflx.jsonc` contains `"apply_append_prompt": "Additional guidance"`
+- **AND** a hook command is configured
+- **WHEN** the hook command is executed
+- **THEN** the hook command string is not modified by `apply_append_prompt`
 
 ### Requirement: Init templates document optional append prompts
 
