@@ -131,14 +131,17 @@ pub async fn resolve_conflicts_with_retry(
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
-    let initial_resolve_prompt = build_conflict_resolve_prompt(
-        config.get_resolve_skill(),
-        vcs_prompt_prefix,
-        &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        vcs_error,
-        &vcs_status,
-        &vcs_log,
-        &conflict_files_str,
+    let initial_resolve_prompt = crate::agent::append_optional_prompt(
+        build_conflict_resolve_prompt(
+            config.get_resolve_skill(),
+            vcs_prompt_prefix,
+            &revisions.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vcs_error,
+            &vcs_status,
+            &vcs_log,
+            &conflict_files_str,
+        ),
+        config.get_resolve_append_prompt(),
     );
     let template = config.get_resolve_command()?;
     let initial_command =
@@ -182,6 +185,11 @@ pub async fn resolve_conflicts_with_retry(
         if !continuation_context.is_empty() {
             resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
         }
+
+        resolve_prompt = crate::agent::append_optional_prompt(
+            resolve_prompt,
+            config.get_resolve_append_prompt(),
+        );
 
         // Use AiCommandRunner for streaming resolve command execution
         let template = config.get_resolve_command()?;
@@ -501,16 +509,19 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
-    let initial_resolve_prompt = build_sequential_merge_resolve_prompt(
-        config.get_resolve_skill(),
-        vcs_prompt_prefix,
-        target_branch,
-        base_revision,
-        &merge_plan,
-        &worktree_locations,
-        &vcs_status,
-        &vcs_log,
-        &conflict_files_str,
+    let initial_resolve_prompt = crate::agent::append_optional_prompt(
+        build_sequential_merge_resolve_prompt(
+            config.get_resolve_skill(),
+            vcs_prompt_prefix,
+            target_branch,
+            base_revision,
+            &merge_plan,
+            &worktree_locations,
+            &vcs_status,
+            &vcs_log,
+            &conflict_files_str,
+        ),
+        config.get_resolve_append_prompt(),
     );
     let template = config.get_resolve_command()?;
     let initial_command =
@@ -557,6 +568,11 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         if !continuation_context.is_empty() {
             resolve_prompt = format!("{}\n\n{}", resolve_prompt, continuation_context);
         }
+
+        resolve_prompt = crate::agent::append_optional_prompt(
+            resolve_prompt,
+            config.get_resolve_append_prompt(),
+        );
 
         // Use AiCommandRunner for streaming resolve command execution
         let template = config.get_resolve_command()?;
@@ -1143,6 +1159,28 @@ mod tests {
             !prompt.contains("--no-verify"),
             "Safety rules must not be in Rust prompt"
         );
+    }
+
+    #[test]
+    fn resolve_append_prompt_is_applied_to_conflict_resolve_command_tail() {
+        let prompt = crate::agent::append_optional_prompt(
+            build_conflict_resolve_prompt(
+                crate::config::defaults::DEFAULT_RESOLVE_SKILL,
+                "Git conflict resolution:",
+                &["branch-a", "branch-b"],
+                "merge failed",
+                "UU file.rs",
+                "commit log here",
+                "file.rs",
+            ),
+            Some("resolve tail {change_id}"),
+        );
+        let command =
+            crate::config::OrchestratorConfig::expand_prompt("agent --prompt '{prompt}'", &prompt);
+
+        assert_eq!(command.matches("resolve tail {change_id}").count(), 1);
+        assert!(command.ends_with("resolve tail {change_id}'"));
+        assert!(!command.contains("branch-a resolve tail"));
     }
 
     #[test]

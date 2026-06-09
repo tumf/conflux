@@ -668,6 +668,51 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_jsonc_with_append_prompts() {
+        let jsonc = r#"{
+            "apply_append_prompt": "apply tail",
+            "acceptance_append_prompt": "acceptance tail",
+            "archive_append_prompt": "archive tail",
+            "analyze_append_prompt": "analyze tail",
+            "resolve_append_prompt": "resolve tail"
+        }"#;
+        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
+        assert_eq!(config.get_apply_append_prompt(), Some("apply tail"));
+        assert_eq!(
+            config.get_acceptance_append_prompt(),
+            Some("acceptance tail")
+        );
+        assert_eq!(config.get_archive_append_prompt(), Some("archive tail"));
+        assert_eq!(config.get_analyze_append_prompt(), Some("analyze tail"));
+        assert_eq!(config.get_resolve_append_prompt(), Some("resolve tail"));
+    }
+
+    #[test]
+    fn test_merge_append_prompt_precedence() {
+        let mut base = OrchestratorConfig {
+            apply_append_prompt: Some("base apply".to_string()),
+            acceptance_append_prompt: Some("base acceptance".to_string()),
+            archive_append_prompt: Some("base archive".to_string()),
+            analyze_append_prompt: Some("base analyze".to_string()),
+            resolve_append_prompt: Some("base resolve".to_string()),
+            ..Default::default()
+        };
+        base.merge(OrchestratorConfig {
+            apply_append_prompt: Some("override apply".to_string()),
+            acceptance_append_prompt: None,
+            archive_append_prompt: Some("override archive".to_string()),
+            analyze_append_prompt: Some("override analyze".to_string()),
+            resolve_append_prompt: Some("override resolve".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(base.get_apply_append_prompt(), Some("override apply"));
+        assert_eq!(base.get_acceptance_append_prompt(), Some("base acceptance"));
+        assert_eq!(base.get_archive_append_prompt(), Some("override archive"));
+        assert_eq!(base.get_analyze_append_prompt(), Some("override analyze"));
+        assert_eq!(base.get_resolve_append_prompt(), Some("override resolve"));
+    }
+
+    #[test]
     fn test_expand_prompt_in_apply_command() {
         let template = "claude -p '/openspec:apply {change_id} {prompt}'";
         let command = OrchestratorConfig::expand_change_id(template, "fix-bug");

@@ -219,10 +219,18 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub apply_prompt: Option<String>,
 
+    /// Optional raw guidance appended after the final generated apply prompt.
+    #[serde(default)]
+    pub apply_append_prompt: Option<String>,
+
     /// System prompt for acceptance command.
     /// Injected into the `{prompt}` placeholder in acceptance_command.
     #[serde(default)]
     pub acceptance_prompt: Option<String>,
+
+    /// Optional raw guidance appended after the final generated acceptance prompt.
+    #[serde(default)]
+    pub acceptance_append_prompt: Option<String>,
 
     /// Controls how the acceptance `{prompt}` is constructed.
     /// - full: DEPRECATED - now behaves identically to context_only (no embedded system prompt)
@@ -237,6 +245,18 @@ pub struct OrchestratorConfig {
     /// Injected into the `{prompt}` placeholder in archive_command.
     #[serde(default)]
     pub archive_prompt: Option<String>,
+
+    /// Optional raw guidance appended after the final generated archive prompt.
+    #[serde(default)]
+    pub archive_append_prompt: Option<String>,
+
+    /// Optional raw guidance appended after the final generated analyze prompt.
+    #[serde(default)]
+    pub analyze_append_prompt: Option<String>,
+
+    /// Optional raw guidance appended after the final generated resolve prompt.
+    #[serde(default)]
+    pub resolve_append_prompt: Option<String>,
 
     /// Hook configurations for various orchestration stages.
     /// All hooks are optional.
@@ -689,9 +709,14 @@ impl OrchestratorConfig {
             analyze_command,
             acceptance_command,
             apply_prompt,
+            apply_append_prompt,
             acceptance_prompt,
+            acceptance_append_prompt,
             acceptance_prompt_mode,
             archive_prompt,
+            archive_append_prompt,
+            analyze_append_prompt,
+            resolve_append_prompt,
             hooks,
             logging,
             stall_detection,
@@ -743,8 +768,13 @@ impl OrchestratorConfig {
         overwrite_if_some(&mut self.resolve_command, resolve_command);
 
         overwrite_if_some(&mut self.apply_prompt, apply_prompt);
+        overwrite_if_some(&mut self.apply_append_prompt, apply_append_prompt);
         overwrite_if_some(&mut self.acceptance_prompt, acceptance_prompt);
+        overwrite_if_some(&mut self.acceptance_append_prompt, acceptance_append_prompt);
         overwrite_if_some(&mut self.archive_prompt, archive_prompt);
+        overwrite_if_some(&mut self.archive_append_prompt, archive_append_prompt);
+        overwrite_if_some(&mut self.analyze_append_prompt, analyze_append_prompt);
+        overwrite_if_some(&mut self.resolve_append_prompt, resolve_append_prompt);
         overwrite_if_some(&mut self.acceptance_prompt_mode, acceptance_prompt_mode);
 
         merge_hooks_config(&mut self.hooks, hooks);
@@ -903,6 +933,26 @@ impl OrchestratorConfig {
         self.archive_prompt
             .as_deref()
             .unwrap_or(DEFAULT_ARCHIVE_PROMPT)
+    }
+
+    pub fn get_apply_append_prompt(&self) -> Option<&str> {
+        self.apply_append_prompt.as_deref()
+    }
+
+    pub fn get_acceptance_append_prompt(&self) -> Option<&str> {
+        self.acceptance_append_prompt.as_deref()
+    }
+
+    pub fn get_archive_append_prompt(&self) -> Option<&str> {
+        self.archive_append_prompt.as_deref()
+    }
+
+    pub fn get_analyze_append_prompt(&self) -> Option<&str> {
+        self.analyze_append_prompt.as_deref()
+    }
+
+    pub fn get_resolve_append_prompt(&self) -> Option<&str> {
+        self.resolve_append_prompt.as_deref()
     }
 
     /// Get the acceptance command (required, returns error if not set)

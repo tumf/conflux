@@ -48,6 +48,13 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Note: A hardcoded acceptance prompt is always prepended before this value
   //"acceptance_prompt": "",
 
+  // Optional raw append prompts. These are added after the final generated prompt and are inactive by default.
+  //"apply_append_prompt": "",
+  //"acceptance_append_prompt": "",
+  //"archive_append_prompt": "",
+  //"analyze_append_prompt": "",
+  //"resolve_append_prompt": "",
+
    // Worktree command for TUI (+ key)
   // Supports {workspace_dir} and {repo_root} placeholders
   "worktree_command": "tmux new-window -n wt ",
@@ -137,6 +144,13 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Note: A hardcoded acceptance prompt is always prepended before this value
   //"acceptance_prompt": "",
 
+  // Optional raw append prompts. These are added after the final generated prompt and are inactive by default.
+  //"apply_append_prompt": "",
+  //"acceptance_append_prompt": "",
+  //"archive_append_prompt": "",
+  //"analyze_append_prompt": "",
+  //"resolve_append_prompt": "",
+
   // Worktree command for TUI (+ key)
   // Supports {workspace_dir} and {repo_root} placeholders
   "worktree_command": "tmux new-window -n wt ",
@@ -225,6 +239,13 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // System prompt for acceptance command (injected into {prompt} placeholder)
   // Note: A hardcoded acceptance prompt is always prepended before this value
   //"acceptance_prompt": "",
+
+  // Optional raw append prompts. These are added after the final generated prompt and are inactive by default.
+  //"apply_append_prompt": "",
+  //"acceptance_append_prompt": "",
+  //"archive_append_prompt": "",
+  //"analyze_append_prompt": "",
+  //"resolve_append_prompt": "",
 
   // Worktree command for TUI (+ key)
   // Supports {workspace_dir} and {repo_root} placeholders
@@ -327,6 +348,29 @@ mod tests {
             assert!(template.contains("\"archive_skill\": \"cflx-archive\""));
             assert!(template.contains("\"resolve_skill\": \"cflx-resolve\""));
             assert!(template.contains("\"accept_skill\": \"cflx-accept-with-speca\""));
+        }
+    }
+
+    #[test]
+    fn test_templates_document_inactive_append_prompt_examples() {
+        for template in [CLAUDE_TEMPLATE, OPENCODE_TEMPLATE, CODEX_TEMPLATE] {
+            for field in [
+                "apply_append_prompt",
+                "acceptance_append_prompt",
+                "archive_append_prompt",
+                "analyze_append_prompt",
+                "resolve_append_prompt",
+            ] {
+                assert!(template.contains(&format!("//\"{}\": \"\"", field)));
+                assert!(!template.contains(&format!("\n  \"{}\"", field)));
+            }
+
+            let config = OrchestratorConfig::parse_jsonc(template).unwrap();
+            assert_eq!(config.get_apply_append_prompt(), None);
+            assert_eq!(config.get_acceptance_append_prompt(), None);
+            assert_eq!(config.get_archive_append_prompt(), None);
+            assert_eq!(config.get_analyze_append_prompt(), None);
+            assert_eq!(config.get_resolve_append_prompt(), None);
         }
     }
 
