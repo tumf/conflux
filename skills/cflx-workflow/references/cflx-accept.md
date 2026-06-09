@@ -165,11 +165,11 @@ Forbidden wrappings (will cause parser failures or unintended fallback):
 Correct output: "ACCEPTANCE: PASS" alone on its own line, followed by a newline.
 
 CRITICAL - When outputting FAIL:
-1. List ALL issues discovered in the FINDINGS section
-2. After listing all findings, update openspec/changes/<change_id>/tasks.md:
-    - Determine the next acceptance attempt number (check existing "## Acceptance #N Failure Follow-up" sections)
-    - Append or create the section for that attempt
-    - Add each finding as a separate unchecked task: "- [ ] <finding>"
+1. List ALL issues discovered in the FINDINGS section with concrete repository evidence.
+2. Do NOT update `openspec/changes/<change_id>/tasks.md` during acceptance.
+3. Do NOT append `## Acceptance #N Failure Follow-up` sections.
+4. Do NOT turn findings into unchecked checkbox tasks. Acceptance findings are review feedback for the next apply pass; apply should fix the underlying repository issue directly and only update existing implementation tasks when their evidence changes.
+5. If the finding concerns final OpenSpec validation or archive-gate readiness, state that final validation belongs in a non-checkbox `## Final Validation` or notes section.
 
 Examples of mandatory FAIL cases:
 - `tasks.md` says loop worker/CLI/runtime flow is complete, but no worker/CLI/runtime files exist outside `openspec/`

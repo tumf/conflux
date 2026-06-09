@@ -215,6 +215,8 @@ Never treat official SPECA runner output as durable workflow-control state. Neve
 - Read changed implementation paths and test evidence from the workspace.
 - Read `openspec/CONSTITUTION.md` when present.
 - Apply the standard `cflx-accept` acceptance checks as authoritative.
+- Treat acceptance as read-only review: do not edit `tasks.md`, do not append `Acceptance #N Failure Follow-up` sections, and do not convert findings into checkbox tasks.
+- Final OpenSpec validation, archive-gate validation, and archive readiness are not implementation tasks; if they need documentation, require a non-checkbox `## Final Validation` or notes section.
 
 ### 2. Derive checkable properties
 

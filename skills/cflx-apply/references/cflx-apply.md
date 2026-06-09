@@ -19,6 +19,8 @@ $ARGUMENTS
 - Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
 - Keep changes tightly scoped to the requested outcome.
 - Do not run any archive command during apply. Archiving is handled by the orchestrator.
+- Do not append `## Acceptance #N Failure Follow-up` checkbox sections. Acceptance findings are review feedback; fix the underlying repository issue directly and update existing implementation tasks only when their evidence changes.
+- Do not create checkbox tasks for final OpenSpec validation, archive-gate validation, archive readiness, or cleanup whose only purpose is moving validation text. Keep that information in non-checkbox `## Final Validation` or notes sections.
 
 **Steps**
 Track these steps as TODOs and complete them one by one.
@@ -245,13 +247,15 @@ CRITICAL: Checkbox removal when moving tasks to excluded sections:
   * CORRECT: `## Future Work` followed by `- Add feature X` (no checkbox)
 
 Tasks format requirements:
-- All tasks MUST have checkboxes: `- [ ]` or `- [x]`
-- Invalid formats that need fixing:
-  * `## N. Task` → Convert to `- [ ] N. Task`
-  * `- Task` → Convert to `- [ ] Task`
-  * `1. Task` → Convert to `1. [ ] Task`
-- If you encounter 0/0 tasks detected, check and fix tasks.md format first
-- Fix any malformed tasks before proceeding with implementation
+- Active implementation/test/documentation/configuration tasks MUST have checkboxes: `- [ ]` or `- [x]`
+- Non-task sections MUST NOT have checkboxes, including `Future Work`, `Out of Scope`, `Notes`, `Final Validation`, `Acceptance Notes`, and acceptance-review history.
+- Do not convert final validation notes, archive-gate notes, or acceptance findings into checkbox tasks.
+- Invalid active-task formats that need fixing:
+  * `## N. Task` → Convert to `- [ ] N. Task` only when it is real implementation/test/doc/config work
+  * `- Task` → Convert to `- [ ] Task` only when it is real implementation/test/doc/config work
+  * `1. Task` → Convert to `1. [ ] Task` only when it is real implementation/test/doc/config work
+- If you encounter 0/0 tasks detected, check and fix tasks.md format first without adding meta-validation checkboxes.
+- Fix malformed active tasks before proceeding with implementation
 
 MANDATORY: Keep tasks.md updated throughout the apply process
 - IMMEDIATELY update tasks.md after completing each task (mark `- [ ]` as `- [x]`)

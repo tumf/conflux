@@ -94,6 +94,8 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Each finding must be actionable by AI agent
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL
+- Acceptance is read-only review. Do not edit `tasks.md`, do not append `Acceptance #N Failure Follow-up` sections, and do not convert findings into checkbox tasks.
+- Final OpenSpec validation, archive-gate validation, and archive readiness are not implementation tasks; if they need to be documented, require a non-checkbox `## Final Validation` or notes section.
 - A valid `Implementation Blocker #<n>` with concrete evidence and unblock actions creates a stalled acceptance hold for operators and lifecycle/status displays.
 - Recoverable infrastructure blockers are non-terminal stalled holds, not rejection evidence. Examples include Docker daemon/image pull failures, DNS/network timeouts, package registry outages, missing non-mockable credentials, port conflicts, and pending managed verification jobs.
 - For the current runtime compatibility period, emit `{"acceptance":"gated"}` and the legacy fallback marker `ACCEPTANCE: GATED` only as protocol handoff tokens for that stalled hold.
