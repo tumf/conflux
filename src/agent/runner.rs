@@ -1698,36 +1698,6 @@ fn build_command(command: &str) -> Command {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn analyze_append_prompt_is_appended_once_during_command_expansion() {
-        let command = expand_analyze_command_with_append(
-            "agent --prompt '{prompt}'",
-            "generated analyze prompt",
-            Some("analyze tail {change_id}"),
-        );
-
-        assert_eq!(command.matches("generated analyze prompt").count(), 1);
-        assert_eq!(command.matches("analyze tail {change_id}").count(), 1);
-        assert!(!command.contains("add-optional-append-prompt"));
-        assert!(command.ends_with("analyze tail {change_id}'"));
-    }
-
-    #[test]
-    fn analyze_append_prompt_whitespace_is_noop_during_command_expansion() {
-        let command = expand_analyze_command_with_append(
-            "agent --prompt '{prompt}'",
-            "generated analyze prompt",
-            Some("  \n\t  "),
-        );
-
-        assert_eq!(command, "agent --prompt 'generated analyze prompt'");
-    }
-}
-
 /// Build a command for execution in a specific directory
 fn build_command_in_dir(command: &str, cwd: &Path) -> Command {
     if cfg!(target_os = "windows") {
@@ -1819,4 +1789,34 @@ fn create_dummy_child() -> Result<tokio::process::Child> {
             .map_err(OrchestratorError::Io)?
     };
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_append_prompt_is_appended_once_during_command_expansion() {
+        let command = expand_analyze_command_with_append(
+            "agent --prompt '{prompt}'",
+            "generated analyze prompt",
+            Some("analyze tail {change_id}"),
+        );
+
+        assert_eq!(command.matches("generated analyze prompt").count(), 1);
+        assert_eq!(command.matches("analyze tail {change_id}").count(), 1);
+        assert!(!command.contains("add-optional-append-prompt"));
+        assert!(command.ends_with("analyze tail {change_id}'"));
+    }
+
+    #[test]
+    fn analyze_append_prompt_whitespace_is_noop_during_command_expansion() {
+        let command = expand_analyze_command_with_append(
+            "agent --prompt '{prompt}'",
+            "generated analyze prompt",
+            Some("  \n\t  "),
+        );
+
+        assert_eq!(command, "agent --prompt 'generated analyze prompt'");
+    }
 }
