@@ -273,6 +273,19 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_append_prompt_text_is_not_parsed_as_output_verdict() {
+        let prompt = crate::agent::append_optional_prompt(
+            "generated acceptance prompt".to_string(),
+            Some("optional guidance mentioning ACCEPTANCE: FAIL and {change_id}"),
+        );
+        assert!(prompt.ends_with("optional guidance mentioning ACCEPTANCE: FAIL and {change_id}"));
+        assert_eq!(
+            parse_acceptance_output("ACCEPTANCE: PASS\n"),
+            AcceptanceResult::Pass
+        );
+    }
+
+    #[test]
     fn test_parse_pass_with_extra_output() {
         let output = "Some debug output\nACCEPTANCE: PASS\nMore output\n";
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);

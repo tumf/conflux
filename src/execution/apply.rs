@@ -442,12 +442,15 @@ pub fn build_apply_prompt(
     acceptance_tail: &str,
 ) -> String {
     let user_prompt = config.get_apply_prompt();
-    crate::agent::build_apply_prompt_with_skill(
-        config.get_apply_skill(),
-        change_id,
-        user_prompt,
-        history,
-        acceptance_tail,
+    crate::agent::append_optional_prompt(
+        crate::agent::build_apply_prompt_with_skill(
+            config.get_apply_skill(),
+            change_id,
+            user_prompt,
+            history,
+            acceptance_tail,
+        ),
+        config.get_apply_append_prompt(),
     )
 }
 
@@ -1417,6 +1420,23 @@ mod tests {
     use tempfile::TempDir;
 
     // === ApplyConfig tests ===
+
+    #[test]
+    fn apply_append_prompt_is_added_after_generated_prompt() {
+        let config = OrchestratorConfig {
+            apply_append_prompt: Some("apply tail {change_id}".to_string()),
+            archive_append_prompt: Some("wrong archive tail".to_string()),
+            acceptance_append_prompt: Some("wrong acceptance tail".to_string()),
+            ..Default::default()
+        };
+
+        let prompt = build_apply_prompt(&config, "change-a", "history ctx", "acceptance ctx");
+
+        assert!(prompt.contains("Apply change id: change-a"));
+        assert!(prompt.ends_with("apply tail {change_id}"));
+        assert!(!prompt.contains("wrong archive tail"));
+        assert!(!prompt.contains("wrong acceptance tail"));
+    }
 
     #[test]
     fn test_apply_config_default() {

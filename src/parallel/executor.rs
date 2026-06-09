@@ -696,11 +696,14 @@ pub async fn execute_archive_in_workspace(
         let history = archive_history.lock().await;
         history.format_context(change_id)
     };
-    let full_prompt = crate::agent::build_archive_prompt_with_skill(
-        config.get_archive_skill(),
-        change_id,
-        user_prompt,
-        &history_context,
+    let full_prompt = crate::agent::append_optional_prompt(
+        crate::agent::build_archive_prompt_with_skill(
+            config.get_archive_skill(),
+            change_id,
+            user_prompt,
+            &history_context,
+        ),
+        config.get_archive_append_prompt(),
     );
 
     // Expand change_id and prompt in archive command
@@ -1315,28 +1318,31 @@ pub async fn execute_acceptance_in_workspace(
     );
 
     // Build prompt injected into `{prompt}`
-    let full_prompt = match config.get_acceptance_prompt_mode() {
-        crate::config::AcceptancePromptMode::Full => {
-            crate::agent::build_acceptance_prompt_with_skill(
-                config.get_accept_skill(),
-                change_id,
-                user_prompt,
-                &history_context,
-                &last_output_context,
-                &diff_context,
-            )
-        }
-        crate::config::AcceptancePromptMode::ContextOnly => {
-            crate::agent::build_acceptance_prompt_context_only_with_skill(
-                config.get_accept_skill(),
-                change_id,
-                user_prompt,
-                &history_context,
-                &last_output_context,
-                &diff_context,
-            )
-        }
-    };
+    let full_prompt = crate::agent::append_optional_prompt(
+        match config.get_acceptance_prompt_mode() {
+            crate::config::AcceptancePromptMode::Full => {
+                crate::agent::build_acceptance_prompt_with_skill(
+                    config.get_accept_skill(),
+                    change_id,
+                    user_prompt,
+                    &history_context,
+                    &last_output_context,
+                    &diff_context,
+                )
+            }
+            crate::config::AcceptancePromptMode::ContextOnly => {
+                crate::agent::build_acceptance_prompt_context_only_with_skill(
+                    config.get_accept_skill(),
+                    change_id,
+                    user_prompt,
+                    &history_context,
+                    &last_output_context,
+                    &diff_context,
+                )
+            }
+        },
+        config.get_acceptance_append_prompt(),
+    );
 
     // Expand change_id and prompt in command
     let template = config.get_acceptance_command()?;

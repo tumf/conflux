@@ -86,7 +86,10 @@ async fn analyze_with_llm(
     agent: &AgentRunner,
     ai_runner: Option<&crate::ai_command_runner::AiCommandRunner>,
 ) -> Result<Change> {
-    let prompt = build_analysis_prompt_with_skill(agent.config().get_analyze_skill(), changes);
+    let prompt = crate::agent::append_optional_prompt(
+        build_analysis_prompt_with_skill(agent.config().get_analyze_skill(), changes),
+        agent.config().get_analyze_append_prompt(),
+    );
     let response = if let Some(ai_runner) = ai_runner {
         agent
             .analyze_dependencies_with_runner(&prompt, ai_runner)

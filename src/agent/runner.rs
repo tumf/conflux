@@ -1098,7 +1098,11 @@ impl AgentRunner {
     /// Analyze dependencies using the configured analyze command (blocking)
     pub async fn analyze_dependencies(&self, prompt: &str) -> Result<String> {
         let template = self.config.get_analyze_command()?;
-        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        let prompt = crate::agent::append_optional_prompt(
+            prompt.to_string(),
+            self.config.get_analyze_append_prompt(),
+        );
+        let command = OrchestratorConfig::expand_prompt(template, &prompt);
         info!(
             module = module_path!(),
             "Running analyze command: {}", template
@@ -1137,7 +1141,11 @@ impl AgentRunner {
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<String> {
         let template = self.config.get_analyze_command()?;
-        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        let prompt = crate::agent::append_optional_prompt(
+            prompt.to_string(),
+            self.config.get_analyze_append_prompt(),
+        );
+        let command = OrchestratorConfig::expand_prompt(template, &prompt);
         info!(
             module = module_path!(),
             "Running analyze command via AiCommandRunner: {}", template
@@ -1193,7 +1201,11 @@ impl AgentRunner {
         prompt: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_analyze_command()?;
-        let command = OrchestratorConfig::expand_prompt(template, prompt);
+        let prompt = crate::agent::append_optional_prompt(
+            prompt.to_string(),
+            self.config.get_analyze_append_prompt(),
+        );
+        let command = OrchestratorConfig::expand_prompt(template, &prompt);
         info!(
             module = module_path!(),
             "Running analyze command (streaming): {}", template

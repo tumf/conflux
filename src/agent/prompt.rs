@@ -12,6 +12,20 @@ pub(crate) fn skill_prelude(skill: &str) -> String {
     format!("load skills: {}\n\n${}", skill, skill)
 }
 
+/// Append optional raw operation guidance to the final prompt tail.
+///
+/// Missing, empty, and whitespace-only append values are no-ops. Non-blank
+/// values are appended verbatim so placeholders such as `{change_id}` remain
+/// raw text instead of being expanded as operation-specific placeholders.
+pub fn append_optional_prompt(base_prompt: String, append_prompt: Option<&str>) -> String {
+    match append_prompt {
+        Some(append_prompt) if !append_prompt.trim().is_empty() => {
+            format!("{}\n\n{}", base_prompt, append_prompt)
+        }
+        _ => base_prompt,
+    }
+}
+
 fn apply_completion_contract(change_id: &str) -> String {
     format!(
         "Apply change id: {change_id}\n\n\
@@ -464,6 +478,56 @@ pub(crate) mod tests {
     /// Expose ARCHIVE_READINESS_CONTEXT for cross-module drift tests.
     pub(crate) fn get_archive_readiness_context() -> &'static str {
         ARCHIVE_READINESS_CONTEXT
+    }
+
+    #[test]
+    fn append_optional_prompt_noops_for_missing_empty_and_whitespace() {
+        assert_eq!(append_optional_prompt("base".to_string(), None), "base");
+        assert_eq!(append_optional_prompt("base".to_string(), Some("")), "base");
+        assert_eq!(
+            append_optional_prompt("base".to_string(), Some("  \n\t  ")),
+            "base"
+        );
+    }
+
+    #[test]
+    fn archive_append_prompt_appends_raw_final_section() {
+        let prompt = append_optional_prompt(
+            build_archive_prompt("change-a", "", ""),
+            Some("archive tail"),
+        );
+        assert!(prompt.contains("Archive change id: change-a"));
+        assert!(prompt.ends_with("archive tail"));
+    }
+
+    #[test]
+    fn acceptance_append_prompt_appends_raw_final_section() {
+        let prompt = append_optional_prompt(
+            build_acceptance_prompt("change-a", "", "", "", ""),
+            Some("acceptance tail"),
+        );
+        assert!(prompt.contains("Acceptance id: change-a"));
+        assert!(prompt.ends_with("acceptance tail"));
+    }
+
+    #[test]
+    fn analyze_append_prompt_appends_raw_final_section() {
+        let prompt =
+            append_optional_prompt("generated analyze prompt".to_string(), Some("analyze tail"));
+        assert_eq!(prompt, "generated analyze prompt\n\nanalyze tail");
+    }
+
+    #[test]
+    fn resolve_append_prompt_appends_raw_final_section() {
+        let prompt =
+            append_optional_prompt("generated resolve prompt".to_string(), Some("resolve tail"));
+        assert_eq!(prompt, "generated resolve prompt\n\nresolve tail");
+    }
+
+    #[test]
+    fn append_optional_prompt_appends_raw_final_section() {
+        let prompt = append_optional_prompt("base {prompt}".to_string(), Some("tail {change_id}"));
+        assert_eq!(prompt, "base {prompt}\n\ntail {change_id}");
     }
 
     #[test]
