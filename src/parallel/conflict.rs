@@ -1162,6 +1162,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_append_prompt_is_applied_to_conflict_resolve_command_tail() {
+        let prompt = crate::agent::append_optional_prompt(
+            build_conflict_resolve_prompt(
+                crate::config::defaults::DEFAULT_RESOLVE_SKILL,
+                "Git conflict resolution:",
+                &["branch-a", "branch-b"],
+                "merge failed",
+                "UU file.rs",
+                "commit log here",
+                "file.rs",
+            ),
+            Some("resolve tail {change_id}"),
+        );
+        let command =
+            crate::config::OrchestratorConfig::expand_prompt("agent --prompt '{prompt}'", &prompt);
+
+        assert_eq!(command.matches("resolve tail {change_id}").count(), 1);
+        assert!(command.ends_with("resolve tail {change_id}'"));
+        assert!(!command.contains("branch-a resolve tail"));
+    }
+
+    #[test]
     fn test_sequential_merge_prompt_has_skill_prelude() {
         let prompt = build_sequential_merge_resolve_prompt(
             crate::config::defaults::DEFAULT_RESOLVE_SKILL,

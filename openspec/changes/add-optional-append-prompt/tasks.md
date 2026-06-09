@@ -23,3 +23,8 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate add-optional-append-prompt --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] Behavior bug: analyze append prompts are appended twice on the LLM selection path. Fixed by making `src/orchestration/selection.rs` pass the generated analysis prompt to `AgentRunner` without pre-appending; the append now happens once in the real analyze command expansion path in `src/agent/runner.rs`. (verification: integration - `agent-exec run -- cargo test analyze_append_prompt` passed in job `25e323a8283cfaf9b22a67d7b926cebc`.)
+- [x] Checklist/evidence mismatch: added real command construction coverage for analyze append prompts in `src/agent/runner.rs` and resolve append prompts in `src/parallel/conflict.rs`, proving tail placement, raw placeholder preservation, and single append behavior through `{prompt}` command expansion. (verification: integration - `agent-exec run -- cargo test analyze_append_prompt` passed in job `25e323a8283cfaf9b22a67d7b926cebc`; `agent-exec run -- cargo test resolve_append_prompt` passed in job `69281945cc53d779eb1bdac26a4f2300`.)
+- [x] Verification run evidence: `agent-exec run -- cargo test analyze_append_prompt` passed (job `25e323a8283cfaf9b22a67d7b926cebc`), and `agent-exec run -- cargo test resolve_append_prompt` passed (job `69281945cc53d779eb1bdac26a4f2300`). An initial combined cargo invocation failed because Cargo accepts only one test-name positional filter; it was replaced with the two valid targeted runs above.

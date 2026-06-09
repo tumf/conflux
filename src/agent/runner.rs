@@ -51,6 +51,15 @@ fn expand_command_with_prompt(template: &str, change_id: Option<&str>, prompt: &
     OrchestratorConfig::expand_prompt(&command, prompt)
 }
 
+fn expand_analyze_command_with_append(
+    template: &str,
+    prompt: &str,
+    append_prompt: Option<&str>,
+) -> String {
+    let prompt = crate::agent::append_optional_prompt(prompt.to_string(), append_prompt);
+    OrchestratorConfig::expand_prompt(template, &prompt)
+}
+
 fn tail_lines(lines: Vec<String>, max_lines: usize) -> Option<String> {
     if lines.is_empty() {
         return None;
@@ -1098,11 +1107,11 @@ impl AgentRunner {
     /// Analyze dependencies using the configured analyze command (blocking)
     pub async fn analyze_dependencies(&self, prompt: &str) -> Result<String> {
         let template = self.config.get_analyze_command()?;
-        let prompt = crate::agent::append_optional_prompt(
-            prompt.to_string(),
+        let command = expand_analyze_command_with_append(
+            template,
+            prompt,
             self.config.get_analyze_append_prompt(),
         );
-        let command = OrchestratorConfig::expand_prompt(template, &prompt);
         info!(
             module = module_path!(),
             "Running analyze command: {}", template
@@ -1141,11 +1150,11 @@ impl AgentRunner {
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
     ) -> Result<String> {
         let template = self.config.get_analyze_command()?;
-        let prompt = crate::agent::append_optional_prompt(
-            prompt.to_string(),
+        let command = expand_analyze_command_with_append(
+            template,
+            prompt,
             self.config.get_analyze_append_prompt(),
         );
-        let command = OrchestratorConfig::expand_prompt(template, &prompt);
         info!(
             module = module_path!(),
             "Running analyze command via AiCommandRunner: {}", template
@@ -1201,11 +1210,11 @@ impl AgentRunner {
         prompt: &str,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>)> {
         let template = self.config.get_analyze_command()?;
-        let prompt = crate::agent::append_optional_prompt(
-            prompt.to_string(),
+        let command = expand_analyze_command_with_append(
+            template,
+            prompt,
             self.config.get_analyze_append_prompt(),
         );
-        let command = OrchestratorConfig::expand_prompt(template, &prompt);
         info!(
             module = module_path!(),
             "Running analyze command (streaming): {}", template
@@ -1686,6 +1695,36 @@ fn build_command(command: &str) -> Command {
         }
 
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_append_prompt_is_appended_once_during_command_expansion() {
+        let command = expand_analyze_command_with_append(
+            "agent --prompt '{prompt}'",
+            "generated analyze prompt",
+            Some("analyze tail {change_id}"),
+        );
+
+        assert_eq!(command.matches("generated analyze prompt").count(), 1);
+        assert_eq!(command.matches("analyze tail {change_id}").count(), 1);
+        assert!(!command.contains("add-optional-append-prompt"));
+        assert!(command.ends_with("analyze tail {change_id}'"));
+    }
+
+    #[test]
+    fn analyze_append_prompt_whitespace_is_noop_during_command_expansion() {
+        let command = expand_analyze_command_with_append(
+            "agent --prompt '{prompt}'",
+            "generated analyze prompt",
+            Some("  \n\t  "),
+        );
+
+        assert_eq!(command, "agent --prompt 'generated analyze prompt'");
     }
 }
 
