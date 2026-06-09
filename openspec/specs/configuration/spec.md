@@ -1048,3 +1048,99 @@ Unsupported modifier syntax such as `Ctrl+R` SHALL be rejected unless modifier s
 - **WHEN** TUI config is loaded
 - **THEN** loading fails
 - **AND** the error identifies the duplicate start keybinding
+
+### Requirement: Operation-specific append prompt fields
+
+The orchestrator SHALL accept optional top-level configuration fields named `apply_append_prompt`, `acceptance_append_prompt`, `archive_append_prompt`, `analyze_append_prompt`, and `resolve_append_prompt`.
+
+When one of these fields is unset, set to an empty string, or set to a whitespace-only string, the corresponding operation prompt SHALL remain unchanged from the existing generated prompt.
+
+When one of these fields is set to a non-blank string, the orchestrator SHALL append that raw string to the end of the final generated prompt for the matching operation before expanding `{prompt}` in the configured command template.
+
+The append prompt fields SHALL be additive only: they SHALL NOT replace, suppress, or reorder the built-in Conflux operation prompt contract, operation history, retry context, diff context, or other generated operation context.
+
+Append prompt values SHALL be treated as raw guidance text. The orchestrator SHALL NOT expand `{change_id}`, `{prompt}`, or any other placeholder inside append prompt values.
+
+#### Scenario: acceptance append prompt is configured
+
+- **GIVEN** `.cflx.jsonc` contains `"acceptance_append_prompt": "If locally available, ocr review may be used as advisory evidence only."`
+- **AND** `acceptance_command` contains the `{prompt}` placeholder
+- **WHEN** the acceptance command is prepared for execution
+- **THEN** the expanded prompt includes the normal Conflux acceptance contract
+- **AND** the expanded prompt ends with the configured acceptance append text
+- **AND** the append text does not by itself change the accepted acceptance verdict markers
+
+#### Scenario: acceptance append prompt is absent
+
+- **GIVEN** `.cflx.jsonc` does not contain `acceptance_append_prompt`
+- **WHEN** the acceptance command is prepared for execution
+- **THEN** the expanded prompt is identical to the current built-in acceptance prompt for the same change context
+
+#### Scenario: append prompts are operation-specific
+
+- **GIVEN** `.cflx.jsonc` contains distinct values for `apply_append_prompt`, `acceptance_append_prompt`, `archive_append_prompt`, `analyze_append_prompt`, and `resolve_append_prompt`
+- **WHEN** each operation command is prepared for execution
+- **THEN** each command receives only the append prompt configured for its own operation
+- **AND** no operation receives another operation's append prompt
+
+#### Scenario: empty append prompt is ignored
+
+- **GIVEN** `.cflx.jsonc` contains `"apply_append_prompt": ""`
+- **WHEN** the apply command is prepared for execution
+- **THEN** the expanded prompt does not include an extra blank guidance section
+- **AND** the apply prompt is otherwise unchanged
+
+#### Scenario: whitespace-only append prompt is ignored
+
+- **GIVEN** `.cflx.jsonc` contains `"apply_append_prompt": "   \n\t  "`
+- **WHEN** the apply command is prepared for execution
+- **THEN** the expanded prompt does not include an extra blank guidance section
+- **AND** the apply prompt is otherwise unchanged
+
+#### Scenario: append prompt placeholders remain raw
+
+- **GIVEN** `.cflx.jsonc` contains `"acceptance_append_prompt": "Review {change_id} with optional local tools."`
+- **WHEN** the acceptance command is prepared for change `add-feature`
+- **THEN** the appended prompt text contains the literal string `{change_id}`
+- **AND** it does not contain `add-feature` as a result of append prompt placeholder expansion
+
+### Requirement: Append prompts must not change workflow control semantics
+
+Append prompt configuration SHALL affect only the prompt text substituted into operation command templates through `{prompt}`.
+
+Append prompt configuration SHALL NOT change command template parsing, verdict marker parsing, lifecycle state transitions, optional tool detection, hook execution, or command availability checks.
+
+#### Scenario: optional review guidance does not become an acceptance gate
+
+- **GIVEN** `.cflx.jsonc` contains `"acceptance_append_prompt": "If ocr review is locally available, use it as advisory evidence only."`
+- **WHEN** the acceptance command is executed
+- **THEN** Conflux does not itself execute `ocr review`
+- **AND** acceptance verdict parsing still depends on the acceptance command output markers
+- **AND** the configured guidance text alone cannot force PASS, CONTINUE, FAIL, gated, or blocked outcomes
+
+#### Scenario: append prompt does not affect hooks
+
+- **GIVEN** `.cflx.jsonc` contains `"apply_append_prompt": "Additional guidance"`
+- **AND** a hook command is configured
+- **WHEN** the hook command is executed
+- **THEN** the hook command string is not modified by `apply_append_prompt`
+
+### Requirement: Init templates document optional append prompts
+
+The configuration templates generated by the `init` command SHALL include commented examples for the optional append prompt fields.
+
+The commented examples SHALL remain disabled by default so generated configurations preserve existing runtime behavior until a user explicitly opts in.
+
+#### Scenario: init template includes append prompt examples
+
+- **WHEN** a user runs `cflx init`
+- **THEN** the generated configuration template contains commented examples for `apply_append_prompt`, `acceptance_append_prompt`, `archive_append_prompt`, `analyze_append_prompt`, and `resolve_append_prompt`
+- **AND** those examples are not active configuration values by default
+
+#### Scenario: template variants include append prompt examples
+
+- **WHEN** a user runs `cflx init --template claude`
+- **OR** `cflx init --template opencode`
+- **OR** `cflx init --template codex`
+- **THEN** the generated template contains commented examples for the optional append prompt fields
+- **AND** the existing command template fields remain valid
