@@ -2129,22 +2129,14 @@ impl ParallelExecutor {
         }
 
         if available_slots == 0 {
-            // No available slots, defer re-analysis until slots become available
             info!(
-                "Re-analysis deferred: no available slots (max: {}, in_flight: {}, queued: {})",
                 max_parallelism,
-                in_flight.len(),
-                queued.len()
+                in_flight = in_flight.len(),
+                queued = queued.len(),
+                manual_resolve_active = self.manual_resolve_active(),
+                auto_resolve_active = self.auto_resolve_count.load(std::sync::atomic::Ordering::Relaxed),
+                "Re-analysis will continue with zero dispatch capacity; ordinary apply dispatch remains suppressed"
             );
-            self.emit_no_analysis_diagnostic(
-                queued,
-                in_flight,
-                max_parallelism,
-                "no_available_slots",
-            )
-            .await;
-            // Re-analysis stays state-driven and will resume once slots free up.
-            return Ok((false, iteration));
         }
 
         let effective_reason =
@@ -2250,6 +2242,24 @@ impl ParallelExecutor {
             in_flight.len(),
             queued.len()
         );
+
+        if available_slots == 0 {
+            info!(
+                max_parallelism,
+                in_flight = in_flight.len(),
+                queued = queued.len(),
+                order = ?analysis_result.order,
+                "Dependency analysis completed, but dispatch is suppressed because no execution slots are available"
+            );
+            self.emit_no_analysis_diagnostic(
+                queued,
+                in_flight,
+                max_parallelism,
+                "dispatch_capacity_zero_after_analysis",
+            )
+            .await;
+            return Ok((false, iteration));
+        }
 
         // Select changes to dispatch based on order and available slots
         let selected_changes = self
