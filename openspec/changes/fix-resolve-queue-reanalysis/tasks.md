@@ -15,3 +15,7 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-resolve-queue-reanalysis --archive-gate`
+
+## Acceptance Notes
+
+Acceptance #1 identified a focused verification failure in `parallel::tests::executor::test_dependency_on_terminal_error_is_blocked_until_retry_and_success`. The test fixture now initializes a git base repository before asserting post-archive dependency dispatch, matching the dependency-resolution path used by `is_merged_to_base`. Focused verification passed with `agent-exec run -- cargo test parallel::tests::executor::test_dependency_on_terminal_error_is_blocked_until_retry_and_success -- --nocapture` (job `cb942e7986957c9c4f42be9601f07a95`, exit code 0).
