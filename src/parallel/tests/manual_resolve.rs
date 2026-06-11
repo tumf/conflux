@@ -196,7 +196,11 @@ fn analysis_result<'a>(
 async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_dispatch() {
     let temp_dir = TempDir::new().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-    let mut executor = ParallelExecutor::new(temp_dir.path().to_path_buf(), create_test_config(), Some(tx));
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
     let manual_resolve_counter = Arc::new(AtomicUsize::new(1));
     executor.set_manual_resolve_counter(manual_resolve_counter);
 
@@ -204,7 +208,8 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
     let mut in_flight = HashSet::new();
     let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
-    let mut cleanup_guard = WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
+    let mut cleanup_guard =
+        WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
     let (should_break, iteration) = executor
         .perform_reanalysis_and_dispatch(
@@ -222,21 +227,52 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
         .expect("re-analysis should not fail");
 
     assert!(!should_break);
-    assert_eq!(iteration, 1, "suppressed dispatch must not advance iteration");
-    assert!(in_flight.is_empty(), "zero capacity must not start apply work");
-    assert_eq!(queued.len(), 1, "queued change remains pending until capacity recovers");
-    assert!(join_set.is_empty(), "no workspace task should be spawned at zero capacity");
+    assert_eq!(
+        iteration, 1,
+        "suppressed dispatch must not advance iteration"
+    );
+    assert!(
+        in_flight.is_empty(),
+        "zero capacity must not start apply work"
+    );
+    assert_eq!(
+        queued.len(),
+        1,
+        "queued change remains pending until capacity recovers"
+    );
+    assert!(
+        join_set.is_empty(),
+        "no workspace task should be spawned at zero capacity"
+    );
 
     let mut saw_analysis_started = false;
     let mut saw_apply_started = false;
+    let mut saw_capacity_diagnostic = false;
     while let Ok(event) = rx.try_recv() {
         match event {
             ExecutionEvent::AnalysisStarted { .. } => saw_analysis_started = true,
             ExecutionEvent::ApplyStarted { .. } => saw_apply_started = true,
+            ExecutionEvent::Log(entry)
+                if entry
+                    .message
+                    .contains("dispatch_capacity_zero_after_analysis") =>
+            {
+                saw_capacity_diagnostic = true;
+            }
             _ => {}
         }
     }
 
-    assert!(saw_analysis_started, "queued work should enter analysis during active manual resolve");
-    assert!(!saw_apply_started, "ordinary apply must remain capacity-gated during active manual resolve");
+    assert!(
+        saw_analysis_started,
+        "queued work should enter analysis during active manual resolve"
+    );
+    assert!(
+        !saw_apply_started,
+        "ordinary apply must remain capacity-gated during active manual resolve"
+    );
+    assert!(
+        saw_capacity_diagnostic,
+        "capacity-gated dispatch should emit an operator-visible diagnostic"
+    );
 }

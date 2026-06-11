@@ -2251,6 +2251,16 @@ impl ParallelExecutor {
                 order = ?analysis_result.order,
                 "Dependency analysis completed, but dispatch is suppressed because no execution slots are available"
             );
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Log(LogEntry::info(format!(
+                    "Dispatch suppressed after dependency analysis: reason=dispatch_capacity_zero_after_analysis, local_queued={}, in_flight={}, max_parallelism={}",
+                    queued.len(),
+                    in_flight.len(),
+                    max_parallelism
+                ))),
+            )
+            .await;
             self.emit_no_analysis_diagnostic(
                 queued,
                 in_flight,
