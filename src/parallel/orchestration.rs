@@ -239,36 +239,24 @@ impl ParallelExecutor {
                 break;
             }
             if !queued.is_empty() {
-                let available_slots = self.calculate_available_slots(max_parallelism, &in_flight);
-                let should_attempt_reanalysis = available_slots > 0;
-                if should_attempt_reanalysis {
-                    let (should_break, new_iteration) = self
-                        .perform_reanalysis_and_dispatch(
-                            &mut queued,
-                            &mut in_flight,
-                            max_parallelism,
-                            iteration,
-                            reanalysis_reason,
-                            &analyzer,
-                            semaphore.clone(),
-                            &mut join_set,
-                            &mut cleanup_guard,
-                        )
-                        .await?;
-
-                    iteration = new_iteration;
-
-                    if should_break {
-                        break;
-                    }
-                } else {
-                    self.emit_no_analysis_diagnostic(
-                        &queued,
-                        &in_flight,
+                let (should_break, new_iteration) = self
+                    .perform_reanalysis_and_dispatch(
+                        &mut queued,
+                        &mut in_flight,
                         max_parallelism,
-                        "no_available_slots",
+                        iteration,
+                        reanalysis_reason,
+                        &analyzer,
+                        semaphore.clone(),
+                        &mut join_set,
+                        &mut cleanup_guard,
                     )
-                    .await;
+                    .await?;
+
+                iteration = new_iteration;
+
+                if should_break {
+                    break;
                 }
             }
 

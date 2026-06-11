@@ -482,6 +482,7 @@ async fn test_terminal_error_change_is_not_selected_until_explicit_retry() {
 #[tokio::test]
 async fn test_dependency_on_terminal_error_is_blocked_until_retry_and_success() {
     let temp = TempDir::new().or_fail("unexpected error");
+    init_git_repo(temp.path()).await;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
     let mut executor = ParallelExecutor::new(
         temp.path().to_path_buf(),
