@@ -1654,6 +1654,8 @@ When the parallel service receives runtime cancellation from its owner, it MUST 
 
 merge/resolve の結果（成功・Deferred・失敗）はスケジューラループに非同期に通知され、適切に処理されなければならない（MUST）。base-mutating lane の単一占有（同時に最大1つの resolve または rejection review）は reducer の lane 占有状態によって維持されなければならない（MUST）。spawn された retry の実行中は、スケジューラはドレイン完了・persistent idle・終了判定においてその作業を未完了として扱わなければならない（MUST）。
 
+spawn された base-mutating lane retry の結果が Merged 以外（自動再開可能な Deferred、または失敗）である場合、スケジューラは結果受信処理において reducer の base-mutating lane 占有を解放しなければならない（MUST）。自動再開可能な Deferred で終わった change は、promotion 元の wait 種別（ResolveWait / RejectWait）に復元され、以降の merge/resolve 完了トリガまたは queue notification で再 promote 可能でなければならない（MUST）。retry の失敗が `ResolveFailed` / `RejectionReviewFailed` などの失敗イベントを伴わずに終了した場合（例: workspace 喪失）も、lane 占有を解放し、運用者可視のイベントを発行しなければならない（MUST）。lane 占有の解放漏れにより promotion が恒久的に不能となる状態（生存するタスクを伴わない Resolving / Rejecting の残留）を生じさせてはならない（MUST NOT）。retry の失敗は運用者に対して 1 回だけ報告されなければならず（MUST）、retry 本体が発行した失敗イベントに加えて汎用エラーを重複報告してはならない（MUST NOT）。
+
 #### Scenario: Queued change dispatched during resolve
 
 - **GIVEN** Change A のコンフリクト解決（resolve）が進行中で、queued に Change B が存在し、利用可能スロットが 1 以上ある
@@ -1716,6 +1718,30 @@ merge/resolve の結果（成功・Deferred・失敗）はスケジューラル�
 - **WHEN** スケジューラがドレイン完了・終了判定を評価する
 - **THEN** スケジューラは終了せず retry の結果通知を待つ
 - **AND** 結果受信後に ResolveWait 解消・次 waiter promotion・re-analysis が行われる
+
+#### Scenario: Auto-resumable deferred retry releases the base-mutating lane
+
+- **GIVEN** Change B が ResolveWait から promote され、spawn された retry の merge 試行が global merge lock 競合により自動再開可能な Deferred（"Merge lane busy"）で終了する
+- **WHEN** スケジューラが retry の Deferred 結果を受信処理する
+- **THEN** reducer の base-mutating lane 占有が解放される（Change B の activity が Resolving のまま残留しない）
+- **AND** Change B は ResolveWait に復元され、resolve wait queue に重複なく再登録される
+- **AND** 後続の merge/resolve 完了トリガまたは queue notification で Change B が再 promote される
+
+#### Scenario: Deferred retry converges after the merge lock is released
+
+- **GIVEN** Change B の retry が "Merge lane busy" の自動再開可能 Deferred で終了し、ResolveWait に復元されている
+- **AND** global merge lock を保持していたタスクが完了して Merged 結果がスケジューラに届く
+- **WHEN** スケジューラが Merged 結果の受信処理で次の waiter を dispatch する
+- **THEN** Change B が promote され retry が再実行される
+- **AND** ユーザー操作なしで Change B の merge が完了に到達する
+
+#### Scenario: Retry failure without a failure event still releases the lane
+
+- **GIVEN** Change B が ResolveWait から promote され、spawn された retry が `ResolveFailed` 等の失敗イベントを発行せずに失敗する（例: workspace が見つからない）
+- **WHEN** スケジューラが retry の失敗結果を受信処理する
+- **THEN** reducer の base-mutating lane 占有が解放される
+- **AND** 運用者可視のイベントが 1 回発行される
+- **AND** 後続の ResolveWait / RejectWait waiter の promotion が引き続き可能である
 
 ### Requirement: Parallel Execution Event Reporting
 
