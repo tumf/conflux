@@ -120,7 +120,10 @@ use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
 use super::merge::base_dirty_reason;
-use super::{MergeResult, MergeTaskOutcome, ParallelEvent, ParallelExecutor, WorkspaceResult};
+use super::{
+    MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelEvent, ParallelExecutor,
+    WorkspaceResult,
+};
 
 fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
     format!(
@@ -226,6 +229,7 @@ impl ParallelExecutor {
             || self.last_dispatched_reject_wait_changes != self.reject_wait_changes
     }
 
+    #[allow(dead_code)]
     pub(super) async fn maybe_dispatch_resolve_wait_retry(&mut self) {
         let base_dirty_changed_to_clean = self
             .resolve_wait_base_dirty_changed_to_clean()
@@ -240,6 +244,23 @@ impl ParallelExecutor {
         self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
         self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
         self.resolve_wait_retry_triggered = false;
+    }
+
+    pub(super) async fn maybe_dispatch_resolve_wait_retry_with_tx(
+        &mut self,
+        merge_result_tx: &mpsc::Sender<MergeResult>,
+    ) {
+        let base_dirty_changed_to_clean = self
+            .resolve_wait_base_dirty_changed_to_clean()
+            .await
+            .unwrap_or(false);
+
+        if !self.should_dispatch_resolve_wait_retry() && !base_dirty_changed_to_clean {
+            return;
+        }
+
+        self.dispatch_deferred_base_lane_waiter(merge_result_tx.clone())
+            .await;
     }
 
     async fn resolve_wait_base_dirty_changed_to_clean(&mut self) -> Result<bool> {
@@ -665,8 +686,9 @@ impl ParallelExecutor {
             .await;
 
             // Rejection review failure releases the rejecting lane. If any archived rows are
-            // waiting in ResolveWait due to that blocker, retry them immediately.
-            self.retry_deferred_base_lane_waiters().await;
+            // waiting in ResolveWait due to that blocker, retry them without blocking the scheduler.
+            self.dispatch_deferred_base_lane_waiter(merge_result_tx.clone())
+                .await;
         } else if let Some(reason) = &workspace_result.rejected {
             info!(
                 "Change '{}' rejected after acceptance blocker: {}",
@@ -709,7 +731,8 @@ impl ParallelExecutor {
 
             // Rejection review completion (confirm) also releases the rejecting lane;
             // retry deferred merges so ResolveWait rows are not stranded.
-            self.retry_deferred_base_lane_waiters().await;
+            self.dispatch_deferred_base_lane_waiter(merge_result_tx.clone())
+                .await;
         } else {
             info!(
                 "Change '{}' completed successfully",
@@ -758,6 +781,7 @@ impl ParallelExecutor {
                     .send(MergeResult {
                         change_id,
                         workspace_name,
+                        origin: MergeResultOrigin::PostArchiveMerge,
                         outcome: Ok(MergeTaskOutcome::deferred(
                             "duplicate post-archive merge task suppressed because the same change is already active",
                             true,
@@ -781,6 +805,7 @@ impl ParallelExecutor {
                 .send(MergeResult {
                     change_id,
                     workspace_name,
+                    origin: MergeResultOrigin::PostArchiveMerge,
                     outcome,
                 })
                 .await
@@ -793,18 +818,32 @@ impl ParallelExecutor {
         });
     }
 
+    #[allow(dead_code)]
     pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) -> bool {
+        let (merge_result_tx, _merge_result_rx) = mpsc::channel(1);
+        self.handle_merge_result_with_tx(merge_result, &merge_result_tx)
+            .await
+    }
+
+    pub(super) async fn handle_merge_result_with_tx(
+        &mut self,
+        merge_result: MergeResult,
+        merge_result_tx: &mpsc::Sender<MergeResult>,
+    ) -> bool {
         self.pending_merge_count.fetch_sub(1, Ordering::Relaxed);
 
         match merge_result.outcome {
             Ok(MergeTaskOutcome::Merged) => {
                 info!(
-                    "Background merge task completed successfully for '{}'",
+                    origin = ?merge_result.origin,
+                    "Background base-lane task completed successfully for '{}'",
                     merge_result.change_id
                 );
-                self.retry_deferred_base_lane_waiters().await;
+                self.dispatch_deferred_base_lane_waiter(merge_result_tx.clone())
+                    .await;
                 true
             }
+
             Ok(MergeTaskOutcome::Deferred {
                 reason,
                 auto_resumable,
@@ -835,7 +874,139 @@ impl ParallelExecutor {
         }
     }
 
+    async fn dispatch_deferred_base_lane_waiter(
+        &mut self,
+        merge_result_tx: mpsc::Sender<MergeResult>,
+    ) {
+        let Some(shared) = &self.shared_orchestrator_state else {
+            // Without reducer-owned lane state there is no safe single-flight signal for a
+            // detached retry. Legacy callers can still use retry_deferred_base_lane_waiters
+            // in tests that do not wire the shared scheduler state.
+            self.retry_deferred_merges().await;
+            self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
+            self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
+            self.resolve_wait_retry_triggered = false;
+            return;
+        };
+
+        let promoted = {
+            let mut guard = shared.write().await;
+            guard.promote_next_base_mutating_lane_waiter()
+        };
+
+        let Some((change_id, wait_state)) = promoted else {
+            self.sync_resolve_wait_from_shared_state_nonblocking();
+            self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
+            self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
+            self.resolve_wait_retry_triggered = false;
+            return;
+        };
+
+        match wait_state {
+            crate::orchestration::state::WaitState::ResolveWait => {
+                self.resolve_wait_changes.insert(change_id.clone());
+                self.spawn_base_lane_retry_task(
+                    change_id,
+                    MergeResultOrigin::ResolveWaitRetry,
+                    merge_result_tx,
+                );
+            }
+            crate::orchestration::state::WaitState::RejectWait => {
+                self.reject_wait_changes.insert(change_id.clone());
+                self.spawn_base_lane_retry_task(
+                    change_id,
+                    MergeResultOrigin::RejectWaitRetry,
+                    merge_result_tx,
+                );
+            }
+            other => {
+                warn!(
+                    "Ignoring unsupported base-mutating lane promotion for '{}' with wait state {:?}",
+                    change_id, other
+                );
+            }
+        }
+
+        self.last_dispatched_resolve_wait_changes = self.resolve_wait_changes.clone();
+        self.last_dispatched_reject_wait_changes = self.reject_wait_changes.clone();
+        self.resolve_wait_retry_triggered = false;
+    }
+
+    fn spawn_base_lane_retry_task(
+        &self,
+        change_id: String,
+        origin: MergeResultOrigin,
+        merge_result_tx: mpsc::Sender<MergeResult>,
+    ) {
+        let mut retry_executor = ParallelExecutor::new(
+            self.repo_root.clone(),
+            self.config.clone(),
+            self.event_tx.clone(),
+        );
+        retry_executor.max_conflict_retries = self.max_conflict_retries;
+        retry_executor.shared_stagger_state = self.shared_stagger_state.clone();
+        retry_executor.auto_resolve_count = self.auto_resolve_count.clone();
+        retry_executor.pending_merge_count = self.pending_merge_count.clone();
+        retry_executor.cancel_token = self.cancel_token.clone();
+        retry_executor.manual_resolve_count = self.manual_resolve_count.clone();
+        retry_executor.hooks = self.hooks.clone();
+        retry_executor.shared_orchestrator_state = self.shared_orchestrator_state.clone();
+
+        self.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let mut workspace_name = change_id.clone();
+            let outcome = async {
+                match origin {
+                    MergeResultOrigin::ResolveWaitRetry => {
+                        if let Ok(Some(workspace_info)) = retry_executor
+                            .workspace_manager
+                            .find_existing_workspace(&change_id)
+                            .await
+                        {
+                            workspace_name = workspace_info.workspace_name;
+                        }
+                        retry_executor
+                            .retry_deferred_merges_for(vec![change_id.clone()])
+                            .await
+                    }
+                    MergeResultOrigin::RejectWaitRetry => {
+                        if let Ok(Some(workspace_info)) = retry_executor
+                            .workspace_manager
+                            .find_existing_workspace(&change_id)
+                            .await
+                        {
+                            workspace_name = workspace_info.workspace_name;
+                        }
+                        retry_executor
+                            .retry_deferred_rejection_review_for(change_id.clone())
+                            .await
+                    }
+                    MergeResultOrigin::PostArchiveMerge => unreachable!(
+                        "post-archive merge is dispatched by spawn_merge_task, not retry dispatcher"
+                    ),
+                }
+            }
+            .await;
+
+            if let Err(send_error) = merge_result_tx
+                .send(MergeResult {
+                    change_id,
+                    workspace_name,
+                    origin,
+                    outcome,
+                })
+                .await
+            {
+                warn!(
+                    "Failed to send base-lane retry result to scheduler loop: {}",
+                    send_error
+                );
+            }
+        });
+    }
+
     /// Retry one pending base-mutating lane operation according to reducer-owned ordering.
+    #[allow(dead_code)]
     pub(super) async fn retry_deferred_base_lane_waiters(&mut self) {
         let Some(shared) = &self.shared_orchestrator_state else {
             self.retry_deferred_merges().await;
@@ -850,11 +1021,11 @@ impl ParallelExecutor {
         match promoted {
             Some((change_id, crate::orchestration::state::WaitState::ResolveWait)) => {
                 self.resolve_wait_changes.insert(change_id.clone());
-                self.retry_deferred_merges_for(vec![change_id]).await;
+                let _ = self.retry_deferred_merges_for(vec![change_id]).await;
             }
             Some((change_id, crate::orchestration::state::WaitState::RejectWait)) => {
                 self.reject_wait_changes.insert(change_id.clone());
-                self.retry_deferred_rejection_review_for(change_id).await;
+                let _ = self.retry_deferred_rejection_review_for(change_id).await;
             }
             Some((change_id, wait_state)) => {
                 warn!(
@@ -892,7 +1063,7 @@ impl ParallelExecutor {
         }
 
         let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
-        self.retry_deferred_merges_for(deferred).await;
+        let _ = self.retry_deferred_merges_for(deferred).await;
     }
 
     pub(super) fn stale_retry_reason(workspace_info: &crate::vcs::WorkspaceInfo) -> Option<String> {
@@ -906,7 +1077,11 @@ impl ParallelExecutor {
         ))
     }
 
-    async fn retry_deferred_merges_for(&mut self, deferred: Vec<String>) {
+    async fn retry_deferred_merges_for(
+        &mut self,
+        deferred: Vec<String>,
+    ) -> std::result::Result<MergeTaskOutcome, String> {
+        let mut outcome = Ok(MergeTaskOutcome::Merged);
         for change_id in deferred.into_iter().take(1) {
             if self.is_change_already_merged_to_base(&change_id).await {
                 info!(
@@ -940,6 +1115,7 @@ impl ParallelExecutor {
                     );
                     // Remove from deferred set; the workspace is gone, nothing to retry.
                     self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                    outcome = Ok(MergeTaskOutcome::Merged);
                     continue;
                 }
                 Err(e) => {
@@ -947,6 +1123,10 @@ impl ParallelExecutor {
                         "Failed to find workspace for deferred change '{}': {}",
                         change_id, e
                     );
+                    outcome = Err(format!(
+                        "Failed to find workspace for deferred change '{}': {}",
+                        change_id, e
+                    ));
                     continue;
                 }
             };
@@ -960,6 +1140,7 @@ impl ParallelExecutor {
                     "Deferred merge retry workspace path is stale; clearing retry intent"
                 );
                 self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                outcome = Ok(MergeTaskOutcome::Merged);
                 continue;
             }
 
@@ -1020,10 +1201,11 @@ impl ParallelExecutor {
                                 &self.event_tx,
                                 ParallelEvent::ResolveFailed {
                                     change_id: change_id.clone(),
-                                    error: message,
+                                    error: message.clone(),
                                 },
                             )
                             .await;
+                            outcome = Err(message);
                             continue;
                         }
                     }
@@ -1075,6 +1257,7 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
+                    outcome = Ok(MergeTaskOutcome::Merged);
                 }
                 Ok(super::merge::MergeAttempt::Deferred(deferred)) => {
                     info!(
@@ -1087,25 +1270,34 @@ impl ParallelExecutor {
                         self.resolve_wait_changes.remove(&change_id);
                         self.merge_wait_changes.insert(change_id.clone());
                     }
+                    let reason = deferred.reason;
+                    let auto_resumable = deferred.auto_resumable;
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: change_id.clone(),
-                            reason: deferred.reason,
-                            auto_resumable: deferred.auto_resumable,
+                            reason: reason.clone(),
+                            auto_resumable,
                         },
                     )
                     .await;
+                    outcome = Ok(MergeTaskOutcome::deferred(reason, auto_resumable));
                 }
                 Err(e) => {
                     error!("Deferred merge retry error for '{}': {}", change_id, e);
                     // Keep in deferred set; another merge/resolve completion will trigger again.
+                    outcome = Err(e.to_string());
                 }
             }
         }
+        outcome
     }
 
-    async fn retry_deferred_rejection_review_for(&mut self, change_id: String) {
+    async fn retry_deferred_rejection_review_for(
+        &mut self,
+        change_id: String,
+    ) -> std::result::Result<MergeTaskOutcome, String> {
+        let mut outcome = Ok(MergeTaskOutcome::Merged);
         send_event(
             &self.event_tx,
             ParallelEvent::Log(LogEntry::info(format!(
@@ -1127,14 +1319,17 @@ impl ParallelExecutor {
                     change_id
                 );
                 self.clear_reject_wait_intent_for_success(&change_id).await;
-                return;
+                return Ok(MergeTaskOutcome::Merged);
             }
             Err(e) => {
                 warn!(
                     "Failed to find workspace for deferred rejection review '{}': {}",
                     change_id, e
                 );
-                return;
+                return Err(format!(
+                    "Failed to find workspace for deferred rejection review '{}': {}",
+                    change_id, e
+                ));
             }
         };
 
@@ -1260,6 +1455,7 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
+                        outcome = Err(error.to_string());
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }
@@ -1291,6 +1487,7 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
+                        outcome = Err(error.to_string());
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }
@@ -1306,9 +1503,11 @@ impl ParallelExecutor {
                 };
                 self.apply_rejection_review_event_in_shared_state(&failed_event)
                     .await;
+                outcome = Err(error.to_string());
                 send_event(&self.event_tx, failed_event).await;
             }
         }
+        outcome
     }
 
     /// Retry rejection review for all RejectWait changes once the base-mutating lane is free.
@@ -1335,7 +1534,7 @@ impl ParallelExecutor {
             return;
         };
 
-        self.retry_deferred_rejection_review_for(change_id).await;
+        let _ = self.retry_deferred_rejection_review_for(change_id).await;
     }
 
     /// Check dynamic queue for newly added changes and update queued list.

@@ -213,7 +213,8 @@ impl ParallelExecutor {
             // Step 2: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
             // This keeps manual resolve dispatch reducer-owned while making scheduler work detection truthful.
             self.sync_resolve_wait_from_shared_state_nonblocking();
-            self.maybe_dispatch_resolve_wait_retry().await;
+            self.maybe_dispatch_resolve_wait_retry_with_tx(&merge_result_tx)
+                .await;
 
             // Step 2: Reconcile reducer-visible queue intent into scheduler-local candidates.
             let reconciliation = self
@@ -275,8 +276,12 @@ impl ParallelExecutor {
                 .should_enter_persistent_idle_wait(join_set.is_empty(), &queued, &in_flight)
                 .await
             {
-                self.wait_for_persistent_idle_wake(&mut reanalysis_reason, &mut merge_result_rx)
-                    .await;
+                self.wait_for_persistent_idle_wake_with_tx(
+                    &mut reanalysis_reason,
+                    &merge_result_tx,
+                    &mut merge_result_rx,
+                )
+                .await;
                 continue;
             }
 
@@ -344,7 +349,7 @@ impl ParallelExecutor {
 
             // Background merge completion: merge+cleanup finished asynchronously
             Some(merge_result) = merge_result_rx.recv() => {
-                let merged = self.handle_merge_result(merge_result).await;
+                let merged = self.handle_merge_result_with_tx(merge_result, merge_result_tx).await;
                 if merged {
                     self.trigger_resolve_wait_retry_dispatch();
                     *reanalysis_reason = ReanalysisReason::ResolveCompletion;
@@ -370,9 +375,25 @@ impl ParallelExecutor {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) async fn wait_for_persistent_idle_wake(
         &mut self,
         reanalysis_reason: &mut ReanalysisReason,
+        merge_result_rx: &mut tokio::sync::mpsc::Receiver<super::MergeResult>,
+    ) {
+        let (merge_result_tx, _merge_result_rx) = tokio::sync::mpsc::channel(1);
+        self.wait_for_persistent_idle_wake_with_tx(
+            reanalysis_reason,
+            &merge_result_tx,
+            merge_result_rx,
+        )
+        .await;
+    }
+
+    pub(super) async fn wait_for_persistent_idle_wake_with_tx(
+        &mut self,
+        reanalysis_reason: &mut ReanalysisReason,
+        merge_result_tx: &tokio::sync::mpsc::Sender<super::MergeResult>,
         merge_result_rx: &mut tokio::sync::mpsc::Receiver<super::MergeResult>,
     ) {
         info!(
@@ -381,7 +402,7 @@ impl ParallelExecutor {
 
         tokio::select! {
             Some(merge_result) = merge_result_rx.recv() => {
-                let merged = self.handle_merge_result(merge_result).await;
+                let merged = self.handle_merge_result_with_tx(merge_result, merge_result_tx).await;
                 if merged {
                     self.trigger_resolve_wait_retry_dispatch();
                     *reanalysis_reason = ReanalysisReason::ResolveCompletion;

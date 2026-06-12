@@ -521,8 +521,6 @@ impl ParallelExecutor {
     ) -> Result<MergeAttempt> {
         use crate::execution::archive::is_archive_commit_complete;
 
-        let _merge_guard = super::global_merge_lock().lock().await;
-
         let auto_resolve_count = self
             .auto_resolve_count
             .load(std::sync::atomic::Ordering::SeqCst);
@@ -536,6 +534,12 @@ impl ParallelExecutor {
                 "Resolve in progress for another change",
             )));
         }
+
+        let Ok(_merge_guard) = super::global_merge_lock().try_lock() else {
+            return Ok(MergeAttempt::Deferred(DeferredMerge::auto(
+                "Merge lane busy; retry when current base operation completes",
+            )));
+        };
 
         if let Some(reason) = base_dirty_reason(&self.repo_root).await? {
             return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
@@ -1068,7 +1072,48 @@ mod tests {
         ArchiveVerificationStatus, DeferredMerge, MergeAttempt,
     };
     use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    fn merge_lock_test_mutex() -> &'static tokio::sync::Mutex<()> {
+        static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn init_test_git_repo(path: &Path) {
+        tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .output()
+            .await
+            .expect("git init");
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(path)
+            .output()
+            .await
+            .expect("git config email");
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .await
+            .expect("git config name");
+        std::fs::write(path.join("README.md"), "base\n").expect("write readme");
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .await
+            .expect("git add");
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(path)
+            .output()
+            .await
+            .expect("git commit");
+    }
 
     #[test]
     fn test_archive_incomplete_after_base_integration_is_idempotent_merged() {
@@ -1205,6 +1250,87 @@ mod tests {
         let deferred = DeferredMerge::manual("Working tree has uncommitted changes");
         assert!(!deferred.auto_resumable);
         assert_eq!(deferred.reason, "Working tree has uncommitted changes");
+    }
+
+    #[tokio::test]
+    async fn attempt_merge_defers_without_waiting_for_global_merge_lock() {
+        let _test_guard = merge_lock_test_mutex().lock().await;
+        let temp = TempDir::new().expect("repo tempdir");
+        init_test_git_repo(temp.path()).await;
+        let _guard = super::super::global_merge_lock()
+            .try_lock()
+            .expect("test should acquire global merge lock");
+
+        let config = crate::config::OrchestratorConfig {
+            apply_command: Some("echo apply".to_string()),
+            archive_command: Some("echo archive".to_string()),
+            ..Default::default()
+        };
+        let executor =
+            crate::parallel::ParallelExecutor::new(temp.path().to_path_buf(), config, None);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            executor.attempt_merge(
+                &["dummy-revision".to_string()],
+                &["change-a".to_string()],
+                &[temp.path().to_path_buf()],
+            ),
+        )
+        .await
+        .expect("attempt_merge must not await a busy global merge lock")
+        .expect("busy lock should be represented as a deferred merge");
+
+        match result {
+            MergeAttempt::Deferred(deferred) => {
+                assert!(deferred.auto_resumable);
+                assert!(
+                    deferred.reason.contains("Merge lane busy"),
+                    "expected merge-lane-busy reason, got {}",
+                    deferred.reason
+                );
+            }
+            other => panic!("busy merge lane must defer, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn attempt_merge_checks_resolve_counters_before_global_merge_lock() {
+        let _test_guard = merge_lock_test_mutex().lock().await;
+        let temp = TempDir::new().expect("repo tempdir");
+        init_test_git_repo(temp.path()).await;
+        let _guard = super::super::global_merge_lock()
+            .try_lock()
+            .expect("test should acquire global merge lock");
+
+        let config = crate::config::OrchestratorConfig {
+            apply_command: Some("echo apply".to_string()),
+            archive_command: Some("echo archive".to_string()),
+            ..Default::default()
+        };
+        let executor =
+            crate::parallel::ParallelExecutor::new(temp.path().to_path_buf(), config, None);
+        executor.auto_resolve_count.store(1, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            executor.attempt_merge(
+                &["dummy-revision".to_string()],
+                &["change-a".to_string()],
+                &[temp.path().to_path_buf()],
+            ),
+        )
+        .await
+        .expect("attempt_merge must check resolve counters before the lock")
+        .expect("active resolve should be represented as a deferred merge");
+
+        match result {
+            MergeAttempt::Deferred(deferred) => {
+                assert!(deferred.auto_resumable);
+                assert_eq!(deferred.reason, "Resolve in progress for another change");
+            }
+            other => panic!("active resolve must defer, got {:?}", other),
+        }
     }
 
     #[test]

@@ -40,13 +40,26 @@ impl MergeTaskOutcome {
     }
 }
 
-/// Result of a background merge operation triggered after workspace completion.
+/// Scheduler-visible origin of a background base-lane operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeResultOrigin {
+    /// Normal post-archive merge task spawned after a workspace completes.
+    PostArchiveMerge,
+    /// Retry of a change that was waiting in ResolveWait.
+    ResolveWaitRetry,
+    /// Retry of a change that was waiting in RejectWait.
+    RejectWaitRetry,
+}
+
+/// Result of a background merge or base-lane retry operation.
 #[derive(Debug, Clone)]
 pub struct MergeResult {
-    /// Change associated with this merge attempt.
+    /// Change associated with this base-lane attempt.
     pub change_id: String,
-    /// Workspace name that produced this merge attempt.
+    /// Workspace name that produced this attempt.
     pub workspace_name: String,
+    /// Scheduler-visible origin of this background base-lane operation.
+    pub origin: MergeResultOrigin,
     /// Outcome of the merge attempt.
     pub outcome: std::result::Result<MergeTaskOutcome, String>,
 }
