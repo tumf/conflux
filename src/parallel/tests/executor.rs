@@ -4078,7 +4078,7 @@ async fn test_rejection_review_failure_retries_deferred_merges() {
 
 #[tokio::test]
 async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
-    use crate::parallel::{MergeResult, MergeTaskOutcome};
+    use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -4095,6 +4095,7 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
             .handle_merge_result(MergeResult {
                 change_id: "change-ok".to_string(),
                 workspace_name: "ws-change-ok".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
                 outcome: Ok(MergeTaskOutcome::Merged),
             })
             .await
@@ -4106,6 +4107,7 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
             .handle_merge_result(MergeResult {
                 change_id: "change-err".to_string(),
                 workspace_name: "ws-change-err".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
                 outcome: Err("merge failed".to_string()),
             })
             .await
@@ -4115,7 +4117,7 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
 
 #[tokio::test]
 async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_completion() {
-    use crate::parallel::{MergeResult, MergeTaskOutcome};
+    use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -4132,6 +4134,7 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
         .handle_merge_result(MergeResult {
             change_id: "change-ok".to_string(),
             workspace_name: "ws-change-ok".to_string(),
+            origin: MergeResultOrigin::PostArchiveMerge,
             outcome: Ok(MergeTaskOutcome::Merged),
         })
         .await;
@@ -4149,7 +4152,7 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
 
 #[tokio::test]
 async fn test_handle_merge_result_deferred_is_not_successful_completion() {
-    use crate::parallel::{MergeResult, MergeTaskOutcome};
+    use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -4167,6 +4170,7 @@ async fn test_handle_merge_result_deferred_is_not_successful_completion() {
         .handle_merge_result(MergeResult {
             change_id: "alpha".to_string(),
             workspace_name: "ws-alpha".to_string(),
+            origin: MergeResultOrigin::PostArchiveMerge,
             outcome: Ok(MergeTaskOutcome::deferred(
                 "archive verification incomplete",
                 false,
@@ -4187,7 +4191,7 @@ async fn test_handle_merge_result_deferred_is_not_successful_completion() {
 
 #[tokio::test]
 async fn test_handle_merge_result_failed_emits_error_event_with_context() {
-    use crate::parallel::MergeResult;
+    use crate::parallel::{MergeResult, MergeResultOrigin};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -4204,6 +4208,7 @@ async fn test_handle_merge_result_failed_emits_error_event_with_context() {
         .handle_merge_result(MergeResult {
             change_id: "alpha".to_string(),
             workspace_name: "ws-alpha".to_string(),
+            origin: MergeResultOrigin::PostArchiveMerge,
             outcome: Err("merge failed hard".to_string()),
         })
         .await;
