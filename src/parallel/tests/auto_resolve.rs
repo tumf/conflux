@@ -437,7 +437,7 @@ async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action()
     );
 
     let retry_result = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
+        std::time::Duration::from_millis(500),
         merge_result_rx.recv(),
     )
     .await

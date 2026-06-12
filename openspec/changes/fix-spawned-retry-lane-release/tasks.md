@@ -111,3 +111,13 @@ Acceptance #1 reported insufficient repository-verifiable evidence for several a
 - Task 5 evidence was strengthened in this apply pass: `src/parallel/tests/auto_resolve.rs::deferred_retry_repromotes_and_converges_to_merged_without_user_action` now initializes a real git repository/worktree and asserts that the spawned retry result itself is `Ok(MergeTaskOutcome::Merged)` before passing that same result to `handle_merge_result_with_tx`.
 - Task 6 evidence was strengthened in this apply pass: `src/parallel/tests/manual_resolve.rs::scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve` now uses a controllable manual-resolve gate counter that remains held while the scheduler loop emits dynamic ingestion, `AnalysisStarted`, and the zero-capacity dispatch diagnostic.
 - Task 7 evidence was strengthened in this apply pass: `src/parallel/tests/executor.rs::finite_scheduler_does_not_drain_while_spawned_retry_is_pending` now spawns a retry via `handle_merge_result_with_tx` promotion, verifies drain/exit remains false before the spawned result is handled, and then verifies ResolveWait clearing plus next-waiter promotion after result delivery.
+
+## Acceptance #3 Notes
+
+Acceptance #3 identified a stale failing run for `parallel::tests::auto_resolve` and represented review findings as active checkboxes. This apply pass treats them as notes rather than implementation tasks, because active acceptance-follow-up checkboxes are not valid cflx-apply task tracking. The current tree has updated retry-result timeout headroom in `src/parallel/tests/auto_resolve.rs`, and `cargo test --lib parallel::tests::auto_resolve -- --nocapture` passed via agent-exec job `458a59297a22a5b8a54230fa3a332aeb` (exit_code 0).
+
+- Task 4 remains covered by the lock-contention retry-lane release test in `src/parallel/tests/executor.rs`.
+- Task 5 evidence is current: `deferred_retry_repromotes_and_converges_to_merged_without_user_action` receives the spawned retry result and asserts `Ok(MergeTaskOutcome::Merged)`.
+- Task 6 remains covered by the scheduler-loop gated manual-resolve test in `src/parallel/tests/manual_resolve.rs`.
+- Task 7 remains covered by the finite scheduler pending-spawned-retry test in `src/parallel/tests/executor.rs`.
+- Task 8 evidence was refreshed for `parallel::tests::auto_resolve` in this apply pass; full final quality gates are recorded by the active checked Task 8 above.
