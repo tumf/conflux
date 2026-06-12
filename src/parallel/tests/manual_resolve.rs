@@ -9,7 +9,10 @@ use crate::parallel::{ParallelExecutor, WorkspaceResult};
 use crate::tui::queue::DynamicQueue;
 use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -286,6 +289,8 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
         .await;
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
+    let gated_resolve_counter = Arc::new(AtomicUsize::new(4));
+
     let mut executor = ParallelExecutor::new(
         std::path::PathBuf::from("."),
         create_test_config(),
@@ -293,7 +298,7 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     );
     executor.set_cancel_token(cancel_token.clone());
     executor.set_dynamic_queue(dynamic_queue);
-    executor.set_manual_resolve_counter(Arc::new(AtomicUsize::new(4)));
+    executor.set_manual_resolve_counter(gated_resolve_counter.clone());
 
     let scheduler = tokio::spawn(async move {
         executor
@@ -333,6 +338,12 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     .await
     .expect("scheduler loop should ingest and analyze bounded dynamic work");
 
+    assert!(
+        gated_resolve_counter.load(Ordering::SeqCst) > 0,
+        "controllable resolve gate must still be held when analysis and capacity diagnostics fire"
+    );
+
+    gated_resolve_counter.store(0, Ordering::SeqCst);
     cancel_token.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_millis(500), scheduler)
         .await
