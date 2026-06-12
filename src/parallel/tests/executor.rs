@@ -11,6 +11,7 @@ use crate::parallel::executor::{
     execute_acceptance_in_workspace, execute_archive_finalization_in_workspace,
     execute_archive_in_workspace,
 };
+use crate::parallel::merge::MergeAttempt;
 use crate::vcs::git::commands::get_current_commit;
 #[cfg(feature = "heavy-tests")]
 use crate::vcs::GitWorkspaceManager;
@@ -5000,13 +5001,39 @@ async fn retry_lane_busy_release_allows_subsequent_repromotion() {
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
+    let merge_guard = global_merge_lock().lock().await;
+    let deferred_by_lock = executor
+        .attempt_merge(
+            &["retry-rev".to_string()],
+            &["change-a".to_string()],
+            &[PathBuf::from("/tmp/retry-archive")],
+        )
+        .await
+        .or_fail("attempt_merge should report lock contention as a deferred retry");
+    let outcome = match deferred_by_lock {
+        MergeAttempt::Deferred(deferred) => {
+            assert!(deferred.auto_resumable);
+            assert!(
+                deferred.reason.contains("Merge lane busy"),
+                "test must exercise the global_merge_lock contention branch, got: {}",
+                deferred.reason
+            );
+            MergeTaskOutcome::Deferred {
+                reason: deferred.reason,
+                auto_resumable: deferred.auto_resumable,
+            }
+        }
+        other => panic!("expected lock-contention deferral, got {other:?}"),
+    };
+    drop(merge_guard);
+
     let merged = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                outcome: Ok(outcome),
             },
             &merge_result_tx,
         )

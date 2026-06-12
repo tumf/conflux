@@ -3,9 +3,12 @@
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
+use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
-use crate::parallel::{ParallelExecutor, WorkspaceResult};
+use crate::parallel::{
+    MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelExecutor, WorkspaceResult,
+};
 use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -314,4 +317,99 @@ async fn test_auto_resolve_zero_capacity_runs_analysis_but_suppresses_apply_disp
         !saw_apply_started,
         "ordinary apply must remain capacity-gated during active automatic resolve"
     );
+}
+
+#[tokio::test]
+async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut executor =
+        ParallelExecutor::new(temp_dir.path().to_path_buf(), create_test_config(), None);
+    let (merge_result_tx, mut merge_result_rx) = tokio::sync::mpsc::channel(8);
+
+    let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("change-a".to_string(), WaitState::ResolveWait))
+        );
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    executor
+        .pending_merge_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        !executor
+            .handle_merge_result_with_tx(
+                MergeResult {
+                    change_id: "change-a".to_string(),
+                    workspace_name: "ws-change-a".to_string(),
+                    origin: MergeResultOrigin::ResolveWaitRetry,
+                    outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                },
+                &merge_result_tx,
+            )
+            .await
+    );
+    assert!(!shared.read().await.is_base_mutating_lane_occupied());
+
+    executor
+        .pending_merge_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        executor
+            .handle_merge_result_with_tx(
+                MergeResult {
+                    change_id: "blocking-merge".to_string(),
+                    workspace_name: "ws-blocking-merge".to_string(),
+                    origin: MergeResultOrigin::PostArchiveMerge,
+                    outcome: Ok(MergeTaskOutcome::Merged),
+                },
+                &merge_result_tx,
+            )
+            .await
+    );
+
+    let retry_result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        merge_result_rx.recv(),
+    )
+    .await
+    .expect("promotion should spawn a retry task result")
+    .expect("promotion result channel closed");
+    assert_eq!(retry_result.change_id, "change-a");
+    assert_eq!(retry_result.origin, MergeResultOrigin::ResolveWaitRetry);
+
+    assert!(
+        executor
+            .handle_merge_result_with_tx(
+                MergeResult {
+                    change_id: "change-a".to_string(),
+                    workspace_name: retry_result.workspace_name,
+                    origin: MergeResultOrigin::ResolveWaitRetry,
+                    outcome: Ok(MergeTaskOutcome::Merged),
+                },
+                &merge_result_tx,
+            )
+            .await,
+        "spawned retry must be able to converge to a merged outcome without user action"
+    );
+    assert_eq!(
+        executor
+            .pending_merge_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "all spawned retry accounting should be cleared after convergence"
+    );
+    assert!(shared.read().await.global_invariants_hold());
 }

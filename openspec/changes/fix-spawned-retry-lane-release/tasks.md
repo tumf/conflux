@@ -94,3 +94,11 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-spawned-retry-lane-release --archive-gate`
+
+## Acceptance Notes
+
+Acceptance #1 reported insufficient repository-verifiable evidence for several already-checked tasks. This apply pass added concrete repository evidence for the lock-contention branch and convergence-to-merged path:
+
+- Task 4 evidence strengthened: `src/parallel/tests/executor.rs::retry_lane_busy_release_allows_subsequent_repromotion` now holds `global_merge_lock`, calls `attempt_merge()`, asserts the actual lock-contention `Merge lane busy` auto-resumable deferral, delivers that result, then verifies lane release and re-promotion.
+- Task 5 evidence strengthened: `src/parallel/tests/auto_resolve.rs::deferred_retry_repromotes_and_converges_to_merged_without_user_action` now verifies a deferred retry is re-promoted after a merge-completion trigger and then handled as a merged retry outcome without user action.
+- Remaining acceptance observations for Task 6 and Task 7 are review notes against already-checked tasks, not active OpenSpec implementation checkboxes. Archive acceptance remains responsible for deciding whether the existing scheduler-loop and pending-merge-count tests satisfy those requirements.
