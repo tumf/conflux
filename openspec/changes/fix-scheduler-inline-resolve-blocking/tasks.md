@@ -81,3 +81,6 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-scheduler-inline-resolve-blocking --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] src/parallel/queue_state.rs::spawn_base_lane_retry_task lines 956-989 unconditionally sends Ok(MergeTaskOutcome::Merged) after retry_deferred_merges_for / retry_deferred_rejection_review_for return, so spawned ResolveWait/RejectWait retry tasks do not report the real merged/deferred/failed outcome through MergeResult. This violates openspec/changes/fix-scheduler-inline-resolve-blocking/specs/parallel-execution/spec.md lines 9-11 and tasks.md Task 2; fix by returning and forwarding the actual retry outcome so Deferred re-enters the scheduler retry flow instead of being treated as success.

@@ -967,7 +967,7 @@ impl ParallelExecutor {
                         }
                         retry_executor
                             .retry_deferred_merges_for(vec![change_id.clone()])
-                            .await;
+                            .await
                     }
                     MergeResultOrigin::RejectWaitRetry => {
                         if let Ok(Some(workspace_info)) = retry_executor
@@ -979,13 +979,12 @@ impl ParallelExecutor {
                         }
                         retry_executor
                             .retry_deferred_rejection_review_for(change_id.clone())
-                            .await;
+                            .await
                     }
                     MergeResultOrigin::PostArchiveMerge => unreachable!(
                         "post-archive merge is dispatched by spawn_merge_task, not retry dispatcher"
                     ),
                 }
-                Ok(MergeTaskOutcome::Merged)
             }
             .await;
 
@@ -1022,11 +1021,11 @@ impl ParallelExecutor {
         match promoted {
             Some((change_id, crate::orchestration::state::WaitState::ResolveWait)) => {
                 self.resolve_wait_changes.insert(change_id.clone());
-                self.retry_deferred_merges_for(vec![change_id]).await;
+                let _ = self.retry_deferred_merges_for(vec![change_id]).await;
             }
             Some((change_id, crate::orchestration::state::WaitState::RejectWait)) => {
                 self.reject_wait_changes.insert(change_id.clone());
-                self.retry_deferred_rejection_review_for(change_id).await;
+                let _ = self.retry_deferred_rejection_review_for(change_id).await;
             }
             Some((change_id, wait_state)) => {
                 warn!(
@@ -1064,7 +1063,7 @@ impl ParallelExecutor {
         }
 
         let deferred: Vec<String> = self.resolve_wait_changes.iter().cloned().collect();
-        self.retry_deferred_merges_for(deferred).await;
+        let _ = self.retry_deferred_merges_for(deferred).await;
     }
 
     pub(super) fn stale_retry_reason(workspace_info: &crate::vcs::WorkspaceInfo) -> Option<String> {
@@ -1078,7 +1077,11 @@ impl ParallelExecutor {
         ))
     }
 
-    async fn retry_deferred_merges_for(&mut self, deferred: Vec<String>) {
+    async fn retry_deferred_merges_for(
+        &mut self,
+        deferred: Vec<String>,
+    ) -> std::result::Result<MergeTaskOutcome, String> {
+        let mut outcome = Ok(MergeTaskOutcome::Merged);
         for change_id in deferred.into_iter().take(1) {
             if self.is_change_already_merged_to_base(&change_id).await {
                 info!(
@@ -1112,6 +1115,7 @@ impl ParallelExecutor {
                     );
                     // Remove from deferred set; the workspace is gone, nothing to retry.
                     self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                    outcome = Ok(MergeTaskOutcome::Merged);
                     continue;
                 }
                 Err(e) => {
@@ -1119,6 +1123,10 @@ impl ParallelExecutor {
                         "Failed to find workspace for deferred change '{}': {}",
                         change_id, e
                     );
+                    outcome = Err(format!(
+                        "Failed to find workspace for deferred change '{}': {}",
+                        change_id, e
+                    ));
                     continue;
                 }
             };
@@ -1132,6 +1140,7 @@ impl ParallelExecutor {
                     "Deferred merge retry workspace path is stale; clearing retry intent"
                 );
                 self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                outcome = Ok(MergeTaskOutcome::Merged);
                 continue;
             }
 
@@ -1192,10 +1201,11 @@ impl ParallelExecutor {
                                 &self.event_tx,
                                 ParallelEvent::ResolveFailed {
                                     change_id: change_id.clone(),
-                                    error: message,
+                                    error: message.clone(),
                                 },
                             )
                             .await;
+                            outcome = Err(message);
                             continue;
                         }
                     }
@@ -1247,6 +1257,7 @@ impl ParallelExecutor {
                         )
                         .await;
                     }
+                    outcome = Ok(MergeTaskOutcome::Merged);
                 }
                 Ok(super::merge::MergeAttempt::Deferred(deferred)) => {
                     info!(
@@ -1259,25 +1270,34 @@ impl ParallelExecutor {
                         self.resolve_wait_changes.remove(&change_id);
                         self.merge_wait_changes.insert(change_id.clone());
                     }
+                    let reason = deferred.reason;
+                    let auto_resumable = deferred.auto_resumable;
                     send_event(
                         &self.event_tx,
                         ParallelEvent::MergeDeferred {
                             change_id: change_id.clone(),
-                            reason: deferred.reason,
-                            auto_resumable: deferred.auto_resumable,
+                            reason: reason.clone(),
+                            auto_resumable,
                         },
                     )
                     .await;
+                    outcome = Ok(MergeTaskOutcome::deferred(reason, auto_resumable));
                 }
                 Err(e) => {
                     error!("Deferred merge retry error for '{}': {}", change_id, e);
                     // Keep in deferred set; another merge/resolve completion will trigger again.
+                    outcome = Err(e.to_string());
                 }
             }
         }
+        outcome
     }
 
-    async fn retry_deferred_rejection_review_for(&mut self, change_id: String) {
+    async fn retry_deferred_rejection_review_for(
+        &mut self,
+        change_id: String,
+    ) -> std::result::Result<MergeTaskOutcome, String> {
+        let mut outcome = Ok(MergeTaskOutcome::Merged);
         send_event(
             &self.event_tx,
             ParallelEvent::Log(LogEntry::info(format!(
@@ -1299,14 +1319,17 @@ impl ParallelExecutor {
                     change_id
                 );
                 self.clear_reject_wait_intent_for_success(&change_id).await;
-                return;
+                return Ok(MergeTaskOutcome::Merged);
             }
             Err(e) => {
                 warn!(
                     "Failed to find workspace for deferred rejection review '{}': {}",
                     change_id, e
                 );
-                return;
+                return Err(format!(
+                    "Failed to find workspace for deferred rejection review '{}': {}",
+                    change_id, e
+                ));
             }
         };
 
@@ -1432,6 +1455,7 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
+                        outcome = Err(error.to_string());
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }
@@ -1463,6 +1487,7 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
+                        outcome = Err(error.to_string());
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }
@@ -1478,9 +1503,11 @@ impl ParallelExecutor {
                 };
                 self.apply_rejection_review_event_in_shared_state(&failed_event)
                     .await;
+                outcome = Err(error.to_string());
                 send_event(&self.event_tx, failed_event).await;
             }
         }
+        outcome
     }
 
     /// Retry rejection review for all RejectWait changes once the base-mutating lane is free.
@@ -1507,7 +1534,7 @@ impl ParallelExecutor {
             return;
         };
 
-        self.retry_deferred_rejection_review_for(change_id).await;
+        let _ = self.retry_deferred_rejection_review_for(change_id).await;
     }
 
     /// Check dynamic queue for newly added changes and update queued list.
