@@ -3,13 +3,18 @@
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
+use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
-use crate::parallel::{ParallelExecutor, WorkspaceResult};
+use crate::parallel::{
+    MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelExecutor, WorkspaceResult,
+};
 use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -23,6 +28,40 @@ fn create_test_config() -> OrchestratorConfig {
         resolve_command: Some("echo resolve".to_string()),
         ..Default::default()
     }
+}
+
+async fn init_git_repo(repo_root: &std::path::Path) {
+    Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .expect("git init should run");
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .expect("git config email should run");
+    Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .expect("git config name should run");
+    std::fs::write(repo_root.join("README.md"), "initial\n").expect("write initial file");
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .expect("git add should run");
+    Command::new("git")
+        .args(["commit", "-m", "initial"])
+        .current_dir(repo_root)
+        .output()
+        .await
+        .expect("git commit should run");
 }
 
 #[tokio::test]
@@ -314,4 +353,116 @@ async fn test_auto_resolve_zero_capacity_runs_analysis_but_suppresses_apply_disp
         !saw_apply_started,
         "ordinary apply must remain capacity-gated during active automatic resolve"
     );
+}
+
+#[tokio::test]
+async fn deferred_retry_repromotes_and_converges_to_merged_without_user_action() {
+    let temp_dir = TempDir::new().unwrap();
+    init_git_repo(temp_dir.path()).await;
+    let workspace_parent = TempDir::new().unwrap();
+    let workspace_dir = workspace_parent.path().join("ws-change-a");
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "ws-change-a",
+            workspace_dir.to_str().expect("utf-8 temp path"),
+            "HEAD",
+        ])
+        .current_dir(temp_dir.path())
+        .output()
+        .await
+        .expect("git worktree add should run");
+    let mut executor =
+        ParallelExecutor::new(temp_dir.path().to_path_buf(), create_test_config(), None);
+    executor.workspace_manager = Box::new(
+        super::executor::TestWorkspaceManager::new(Arc::new(AtomicUsize::new(1)))
+            .with_existing_workspace("change-a", workspace_dir.clone()),
+    );
+    let (merge_result_tx, mut merge_result_rx) = tokio::sync::mpsc::channel(8);
+
+    let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("change-a".to_string(), WaitState::ResolveWait))
+        );
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    executor
+        .pending_merge_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        !executor
+            .handle_merge_result_with_tx(
+                MergeResult {
+                    change_id: "change-a".to_string(),
+                    workspace_name: "ws-change-a".to_string(),
+                    origin: MergeResultOrigin::ResolveWaitRetry,
+                    outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                },
+                &merge_result_tx,
+            )
+            .await
+    );
+    assert!(!shared.read().await.is_base_mutating_lane_occupied());
+
+    executor
+        .pending_merge_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        executor
+            .handle_merge_result_with_tx(
+                MergeResult {
+                    change_id: "blocking-merge".to_string(),
+                    workspace_name: "ws-blocking-merge".to_string(),
+                    origin: MergeResultOrigin::PostArchiveMerge,
+                    outcome: Ok(MergeTaskOutcome::Merged),
+                },
+                &merge_result_tx,
+            )
+            .await
+    );
+
+    let retry_result = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        merge_result_rx.recv(),
+    )
+    .await
+    .expect("promotion should spawn a retry task result")
+    .expect("promotion result channel closed");
+    assert_eq!(retry_result.change_id, "change-a");
+    assert_eq!(retry_result.origin, MergeResultOrigin::ResolveWaitRetry);
+    assert!(
+        matches!(retry_result.outcome, Ok(MergeTaskOutcome::Merged)),
+        "spawned retry itself must reach a merged outcome without a synthetic replacement: {:?}",
+        retry_result.outcome
+    );
+
+    assert!(
+        executor
+            .handle_merge_result_with_tx(retry_result, &merge_result_tx)
+            .await,
+        "scheduler must accept the spawned retry's merged outcome without user action"
+    );
+    assert_eq!(
+        executor
+            .pending_merge_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "all spawned retry accounting should be cleared after convergence"
+    );
+    assert!(shared.read().await.global_invariants_hold());
 }

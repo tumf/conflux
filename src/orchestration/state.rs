@@ -905,6 +905,45 @@ impl OrchestratorState {
         self.remove_from_reject_wait_queue(change_id);
     }
 
+    /// Release a promoted base-mutating retry occupant after a non-terminal retry outcome.
+    ///
+    /// Spawned ResolveWait/RejectWait retries promote a queued waiter by clearing its
+    /// wait state and marking it Resolving/Rejecting. If the detached retry then
+    /// defers auto-resumably or fails before a terminal reducer event, the lane must
+    /// be returned to its reducer-owned wait state so later completion triggers can
+    /// promote it again. Terminal entries, non-occupants, and unsupported wait kinds
+    /// are left unchanged.
+    pub fn release_base_mutating_lane_after_retry(
+        &mut self,
+        change_id: &str,
+        wait_state: WaitState,
+    ) -> bool {
+        if !matches!(wait_state, WaitState::ResolveWait | WaitState::RejectWait) {
+            return false;
+        }
+
+        let rt = self.runtime_entry(change_id);
+        if rt.is_terminal()
+            || !matches!(
+                rt.activity,
+                ActivityState::Resolving | ActivityState::Rejecting
+            )
+        {
+            return false;
+        }
+
+        rt.activity = ActivityState::Idle;
+        rt.wait_state = wait_state.clone();
+        rt.clear_blocked_metadata();
+        self.clear_base_mutating_wait_queues(change_id);
+        match wait_state {
+            WaitState::ResolveWait => self.enqueue_unique_resolve_wait(change_id),
+            WaitState::RejectWait => self.enqueue_unique_reject_wait(change_id),
+            _ => unreachable!("wait_state was validated above"),
+        }
+        true
+    }
+
     /// Promote exactly one pending base-mutating operation when the lane is free.
     /// Resolve waits take priority over reject waits to preserve existing merge retry semantics.
     pub fn promote_next_base_mutating_lane_waiter(&mut self) -> Option<(String, WaitState)> {
@@ -2461,6 +2500,71 @@ mod tests {
         assert_eq!(state.display_status("b"), "reject pending");
         assert_eq!(state.reject_wait_change_ids(), vec!["b".to_string()]);
         assert!(state.has_other_post_archive_lane_blocker("b"));
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn release_base_mutating_lane_after_retry_restores_resolve_wait_uniquely() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "conflict".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("alpha".to_string(), WaitState::ResolveWait))
+        );
+        assert!(state.is_base_mutating_lane_occupied());
+
+        assert!(state.release_base_mutating_lane_after_retry("alpha", WaitState::ResolveWait));
+        assert!(!state.is_base_mutating_lane_occupied());
+        assert_eq!(state.display_status("alpha"), "resolve pending");
+        assert_eq!(state.resolve_wait_change_ids(), vec!["alpha".to_string()]);
+        assert!(state.global_invariants_hold());
+
+        assert!(!state.release_base_mutating_lane_after_retry("alpha", WaitState::ResolveWait));
+        assert_eq!(state.resolve_wait_queue, vec!["alpha".to_string()]);
+        assert!(state.reject_wait_queue.is_empty());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn release_base_mutating_lane_after_retry_restores_reject_wait_and_noops_terminal() {
+        let mut state = OrchestratorState::with_mode(
+            vec!["lane".to_string(), "reject".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
+            "lane".to_string(),
+        ));
+        state.mark_reject_wait("reject");
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "lane".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("reject".to_string(), WaitState::RejectWait))
+        );
+
+        assert!(state.release_base_mutating_lane_after_retry("reject", WaitState::RejectWait));
+        assert!(!state.is_base_mutating_lane_occupied());
+        assert_eq!(state.display_status("reject"), "reject pending");
+        assert_eq!(state.reject_wait_change_ids(), vec!["reject".to_string()]);
+        assert!(state.global_invariants_hold());
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::ChangeRejected {
+            change_id: "reject".to_string(),
+            reason: "confirmed".to_string(),
+        });
+        assert!(!state.release_base_mutating_lane_after_retry("reject", WaitState::RejectWait));
+        assert!(state.reject_wait_change_ids().is_empty());
         assert!(state.global_invariants_hold());
     }
 

@@ -9,7 +9,10 @@ use crate::parallel::{ParallelExecutor, WorkspaceResult};
 use crate::tui::queue::DynamicQueue;
 use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
-use std::sync::{atomic::AtomicUsize, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -274,5 +277,84 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
     assert!(
         saw_capacity_diagnostic,
         "capacity-gated dispatch should emit an operator-visible diagnostic"
+    );
+}
+
+#[tokio::test]
+async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    dynamic_queue
+        .push("fix-spawned-retry-lane-release".to_string())
+        .await;
+
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let gated_resolve_counter = Arc::new(AtomicUsize::new(4));
+
+    let mut executor = ParallelExecutor::new(
+        std::path::PathBuf::from("."),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_cancel_token(cancel_token.clone());
+    executor.set_dynamic_queue(dynamic_queue);
+    executor.set_manual_resolve_counter(gated_resolve_counter.clone());
+
+    let scheduler = tokio::spawn(async move {
+        executor
+            .execute_with_order_based_reanalysis(vec![test_change("seed-gated")], analysis_result)
+            .await
+    });
+
+    let mut saw_dynamic_ingest = false;
+    let mut saw_analysis_started = false;
+    let mut saw_apply_started = false;
+    let mut saw_capacity_diagnostic = false;
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while !(saw_dynamic_ingest && saw_analysis_started && saw_capacity_diagnostic) {
+            match rx.recv().await {
+                Some(ExecutionEvent::Log(entry))
+                    if entry.message.contains(
+                        "Dynamically added to parallel execution: fix-spawned-retry-lane-release",
+                    ) =>
+                {
+                    saw_dynamic_ingest = true;
+                }
+                Some(ExecutionEvent::Log(entry))
+                    if entry
+                        .message
+                        .contains("dispatch_capacity_zero_after_analysis") =>
+                {
+                    saw_capacity_diagnostic = true;
+                }
+                Some(ExecutionEvent::AnalysisStarted { .. }) => saw_analysis_started = true,
+                Some(ExecutionEvent::ApplyStarted { .. }) => saw_apply_started = true,
+                Some(_) => {}
+                None => break,
+            }
+        }
+    })
+    .await
+    .expect("scheduler loop should ingest and analyze bounded dynamic work");
+
+    assert!(
+        gated_resolve_counter.load(Ordering::SeqCst) > 0,
+        "controllable resolve gate must still be held when analysis and capacity diagnostics fire"
+    );
+
+    gated_resolve_counter.store(0, Ordering::SeqCst);
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), scheduler)
+        .await
+        .expect("scheduler should stop after cancellation")
+        .expect("scheduler task should not panic");
+
+    assert!(saw_dynamic_ingest);
+    assert!(saw_analysis_started);
+    assert!(saw_capacity_diagnostic);
+    assert!(
+        !saw_apply_started,
+        "zero recalculated capacity must suppress apply dispatch while gated resolve is active"
     );
 }

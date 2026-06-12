@@ -41,6 +41,7 @@ pub use types::{
 #[cfg(test)]
 pub use crate::vcs::Workspace;
 #[cfg(all(test, feature = "heavy-tests"))]
+#[allow(unused_imports)]
 pub use merge::MergeAttempt;
 
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
