@@ -6,7 +6,7 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
-use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand};
+use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::executor::{
     execute_acceptance_in_workspace, execute_archive_finalization_in_workspace,
     execute_archive_in_workspace,
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 trait TestAssertionExt<T> {
@@ -4776,6 +4776,106 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
     assert!(
         should_exit,
         "finite scheduler should drain when only reducer-visible ResolveWait work remains"
+    );
+}
+
+#[tokio::test]
+async fn handle_merge_result_releases_resolve_wait_retry_lane_on_auto_deferred() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let mut executor = ParallelExecutor::new(repo_root, config, None);
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["change-a".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_observation(
+            "change-a",
+            crate::orchestration::state::WorkspaceObservation::WorkspaceArchived,
+        );
+        guard.apply_command(ReducerCommand::ResolveMerge("change-a".to_string()));
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("change-a".to_string(), WaitState::ResolveWait))
+        );
+        assert!(guard.is_base_mutating_lane_occupied());
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let merged = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-change-a".to_string(),
+                origin: MergeResultOrigin::ResolveWaitRetry,
+                outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+            },
+            &merge_result_tx,
+        )
+        .await;
+
+    assert!(!merged);
+    let guard = shared.read().await;
+    assert!(!guard.is_base_mutating_lane_occupied());
+    assert_eq!(
+        guard.resolve_wait_change_ids(),
+        vec!["change-a".to_string()]
+    );
+    assert!(guard.global_invariants_hold());
+}
+
+#[tokio::test]
+async fn handle_merge_result_releases_reject_wait_retry_lane_and_suppresses_duplicate_error() {
+    let config = create_test_config();
+    let repo_root = PathBuf::from("/tmp/test-repo");
+    let (event_tx, mut event_rx) = mpsc::channel(8);
+    let mut executor = ParallelExecutor::new(repo_root, config, Some(event_tx));
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["lane".to_string(), "reject-a".to_string()],
+        3,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane".to_string()));
+        guard.mark_reject_wait("reject-a");
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "lane".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("reject-a".to_string(), WaitState::RejectWait))
+        );
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let merged = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "reject-a".to_string(),
+                workspace_name: "ws-reject-a".to_string(),
+                origin: MergeResultOrigin::RejectWaitRetry,
+                outcome: Err("specific rejection review failure already emitted".to_string()),
+            },
+            &merge_result_tx,
+        )
+        .await;
+
+    assert!(!merged);
+    let guard = shared.read().await;
+    assert!(!guard.is_base_mutating_lane_occupied());
+    assert_eq!(guard.reject_wait_change_ids(), vec!["reject-a".to_string()]);
+    assert!(guard.global_invariants_hold());
+    assert!(
+        event_rx.try_recv().is_err(),
+        "retry-origin errors must not emit duplicate generic ParallelEvent::Error"
     );
 }
 

@@ -13,6 +13,7 @@ use crate::dependency_targets::{
 };
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
+use crate::orchestration::state::WaitState;
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
     run_rejection_review, RejectionReviewVerdict,
@@ -818,6 +819,39 @@ impl ParallelExecutor {
         });
     }
 
+    async fn release_retry_lane_after_non_terminal_outcome(
+        &mut self,
+        change_id: &str,
+        origin: MergeResultOrigin,
+    ) {
+        let wait_state = match origin {
+            MergeResultOrigin::ResolveWaitRetry => WaitState::ResolveWait,
+            MergeResultOrigin::RejectWaitRetry => WaitState::RejectWait,
+            MergeResultOrigin::PostArchiveMerge => return,
+        };
+
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let released = {
+                let mut guard = shared.write().await;
+                guard.release_base_mutating_lane_after_retry(change_id, wait_state)
+            };
+            if released {
+                info!(
+                    change_id = %change_id,
+                    origin = ?origin,
+                    "Released base-mutating lane after non-terminal spawned retry outcome"
+                );
+            } else {
+                debug!(
+                    change_id = %change_id,
+                    origin = ?origin,
+                    "No base-mutating lane release needed after non-terminal spawned retry outcome"
+                );
+            }
+        }
+        self.sync_resolve_wait_from_shared_state_nonblocking();
+    }
+
     #[allow(dead_code)]
     pub(super) async fn handle_merge_result(&mut self, merge_result: MergeResult) -> bool {
         let (merge_result_tx, _merge_result_rx) = mpsc::channel(1);
@@ -852,23 +886,40 @@ impl ParallelExecutor {
                     "Background merge task deferred for '{}' (workspace '{}', auto_resumable={}): {}",
                     merge_result.change_id, merge_result.workspace_name, auto_resumable, reason
                 );
+                if auto_resumable {
+                    self.release_retry_lane_after_non_terminal_outcome(
+                        &merge_result.change_id,
+                        merge_result.origin,
+                    )
+                    .await;
+                }
                 false
             }
             Err(error) => {
                 error!(
-                    "Background merge task failed for '{}' (workspace '{}'): {}",
-                    merge_result.change_id, merge_result.workspace_name, error
+                    "Background merge task failed for '{}' (workspace '{}', origin {:?}): {}",
+                    merge_result.change_id, merge_result.workspace_name, merge_result.origin, error
                 );
-                send_event(
-                    &self.event_tx,
-                    ParallelEvent::Error {
-                        message: format!(
-                            "Background merge failed for '{}' (workspace '{}'): {}",
-                            merge_result.change_id, merge_result.workspace_name, error
-                        ),
-                    },
+                self.release_retry_lane_after_non_terminal_outcome(
+                    &merge_result.change_id,
+                    merge_result.origin,
                 )
                 .await;
+                if !matches!(
+                    merge_result.origin,
+                    MergeResultOrigin::ResolveWaitRetry | MergeResultOrigin::RejectWaitRetry
+                ) {
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Error {
+                            message: format!(
+                                "Background merge failed for '{}' (workspace '{}'): {}",
+                                merge_result.change_id, merge_result.workspace_name, error
+                            ),
+                        },
+                    )
+                    .await;
+                }
                 false
             }
         }
@@ -1109,24 +1160,31 @@ impl ParallelExecutor {
             {
                 Ok(Some(ws)) => ws,
                 Ok(None) => {
-                    warn!(
-                        "No workspace found for deferred change '{}', clearing stale retry intent",
+                    let message = format!(
+                        "No workspace found for ResolveWait retry '{}', clearing stale retry intent",
                         change_id
                     );
+                    warn!("{}", message);
+                    send_event(&self.event_tx, ParallelEvent::Error { message }).await;
                     // Remove from deferred set; the workspace is gone, nothing to retry.
                     self.clear_resolve_wait_intent_for_outcome(&change_id).await;
                     outcome = Ok(MergeTaskOutcome::Merged);
                     continue;
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to find workspace for deferred change '{}': {}",
+                    let message = format!(
+                        "Failed to find workspace for ResolveWait retry '{}': {}",
                         change_id, e
                     );
-                    outcome = Err(format!(
-                        "Failed to find workspace for deferred change '{}': {}",
-                        change_id, e
-                    ));
+                    warn!("{}", message);
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Error {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                    outcome = Err(message);
                     continue;
                 }
             };
@@ -1314,22 +1372,29 @@ impl ParallelExecutor {
         {
             Ok(Some(ws)) => ws,
             Ok(None) => {
-                warn!(
-                    "No workspace found for deferred rejection review '{}', clearing reject wait",
+                let message = format!(
+                    "No workspace found for RejectWait retry '{}', clearing reject wait",
                     change_id
                 );
+                warn!("{}", message);
+                send_event(&self.event_tx, ParallelEvent::Error { message }).await;
                 self.clear_reject_wait_intent_for_success(&change_id).await;
                 return Ok(MergeTaskOutcome::Merged);
             }
             Err(e) => {
-                warn!(
-                    "Failed to find workspace for deferred rejection review '{}': {}",
+                let message = format!(
+                    "Failed to find workspace for RejectWait retry '{}': {}",
                     change_id, e
                 );
-                return Err(format!(
-                    "Failed to find workspace for deferred rejection review '{}': {}",
-                    change_id, e
-                ));
+                warn!("{}", message);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Error {
+                        message: message.clone(),
+                    },
+                )
+                .await;
+                return Err(message);
             }
         };
 

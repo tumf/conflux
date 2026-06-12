@@ -2,7 +2,7 @@
 
 ## Implementation Tasks
 
-- [ ] Task 1: Add a reducer lane-release method to `src/orchestration/state.rs`
+- [x] Task 1: Add a reducer lane-release method to `src/orchestration/state.rs`
       (e.g. `release_base_mutating_lane_after_retry(change_id, wait_state)`): for a
       non-terminal entry whose `activity` is `Resolving`/`Rejecting`, reset `activity` to
       `Idle`, restore `wait_state` to the given `ResolveWait`/`RejectWait`, and re-enqueue
@@ -12,7 +12,7 @@
       activity reset, wait restoration, unique enqueue (no duplicates on repeated calls),
       no-op on terminal entries, and `global_invariants_hold()` after release.
       verification: unit - reducer tests in `src/orchestration/state.rs`
-- [ ] Task 2: Wire origin-aware lane release into
+- [x] Task 2: Wire origin-aware lane release into
       `src/parallel/queue_state.rs::handle_merge_result_with_tx`: when
       `merge_result.origin` is `ResolveWaitRetry` or `RejectWaitRetry` and the outcome is
       `Ok(MergeTaskOutcome::Deferred { auto_resumable: true, .. })` or `Err(_)`, call the
