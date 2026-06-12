@@ -2,7 +2,7 @@
 
 ## Implementation Tasks
 
-- [ ] Task 1: Switch dynamic-queue ingestion candidate validation to the configured
+- [x] Task 1: Switch dynamic-queue ingestion candidate validation to the configured
       repository root: in
       `src/parallel/queue_state.rs::check_dynamic_queue_and_add_changes`
       (currently line 1645), replace `crate::openspec::list_changes_native()` with
@@ -13,7 +13,7 @@
       site. verification: unit - covered by Task 3's repo-root resolution test, which
       fails if the ingestion site regresses to cwd-based lookup
 
-- [ ] Task 2: Make `scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve`
+- [x] Task 2: Make `scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve`
       (`src/parallel/tests/manual_resolve.rs:284`) self-contained: create a `TempDir`
       containing a synthetic ACTIVE change at
       `openspec/changes/<synthetic-id>/` (minimal `proposal.md` + `tasks.md` so
@@ -28,7 +28,7 @@
       verification: integration - `cargo test --lib parallel::tests::manual_resolve::scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve`
       (red on current main before this change, green after)
 
-- [ ] Task 3: Add a focused ingestion repo-root regression test in
+- [x] Task 3: Add a focused ingestion repo-root regression test in
       `src/parallel/tests/` driving `check_dynamic_queue_and_add_changes` (directly or
       via the scheduler loop) with an executor whose `repo_root` is a temp dir that is
       NOT the process cwd: (a) a change present only under the temp `repo_root` is
@@ -39,7 +39,7 @@
       under 1 second. verification: unit - new test(s) in
       `src/parallel/tests/manual_resolve.rs` or `src/parallel/tests/executor.rs`
 
-- [ ] Task 4: Run quality gates on the final tree. Completion condition: all of the
+- [x] Task 4: Run quality gates on the final tree. Completion condition: all of the
       following exit 0, and no existing manual-resolve, auto-resolve, executor, drain,
       or capacity-gating test regresses.
       verification: integration - `cargo test --lib parallel::tests` plus

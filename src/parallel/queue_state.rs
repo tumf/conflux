@@ -1642,7 +1642,7 @@ impl ParallelExecutor {
                         }
                     }
 
-                    match crate::openspec::list_changes_native() {
+                    match crate::openspec::list_changes_native_from(&self.repo_root) {
                         Ok(all_changes) => {
                             if let Some(new_change) =
                                 all_changes.into_iter().find(|c| c.id == dynamic_id)

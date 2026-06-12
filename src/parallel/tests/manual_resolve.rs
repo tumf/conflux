@@ -5,10 +5,11 @@ use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
-use crate::parallel::{ParallelExecutor, WorkspaceResult};
+use crate::parallel::{ParallelExecutor, SchedulerLifetime, WorkspaceResult};
 use crate::tui::queue::DynamicQueue;
 use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -179,6 +180,53 @@ fn test_change(id: &str) -> Change {
     }
 }
 
+fn create_active_change_fixture(repo_root: &std::path::Path, change_id: &str) {
+    let change_dir = repo_root.join("openspec").join("changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).expect("create synthetic OpenSpec change directory");
+    std::fs::write(
+        change_dir.join("proposal.md"),
+        format!("# Synthetic Change {change_id}\n\n## Why\n\nTest fixture.\n"),
+    )
+    .expect("write synthetic proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "# Tasks\n\n- [ ] Synthetic fixture task\n",
+    )
+    .expect("write synthetic tasks");
+}
+
+fn init_minimal_git_repo(repo_root: &std::path::Path) {
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test User"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .expect("run git setup command");
+        assert!(
+            output.status.success(),
+            "git setup command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(repo_root.join("README.md"), "base\n").expect("write base file");
+    for args in [vec!["add", "-A"], vec!["commit", "-m", "Base"]] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .expect("run git commit command");
+        assert!(
+            output.status.success(),
+            "git commit command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 fn analysis_result<'a>(
     changes: &'a [Change],
     _in_flight: &'a [String],
@@ -282,42 +330,50 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
 
 #[tokio::test]
 async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
+    let temp_dir = TempDir::new().unwrap();
+    init_minimal_git_repo(temp_dir.path());
+    let seed_change_id = "synthetic-seed-gated";
+    let synthetic_change_id = "synthetic-dynamic-gated-resolve";
+    create_active_change_fixture(temp_dir.path(), seed_change_id);
+    create_active_change_fixture(temp_dir.path(), synthetic_change_id);
+
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let dynamic_queue = Arc::new(DynamicQueue::new());
-    dynamic_queue
-        .push("fix-spawned-retry-lane-release".to_string())
-        .await;
 
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let gated_resolve_counter = Arc::new(AtomicUsize::new(4));
 
     let mut executor = ParallelExecutor::new(
-        std::path::PathBuf::from("."),
+        temp_dir.path().to_path_buf(),
         create_test_config(),
         Some(tx),
     );
     executor.set_cancel_token(cancel_token.clone());
-    executor.set_dynamic_queue(dynamic_queue);
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    executor.set_scheduler_lifetime(SchedulerLifetime::Persistent);
     executor.set_manual_resolve_counter(gated_resolve_counter.clone());
 
+    let scheduler_queue = dynamic_queue.clone();
     let scheduler = tokio::spawn(async move {
         executor
-            .execute_with_order_based_reanalysis(vec![test_change("seed-gated")], analysis_result)
+            .execute_with_order_based_reanalysis(vec![test_change(seed_change_id)], analysis_result)
             .await
     });
+    scheduler_queue.push(synthetic_change_id.to_string()).await;
 
     let mut saw_dynamic_ingest = false;
     let mut saw_analysis_started = false;
     let mut saw_apply_started = false;
     let mut saw_capacity_diagnostic = false;
+    let mut log_messages = Vec::new();
 
     tokio::time::timeout(std::time::Duration::from_millis(500), async {
         while !(saw_dynamic_ingest && saw_analysis_started && saw_capacity_diagnostic) {
             match rx.recv().await {
                 Some(ExecutionEvent::Log(entry))
-                    if entry.message.contains(
-                        "Dynamically added to parallel execution: fix-spawned-retry-lane-release",
-                    ) =>
+                    if entry.message.contains(&format!(
+                        "Dynamically added to parallel execution: {synthetic_change_id}"
+                    )) =>
                 {
                     saw_dynamic_ingest = true;
                 }
@@ -327,7 +383,9 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
                         .contains("dispatch_capacity_zero_after_analysis") =>
                 {
                     saw_capacity_diagnostic = true;
+                    log_messages.push(entry.message);
                 }
+                Some(ExecutionEvent::Log(entry)) => log_messages.push(entry.message),
                 Some(ExecutionEvent::AnalysisStarted { .. }) => saw_analysis_started = true,
                 Some(ExecutionEvent::ApplyStarted { .. }) => saw_apply_started = true,
                 Some(_) => {}
@@ -350,11 +408,77 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
         .expect("scheduler should stop after cancellation")
         .expect("scheduler task should not panic");
 
-    assert!(saw_dynamic_ingest);
+    assert!(
+        saw_dynamic_ingest,
+        "expected dynamic ingest log for {synthetic_change_id}; saw logs: {log_messages:?}"
+    );
     assert!(saw_analysis_started);
     assert!(saw_capacity_diagnostic);
     assert!(
         !saw_apply_started,
         "zero recalculated capacity must suppress apply dispatch while gated resolve is active"
+    );
+}
+
+#[tokio::test]
+async fn dynamic_queue_ingestion_validates_candidates_against_executor_repo_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let present_change_id = "synthetic-present-only-under-repo-root";
+    let absent_change_id = "synthetic-absent-under-repo-root";
+    create_active_change_fixture(temp_dir.path(), present_change_id);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    dynamic_queue.push(present_change_id.to_string()).await;
+    dynamic_queue.push(absent_change_id.to_string()).await;
+
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_dynamic_queue(dynamic_queue);
+
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reanalysis_reason = ReanalysisReason::Initial;
+
+    let queue_changed = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reanalysis_reason)
+        .await;
+
+    assert!(queue_changed, "present repo-root change should be ingested");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, present_change_id);
+    assert_eq!(reanalysis_reason, ReanalysisReason::QueueNotification);
+
+    let mut saw_present_ingest = false;
+    let mut saw_absent_reconciliation = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(entry) = event {
+            if entry.message.contains(&format!(
+                "Dynamically added to parallel execution: {present_change_id}"
+            )) {
+                saw_present_ingest = true;
+            }
+            if entry.message.contains(&format!(
+                "Queue reconciliation pending for '{absent_change_id}': candidate_not_found"
+            )) {
+                saw_absent_reconciliation = true;
+            }
+        }
+    }
+
+    assert!(
+        saw_present_ingest,
+        "ingestion log should name repo-root candidate"
+    );
+    assert!(
+        saw_absent_reconciliation,
+        "absent repo-root candidate should emit candidate_not_found reconciliation"
+    );
+    assert!(
+        queued.iter().all(|change| change.id != absent_change_id),
+        "absent candidate must not be queued"
     );
 }
