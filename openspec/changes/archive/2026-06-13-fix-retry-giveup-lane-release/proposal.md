@@ -1,8 +1,6 @@
 ---
 change_type: implementation
 priority: high
-dependencies:
-  - fix-dynamic-queue-ingest-repo-root
 references:
   - src/parallel/queue_state.rs
   - src/orchestration/state.rs
