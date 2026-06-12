@@ -121,3 +121,11 @@ Acceptance #3 identified a stale failing run for `parallel::tests::auto_resolve`
 - Task 6 remains covered by the scheduler-loop gated manual-resolve test in `src/parallel/tests/manual_resolve.rs`.
 - Task 7 remains covered by the finite scheduler pending-spawned-retry test in `src/parallel/tests/executor.rs`.
 - Task 8 evidence was refreshed for `parallel::tests::auto_resolve` in this apply pass; full final quality gates are recorded by the active checked Task 8 above.
+
+## Acceptance #4 Notes
+
+Acceptance #4 の指摘はレビュー所見として扱い、cflx-apply の active checkbox にはしません。この apply pass では commit-path 相当の `cargo clippy --locked --all-targets --all-features -- -D warnings` で報告された `src/parallel/mod.rs` の `MergeAttempt` re-export に `#[allow(unused_imports)]` を追加し、archive commitability blocker を解消しました。
+
+- OpenSpec validation は `cflx openspec validate fix-spawned-retry-lane-release --strict` が成功しました。過去の品質ゲートでは `cargo test --lib parallel::tests::auto_resolve`（agent-exec job `bd88c177e9ea724ca5b27cc7543a07ec`）、`cargo test --lib parallel::tests::executor`（`ab9691ba7265f8f3b74f95aef7b49add`）、`cargo test --lib parallel::tests::manual_resolve`（`abf542a6ed1c17d1964edccc1e7ac4f9`）、`cargo test --lib orchestration::state`（`af8081e90f8216d838c883cfc5d5e5ac`）、`cargo fmt --check`（`bf442023252ab0425e0c2ae64d2175d2`）、および `cargo clippy`（`04774770d02af515a6a62f5587d5c611`）はいずれも exit_code 0 でした。
+- `tasks.md` の active task section に未チェック `[ ]` はありません（`openspec/changes/fix-spawned-retry-lane-release/tasks.md:5-79` は全て `[x]`）。
+- 前回の主要指摘は現在のツリーで改善されています。Task 5 は `src/parallel/tests/auto_resolve.rs:439-459` で spawned retry result 自体を受信し、`Ok(MergeTaskOutcome::Merged)` を assert したうえで同じ result を `handle_merge_result_with_tx` に渡しています。Task 7 は `src/parallel/tests/executor.rs:5156-5225` で post-archive Merged trigger による retry spawn、pending count 維持、result handling 後の ResolveWait clearing / next-waiter promotion を確認しています。Task 6 は `src/parallel/tests/manual_resolve.rs:283-360` で scheduler loop 経由の dynamic queue ingest、`AnalysisStarted`、`dispatch_capacity_zero_after_analysis`、gate held 状態を確認しています。Task 4 は `src/parallel/tests/executor.rs:4977-5061` で `global_merge_lock` contention の実 deferral と lane release / re-promotion を確認しています。
