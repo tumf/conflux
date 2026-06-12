@@ -1128,7 +1128,7 @@ impl ParallelExecutor {
         ))
     }
 
-    async fn retry_deferred_merges_for(
+    pub(super) async fn retry_deferred_merges_for(
         &mut self,
         deferred: Vec<String>,
     ) -> std::result::Result<MergeTaskOutcome, String> {
@@ -1351,7 +1351,7 @@ impl ParallelExecutor {
         outcome
     }
 
-    async fn retry_deferred_rejection_review_for(
+    pub(super) async fn retry_deferred_rejection_review_for(
         &mut self,
         change_id: String,
     ) -> std::result::Result<MergeTaskOutcome, String> {

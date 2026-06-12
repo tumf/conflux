@@ -25,7 +25,7 @@
       `handle_merge_result_with_tx` with origin `ResolveWaitRetry` + `Deferred(auto)` and
       asserting `is_base_mutating_lane_occupied()` is false and the change is listed by
       `resolve_wait_change_ids()` afterwards (this test fails on current code)
-- [ ] Task 3: Make retry failure reporting origin-aware in
+- [x] Task 3: Make retry failure reporting origin-aware in
       `handle_merge_result_with_tx` and the retry bodies: suppress the generic
       "Background merge failed" `ParallelEvent::Error` for `ResolveWaitRetry` /
       `RejectWaitRetry` results whose retry body already emitted `ResolveFailed` /
@@ -36,7 +36,7 @@
       report per retry failure; workspace-lookup failure is operator-visible.
       verification: unit - event-channel assertions in `src/parallel/tests/executor.rs`
       covering both a resolve-failure result and a workspace-lookup failure result
-- [ ] Task 4: Lock-variant regression test (prior change Task 6d backfill): hold
+- [x] Task 4: Lock-variant regression test (prior change Task 6d backfill): hold
       `global_merge_lock` from the test, place a change in ResolveWait in shared state,
       trigger retry dispatch so the spawned retry defers with "Merge lane busy", deliver
       the result, then assert the lane is unoccupied, the change is back in ResolveWait,
@@ -44,7 +44,7 @@
       fails when the Task 2 release is reverted; runs under 1 second using the existing
       `merge_lock_test_mutex` serialization. verification: integration - test in
       `src/parallel/tests/executor.rs` (red on pre-fix code, green after)
-- [ ] Task 5: Deferred-then-retried convergence regression test (prior change Task 7
+- [x] Task 5: Deferred-then-retried convergence regression test (prior change Task 7
       backfill): after the lock holder releases and a merge-completion trigger fires
       (`handle_merge_result_with_tx` with a Merged result), assert the previously
       lane-busy-deferred change is re-promoted and its retry reaches a merged outcome
@@ -52,7 +52,7 @@
       Completion condition: test exists and fails when the Task 2 release is reverted;
       under 1 second with a controllable (instant) resolve mock.
       verification: integration - test in `src/parallel/tests/auto_resolve.rs`
-- [ ] Task 6: Gated-resolve scheduler-loop regression test (prior change Task 6a/6c
+- [x] Task 6: Gated-resolve scheduler-loop regression test (prior change Task 6a/6c
       backfill): configure the resolve command as a controllable gated mock (blocks until
       the test releases a file/oneshot gate); while the gate is held, push a change via
       the dynamic queue and assert `AnalysisStarted` fires for it within bounded
@@ -63,14 +63,14 @@
       `perform_reanalysis_and_dispatch` directly) and complete under 1 second; any
       wide-window variant is `heavy`-gated. verification: integration - tests in
       `src/parallel/tests/manual_resolve.rs` or `auto_resolve.rs`
-- [ ] Task 7: Drain/exit regression test (prior change Task 5 backfill): with a spawned
+- [x] Task 7: Drain/exit regression test (prior change Task 5 backfill): with a spawned
       base-lane retry in flight (gated so it has not reported) and queued/in-flight
       empty, assert a finite-lifetime scheduler does not exit and `is_fully_drained()`
       stays false until the retry result is delivered, then the scheduler proceeds to
       ResolveWait clearing and next-waiter promotion. Completion condition: test exists
       and exercises `pending_merge_count` accounting across the spawn window, under 1
       second. verification: integration - test in `src/parallel/tests/executor.rs`
-- [ ] Task 8: Run quality gates (verification: integration - `cargo test --lib parallel::tests::executor` plus
+- [x] Task 8: Run quality gates (verification: integration - `cargo test --lib parallel::tests::executor` plus
       `cargo fmt --check`, `cargo clippy`,
       `cargo test --lib parallel::tests::auto_resolve`,
       `cargo test --lib parallel::tests::manual_resolve`, and
