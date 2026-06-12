@@ -1656,6 +1656,8 @@ merge/resolve の結果（成功・Deferred・失敗）はスケジューラル�
 
 spawn された base-mutating lane retry の結果が Merged 以外（自動再開可能な Deferred、または失敗）である場合、スケジューラは結果受信処理において reducer の base-mutating lane 占有を解放しなければならない（MUST）。自動再開可能な Deferred で終わった change は、promotion 元の wait 種別（ResolveWait / RejectWait）に復元され、以降の merge/resolve 完了トリガまたは queue notification で再 promote 可能でなければならない（MUST）。retry の失敗が `ResolveFailed` / `RejectionReviewFailed` などの失敗イベントを伴わずに終了した場合（例: workspace 喪失）も、lane 占有を解放し、運用者可視のイベントを発行しなければならない（MUST）。lane 占有の解放漏れにより promotion が恒久的に不能となる状態（生存するタスクを伴わない Resolving / Rejecting の残留）を生じさせてはならない（MUST NOT）。retry の失敗は運用者に対して 1 回だけ報告されなければならず（MUST）、retry 本体が発行した失敗イベントに加えて汎用エラーを重複報告してはならない（MUST NOT）。
 
+spawn された retry が実マージを行わずに retry 意図を放棄して終了する場合（give-up: workspace 喪失、stale workspace path、base への既マージ検出による stale intent cleanup を含む）、retry 本体は intent 解除と同時に reducer の lane 占有を同期的に解放しなければならない（MUST）。give-up による解放では、対象 change を ResolveWait / RejectWait のいずれの wait queue にも再登録してはならない（MUST NOT）。give-up の結果が Merged 相当のトリガとしてスケジューラに届いた後、後続の ResolveWait / RejectWait waiter の promotion が可能でなければならない（MUST）。give-up 解放は terminal 遷移済みエントリおよび lane 非占有エントリに対しては no-op でなければならない（MUST）。
+
 #### Scenario: Queued change dispatched during resolve
 
 - **GIVEN** Change A のコンフリクト解決（resolve）が進行中で、queued に Change B が存在し、利用可能スロットが 1 以上ある
@@ -1742,6 +1744,22 @@ spawn された base-mutating lane retry の結果が Merged 以外（自動再�
 - **THEN** reducer の base-mutating lane 占有が解放される
 - **AND** 運用者可視のイベントが 1 回発行される
 - **AND** 後続の ResolveWait / RejectWait waiter の promotion が引き続き可能である
+
+#### Scenario: Retry give-up without a merge releases the lane without re-enqueueing
+
+- **GIVEN** Change B が ResolveWait または RejectWait から promote され、spawn された retry が workspace 喪失・stale workspace path・base への既マージ検出のいずれかにより実マージを行わず retry 意図を放棄して Merged 相当の結果を返す
+- **WHEN** retry 本体が intent を解除して give-up を確定する
+- **THEN** reducer の base-mutating lane 占有が同期的に解放される（Change B の activity が Resolving / Rejecting のまま残留しない）
+- **AND** Change B は resolve wait queue / reject wait queue のいずれにも再登録されない
+- **AND** give-up 結果の受信処理を契機として、後続の ResolveWait / RejectWait waiter が promote 可能である
+
+#### Scenario: Give-up by the lane occupant unblocks the next waiter
+
+- **GIVEN** Change B と Change C がともに ResolveWait に存在し、Change B が promote されている
+- **AND** Change B の workspace が失われており、spawn された retry が give-up する
+- **WHEN** give-up の Merged 相当結果がスケジューラの結果受信処理に届く
+- **THEN** Change C が promote され、その retry がバックグラウンドタスクとして spawn される
+- **AND** Change B は wait queue に存在せず、再 promote されない
 
 ### Requirement: Parallel Execution Event Reporting
 

@@ -2,7 +2,7 @@
 
 ## Implementation Tasks
 
-- [ ] Task 1: Add `abandon_base_mutating_lane_occupant(change_id)` to
+- [x] Task 1: Add `abandon_base_mutating_lane_occupant(change_id)` to
       `src/orchestration/state.rs`: for a non-terminal entry whose `activity` is
       `Resolving`/`Rejecting`, set `activity = Idle`, keep `wait_state = None` (no
       restore), clear blocked metadata, and remove the change from both
@@ -15,7 +15,7 @@
       RejectWait occupant). verification: unit - reducer tests in
       `src/orchestration/state.rs`
 
-- [ ] Task 2: Wire the abandon call into all four give-up sites in
+- [x] Task 2: Wire the abandon call into all four give-up sites in
       `src/parallel/queue_state.rs`, synchronously adjacent to the intent clearing and
       before the `Ok(MergeTaskOutcome::Merged)` give-up return:
       (a) `retry_deferred_merges_for` already-merged-to-base skip (~line 1137),
@@ -29,7 +29,7 @@
       the diff. verification: unit - tests in Task 3 and Task 4 fail when any site's
       abandon call is removed
 
-- [ ] Task 3: Strengthen the two workspace-lookup operator-visibility tests in
+- [x] Task 3: Strengthen the two workspace-lookup operator-visibility tests in
       `src/parallel/tests/executor.rs`
       (`resolve_retry_workspace_lookup_failure_is_operator_visible`,
       `reject_retry_workspace_lookup_failure_is_operator_visible`): set up a shared
@@ -43,7 +43,7 @@
       verification: integration - `cargo test --lib parallel::tests::executor`
       (red before fix, green after)
 
-- [ ] Task 4: Add a give-up next-waiter convergence test: queue two changes in
+- [x] Task 4: Add a give-up next-waiter convergence test: queue two changes in
       ResolveWait in shared state, promote the first, drive its spawned-retry give-up
       (missing workspace via `TestWorkspaceManager`), deliver the resulting
       `Ok(Merged)` result through `handle_merge_result_with_tx`, and assert the second
@@ -52,7 +52,7 @@
       Completion condition: test exists, fails when Task 2 is reverted, runs under 1
       second. verification: integration - test in `src/parallel/tests/executor.rs`
 
-- [ ] Task 5: Run quality gates on the final tree (verification: integration - `cargo test --lib parallel::tests`
+- [x] Task 5: Run quality gates on the final tree (verification: integration - `cargo test --lib parallel::tests`
       plus `cargo test --lib orchestration::state`,
       `cargo fmt --check`, and
       `cargo clippy --locked --all-targets --all-features -- -D warnings`; all exit 0).
