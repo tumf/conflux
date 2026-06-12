@@ -944,6 +944,29 @@ impl OrchestratorState {
         true
     }
 
+    /// Abandon a promoted base-mutating retry occupant after a give-up outcome.
+    ///
+    /// Unlike `release_base_mutating_lane_after_retry`, this does not restore the
+    /// original wait state or re-enqueue the change. Give-up paths have determined
+    /// there is no live retry work left, so the lane is simply released.
+    pub fn abandon_base_mutating_lane_occupant(&mut self, change_id: &str) -> bool {
+        let rt = self.runtime_entry(change_id);
+        if rt.is_terminal()
+            || !matches!(
+                rt.activity,
+                ActivityState::Resolving | ActivityState::Rejecting
+            )
+        {
+            return false;
+        }
+
+        rt.activity = ActivityState::Idle;
+        rt.wait_state = WaitState::None;
+        rt.clear_blocked_metadata();
+        self.clear_base_mutating_wait_queues(change_id);
+        true
+    }
+
     /// Promote exactly one pending base-mutating operation when the lane is free.
     /// Resolve waits take priority over reject waits to preserve existing merge retry semantics.
     pub fn promote_next_base_mutating_lane_waiter(&mut self) -> Option<(String, WaitState)> {
@@ -2529,6 +2552,101 @@ mod tests {
         assert!(!state.release_base_mutating_lane_after_retry("alpha", WaitState::ResolveWait));
         assert_eq!(state.resolve_wait_queue, vec!["alpha".to_string()]);
         assert!(state.reject_wait_queue.is_empty());
+        assert!(state.global_invariants_hold());
+    }
+
+    #[test]
+    fn abandon_base_mutating_lane_occupant_releases_resolve_without_requeueing() {
+        let mut state = OrchestratorState::with_mode(
+            vec!["alpha".to_string(), "beta".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "conflict".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string()));
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("alpha".to_string(), WaitState::ResolveWait))
+        );
+        state.resolve_wait_queue.push("alpha".to_string());
+        state.reject_wait_queue.push("alpha".to_string());
+        state
+            .runtime_entry("alpha")
+            .set_blocked_metadata("reason", "unblock", "snapshot");
+
+        assert!(state.abandon_base_mutating_lane_occupant("alpha"));
+
+        let runtime = state.change_runtime("alpha").expect("runtime for alpha");
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert_eq!(runtime.wait_state, WaitState::None);
+        assert_eq!(runtime.blocked_metadata, BlockedMetadata::default());
+        assert!(!state
+            .resolve_wait_change_ids()
+            .contains(&"alpha".to_string()));
+        assert!(!state
+            .reject_wait_change_ids()
+            .contains(&"alpha".to_string()));
+        assert!(!state.resolve_wait_queue.contains(&"alpha".to_string()));
+        assert!(!state.reject_wait_queue.contains(&"alpha".to_string()));
+        assert!(!state.is_base_mutating_lane_occupied());
+        assert!(state.global_invariants_hold());
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "beta".to_string(),
+            reason: "conflict".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_command(ReducerCommand::ResolveMerge("beta".to_string()));
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("beta".to_string(), WaitState::ResolveWait))
+        );
+    }
+
+    #[test]
+    fn abandon_base_mutating_lane_occupant_releases_reject_and_noops_terminal_or_non_occupant() {
+        let mut state = OrchestratorState::with_mode(
+            vec![
+                "lane".to_string(),
+                "reject".to_string(),
+                "terminal".to_string(),
+            ],
+            0,
+            ExecutionMode::Parallel,
+        );
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::ChangeArchived(
+            "lane".to_string(),
+        ));
+        state.mark_reject_wait("reject");
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "lane".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            state.promote_next_base_mutating_lane_waiter(),
+            Some(("reject".to_string(), WaitState::RejectWait))
+        );
+
+        assert!(state.abandon_base_mutating_lane_occupant("reject"));
+        let runtime = state.change_runtime("reject").expect("runtime for reject");
+        assert_eq!(runtime.activity, ActivityState::Idle);
+        assert_eq!(runtime.wait_state, WaitState::None);
+        assert!(state.reject_wait_change_ids().is_empty());
+        assert!(!state.is_base_mutating_lane_occupied());
+        assert!(state.global_invariants_hold());
+
+        state.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+            change_id: "terminal".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert!(!state.abandon_base_mutating_lane_occupant("terminal"));
+        assert!(!state.abandon_base_mutating_lane_occupant("unknown"));
         assert!(state.global_invariants_hold());
     }
 

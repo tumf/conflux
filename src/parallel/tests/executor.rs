@@ -4920,6 +4920,28 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
         Some(event_tx),
     );
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["missing-ws".to_string(), "next-ws".to_string()],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        for change_id in ["missing-ws", "next-ws"] {
+            guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+                change_id: change_id.to_string(),
+                reason: "manual conflict".to_string(),
+                auto_resumable: false,
+            });
+            guard.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()));
+        }
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("missing-ws".to_string(), WaitState::ResolveWait))
+        );
+        assert!(guard.is_base_mutating_lane_occupied());
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
     executor
         .resolve_wait_changes
         .insert("missing-ws".to_string());
@@ -4941,6 +4963,24 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
         saw_workspace_error,
         "missing-workspace retry path must emit an operator-visible Error event"
     );
+    {
+        let guard = shared.read().await;
+        assert!(!guard.is_base_mutating_lane_occupied());
+        assert!(!guard
+            .resolve_wait_change_ids()
+            .contains(&"missing-ws".to_string()));
+        assert!(!guard
+            .reject_wait_change_ids()
+            .contains(&"missing-ws".to_string()));
+        assert!(guard.global_invariants_hold());
+    }
+    assert_eq!(
+        shared
+            .write()
+            .await
+            .promote_next_base_mutating_lane_waiter(),
+        Some(("next-ws".to_string(), WaitState::ResolveWait))
+    );
 }
 
 #[tokio::test]
@@ -4954,6 +4994,31 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
         Some(event_tx),
     );
     executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            "lane".to_string(),
+            "missing-reject-ws".to_string(),
+            "next-reject-ws".to_string(),
+        ],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane".to_string()));
+        guard.mark_reject_wait("missing-reject-ws");
+        guard.mark_reject_wait("next-reject-ws");
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "lane".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("missing-reject-ws".to_string(), WaitState::RejectWait))
+        );
+        assert!(guard.is_base_mutating_lane_occupied());
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
 
     let outcome = executor
         .retry_deferred_rejection_review_for("missing-reject-ws".to_string())
@@ -4972,6 +5037,99 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
         saw_workspace_error,
         "missing RejectWait workspace path must emit an operator-visible Error event"
     );
+    {
+        let guard = shared.read().await;
+        assert!(!guard.is_base_mutating_lane_occupied());
+        assert!(!guard
+            .resolve_wait_change_ids()
+            .contains(&"missing-reject-ws".to_string()));
+        assert!(!guard
+            .reject_wait_change_ids()
+            .contains(&"missing-reject-ws".to_string()));
+        assert!(guard.global_invariants_hold());
+    }
+    assert_eq!(
+        shared
+            .write()
+            .await
+            .promote_next_base_mutating_lane_waiter(),
+        Some(("next-reject-ws".to_string(), WaitState::RejectWait))
+    );
+}
+
+#[tokio::test]
+async fn resolve_give_up_promotes_next_waiter_without_user_action() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.workspace_manager = Box::new(TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0))));
+    let (merge_result_tx, mut merge_result_rx) = mpsc::channel(8);
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["first".to_string(), "second".to_string()],
+        0,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        for change_id in ["first", "second"] {
+            guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+                change_id: change_id.to_string(),
+                reason: "manual conflict".to_string(),
+                auto_resumable: false,
+            });
+            guard.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()));
+        }
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some(("first".to_string(), WaitState::ResolveWait))
+        );
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.resolve_wait_changes.insert("first".to_string());
+
+    let outcome = executor
+        .retry_deferred_merges_for(vec!["first".to_string()])
+        .await
+        .or_fail("missing first workspace gives up as merged trigger");
+    assert_eq!(outcome, MergeTaskOutcome::Merged);
+
+    let merged = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "first".to_string(),
+                workspace_name: "ws-first".to_string(),
+                origin: MergeResultOrigin::ResolveWaitRetry,
+                outcome: Ok(MergeTaskOutcome::Merged),
+            },
+            &merge_result_tx,
+        )
+        .await;
+    assert!(merged);
+
+    {
+        let guard = shared.read().await;
+        assert_eq!(
+            guard.base_mutating_lane_occupant(),
+            Some("second".to_string())
+        );
+        assert!(!guard
+            .resolve_wait_change_ids()
+            .contains(&"first".to_string()));
+        assert!(!guard
+            .reject_wait_change_ids()
+            .contains(&"first".to_string()));
+        assert!(guard.global_invariants_hold());
+    }
+    let retry_result = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        merge_result_rx.recv(),
+    )
+    .await
+    .or_fail("second retry result should arrive")
+    .or_fail("second retry result channel should remain open");
+    assert_eq!(retry_result.change_id, "second");
+    assert_eq!(retry_result.origin, MergeResultOrigin::ResolveWaitRetry);
 }
 
 #[tokio::test]

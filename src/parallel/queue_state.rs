@@ -184,6 +184,19 @@ impl ParallelExecutor {
         }
     }
 
+    async fn abandon_base_mutating_lane_occupant_for_give_up(&mut self, change_id: &str) {
+        if let Some(shared) = &self.shared_orchestrator_state {
+            let mut guard = shared.write().await;
+            let released = guard.abandon_base_mutating_lane_occupant(change_id);
+            if released {
+                info!(
+                    change_id = %change_id,
+                    "Released base-mutating lane after spawned retry give-up"
+                );
+            }
+        }
+    }
+
     async fn apply_rejection_review_event_in_shared_state(&mut self, event: &ExecutionEvent) {
         if let Some(shared) = &self.shared_orchestrator_state {
             let mut guard = shared.write().await;
@@ -1140,6 +1153,8 @@ impl ParallelExecutor {
                     change_id
                 );
                 self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                    .await;
                 continue;
             }
 
@@ -1168,6 +1183,8 @@ impl ParallelExecutor {
                     send_event(&self.event_tx, ParallelEvent::Error { message }).await;
                     // Remove from deferred set; the workspace is gone, nothing to retry.
                     self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                    self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                        .await;
                     outcome = Ok(MergeTaskOutcome::Merged);
                     continue;
                 }
@@ -1198,6 +1215,8 @@ impl ParallelExecutor {
                     "Deferred merge retry workspace path is stale; clearing retry intent"
                 );
                 self.clear_resolve_wait_intent_for_outcome(&change_id).await;
+                self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                    .await;
                 outcome = Ok(MergeTaskOutcome::Merged);
                 continue;
             }
@@ -1379,6 +1398,8 @@ impl ParallelExecutor {
                 warn!("{}", message);
                 send_event(&self.event_tx, ParallelEvent::Error { message }).await;
                 self.clear_reject_wait_intent_for_success(&change_id).await;
+                self.abandon_base_mutating_lane_occupant_for_give_up(&change_id)
+                    .await;
                 return Ok(MergeTaskOutcome::Merged);
             }
             Err(e) => {
