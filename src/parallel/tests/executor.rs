@@ -4617,6 +4617,7 @@ async fn test_queue_notification_triggers_reanalysis() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_defers_when_change_not_archived() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -4719,6 +4720,7 @@ async fn test_attempt_merge_defers_when_change_not_archived() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_succeeds_when_change_archived() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -5230,6 +5232,9 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
 
 #[tokio::test]
 async fn retry_lane_busy_release_allows_subsequent_repromotion() {
+    // Serialize against other suites that manipulate the global merge lock so
+    // their `try_lock` contention checks do not race this test's held guard.
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     let config = create_test_config();
     let repo_root = PathBuf::from("/tmp/test-repo");
     let mut executor = ParallelExecutor::new(repo_root, config, None);
@@ -7267,6 +7272,7 @@ async fn test_on_merged_hook_execution() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_deferred_when_resolve_active() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7654,6 +7660,7 @@ async fn test_merge_proceeds_when_archive_complete() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_attempt_merge_errors_on_detached_head() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use tempfile::TempDir;
     use tokio::sync::mpsc;

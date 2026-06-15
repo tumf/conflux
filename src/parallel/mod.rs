@@ -88,6 +88,19 @@ fn global_merge_lock() -> &'static Mutex<()> {
     GLOBAL_MERGE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Test-only serialization mutex for suites that manipulate the
+/// [`global_merge_lock`] directly (acquiring it to exercise contention paths).
+///
+/// Such tests race against each other when the harness runs them concurrently:
+/// one test holding the global lock makes another's `try_lock` fail. All tests
+/// that touch the global merge lock must hold this mutex first so they run
+/// serially regardless of which module they live in.
+#[cfg(test)]
+pub(crate) fn merge_lock_test_mutex() -> &'static Mutex<()> {
+    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
 fn active_post_archive_merges() -> &'static StdMutex<HashSet<String>> {
     ACTIVE_POST_ARCHIVE_MERGES.get_or_init(|| StdMutex::new(HashSet::new()))
 }

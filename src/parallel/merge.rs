@@ -1073,13 +1073,9 @@ mod tests {
     };
     use std::path::Path;
     use std::sync::atomic::Ordering;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
 
-    fn merge_lock_test_mutex() -> &'static tokio::sync::Mutex<()> {
-        static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
+    use crate::parallel::merge_lock_test_mutex;
 
     async fn init_test_git_repo(path: &Path) {
         tokio::process::Command::new("git")
@@ -1172,6 +1168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attempt_merge_dirty_base_remains_manual_deferred() {
+        let _test_guard = merge_lock_test_mutex().lock().await;
         let temp = tempfile::TempDir::new().expect("tempdir");
         tokio::process::Command::new("git")
             .args(["init", "-b", "main"])
