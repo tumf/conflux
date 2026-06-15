@@ -28,6 +28,21 @@ pub(super) struct QueueReconciliationOutcome {
     pub repair_added: usize,
 }
 
+fn analysis_attempt_id(
+    iteration: u32,
+    trigger: impl std::fmt::Display,
+    queued: &[crate::openspec::Change],
+) -> String {
+    let mut queued_ids: Vec<&str> = queued.iter().map(|change| change.id.as_str()).collect();
+    queued_ids.sort_unstable();
+    format!(
+        "iteration={};trigger={};queued={}",
+        iteration,
+        trigger,
+        queued_ids.join(",")
+    )
+}
+
 impl QueueReconciliationOutcome {
     #[cfg(test)]
     pub fn total_added(self) -> usize {
@@ -2561,10 +2576,12 @@ impl ParallelExecutor {
             in_flight.len(),
             effective_reason
         );
+        let attempt_id = analysis_attempt_id(iteration, effective_reason, queued);
         send_event(
             &self.event_tx,
             ParallelEvent::AnalysisStarted {
                 remaining_changes: queued.len(),
+                attempt_id,
             },
         )
         .await;

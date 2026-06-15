@@ -98,16 +98,22 @@ impl AppState {
         );
     }
 
-    pub(crate) fn handle_analysis_started(&mut self, remaining_changes: usize) {
-        if self.last_logged_analysis_remaining == Some(remaining_changes) {
+    pub(crate) fn handle_analysis_started(&mut self, remaining_changes: usize, attempt_id: String) {
+        let signature = (remaining_changes, attempt_id);
+        if self
+            .last_logged_analysis_signature
+            .as_ref()
+            .is_some_and(|last| last == &signature)
+        {
             tracing::debug!(
                 remaining_changes = remaining_changes,
+                attempt_id = %signature.1,
                 "Suppressing repeated analysis-started TUI log"
             );
             return;
         }
 
-        self.last_logged_analysis_remaining = Some(remaining_changes);
+        self.last_logged_analysis_signature = Some(signature);
         self.add_log(LogEntry::info(format!(
             "Re-analyzing queued changes for dispatch (remaining: {})",
             remaining_changes
@@ -239,8 +245,8 @@ mod tests {
     fn repeated_analysis_started_with_same_remaining_count_logs_once() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
 
-        app.handle_analysis_started(1);
-        app.handle_analysis_started(1);
+        app.handle_analysis_started(1, "attempt-a".to_string());
+        app.handle_analysis_started(1, "attempt-a".to_string());
 
         assert_eq!(count_analysis_logs(&app, 1), 1);
     }
@@ -249,8 +255,8 @@ mod tests {
     fn analysis_started_logs_again_when_remaining_count_changes() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
 
-        app.handle_analysis_started(1);
-        app.handle_analysis_started(2);
+        app.handle_analysis_started(1, "attempt-a".to_string());
+        app.handle_analysis_started(2, "attempt-b".to_string());
 
         assert_eq!(count_analysis_logs(&app, 1), 1);
         assert_eq!(count_analysis_logs(&app, 2), 1);
@@ -260,9 +266,33 @@ mod tests {
     fn analysis_started_logs_again_after_progress_reset() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
 
-        app.handle_analysis_started(1);
+        app.handle_analysis_started(1, "attempt-a".to_string());
         app.handle_progress_updated("change-a".to_string(), 1, 1);
-        app.handle_analysis_started(1);
+        app.handle_analysis_started(1, "attempt-a".to_string());
+
+        assert_eq!(count_analysis_logs(&app, 1), 2);
+    }
+
+    #[test]
+    fn distinct_same_count_analysis_attempts_both_log_after_merge_wait_queueing() {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ]);
+
+        app.handle_analysis_started(1, "iteration=1;trigger=initial;queued=change-a".to_string());
+        let _ = app.handle_merge_deferred("change-a".to_string(), "merge wait".to_string(), true);
+        app.handle_analysis_started(1, "iteration=1;trigger=queue;queued=change-b".to_string());
+
+        assert_eq!(count_analysis_logs(&app, 1), 2);
+    }
+
+    #[test]
+    fn same_count_analysis_with_distinct_attempt_id_logs_again() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_analysis_started(1, "attempt-a".to_string());
+        app.handle_analysis_started(1, "attempt-b".to_string());
 
         assert_eq!(count_analysis_logs(&app, 1), 2);
     }

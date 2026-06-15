@@ -497,9 +497,16 @@ pub enum ExecutionEvent {
     },
 
     // Analysis events (parallel mode)
-    /// Analysis started for remaining changes
+    /// Analysis started for remaining changes.
+    ///
+    /// `attempt_id` is observability-only metadata used by UIs to distinguish
+    /// separate scheduler analysis attempts that happen to have the same
+    /// remaining count. It must not be used as workflow-control state.
     #[allow(dead_code)]
-    AnalysisStarted { remaining_changes: usize },
+    AnalysisStarted {
+        remaining_changes: usize,
+        attempt_id: String,
+    },
     /// Analysis output (streaming)
     #[allow(dead_code)]
     AnalysisOutput { output: String, iteration: u32 },
