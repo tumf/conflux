@@ -268,10 +268,10 @@ pub struct AppState {
     ///
     /// Runtime-only observability dedupe; it is not workflow-control state.
     last_merge_deferred_diagnostic: Option<MergeDeferredDiagnosticSignature>,
-    /// Last `AnalysisStarted` remaining count that produced a TUI log entry.
+    /// Last `AnalysisStarted` attempt signature that produced a TUI log entry.
     ///
     /// Runtime-only observability dedupe; it is not workflow-control state.
-    last_logged_analysis_remaining: Option<usize>,
+    last_logged_analysis_signature: Option<(usize, String)>,
 }
 
 // ============================================================================
@@ -439,7 +439,7 @@ impl AppState {
             tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
             last_merge_deferred_diagnostic: None,
-            last_logged_analysis_remaining: None,
+            last_logged_analysis_signature: None,
         }
     }
 
@@ -1085,7 +1085,7 @@ impl AppState {
     }
 
     pub(crate) fn reset_analysis_log_dedupe(&mut self) {
-        self.last_logged_analysis_remaining = None;
+        self.last_logged_analysis_signature = None;
     }
 
     /// Start processing selected changes

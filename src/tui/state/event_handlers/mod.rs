@@ -141,9 +141,10 @@ impl AppState {
                 output,
                 iteration,
             } => self.handle_resolve_output(change_id, output, iteration),
-            OrchestratorEvent::AnalysisStarted { remaining_changes } => {
-                self.handle_analysis_started(remaining_changes)
-            }
+            OrchestratorEvent::AnalysisStarted {
+                remaining_changes,
+                attempt_id,
+            } => self.handle_analysis_started(remaining_changes, attempt_id),
             OrchestratorEvent::Log(entry) => self.handle_log(entry),
             OrchestratorEvent::Warning { title, message } => self.handle_warning(title, message),
             OrchestratorEvent::ParallelStartRejected { change_ids, reason } => {
