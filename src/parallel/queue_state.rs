@@ -371,12 +371,25 @@ impl ParallelExecutor {
         blockers: &[(String, DependencyTargetClass)],
     ) {
         for (dep_id, class) in blockers {
-            let message = format!(
-                "Change '{}' blocked by {} dependency '{}' and will remain queued",
-                change_id,
-                class.as_str(),
-                dep_id
-            );
+            let message = if matches!(class, DependencyTargetClass::Archived) {
+                match self.effective_dependency_base().await {
+                    Ok(effective_base) => format!(
+                        "Change '{}' blocked by archived-but-not-merged dependency '{}' on effective dependency base '{}' and will remain queued",
+                        change_id, dep_id, effective_base
+                    ),
+                    Err(err) => format!(
+                        "Change '{}' blocked by archived dependency '{}' while effective dependency base could not be determined ({}) and will remain queued",
+                        change_id, dep_id, err
+                    ),
+                }
+            } else {
+                format!(
+                    "Change '{}' blocked by {} dependency '{}' and will remain queued",
+                    change_id,
+                    class.as_str(),
+                    dep_id
+                )
+            };
             match class {
                 DependencyTargetClass::Missing
                 | DependencyTargetClass::Rejected
@@ -384,7 +397,7 @@ impl ParallelExecutor {
                 DependencyTargetClass::Queued
                 | DependencyTargetClass::InFlight
                 | DependencyTargetClass::ActiveButNotQueued => info!("{}", message),
-                DependencyTargetClass::Archived => debug!("{}", message),
+                DependencyTargetClass::Archived => info!("{}", message),
             }
             if matches!(
                 class,
@@ -397,28 +410,67 @@ impl ParallelExecutor {
         }
     }
 
-    /// Check if a dependency is resolved (merged to base branch).
+    /// Select the repository-visible base used for archived dependency merge checks.
     ///
-    /// A dependency is considered resolved if its archive commit is present in the base branch.
-    /// This indicates that the dependency's artifacts are available for dependent changes.
-    pub(super) async fn is_dependency_resolved(&self, dep_id: &str) -> Result<bool> {
+    /// Ordinary runs use the original branch captured at scheduler startup. Stacked
+    /// orchestration can advance a separate integration branch after startup; when the
+    /// repository is currently on such a branch, that current branch is the effective
+    /// dependency base for dispatch decisions.
+    async fn effective_dependency_base(&self) -> Result<String> {
         let original_branch = self
             .workspace_manager
             .ensure_original_branch_initialized()
             .await
             .map_err(OrchestratorError::from_vcs_error)?;
 
-        // Check if the archive commit for this dependency exists in the base branch
-        match crate::execution::state::is_merged_to_base(dep_id, &self.repo_root, &original_branch)
+        match crate::vcs::git::commands::get_current_branch(&self.repo_root).await {
+            Ok(Some(current_branch)) if current_branch != original_branch => {
+                debug!(
+                    original_branch = %original_branch,
+                    effective_dependency_base = %current_branch,
+                    "Using current integration branch as effective dependency base"
+                );
+                Ok(current_branch)
+            }
+            Ok(Some(_)) | Ok(None) => Ok(original_branch),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    original_branch = %original_branch,
+                    "Failed to determine current branch for dependency base; using original branch"
+                );
+                Ok(original_branch)
+            }
+        }
+    }
+
+    /// Check if a dependency is resolved (merged to the effective dependency base).
+    ///
+    /// A dependency is considered resolved if its archive commit is present in the
+    /// effective base branch/tree and its active change directory is absent there.
+    /// This preserves the archive-only safety guard while allowing stacked runs to
+    /// unblock dependents once the dependency is merged into the integration branch.
+    #[allow(dead_code)]
+    pub(super) async fn is_dependency_resolved(&self, dep_id: &str) -> Result<bool> {
+        let (is_resolved, _) = self.is_dependency_resolved_with_base(dep_id).await?;
+        Ok(is_resolved)
+    }
+
+    async fn is_dependency_resolved_with_base(&self, dep_id: &str) -> Result<(bool, String)> {
+        let effective_base = self.effective_dependency_base().await?;
+
+        match crate::execution::state::is_merged_to_base(dep_id, &self.repo_root, &effective_base)
             .await
         {
-            Ok(is_merged) => Ok(is_merged),
+            Ok(is_merged) => Ok((is_merged, effective_base)),
             Err(e) => {
                 warn!(
-                    "Failed to check if dependency '{}' is merged to base: {}, assuming not resolved",
-                    dep_id, e
+                    dependency = %dep_id,
+                    effective_dependency_base = %effective_base,
+                    error = %e,
+                    "Failed to check if dependency is merged to effective base; assuming not resolved"
                 );
-                Ok(false)
+                Ok((false, effective_base))
             }
         }
     }
@@ -569,9 +621,26 @@ impl ParallelExecutor {
                         }
                     }
 
-                    match self.is_dependency_resolved(dep_id).await {
-                        Ok(true) => {}
-                        Ok(false) => {
+                    match self.is_dependency_resolved_with_base(dep_id).await {
+                        Ok((true, effective_base)) => {
+                            if matches!(class, DependencyTargetClass::Archived) {
+                                debug!(
+                                    change_id = %change_id,
+                                    dependency = %dep_id,
+                                    effective_dependency_base = %effective_base,
+                                    "Archived dependency is merged into effective dependency base"
+                                );
+                            }
+                        }
+                        Ok((false, effective_base)) => {
+                            if matches!(class, DependencyTargetClass::Archived) {
+                                info!(
+                                    change_id = %change_id,
+                                    dependency = %dep_id,
+                                    effective_dependency_base = %effective_base,
+                                    "Archived dependency is not merged into effective dependency base; dispatch remains blocked"
+                                );
+                            }
                             unresolved_deps.push(dep_id.clone());
                             blockers.push((dep_id.clone(), class));
                         }

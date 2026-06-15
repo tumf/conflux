@@ -3054,6 +3054,102 @@ async fn test_single_queued_archived_dependency_can_dispatch_after_merge() {
 }
 
 #[tokio::test]
+async fn test_archived_dependency_uses_effective_integration_base_after_startup() {
+    let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let archived_dir = repo_dir
+        .path()
+        .join("openspec/changes/archive/2026-05-13-policy");
+    std::fs::create_dir_all(&archived_dir).or_fail("unexpected error");
+    std::fs::write(archived_dir.join("proposal.md"), "# Archived policy\n")
+        .or_fail("unexpected error");
+
+    let config = create_test_config();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let analysis_result = crate::analyzer::AnalysisResult {
+        order: vec!["route".to_string()],
+        dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    let initially_blocked = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+    assert!(
+        initially_blocked.is_empty(),
+        "archived-but-not-merged dependency should capture startup branch and remain blocked"
+    );
+    assert_eq!(
+        drain_dependency_events(&mut rx, "route"),
+        vec!["blocked:policy".to_string()]
+    );
+
+    let startup_branch_has_archive =
+        crate::execution::state::is_merged_to_base("policy", repo_dir.path(), "main")
+            .await
+            .or_fail("unexpected error");
+    assert!(
+        !startup_branch_has_archive,
+        "test fixture must prove the original startup branch lacks the archive merge before integration advances"
+    );
+
+    Command::new("git")
+        .args(["checkout", "-b", "integration"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Archive policy on integration"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let integration_has_archive =
+        crate::execution::state::is_merged_to_base("policy", repo_dir.path(), "integration")
+            .await
+            .or_fail("unexpected error");
+    assert!(
+        integration_has_archive,
+        "test fixture must prove the effective integration base contains the archive merge"
+    );
+
+    let selected = executor
+        .select_changes_for_dispatch(&analysis_result, 1, &in_flight)
+        .await;
+
+    assert_eq!(
+        selected,
+        vec!["route".to_string()],
+        "archived dependency merged into the effective integration base should unblock dispatch even when startup branch is unchanged"
+    );
+    assert_eq!(
+        drain_dependency_events(&mut rx, "route"),
+        vec!["resolved".to_string()],
+        "effective-base merge should resolve the previous archived dependency blocker"
+    );
+
+    let main_has_archive =
+        crate::execution::state::is_merged_to_base("policy", repo_dir.path(), "main")
+            .await
+            .or_fail("unexpected error");
+    assert!(
+        !main_has_archive,
+        "test fixture must prove the original startup branch still lacks the archive merge"
+    );
+}
+
+#[tokio::test]
 async fn dependency_resolving_dependents_wait_until_merged() {
     let repo_dir = tempfile::TempDir::new().or_fail("unexpected error");
     init_git_repo(repo_dir.path()).await;
