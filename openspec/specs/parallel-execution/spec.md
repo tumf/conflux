@@ -1206,7 +1206,9 @@ re-analysis の起動トリガは、キュー通知・デバウンスタイマ�
 
 スケジューラは reducer-visible queued work が存在するのに re-analysis または dispatch を開始しない場合、その理由を観測可能なログまたはイベントとして出力しなければならない（SHALL）。
 
-<!-- Expected canonical result after archive: `parallel-execution` will require re-analysis and diagnostics to remain active for queued dispatchable work during resolve, while final apply dispatch remains capacity-gated. -->
+TUI は distinct な re-analysis attempt を operator-visible に表示しなければならない（SHALL）。同じ attempt の重複 delivery は抑止してよいが、`remaining_changes` が同じという理由だけで別 attempt の analysis-started 表示を抑止してはならない（MUST NOT）。
+
+<!-- Expected canonical result after archive: `parallel-execution` will require re-analysis and diagnostics to remain active for queued dispatchable work during resolve, while TUI analysis-started dedupe distinguishes distinct attempts instead of only remaining count. -->
 
 #### Scenario: キュー変化でre-analysisが起動する
 
@@ -1266,6 +1268,20 @@ re-analysis の起動トリガは、キュー通知・デバウンスタイマ�
 - **AND** ordinary apply dispatch は実行されない
 - **AND** スロットが空いた時点で dispatch eligibility が再評価される
 - **AND** no available slots または capacity gated の理由がログまたはイベントで観測できる
+
+#### Scenario: MergeWait後の同数analysis-started表示は抑止されない
+
+- **GIVEN** change A の analysis-started 表示が `remaining_changes = 1` で記録済みである
+- **AND** change A は `MergeWait` に入っている
+- **WHEN** ユーザーが別 change B を queued にし、debounce 後に別の re-analysis attempt が `remaining_changes = 1` で開始される
+- **THEN** TUI は change B の re-analysis attempt に対応する analysis-started 表示を出す
+- **AND** `remaining_changes` が前回と同じであることだけを理由に表示を抑止しない
+
+#### Scenario: 同一analysis-started attemptの重複表示は抑止される
+
+- **GIVEN** 1つの re-analysis attempt に対する analysis-started event が配送済みである
+- **WHEN** 同一 attempt を表す analysis-started event が重複配送される
+- **THEN** TUI は同じ attempt の user-visible analysis-started log を重複表示しない
 
 ### Requirement: In-flight tracking and slot-based dispatch
 
