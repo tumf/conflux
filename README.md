@@ -67,6 +67,12 @@ cflx init
 
 # Install bundled skills
 cflx install-skills
+
+# Install bundled skills for Claude Code
+cflx install-skills --claude
+
+# Install bundled skills globally for Claude Code
+cflx install-skills --claude --global
 ```
 
 ## Configuration
@@ -87,7 +93,7 @@ TUI user preferences are intentionally separate from orchestration config. The d
 }
 ```
 
-Generate templates:
+Generate config templates:
 
 ```bash
 cflx init
@@ -96,7 +102,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-For detailed configuration examples, hooks, workspace execution, and command queue explanations, see the English README.
+For detailed configuration examples, hooks, workspace execution, and command queue explanations, see [docs/guides/USAGE.md](docs/guides/USAGE.md).
 
 ## Installation
 
@@ -110,7 +116,7 @@ cargo install cflx
 |----------|-------------|
 | [QUICKSTART.md](QUICKSTART.md) | Initial setup |
 | [Server Mode Guide (English)](docs/guides/SERVER.md) | Server mode, remote TUI, Web UI, REST API, background service |
-| [README.md](README.md) | Full documentation (English) |
+| [README.ja.md](README.ja.md) | Full documentation (Japanese) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Usage examples |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |
 | [docs/guides/DEVELOPMENT.md](docs/guides/DEVELOPMENT.md) | Development guide |
