@@ -699,6 +699,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -820,6 +821,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -932,6 +934,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1093,6 +1096,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1309,6 +1313,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1517,6 +1522,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -1731,6 +1737,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_resolve_wait_base_dirty: None,
         queue_reconciliation_diagnostics_seen: HashSet::new(),
         no_analysis_diagnostics_seen: HashSet::new(),
+        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
         #[cfg(test)]
         analyze_failure_diagnostics_seen: HashSet::new(),
         dependency_blocker_diagnostics_seen: HashSet::new(),
@@ -2336,6 +2343,67 @@ fn make_test_change(id: &str) -> crate::openspec::Change {
         dependencies: Vec::new(),
         metadata: crate::openspec::ProposalMetadata::default(),
     }
+}
+
+#[tokio::test]
+async fn capacity_zero_dispatch_diagnostic_guard_suppresses_identical_keys_and_emits_changed_keys()
+{
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut executor = ParallelExecutor::new(
+        PathBuf::from("/tmp/cflx-capacity-zero-dedup-unit"),
+        create_test_config(),
+        Some(tx),
+    );
+    let queued = vec![make_test_change("change-a")];
+    let in_flight = HashSet::from(["active-apply".to_string()]);
+    let order = vec!["change-a".to_string()];
+
+    executor
+        .emit_capacity_zero_dispatch_diagnostic_once(&queued, &in_flight, 1, &order)
+        .await;
+    executor
+        .emit_capacity_zero_dispatch_diagnostic_once(&queued, &in_flight, 1, &order)
+        .await;
+
+    let changed_order = vec!["change-b".to_string()];
+    executor
+        .emit_capacity_zero_dispatch_diagnostic_once(&queued, &in_flight, 1, &changed_order)
+        .await;
+    let changed_parallelism = 2;
+    executor
+        .emit_capacity_zero_dispatch_diagnostic_once(
+            &queued,
+            &in_flight,
+            changed_parallelism,
+            &order,
+        )
+        .await;
+
+    drop(executor);
+
+    let mut diagnostics = Vec::new();
+    while let Some(event) = rx.recv().await {
+        if let ExecutionEvent::Log(entry) = event {
+            if entry
+                .message
+                .contains("dispatch_capacity_zero_after_analysis")
+            {
+                diagnostics.push(entry.message);
+            }
+        }
+    }
+
+    assert_eq!(
+        diagnostics.len(),
+        3,
+        "initial signature plus two changed signatures should emit exactly three diagnostics; saw {diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|message| message.contains("max_parallelism=2")),
+        "changed max_parallelism should emit a fresh diagnostic; saw {diagnostics:?}"
+    );
 }
 
 fn ready_analysis_result<'a>(
