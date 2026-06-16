@@ -44,6 +44,14 @@ In short, Conflux is an **orchestrator for running autonomous, specification-dri
 | TUI | `cflx` |
 | Headless execution | `cflx run` |
 
+Useful TUI keys:
+
+| Key | Action |
+|-----|--------|
+| `Space` | Mark or unmark changes |
+| `F5` | Start, resume, retry, or continue processing |
+| `x` | Queue eligible `not queued` changes while processing is running |
+
 For server mode, remote TUI, REST API, and `cflx service`, see the [Server Mode Guide (English)](docs/guides/SERVER.md).
 
 ## Quick Start
