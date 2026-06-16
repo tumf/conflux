@@ -160,30 +160,21 @@ The scheduler SHALL preserve dependency-blocked state for queued changes that ca
 
 A blocker signature SHALL include at least the blocked change id, dependency ids, and dependency target classes. When the signature changes, the scheduler SHALL emit a fresh diagnostic and re-evaluate dispatch using the updated dependency evidence.
 
-#### Scenario: Repeated rejected dependency blocker does not spam logs
+Dispatch-capacity-zero diagnostics SHALL be treated as operator-visible diagnostics subject to the same stability and non-spamming rule. The signature for a capacity-zero diagnostic SHALL include at least the analysis order (or queued change ids), `queued.len()`, `in_flight.len()`, and `max_parallelism`. When any component of the signature changes, the scheduler SHALL emit a fresh diagnostic.
 
-- **GIVEN** queued change `alpha` depends on rejected dependency `beta`
-- **AND** the scheduler has already emitted an operator-visible diagnostic for blocker signature `alpha -> beta [rejected]`
-- **WHEN** later scheduler loops observe the same blocker signature
-- **THEN** `alpha` remains dependency-blocked
-- **AND** no duplicate operator-visible warn/error diagnostic for the same signature is appended
+#### Scenario: Repeated identical capacity-zero state does not spam logs
 
-#### Scenario: Changed blocker signature emits a fresh diagnostic
+- **GIVEN** the scheduler has already emitted the `dispatch_capacity_zero_after_analysis` diagnostic for a given `(order, queued.len(), in_flight.len(), max_parallelism)` signature
+- **WHEN** later scheduler re-analysis loops observe the identical zero-capacity signature
+- **THEN** no duplicate operator-visible `dispatch_capacity_zero_after_analysis` log is appended
+- **AND** dispatch remains suppressed
 
-- **GIVEN** queued change `alpha` was previously blocked by dependency `beta [missing]`
-- **WHEN** repository-visible evidence changes so `beta` is now `rejected`
-- **THEN** the scheduler emits a fresh diagnostic for `beta [rejected]`
-- **AND** dispatch remains blocked
+#### Scenario: Changed capacity-zero signature emits a fresh diagnostic
 
-#### Scenario: Archived blocker re-evaluates dispatch eligibility
-
-- **GIVEN** queued change `alpha` was previously blocked by dependency `beta [queued]`
-- **WHEN** repository-visible evidence changes so `beta` is archived but not merged to base
-- **THEN** `alpha` remains dependency-blocked
-- **AND** no duplicate operator-visible diagnostic is emitted unless the blocker signature changes
-- **WHEN** repository-visible base-branch evidence later shows `beta` is merged
-- **THEN** the scheduler treats `beta` as satisfied
-- **AND** `alpha` becomes eligible for dispatch if no other unresolved dependency blockers remain
+- **GIVEN** the scheduler previously emitted `dispatch_capacity_zero_after_analysis` for a signature with `in_flight.len() == 3`
+- **WHEN** an in-flight change completes and `in_flight.len()` decreases to 2 while `queued` work remains
+- **THEN** the scheduler emits a fresh `dispatch_capacity_zero_after_analysis` diagnostic reflecting the updated signature
+- **AND** ordinary apply dispatch remains suppressed until a positive slot count is observed
 
 ### Requirement: Parallel Event Bridge for TUI
 

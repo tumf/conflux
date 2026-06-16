@@ -329,6 +329,94 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
 }
 
 #[tokio::test]
+async fn repeated_capacity_zero_does_not_spam_dispatch_diagnostic() {
+    let temp_dir = TempDir::new().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+
+    let mut queued = vec![test_change("queued-apply")];
+    let mut in_flight = HashSet::from(["active-apply".to_string()]);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard =
+        WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
+
+    for iteration in 1..=2 {
+        let (should_break, returned_iteration) = executor
+            .perform_reanalysis_and_dispatch(
+                &mut queued,
+                &mut in_flight,
+                1,
+                iteration,
+                ReanalysisReason::ResolveCompletion,
+                &analysis_result,
+                semaphore.clone(),
+                &mut join_set,
+                &mut cleanup_guard,
+            )
+            .await
+            .expect("re-analysis should not fail");
+
+        assert!(!should_break);
+        assert_eq!(
+            returned_iteration, iteration,
+            "suppressed dispatch must not advance iteration"
+        );
+    }
+
+    assert_eq!(
+        queued.len(),
+        1,
+        "queued change remains pending while capacity is zero"
+    );
+    assert_eq!(
+        in_flight.len(),
+        1,
+        "test must keep capacity at zero across repeated analysis iterations"
+    );
+    assert!(
+        join_set.is_empty(),
+        "no workspace task should be spawned at zero capacity"
+    );
+
+    let mut analysis_started_count = 0;
+    let mut apply_started_count = 0;
+    let mut capacity_diagnostics = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AnalysisStarted { .. } => analysis_started_count += 1,
+            ExecutionEvent::ApplyStarted { .. } => apply_started_count += 1,
+            ExecutionEvent::Log(entry)
+                if entry
+                    .message
+                    .contains("dispatch_capacity_zero_after_analysis") =>
+            {
+                capacity_diagnostics.push(entry.message);
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        analysis_started_count >= 2,
+        "expected at least two re-analysis iterations; saw {analysis_started_count}"
+    );
+    assert_eq!(
+        apply_started_count, 0,
+        "ordinary apply must remain capacity-gated"
+    );
+    assert_eq!(
+        capacity_diagnostics.len(),
+        1,
+        "identical zero-capacity signatures should emit one operator-visible diagnostic; saw {capacity_diagnostics:?}"
+    );
+}
+
+#[tokio::test]
 async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
     let temp_dir = TempDir::new().unwrap();
     init_minimal_git_repo(temp_dir.path());

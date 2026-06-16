@@ -2398,6 +2398,61 @@ impl ParallelExecutor {
         .await;
     }
 
+    pub(super) async fn emit_capacity_zero_dispatch_diagnostic_once(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        analysis_order: &[String],
+    ) {
+        const REASON: &str = "dispatch_capacity_zero_after_analysis";
+
+        let signature_order = if analysis_order.is_empty() {
+            let mut queued_ids = queued
+                .iter()
+                .map(|change| change.id.clone())
+                .collect::<Vec<_>>();
+            queued_ids.sort();
+            queued_ids
+        } else {
+            analysis_order.to_vec()
+        };
+
+        let diagnostic_key = (
+            signature_order.clone(),
+            queued.len(),
+            in_flight.len(),
+            max_parallelism,
+            REASON.to_string(),
+        );
+        if !self
+            .dispatch_capacity_zero_diagnostics_seen
+            .insert(diagnostic_key)
+        {
+            debug!(
+                reason = REASON,
+                order = ?signature_order,
+                local_queued = queued.len(),
+                in_flight = in_flight.len(),
+                max_parallelism,
+                "Suppressing repeated capacity-zero dispatch diagnostic"
+            );
+            return;
+        }
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::Log(LogEntry::info(format!(
+                "Dispatch suppressed after dependency analysis: reason={}, local_queued={}, in_flight={}, max_parallelism={}",
+                REASON,
+                queued.len(),
+                in_flight.len(),
+                max_parallelism
+            ))),
+        )
+        .await;
+    }
+
     /// Perform reanalysis and dispatch changes if conditions are met.
     ///
     /// # Arguments
@@ -2622,14 +2677,11 @@ impl ParallelExecutor {
                 order = ?analysis_result.order,
                 "Dependency analysis completed, but dispatch is suppressed because no execution slots are available"
             );
-            send_event(
-                &self.event_tx,
-                ParallelEvent::Log(LogEntry::info(format!(
-                    "Dispatch suppressed after dependency analysis: reason=dispatch_capacity_zero_after_analysis, local_queued={}, in_flight={}, max_parallelism={}",
-                    queued.len(),
-                    in_flight.len(),
-                    max_parallelism
-                ))),
+            self.emit_capacity_zero_dispatch_diagnostic_once(
+                queued,
+                in_flight,
+                max_parallelism,
+                &analysis_result.order,
             )
             .await;
             self.emit_no_analysis_diagnostic(
