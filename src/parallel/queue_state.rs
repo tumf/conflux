@@ -18,6 +18,7 @@ use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
     run_rejection_review, RejectionReviewVerdict,
 };
+use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -372,8 +373,11 @@ impl ParallelExecutor {
         if changed {
             self.dependency_blocker_fingerprints
                 .insert(change_id.to_string(), fingerprint.clone());
-            self.dependency_blocker_diagnostics_seen
-                .insert((change_id.to_string(), fingerprint));
+            self.diagnostic_dedup
+                .should_emit(DiagnosticDeduplicationKey::DependencyBlocker {
+                    change_id: change_id.to_string(),
+                    fingerprint,
+                });
             return true;
         }
 
@@ -1824,8 +1828,11 @@ impl ParallelExecutor {
         change_id: &str,
         reason: &str,
     ) -> bool {
-        self.queue_reconciliation_diagnostics_seen
-            .insert((change_id.to_string(), reason.to_string()))
+        self.diagnostic_dedup
+            .should_emit(DiagnosticDeduplicationKey::QueueReconciliation {
+                change_id: change_id.to_string(),
+                reason: reason.to_string(),
+            })
     }
 
     async fn emit_queue_reconciliation_diagnostic(
@@ -2319,95 +2326,108 @@ impl ParallelExecutor {
                 .is_blocked_only()
     }
 
-    #[cfg(test)]
-    pub(super) async fn emit_analysis_failure_diagnostic_once(
+    async fn emit_log_diagnostic_once(
         &mut self,
+        key: DiagnosticDeduplicationKey,
+        log_entry: LogEntry,
+        suppressed_message: &'static str,
+    ) {
+        let event_tx = self.event_tx.clone();
+        self.diagnostic_dedup
+            .emit_or_suppress(
+                key,
+                || async move {
+                    send_event(&event_tx, ParallelEvent::Log(log_entry)).await;
+                },
+                || debug!("{}", suppressed_message),
+            )
+            .await;
+    }
+
+    #[cfg(test)]
+    async fn emit_error_diagnostic_once(
+        &mut self,
+        key: DiagnosticDeduplicationKey,
+        message: String,
+        suppressed_message: &'static str,
+    ) {
+        let event_tx = self.event_tx.clone();
+        self.diagnostic_dedup
+            .emit_or_suppress(
+                key,
+                || async move {
+                    warn!("{}", message);
+                    send_event(&event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
+                    send_event(&event_tx, ParallelEvent::Error { message }).await;
+                },
+                || debug!("{}", suppressed_message),
+            )
+            .await;
+    }
+
+    #[cfg(test)]
+    fn analysis_failure_diagnostic(
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         error: &str,
-    ) {
+    ) -> (DiagnosticDeduplicationKey, String) {
         let mut queued_ids: Vec<String> = queued.iter().map(|change| change.id.clone()).collect();
         queued_ids.sort();
         let mut in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
         in_flight_ids.sort();
         let normalized_error = error.trim().to_string();
-        let key = (
-            queued_ids.clone(),
-            in_flight_ids.clone(),
-            normalized_error.clone(),
-        );
-        if !self.analyze_failure_diagnostics_seen.insert(key) {
-            debug!(
-                queued = ?queued_ids,
-                in_flight = ?in_flight_ids,
-                error = %normalized_error,
-                "Suppressing repeated analysis failure diagnostic"
-            );
-            return;
-        }
-
+        let key = DiagnosticDeduplicationKey::AnalysisFailure {
+            queued_ids: queued_ids.clone(),
+            in_flight_ids: in_flight_ids.clone(),
+            error: normalized_error.clone(),
+        };
         let message = format!(
             "Dependency analysis failed: error={}, queued={:?}, in_flight={:?}",
             normalized_error, queued_ids, in_flight_ids
         );
-        warn!("{}", message);
-        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
-        send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+        (key, message)
     }
 
-    pub(super) async fn emit_no_analysis_diagnostic(
-        &mut self,
+    fn no_analysis_diagnostic(
+        &self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         reason: &str,
-    ) {
+    ) -> Option<(DiagnosticDeduplicationKey, LogEntry)> {
         let reducer_queued = self
             .shared_orchestrator_state
             .as_ref()
             .and_then(|state| state.try_read().ok())
             .map(|state| state.queued_change_ids())
             .unwrap_or_default();
-
         if reducer_queued.is_empty() {
-            return;
+            return None;
         }
 
-        let diagnostic_key = (
-            reducer_queued.clone(),
-            queued.len(),
-            in_flight.len(),
-            reason.to_string(),
-        );
-        if !self.no_analysis_diagnostics_seen.insert(diagnostic_key) {
-            debug!(reason, "Suppressing repeated no-analysis diagnostic");
-            return;
-        }
-
-        send_event(
-            &self.event_tx,
-            ParallelEvent::Log(LogEntry::info(format!(
-                "No analysis started despite reducer-visible queued work: reason={}, reducer_queued={:?}, local_queued={}, in_flight={}, max_parallelism={}",
-                reason,
-                reducer_queued,
-                queued.len(),
-                in_flight.len(),
-                max_parallelism
-            ))),
-        )
-        .await;
+        let queued_len = queued.len();
+        let in_flight_len = in_flight.len();
+        let key = DiagnosticDeduplicationKey::NoAnalysis {
+            reducer_queued: reducer_queued.clone(),
+            queued_len,
+            in_flight_len,
+            reason: reason.to_string(),
+        };
+        let log_entry = LogEntry::info(format!(
+            "No analysis started despite reducer-visible queued work: reason={}, reducer_queued={:?}, local_queued={}, in_flight={}, max_parallelism={}",
+            reason, reducer_queued, queued_len, in_flight_len, max_parallelism
+        ));
+        Some((key, log_entry))
     }
 
-    pub(super) async fn emit_capacity_zero_dispatch_diagnostic_once(
-        &mut self,
+    fn capacity_zero_dispatch_diagnostic(
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         analysis_order: &[String],
-    ) {
+    ) -> (DiagnosticDeduplicationKey, LogEntry) {
         const REASON: &str = "dispatch_capacity_zero_after_analysis";
-
-        let signature_order = if analysis_order.is_empty() {
+        let order = if analysis_order.is_empty() {
             let mut queued_ids = queued
                 .iter()
                 .map(|change| change.id.clone())
@@ -2417,38 +2437,74 @@ impl ParallelExecutor {
         } else {
             analysis_order.to_vec()
         };
-
-        let diagnostic_key = (
-            signature_order.clone(),
-            queued.len(),
-            in_flight.len(),
+        let queued_len = queued.len();
+        let in_flight_len = in_flight.len();
+        let key = DiagnosticDeduplicationKey::DispatchCapacityZero {
+            order,
+            queued_len,
+            in_flight_len,
             max_parallelism,
-            REASON.to_string(),
-        );
-        if !self
-            .dispatch_capacity_zero_diagnostics_seen
-            .insert(diagnostic_key)
-        {
-            debug!(
-                reason = REASON,
-                order = ?signature_order,
-                local_queued = queued.len(),
-                in_flight = in_flight.len(),
-                max_parallelism,
-                "Suppressing repeated capacity-zero dispatch diagnostic"
-            );
-            return;
-        }
+            reason: REASON.to_string(),
+        };
+        let log_entry = LogEntry::info(format!(
+            "Dispatch suppressed after dependency analysis: reason={}, local_queued={}, in_flight={}, max_parallelism={}",
+            REASON, queued_len, in_flight_len, max_parallelism
+        ));
+        (key, log_entry)
+    }
 
-        send_event(
-            &self.event_tx,
-            ParallelEvent::Log(LogEntry::info(format!(
-                "Dispatch suppressed after dependency analysis: reason={}, local_queued={}, in_flight={}, max_parallelism={}",
-                REASON,
-                queued.len(),
-                in_flight.len(),
-                max_parallelism
-            ))),
+    #[cfg(test)]
+    pub(super) async fn emit_analysis_failure_diagnostic_once(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        error: &str,
+    ) {
+        let (key, message) = Self::analysis_failure_diagnostic(queued, in_flight, error);
+        self.emit_error_diagnostic_once(
+            key,
+            message,
+            "Suppressing repeated analysis failure diagnostic",
+        )
+        .await;
+    }
+
+    pub(super) async fn emit_no_analysis_diagnostic(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        reason: &str,
+    ) {
+        if let Some((key, log_entry)) =
+            self.no_analysis_diagnostic(queued, in_flight, max_parallelism, reason)
+        {
+            self.emit_log_diagnostic_once(
+                key,
+                log_entry,
+                "Suppressing repeated no-analysis diagnostic",
+            )
+            .await;
+        }
+    }
+
+    pub(super) async fn emit_capacity_zero_dispatch_diagnostic_once(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        analysis_order: &[String],
+    ) {
+        let (key, log_entry) = Self::capacity_zero_dispatch_diagnostic(
+            queued,
+            in_flight,
+            max_parallelism,
+            analysis_order,
+        );
+        self.emit_log_diagnostic_once(
+            key,
+            log_entry,
+            "Suppressing repeated capacity-zero dispatch diagnostic",
         )
         .await;
     }

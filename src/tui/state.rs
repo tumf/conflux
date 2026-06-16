@@ -15,6 +15,7 @@
 //! Both TUI and Web states are updated via `ExecutionEvent` messages, ensuring consistency.
 
 use crate::openspec::Change;
+use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::tui::config::TuiConfig;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
 use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
@@ -22,12 +23,6 @@ use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MergeDeferredDiagnosticSignature {
-    change_id: String,
-    reason: String,
-    auto_resumable: bool,
-}
 use std::path::PathBuf;
 
 use std::time::{Duration, Instant};
@@ -264,14 +259,10 @@ pub struct AppState {
     /// reducer-owned lifecycle intent is stronger than refresh-derived display hints.
     /// It must not be used as scheduler dispatch, resume routing, or workflow-control input.
     reducer_display_status_snapshot: HashMap<String, &'static str>,
-    /// Last merge-deferred diagnostic shown in the TUI.
+    /// Runtime-only observability dedupe for TUI diagnostics.
     ///
-    /// Runtime-only observability dedupe; it is not workflow-control state.
-    last_merge_deferred_diagnostic: Option<MergeDeferredDiagnosticSignature>,
-    /// Last `AnalysisStarted` attempt signature that produced a TUI log entry.
-    ///
-    /// Runtime-only observability dedupe; it is not workflow-control state.
-    last_logged_analysis_signature: Option<(usize, String)>,
+    /// This state is not workflow-control state.
+    diagnostic_dedup: DiagnosticDeduplicationStore<DiagnosticDeduplicationKey>,
 }
 
 // ============================================================================
@@ -438,8 +429,7 @@ impl AppState {
             logs_panel_enabled: true, // Default: logs panel visible
             tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
-            last_merge_deferred_diagnostic: None,
-            last_logged_analysis_signature: None,
+            diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         }
     }
 
@@ -1085,7 +1075,9 @@ impl AppState {
     }
 
     pub(crate) fn reset_analysis_log_dedupe(&mut self) {
-        self.last_logged_analysis_signature = None;
+        self.diagnostic_dedup.reset_matching(|key| {
+            matches!(key, DiagnosticDeduplicationKey::TuiAnalysisStarted { .. })
+        });
     }
 
     /// Start processing selected changes

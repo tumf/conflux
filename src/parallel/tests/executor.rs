@@ -7,6 +7,7 @@ use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
+use crate::parallel::dedup::DiagnosticDeduplicationStore;
 use crate::parallel::executor::{
     execute_acceptance_in_workspace, execute_archive_finalization_in_workspace,
     execute_archive_in_workspace,
@@ -697,12 +698,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -819,12 +815,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     let revisions = vec![workspace_a.name];
@@ -932,12 +923,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1094,12 +1080,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1311,12 +1292,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1520,12 +1496,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1735,12 +1706,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         last_dispatched_reject_wait_changes: HashSet::new(),
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
-        queue_reconciliation_diagnostics_seen: HashSet::new(),
-        no_analysis_diagnostics_seen: HashSet::new(),
-        dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-        #[cfg(test)]
-        analyze_failure_diagnostics_seen: HashSet::new(),
-        dependency_blocker_diagnostics_seen: HashSet::new(),
+        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
     };
 
     let revisions = vec![workspace_a.name];
