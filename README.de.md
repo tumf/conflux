@@ -44,6 +44,14 @@ Kurz gesagt ist Conflux ein **Orchestrator, der autonome, spezifikationsgetriebe
 | TUI | `cflx` |
 | Headless-Ausführung | `cflx run` |
 
+Nützliche TUI-Tasten:
+
+| Taste | Aktion |
+|-------|--------|
+| `Space` | Changes markieren oder Markierung entfernen |
+| `F5` | Verarbeitung starten, fortsetzen, erneut versuchen oder weiterführen |
+| `x` | Geeignete `not queued` changes während laufender Verarbeitung in die Queue legen |
+
 Für Servermodus, Remote-TUI, REST API und `cflx service` siehe den [Leitfaden zum Servermodus (Englisch)](docs/guides/SERVER.md).
 
 ## Schnellstart
@@ -67,6 +75,12 @@ cflx init
 
 # bundled skills installieren
 cflx install-skills
+
+# bundled skills für Claude Code installieren
+cflx install-skills --claude
+
+# bundled skills global für Claude Code installieren
+cflx install-skills --claude --global
 ```
 
 ## Konfiguration
@@ -77,7 +91,17 @@ Die Konfigurationsdatei ist im JSONC-Format.
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
-Vorlagen generieren:
+TUI-Benutzereinstellungen sind absichtlich von der Orchestrierungskonfiguration getrennt. Die Standardtaste zum Starten, Fortsetzen, erneuten Versuch oder Weiterführen ist `F5`; um nur das lokale Start-Binding der TUI zu überschreiben, verwenden Sie `~/.config/cflx/tui.jsonc`:
+
+```jsonc
+{
+  "keybindings": {
+    "start": ["F5", "!"]
+  }
+}
+```
+
+Konfigurationsvorlagen generieren:
 
 ```bash
 cflx init
@@ -86,7 +110,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-Ausführlichere Konfigurationsbeispiele sowie Erläuterungen zu Hooks, Workspace-Ausführung und der Befehlswarteschlange finden Sie im englischen README.
+Ausführlichere Konfigurationsbeispiele sowie Erläuterungen zu Hooks, Workspace-Ausführung und der Befehlswarteschlange finden Sie in [docs/guides/USAGE.md](docs/guides/USAGE.md).
 
 ## Installation
 

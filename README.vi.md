@@ -44,6 +44,14 @@ Tóm lại, Conflux là **một bộ điều phối giúp liên tục thúc đ�
 | TUI | `cflx` |
 | Chạy headless | `cflx run` |
 
+Các phím TUI hữu ích:
+
+| Phím | Hành động |
+|------|-----------|
+| `Space` | Đánh dấu hoặc bỏ đánh dấu changes |
+| `F5` | Bắt đầu, tiếp tục, thử lại hoặc tiếp tục xử lý |
+| `x` | Đưa các changes `not queued` đủ điều kiện vào hàng đợi khi quá trình xử lý đang chạy |
+
 Đối với chế độ máy chủ, TUI từ xa, REST API và `cflx service`, hãy xem [hướng dẫn chế độ máy chủ (bản tiếng Anh)](docs/guides/SERVER.md).
 
 ## Bắt đầu nhanh
@@ -67,6 +75,12 @@ cflx init
 
 # Cài đặt bundled skills
 cflx install-skills
+
+# Cài đặt bundled skills cho Claude Code
+cflx install-skills --claude
+
+# Cài đặt bundled skills toàn cục cho Claude Code
+cflx install-skills --claude --global
 ```
 
 ## Cấu hình
@@ -77,7 +91,17 @@ Tệp cấu hình sử dụng định dạng JSONC.
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
-Tạo mẫu:
+Tùy chọn người dùng của TUI được tách riêng có chủ ý khỏi cấu hình điều phối. Phím mặc định để bắt đầu, tiếp tục, thử lại hoặc tiếp tục xử lý là `F5`; để chỉ ghi đè binding start cục bộ của TUI, hãy dùng `~/.config/cflx/tui.jsonc`:
+
+```jsonc
+{
+  "keybindings": {
+    "start": ["F5", "!"]
+  }
+}
+```
+
+Tạo mẫu cấu hình:
 
 ```bash
 cflx init
@@ -86,7 +110,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-Để xem các ví dụ cấu hình chi tiết hơn, cùng giải thích về hooks, chạy theo workspace và hàng đợi lệnh, hãy tham khảo README tiếng Anh.
+Để xem các ví dụ cấu hình chi tiết hơn, cùng giải thích về hooks, chạy theo workspace và hàng đợi lệnh, hãy xem [docs/guides/USAGE.md](docs/guides/USAGE.md).
 
 ## Cài đặt
 

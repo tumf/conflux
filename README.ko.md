@@ -44,6 +44,14 @@ Conflux가 지향하는 것은 일회성 코드 생성만이 아닙니다. 먼�
 | TUI | `cflx` |
 | 헤드리스 실행 | `cflx run` |
 
+유용한 TUI 키:
+
+| 키 | 동작 |
+|----|------|
+| `Space` | change 표시 또는 표시 해제 |
+| `F5` | 처리 시작, 재개, 재시도 또는 계속 |
+| `x` | 처리 실행 중 eligible `not queued` change 를 큐에 추가 |
+
 서버 모드, 원격 TUI, REST API, `cflx service`에 대해서는 [서버 모드 가이드(영문)](docs/guides/SERVER.md)를 참고하세요.
 
 ## 빠른 시작
@@ -67,6 +75,12 @@ cflx init
 
 # bundled skills 설치
 cflx install-skills
+
+# Claude Code용 bundled skills 설치
+cflx install-skills --claude
+
+# Claude Code용 bundled skills를 전역으로 설치
+cflx install-skills --claude --global
 ```
 
 ## 설정
@@ -77,7 +91,17 @@ cflx install-skills
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
-템플릿 생성:
+TUI 사용자 설정은 orchestration 설정과 의도적으로 분리되어 있습니다. 시작, 재개, 재시도, 계속의 기본 키는 `F5`입니다. 로컬 TUI의 start binding만 바꾸려면 `~/.config/cflx/tui.jsonc`에서 덮어씁니다:
+
+```jsonc
+{
+  "keybindings": {
+    "start": ["F5", "!"]
+  }
+}
+```
+
+구성 템플릿 생성:
 
 ```bash
 cflx init
@@ -86,7 +110,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-자세한 설정 예시, 훅, 워크스페이스 실행, 명령 큐 설명은 영어 README를 참고하세요.
+자세한 설정 예시, 훅, 워크스페이스 실행, 명령 큐 설명은 [docs/guides/USAGE.md](docs/guides/USAGE.md)를 참고하세요.
 
 ## 설치
 

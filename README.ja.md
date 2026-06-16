@@ -44,6 +44,14 @@ Conflux は、仕様駆動開発に基づく AI コーディングエージェ�
 | TUI | `cflx` |
 | ヘッドレス実行 | `cflx run` |
 
+便利な TUI キー:
+
+| キー | 操作 |
+|-----|------|
+| `Space` | change をマーク、またはマーク解除 |
+| `F5` | 処理の開始、再開、リトライ、継続 |
+| `x` | 処理中に対象の `not queued` change をキューへ追加 |
+
 サーバーモード、リモート TUI、REST API、`cflx service` は [サーバーモードガイド](docs/guides/SERVER.ja.md) を参照してください。
 
 ## クイックスタート
@@ -83,6 +91,16 @@ cflx install-skills --claude --global
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
+TUI のユーザー設定は orchestration 設定とは意図的に分離されています。開始、再開、リトライ、継続の既定キーは `F5` です。ローカル TUI の start binding だけを変える場合は `~/.config/cflx/tui.jsonc` で上書きします:
+
+```jsonc
+{
+  "keybindings": {
+    "start": ["F5", "!"]
+  }
+}
+```
+
 テンプレート生成:
 
 ```bash
@@ -92,7 +110,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-詳しい設定例やフック、ワークスペース実行、コマンドキューの説明は英語 README を参照してください。
+詳しい設定例やフック、ワークスペース実行、コマンドキューの説明は [docs/guides/USAGE.md](docs/guides/USAGE.md) を参照してください。
 
 ## インストール
 

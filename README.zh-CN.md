@@ -44,6 +44,14 @@ Conflux 是一个基于规格驱动开发、用于编排 AI 编码代理自主�
 | TUI | `cflx` |
 | 无头执行 | `cflx run` |
 
+常用 TUI 按键：
+
+| 按键 | 操作 |
+|-----|------|
+| `Space` | 标记或取消标记 change |
+| `F5` | 开始、恢复、重试或继续处理 |
+| `x` | 处理运行中时，将符合条件的 `not queued` change 加入队列 |
+
 关于服务器模式、远程 TUI、REST API 和 `cflx service`，请参阅[服务器模式指南（英文）](docs/guides/SERVER.md)。
 
 ## 快速开始
@@ -67,6 +75,12 @@ cflx init
 
 # 安装 bundled skills
 cflx install-skills
+
+# 为 Claude Code 安装 bundled skills
+cflx install-skills --claude
+
+# 为 Claude Code 全局安装 bundled skills
+cflx install-skills --claude --global
 ```
 
 ## 配置
@@ -77,7 +91,17 @@ cflx install-skills
 - `~/.config/cflx/config.jsonc`
 - `--config <PATH>`
 
-生成模板：
+TUI 用户偏好会有意与编排配置分开。默认的开始、恢复、重试、继续键是 `F5`；如需仅覆盖本地 TUI 的 start 绑定，请在 `~/.config/cflx/tui.jsonc` 中设置：
+
+```jsonc
+{
+  "keybindings": {
+    "start": ["F5", "!"]
+  }
+}
+```
+
+生成配置模板：
 
 ```bash
 cflx init
@@ -86,7 +110,7 @@ cflx init --template codex
 cflx init --force
 ```
 
-关于更详细的配置示例、hooks、工作区执行以及命令队列说明，请参阅英文 README。
+关于更详细的配置示例、hooks、工作区执行以及命令队列说明，请参阅 [docs/guides/USAGE.md](docs/guides/USAGE.md)。
 
 ## 安装
 
