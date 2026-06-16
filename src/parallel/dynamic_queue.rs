@@ -21,7 +21,7 @@ pub async fn should_reanalyze_queue(
     bypass_debounce: bool,
 ) -> bool {
     if bypass_debounce {
-        info!("Bypassing queue debounce because execution capacity recovered");
+        info!("Bypassing queue debounce for explicit scheduler re-analysis trigger");
         return true;
     }
 

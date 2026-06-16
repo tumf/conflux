@@ -203,12 +203,13 @@ impl ParallelExecutor {
             }
 
             // Step 1: Check dynamic queue for newly added changes (TUI mode)
-            self.check_dynamic_queue_and_add_changes(
-                &mut queued,
-                &in_flight,
-                &mut reanalysis_reason,
-            )
-            .await;
+            let dynamic_queue_added = self
+                .check_dynamic_queue_and_add_changes(
+                    &mut queued,
+                    &in_flight,
+                    &mut reanalysis_reason,
+                )
+                .await;
 
             // Step 2: Sync reducer-owned ResolveWait intent before scheduler drain/idle checks.
             // This keeps manual resolve dispatch reducer-owned while making scheduler work detection truthful.
@@ -224,6 +225,13 @@ impl ParallelExecutor {
                 reanalysis_reason = ReanalysisReason::QueueNotification;
             } else if reconciliation.has_repair_additions() {
                 reanalysis_reason = ReanalysisReason::RepairCandidate;
+            } else if matches!(reanalysis_reason, ReanalysisReason::QueueNotification)
+                && !dynamic_queue_added
+            {
+                // A scheduler wake without scheduler-visible queue additions remains
+                // debounceable.  `QueueNotification` only carries operator-intent
+                // priority into analysis when the current loop ingested new queued work.
+                reanalysis_reason = ReanalysisReason::Initial;
             }
 
             // Step 3: Re-analysis decision is derived from scheduler state.

@@ -509,6 +509,92 @@ async fn scheduler_loop_ingests_dynamic_queue_during_gated_manual_resolve() {
 }
 
 #[tokio::test]
+async fn persistent_scheduler_dynamic_queue_push_after_initial_analysis_bypasses_debounce() {
+    let temp_dir = TempDir::new().unwrap();
+    init_minimal_git_repo(temp_dir.path());
+    let seed_change_id = "synthetic-seed-running";
+    let dynamic_change_id = "synthetic-running-dynamic-queue";
+    create_active_change_fixture(temp_dir.path(), seed_change_id);
+    create_active_change_fixture(temp_dir.path(), dynamic_change_id);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    let mut executor = ParallelExecutor::new(
+        temp_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.set_cancel_token(cancel_token.clone());
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    executor.set_scheduler_lifetime(SchedulerLifetime::Persistent);
+
+    let scheduler = tokio::spawn(async move {
+        executor
+            .execute_with_order_based_reanalysis(vec![test_change(seed_change_id)], analysis_result)
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            match rx.recv().await {
+                Some(ExecutionEvent::AnalysisStarted { attempt_id, .. })
+                    if attempt_id.contains(seed_change_id) =>
+                {
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("scheduler event stream closed before initial analysis"),
+            }
+        }
+    })
+    .await
+    .expect("initial running scheduler analysis should start promptly");
+
+    assert!(dynamic_queue.push(dynamic_change_id.to_string()).await);
+
+    let mut saw_dynamic_ingest = false;
+    let mut dynamic_analysis_attempt = None;
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while dynamic_analysis_attempt.is_none() {
+            match rx.recv().await {
+                Some(ExecutionEvent::Log(entry))
+                    if entry.message.contains(&format!(
+                        "Dynamically added to parallel execution: {dynamic_change_id}"
+                    )) =>
+                {
+                    saw_dynamic_ingest = true;
+                }
+                Some(ExecutionEvent::AnalysisStarted { attempt_id, .. })
+                    if attempt_id.contains(dynamic_change_id) =>
+                {
+                    dynamic_analysis_attempt = Some(attempt_id);
+                }
+                Some(_) => {}
+                None => panic!("scheduler event stream closed before dynamic queue analysis"),
+            }
+        }
+    })
+    .await
+    .expect("dynamic queue push after initial analysis should trigger sub-second reanalysis");
+
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), scheduler)
+        .await
+        .expect("scheduler should stop after cancellation")
+        .expect("scheduler task should not panic");
+
+    assert!(saw_dynamic_ingest, "dynamic queue entry should be ingested");
+    assert!(
+        dynamic_analysis_attempt
+            .as_deref()
+            .is_some_and(|attempt_id| attempt_id.contains("trigger=queue")),
+        "dynamic queue analysis must use explicit queue trigger, got {dynamic_analysis_attempt:?}"
+    );
+}
+
+#[tokio::test]
 async fn dynamic_queue_ingestion_validates_candidates_against_executor_repo_root() {
     let temp_dir = TempDir::new().unwrap();
     let present_change_id = "synthetic-present-only-under-repo-root";

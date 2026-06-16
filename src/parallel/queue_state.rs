@@ -2571,7 +2571,8 @@ impl ParallelExecutor {
             };
         let bypass_debounce = matches!(
             effective_reason,
-            ReanalysisReason::SlotRecovery
+            ReanalysisReason::QueueNotification
+                | ReanalysisReason::SlotRecovery
                 | ReanalysisReason::ResolveCompletion
                 | ReanalysisReason::RepairCandidate
         );
