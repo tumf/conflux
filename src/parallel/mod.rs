@@ -16,6 +16,7 @@ mod archive_state;
 mod builder;
 mod cleanup;
 mod conflict;
+pub(crate) mod dedup;
 mod dispatch;
 mod dynamic_queue;
 mod events;
@@ -47,6 +48,7 @@ pub use merge::MergeAttempt;
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
+use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::vcs::WorkspaceManager;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -191,27 +193,10 @@ pub struct ParallelExecutor {
     /// This is runtime-only dedupe state. It is not durable workflow state; retry routing is
     /// recalculated from reducer state plus current base git/workspace state on each scheduler run.
     last_resolve_wait_base_dirty: Option<bool>,
-    /// Runtime-only observability dedupe for queue reconciliation diagnostics.
+    /// Runtime-only observability dedupe for operator-visible diagnostics.
     ///
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
-    queue_reconciliation_diagnostics_seen: HashSet<(String, String)>,
-    no_analysis_diagnostics_seen: HashSet<(Vec<String>, usize, usize, String)>,
-    /// Runtime-only observability dedupe for unchanged zero-capacity dispatch diagnostics.
-    ///
-    /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
-    dispatch_capacity_zero_diagnostics_seen: HashSet<(Vec<String>, usize, usize, usize, String)>,
-    /// Runtime-only observability dedupe for unchanged analysis failure signatures.
-    ///
-    /// This never controls routing; it only prevents stable analyzer failures from
-    /// spamming operator-visible diagnostics during a single process lifetime.
-    #[cfg(test)]
-    analyze_failure_diagnostics_seen: HashSet<(Vec<String>, Vec<String>, String)>,
-    /// Runtime-only observability dedupe for unchanged dependency blocker signatures.
-    ///
-    /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
-    /// It is retained for older diagnostics helpers/tests; transition emission uses
-    /// `dependency_blocker_fingerprints` above.
-    dependency_blocker_diagnostics_seen: HashSet<(String, DependencyBlockerFingerprint)>,
+    diagnostic_dedup: DiagnosticDeduplicationStore<DiagnosticDeduplicationKey>,
 }
 
 #[cfg(test)]

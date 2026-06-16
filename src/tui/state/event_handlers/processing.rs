@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use crate::task_parser;
 use crate::tui::events::LogEntry;
 use crate::tui::types::{AppMode, StopMode};
@@ -99,21 +100,18 @@ impl AppState {
     }
 
     pub(crate) fn handle_analysis_started(&mut self, remaining_changes: usize, attempt_id: String) {
-        let signature = (remaining_changes, attempt_id);
-        if self
-            .last_logged_analysis_signature
-            .as_ref()
-            .is_some_and(|last| last == &signature)
-        {
+        let key = DiagnosticDeduplicationKey::TuiAnalysisStarted {
+            remaining_changes,
+            attempt_id,
+        };
+        if !self.diagnostic_dedup.should_emit(key) {
             tracing::debug!(
                 remaining_changes = remaining_changes,
-                attempt_id = %signature.1,
                 "Suppressing repeated analysis-started TUI log"
             );
             return;
         }
 
-        self.last_logged_analysis_signature = Some(signature);
         self.add_log(LogEntry::info(format!(
             "Re-analyzing queued changes for dispatch (remaining: {})",
             remaining_changes

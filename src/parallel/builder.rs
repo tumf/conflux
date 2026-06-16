@@ -19,8 +19,8 @@ use crate::hooks::HookRunner;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 
 use super::{
-    FailedChangeTracker, ParallelEvent, ParallelExecutor, SchedulerLifetime,
-    DEFAULT_MAX_CONFLICT_RETRIES,
+    dedup::DiagnosticDeduplicationStore, FailedChangeTracker, ParallelEvent, ParallelExecutor,
+    SchedulerLifetime, DEFAULT_MAX_CONFLICT_RETRIES,
 };
 
 impl ParallelExecutor {
@@ -167,12 +167,7 @@ impl ParallelExecutor {
             last_dispatched_reject_wait_changes: HashSet::new(),
             resolve_wait_retry_triggered: false,
             last_resolve_wait_base_dirty: None,
-            queue_reconciliation_diagnostics_seen: HashSet::new(),
-            no_analysis_diagnostics_seen: HashSet::new(),
-            dispatch_capacity_zero_diagnostics_seen: HashSet::new(),
-            #[cfg(test)]
-            analyze_failure_diagnostics_seen: HashSet::new(),
-            dependency_blocker_diagnostics_seen: HashSet::new(),
+            diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         }
     }
 

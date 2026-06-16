@@ -13,6 +13,7 @@ use crate::dependency_targets::union_metadata_dependencies;
 use crate::error::Result;
 use crate::hooks::HookRunner;
 use crate::openspec::Change;
+use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::parallel::{ParallelEvent, ParallelExecutor};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -21,8 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-type AnalyzeFailureDiagnosticSignature = (Vec<String>, Vec<String>, String);
-type AnalyzeFailureDiagnosticStore = Arc<Mutex<HashSet<AnalyzeFailureDiagnosticSignature>>>;
+type AnalysisDiagnosticStore = Arc<Mutex<DiagnosticDeduplicationStore<DiagnosticDeduplicationKey>>>;
 
 /// Service for parallel execution of changes.
 ///
@@ -46,7 +46,7 @@ pub struct ParallelRunService {
     /// AI command runner for analyze commands
     ai_runner: AiCommandRunner,
     /// Runtime-only observability dedupe for stable analyzer failure signatures.
-    analyze_failure_diagnostics_seen: AnalyzeFailureDiagnosticStore,
+    diagnostic_dedup: AnalysisDiagnosticStore,
 }
 
 impl ParallelRunService {
@@ -94,7 +94,7 @@ impl ParallelRunService {
             shared_stagger_state,
             shared_orchestrator_state,
             ai_runner,
-            analyze_failure_diagnostics_seen: Arc::new(Mutex::new(HashSet::new())),
+            diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
         }
     }
 
@@ -145,7 +145,7 @@ impl ParallelRunService {
             shared_stagger_state,
             shared_orchestrator_state,
             ai_runner,
-            analyze_failure_diagnostics_seen: Arc::new(Mutex::new(HashSet::new())),
+            diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
         }
     }
 
@@ -650,31 +650,30 @@ impl ParallelRunService {
         let mut in_flight = in_flight_ids.to_vec();
         in_flight.sort();
         let normalized_error = error.trim().to_string();
-        let key = (
-            queued_ids.clone(),
-            in_flight.clone(),
-            normalized_error.clone(),
-        );
-        let mut seen = self.analyze_failure_diagnostics_seen.lock().await;
-        if !seen.insert(key) {
-            debug!(
-                queued = ?queued_ids,
-                in_flight = ?in_flight,
-                error = %normalized_error,
-                "Suppressing repeated analysis failure diagnostic"
-            );
-            return;
-        }
-        drop(seen);
-
-        let message = format!(
-            "Dependency analysis failed: error={}, queued={:?}, in_flight={:?}",
-            normalized_error, queued_ids, in_flight
-        );
-        let _ = tx
-            .send(ParallelEvent::Log(crate::events::LogEntry::warn(&message)))
+        let key = DiagnosticDeduplicationKey::AnalysisFailure {
+            queued_ids: queued_ids.clone(),
+            in_flight_ids: in_flight.clone(),
+            error: normalized_error.clone(),
+        };
+        let mut dedup = self.diagnostic_dedup.lock().await;
+        dedup
+            .emit_or_suppress(
+                key,
+                || async move {
+                    let message = format!(
+                        "Dependency analysis failed: error={}, queued={:?}, in_flight={:?}",
+                        normalized_error, queued_ids, in_flight
+                    );
+                    let _ = tx
+                        .send(ParallelEvent::Log(crate::events::LogEntry::warn(&message)))
+                        .await;
+                    let _ = tx.send(ParallelEvent::Error { message }).await;
+                },
+                || {
+                    debug!("Suppressing repeated analysis failure diagnostic");
+                },
+            )
             .await;
-        let _ = tx.send(ParallelEvent::Error { message }).await;
     }
 
     fn metadata_dependency_analysis_result(changes: &[Change]) -> crate::analyzer::AnalysisResult {

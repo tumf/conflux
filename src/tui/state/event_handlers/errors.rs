@@ -1,6 +1,7 @@
+use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use crate::tui::events::{LogEntry, TuiCommand};
 
-use crate::tui::state::{AppState, MergeDeferredDiagnosticSignature};
+use crate::tui::state::AppState;
 
 impl AppState {
     pub(crate) fn handle_processing_error(&mut self, id: String, error: String) {
@@ -116,17 +117,13 @@ impl AppState {
         auto_resumable: bool,
         message: String,
     ) {
-        let signature = MergeDeferredDiagnosticSignature {
+        let key = DiagnosticDeduplicationKey::TuiMergeDeferred {
             change_id: change_id.to_string(),
             reason: reason.to_string(),
             auto_resumable,
         };
 
-        if self
-            .last_merge_deferred_diagnostic
-            .as_ref()
-            .is_some_and(|last| last == &signature)
-        {
+        if !self.diagnostic_dedup.should_emit(key) {
             tracing::debug!(
                 change_id = %change_id,
                 auto_resumable = auto_resumable,
@@ -136,7 +133,6 @@ impl AppState {
             return;
         }
 
-        self.last_merge_deferred_diagnostic = Some(signature);
         self.add_log(LogEntry::warn(message));
     }
 
