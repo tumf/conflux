@@ -1,8 +1,7 @@
 ---
 change_type: implementation
 priority: high
-dependencies:
-  - unify-diagnostic-deduplication
+dependencies: []
 references:
   - "src/parallel/queue_state.rs:2472-2770 (perform_reanalysis_and_dispatch)"
   - "src/parallel/orchestration.rs:86-319 (scheduler loop)"
