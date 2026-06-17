@@ -30,5 +30,7 @@ pub use merge::{
 #[allow(unused_imports)]
 pub use worktree::{
     count_commits_ahead, is_worktree, list_worktrees, run_worktree_setup, run_worktree_teardown,
-    worktree_add, worktree_remove, worktree_remove_with_options, WorktreeRemoveOptions,
+    validate_worktree_command_cwd, validate_worktree_command_cwd_facts, worktree_add,
+    worktree_remove, worktree_remove_with_options, RegisteredWorktreePath, WorktreeCommandCwdFacts,
+    WorktreeCommandCwdValidationError, WorktreeRemoveOptions,
 };
