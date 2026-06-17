@@ -2476,6 +2476,26 @@ fn blocked_analysis_result<'a>(
     })
 }
 
+fn declared_dependency_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    let dependencies = changes
+        .iter()
+        .map(|change| (change.id.clone(), change.dependencies.clone()))
+        .collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies,
+            groups: None,
+        }
+    })
+}
+
 fn selective_dependency_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
@@ -2581,6 +2601,48 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
 }
 
 #[tokio::test]
+async fn test_blocked_only_resolve_wait_present() {
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+    let active_alpha = repo_dir.path().join("openspec/changes/alpha");
+    std::fs::create_dir_all(&active_alpha).or_fail("create active alpha change dir");
+    std::fs::write(active_alpha.join("proposal.md"), "# Alpha\n")
+        .or_fail("write active alpha proposal");
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.resolve_wait_changes.insert("alpha".to_string());
+
+    let mut beta = make_test_change("beta");
+    beta.dependencies = vec!["alpha".to_string()];
+    let queued = vec![beta];
+    let in_flight = HashSet::new();
+
+    assert!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .is_blocked_only(),
+        "fixture must still be blocked-only at the queue-classification layer"
+    );
+    assert!(
+        !executor
+            .is_blocked_only_scheduler_state(&queued, &in_flight)
+            .await,
+        "local resolve_wait entries must keep the scheduler alive until resolve dispatch or completion"
+    );
+
+    executor.resolve_wait_changes.clear();
+    executor.reject_wait_changes.insert("alpha".to_string());
+    assert!(
+        !executor
+            .is_blocked_only_scheduler_state(&queued, &in_flight)
+            .await,
+        "local reject_wait entries must also prevent blocked-only drain"
+    );
+}
+
+#[tokio::test]
 async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal_error() {
     use crate::parallel::dynamic_queue::ReanalysisReason;
     use crate::parallel::WorkspaceResult;
@@ -2675,6 +2737,121 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
 }
 
 #[tokio::test]
+async fn test_resolve_wait_completion_unblocks_dependents() {
+    use crate::parallel::dynamic_queue::ReanalysisReason;
+    use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome, WorkspaceResult};
+    use crate::vcs::VcsBackend;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::task::JoinSet;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    let workspace_base = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let alpha_dir = repo_dir.path().join("openspec/changes/alpha");
+    std::fs::create_dir_all(&alpha_dir).or_fail("unexpected error");
+    std::fs::write(alpha_dir.join("proposal.md"), "# Alpha\n").or_fail("unexpected error");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let (tx, _rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.resolve_wait_changes.insert("alpha".to_string());
+
+    let mut beta = make_test_change("beta");
+    beta.dependencies = vec!["alpha".to_string()];
+    let mut queued = vec![beta];
+    let mut in_flight = HashSet::new();
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+
+    assert!(
+        !executor
+            .should_exit_when_idle(true, &queued, &in_flight)
+            .await,
+        "finite scheduler must not exit while a dependency blocker is waiting on resolve_wait completion"
+    );
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &beta_depends_on_alpha_analysis_result,
+            semaphore: semaphore.clone(),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("blocked pre-completion reanalysis should not fail");
+    assert!(!should_break);
+    assert_eq!(
+        iteration, 1,
+        "blocked-only beta must not dispatch before alpha resolves"
+    );
+    assert!(in_flight.is_empty());
+    assert_eq!(queued.len(), 1);
+
+    std::fs::remove_dir_all(&alpha_dir).or_fail("unexpected error");
+    commit_archive_to_base(repo_dir.path(), "2026-05-13-alpha", "alpha").await;
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        executor
+            .handle_merge_result(MergeResult {
+                change_id: "alpha".to_string(),
+                workspace_name: "ws-alpha".to_string(),
+                origin: MergeResultOrigin::ResolveWaitRetry,
+                outcome: Ok(MergeTaskOutcome::Merged),
+            })
+            .await,
+        "merged resolve_wait result should be treated as a successful base-lane completion"
+    );
+    assert!(
+        executor.resolve_wait_changes.is_empty(),
+        "merged resolve_wait result should clear local resolve_wait state"
+    );
+
+    let (should_break, iteration) = executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration,
+            reanalysis_reason: ReanalysisReason::ResolveCompletion,
+            analyzer: &beta_depends_on_alpha_analysis_result,
+            semaphore,
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("post-completion reanalysis should dispatch unblocked beta");
+
+    assert!(!should_break);
+    assert_eq!(
+        iteration, 2,
+        "dispatching beta should advance the scheduler iteration"
+    );
+    assert!(
+        queued.is_empty(),
+        "unblocked dependent should leave the queue"
+    );
+    assert!(
+        in_flight.contains("beta"),
+        "dependent beta should dispatch after alpha resolve_wait completion is merged"
+    );
+
+    while join_set.join_next().await.is_some() {}
+}
+
+#[tokio::test]
 async fn test_analyze_failure_diagnostic_dedupes_by_signature() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let mut executor = ParallelExecutor::new(
@@ -2720,6 +2897,22 @@ fn single_queued_route_depends_on_policy_analysis_result<'a>(
         crate::analyzer::AnalysisResult {
             order,
             dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
+            groups: None,
+        }
+    })
+}
+
+fn beta_depends_on_alpha_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies: HashMap::from([("beta".to_string(), vec!["alpha".to_string()])]),
             groups: None,
         }
     })
@@ -4975,8 +5168,8 @@ async fn test_scheduler_syncs_manual_resolve_wait_from_shared_state() {
         .should_exit_when_idle(true, &queued, &in_flight)
         .await;
     assert!(
-        should_exit,
-        "finite scheduler should drain when only reducer-visible ResolveWait work remains"
+        !should_exit,
+        "finite scheduler must remain alive while reducer-visible ResolveWait work can unblock queued dependents"
     );
 }
 

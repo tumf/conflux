@@ -2277,6 +2277,10 @@ impl ParallelExecutor {
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
     ) -> bool {
+        if !self.resolve_wait_changes.is_empty() || !self.reject_wait_changes.is_empty() {
+            return false;
+        }
+
         in_flight.is_empty()
             && self.manual_resolve_active() == 0
             && self.pending_merge_count.load(Ordering::Relaxed) == 0
