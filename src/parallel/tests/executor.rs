@@ -5926,6 +5926,55 @@ async fn test_reducer_visible_queue_addition_marks_reanalysis_timestamp_and_enqu
 }
 
 #[tokio::test]
+async fn test_reducer_visible_queue_addition_preserves_existing_reanalysis_timestamp() {
+    let config = create_test_config();
+    let repo_dir = tempfile::tempdir().or_fail("create temp repo");
+    let change_id = "reducer-visible-queue-debounce-preserved";
+    let change_dir = repo_dir.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create reducer-visible change dir");
+    std::fs::write(
+        change_dir.join("proposal.md"),
+        "# Reducer visible queue debounce preserved\n",
+    )
+    .or_fail("write reducer-visible proposal");
+    std::fs::write(change_dir.join("tasks.md"), "- [ ] Add queue coverage\n")
+        .or_fail("write reducer-visible tasks");
+
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
+    let existing_timestamp = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    {
+        let mut last_change = executor.last_queue_change_at.lock().await;
+        *last_change = Some(existing_timestamp);
+    }
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let outcome = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(outcome.queued_added, 1);
+    assert_eq!(outcome.repair_added, 0);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, change_id);
+    assert_eq!(
+        *executor.last_queue_change_at.lock().await,
+        Some(existing_timestamp),
+        "reducer-visible reconciliation must not refresh an existing queue debounce timestamp"
+    );
+}
+
+#[tokio::test]
 async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_base() {
     use tempfile::TempDir;
     use tokio::sync::mpsc;

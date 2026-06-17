@@ -2223,7 +2223,18 @@ impl ParallelExecutor {
 
         if outcome.queued_added > 0 {
             let mut last_change = self.last_queue_change_at.lock().await;
-            *last_change = Some(std::time::Instant::now());
+            if last_change.is_none() {
+                *last_change = Some(std::time::Instant::now());
+                debug!(
+                    queued_added = outcome.queued_added,
+                    "Queue reconciliation initialized reducer-visible queue debounce timestamp"
+                );
+            } else {
+                debug!(
+                    queued_added = outcome.queued_added,
+                    "Queue reconciliation preserved existing queue debounce timestamp"
+                );
+            }
         }
 
         outcome
