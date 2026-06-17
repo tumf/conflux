@@ -8,10 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::analyzer::AnalysisResult;
-use crate::dependency_targets::{
-    classify_dependency_target, collect_active_change_ids, collect_archived_change_ids,
-    collect_rejected_change_ids, DependencyTargetClass,
-};
+use crate::dependency_targets::DependencyTargetClass;
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
 use crate::orchestration::state::WaitState;
@@ -134,6 +131,7 @@ enum QueueReconciliationDiagnosticLevel {
 
 use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
+use super::dependency::DependencyContext;
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
@@ -393,29 +391,11 @@ impl ParallelExecutor {
         None
     }
 
-    fn active_dependency_ids(&self) -> HashSet<String> {
-        collect_active_change_ids(&self.repo_root)
-    }
-
-    fn archived_dependency_ids(&self) -> HashSet<String> {
-        collect_archived_change_ids(&self.repo_root)
-    }
-
-    fn rejected_dependency_ids(&self) -> HashSet<String> {
-        collect_rejected_change_ids(&self.repo_root)
-    }
-
     fn dependency_blocker_fingerprint(
         change_id: &str,
         blockers: &[(String, DependencyTargetClass)],
     ) -> super::DependencyBlockerFingerprint {
-        let mut fingerprint = blockers
-            .iter()
-            .map(|(dep_id, class)| (dep_id.clone(), class.as_str().to_string()))
-            .collect::<Vec<_>>();
-        fingerprint.sort();
-        fingerprint.insert(0, ("change_id".to_string(), change_id.to_string()));
-        fingerprint
+        DependencyContext::blocker_fingerprint(change_id, blockers)
     }
 
     fn should_emit_dependency_blocked_transition(
@@ -495,31 +475,12 @@ impl ParallelExecutor {
     /// repository is currently on such a branch, that current branch is the effective
     /// dependency base for dispatch decisions.
     async fn effective_dependency_base(&self) -> Result<String> {
-        let original_branch = self
-            .workspace_manager
-            .ensure_original_branch_initialized()
+        let mut dependency_context =
+            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new());
+        dependency_context
+            .effective_dependency_base(self.workspace_manager.as_ref())
             .await
-            .map_err(OrchestratorError::from_vcs_error)?;
-
-        match crate::vcs::git::commands::get_current_branch(&self.repo_root).await {
-            Ok(Some(current_branch)) if current_branch != original_branch => {
-                debug!(
-                    original_branch = %original_branch,
-                    effective_dependency_base = %current_branch,
-                    "Using current integration branch as effective dependency base"
-                );
-                Ok(current_branch)
-            }
-            Ok(Some(_)) | Ok(None) => Ok(original_branch),
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    original_branch = %original_branch,
-                    "Failed to determine current branch for dependency base; using original branch"
-                );
-                Ok(original_branch)
-            }
-        }
+            .map(str::to_string)
     }
 
     /// Check if a dependency is resolved (merged to the effective dependency base).
@@ -535,22 +496,11 @@ impl ParallelExecutor {
     }
 
     async fn is_dependency_resolved_with_base(&self, dep_id: &str) -> Result<(bool, String)> {
-        let effective_base = self.effective_dependency_base().await?;
-
-        match crate::execution::state::is_merged_to_base(dep_id, &self.repo_root, &effective_base)
+        let mut dependency_context =
+            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new());
+        dependency_context
+            .is_dependency_resolved_with_base(dep_id, self.workspace_manager.as_ref())
             .await
-        {
-            Ok(is_merged) => Ok((is_merged, effective_base)),
-            Err(e) => {
-                warn!(
-                    dependency = %dep_id,
-                    effective_dependency_base = %effective_base,
-                    error = %e,
-                    "Failed to check if dependency is merged to effective base; assuming not resolved"
-                );
-                Ok((false, effective_base))
-            }
-        }
     }
 
     /// Calculate available execution slots accounting for in-flight changes and resolves.
@@ -629,25 +579,19 @@ impl ParallelExecutor {
         in_flight: &HashSet<String>,
     ) -> Vec<String> {
         let mut selected_changes: Vec<String> = Vec::new();
-
-        let queued_ids: HashSet<&str> = analysis_result.order.iter().map(String::as_str).collect();
-        let in_flight_ids: HashSet<&str> = in_flight.iter().map(String::as_str).collect();
-        let active_ids = self.active_dependency_ids();
-        let active_refs: HashSet<&str> = active_ids.iter().map(String::as_str).collect();
-        let archived_ids = self.archived_dependency_ids();
-        let rejected_ids = self.rejected_dependency_ids();
+        let mut dependency_context = DependencyContext::from_executor(
+            self,
+            analysis_result.order.iter().map(String::as_str),
+            in_flight,
+        );
 
         for change_id in &analysis_result.order {
-            if let Some(shared) = &self.shared_orchestrator_state {
-                if let Ok(guard) = shared.try_read() {
-                    if guard.is_terminal_error_change(change_id) {
-                        info!(
-                            change_id = %change_id,
-                            "Skipping ordinary apply dispatch because terminal error requires explicit retry"
-                        );
-                        continue;
-                    }
-                }
+            if dependency_context.is_terminal_error_change(change_id) {
+                info!(
+                    change_id = %change_id,
+                    "Skipping ordinary apply dispatch because terminal error requires explicit retry"
+                );
+                continue;
             }
 
             // Check if change has unresolved dependencies
@@ -655,70 +599,50 @@ impl ParallelExecutor {
                 let mut unresolved_deps = Vec::new();
                 let mut blockers = Vec::new();
                 for dep_id in deps {
-                    let class = classify_dependency_target(
-                        dep_id,
-                        queued_ids.iter().copied(),
-                        in_flight_ids.iter().copied(),
-                        active_refs.iter().copied(),
-                        &archived_ids,
-                        &rejected_ids,
-                    );
+                    let class = dependency_context.classify(dep_id);
                     match class {
                         DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
                             unresolved_deps.push(dep_id.clone());
                             blockers.push((dep_id.clone(), class));
                             continue;
                         }
-                        DependencyTargetClass::Archived => {
-                            debug!(
+                        DependencyTargetClass::Error => {
+                            warn!(
                                 change_id = %change_id,
                                 dependency = %dep_id,
-                                "Archived dependency evidence found; verifying base-branch merge before dispatch"
+                                "Blocking dispatch because dependency is in terminal error and requires explicit retry"
                             );
+                            unresolved_deps.push(dep_id.clone());
+                            blockers.push((dep_id.clone(), class));
+                            continue;
+                        }
+                        DependencyTargetClass::Archived => {
+                            DependencyContext::log_archived_dependency_check(change_id, dep_id);
                         }
                         DependencyTargetClass::Queued
                         | DependencyTargetClass::InFlight
                         | DependencyTargetClass::ActiveButNotQueued => {}
-                        DependencyTargetClass::Error => unreachable!(
-                            "error dependency class is derived from reducer state, not repository classification"
-                        ),
                     }
 
-                    if let Some(shared) = &self.shared_orchestrator_state {
-                        if let Ok(guard) = shared.try_read() {
-                            if guard.is_terminal_error_change(dep_id) {
-                                warn!(
-                                    change_id = %change_id,
-                                    dependency = %dep_id,
-                                    "Blocking dispatch because dependency is in terminal error and requires explicit retry"
-                                );
-                                unresolved_deps.push(dep_id.clone());
-                                blockers.push((dep_id.clone(), DependencyTargetClass::Error));
-                                continue;
-                            }
-                        }
-                    }
-
-                    match self.is_dependency_resolved_with_base(dep_id).await {
+                    match dependency_context
+                        .is_dependency_resolved_with_base(dep_id, self.workspace_manager.as_ref())
+                        .await
+                    {
                         Ok((true, effective_base)) => {
-                            if matches!(class, DependencyTargetClass::Archived) {
-                                debug!(
-                                    change_id = %change_id,
-                                    dependency = %dep_id,
-                                    effective_dependency_base = %effective_base,
-                                    "Archived dependency is merged into effective dependency base"
-                                );
-                            }
+                            DependencyContext::log_dependency_resolved(
+                                change_id,
+                                dep_id,
+                                class,
+                                &effective_base,
+                            );
                         }
                         Ok((false, effective_base)) => {
-                            if matches!(class, DependencyTargetClass::Archived) {
-                                info!(
-                                    change_id = %change_id,
-                                    dependency = %dep_id,
-                                    effective_dependency_base = %effective_base,
-                                    "Archived dependency is not merged into effective dependency base; dispatch remains blocked"
-                                );
-                            }
+                            DependencyContext::log_dependency_unresolved(
+                                change_id,
+                                dep_id,
+                                class,
+                                &effective_base,
+                            );
                             unresolved_deps.push(dep_id.clone());
                             blockers.push((dep_id.clone(), class));
                         }
@@ -2247,34 +2171,25 @@ impl ParallelExecutor {
     ) -> BlockedOnlyQueueClassification {
         let mut classification = BlockedOnlyQueueClassification::default();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        let queued_local_ids: HashSet<&str> =
-            queued.iter().map(|change| change.id.as_str()).collect();
-        let in_flight_ids: HashSet<&str> = in_flight.iter().map(String::as_str).collect();
-        let active_ids = self.active_dependency_ids();
-        let active_refs: HashSet<&str> = active_ids.iter().map(String::as_str).collect();
-        let archived_ids = self.archived_dependency_ids();
-        let rejected_ids = self.rejected_dependency_ids();
+        let dependency_context = DependencyContext::from_executor(
+            self,
+            queued.iter().map(|change| change.id.as_str()),
+            in_flight,
+        );
 
-        let (reducer_queued, merge_wait_ids, resolve_wait_ids, reject_wait_ids, terminal_error_ids) =
-            self.shared_orchestrator_state
-                .as_ref()
-                .and_then(|state| state.try_read().ok())
-                .map(|state| {
-                    let terminal_error_ids = state
-                        .initial_change_ids()
-                        .iter()
-                        .filter(|id| state.is_terminal_error_change(id))
-                        .cloned()
-                        .collect::<HashSet<_>>();
-                    (
-                        state.queued_change_ids(),
-                        state.merge_wait_change_ids(),
-                        state.resolve_wait_change_ids(),
-                        state.reject_wait_change_ids(),
-                        terminal_error_ids,
-                    )
-                })
-                .unwrap_or_default();
+        let (reducer_queued, merge_wait_ids, resolve_wait_ids, reject_wait_ids) = self
+            .shared_orchestrator_state
+            .as_ref()
+            .and_then(|state| state.try_read().ok())
+            .map(|state| {
+                (
+                    state.queued_change_ids(),
+                    state.merge_wait_change_ids(),
+                    state.resolve_wait_change_ids(),
+                    state.reject_wait_change_ids(),
+                )
+            })
+            .unwrap_or_default();
 
         let merge_wait_set: HashSet<String> = merge_wait_ids.into_iter().collect();
         let resolve_wait_set: HashSet<String> = resolve_wait_ids.into_iter().collect();
@@ -2294,7 +2209,7 @@ impl ParallelExecutor {
                 classification.scheduler_lane_wait.push(change.id.clone());
                 continue;
             }
-            if terminal_error_ids.contains(&change.id) {
+            if dependency_context.is_terminal_error_change(&change.id) {
                 classification
                     .terminal_error_retry_required
                     .push(change.id.clone());
@@ -2305,34 +2220,9 @@ impl ParallelExecutor {
                 continue;
             }
 
-            let mut blocked = false;
-            for dep_id in &change.dependencies {
-                let class = classify_dependency_target(
-                    dep_id,
-                    queued_local_ids.iter().copied(),
-                    in_flight_ids.iter().copied(),
-                    active_refs.iter().copied(),
-                    &archived_ids,
-                    &rejected_ids,
-                );
-                match class {
-                    DependencyTargetClass::Archived => {}
-                    DependencyTargetClass::Missing
-                    | DependencyTargetClass::Rejected
-                    | DependencyTargetClass::Queued
-                    | DependencyTargetClass::InFlight
-                    | DependencyTargetClass::ActiveButNotQueued
-                    | DependencyTargetClass::Error => {
-                        blocked = true;
-                    }
-                }
-                if terminal_error_ids.contains(dep_id) {
-                    blocked = true;
-                }
-                if blocked {
-                    break;
-                }
-            }
+            let blocked = dependency_context
+                .is_blocked(&change.dependencies)
+                .is_some();
 
             if blocked {
                 classification.dependency_blocked.push(change.id.clone());
@@ -2353,7 +2243,7 @@ impl ParallelExecutor {
                 || self.reject_wait_changes.contains(&queued_id)
             {
                 classification.scheduler_lane_wait.push(queued_id);
-            } else if terminal_error_ids.contains(&queued_id) {
+            } else if dependency_context.is_terminal_error_change(&queued_id) {
                 classification.terminal_error_retry_required.push(queued_id);
             } else {
                 classification.candidate_unavailable.push(queued_id);

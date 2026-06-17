@@ -17,6 +17,7 @@ mod builder;
 mod cleanup;
 mod conflict;
 pub(crate) mod dedup;
+mod dependency;
 mod dispatch;
 mod dynamic_queue;
 mod events;
