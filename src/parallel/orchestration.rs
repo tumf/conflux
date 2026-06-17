@@ -65,6 +65,11 @@ impl ParallelExecutor {
             return false;
         }
         self.is_fully_drained(join_set_empty, queued.is_empty(), in_flight.is_empty())
+            || (queued.is_empty()
+                && in_flight.is_empty()
+                && (!self.resolve_wait_changes.is_empty() || !self.reject_wait_changes.is_empty())
+                && self.manual_resolve_active() == 0
+                && self.pending_merge_count.load(Ordering::Relaxed) == 0)
             || self
                 .is_blocked_only_scheduler_state(queued, in_flight)
                 .await
