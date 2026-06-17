@@ -1,9 +1,7 @@
 ---
 change_type: implementation
 priority: medium
-dependencies:
-  - unify-diagnostic-deduplication
-  - extract-reanalysis-dispatch-guards
+dependencies: []
 references:
   - "src/parallel/queue_state.rs:1475-1618 (classify_queued_work)"
   - "src/parallel/queue_state.rs:1767-1945 (select_changes_for_dispatch)"
