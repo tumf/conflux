@@ -628,7 +628,9 @@ re-analysis はメインの実行ループ進行に依存せず開始できな�
 
 Scheduler reconciliation は reducer-visible queued work が analysis 対象へ取り込まれない理由を観測可能にしなければならない（SHALL）。ただし、同じ change と同じ理由が scheduler loop ごとに連続する場合、user-visible logs と WARN-level debug log entries への出力は dedupe、rate-limit、または summary 化されなければならない（SHALL）。
 
-<!-- Expected canonical result after archive: `Parallel Analysis Targeting` explicitly distinguishes explicit queue additions from debounceable timer/poll checks, while preserving blocked-only and idle anti-polling behavior. -->
+Reducer-visible queued reconciliation MUST NOT refresh an existing queue debounce timestamp merely because the same reducer-visible queued intent is reconstructed again from repository-visible OpenSpec state. Reconciliation MAY initialize the debounce timestamp when reducer-visible queued work is first reconstructed and no timestamp exists, but repeated rediscovery of the same reducer-owned queued state MUST allow the original debounce window to elapse or must be handled by the existing explicit queue-notification bypass rules.
+
+<!-- Expected canonical result after archive: `Parallel Analysis Targeting` prevents reducer-visible queued reconciliation from starving analysis by repeatedly resetting queue debounce, while preserving explicit queue-addition bypass and blocked-only idle behavior. -->
 
 #### Scenario: missing queued candidate diagnostic is bounded
 
@@ -664,6 +666,15 @@ Scheduler reconciliation は reducer-visible queued work が analysis 対象へ�
 - **AND** the queue debounce timestamp is fresh enough that timer-driven reanalysis would normally be deferred
 - **WHEN** scheduler reconciliation adds `gamma` to scheduler-local queued work
 - **THEN** dependency analysis starts for `gamma` without waiting for the debounce period to expire
+
+#### Scenario: repeated reducer-visible reconciliation does not starve debounce
+
+- **GIVEN** reducer-visible queued intent exists for change `epsilon`
+- **AND** `epsilon` is loadable from active OpenSpec changes
+- **AND** queue debounce timestamp is already set from a prior queue addition
+- **WHEN** scheduler reconciliation reconstructs `epsilon` again on repeated scheduler ticks without a new explicit queue edit
+- **THEN** the existing queue debounce timestamp is not refreshed solely by that repeated reconciliation
+- **AND** the original debounce window can elapse so dependency analysis can run normally
 
 #### Scenario: zero capacity still analyzes explicit queue additions without dispatching
 
