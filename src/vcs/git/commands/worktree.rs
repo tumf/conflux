@@ -4,6 +4,7 @@
 
 use super::basic::run_git;
 use crate::vcs::{VcsError, VcsResult};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -12,6 +13,191 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WorktreeRemoveOptions {
     pub skip_teardown: bool,
+}
+
+/// Repository evidence collected before launching a user command in a TUI-created worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeCommandCwdFacts {
+    pub path_exists: bool,
+    pub is_directory: bool,
+    pub has_git_metadata: bool,
+    pub resolved_toplevel: Option<PathBuf>,
+    pub registered_worktrees: Vec<RegisteredWorktreePath>,
+}
+
+/// A path reported by `git worktree list --porcelain` for the base repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredWorktreePath {
+    pub path: PathBuf,
+    pub is_main: bool,
+}
+
+/// Actionable failure reason for suppressing a worktree command launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeCommandCwdValidationError {
+    MissingPath { path: PathBuf },
+    NotDirectory { path: PathBuf },
+    MissingGitMetadata { path: PathBuf },
+    MissingResolvedToplevel { path: PathBuf },
+    ToplevelMismatch { expected: PathBuf, actual: PathBuf },
+    NotRegistered { path: PathBuf },
+    MainWorktree { path: PathBuf },
+}
+
+impl fmt::Display for WorktreeCommandCwdValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingPath { path } => write!(f, "path does not exist: {}", path.display()),
+            Self::NotDirectory { path } => write!(f, "path is not a directory: {}", path.display()),
+            Self::MissingGitMetadata { path } => {
+                write!(
+                    f,
+                    "path does not contain usable Git metadata: {}",
+                    path.display()
+                )
+            }
+            Self::MissingResolvedToplevel { path } => {
+                write!(
+                    f,
+                    "failed to resolve Git toplevel for path: {}",
+                    path.display()
+                )
+            }
+            Self::ToplevelMismatch { expected, actual } => write!(
+                f,
+                "Git toplevel mismatch: expected {}, got {}",
+                expected.display(),
+                actual.display()
+            ),
+            Self::NotRegistered { path } => write!(
+                f,
+                "path is not registered in git worktree list for the base repo: {}",
+                path.display()
+            ),
+            Self::MainWorktree { path } => write!(
+                f,
+                "path resolves to the main worktree, not a TUI-created worktree: {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+pub type WorktreeCommandCwdValidationResult<T> =
+    std::result::Result<T, WorktreeCommandCwdValidationError>;
+
+/// Validate collected command-cwd facts without touching filesystem or Git state.
+pub fn validate_worktree_command_cwd_facts(
+    worktree_path: &Path,
+    facts: &WorktreeCommandCwdFacts,
+) -> WorktreeCommandCwdValidationResult<()> {
+    if !facts.path_exists {
+        return Err(WorktreeCommandCwdValidationError::MissingPath {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    if !facts.is_directory {
+        return Err(WorktreeCommandCwdValidationError::NotDirectory {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    if !facts.has_git_metadata {
+        return Err(WorktreeCommandCwdValidationError::MissingGitMetadata {
+            path: worktree_path.to_path_buf(),
+        });
+    }
+
+    let Some(resolved_toplevel) = &facts.resolved_toplevel else {
+        return Err(WorktreeCommandCwdValidationError::MissingResolvedToplevel {
+            path: worktree_path.to_path_buf(),
+        });
+    };
+
+    if resolved_toplevel != worktree_path {
+        return Err(WorktreeCommandCwdValidationError::ToplevelMismatch {
+            expected: worktree_path.to_path_buf(),
+            actual: resolved_toplevel.clone(),
+        });
+    }
+
+    match facts
+        .registered_worktrees
+        .iter()
+        .find(|registered| registered.path == worktree_path)
+    {
+        Some(registered) if registered.is_main => {
+            Err(WorktreeCommandCwdValidationError::MainWorktree {
+                path: worktree_path.to_path_buf(),
+            })
+        }
+        Some(_) => Ok(()),
+        None => Err(WorktreeCommandCwdValidationError::NotRegistered {
+            path: worktree_path.to_path_buf(),
+        }),
+    }
+}
+
+fn canonicalize_if_possible(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Validate that a path is safe to use as cwd for a user worktree command.
+pub async fn validate_worktree_command_cwd<P1: AsRef<Path>, P2: AsRef<Path>>(
+    repo_root: P1,
+    worktree_path: P2,
+) -> VcsResult<()> {
+    let repo_root = repo_root.as_ref();
+    let worktree_path = worktree_path.as_ref();
+    let expected_path = canonicalize_if_possible(worktree_path);
+
+    let metadata = std::fs::metadata(worktree_path);
+    let (path_exists, is_directory) = match metadata {
+        Ok(metadata) => (true, metadata.is_dir()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, false),
+        Err(err) => return Err(VcsError::Io(err)),
+    };
+
+    let (has_git_metadata, resolved_toplevel) = if path_exists && is_directory {
+        let has_git_metadata = run_git(&["rev-parse", "--git-dir"], worktree_path)
+            .await
+            .is_ok();
+        let resolved_toplevel = run_git(&["rev-parse", "--show-toplevel"], worktree_path)
+            .await
+            .ok()
+            .map(|path| canonicalize_if_possible(Path::new(&path)));
+        (has_git_metadata, resolved_toplevel)
+    } else {
+        (false, None)
+    };
+
+    let registered_worktrees = list_worktrees(repo_root)
+        .await?
+        .into_iter()
+        .map(
+            |(path, _head, _branch, _is_detached, is_main)| RegisteredWorktreePath {
+                path: canonicalize_if_possible(Path::new(&path)),
+                is_main,
+            },
+        )
+        .collect();
+
+    let facts = WorktreeCommandCwdFacts {
+        path_exists,
+        is_directory,
+        has_git_metadata,
+        resolved_toplevel,
+        registered_worktrees,
+    };
+
+    validate_worktree_command_cwd_facts(&expected_path, &facts).map_err(|err| {
+        VcsError::git_command(format!(
+            "Worktree command cwd validation failed for {}: {}",
+            worktree_path.display(),
+            err
+        ))
+    })
 }
 
 /// Classification of worktree add failures based on stderr output.
@@ -782,6 +968,160 @@ pub async fn run_worktree_setup<P1: AsRef<Path>, P2: AsRef<Path>>(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn valid_cwd_facts(path: &Path) -> WorktreeCommandCwdFacts {
+        WorktreeCommandCwdFacts {
+            path_exists: true,
+            is_directory: true,
+            has_git_metadata: true,
+            resolved_toplevel: Some(path.to_path_buf()),
+            registered_worktrees: vec![RegisteredWorktreePath {
+                path: path.to_path_buf(),
+                is_main: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_accepts_valid_registered_worktree() {
+        let path = PathBuf::from("/repo/wt");
+        let facts = valid_cwd_facts(&path);
+
+        assert_eq!(validate_worktree_command_cwd_facts(&path, &facts), Ok(()));
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_rejects_missing_path() {
+        let path = PathBuf::from("/repo/wt");
+        let mut facts = valid_cwd_facts(&path);
+        facts.path_exists = false;
+
+        assert!(matches!(
+            validate_worktree_command_cwd_facts(&path, &facts),
+            Err(WorktreeCommandCwdValidationError::MissingPath { path: failed }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_rejects_non_directory() {
+        let path = PathBuf::from("/repo/wt");
+        let mut facts = valid_cwd_facts(&path);
+        facts.is_directory = false;
+
+        assert!(matches!(
+            validate_worktree_command_cwd_facts(&path, &facts),
+            Err(WorktreeCommandCwdValidationError::NotDirectory { path: failed }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_rejects_non_git_path() {
+        let path = PathBuf::from("/repo/wt");
+        let mut facts = valid_cwd_facts(&path);
+        facts.has_git_metadata = false;
+
+        assert!(matches!(
+            validate_worktree_command_cwd_facts(&path, &facts),
+            Err(WorktreeCommandCwdValidationError::MissingGitMetadata { path: failed }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_rejects_toplevel_mismatch() {
+        let path = PathBuf::from("/repo/wt");
+        let mut facts = valid_cwd_facts(&path);
+        facts.resolved_toplevel = Some(PathBuf::from("/repo/other"));
+
+        assert!(matches!(
+            validate_worktree_command_cwd_facts(&path, &facts),
+            Err(WorktreeCommandCwdValidationError::ToplevelMismatch { expected, actual })
+                if expected == path && actual == PathBuf::from("/repo/other")
+        ));
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_rejects_unregistered_path() {
+        let path = PathBuf::from("/repo/wt");
+        let mut facts = valid_cwd_facts(&path);
+        facts.registered_worktrees.clear();
+
+        assert!(matches!(
+            validate_worktree_command_cwd_facts(&path, &facts),
+            Err(WorktreeCommandCwdValidationError::NotRegistered { path: failed }) if failed == path
+        ));
+    }
+
+    #[test]
+    fn validate_worktree_command_cwd_facts_rejects_main_worktree() {
+        let path = PathBuf::from("/repo/wt");
+        let mut facts = valid_cwd_facts(&path);
+        facts.registered_worktrees[0].is_main = true;
+
+        assert!(matches!(
+            validate_worktree_command_cwd_facts(&path, &facts),
+            Err(WorktreeCommandCwdValidationError::MainWorktree { path: failed }) if failed == path
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_worktree_command_cwd_accepts_real_materialized_worktree() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo_with_commit(temp_dir.path()).await;
+        let worktree_path = temp_dir.path().join("worktrees").join("valid-wt");
+        std::fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        worktree_add(
+            temp_dir.path(),
+            worktree_path.to_str().unwrap(),
+            "valid-wt-branch",
+            "HEAD",
+        )
+        .await
+        .unwrap();
+
+        let result = validate_worktree_command_cwd(temp_dir.path(), &worktree_path).await;
+
+        assert!(
+            result.is_ok(),
+            "expected valid worktree cwd, got {result:?}"
+        );
+        let _ = worktree_remove(temp_dir.path(), worktree_path.to_str().unwrap()).await;
+    }
+
+    async fn init_git_repo_with_commit(repo: &Path) {
+        let init = Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(init.status.success(), "git init failed: {init:?}");
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(repo.join("README.md"), "test").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        let commit = Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+    }
 
     #[test]
     fn test_worktree_add_error_classification() {

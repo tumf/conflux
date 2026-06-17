@@ -285,6 +285,25 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_worktree_command_tmux_c_template() {
+        let template = "tmux new-window -n wt -c {workspace_dir} -- opencode";
+        let result = expand_worktree_command(template, "/tmp/work tree", "/repo/root");
+
+        assert_eq!(
+            result,
+            "tmux new-window -n wt -c '/tmp/work tree' -- opencode"
+        );
+    }
+
+    #[test]
+    fn test_expand_worktree_command_cwd_based_template_still_works() {
+        let template = "opencode run --repo {repo_root}";
+        let result = expand_worktree_command(template, "/tmp/work tree", "/repo/root path");
+
+        assert_eq!(result, "opencode run --repo '/repo/root path'");
+    }
+
+    #[test]
     fn test_expand_prompt_with_single_quotes() {
         let template = "claude -p 'apply {prompt}'";
         let result = expand_prompt(template, "it's a test");

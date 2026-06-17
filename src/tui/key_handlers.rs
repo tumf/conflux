@@ -8,9 +8,11 @@ use crate::error::Result;
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use crate::tui::state::AppState;
 use crate::tui::types::{AppMode, StopMode};
+use crate::vcs::VcsResult;
+use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -19,6 +21,111 @@ use tracing::debug;
 
 use super::terminal::{execute_worktree_command, suspend_terminal_and_execute_sync};
 use super::worktrees::load_worktrees_with_conflict_check;
+
+#[async_trait]
+trait WorktreePlusRuntime {
+    async fn check_git_repo(&self, repo_root: &Path) -> VcsResult<bool>;
+    async fn generate_unique_branch_name(
+        &self,
+        repo_root: &Path,
+        prefix: &str,
+        max_attempts: u32,
+    ) -> VcsResult<String>;
+    async fn worktree_add(
+        &self,
+        repo_root: &Path,
+        worktree_path: &str,
+        branch_name: &str,
+        base_commit: &str,
+    ) -> VcsResult<()>;
+    async fn validate_worktree_command_cwd(
+        &self,
+        repo_root: &Path,
+        worktree_path: &Path,
+    ) -> VcsResult<()>;
+    async fn run_worktree_setup(&self, repo_root: &Path, worktree_path: &Path) -> VcsResult<()>;
+    async fn worktree_remove_after_setup_failure(
+        &self,
+        repo_root: &Path,
+        worktree_path: &str,
+    ) -> VcsResult<()>;
+    async fn execute_worktree_command(
+        &self,
+        terminal: &mut DefaultTerminal,
+        command: &str,
+        worktree_path: &Path,
+        ai_runner: &AiCommandRunner,
+        app: &mut AppState,
+    ) -> Result<()>;
+}
+
+struct ProductionWorktreePlusRuntime;
+
+#[async_trait]
+impl WorktreePlusRuntime for ProductionWorktreePlusRuntime {
+    async fn check_git_repo(&self, repo_root: &Path) -> VcsResult<bool> {
+        crate::vcs::git::commands::check_git_repo(repo_root).await
+    }
+
+    async fn generate_unique_branch_name(
+        &self,
+        repo_root: &Path,
+        prefix: &str,
+        max_attempts: u32,
+    ) -> VcsResult<String> {
+        crate::vcs::git::commands::generate_unique_branch_name(repo_root, prefix, max_attempts)
+            .await
+    }
+
+    async fn worktree_add(
+        &self,
+        repo_root: &Path,
+        worktree_path: &str,
+        branch_name: &str,
+        base_commit: &str,
+    ) -> VcsResult<()> {
+        crate::vcs::git::commands::worktree_add(repo_root, worktree_path, branch_name, base_commit)
+            .await
+    }
+
+    async fn validate_worktree_command_cwd(
+        &self,
+        repo_root: &Path,
+        worktree_path: &Path,
+    ) -> VcsResult<()> {
+        crate::vcs::git::commands::validate_worktree_command_cwd(repo_root, worktree_path).await
+    }
+
+    async fn run_worktree_setup(&self, repo_root: &Path, worktree_path: &Path) -> VcsResult<()> {
+        crate::vcs::git::commands::run_worktree_setup(repo_root, worktree_path).await
+    }
+
+    async fn worktree_remove_after_setup_failure(
+        &self,
+        repo_root: &Path,
+        worktree_path: &str,
+    ) -> VcsResult<()> {
+        crate::vcs::git::commands::worktree_remove_with_options(
+            repo_root,
+            worktree_path,
+            crate::vcs::git::commands::WorktreeRemoveOptions {
+                skip_teardown: true,
+            },
+        )
+        .await
+    }
+
+    async fn execute_worktree_command(
+        &self,
+        terminal: &mut DefaultTerminal,
+        command: &str,
+        worktree_path: &Path,
+        ai_runner: &AiCommandRunner,
+        app: &mut AppState,
+    ) -> Result<()> {
+        execute_worktree_command(terminal, command, worktree_path, ai_runner, app).await
+    }
+}
 
 /// Context for key event handling containing necessary state and channels
 pub struct KeyEventContext<'a> {
@@ -303,135 +410,209 @@ pub async fn handle_enter_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
 
 /// Handle '+' key: Create new worktree and execute worktree command
 pub async fn handle_plus_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
+    handle_plus_key_with_runtime(ctx, &ProductionWorktreePlusRuntime).await
+}
+
+struct PreparedWorktreeCommand {
+    command: String,
+    worktree_path: PathBuf,
+}
+
+async fn handle_plus_key_with_runtime(
+    ctx: &mut KeyEventContext<'_>,
+    runtime: &dyn WorktreePlusRuntime,
+) -> Result<()> {
+    let Some(prepared) = prepare_plus_worktree_command(
+        ctx.app,
+        ctx.config,
+        ctx.repo_root,
+        ctx.worktree_base_dir,
+        runtime,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+
+    runtime
+        .execute_worktree_command(
+            ctx.terminal,
+            &prepared.command,
+            &prepared.worktree_path,
+            ctx.ai_runner,
+            ctx.app,
+        )
+        .await
+}
+
+async fn prepare_plus_worktree_command(
+    app: &mut AppState,
+    config: &OrchestratorConfig,
+    repo_root: &Path,
+    worktree_base_dir: &Path,
+    runtime: &dyn WorktreePlusRuntime,
+) -> Option<PreparedWorktreeCommand> {
     use crate::tui::types::ViewMode;
 
     // Only work in Worktrees view
-    if ctx.app.view_mode != ViewMode::Worktrees {
-        return Ok(());
+    if app.view_mode != ViewMode::Worktrees {
+        return None;
     }
 
-    let Some(template) = ctx.config.get_worktree_command().map(str::to_string) else {
-        return Ok(());
-    };
+    let template = config.get_worktree_command().map(str::to_string)?;
 
-    let is_git_repo = match crate::vcs::git::commands::check_git_repo(ctx.repo_root).await {
+    let is_git_repo = match runtime.check_git_repo(repo_root).await {
         Ok(is_repo) => is_repo,
         Err(err) => {
-            ctx.app.add_log(LogEntry::error(format!(
+            app.add_log(LogEntry::error(format!(
                 "Failed to check git repo: {}",
                 err
             )));
-            return Ok(());
+            return None;
         }
     };
 
-    if !super::worktrees::should_trigger_worktree_command(ctx.config, is_git_repo) {
-        return Ok(());
+    if !super::worktrees::should_trigger_worktree_command(config, is_git_repo) {
+        return None;
     }
 
-    if let Err(err) = std::fs::create_dir_all(ctx.worktree_base_dir) {
-        ctx.app.add_log(LogEntry::error(format!(
+    if let Err(err) = std::fs::create_dir_all(worktree_base_dir) {
+        app.add_log(LogEntry::error(format!(
             "Failed to prepare worktree base dir: {}",
             err
         )));
-        return Ok(());
+        return None;
     }
 
-    let worktree_path = super::worktrees::build_worktree_path(ctx.worktree_base_dir);
+    let worktree_path = super::worktrees::build_worktree_path(worktree_base_dir);
     let Some(worktree_path_str) = worktree_path.to_str() else {
-        ctx.app.add_log(LogEntry::error(
+        app.add_log(LogEntry::error(
             "Failed to resolve worktree path".to_string(),
         ));
-        return Ok(());
+        return None;
     };
-    let Some(repo_root_str) = ctx.repo_root.to_str() else {
-        ctx.app.add_log(LogEntry::error(
+    let Some(repo_root_str) = repo_root.to_str() else {
+        app.add_log(LogEntry::error(
             "Failed to resolve repo root path".to_string(),
         ));
-        return Ok(());
+        return None;
     };
 
-    // Generate unique branch name with format: ws-session-<timestamp>
-    let branch_name = match crate::vcs::git::commands::generate_unique_branch_name(
-        ctx.repo_root,
-        "ws-session",
-        10,
-    )
-    .await
+    // Generate unique branch name with format: ws-session-<random>
+    let branch_name = match runtime
+        .generate_unique_branch_name(repo_root, "ws-session", 10)
+        .await
     {
         Ok(name) => name,
         Err(err) => {
-            ctx.app.add_log(LogEntry::error(format!(
+            app.add_log(LogEntry::error(format!(
                 "Failed to generate unique branch name: {}",
                 err
             )));
-            return Ok(());
+            return None;
         }
     };
 
     // Create worktree with branch instead of detached HEAD
-    if let Err(err) = crate::vcs::git::commands::worktree_add(
-        ctx.repo_root,
-        worktree_path_str,
-        &branch_name,
-        "HEAD",
-    )
-    .await
+    if let Err(err) = runtime
+        .worktree_add(repo_root, worktree_path_str, &branch_name, "HEAD")
+        .await
     {
-        ctx.app.add_log(LogEntry::error(format!(
+        app.add_log(LogEntry::error(format!(
             "Failed to create worktree: {}",
             err
         )));
-        return Ok(());
+        return None;
     }
 
-    ctx.app.add_log(LogEntry::info(format!(
-        "Created worktree with branch '{}'",
-        branch_name
+    app.add_log(LogEntry::info(format!(
+        "Created worktree with branch '{}' at {}",
+        branch_name, worktree_path_str
     )));
 
+    if !validate_plus_worktree_cwd(app, runtime, repo_root, &worktree_path, "after create").await {
+        return None;
+    }
+
     // Execute setup script if it exists
-    if let Err(err) =
-        crate::vcs::git::commands::run_worktree_setup(ctx.repo_root, &worktree_path).await
-    {
-        ctx.app.add_log(LogEntry::error(format!(
-            "Failed to run worktree setup: {}",
+    if let Err(err) = runtime.run_worktree_setup(repo_root, &worktree_path).await {
+        app.add_log(LogEntry::error(format!(
+            "Failed to run worktree setup for {}: {}",
+            worktree_path.display(),
             err
         )));
-        // Don't continue - setup failure is considered an error
-        // but the worktree was already created, so we should clean it up
-        if let Err(cleanup_err) = crate::vcs::git::commands::worktree_remove_with_options(
-            ctx.repo_root,
-            worktree_path_str,
-            crate::vcs::git::commands::WorktreeRemoveOptions {
-                skip_teardown: true,
-            },
-        )
-        .await
+        app.add_log(LogEntry::warn(format!(
+            "Cleaning up worktree after setup failure: {}",
+            worktree_path.display()
+        )));
+        match runtime
+            .worktree_remove_after_setup_failure(repo_root, worktree_path_str)
+            .await
         {
-            ctx.app.add_log(LogEntry::error(format!(
-                "Failed to cleanup worktree after setup failure: {}",
+            Ok(()) => app.add_log(LogEntry::info(format!(
+                "Cleaned up worktree after setup failure: {}",
+                worktree_path.display()
+            ))),
+            Err(cleanup_err) => app.add_log(LogEntry::error(format!(
+                "Failed to cleanup worktree after setup failure at {}: {}",
+                worktree_path.display(),
                 cleanup_err
-            )));
+            ))),
         }
-        return Ok(());
+        return None;
+    }
+
+    if !validate_plus_worktree_cwd(app, runtime, repo_root, &worktree_path, "after setup").await {
+        return None;
+    }
+
+    if !validate_plus_worktree_cwd(
+        app,
+        runtime,
+        repo_root,
+        &worktree_path,
+        "before command launch",
+    )
+    .await
+    {
+        return None;
     }
 
     let command =
         OrchestratorConfig::expand_worktree_command(&template, worktree_path_str, repo_root_str);
-    ctx.app.add_log(LogEntry::info(format!(
+    app.add_log(LogEntry::info(format!(
         "Running worktree command in {}",
         worktree_path_str
     )));
 
-    execute_worktree_command(
-        ctx.terminal,
-        &command,
-        &worktree_path,
-        ctx.ai_runner,
-        ctx.app,
-    )
-    .await
+    Some(PreparedWorktreeCommand {
+        command,
+        worktree_path,
+    })
+}
+
+async fn validate_plus_worktree_cwd(
+    app: &mut AppState,
+    runtime: &dyn WorktreePlusRuntime,
+    repo_root: &Path,
+    worktree_path: &Path,
+    phase: &str,
+) -> bool {
+    match runtime
+        .validate_worktree_command_cwd(repo_root, worktree_path)
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            app.add_log(LogEntry::error(format!(
+                "Suppressing worktree command launch: invalid cwd {} during {}: {}",
+                worktree_path.display(),
+                phase,
+                err
+            )));
+            false
+        }
+    }
 }
 
 pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> bool {
@@ -894,6 +1075,411 @@ mod tests {
         assert_eq!(app.warning_popup_scroll, 0);
         assert!(app.warning_popup.is_some());
     }
+    struct StubPlusRuntime {
+        is_git_repo: bool,
+        branch_name: String,
+        fail_validation_at: Option<usize>,
+        setup_error: Option<String>,
+        cleanup_error: Option<String>,
+        worktree_add_calls: std::sync::atomic::AtomicUsize,
+        validation_calls: std::sync::atomic::AtomicUsize,
+        setup_calls: std::sync::atomic::AtomicUsize,
+        cleanup_calls: std::sync::atomic::AtomicUsize,
+        execute_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubPlusRuntime {
+        fn new() -> Self {
+            Self {
+                is_git_repo: true,
+                branch_name: "ws-session-test".to_string(),
+                fail_validation_at: None,
+                setup_error: None,
+                cleanup_error: None,
+                worktree_add_calls: std::sync::atomic::AtomicUsize::new(0),
+                validation_calls: std::sync::atomic::AtomicUsize::new(0),
+                setup_calls: std::sync::atomic::AtomicUsize::new(0),
+                cleanup_calls: std::sync::atomic::AtomicUsize::new(0),
+                execute_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorktreePlusRuntime for StubPlusRuntime {
+        async fn check_git_repo(&self, _repo_root: &Path) -> VcsResult<bool> {
+            Ok(self.is_git_repo)
+        }
+
+        async fn generate_unique_branch_name(
+            &self,
+            _repo_root: &Path,
+            _prefix: &str,
+            _max_attempts: u32,
+        ) -> VcsResult<String> {
+            Ok(self.branch_name.clone())
+        }
+
+        async fn worktree_add(
+            &self,
+            _repo_root: &Path,
+            worktree_path: &str,
+            _branch_name: &str,
+            _base_commit: &str,
+        ) -> VcsResult<()> {
+            self.worktree_add_calls.fetch_add(1, Ordering::SeqCst);
+            std::fs::create_dir_all(worktree_path).unwrap();
+            Ok(())
+        }
+
+        async fn validate_worktree_command_cwd(
+            &self,
+            _repo_root: &Path,
+            _worktree_path: &Path,
+        ) -> VcsResult<()> {
+            let call = self.validation_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_validation_at == Some(call) {
+                return Err(crate::vcs::VcsError::git_command(format!(
+                    "validation failed at call {call}"
+                )));
+            }
+            Ok(())
+        }
+
+        async fn run_worktree_setup(
+            &self,
+            _repo_root: &Path,
+            _worktree_path: &Path,
+        ) -> VcsResult<()> {
+            self.setup_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(message) = &self.setup_error {
+                return Err(crate::vcs::VcsError::git_command(message.clone()));
+            }
+            Ok(())
+        }
+
+        async fn worktree_remove_after_setup_failure(
+            &self,
+            _repo_root: &Path,
+            _worktree_path: &str,
+        ) -> VcsResult<()> {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(message) = &self.cleanup_error {
+                return Err(crate::vcs::VcsError::git_command(message.clone()));
+            }
+            Ok(())
+        }
+
+        async fn execute_worktree_command(
+            &self,
+            _terminal: &mut DefaultTerminal,
+            _command: &str,
+            _worktree_path: &Path,
+            _ai_runner: &AiCommandRunner,
+            _app: &mut AppState,
+        ) -> Result<()> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn plus_config(template: &str) -> OrchestratorConfig {
+        OrchestratorConfig {
+            worktree_command: Some(template.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn worktrees_app() -> AppState {
+        let mut app = AppState::new(vec![]);
+        app.view_mode = crate::tui::types::ViewMode::Worktrees;
+        app
+    }
+
+    #[tokio::test]
+    async fn plus_prepare_suppresses_setup_when_created_worktree_validation_fails() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut app = worktrees_app();
+        let config = plus_config("true");
+        let runtime = StubPlusRuntime {
+            fail_validation_at: Some(1),
+            ..StubPlusRuntime::new()
+        };
+
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+        assert_eq!(runtime.worktree_add_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.setup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.execute_calls.load(Ordering::SeqCst), 0);
+        assert!(app.logs.iter().any(|entry| {
+            entry
+                .message
+                .contains("Suppressing worktree command launch: invalid cwd")
+                && entry.message.contains("after create")
+        }));
+    }
+
+    #[tokio::test]
+    async fn plus_prepare_suppresses_command_when_worktree_invalid_after_setup() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut app = worktrees_app();
+        let config = plus_config("true");
+        let runtime = StubPlusRuntime {
+            fail_validation_at: Some(2),
+            ..StubPlusRuntime::new()
+        };
+
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+        assert_eq!(runtime.setup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.execute_calls.load(Ordering::SeqCst), 0);
+        assert!(app.logs.iter().any(|entry| {
+            entry
+                .message
+                .contains("Suppressing worktree command launch: invalid cwd")
+                && entry.message.contains("after setup")
+        }));
+    }
+
+    #[tokio::test]
+    async fn plus_prepare_suppresses_command_when_worktree_invalid_before_launch() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut app = worktrees_app();
+        let config = plus_config("true");
+        let runtime = StubPlusRuntime {
+            fail_validation_at: Some(3),
+            ..StubPlusRuntime::new()
+        };
+
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+        assert_eq!(runtime.setup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.execute_calls.load(Ordering::SeqCst), 0);
+        assert!(app.logs.iter().any(|entry| {
+            entry
+                .message
+                .contains("Suppressing worktree command launch: invalid cwd")
+                && entry.message.contains("before command launch")
+        }));
+    }
+
+    #[tokio::test]
+    async fn plus_prepare_logs_setup_failure_cleanup_and_suppresses_command() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut app = worktrees_app();
+        let config = plus_config("true");
+        let runtime = StubPlusRuntime {
+            setup_error: Some("setup exploded".to_string()),
+            ..StubPlusRuntime::new()
+        };
+
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+        assert_eq!(runtime.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.execute_calls.load(Ordering::SeqCst), 0);
+        assert!(app.logs.iter().any(|entry| entry
+            .message
+            .contains("Failed to run worktree setup")
+            && entry.message.contains("setup exploded")));
+        assert!(app.logs.iter().any(|entry| entry
+            .message
+            .contains("Cleaning up worktree after setup failure")));
+        assert!(app.logs.iter().any(|entry| entry
+            .message
+            .contains("Cleaned up worktree after setup failure")));
+    }
+
+    async fn init_plus_git_repo(repo: &Path) {
+        let init = tokio::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(init.status.success(), "git init failed: {init:?}");
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(repo.join("README.md"), "test").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        let commit = tokio::process::Command::new("git")
+            .args(["commit", "-m", "Initial commit"])
+            .current_dir(repo)
+            .output()
+            .await
+            .unwrap();
+        assert!(commit.status.success(), "git commit failed: {commit:?}");
+    }
+
+    #[tokio::test]
+    async fn plus_prepare_returns_expanded_command_for_valid_worktree() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut app = worktrees_app();
+        let config = plus_config("tmux new-window -n wt -c {workspace_dir} -- echo {repo_root}");
+        let runtime = StubPlusRuntime::new();
+
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &temp_dir.path().join("worktrees"),
+            &runtime,
+        )
+        .await
+        .expect("valid worktree should prepare command launch");
+
+        assert_eq!(runtime.validation_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(runtime.setup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            prepared.worktree_path.parent().unwrap(),
+            temp_dir.path().join("worktrees")
+        );
+        assert!(prepared.command.contains("tmux new-window -n wt -c"));
+        assert!(prepared
+            .command
+            .contains(prepared.worktree_path.to_str().unwrap()));
+        assert!(prepared.command.contains(temp_dir.path().to_str().unwrap()));
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("Running worktree command in")));
+    }
+
+    fn test_ai_runner() -> AiCommandRunner {
+        let queue_config = crate::command_queue::CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            retry_error_patterns: Vec::new(),
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 0,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        AiCommandRunner::new(queue_config, Arc::new(tokio::sync::Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn plus_handle_invokes_command_runner_boundary_for_valid_worktree() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut app = worktrees_app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+        let config = plus_config("echo {workspace_dir}");
+        let (tx, _rx) = mpsc::channel(1);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let ai_runner = test_ai_runner();
+        let graceful_stop_flag = inert_stop_flag();
+        let runtime = StubPlusRuntime::new();
+        let worktree_base_dir = temp_dir.path().join("worktrees");
+        let orchestrator_cancel = None;
+        let orchestrator_handle = None;
+        let mut ctx = KeyEventContext {
+            app: &mut app,
+            terminal: &mut terminal,
+            repo_root: temp_dir.path(),
+            config: &config,
+            worktree_base_dir: &worktree_base_dir,
+            tx: &tx,
+            cmd_tx: &cmd_tx,
+            ai_runner: &ai_runner,
+            graceful_stop_flag: &graceful_stop_flag,
+            orchestrator_cancel: &orchestrator_cancel,
+            orchestrator_handle: &orchestrator_handle,
+        };
+
+        handle_plus_key_with_runtime(&mut ctx, &runtime)
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.validation_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(runtime.execute_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn plus_prepare_with_production_runtime_creates_registered_materialized_worktree() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        init_plus_git_repo(temp_dir.path()).await;
+        let mut app = worktrees_app();
+        let config = plus_config("printf ok");
+        let worktree_base_dir = temp_dir.path().join("worktrees");
+
+        let prepared = prepare_plus_worktree_command(
+            &mut app,
+            &config,
+            temp_dir.path(),
+            &worktree_base_dir,
+            &ProductionWorktreePlusRuntime,
+        )
+        .await
+        .expect("valid Git fixture should prepare command launch");
+
+        assert!(prepared.worktree_path.exists());
+        assert!(prepared.worktree_path.join(".git").exists());
+        assert!(prepared.worktree_path.join("README.md").exists());
+        assert_eq!(prepared.command, "printf ok");
+        crate::vcs::git::commands::validate_worktree_command_cwd(
+            temp_dir.path(),
+            &prepared.worktree_path,
+        )
+        .await
+        .unwrap();
+        let _ = crate::vcs::git::commands::worktree_remove(
+            temp_dir.path(),
+            prepared.worktree_path.to_str().unwrap(),
+        )
+        .await;
+    }
+
     #[test]
     fn ctrl_c_quit_cancels_local_orchestrator_token() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
