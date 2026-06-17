@@ -18,9 +18,11 @@ When a scheduler is already running because other changes are applying, acceptin
 
 When no scheduler is running, pressing `M` on a `MergeWait` row MAY start a scheduler with zero normal queued changes, but that run MUST be classified as a manual retry run rather than ordinary empty execution. The TUI MUST NOT report `Execution completed (0 changes processed)`, `All parallel changes completed`, or equivalent success while the shared reducer still contains accepted retry intent for that row. The row MUST leave `resolve pending` through scheduler-owned events or visible retry-prerequisite failure evidence.
 
+After a dirty workspace/base manual retry returns a row to `merge wait`, pressing `M` again after the user makes retry preconditions clean MUST create or preserve scheduler-consumable retry intent for that row and MUST start or wake scheduler-owned retry evaluation. This second retry MUST NOT be suppressed solely because the same change was previously dispatched, dirty-deferred, or tracked in executor-local retry/dirty snapshots.
+
 When a manual merge retry starts through the resolve lifecycle and the successful repository integration is reported as `MergeCompleted` rather than `ResolveCompleted`, the TUI MUST treat that `MergeCompleted` event as closing the local resolve lifecycle. It MUST clear any stale `is_resolving` reservation and MUST dispatch the next queued resolve retry intent, if one exists.
 
-<!-- Expected canonical result after archive: `tui-resolve` will treat empty manual resolve scheduler startup as retry work, not successful zero-change execution. -->
+<!-- Expected canonical result after archive: `tui-resolve` will explicitly require a clean second `M` after dirty manual deferral to start or wake scheduler-owned retry work for the same merge-wait row. -->
 
 #### Scenario: M during active resolve remains resolve pending despite dirty evidence
 
@@ -42,6 +44,18 @@ When a manual merge retry starts through the resolve lifecycle and the successfu
 **And**: after scheduler classification, `alpha` is visible as `merge wait`
 **And**: scheduler-owned `ResolveWait(alpha)` is cleared
 **And**: no `ResolveStarted(alpha)` event is emitted
+
+#### Scenario: M after dirty blocker is cleaned starts retry
+
+**Given**: no resolve/base-mutating operation is active
+**And**: change `alpha` is visible as `merge wait` because an earlier manual retry was deferred by dirty workspace/base state
+**And**: scheduler-owned `ResolveWait(alpha)` was cleared by that dirty manual deferral
+**And**: the user has cleaned the workspace/base retry preconditions
+**When**: the user presses `M` on `alpha` again
+**Then**: the reducer records scheduler-consumable `ResolveWait` for `alpha`
+**And**: the TUI starts a manual retry scheduler run or notifies the existing scheduler
+**And**: scheduler-owned retry evaluation reaches the merge attempt path for `alpha`
+**And**: the retry does not require another queued change or another `M` keypress to make progress
 
 #### Scenario: M with clean state and no active resolve starts scheduler-owned retry
 

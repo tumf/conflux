@@ -86,11 +86,13 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a manual `MergeDeferred(auto_resumable=false)` returns a change to `MergeWait`, a later explicit `ResolveMerge` for the same change MUST be treated as a fresh user retry intent. Executor-local retry dedupe, dirty-state tracking, or previous dispatch snapshots MUST NOT suppress this retry after the manual blocker has been resolved.
 
+If an explicit `ResolveMerge` for a `MergeWait` change is accepted after a previous dirty manual deferral, the active or newly-started scheduler MUST consume the same shared reducer-owned `ResolveWait` membership even when there are no ordinary queued apply candidates. A scheduler run started for this purpose MUST NOT replace caller-owned reducer state with a fresh reducer and MUST NOT complete as an ordinary zero-change run while accepted retry membership remains.
+
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
 The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
 
-<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after `MergeDeferred(auto_resumable=false)` to invalidate stale scheduler dedupe and be consumed by the scheduler once workspace/git/base evidence allows it. -->
+<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after dirty manual deferral to be consumed by the same shared scheduler/reducer path even when normal queue work is empty. -->
 
 #### Scenario: dirty base manual retry returns to merge wait
 
@@ -113,6 +115,27 @@ The shared reducer state that accepts `ResolveMerge` MUST be the same authoritat
 **And**: the active or newly-started scheduler consumes that same reducer-owned `ResolveWait` intent
 **And**: retry evaluation reaches the merge attempt path for `alpha`
 **And**: if no blocker remains, `alpha` can transition to `merged`
+
+#### Scenario: clean retry is not suppressed by prior dirty dispatch
+
+**Given**: change `alpha` previously had a manual retry dispatched
+**And**: that retry returned to `MergeWait` through dirty workspace/base manual deferral
+**And**: executor-local retry dispatch snapshots or dirty-state observations still remember the previous attempt
+**And**: the base/workspace retry preconditions are now clean
+**When**: the user requests merge retry for `alpha` again
+**Then**: stale executor-local state does not suppress retry dispatch
+**And**: retry evaluation uses current workspace and base repository state
+**And**: retry evaluation reaches the merge attempt path for `alpha`
+
+#### Scenario: zero-normal-queue retry consumes shared reducer membership
+
+**Given**: no ordinary queued apply candidates exist
+**And**: no scheduler is currently running
+**And**: the shared reducer accepts `ResolveMerge(alpha)` for a manual `merge wait` row
+**When**: the TUI command handler starts a scheduler run for the manual retry
+**Then**: the scheduler observes the caller-owned shared reducer state containing `ResolveWait(alpha)`
+**And**: the scheduler evaluates base-lane waiters before reporting ordinary zero-change completion
+**And**: `alpha` leaves `ResolveWait` only through scheduler-owned events or visible blocker evidence
 
 #### Scenario: live scheduler notification consumes lane waiter without ordinary queue work
 
@@ -216,11 +239,13 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a manual `MergeDeferred(auto_resumable=false)` returns a change to `MergeWait`, a later explicit `ResolveMerge` for the same change MUST be treated as a fresh user retry intent. Executor-local retry dedupe, dirty-state tracking, or previous dispatch snapshots MUST NOT suppress this retry after the manual blocker has been resolved.
 
+If an explicit `ResolveMerge` for a `MergeWait` change is accepted after a previous dirty manual deferral, the active or newly-started scheduler MUST consume the same shared reducer-owned `ResolveWait` membership even when there are no ordinary queued apply candidates. A scheduler run started for this purpose MUST NOT replace caller-owned reducer state with a fresh reducer and MUST NOT complete as an ordinary zero-change run while accepted retry membership remains.
+
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
 The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
 
-<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after `MergeDeferred(auto_resumable=false)` to invalidate stale scheduler dedupe and be consumed by the scheduler once workspace/git/base evidence allows it. -->
+<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after dirty manual deferral to be consumed by the same shared scheduler/reducer path even when normal queue work is empty. -->
 
 #### Scenario: dirty base manual retry returns to merge wait
 
@@ -243,6 +268,27 @@ The shared reducer state that accepts `ResolveMerge` MUST be the same authoritat
 **And**: the active or newly-started scheduler consumes that same reducer-owned `ResolveWait` intent
 **And**: retry evaluation reaches the merge attempt path for `alpha`
 **And**: if no blocker remains, `alpha` can transition to `merged`
+
+#### Scenario: clean retry is not suppressed by prior dirty dispatch
+
+**Given**: change `alpha` previously had a manual retry dispatched
+**And**: that retry returned to `MergeWait` through dirty workspace/base manual deferral
+**And**: executor-local retry dispatch snapshots or dirty-state observations still remember the previous attempt
+**And**: the base/workspace retry preconditions are now clean
+**When**: the user requests merge retry for `alpha` again
+**Then**: stale executor-local state does not suppress retry dispatch
+**And**: retry evaluation uses current workspace and base repository state
+**And**: retry evaluation reaches the merge attempt path for `alpha`
+
+#### Scenario: zero-normal-queue retry consumes shared reducer membership
+
+**Given**: no ordinary queued apply candidates exist
+**And**: no scheduler is currently running
+**And**: the shared reducer accepts `ResolveMerge(alpha)` for a manual `merge wait` row
+**When**: the TUI command handler starts a scheduler run for the manual retry
+**Then**: the scheduler observes the caller-owned shared reducer state containing `ResolveWait(alpha)`
+**And**: the scheduler evaluates base-lane waiters before reporting ordinary zero-change completion
+**And**: `alpha` leaves `ResolveWait` only through scheduler-owned events or visible blocker evidence
 
 #### Scenario: live scheduler notification consumes lane waiter without ordinary queue work
 
@@ -396,11 +442,13 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a manual `MergeDeferred(auto_resumable=false)` returns a change to `MergeWait`, a later explicit `ResolveMerge` for the same change MUST be treated as a fresh user retry intent. Executor-local retry dedupe, dirty-state tracking, or previous dispatch snapshots MUST NOT suppress this retry after the manual blocker has been resolved.
 
+If an explicit `ResolveMerge` for a `MergeWait` change is accepted after a previous dirty manual deferral, the active or newly-started scheduler MUST consume the same shared reducer-owned `ResolveWait` membership even when there are no ordinary queued apply candidates. A scheduler run started for this purpose MUST NOT replace caller-owned reducer state with a fresh reducer and MUST NOT complete as an ordinary zero-change run while accepted retry membership remains.
+
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
 The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
 
-<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after `MergeDeferred(auto_resumable=false)` to invalidate stale scheduler dedupe and be consumed by the scheduler once workspace/git/base evidence allows it. -->
+<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after dirty manual deferral to be consumed by the same shared scheduler/reducer path even when normal queue work is empty. -->
 
 #### Scenario: dirty base manual retry returns to merge wait
 
@@ -423,6 +471,27 @@ The shared reducer state that accepts `ResolveMerge` MUST be the same authoritat
 **And**: the active or newly-started scheduler consumes that same reducer-owned `ResolveWait` intent
 **And**: retry evaluation reaches the merge attempt path for `alpha`
 **And**: if no blocker remains, `alpha` can transition to `merged`
+
+#### Scenario: clean retry is not suppressed by prior dirty dispatch
+
+**Given**: change `alpha` previously had a manual retry dispatched
+**And**: that retry returned to `MergeWait` through dirty workspace/base manual deferral
+**And**: executor-local retry dispatch snapshots or dirty-state observations still remember the previous attempt
+**And**: the base/workspace retry preconditions are now clean
+**When**: the user requests merge retry for `alpha` again
+**Then**: stale executor-local state does not suppress retry dispatch
+**And**: retry evaluation uses current workspace and base repository state
+**And**: retry evaluation reaches the merge attempt path for `alpha`
+
+#### Scenario: zero-normal-queue retry consumes shared reducer membership
+
+**Given**: no ordinary queued apply candidates exist
+**And**: no scheduler is currently running
+**And**: the shared reducer accepts `ResolveMerge(alpha)` for a manual `merge wait` row
+**When**: the TUI command handler starts a scheduler run for the manual retry
+**Then**: the scheduler observes the caller-owned shared reducer state containing `ResolveWait(alpha)`
+**And**: the scheduler evaluates base-lane waiters before reporting ordinary zero-change completion
+**And**: `alpha` leaves `ResolveWait` only through scheduler-owned events or visible blocker evidence
 
 #### Scenario: live scheduler notification consumes lane waiter without ordinary queue work
 
@@ -1018,11 +1087,13 @@ An explicit `ResolveMerge` command remains the way to retry a manual merge-wait 
 
 After a manual `MergeDeferred(auto_resumable=false)` returns a change to `MergeWait`, a later explicit `ResolveMerge` for the same change MUST be treated as a fresh user retry intent. Executor-local retry dedupe, dirty-state tracking, or previous dispatch snapshots MUST NOT suppress this retry after the manual blocker has been resolved.
 
+If an explicit `ResolveMerge` for a `MergeWait` change is accepted after a previous dirty manual deferral, the active or newly-started scheduler MUST consume the same shared reducer-owned `ResolveWait` membership even when there are no ordinary queued apply candidates. A scheduler run started for this purpose MUST NOT replace caller-owned reducer state with a fresh reducer and MUST NOT complete as an ordinary zero-change run while accepted retry membership remains.
+
 After a change has reached repository-visible base integration, later stale duplicate merge outcomes for the same change MUST NOT regress the reducer-visible lifecycle from `Merged` to `MergeWait` or `ResolveWait`.
 
 The shared reducer state that accepts `ResolveMerge` MUST be the same authoritative reducer state observed by the scheduler/executor that consumes the retry. A service or executor construction path MUST NOT replace caller-owned reducer state with a fresh empty reducer state after retry intent has been accepted. State synchronization may copy reducer-owned lane-wait membership into executor-local caches, but the copied cache MUST NOT become an independent source of truth that can make the UI show `resolve pending` after reducer-owned membership has been cleared.
 
-<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after `MergeDeferred(auto_resumable=false)` to invalidate stale scheduler dedupe and be consumed by the scheduler once workspace/git/base evidence allows it. -->
+<!-- Expected canonical result after archive: `orchestration-state` will require explicit manual retry after dirty manual deferral to be consumed by the same shared scheduler/reducer path even when normal queue work is empty. -->
 
 #### Scenario: dirty base manual retry returns to merge wait
 
@@ -1045,6 +1116,27 @@ The shared reducer state that accepts `ResolveMerge` MUST be the same authoritat
 **And**: the active or newly-started scheduler consumes that same reducer-owned `ResolveWait` intent
 **And**: retry evaluation reaches the merge attempt path for `alpha`
 **And**: if no blocker remains, `alpha` can transition to `merged`
+
+#### Scenario: clean retry is not suppressed by prior dirty dispatch
+
+**Given**: change `alpha` previously had a manual retry dispatched
+**And**: that retry returned to `MergeWait` through dirty workspace/base manual deferral
+**And**: executor-local retry dispatch snapshots or dirty-state observations still remember the previous attempt
+**And**: the base/workspace retry preconditions are now clean
+**When**: the user requests merge retry for `alpha` again
+**Then**: stale executor-local state does not suppress retry dispatch
+**And**: retry evaluation uses current workspace and base repository state
+**And**: retry evaluation reaches the merge attempt path for `alpha`
+
+#### Scenario: zero-normal-queue retry consumes shared reducer membership
+
+**Given**: no ordinary queued apply candidates exist
+**And**: no scheduler is currently running
+**And**: the shared reducer accepts `ResolveMerge(alpha)` for a manual `merge wait` row
+**When**: the TUI command handler starts a scheduler run for the manual retry
+**Then**: the scheduler observes the caller-owned shared reducer state containing `ResolveWait(alpha)`
+**And**: the scheduler evaluates base-lane waiters before reporting ordinary zero-change completion
+**And**: `alpha` leaves `ResolveWait` only through scheduler-owned events or visible blocker evidence
 
 #### Scenario: live scheduler notification consumes lane waiter without ordinary queue work
 

@@ -808,6 +808,45 @@ impl AppState {
         commands
     }
 
+    fn reducer_accepts_resolve_merge_intent(&mut self, change_id: &str) -> bool {
+        let Some(shared) = self.shared_orchestrator_state.clone() else {
+            // Tests and standalone UI state can still operate without a shared reducer.
+            return true;
+        };
+
+        let outcome = {
+            let Ok(mut guard) = shared.try_write() else {
+                self.warning_message = Some(format!(
+                    "Could not record merge retry intent for '{}'; scheduler state is busy",
+                    change_id
+                ));
+                self.add_log(LogEntry::warn(format!(
+                    "Manual merge-wait retry for '{}' was ignored because scheduler state is busy",
+                    change_id
+                )));
+                return false;
+            };
+
+            guard.apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+                change_id.to_string(),
+            ))
+        };
+
+        if matches!(outcome, crate::orchestration::state::ReduceOutcome::NoOp) {
+            self.warning_message = Some(format!(
+                "Manual merge retry for '{}' is no longer valid",
+                change_id
+            ));
+            self.add_log(LogEntry::warn(format!(
+                "Manual merge-wait retry for '{}' was rejected by reducer state",
+                change_id
+            )));
+            return false;
+        }
+
+        true
+    }
+
     /// Trigger merge resolution for the selected change when applicable.
     ///
     /// If resolve is already running, the change is added to the resolve queue
@@ -835,23 +874,14 @@ impl AppState {
             change.id.clone()
         };
 
+        if !self.reducer_accepts_resolve_merge_intent(&change_id) {
+            return None;
+        }
+
         if self.is_resolving {
             // Resolve is running: add to queue and transition to ResolveWait
             if self.add_to_resolve_queue(&change_id) {
                 self.changes[self.cursor_index].set_display_status_cache("resolve pending");
-
-                // Sync resolve intent into the shared reducer so that
-                // apply_display_statuses_from_reducer() cannot regress the
-                // status back to "merge wait" on the next ChangesRefreshed.
-                if let Some(shared) = &self.shared_orchestrator_state {
-                    if let Ok(mut guard) = shared.try_write() {
-                        guard.apply_command(
-                            crate::orchestration::state::ReducerCommand::ResolveMerge(
-                                change_id.clone(),
-                            ),
-                        );
-                    }
-                }
 
                 self.add_log(LogEntry::info(format!(
                     "Queued '{}' for resolve (position: {})",
@@ -875,17 +905,6 @@ impl AppState {
                 self.mode = AppMode::Running;
             }
             self.changes[self.cursor_index].set_display_status_cache("resolve pending");
-
-            // Sync resolve intent into the shared reducer so that
-            // apply_display_statuses_from_reducer() cannot regress the
-            // status back to "merge wait" on the next ChangesRefreshed.
-            if let Some(shared) = &self.shared_orchestrator_state {
-                if let Ok(mut guard) = shared.try_write() {
-                    guard.apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
-                        change_id.clone(),
-                    ));
-                }
-            }
 
             Some(TuiCommand::ResolveMerge(change_id))
         }
@@ -2976,6 +2995,86 @@ mod tests {
             Some(&"resolve pending"),
             "reducer must reflect 'resolve pending' after immediate resolve_merge()"
         );
+    }
+
+    #[test]
+    fn test_resolve_merge_noop_does_not_optimistically_advance_display() {
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            vec!["change-a".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        )));
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-a".to_string(),
+            });
+        }
+        app.set_shared_state(shared.clone());
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.cursor_index = 0;
+        app.mode = AppMode::Running;
+        app.is_resolving = false;
+
+        let cmd = app.resolve_merge();
+
+        assert!(
+            cmd.is_none(),
+            "terminal reducer NoOp must not dispatch retry"
+        );
+        assert_eq!(
+            app.changes[0].display_status_cache, "merge wait",
+            "display must not advance beyond reducer-owned scheduler intent"
+        );
+        assert!(
+            !app.is_resolving,
+            "NoOp retry must not reserve resolve slot"
+        );
+        assert!(shared.blocking_read().resolve_wait_change_ids().is_empty());
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.message.contains("rejected by reducer state")));
+    }
+
+    #[test]
+    fn test_resolve_merge_queued_noop_does_not_enqueue_local_waiter() {
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use std::sync::Arc;
+
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            vec!["change-a".to_string()],
+            0,
+            ExecutionMode::Parallel,
+        )));
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ChangeRejected {
+                change_id: "change-a".to_string(),
+                reason: "terminal rejection".to_string(),
+            });
+        }
+        app.set_shared_state(shared.clone());
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.cursor_index = 0;
+        app.mode = AppMode::Running;
+        app.is_resolving = true;
+
+        let cmd = app.resolve_merge();
+
+        assert!(cmd.is_none());
+        assert!(app.resolve_queue.is_empty());
+        assert!(app.resolve_queue_set.is_empty());
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert!(shared.blocking_read().resolve_wait_change_ids().is_empty());
     }
 
     /// Regression test: after immediate resolve (is_resolving == false), a ChangesRefreshed
