@@ -6,6 +6,7 @@ use crate::openspec::{Change, ProposalMetadata};
 use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
+use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::parallel::{
     MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelExecutor, WorkspaceResult,
 };
@@ -302,17 +303,17 @@ async fn test_auto_resolve_zero_capacity_runs_analysis_but_suppresses_apply_disp
         WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::ResolveCompletion,
-            &analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::ResolveCompletion,
+            analyzer: &analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .expect("re-analysis should not fail");
 

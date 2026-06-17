@@ -5,6 +5,7 @@ use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
 use crate::parallel::cleanup::WorkspaceCleanupGuard;
 use crate::parallel::dynamic_queue::ReanalysisReason;
+use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::parallel::{ParallelExecutor, SchedulerLifetime, WorkspaceResult};
 use crate::tui::queue::DynamicQueue;
 use crate::vcs::VcsBackend;
@@ -263,17 +264,17 @@ async fn test_manual_resolve_zero_capacity_runs_analysis_but_suppresses_apply_di
         WorkspaceCleanupGuard::new(VcsBackend::Git, temp_dir.path().to_path_buf());
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::ResolveCompletion,
-            &analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::ResolveCompletion,
+            analyzer: &analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .expect("re-analysis should not fail");
 
@@ -347,17 +348,17 @@ async fn repeated_capacity_zero_does_not_spam_dispatch_diagnostic() {
 
     for iteration in 1..=2 {
         let (should_break, returned_iteration) = executor
-            .perform_reanalysis_and_dispatch(
-                &mut queued,
-                &mut in_flight,
-                1,
+            .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+                queued: &mut queued,
+                in_flight: &mut in_flight,
+                max_parallelism: 1,
                 iteration,
-                ReanalysisReason::ResolveCompletion,
-                &analysis_result,
-                semaphore.clone(),
-                &mut join_set,
-                &mut cleanup_guard,
-            )
+                reanalysis_reason: ReanalysisReason::ResolveCompletion,
+                analyzer: &analysis_result,
+                semaphore: semaphore.clone(),
+                join_set: &mut join_set,
+                cleanup_guard: &mut cleanup_guard,
+            })
             .await
             .expect("re-analysis should not fail");
 

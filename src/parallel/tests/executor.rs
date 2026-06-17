@@ -13,6 +13,7 @@ use crate::parallel::executor::{
     execute_archive_in_workspace,
 };
 use crate::parallel::merge::MergeAttempt;
+use crate::parallel::queue_state::ReanalysisDispatchContext;
 use crate::vcs::git::commands::get_current_commit;
 #[cfg(feature = "heavy-tests")]
 use crate::vcs::GitWorkspaceManager;
@@ -2334,17 +2335,17 @@ async fn test_queue_notification_with_fresh_debounce_starts_analysis_after_initi
     );
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            2,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 2,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("queue notification reanalysis should not fail");
 
@@ -2647,17 +2648,17 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
     );
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::QueueNotification,
-            &should_not_call_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &should_not_call_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3022,17 +3023,17 @@ async fn test_dependency_blocked_event_is_emitted_even_when_slots_are_full() {
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::QueueNotification,
-            &selective_dependency_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &selective_dependency_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3385,17 +3386,17 @@ async fn test_single_queued_active_dependency_does_not_emit_apply_started() {
     let mut in_flight = HashSet::new();
 
     let (_should_break, _iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::QueueNotification,
-            &single_queued_route_depends_on_policy_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &single_queued_route_depends_on_policy_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3458,17 +3459,17 @@ async fn test_inflight_dependency_blocks_dispatch_until_resolved() {
     let mut in_flight = HashSet::from(["policy".to_string()]);
 
     let (_should_break, _iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            2,
-            1,
-            ReanalysisReason::QueueNotification,
-            &dependency_on_inflight_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 2,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &dependency_on_inflight_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3787,17 +3788,17 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            2,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
-            semaphore.clone(),
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 2,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &ready_analysis_result,
+            semaphore: semaphore.clone(),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3822,17 +3823,17 @@ async fn test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes() 
     manual_resolve_counter.store(0, Ordering::SeqCst);
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
             iteration,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3892,17 +3893,17 @@ async fn test_resolve_wait_does_not_block_queue_reanalysis_dispatch() {
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -3949,17 +3950,17 @@ async fn test_resolving_with_free_slot_still_dispatches_queued_change() {
     let mut in_flight = HashSet::from(["alpha-resolving".to_string()]);
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            2,
-            1,
-            ReanalysisReason::QueueNotification,
-            &ready_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 2,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -4009,17 +4010,17 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            1,
-            ReanalysisReason::QueueNotification,
-            &blocked_analysis_result,
-            semaphore.clone(),
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::QueueNotification,
+            analyzer: &blocked_analysis_result,
+            semaphore: semaphore.clone(),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -4029,17 +4030,17 @@ async fn test_dispatch_zero_reanalysis_is_retried_on_next_loop() {
     assert!(in_flight.is_empty());
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
             iteration,
-            ReanalysisReason::ResolveCompletion,
-            &ready_analysis_result,
+            reanalysis_reason: ReanalysisReason::ResolveCompletion,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -4089,17 +4090,17 @@ async fn test_resolve_completion_reanalysis_bypasses_debounce_and_dispatches_wor
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            2,
-            ReanalysisReason::ResolveCompletion,
-            &ready_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 2,
+            reanalysis_reason: ReanalysisReason::ResolveCompletion,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
@@ -4159,17 +4160,17 @@ async fn test_repair_candidate_reanalysis_bypasses_debounce_and_dispatches_work(
     let mut in_flight = HashSet::new();
 
     let (should_break, iteration) = executor
-        .perform_reanalysis_and_dispatch(
-            &mut queued,
-            &mut in_flight,
-            1,
-            2,
-            ReanalysisReason::RepairCandidate,
-            &ready_analysis_result,
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 1,
+            iteration: 2,
+            reanalysis_reason: ReanalysisReason::RepairCandidate,
+            analyzer: &ready_analysis_result,
             semaphore,
-            &mut join_set,
-            &mut cleanup_guard,
-        )
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
         .await
         .or_fail("unexpected error");
 
