@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 use super::cleanup::WorkspaceCleanupGuard;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
+use super::queue_state::ReanalysisDispatchContext;
 use super::types::WorkspaceResult;
 use super::ParallelEvent;
 use super::ParallelExecutor;
@@ -249,17 +250,17 @@ impl ParallelExecutor {
             }
             if !queued.is_empty() {
                 let (should_break, new_iteration) = self
-                    .perform_reanalysis_and_dispatch(
-                        &mut queued,
-                        &mut in_flight,
+                    .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+                        queued: &mut queued,
+                        in_flight: &mut in_flight,
                         max_parallelism,
                         iteration,
                         reanalysis_reason,
-                        &analyzer,
-                        semaphore.clone(),
-                        &mut join_set,
-                        &mut cleanup_guard,
-                    )
+                        analyzer: &analyzer,
+                        semaphore: semaphore.clone(),
+                        join_set: &mut join_set,
+                        cleanup_guard: &mut cleanup_guard,
+                    })
                     .await?;
 
                 iteration = new_iteration;

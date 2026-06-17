@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use crate::analyzer::AnalysisResult;
 use crate::dependency_targets::{
     classify_dependency_target, collect_active_change_ids, collect_archived_change_ids,
     collect_rejected_change_ids, DependencyTargetClass,
@@ -141,6 +142,64 @@ use super::{
     MergeResult, MergeResultOrigin, MergeTaskOutcome, ParallelEvent, ParallelExecutor,
     WorkspaceResult,
 };
+
+pub(crate) struct ReanalysisDispatchContext<'a, F> {
+    pub queued: &'a mut Vec<crate::openspec::Change>,
+    pub in_flight: &'a mut HashSet<String>,
+    pub max_parallelism: usize,
+    pub iteration: u32,
+    pub reanalysis_reason: ReanalysisReason,
+    pub analyzer: &'a F,
+    pub semaphore: Arc<Semaphore>,
+    pub join_set: &'a mut JoinSet<WorkspaceResult>,
+    pub cleanup_guard: &'a mut WorkspaceCleanupGuard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReanalysisFlowDecision {
+    Continue,
+    Done { should_break: bool, iteration: u32 },
+}
+
+impl ReanalysisFlowDecision {
+    fn done(should_break: bool, iteration: u32) -> Self {
+        Self::Done {
+            should_break,
+            iteration,
+        }
+    }
+
+    fn into_result(self) -> Option<(bool, u32)> {
+        match self {
+            Self::Continue => None,
+            Self::Done {
+                should_break,
+                iteration,
+            } => Some((should_break, iteration)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReanalysisExecutionDecision {
+    effective_reason: ReanalysisReason,
+}
+
+enum DependencyAnalysisAttempt {
+    Completed(AnalysisResult),
+    EmptyOrder(ReanalysisFlowDecision),
+}
+
+struct DispatchSelectedCandidatesContext<'a> {
+    queued: &'a mut Vec<crate::openspec::Change>,
+    in_flight: &'a mut HashSet<String>,
+    iteration: u32,
+    analysis_result: &'a AnalysisResult,
+    available_slots: usize,
+    semaphore: Arc<Semaphore>,
+    join_set: &'a mut JoinSet<WorkspaceResult>,
+    cleanup_guard: &'a mut WorkspaceCleanupGuard,
+}
 
 fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
     format!(
@@ -2509,51 +2568,13 @@ impl ParallelExecutor {
         .await;
     }
 
-    /// Perform reanalysis and dispatch changes if conditions are met.
-    ///
-    /// # Arguments
-    /// * `queued` - Mutable reference to queued changes list
-    /// * `in_flight` - Mutable reference to in-flight changes set
-    /// * `max_parallelism` - Maximum parallelism level
-    /// * `iteration` - Current iteration number
-    /// * `reanalysis_reason` - Current reanalysis reason for logging
-    /// * `analyzer` - Dependency analyzer function
-    /// * `semaphore` - Semaphore for concurrency control
-    /// * `join_set` - JoinSet for spawned tasks
-    /// * `cleanup_guard` - Guard for workspace cleanup tracking
-    ///
-    /// # Returns
-    /// `Ok((should_break, new_iteration))` - Whether to break loop and new iteration count
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn perform_reanalysis_and_dispatch<F>(
+    async fn prepare_dispatch_candidates(
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
-        in_flight: &mut HashSet<String>,
+        in_flight: &HashSet<String>,
         max_parallelism: usize,
         iteration: u32,
-        reanalysis_reason: ReanalysisReason,
-        analyzer: &F,
-        semaphore: Arc<Semaphore>,
-        join_set: &mut JoinSet<WorkspaceResult>,
-        cleanup_guard: &mut WorkspaceCleanupGuard,
-    ) -> Result<(bool, u32)>
-    where
-        for<'a> F: Fn(
-                &'a [crate::openspec::Change],
-                &'a [String],
-                u32,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
-            > + Send
-            + Sync,
-    {
-        if self.is_cancelled() {
-            info!(
-                "Skipping dependency analysis and dispatch because parallel execution is cancelled"
-            );
-            return Ok((true, iteration));
-        }
-
+    ) -> ReanalysisFlowDecision {
         let classification = self.classify_queued_work(queued, in_flight).await;
         if classification.is_blocked_only() {
             info!(
@@ -2572,8 +2593,9 @@ impl ParallelExecutor {
                 "blocked_only_no_dispatchable_candidates",
             )
             .await;
-            return Ok((false, iteration));
+            return ReanalysisFlowDecision::done(false, iteration);
         }
+
         if !classification.has_dispatchable_apply() && !queued.is_empty() {
             info!(
                 queued = queued.len(),
@@ -2586,15 +2608,23 @@ impl ParallelExecutor {
                 "no_dispatchable_apply_candidates",
             )
             .await;
-            return Ok((false, iteration));
+            return ReanalysisFlowDecision::done(false, iteration);
         }
+
         if queued.len() != classification.dispatchable.len() {
             *queued = classification.dispatchable;
         }
 
-        // Gate re-analysis by available execution slots.
-        // Track zero->positive transitions so queue-edit debounce can be bypassed when
-        // capacity is restored and queued work can run immediately.
+        ReanalysisFlowDecision::Continue
+    }
+
+    fn compute_effective_reanalysis_reason(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        reanalysis_reason: ReanalysisReason,
+    ) -> ReanalysisExecutionDecision {
         let available_slots = self.calculate_available_slots(max_parallelism, in_flight);
         let previous_available_slots = self.last_available_slots.replace(available_slots);
         let slot_recovered = matches!(previous_available_slots, Some(0)) && available_slots > 0;
@@ -2614,7 +2644,7 @@ impl ParallelExecutor {
                 in_flight = in_flight.len(),
                 queued = queued.len(),
                 manual_resolve_active = self.manual_resolve_active(),
-                auto_resolve_active = self.auto_resolve_count.load(std::sync::atomic::Ordering::Relaxed),
+                auto_resolve_active = self.auto_resolve_count.load(Ordering::Relaxed),
                 "Re-analysis will continue with zero dispatch capacity; ordinary apply dispatch remains suppressed"
             );
         }
@@ -2625,6 +2655,18 @@ impl ParallelExecutor {
             } else {
                 reanalysis_reason
             };
+
+        ReanalysisExecutionDecision { effective_reason }
+    }
+
+    async fn should_run_analysis_now(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        iteration: u32,
+        effective_reason: ReanalysisReason,
+    ) -> ReanalysisFlowDecision {
         let bypass_debounce = matches!(
             effective_reason,
             ReanalysisReason::QueueNotification
@@ -2633,7 +2675,6 @@ impl ParallelExecutor {
                 | ReanalysisReason::RepairCandidate
         );
 
-        // Check debounce (skip on first iteration)
         let should_analyze = if iteration == 1 {
             info!("First iteration, skipping debounce check");
             true
@@ -2641,18 +2682,25 @@ impl ParallelExecutor {
             self.should_reanalyze(bypass_debounce).await
         };
 
-        if !should_analyze {
-            // Debounce active, wait for timer or queue notification
+        if should_analyze {
+            ReanalysisFlowDecision::Continue
+        } else {
             info!("Debounce active, waiting for timer or queue notification");
             self.emit_no_analysis_diagnostic(queued, in_flight, max_parallelism, "debounce_active")
                 .await;
-            return Ok((false, iteration));
+            ReanalysisFlowDecision::done(false, iteration)
         }
+    }
 
-        // Filter out changes that depend on failed changes
+    async fn filter_executable_candidates(
+        &mut self,
+        queued: &mut Vec<crate::openspec::Change>,
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        iteration: u32,
+    ) -> ReanalysisFlowDecision {
         let (executable_changes, skipped_changes) = self.filter_executable_changes(queued);
 
-        // Emit skip events
         for (change_id, reason) in skipped_changes {
             send_event(
                 &self.event_tx,
@@ -2672,15 +2720,30 @@ impl ParallelExecutor {
                 "local_queue_empty_after_reconciliation",
             )
             .await;
-            if in_flight.is_empty() {
-                return Ok((true, iteration)); // Should break
-            } else {
-                // Wait for in-flight to complete
-                return Ok((false, iteration)); // Continue, don't break
-            }
+            return ReanalysisFlowDecision::done(in_flight.is_empty(), iteration);
         }
 
-        // Run dependency analysis
+        ReanalysisFlowDecision::Continue
+    }
+
+    async fn run_dependency_analysis_attempt<F>(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        iteration: u32,
+        effective_reason: ReanalysisReason,
+        analyzer: &F,
+    ) -> DependencyAnalysisAttempt
+    where
+        for<'a> F: Fn(
+                &'a [crate::openspec::Change],
+                &'a [String],
+                u32,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = AnalysisResult> + Send + 'a>>
+            + Send
+            + Sync,
+    {
         info!(
             "Re-analysis triggered: iteration={}, queued={}, in_flight={}, trigger={}",
             iteration,
@@ -2698,25 +2761,32 @@ impl ParallelExecutor {
         )
         .await;
 
-        // Convert in_flight HashSet to Vec<String> for analyzer
         let in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
         let analysis_result = analyzer(queued, &in_flight_ids, iteration).await;
 
         if analysis_result.order.is_empty() {
             warn!("No order returned from analysis");
-            if in_flight.is_empty() {
-                return Ok((true, iteration)); // Should break
-            } else {
-                return Ok((false, iteration)); // Continue
-            }
+            return DependencyAnalysisAttempt::EmptyOrder(ReanalysisFlowDecision::done(
+                in_flight.is_empty(),
+                iteration,
+            ));
         }
 
-        // Update dependencies
+        DependencyAnalysisAttempt::Completed(analysis_result)
+    }
+
+    async fn handle_post_analysis_capacity(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        _iteration: u32,
+        analysis_result: &AnalysisResult,
+    ) -> Result<Option<usize>> {
         self.failed_tracker
             .set_dependencies(analysis_result.dependencies.clone());
         self.change_dependencies = analysis_result.dependencies.clone();
 
-        // Recalculate available slots (may have changed during analysis if tasks completed)
         let available_slots = self.calculate_available_slots(max_parallelism, in_flight);
         info!(
             "Available slots after analysis: {} (max: {}, in_flight: {}, queued: {})",
@@ -2748,79 +2818,240 @@ impl ParallelExecutor {
                 "dispatch_capacity_zero_after_analysis",
             )
             .await;
-            return Ok((false, iteration));
+            return Ok(None);
         }
 
-        // Select changes to dispatch based on order and available slots
+        Ok(Some(available_slots))
+    }
+
+    async fn dispatch_selected_candidates(
+        &mut self,
+        ctx: DispatchSelectedCandidatesContext<'_>,
+    ) -> Result<u32> {
+        let DispatchSelectedCandidatesContext {
+            queued,
+            in_flight,
+            iteration,
+            analysis_result,
+            available_slots,
+            semaphore,
+            join_set,
+            cleanup_guard,
+        } = ctx;
         let selected_changes = self
-            .select_changes_for_dispatch(&analysis_result, available_slots, in_flight)
+            .select_changes_for_dispatch(analysis_result, available_slots, in_flight)
             .await;
 
-        // Ordinary apply candidates must not be converted into RejectWait simply
-        // because another change occupies the base-mutating lane. RejectWait is
-        // only valid after a repository-visible rejection-review handoff
-        // (`REJECTED.md` or rejecting resume), where dispatch.rs marks that intent.
-        // Slot accounting still prevents normal apply dispatch when no execution
-        // capacity is available.
+        if selected_changes.is_empty() {
+            return Ok(iteration);
+        }
 
-        // Dispatch selected changes
-        let new_iteration = if !selected_changes.is_empty() {
-            let base_revision = self
-                .workspace_manager
-                .get_current_revision()
-                .await
-                .map_err(OrchestratorError::from)?;
+        let base_revision = self
+            .workspace_manager
+            .get_current_revision()
+            .await
+            .map_err(OrchestratorError::from)?;
 
-            info!(
-                "Dispatching {} changes (iteration {}): {:?}",
-                selected_changes.len(),
-                iteration,
-                selected_changes
-            );
+        info!(
+            "Dispatching {} changes (iteration {}): {:?}",
+            selected_changes.len(),
+            iteration,
+            selected_changes
+        );
 
-            for change_id in &selected_changes {
-                if self.is_cancelled() {
-                    info!("Stopping selected-change dispatch loop because parallel execution is cancelled");
-                    break;
-                }
-                if let Err(e) = self
-                    .dispatch_change_to_workspace(
-                        change_id.clone(),
-                        base_revision.clone(),
-                        semaphore.clone(),
-                        join_set,
-                        in_flight,
-                        cleanup_guard,
-                    )
-                    .await
-                {
-                    let message = format!("Failed to dispatch change '{}': {}", change_id, e);
-                    self.failed_tracker.mark_failed(change_id);
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::ProcessingError {
-                            id: change_id.clone(),
-                            error: message.clone(),
-                        },
-                    )
-                    .await;
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::Log(LogEntry::error(message.clone())),
-                    )
-                    .await;
-                    error!("{}", message);
-                }
+        for change_id in &selected_changes {
+            if self.is_cancelled() {
+                info!("Stopping selected-change dispatch loop because parallel execution is cancelled");
+                break;
             }
+            if let Err(e) = self
+                .dispatch_change_to_workspace(
+                    change_id.clone(),
+                    base_revision.clone(),
+                    semaphore.clone(),
+                    join_set,
+                    in_flight,
+                    cleanup_guard,
+                )
+                .await
+            {
+                let message = format!("Failed to dispatch change '{}': {}", change_id, e);
+                self.failed_tracker.mark_failed(change_id);
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error: message.clone(),
+                    },
+                )
+                .await;
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Log(LogEntry::error(message.clone())),
+                )
+                .await;
+                error!("{}", message);
+            }
+        }
 
-            // Remove dispatched changes from queued
-            let dispatched_set: std::collections::HashSet<_> = selected_changes.iter().collect();
-            queued.retain(|c| !dispatched_set.contains(&c.id));
+        let dispatched_set: HashSet<_> = selected_changes.iter().collect();
+        queued.retain(|c| !dispatched_set.contains(&c.id));
 
-            iteration + 1
-        } else {
-            iteration
+        Ok(iteration + 1)
+    }
+
+    async fn before_dependency_analysis<F>(
+        &mut self,
+        queued: &mut Vec<crate::openspec::Change>,
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        iteration: u32,
+        reanalysis_reason: ReanalysisReason,
+        analyzer: &F,
+    ) -> Result<DependencyAnalysisAttempt>
+    where
+        for<'a> F: Fn(
+                &'a [crate::openspec::Change],
+                &'a [String],
+                u32,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = AnalysisResult> + Send + 'a>>
+            + Send
+            + Sync,
+    {
+        if let Some((should_break, iteration)) = self
+            .prepare_dispatch_candidates(queued, in_flight, max_parallelism, iteration)
+            .await
+            .into_result()
+        {
+            return Ok(DependencyAnalysisAttempt::EmptyOrder(
+                ReanalysisFlowDecision::done(should_break, iteration),
+            ));
+        }
+
+        let analysis_decision = self.compute_effective_reanalysis_reason(
+            queued,
+            in_flight,
+            max_parallelism,
+            reanalysis_reason,
+        );
+        if let Some((should_break, iteration)) = self
+            .should_run_analysis_now(
+                queued,
+                in_flight,
+                max_parallelism,
+                iteration,
+                analysis_decision.effective_reason,
+            )
+            .await
+            .into_result()
+        {
+            return Ok(DependencyAnalysisAttempt::EmptyOrder(
+                ReanalysisFlowDecision::done(should_break, iteration),
+            ));
+        }
+
+        if let Some((should_break, iteration)) = self
+            .filter_executable_candidates(queued, in_flight, max_parallelism, iteration)
+            .await
+            .into_result()
+        {
+            return Ok(DependencyAnalysisAttempt::EmptyOrder(
+                ReanalysisFlowDecision::done(should_break, iteration),
+            ));
+        }
+
+        Ok(self
+            .run_dependency_analysis_attempt(
+                queued,
+                in_flight,
+                iteration,
+                analysis_decision.effective_reason,
+                analyzer,
+            )
+            .await)
+    }
+
+    pub(super) async fn perform_reanalysis_and_dispatch<F>(
+        &mut self,
+        ctx: ReanalysisDispatchContext<'_, F>,
+    ) -> Result<(bool, u32)>
+    where
+        for<'a> F: Fn(
+                &'a [crate::openspec::Change],
+                &'a [String],
+                u32,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+            > + Send
+            + Sync,
+    {
+        let ReanalysisDispatchContext {
+            queued,
+            in_flight,
+            max_parallelism,
+            iteration,
+            reanalysis_reason,
+            analyzer,
+            semaphore,
+            join_set,
+            cleanup_guard,
+        } = ctx;
+
+        if self.is_cancelled() {
+            info!(
+                "Skipping dependency analysis and dispatch because parallel execution is cancelled"
+            );
+            return Ok((true, iteration));
+        }
+
+        let analysis_result = match self
+            .before_dependency_analysis(
+                queued,
+                in_flight,
+                max_parallelism,
+                iteration,
+                reanalysis_reason,
+                analyzer,
+            )
+            .await?
+        {
+            DependencyAnalysisAttempt::Completed(result) => result,
+            DependencyAnalysisAttempt::EmptyOrder(decision) => {
+                if let Some(result) = decision.into_result() {
+                    return Ok(result);
+                }
+                unreachable!("empty analysis order always produces a terminal flow decision")
+            }
         };
+
+        let available_slots = match self
+            .handle_post_analysis_capacity(
+                queued,
+                in_flight,
+                max_parallelism,
+                iteration,
+                &analysis_result,
+            )
+            .await
+        {
+            Ok(Some(slots)) => slots,
+            Ok(None) => return Ok((false, iteration)),
+            Err(error) => return Err(error),
+        };
+
+        let new_iteration = self
+            .dispatch_selected_candidates(DispatchSelectedCandidatesContext {
+                queued,
+                in_flight,
+                iteration,
+                analysis_result: &analysis_result,
+                available_slots,
+                semaphore,
+                join_set,
+                cleanup_guard,
+            })
+            .await?;
 
         Ok((false, new_iteration))
     }
