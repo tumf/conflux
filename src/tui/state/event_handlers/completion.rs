@@ -221,6 +221,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
+    use crate::tui::events::OrchestratorEvent;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -315,6 +316,25 @@ mod tests {
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(app.changes[1].display_status_cache, "not queued");
         assert_eq!(app.mode, AppMode::Select);
+    }
+
+    #[test]
+    fn change_dequeued_clears_selection_and_marks_not_queued() {
+        let changes = vec![create_test_change("change-a", 0, 1)];
+        let mut app = AppState::new(changes);
+        app.changes[0].set_display_status_cache("applying");
+        app.changes[0].selected = true;
+
+        app.handle_orchestrator_event(OrchestratorEvent::ChangeDequeued {
+            change_id: "change-a".to_string(),
+        });
+
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(!app.changes[0].selected);
+        assert!(app
+            .logs
+            .iter()
+            .any(|log| log.message == "Stopped: change-a"));
     }
 
     #[test]
