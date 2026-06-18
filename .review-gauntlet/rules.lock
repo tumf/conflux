@@ -1,0 +1,111 @@
+{
+  "upstream_repository": "https://github.com/alibaba/open-code-review",
+  "upstream_commit": "c323c6b40c72aa95d7cb801bedcb957b52ff9807",
+  "system_rules": {
+    "**/*.properties": "properties.md",
+    "**/*mapper*.xml": "mapper_dao_xml.md",
+    "**/*dao*.xml": "mapper_dao_xml.md",
+    "**/pom.xml": "pom_xml.md",
+    "**/build.gradle": "build_gradle.md",
+    "**/package.json": "package_json.md",
+    "**/Cargo.toml": "cargo_toml.md",
+    "**/*.{json,json5}": "json.md",
+    "**/*.{yaml,yml}": "yaml.md",
+    "**/*.java": "java.md",
+    "**/*.ets": "arkts.md",
+    "**/*.{ts,js,tsx,jsx}": "ts_js_tsx_jsx.md",
+    "**/*.kt": "kotlin.md",
+    "**/*.rs": "rust.md",
+    "**/*.{cpp,cc,hpp}": "cpp.md",
+    "**/*.c": "c.md",
+    "**/*.sol": "solidity.md"
+  },
+  "documents": {
+    "arkts.md": {
+      "id": "arkts",
+      "filename": "arkts.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## arkts.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "build_gradle.md": {
+      "id": "build_gradle",
+      "filename": "build_gradle.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## build_gradle.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "c.md": {
+      "id": "c",
+      "filename": "c.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## c.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "cargo_toml.md": {
+      "id": "cargo_toml",
+      "filename": "cargo_toml.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## cargo_toml.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "cpp.md": {
+      "id": "cpp",
+      "filename": "cpp.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## cpp.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "default.md": {
+      "id": "default",
+      "filename": "default.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Focus on correctness, security, maintainability, and actionable line-level comments.\n"
+    },
+    "java.md": {
+      "id": "java",
+      "filename": "java.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## java.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "json.md": {
+      "id": "json",
+      "filename": "json.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## json.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "kotlin.md": {
+      "id": "kotlin",
+      "filename": "kotlin.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## kotlin.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "mapper_dao_xml.md": {
+      "id": "mapper_dao_xml",
+      "filename": "mapper_dao_xml.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## mapper_dao_xml.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "package_json.md": {
+      "id": "package_json",
+      "filename": "package_json.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## package_json.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "pom_xml.md": {
+      "id": "pom_xml",
+      "filename": "pom_xml.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## pom_xml.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "properties.md": {
+      "id": "properties",
+      "filename": "properties.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## properties.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "rust.md": {
+      "id": "rust",
+      "filename": "rust.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## rust.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "solidity.md": {
+      "id": "solidity",
+      "filename": "solidity.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## solidity.md\n\nApply OCR-style checks for Solidity smart contracts. Prioritize externally exploitable contract behavior, asset safety, authorization boundaries, and invariant preservation. When filing findings, include concrete impact, affected function or storage state, and a minimal exploit or failure scenario when possible.\n\n## Solidity smart-contract review checklist\n\n1. **Specification and assumptions**: confirm the intended protocol behavior, trust model, privileged roles, economic assumptions, threat model, and invariants are explicit and matched by the implementation.\n2. **Solidity version and compiler settings**: verify pragma constraints, optimizer assumptions, EVM version, unchecked blocks, ABI encoder behavior, and build settings are intentional and reproducible.\n3. **Access control**: check owner/admin/operator boundaries, role initialization, role revocation, multisig/timelock expectations, modifier coverage, and privilege escalation paths.\n4. **Reentrancy and external calls**: inspect every external call, callback, hook, delegatecall, low-level call, transfer of control, and checks-effects-interactions ordering for reentrancy or cross-function state corruption.\n5. **ETH and token transfers**: validate native ETH handling, ERC20 return-value handling, fee-on-transfer/rebasing tokens, approval races, safe transfer libraries, pull-vs-push payments, and stuck-fund paths.\n6. **Input validation and boundary values**: test zero addresses, zero amounts, max values, empty arrays, duplicate entries, unsorted inputs, invalid enum states, expired deadlines, and unexpected caller or receiver contracts.\n7. **Numeric calculation, rounding, and casting**: review precision loss, rounding direction, scale factors, overflow/underflow assumptions, signed/unsigned conversion, downcasts, division before multiplication, and accounting dust.\n8. **State management and invariants**: check storage updates, lifecycle state machines, aggregate accounting, supply and balance invariants, idempotency, pause/resume transitions, and consistency after partial failure.\n9. **Randomness, time, block data, and on-chain secrecy assumptions**: flag miner/validator-influenceable values, timestamp dependence, blockhash limits, predictable randomness, front-running, MEV exposure, and secrets that are visible on-chain.\n10. **Oracle, pricing, and external data**: verify oracle freshness, decimals, stale or missing rounds, manipulation resistance, TWAP windows, sequencer/down flags, fallback behavior, and assumptions about third-party data feeds.\n11. **Gas and denial-of-service resistance**: look for unbounded loops, attacker-controlled array growth, expensive callbacks, griefing via revert, block gas limit risks, storage bloat, and operations that can permanently block withdrawals or administration.\n12. **Upgradeable/proxy contracts**: inspect initializer protection, storage layout compatibility, delegatecall context, UUPS/transparent proxy authorization, implementation selfdestruct/deactivation risks, and upgrade sequencing.\n13. **Signatures, permits, and replay protection**: validate EIP-712 domain separation, chain ID and contract address binding, nonces, deadlines, signature malleability, permit semantics, and cross-chain or cross-contract replay resistance.\n14. **ERC/interface compliance**: compare behavior against claimed ERC standards and interfaces, including events, return values, hooks, supportsInterface, metadata, receiver callbacks, and edge-case compatibility.\n15. **Emergency design**: evaluate pause, circuit breaker, rescue, sweep, blacklist, shutdown, and governance emergency paths for clear authority, bounded power, recovery ability, and abuse resistance.\n16. **Events and auditability**: ensure important state changes, admin actions, parameter updates, upgrades, deposits, withdrawals, liquidations, and emergency actions emit accurate and indexed events.\n17. **Testing and verification**: require unit, integration, invariant, fuzz, differential, and regression tests for critical paths; check static-analysis findings and ensure tests exercise adversarial callers and boundary values.\n18. **Deployment and operations**: review constructor/initializer arguments, deployment ordering, address wiring, chain-specific constants, ownership transfer, verification artifacts, migration scripts, and post-deploy runbooks.\n19. **Code quality and readability**: check simple control flow, clear naming, isolated accounting logic, minimal inheritance complexity, explicit errors, consistent libraries, comments for non-obvious assumptions, and dead-code removal.\n20. **High-risk signal review**: scrutinize low-level call, delegatecall, assembly, selfdestruct, tx.origin, arbitrary token/address parameters, unchecked arithmetic, custom auth, custom proxies, flash-loan paths, oracle writes, and owner-only fund movement.\n\n## Practical review order\n\nReview Solidity files in this order so the highest-impact assumptions are checked first:\n\n1. Start with the specification, trust model, lifecycle, and invariants; write down what must always remain true.\n2. Trace permissions and fund flows, including who can move value, mint, burn, upgrade, pause, rescue, or change parameters.\n3. Inspect external calls and reentrancy surfaces before trusting any state transition that crosses contract boundaries.\n4. Verify accounting and math, including rounding, precision, casting, aggregate totals, and token balance reconciliation.\n5. Review high-risk mechanisms such as proxies, signatures, permits, oracle pricing, randomness, flash loans, assembly, and low-level calls.\n6. Exercise boundary, denial-of-service, gas, revert, and error cases with adversarial inputs and caller-controlled collections.\n7. Finish by checking tests, fuzz/invariant coverage, static-analysis results, compiler/deployment settings, and operational handoff steps.\n"
+    },
+    "ts_js_tsx_jsx.md": {
+      "id": "ts_js_tsx_jsx",
+      "filename": "ts_js_tsx_jsx.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## ts_js_tsx_jsx.md\n\nApply OCR-style checks for this file family.\n"
+    },
+    "yaml.md": {
+      "id": "yaml",
+      "filename": "yaml.md",
+      "content": "# OCR Rule Attribution\n\nPorted review guidance derived from Alibaba open-code-review at commit c323c6b40c72aa95d7cb801bedcb957b52ff9807 (Apache-2.0). Review for correctness, security, maintainability, and actionable line-level comments.\n\n## yaml.md\n\nApply OCR-style checks for this file family.\n"
+    }
+  },
+  "digest": "8f6075fa8b3d8ad3606e0f850277b73de14cf786552139cd817a8bd18d34477c"
+}
