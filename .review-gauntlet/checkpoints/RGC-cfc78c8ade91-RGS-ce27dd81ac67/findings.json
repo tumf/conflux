@@ -1,0 +1,48 @@
+{
+  "checkpoint_id": "RGC-cfc78c8ade91-RGS-ce27dd81ac67",
+  "findings": [
+    {
+      "checkpoint_id": "RGC-cfc78c8ade91-RGS-ce27dd81ac67",
+      "content": "The top-level `web` block is not part of `OrchestratorConfig`, and the web monitoring server is configured only from CLI flags (`--web`, `--web-port`, `--web-bind`) when starting TUI/run. Because serde ignores unknown fields by default, these settings are silently ignored, so the checked-in port/bind/refresh interval do not affect cflx behavior.",
+      "finding_id": "RGF-0001",
+      "fingerprint": "112fba92e5ce4536c8a682fec52000aef63c62628995e367b88027b0c530c7f5",
+      "latest_occurrence": {
+        "cell_id": "RGC-3dcb52d080b10678",
+        "end_line": 9,
+        "finding_id": "RGF-0001",
+        "imprecise": 0,
+        "occurrence_id": 1,
+        "path": ".cflx.jsonc",
+        "run_id": 3,
+        "start_line": 5
+      },
+      "metadata": "{\"fingerprint\":\"112fba92e5ce4536c8a682fec52000aef63c62628995e367b88027b0c530c7f5\",\"path\":\".cflx.jsonc\",\"rule_id\":\"cli-contract\",\"content\":\"The top-level `web` block is not part of `OrchestratorConfig`, and the web monitoring server is configured only from CLI flags (`--web`, `--web-port`, `--web-bind`) when starting TUI/run. Because serde ignores unknown fields by default, these settings are silently ignored, so the checked-in port/bind/refresh interval do not affect cflx behavior.\",\"suggestion_code\":\"\",\"existing_code\":\"    \\\"web\\\": {\\n        \\\"port\\\": 51823,\\n        \\\"bind\\\": \\\"127.0.0.1\\\",\\n        \\\"refresh_interval_secs\\\": 5,\\n    },\",\"start_line\":5,\"end_line\":9,\"thinking\":\"OrchestratorConfig in src/config/types.rs has `server` and other orchestration fields, but no `web` field; main.rs creates web::WebConfig from CLI args instead of project config.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".cflx.jsonc",
+      "rule_id": "cli-contract",
+      "session_id": "RGS-ce27dd81ac67",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-cfc78c8ade91-RGS-ce27dd81ac67",
+      "content": "The checked-in comment says this is web monitoring server configuration, but the documented configuration contract only enables web monitoring via `web.enabled = true`; this block omits `enabled` and includes `refresh_interval_secs`, which is not documented in the configuration spec. As written, the example implies behavior that the documented CLI/config contract does not provide.",
+      "finding_id": "RGF-0002",
+      "fingerprint": "41f79fe4ee859277c4442ff93e276708a2db8d5b5f037e22555d60a4ca1d417f",
+      "latest_occurrence": {
+        "cell_id": "RGC-a8ab6ff0a8356e58",
+        "end_line": 9,
+        "finding_id": "RGF-0002",
+        "imprecise": 0,
+        "occurrence_id": 2,
+        "path": ".cflx.jsonc",
+        "run_id": 3,
+        "start_line": 4
+      },
+      "metadata": "{\"fingerprint\":\"41f79fe4ee859277c4442ff93e276708a2db8d5b5f037e22555d60a4ca1d417f\",\"path\":\".cflx.jsonc\",\"rule_id\":\"docs-accuracy\",\"content\":\"The checked-in comment says this is web monitoring server configuration, but the documented configuration contract only enables web monitoring via `web.enabled = true`; this block omits `enabled` and includes `refresh_interval_secs`, which is not documented in the configuration spec. As written, the example implies behavior that the documented CLI/config contract does not provide.\",\"suggestion_code\":\"\",\"existing_code\":\"    // Web monitoring server configuration\\n    \\\"web\\\": {\\n        \\\"port\\\": 51823,\\n        \\\"bind\\\": \\\"127.0.0.1\\\",\\n        \\\"refresh_interval_secs\\\": 5,\\n    },\",\"start_line\":4,\"end_line\":9,\"thinking\":\"openspec/specs/configuration/spec.md documents web.enabled plus port/bind, partial web config as disabled, and no refresh_interval_secs config key.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".cflx.jsonc",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-ce27dd81ac67",
+      "state": "confirmed"
+    }
+  ],
+  "schema_version": 1
+}
