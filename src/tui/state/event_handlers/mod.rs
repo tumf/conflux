@@ -82,6 +82,9 @@ impl AppState {
                 hook_type,
                 error,
             } => self.handle_hook_failed(change_id, hook_type, error),
+            OrchestratorEvent::ChangeDequeued { change_id } => {
+                self.handle_change_stopped(change_id)
+            }
             OrchestratorEvent::ChangeStopped { change_id } => self.handle_change_stopped(change_id),
             OrchestratorEvent::ChangeStopFailed { change_id, error } => {
                 self.handle_change_stop_failed(change_id, error)
