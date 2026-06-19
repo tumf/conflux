@@ -12,7 +12,7 @@ $ARGUMENTS
 **CRITICAL**: You CANNOT ask questions to the user during apply operations. If anything is unclear or ambiguous, make your best autonomous decision based on available context (proposal.md, design.md, tasks.md, existing code patterns). Document your decisions in implementation comments if needed.
 
 
-**Goal**: Achieve 100% task completion (all tasks in `openspec/chagens/{change_id}/tasks.md` marked as `- [x]` or moved to Future Work). Implement the approved change fully; update the `tasks.md` as progress is made; and provide all AI-executable verification (build/tests/lint) to the extent possible.
+**Goal**: Achieve 100% task completion (all tasks in `openspec/changes/{change_id}/tasks.md` marked as `- [x]` or moved to Future Work). Implement the approved change fully; update the `tasks.md` as progress is made; and provide all AI-executable verification (build/tests/lint) to the extent possible.
 **Non-Goal**: Archiving the change or running any archive command; human-only steps (manual verification, visual checks, approvals); long-wait tests; production deployment or production testing.
 
 **MUST**: The files under `openspec/changes/*` (tasks.md, design.md, proposal.md) must be written in Japanese.
