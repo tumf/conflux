@@ -1,0 +1,45 @@
+{
+  "blockers": [],
+  "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+  "checkpoint_state": "complete",
+  "coverage": {
+    "reviewed": 620
+  },
+  "created_at": "2026-06-19T06:28:42.641312Z",
+  "finding_state_counts": {
+    "confirmed": 12,
+    "dismissed": 2
+  },
+  "head_commit": "87e455200b01e37d863ea42bf8ecedab9b1f1a12",
+  "last_run_target_digest": "3c2320a63dbf863a973b6f50eaa1d99b0c7c47308a3fdd092e79647baa548a6e",
+  "next_required_action": "init_next_session",
+  "review_base_commit": "87e455200b01e37d863ea42bf8ecedab9b1f1a12",
+  "ruleset_digest": "8f6075fa8b3d8ad3606e0f850277b73de14cf786552139cd817a8bd18d34477c",
+  "run_count": 8,
+  "schema_version": 1,
+  "session_id": "RGS-062041c1700b",
+  "session_metadata": {
+    "root": "/Users/tumf/work/conflux",
+    "ruleset_digest": "8f6075fa8b3d8ad3606e0f850277b73de14cf786552139cd817a8bd18d34477c",
+    "session_id": "RGS-062041c1700b",
+    "target": {
+      "base_ref": null,
+      "commit": null,
+      "head_mode": "moving",
+      "head_ref": null,
+      "include_worktree": false,
+      "kind": "all"
+    },
+    "target_digest": "f33655739316b0277e11980416f9e5abdc3a104eb678e3672697725e2a514f11"
+  },
+  "target": {
+    "base_ref": null,
+    "commit": null,
+    "head_mode": "moving",
+    "head_ref": null,
+    "include_worktree": false,
+    "kind": "all"
+  },
+  "target_digest": "3c2320a63dbf863a973b6f50eaa1d99b0c7c47308a3fdd092e79647baa548a6e",
+  "usable_as_review_base": true
+}

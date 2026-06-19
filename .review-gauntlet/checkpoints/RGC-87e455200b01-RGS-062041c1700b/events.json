@@ -1,0 +1,150 @@
+{
+  "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+  "events": [
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:10:59",
+      "event_id": 1,
+      "finding_id": "RGF-0001",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "Confirmed: .cflx.jsonc line 12 sets git_commit_no_verify=true for the on_merged make bump-patch hook, so the generated version-bump commit bypasses repository git verification hooks.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:12:27",
+      "event_id": 2,
+      "finding_id": "RGF-0002",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "ci.yml uses mutable selectors: ubuntu-latest/macos-latest runner labels, dtolnay/rust-toolchain@stable, and unpinned third-party action major tags; these can change CI behavior across runs.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:12:27",
+      "event_id": 3,
+      "finding_id": "RGF-0003",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "ci.yml installs cargo-audit with cargo install cargo-audit --locked but without --version, so the binary version can change between CI runs.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:14:15",
+      "event_id": 4,
+      "finding_id": "RGF-0004",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "Real reproducibility issue: release matrix uses floating macos-latest for x86_64-apple-darwin at .github/workflows/release.yml:25, so a later tag rebuild may run on a different macOS image.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:14:15",
+      "event_id": 5,
+      "finding_id": "RGF-0005",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "Real reproducibility issue: .github/workflows/release.yml:87-90 installs Rust from dtolnay/rust-toolchain@stable, so later rebuilds may use a different Rust compiler.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:14:15",
+      "event_id": 6,
+      "finding_id": "RGF-0006",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "Real reproducibility issue: .github/workflows/release.yml:92-95 configures Node.js as floating major '20', so later dashboard builds may use a different Node.js patch/minor.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:16:05",
+      "event_id": 7,
+      "finding_id": "RGF-0007",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "Real issue: ignoring .review-gauntlet/ prevents Git from recursing into the directory, so the later negation cannot re-include .review-gauntlet/checkpoints/.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:17:38",
+      "event_id": 8,
+      "finding_id": "RGF-0008",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "Real mismatch: .node-version pins local development to 24.12.0 while CI and release workflows configure actions/setup-node with node-version '20'.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:19:37",
+      "event_id": 9,
+      "finding_id": "RGF-0009",
+      "from_state": "open",
+      "metadata": {
+        "dismiss_reason": "Non-issue: current OpenCode agent guidance in this environment recognizes both .opencode/agent/<name>.md and .opencode/agents/<name>.md as valid project agent locations; therefore this file being under singular .opencode/agent/ is not enough to make it unloaded."
+      },
+      "reason": "Non-issue: current OpenCode agent guidance in this environment recognizes both .opencode/agent/<name>.md and .opencode/agents/<name>.md as valid project agent locations; therefore this file being under singular .opencode/agent/ is not enough to make it unloaded.",
+      "to_state": "dismissed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:19:37",
+      "event_id": 10,
+      "finding_id": "RGF-0010",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "OpenCode agents documentation marks the tools option as deprecated and recommends permission for new or updated configs; this file still uses tools at lines 5-6.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:19:38",
+      "event_id": 11,
+      "finding_id": "RGF-0011",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "AGENTS.md requires bd for all task tracking and explicitly forbids TodoWrite/TaskCreate/markdown TODO lists, while this agent prompt tells implementers to plan with TodoWrite at lines 90-91.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:21:29",
+      "event_id": 12,
+      "finding_id": "RGF-0012",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "OpenCode docs specify per-project markdown agents must be placed under .opencode/agents/, while the target file is under the singular .opencode/agent/ path.",
+      "to_state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:24:42",
+      "event_id": 13,
+      "finding_id": "RGF-0013",
+      "from_state": "open",
+      "metadata": {
+        "dismiss_reason": "Line 15 currently reads 'openspec/changes/{change_id}/tasks.md' \u2014 the typo 'chagens' no longer exists in the file. The content digest may have changed since the finding was created. No action needed."
+      },
+      "reason": "Line 15 currently reads 'openspec/changes/{change_id}/tasks.md' \u2014 the typo 'chagens' no longer exists in the file. The content digest may have changed since the finding was created. No action needed.",
+      "to_state": "dismissed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "created_at": "2026-06-19 06:26:16",
+      "event_id": 14,
+      "finding_id": "RGF-0014",
+      "from_state": "open",
+      "metadata": {},
+      "reason": "The archive command still instructs agents to invoke upstream npx @fission-ai/openspec@latest for list/show/archive/validate, while this repository's Conflux workflow should use the project-local OpenSpec conventions/CLI wrapper rather than the upstream package; lines 21-31 therefore document the wrong operational path.",
+      "to_state": "confirmed"
+    }
+  ],
+  "schema_version": 1
+}

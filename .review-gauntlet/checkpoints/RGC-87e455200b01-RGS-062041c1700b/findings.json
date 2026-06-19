@@ -1,0 +1,300 @@
+{
+  "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+  "findings": [
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "The on_merged hook config disables git verification hooks for the version-bump commit. This bypasses repository commit hooks during an automated merge lifecycle step, which can let invalid generated commits land unnoticed unless there is a documented, compensating check elsewhere.",
+      "finding_id": "RGF-0001",
+      "fingerprint": "bb1230ee4382c6eac31efd2e051a5f1d7303412cc70bb0ddaf4dd1150bf8e973",
+      "latest_occurrence": {
+        "cell_id": "RGC-3dcb52d080b10678",
+        "end_line": 12,
+        "finding_id": "RGF-0001",
+        "imprecise": 0,
+        "occurrence_id": 1,
+        "path": ".cflx.jsonc",
+        "run_id": 2,
+        "start_line": 12
+      },
+      "metadata": "{\"fingerprint\":\"bb1230ee4382c6eac31efd2e051a5f1d7303412cc70bb0ddaf4dd1150bf8e973\",\"path\":\".cflx.jsonc\",\"rule_id\":\"cli-contract\",\"content\":\"The on_merged hook config disables git verification hooks for the version-bump commit. This bypasses repository commit hooks during an automated merge lifecycle step, which can let invalid generated commits land unnoticed unless there is a documented, compensating check elsewhere.\",\"suggestion_code\":\"            \\\"git_commit_no_verify\\\": false,\",\"existing_code\":\"            \\\"git_commit_no_verify\\\": true,\",\"start_line\":12,\"end_line\":12,\"thinking\":\"Automated lifecycle hooks should be safe by default; skipping git verification in project config weakens CLI contract guarantees around generated commits.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".cflx.jsonc",
+      "rule_id": "cli-contract",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "The CI workflow depends on floating action refs and mutable runner/toolchain selectors, which makes successful builds non-reproducible and exposes the workflow to unexpected upstream changes. Pin third-party actions and toolchains to immutable versions or SHAs, and use explicit runner images where practical.",
+      "finding_id": "RGF-0002",
+      "fingerprint": "3716de97d1c3e0e9140a62251e8cd2d4396394e99449323b0589af199bad5232",
+      "latest_occurrence": {
+        "cell_id": "RGC-28c8daef87e0bafa",
+        "end_line": 59,
+        "finding_id": "RGF-0002",
+        "imprecise": 0,
+        "occurrence_id": 2,
+        "path": ".github/workflows/ci.yml",
+        "run_id": 3,
+        "start_line": 35
+      },
+      "metadata": "{\"fingerprint\":\"3716de97d1c3e0e9140a62251e8cd2d4396394e99449323b0589af199bad5232\",\"path\":\".github/workflows/ci.yml\",\"rule_id\":\"ci-reproducibility\",\"content\":\"The CI workflow depends on floating action refs and mutable runner/toolchain selectors, which makes successful builds non-reproducible and exposes the workflow to unexpected upstream changes. Pin third-party actions and toolchains to immutable versions or SHAs, and use explicit runner images where practical.\",\"suggestion_code\":\"        os: [ubuntu-24.04, macos-15]\\n    steps:\\n      - uses: actions/checkout@<pinned-commit-sha>\\n\\n      - name: Install dependencies\\n        run: |\\n          if [ \\\"$RUNNER_OS\\\" = \\\"Linux\\\" ]; then\\n            sudo apt-get update && sudo apt-get install -y make\\n          else\\n            brew install make\\n          fi\\n        shell: bash\\n\\n      - name: Install Rust\\n        uses: dtolnay/rust-toolchain@<pinned-commit-sha>\\n        with:\\n          toolchain: 1.90.0\\n          components: rustfmt, clippy\\n\\n      - name: Cache Rust build artifacts\\n        uses: Swatinem/rust-cache@<pinned-commit-sha>\\n\\n      - name: Setup Node.js\\n        uses: actions/setup-node@<pinned-commit-sha>\\n        with:\\n          node-version: '20.19.0'\",\"existing_code\":\"        os: [ubuntu-latest, macos-latest]\\n    steps:\\n      - uses: actions/checkout@v5\\n\\n      - name: Install dependencies\\n        run: |\\n          if [ \\\"$RUNNER_OS\\\" = \\\"Linux\\\" ]; then\\n            sudo apt-get update && sudo apt-get install -y make\\n          else\\n            brew install make\\n          fi\\n        shell: bash\\n\\n      - name: Install Rust\\n        uses: dtolnay/rust-toolchain@stable\\n        with:\\n          components: rustfmt, clippy\\n\\n      - name: Cache Rust build artifacts\\n        uses: Swatinem/rust-cache@v2\\n\\n      - name: Setup Node.js\\n        uses: actions/setup-node@v4\\n        with:\\n          node-version: '20'\",\"start_line\":35,\"end_line\":59,\"thinking\":\"Floating tags like @v4/@v5/@stable and latest runner aliases can change behavior without a repository diff, which violates CI reproducibility.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".github/workflows/ci.yml",
+      "rule_id": "ci-reproducibility",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "cargo-audit is installed without a version constraint, so every CI run may test with a different audit binary. Pin the cargo-audit version or install from a checked-in tool manifest to keep audit results reproducible.",
+      "finding_id": "RGF-0003",
+      "fingerprint": "7b836d0b1f598971451bfcf460773ae7162b23809ce5908053ecd00ee7431f62",
+      "latest_occurrence": {
+        "cell_id": "RGC-28c8daef87e0bafa",
+        "end_line": 68,
+        "finding_id": "RGF-0003",
+        "imprecise": 0,
+        "occurrence_id": 3,
+        "path": ".github/workflows/ci.yml",
+        "run_id": 3,
+        "start_line": 67
+      },
+      "metadata": "{\"fingerprint\":\"7b836d0b1f598971451bfcf460773ae7162b23809ce5908053ecd00ee7431f62\",\"path\":\".github/workflows/ci.yml\",\"rule_id\":\"ci-reproducibility\",\"content\":\"cargo-audit is installed without a version constraint, so every CI run may test with a different audit binary. Pin the cargo-audit version or install from a checked-in tool manifest to keep audit results reproducible.\",\"suggestion_code\":\"      - name: Install cargo-audit\\n        run: cargo install cargo-audit --version 0.21.2 --locked\",\"existing_code\":\"      - name: Install cargo-audit\\n        run: cargo install cargo-audit --locked\",\"start_line\":67,\"end_line\":68,\"thinking\":\"The --locked flag locks cargo-audit's dependency graph, but not which cargo-audit release is selected.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".github/workflows/ci.yml",
+      "rule_id": "ci-reproducibility",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "The release matrix uses `macos-latest` for the x86_64 Darwin artifact, so the runner image can change underneath release builds and alter toolchains, SDKs, or packaging behavior. Pin the macOS image to a concrete version to keep release artifacts reproducible.",
+      "finding_id": "RGF-0004",
+      "fingerprint": "d58c86ddfe1a8a22e269ad15f5b566db273720a7aa2c7c7eccbefdc3238506c6",
+      "latest_occurrence": {
+        "cell_id": "RGC-9074753f6395dda6",
+        "end_line": 25,
+        "finding_id": "RGF-0004",
+        "imprecise": 0,
+        "occurrence_id": 4,
+        "path": ".github/workflows/release.yml",
+        "run_id": 3,
+        "start_line": 25
+      },
+      "metadata": "{\"fingerprint\":\"d58c86ddfe1a8a22e269ad15f5b566db273720a7aa2c7c7eccbefdc3238506c6\",\"path\":\".github/workflows/release.yml\",\"rule_id\":\"ci-reproducibility\",\"content\":\"The release matrix uses `macos-latest` for the x86_64 Darwin artifact, so the runner image can change underneath release builds and alter toolchains, SDKs, or packaging behavior. Pin the macOS image to a concrete version to keep release artifacts reproducible.\",\"suggestion_code\":\"      {\\\"os\\\": \\\"macos-13\\\", \\\"target\\\": \\\"x86_64-apple-darwin\\\"},\",\"existing_code\":\"      {\\\"os\\\": \\\"macos-latest\\\", \\\"target\\\": \\\"x86_64-apple-darwin\\\"},\",\"start_line\":25,\"end_line\":25,\"thinking\":\"Release artifacts should be built on stable runner images; `latest` aliases are explicitly allowed to drift.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".github/workflows/release.yml",
+      "rule_id": "ci-reproducibility",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "Rust is installed from the moving `stable` channel, which means a tag rebuild at a later date may use a different compiler and produce different artifacts or failures. Pin the Rust toolchain version or read it from a committed rust-toolchain file.",
+      "finding_id": "RGF-0005",
+      "fingerprint": "fec559f0850fa8e94cfe29336deffba882041f1a519d062e54db9ddba8b7829e",
+      "latest_occurrence": {
+        "cell_id": "RGC-9074753f6395dda6",
+        "end_line": 90,
+        "finding_id": "RGF-0005",
+        "imprecise": 0,
+        "occurrence_id": 5,
+        "path": ".github/workflows/release.yml",
+        "run_id": 3,
+        "start_line": 87
+      },
+      "metadata": "{\"fingerprint\":\"fec559f0850fa8e94cfe29336deffba882041f1a519d062e54db9ddba8b7829e\",\"path\":\".github/workflows/release.yml\",\"rule_id\":\"ci-reproducibility\",\"content\":\"Rust is installed from the moving `stable` channel, which means a tag rebuild at a later date may use a different compiler and produce different artifacts or failures. Pin the Rust toolchain version or read it from a committed rust-toolchain file.\",\"suggestion_code\":\"      - name: Install Rust\\n        uses: dtolnay/rust-toolchain@1.85.1\\n        with:\\n          targets: ${{ matrix.target }}\",\"existing_code\":\"      - name: Install Rust\\n        uses: dtolnay/rust-toolchain@stable\\n        with:\\n          targets: ${{ matrix.target }}\",\"start_line\":87,\"end_line\":90,\"thinking\":\"The rule is CI reproducibility; a floating compiler channel is a direct source of non-reproducible release builds.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".github/workflows/release.yml",
+      "rule_id": "ci-reproducibility",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "Node.js is configured as the floating major version `20`, so dashboard builds can change when GitHub resolves a newer Node 20 patch/minor. Pin the exact Node version used for release builds.",
+      "finding_id": "RGF-0006",
+      "fingerprint": "24daed7932849207cb5bca6aeded941419208248b8dab84b3bff567021a978dd",
+      "latest_occurrence": {
+        "cell_id": "RGC-9074753f6395dda6",
+        "end_line": 95,
+        "finding_id": "RGF-0006",
+        "imprecise": 0,
+        "occurrence_id": 6,
+        "path": ".github/workflows/release.yml",
+        "run_id": 3,
+        "start_line": 92
+      },
+      "metadata": "{\"fingerprint\":\"24daed7932849207cb5bca6aeded941419208248b8dab84b3bff567021a978dd\",\"path\":\".github/workflows/release.yml\",\"rule_id\":\"ci-reproducibility\",\"content\":\"Node.js is configured as the floating major version `20`, so dashboard builds can change when GitHub resolves a newer Node 20 patch/minor. Pin the exact Node version used for release builds.\",\"suggestion_code\":\"      - name: Setup Node.js\\n        uses: actions/setup-node@v4\\n        with:\\n          node-version: '20.19.5'\",\"existing_code\":\"      - name: Setup Node.js\\n        uses: actions/setup-node@v4\\n        with:\\n          node-version: '20'\",\"start_line\":92,\"end_line\":95,\"thinking\":\"Even with npm ci, the runtime itself is part of the release build environment and should not float.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".github/workflows/release.yml",
+      "rule_id": "ci-reproducibility",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "`.review-gauntlet/` ignores the directory itself, so the later negation cannot re-include `.review-gauntlet/checkpoints/`. Git does not re-include files under an ignored parent directory; use a contents-only ignore pattern and explicitly unignore the checkpoint subtree.",
+      "finding_id": "RGF-0007",
+      "fingerprint": "af677426fc2bc3353c0f837312ea8e79062ea757855bff14cab4f871bffdffa6",
+      "latest_occurrence": {
+        "cell_id": "RGC-cd58b2d4c848b8c0",
+        "end_line": 29,
+        "finding_id": "RGF-0007",
+        "imprecise": 0,
+        "occurrence_id": 7,
+        "path": ".gitignore",
+        "run_id": 4,
+        "start_line": 28
+      },
+      "metadata": "{\"fingerprint\":\"af677426fc2bc3353c0f837312ea8e79062ea757855bff14cab4f871bffdffa6\",\"path\":\".gitignore\",\"rule_id\":\"data-validation\",\"content\":\"`.review-gauntlet/` ignores the directory itself, so the later negation cannot re-include `.review-gauntlet/checkpoints/`. Git does not re-include files under an ignored parent directory; use a contents-only ignore pattern and explicitly unignore the checkpoint subtree.\",\"suggestion_code\":\".review-gauntlet/*\\n!.review-gauntlet/checkpoints/\\n!.review-gauntlet/checkpoints/**\",\"existing_code\":\".review-gauntlet/\\n!.review-gauntlet/checkpoints/\",\"start_line\":28,\"end_line\":29,\"thinking\":\"The exception currently cannot take effect because the parent directory is excluded.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".gitignore",
+      "rule_id": "data-validation",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "This pins local development to Node 24.12.0, but both CI and release workflows build the dashboard with Node 20. Contributors using this file can install dependencies or generate lockfile output under a different Node major than the one used in automation, making local verification diverge from CI.",
+      "finding_id": "RGF-0008",
+      "fingerprint": "184d256a00ac5d75336dc4897c876f59e83c9306d1c573150ca43b7c057e1fe6",
+      "latest_occurrence": {
+        "cell_id": "RGC-90345c893c5ff17c",
+        "end_line": 1,
+        "finding_id": "RGF-0008",
+        "imprecise": 0,
+        "occurrence_id": 8,
+        "path": ".node-version",
+        "run_id": 5,
+        "start_line": 1
+      },
+      "metadata": "{\"fingerprint\":\"184d256a00ac5d75336dc4897c876f59e83c9306d1c573150ca43b7c057e1fe6\",\"path\":\".node-version\",\"rule_id\":\"docs-accuracy\",\"content\":\"This pins local development to Node 24.12.0, but both CI and release workflows build the dashboard with Node 20. Contributors using this file can install dependencies or generate lockfile output under a different Node major than the one used in automation, making local verification diverge from CI.\",\"suggestion_code\":\"20\\n\",\"existing_code\":\"24.12.0\",\"start_line\":1,\"end_line\":1,\"thinking\":\".github/workflows/ci.yml and .github/workflows/release.yml both configure actions/setup-node with node-version: '20', while the reviewed file pins 24.12.0.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".node-version",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "OpenCode loads project markdown agents from `.opencode/agents/` (plural), but this file is under `.opencode/agent/`, so the agent definition will not be discovered as documented.",
+      "finding_id": "RGF-0009",
+      "fingerprint": "fd478f74570af45e46bb73c32519bb66b4e5f07eb4a42ca44d1d2974267e8a77",
+      "latest_occurrence": {
+        "cell_id": "RGC-40d0d3b2d02d890d",
+        "end_line": 7,
+        "finding_id": "RGF-0009",
+        "imprecise": 0,
+        "occurrence_id": 9,
+        "path": ".opencode/agent/code.md",
+        "run_id": 5,
+        "start_line": 1
+      },
+      "metadata": "{\"fingerprint\":\"fd478f74570af45e46bb73c32519bb66b4e5f07eb4a42ca44d1d2974267e8a77\",\"path\":\".opencode/agent/code.md\",\"rule_id\":\"docs-accuracy\",\"content\":\"OpenCode loads project markdown agents from `.opencode/agents/` (plural), but this file is under `.opencode/agent/`, so the agent definition will not be discovered as documented.\",\"suggestion_code\":\"Move this file to `.opencode/agents/code.md` so OpenCode discovers it as a project agent.\",\"existing_code\":\"---\\ndescription: Code implementation agent focused on writing production-quality code\\nmode: primary\\ntemperature: 0.2\\ntools:\\n  mcp_question: false\\n---\",\"start_line\":1,\"end_line\":7,\"thinking\":\"The official OpenCode agents documentation says project-specific markdown agents must be placed in `.opencode/agents/`; the current singular directory makes this documentation/config ineffective.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".opencode/agent/code.md",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "dismissed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "The frontmatter uses the deprecated `tools` option. OpenCode documentation recommends using `permission` for new or updated agent configs, so this should be updated to avoid stale configuration guidance.",
+      "finding_id": "RGF-0010",
+      "fingerprint": "0f0590a33a83191e8e1032e44d60f4bc591f4772a66ba6c79a4c238f19a85161",
+      "latest_occurrence": {
+        "cell_id": "RGC-40d0d3b2d02d890d",
+        "end_line": 6,
+        "finding_id": "RGF-0010",
+        "imprecise": 0,
+        "occurrence_id": 10,
+        "path": ".opencode/agent/code.md",
+        "run_id": 5,
+        "start_line": 5
+      },
+      "metadata": "{\"fingerprint\":\"0f0590a33a83191e8e1032e44d60f4bc591f4772a66ba6c79a4c238f19a85161\",\"path\":\".opencode/agent/code.md\",\"rule_id\":\"docs-accuracy\",\"content\":\"The frontmatter uses the deprecated `tools` option. OpenCode documentation recommends using `permission` for new or updated agent configs, so this should be updated to avoid stale configuration guidance.\",\"suggestion_code\":\"permission:\\n  mcp_question: deny\",\"existing_code\":\"tools:\\n  mcp_question: false\",\"start_line\":5,\"end_line\":6,\"thinking\":\"OpenCode docs mark `tools` as deprecated and describe `permission` as the replacement, including wildcard/exact tool-name matching for custom or MCP tools.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".opencode/agent/code.md",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "This workflow tells the agent to plan with TodoWrite, but the repository AGENTS.md explicitly says to use `bd` for all task tracking and not TodoWrite. That makes the agent instructions inconsistent with the repo's required workflow.",
+      "finding_id": "RGF-0011",
+      "fingerprint": "4044dc501ed9784ce83045667b20976a4db25fff961d400c25d1921203963e1a",
+      "latest_occurrence": {
+        "cell_id": "RGC-40d0d3b2d02d890d",
+        "end_line": 91,
+        "finding_id": "RGF-0011",
+        "imprecise": 0,
+        "occurrence_id": 11,
+        "path": ".opencode/agent/code.md",
+        "run_id": 5,
+        "start_line": 90
+      },
+      "metadata": "{\"fingerprint\":\"4044dc501ed9784ce83045667b20976a4db25fff961d400c25d1921203963e1a\",\"path\":\".opencode/agent/code.md\",\"rule_id\":\"docs-accuracy\",\"content\":\"This workflow tells the agent to plan with TodoWrite, but the repository AGENTS.md explicitly says to use `bd` for all task tracking and not TodoWrite. That makes the agent instructions inconsistent with the repo's required workflow.\",\"suggestion_code\":\"2. **Plan** - Break down into tasks using `bd`, list files to create/modify, identify dependencies\\n3. **Implement** - Build incrementally in small testable steps, add error handling and logging, write tests as you go\",\"existing_code\":\"2. **Plan** - Break down into tasks using TodoWrite, list files to create/modify, identify dependencies\\n3. **Implement** - Build incrementally in small testable steps, add error handling and logging, write tests as you go\",\"start_line\":90,\"end_line\":91,\"thinking\":\"The project-level agent instructions override local workflow expectations and specifically prohibit TodoWrite for task tracking.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".opencode/agent/code.md",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "This project-specific markdown agent file is under `.opencode/agent/`, but OpenCode documents project agents as being loaded from `.opencode/agents/`. As placed, this spec agent is likely not discovered by OpenCode, so the documented `/cflx-proposal` handoff workflow will not be available as intended.",
+      "finding_id": "RGF-0012",
+      "fingerprint": "603c4c66ff92a64e7259e2ea83258b54bac5cc9bb20270ce100564a0c62d7886",
+      "latest_occurrence": {
+        "cell_id": "RGC-116e4bc1c86ec428",
+        "end_line": 5,
+        "finding_id": "RGF-0012",
+        "imprecise": 0,
+        "occurrence_id": 12,
+        "path": ".opencode/agent/spec.md",
+        "run_id": 5,
+        "start_line": 1
+      },
+      "metadata": "{\"fingerprint\":\"603c4c66ff92a64e7259e2ea83258b54bac5cc9bb20270ce100564a0c62d7886\",\"path\":\".opencode/agent/spec.md\",\"rule_id\":\"docs-accuracy\",\"content\":\"This project-specific markdown agent file is under `.opencode/agent/`, but OpenCode documents project agents as being loaded from `.opencode/agents/`. As placed, this spec agent is likely not discovered by OpenCode, so the documented `/cflx-proposal` handoff workflow will not be available as intended.\",\"suggestion_code\":\"Move this file to `.opencode/agents/spec.md` (and likewise update any sibling agent files), or configure the agent explicitly in `.opencode/opencode.jsonc` under the `agent` key.\",\"existing_code\":\"---\\ndescription: Collaborative software specification and requirements analysis with AI\\nmode: primary\\ntemperature: 0.3\\n---\",\"start_line\":1,\"end_line\":5,\"thinking\":\"OpenCode docs list markdown agent locations as `~/.config/opencode/agents/` and `.opencode/agents/`; this repository currently has `.opencode/agent/spec.md`, singular. The file contents may be valid YAML frontmatter, but the path prevents discovery.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".opencode/agent/spec.md",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "The Goal path contains a typo (`openspec/chagens/{change_id}/tasks.md`), which can mislead apply agents away from the actual OpenSpec change directory used elsewhere in the prompt (`changes/<id>/...`).",
+      "finding_id": "RGF-0013",
+      "fingerprint": "a8baabbf2a3afdf3b67bfcdc00e44dbf59e98aefcbf627b047364259d9545609",
+      "latest_occurrence": {
+        "cell_id": "RGC-d769cde5cbbd5807",
+        "end_line": 15,
+        "finding_id": "RGF-0013",
+        "imprecise": 0,
+        "occurrence_id": 13,
+        "path": ".opencode/commands/cflx-apply.md",
+        "run_id": 6,
+        "start_line": 15
+      },
+      "metadata": "{\"fingerprint\":\"a8baabbf2a3afdf3b67bfcdc00e44dbf59e98aefcbf627b047364259d9545609\",\"path\":\".opencode/commands/cflx-apply.md\",\"rule_id\":\"docs-accuracy\",\"content\":\"The Goal path contains a typo (`openspec/chagens/{change_id}/tasks.md`), which can mislead apply agents away from the actual OpenSpec change directory used elsewhere in the prompt (`changes/<id>/...`).\",\"suggestion_code\":\"**Goal**: Achieve 100% task completion (all tasks in `openspec/changes/{change_id}/tasks.md` marked as `- [x]` or moved to Future Work). Implement the approved change fully; update the `tasks.md` as progress is made; and provide all AI-executable verification (build/tests/lint) to the extent possible.\",\"existing_code\":\"**Goal**: Achieve 100% task completion (all tasks in `openspec/chagens/{change_id}/tasks.md` marked as `- [x]` or moved to Future Work). Implement the approved change fully; update the `tasks.md` as progress is made; and provide all AI-executable verification (build/tests/lint) to the extent possible.\",\"start_line\":15,\"end_line\":15,\"thinking\":\"The repository uses openspec/changes, and line 30 also references changes/<id>. The misspelling makes the documentation inaccurate.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".opencode/commands/cflx-apply.md",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "dismissed"
+    },
+    {
+      "checkpoint_id": "RGC-87e455200b01-RGS-062041c1700b",
+      "content": "This command prompt still directs agents to use the upstream `npx @fission-ai/openspec@latest` CLI for listing, showing, archiving, and validating. In this repository the archive workflow is documented and specified around the native `cflx openspec` commands, so following this prompt can bypass Conflux's repository-specific archive behavior and diverge from the embedded `cflx-archive` skill reference.",
+      "finding_id": "RGF-0014",
+      "fingerprint": "11759c7c42011db33461e515b4c4e59eae9913cd354dd4d3850fb9c4ca61f3c2",
+      "latest_occurrence": {
+        "cell_id": "RGC-a1d2469e4851155b",
+        "end_line": 31,
+        "finding_id": "RGF-0014",
+        "imprecise": 0,
+        "occurrence_id": 14,
+        "path": ".opencode/commands/cflx-archive.md",
+        "run_id": 6,
+        "start_line": 21
+      },
+      "metadata": "{\"fingerprint\":\"11759c7c42011db33461e515b4c4e59eae9913cd354dd4d3850fb9c4ca61f3c2\",\"path\":\".opencode/commands/cflx-archive.md\",\"rule_id\":\"docs-accuracy\",\"content\":\"This command prompt still directs agents to use the upstream `npx @fission-ai/openspec@latest` CLI for listing, showing, archiving, and validating. In this repository the archive workflow is documented and specified around the native `cflx openspec` commands, so following this prompt can bypass Conflux's repository-specific archive behavior and diverge from the embedded `cflx-archive` skill reference.\",\"suggestion_code\":\"   - If the conversation references a change loosely (for example by title or summary), run `cflx openspec list` to surface likely IDs and pick the single best match without asking.\\n   - Otherwise, review the conversation, run `cflx openspec list`, and ask the user which change to archive; wait for a confirmed change ID before proceeding.\\n   - If you still cannot identify a single change ID, stop and tell the user you cannot archive anything yet.\\n2. Validate the change ID by running `cflx openspec list` (or `cflx openspec show <id>`) and stop if the change is missing, already archived, or otherwise not ready to archive.\\n3. Run `cflx openspec archive <id> --yes` so the CLI moves the change and applies spec updates without prompts (use `--skip-specs` only for tooling-only work).\\n4. Review the command output to confirm the target specs were updated and the change landed in `changes/archive/`.\\n5. Verify the canonical spec diff with `git diff openspec/specs/` and confirm the expected requirement changes.\\n6. Validate with `cflx openspec validate --strict` and inspect with `cflx openspec show <id>` if anything looks off.\\n\\n**Reference**\\n- Use `cflx openspec list` to confirm change IDs before archiving.\\n- Inspect refreshed specs with `cflx openspec list --specs` and address any validation issues before handing off.\",\"existing_code\":\"   - If the conversation references a change loosely (for example by title or summary), run `npx @fission-ai/openspec@latest list` to surface likely IDs and pick the single best match without asking.\\n   - Otherwise, review the conversation, run `npx @fission-ai/openspec@latest list`, and ask the user which change to archive; wait for a confirmed change ID before proceeding.\\n   - If you still cannot identify a single change ID, stop and tell the user you cannot archive anything yet.\\n2. Validate the change ID by running `npx @fission-ai/openspec@latest list` (or `npx @fission-ai/openspec@latest show <id>`) and stop if the change is missing, already archived, or otherwise not ready to archive.\\n3. Run `npx @fission-ai/openspec@latest archive <id> --yes` so the CLI moves the change and applies spec updates without prompts (use `--skip-specs` only for tooling-only work).\\n4. Review the command output to confirm the target specs were updated and the change landed in `changes/archive/`.\\n5. Validate with `npx @fission-ai/openspec@latest validate --strict` and inspect with `npx @fission-ai/openspec@latest show <id>` if anything looks off.\\n\\n**Reference**\\n- Use `npx @fission-ai/openspec@latest list` to confirm change IDs before archiving.\\n- Inspect refreshed specs with `npx @fission-ai/openspec@latest list --specs` and address any validation issues before handing off.\",\"start_line\":21,\"end_line\":31,\"thinking\":\"The native `cflx openspec` namespace is specified in `openspec/specs/cli/spec.md` and the embedded archive skill/reference use those commands for this workflow.\",\"imprecise\":false,\"dismiss_reason\":null}",
+      "path": ".opencode/commands/cflx-archive.md",
+      "rule_id": "docs-accuracy",
+      "session_id": "RGS-062041c1700b",
+      "state": "confirmed"
+    }
+  ],
+  "schema_version": 1
+}
