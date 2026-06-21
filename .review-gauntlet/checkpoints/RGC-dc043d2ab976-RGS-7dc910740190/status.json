@@ -1,0 +1,42 @@
+{
+  "blockers": [],
+  "checkpoint_id": "RGC-dc043d2ab976-RGS-7dc910740190",
+  "checkpoint_state": "complete",
+  "coverage": {
+    "reviewed": 2
+  },
+  "created_at": "2026-06-21T11:32:21.905894Z",
+  "finding_state_counts": {},
+  "head_commit": "dc043d2ab9760200a7b0b791574ddeae7aad11e2",
+  "last_run_target_digest": "c8253819027cb9759e075a1e1a2b5d9a0c606680c5c6d8c0facf59777ebd7b8f",
+  "next_required_action": "init_next_session",
+  "review_base_commit": "dc043d2ab9760200a7b0b791574ddeae7aad11e2",
+  "ruleset_digest": "8f6075fa8b3d8ad3606e0f850277b73de14cf786552139cd817a8bd18d34477c",
+  "run_count": 1,
+  "schema_version": 1,
+  "session_id": "RGS-7dc910740190",
+  "session_metadata": {
+    "root": "/Users/tumf/work/conflux",
+    "ruleset_digest": "8f6075fa8b3d8ad3606e0f850277b73de14cf786552139cd817a8bd18d34477c",
+    "session_id": "RGS-7dc910740190",
+    "target": {
+      "base_ref": "87e455200b01e37d863ea42bf8ecedab9b1f1a12",
+      "commit": null,
+      "head_mode": "moving",
+      "head_ref": "dc043d2ab9760200a7b0b791574ddeae7aad11e2",
+      "include_worktree": true,
+      "kind": "branch"
+    },
+    "target_digest": "c8253819027cb9759e075a1e1a2b5d9a0c606680c5c6d8c0facf59777ebd7b8f"
+  },
+  "target": {
+    "base_ref": "87e455200b01e37d863ea42bf8ecedab9b1f1a12",
+    "commit": null,
+    "head_mode": "moving",
+    "head_ref": "dc043d2ab9760200a7b0b791574ddeae7aad11e2",
+    "include_worktree": true,
+    "kind": "branch"
+  },
+  "target_digest": "c8253819027cb9759e075a1e1a2b5d9a0c606680c5c6d8c0facf59777ebd7b8f",
+  "usable_as_review_base": true
+}
