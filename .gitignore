@@ -25,5 +25,5 @@ src/tui/.tldrignore
 *.db
 .beads-credential-key
 
-.review-gauntlet/
+.review-gauntlet/*
 !.review-gauntlet/checkpoints/
