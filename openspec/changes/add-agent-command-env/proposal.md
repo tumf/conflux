@@ -26,13 +26,32 @@ Implementation. This proposal changes runtime command execution behavior and upd
 
 ## Proposed Solution
 
-Add a top-level JSONC config field named `agent_command_env`:
+Add a top-level JSONC config field named `envs`:
 
 ```jsonc
 {
-  "agent_command_env": {
-    "OPENCODE_CONFIG": "/absolute/path/to/opencode.json",
-    "ANTHROPIC_MODEL": "claude-sonnet-4-20250514"
+  "envs": {
+    "OPENCODE_CONFIG": "$HOME/.config/opencode/opencode.json",
+    "ANTHROPIC_API_KEY": "$ANTHROPIC_API_KEY",
+    "MODEL_NAME": "${ANTHROPIC_MODEL}"
+  }
+}
+```
+
+`envs` is an object of string values. Values are expanded at command-spawn time using the Conflux parent process environment:
+
+- `$VAR` expands from the parent process environment.
+- `${VAR}` expands from the parent process environment.
+- Unset variables expand to an empty string.
+- No shell execution is performed.
+- Shell features such as `$(...)`, backticks, `${VAR:-default}`, globbing, and command substitution are not supported.
+
+This makes parent inheritance explicit when needed, for example:
+
+```jsonc
+{
+  "envs": {
+    "ANTHROPIC_API_KEY": "$ANTHROPIC_API_KEY"
   }
 }
 ```
@@ -48,34 +67,40 @@ The field applies to Conflux-owned agent command execution paths:
 - `resolve_command`
 - `worktree_command`
 
+The effective child environment starts from the Conflux parent process environment, includes Conflux runner defaults/safety env, then applies expanded `envs` values at spawn time.
+
 The field does not apply to hooks and does not replace `proposal_session.transport_env`.
 
 ## Acceptance Criteria
 
-- Users can define top-level `agent_command_env` in JSONC config.
+- Users can define top-level `envs` in JSONC config.
 - Merged config preserves lower-priority env keys and lets higher-priority config override only same-name keys.
-- Agent command subprocesses receive the configured environment variables in both common `AiCommandRunner` execution and legacy `AgentRunner` execution paths.
-- Hook commands do not receive `agent_command_env` solely by virtue of this feature.
+- Agent command subprocesses inherit the Conflux parent process environment by default.
+- Agent command subprocesses receive expanded `envs` values in both common `AiCommandRunner` execution and legacy `AgentRunner` execution paths.
+- `envs` values can reference parent process variables with `$VAR` and `${VAR}`.
+- Hook commands do not receive configured `envs` solely by virtue of this feature.
 - Proposal-session ACP subprocesses continue to use `proposal_session.transport_env` unchanged.
-- Logs and user-visible command strings do not print configured environment variable values.
-- Documentation explains `agent_command_env`, scope, merge behavior, and its difference from `proposal_session.transport_env`.
+- Logs and user-visible command strings do not print configured or expanded environment variable values.
+- Documentation explains `envs`, scope, merge behavior, `$VAR` / `${VAR}` expansion, and its difference from `proposal_session.transport_env`.
 
 ## Explicit Completion Conditions
 
 This change is complete when repository evidence shows:
 
-- `OrchestratorConfig` parses, stores, merges, and exposes `agent_command_env`.
-- `AiCommandRunner` applies configured env vars to spawned agent commands.
-- Legacy `AgentRunner` command builders apply configured env vars to spawned agent commands.
+- `OrchestratorConfig` parses, stores, merges, and exposes `envs` as a string map.
+- `envs` supports `$VAR` and `${VAR}` expansion from the Conflux parent process environment.
+- `AiCommandRunner` applies effective env vars to spawned agent commands without dropping parent process inheritance.
+- Legacy `AgentRunner` command builders apply effective env vars to spawned agent commands without dropping parent process inheritance.
 - Config merge tests prove key-wise inheritance and override behavior.
-- Runtime command tests prove a spawned command can observe a configured variable without embedding it in the command string.
+- Runtime command tests prove a spawned command can observe both a configured literal variable and an expanded parent-derived variable without embedding assignments in the command string.
 - Documentation and OpenSpec configuration delta are updated.
 - `cflx openspec validate add-agent-command-env --strict --evidence warn` passes.
 
 ## Out of Scope
 
 - Per-command environment maps such as `apply_env` or `acceptance_env`.
-- Env variable interpolation from host env, `{prompt}`, `{change_id}`, or shell expressions inside config values.
-- Passing `agent_command_env` to hooks.
+- Executing shell syntax while expanding `envs` values.
+- Supporting advanced shell parameter expansion such as `${VAR:-default}`.
+- Passing configured `envs` to hooks.
 - Changing `proposal_session.transport_env` behavior.
 - Secret management beyond avoiding value logging.

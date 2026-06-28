@@ -10,19 +10,23 @@ Normal orchestration commands are configured as shell command templates on `Orch
 
 ### Top-level shared env map
 
-Use one top-level `agent_command_env` map for all Conflux-owned agent commands. This keeps the feature small and avoids adding per-command config until there is a proven need.
+Use one top-level `envs` map for all Conflux-owned agent commands. This keeps the feature small and avoids adding per-command config until there is a proven need.
 
 ### Key-wise config merge
 
 Environment variables compose naturally across user-wide and repo-local config. A global config can define shared agent settings, and a project config can override one key without replacing the whole map.
 
-### Literal values only
+### Parent-env expansion without shell execution
 
-Values are literal strings. Config parsing does not expand shell syntax, host environment references, or Conflux placeholders. Users who need dynamic behavior can still express it in the command shell itself.
+`envs` values are strings expanded by Conflux at command-spawn time using the parent process environment. This supports common paths such as `$HOME/.config/tool/config.json` and secret forwarding such as `$ANTHROPIC_API_KEY` without embedding assignments in command templates.
+
+The expansion is intentionally not a shell. Only `$VAR` and `${VAR}` are supported. Unset variables expand to an empty string. Command substitution, globbing, and shell parameter operators are out of scope.
 
 ### Runner-level application
 
 The env map should be applied at the command-spawn boundary, not by mutating process-global environment. This avoids cross-command leakage and keeps parallel execution safe.
+
+The effective child environment starts from the Conflux parent process environment, applies existing runner defaults/safety variables, then applies expanded `envs` values as explicit overrides.
 
 ## Runtime Scope
 
