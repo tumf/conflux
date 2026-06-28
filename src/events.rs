@@ -441,6 +441,31 @@ pub enum ExecutionEvent {
         #[allow(dead_code)]
         revision: String,
     },
+    /// Push started for a completed change branch.
+    PushStarted {
+        change_id: String,
+        #[allow(dead_code)]
+        remote: String,
+        #[allow(dead_code)]
+        branch: String,
+    },
+    /// Push completed for a completed change branch.
+    PushCompleted {
+        change_id: String,
+        #[allow(dead_code)]
+        remote: String,
+        #[allow(dead_code)]
+        branch: String,
+    },
+    /// Push failed for a completed change branch.
+    PushFailed {
+        change_id: String,
+        #[allow(dead_code)]
+        remote: String,
+        #[allow(dead_code)]
+        branch: String,
+        error: String,
+    },
     /// Merge deferred due to dirty base or incomplete archive.
     /// `auto_resumable` is `true` when the deferral is caused by a temporary condition
     /// (base dirty, merge in progress) that will resolve automatically once a preceding

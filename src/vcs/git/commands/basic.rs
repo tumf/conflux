@@ -76,6 +76,21 @@ pub async fn has_uncommitted_changes<P: AsRef<Path>>(cwd: P) -> VcsResult<(bool,
     Ok((has_changes, output))
 }
 
+/// Push a local branch to the same-named branch on the selected remote.
+pub async fn push_same_named_branch<P: AsRef<Path>>(
+    remote: &str,
+    branch: &str,
+    cwd: P,
+) -> VcsResult<String> {
+    if remote.contains(':') || branch.contains(':') {
+        return Err(VcsError::git_command(
+            "branch selection is not supported for push mode",
+        ));
+    }
+    let refspec = format!("{branch}:{branch}");
+    run_git(&["push", remote, &refspec], cwd).await
+}
+
 /// Get the current commit hash (HEAD).
 pub async fn get_current_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
     run_git(&["rev-parse", "HEAD"], cwd).await
@@ -220,6 +235,7 @@ pub async fn generate_unique_branch_name<P: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -356,6 +372,78 @@ mod tests {
         let (has_changes, output) = result.unwrap();
         assert!(has_changes);
         assert!(output.contains("test.txt"));
+    }
+
+    async fn run_git_ok(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .await
+            .expect("git command should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn push_post_archive_push_same_named_branch_to_bare_remote() {
+        let repo = TempDir::new().unwrap();
+        let remote = TempDir::new().unwrap();
+        run_git_ok(remote.path(), &["init", "--bare"]).await;
+        run_git_ok(repo.path(), &["init", "-b", "main"]).await;
+        run_git_ok(repo.path(), &["config", "user.email", "test@example.com"]).await;
+        run_git_ok(repo.path(), &["config", "user.name", "Test User"]).await;
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        run_git_ok(repo.path(), &["add", "."]).await;
+        run_git_ok(repo.path(), &["commit", "-m", "base"]).await;
+        run_git_ok(repo.path(), &["checkout", "-b", "change-a"]).await;
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        run_git_ok(repo.path(), &["add", "."]).await;
+        run_git_ok(repo.path(), &["commit", "-m", "feature"]).await;
+        run_git_ok(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().expect("remote path utf8"),
+            ],
+        )
+        .await;
+
+        push_same_named_branch("origin", "change-a", repo.path())
+            .await
+            .expect("push same named branch");
+
+        let remote_head = run_git(&["rev-parse", "refs/heads/change-a"], remote.path())
+            .await
+            .expect("remote branch head");
+        let local_head = run_git(&["rev-parse", "change-a"], repo.path())
+            .await
+            .expect("local branch head");
+        assert_eq!(remote_head, local_head);
+    }
+
+    #[tokio::test]
+    async fn push_post_archive_rejects_branch_selection_syntax() {
+        let repo = TempDir::new().unwrap();
+        let error = push_same_named_branch("origin:main", "change-a", repo.path())
+            .await
+            .expect_err("remote override must fail");
+        assert!(error
+            .to_string()
+            .contains("branch selection is not supported"));
+
+        let error = push_same_named_branch("origin", "change-a:main", repo.path())
+            .await
+            .expect_err("branch override must fail");
+        assert!(error
+            .to_string()
+            .contains("branch selection is not supported"));
     }
 
     #[tokio::test]

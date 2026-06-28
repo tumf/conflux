@@ -18,6 +18,13 @@ const fn get_version_string() -> &'static str {
     VERSION_WITH_BUILD
 }
 
+fn parse_push_remote(value: &str) -> std::result::Result<String, String> {
+    if value.contains(':') {
+        return Err("branch selection is not supported for --push; use a remote name only".into());
+    }
+    Ok(value.to_string())
+}
+
 /// OpenSpec Orchestrator - Automate OpenSpec workflow
 #[derive(Parser, Debug)]
 #[command(name = "cflx")]
@@ -332,6 +339,10 @@ pub struct RunArgs {
     /// Enable parallel execution mode using git worktrees
     #[arg(long)]
     pub parallel: bool,
+
+    /// Push completed parallel change branches to a remote instead of merging to base.
+    #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
+    pub push: Option<String>,
 
     /// Maximum number of concurrent workspaces for parallel execution
     #[arg(long)]
@@ -1237,6 +1248,33 @@ mod tests {
             }
             _ => panic!("Expected Run subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_push_defaults_to_origin() {
+        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--push"]);
+        match cli.command {
+            Some(Commands::Run(args)) => assert_eq!(args.push.as_deref(), Some("origin")),
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_push_accepts_remote_name() {
+        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--push", "upstream"]);
+        match cli.command {
+            Some(Commands::Run(args)) => assert_eq!(args.push.as_deref(), Some("upstream")),
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_push_rejects_branch_selection() {
+        let err = Cli::try_parse_from(["cflx", "run", "--parallel", "--push", "origin:main"])
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("branch selection is not supported"));
     }
 
     #[test]

@@ -23,7 +23,9 @@ CLI SHALL have a subcommand structure that supports future command extensions.
 
 The `run` subcommand SHALL execute the OpenSpec change workflow orchestration loop only when the operator provides an explicit target mode: `--all`, one or more positional change IDs, or the legacy `--change` option. Positional IDs and legacy `--change` values SHALL be normalized into the same explicit change ID target list. `--all` SHALL target all current changes from the initial run snapshot. The target modes SHALL be mutually exclusive.
 
-<!-- Expected canonical result after archive: `run Subcommand` will require explicit target selection for non-interactive run mode, add positional ID support, keep legacy `--change`, and remove partial execution for unknown IDs. -->
+When `--push [remote]` is provided with parallel execution, `run` SHALL use push post-archive mode instead of base-merge post-archive mode. If the remote argument is omitted, the remote SHALL default to `origin`. The remote argument MUST NOT contain `:`; branch selection is unsupported and MUST be rejected before orchestration starts.
+
+<!-- Expected canonical result after archive: `run Subcommand` requires explicit target selection for non-interactive run mode, supports positional IDs and legacy `--change`, removes partial execution for unknown IDs, and documents opt-in parallel push post-archive mode. -->
 
 #### Scenario: Run with positional changes
 
@@ -57,7 +59,7 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 - **AND** the snapshot log shows only `a`, `b`, `c`
 - **AND** duplicate and unknown validation matches positional ID validation
 
-#### Scenario: Run with non-existent change
+#### Scenario: Unknown explicit change is rejected
 
 - **WHEN** user runs `cflx run nonexistent`
 - **AND** no change named `nonexistent` exists in the initial run snapshot
@@ -65,7 +67,7 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 - **AND** the command exits with an error naming `nonexistent`
 - **AND** no partial subset of requested changes is processed
 
-#### Scenario: Run with mixed valid and invalid changes
+#### Scenario: Mixed known and unknown explicit changes are rejected
 
 - **WHEN** user runs `cflx run a nonexistent c`
 - **AND** `a` and `c` exist but `nonexistent` does not
@@ -97,6 +99,26 @@ The `run` subcommand SHALL execute the OpenSpec change workflow orchestration lo
 - **WHEN** user runs `cflx run --parallel a c`
 - **THEN** parallel execution starts only for `a` and `c`
 - **AND** unrequested changes are not scheduled into worktrees
+
+#### Scenario: Run push mode defaults to origin
+
+- **WHEN** user runs `cflx run --parallel --push --all`
+- **THEN** run mode is configured for push post-archive action
+- **AND** the selected remote is `origin`
+- **AND** completed change branches are not configured for base-branch merge
+
+#### Scenario: Run push mode accepts remote name
+
+- **WHEN** user runs `cflx run --parallel --push upstream --all`
+- **THEN** run mode is configured for push post-archive action
+- **AND** the selected remote is `upstream`
+
+#### Scenario: Run push mode rejects branch selection
+
+- **WHEN** user runs `cflx run --parallel --push origin:main --all`
+- **THEN** orchestration does not start
+- **AND** the CLI reports that branch selection is not supported for `--push`
+- **AND** no worktree, apply, acceptance, archive, merge, or push work is started
 
 #### Scenario: Successful run exits promptly
 
