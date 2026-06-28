@@ -23,39 +23,29 @@ CLI SHALL have a subcommand structure that supports future command extensions.
 
 The `run` subcommand SHALL execute the OpenSpec change workflow orchestration loop.
 
-#### Scenario: Run with specific change
+When `--push [remote]` is provided with parallel execution, `run` SHALL use push post-archive mode instead of base-merge post-archive mode. If the remote argument is omitted, the remote SHALL default to `origin`. The remote argument MUST NOT contain `:`; branch selection is unsupported and MUST be rejected before orchestration starts.
 
-- **WHEN** user runs `cflx run --change <id>`
-- **THEN** only the specified change is processed
-- **AND** the snapshot log shows only the specified change
+<!-- Expected canonical result after archive: `cli` will document `cflx run --push [remote]` as an opt-in parallel post-archive push mode with default remote `origin` and no branch override syntax. -->
 
-#### Scenario: Run with comma-separated changes
+#### Scenario: Run push mode defaults to origin
 
-- **WHEN** user runs `cflx run --change a,b,c`
-- **THEN** only changes `a`, `b`, `c` are processed
-- **AND** the snapshot log shows only `a`, `b`, `c`
+- **WHEN** user runs `cflx run --parallel --push`
+- **THEN** run mode is configured for push post-archive action
+- **AND** the selected remote is `origin`
+- **AND** completed change branches are not configured for base-branch merge
 
-#### Scenario: Run with non-existent change
+#### Scenario: Run push mode accepts remote name
 
-- **WHEN** user runs `cflx run --change nonexistent`
-- **AND** no change named `nonexistent` exists
-- **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
-- **AND** exits with "No changes found"
+- **WHEN** user runs `cflx run --parallel --push upstream`
+- **THEN** run mode is configured for push post-archive action
+- **AND** the selected remote is `upstream`
 
-#### Scenario: Run with mixed valid and invalid changes
+#### Scenario: Run push mode rejects branch selection
 
-- **WHEN** user runs `cflx run --change a,nonexistent,c`
-- **AND** `a` and `c` exist but `nonexistent` does not
-- **THEN** a warning message "Specified change 'nonexistent' not found, skipping" is displayed
-- **AND** only `a` and `c` are processed
-- **AND** the snapshot log shows only `a`, `c`
-
-#### Scenario: Successful run exits promptly
-
-- **GIVEN** orchestration completes successfully and no restart was explicitly requested
-- **WHEN** `cflx run` logs successful completion
-- **THEN** the command exits promptly with status code 0
-- **AND** it does not wait for an additional stop signal before terminating
+- **WHEN** user runs `cflx run --parallel --push origin:main`
+- **THEN** orchestration does not start
+- **AND** the CLI reports that branch selection is not supported for `--push`
+- **AND** no worktree, apply, acceptance, archive, merge, or push work is started
 
 ### Requirement: Orchestration loop runs apply and archive
 
