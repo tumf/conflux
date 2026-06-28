@@ -147,6 +147,7 @@ pub async fn run_orchestrator(
     let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
     ai_runner.set_stream_json_textify(stream_json_textify);
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+    ai_runner.set_command_envs(config.get_command_envs());
 
     // Create serial run service for shared state and helpers
     let repo_root = std::env::current_dir()?;

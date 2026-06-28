@@ -258,6 +258,10 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub resolve_append_prompt: Option<String>,
 
+    /// Additional environment variables for Conflux-owned agent commands.
+    #[serde(default)]
+    pub envs: Option<HashMap<String, String>>,
+
     /// Hook configurations for various orchestration stages.
     /// All hooks are optional.
     #[serde(default)]
@@ -717,6 +721,7 @@ impl OrchestratorConfig {
             archive_append_prompt,
             analyze_append_prompt,
             resolve_append_prompt,
+            envs,
             hooks,
             logging,
             stall_detection,
@@ -776,6 +781,10 @@ impl OrchestratorConfig {
         overwrite_if_some(&mut self.analyze_append_prompt, analyze_append_prompt);
         overwrite_if_some(&mut self.resolve_append_prompt, resolve_append_prompt);
         overwrite_if_some(&mut self.acceptance_prompt_mode, acceptance_prompt_mode);
+
+        if let Some(envs) = envs {
+            self.envs.get_or_insert_with(HashMap::new).extend(envs);
+        }
 
         merge_hooks_config(&mut self.hooks, hooks);
 
@@ -971,6 +980,18 @@ impl OrchestratorConfig {
 
     pub fn get_acceptance_prompt_mode(&self) -> AcceptancePromptMode {
         self.acceptance_prompt_mode.clone().unwrap_or_default()
+    }
+
+    /// Get configured agent command environment variables, expanded from the parent process environment.
+    pub fn get_command_envs(&self) -> HashMap<String, String> {
+        self.envs
+            .as_ref()
+            .map(|envs| {
+                envs.iter()
+                    .map(|(key, value)| (key.clone(), expand::expand_env_value(value)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Get the hooks configuration, returning default (empty) if not set

@@ -140,6 +140,7 @@ impl Orchestrator {
         let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
         ai_runner.set_stream_json_textify(config.get_stream_json_textify());
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+        ai_runner.set_command_envs(config.get_command_envs());
 
         // Initialize shared state (will be populated when run() is called with actual changes)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -239,6 +240,7 @@ impl Orchestrator {
         let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
         ai_runner.set_stream_json_textify(config.get_stream_json_textify());
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+        ai_runner.set_command_envs(config.get_command_envs());
 
         // Initialize shared state (for testing, will use empty change list)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring

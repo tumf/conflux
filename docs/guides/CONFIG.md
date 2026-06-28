@@ -30,6 +30,8 @@ Configuration files are loaded and merged per key in this order, lowest to highe
 
 Higher-priority values override lower-priority values only for keys they define. Missing keys are inherited from lower-priority files.
 
+`envs` is merged key-wise: lower-priority environment keys remain present unless a higher-priority config defines the same key.
+
 ## Minimal Example
 
 ```jsonc
@@ -117,6 +119,7 @@ Command templates support these placeholders:
 | `acceptance_prompt` | string | No | `""` | Appended to acceptance prompt |
 | `acceptance_prompt_mode` | `full` or `context_only` | No | `full` | `full` is deprecated and behaves like `context_only` |
 | `archive_prompt` | string | No | `""` | Appended to archive prompt |
+| `envs` | object<string,string> | No | `{}` | Extra env for Conflux-owned agent commands; key-wise merge |
 | `hooks` | object | No | empty | Hook configuration with deep merge |
 | `logging` | object | No | see below | Logging behavior |
 | `stall_detection` | object | No | see below | Empty-WIP stall detection |
@@ -263,6 +266,28 @@ If the optional escalation command keys are unset, Conflux silently skips escala
 |---|---|---|---|
 | `enabled` | boolean | `true` | Enables repeated-error detection |
 | `threshold` | integer | `5` | Opens after the same error repeats this many times |
+
+## `envs`
+
+`envs` adds environment variables to Conflux-owned agent command subprocesses:
+
+```jsonc
+{
+  "envs": {
+    "OPENCODE_CONFIG": "$HOME/.config/opencode/opencode.json",
+    "ANTHROPIC_API_KEY": "$ANTHROPIC_API_KEY",
+    "MODEL_NAME": "${ANTHROPIC_MODEL}"
+  }
+}
+```
+
+Scope: `apply_command`, `apply_escalation_command`, `apply_stall_diagnose_command`, `archive_command`, `analyze_command`, `acceptance_command`, `resolve_command`, and `worktree_command`.
+
+Values expand at command-spawn time from the Conflux parent process environment. Supported forms are `$VAR` and `${VAR}`. Unset variables expand to an empty string. Conflux does not run a shell while expanding `envs`; command substitution, backticks, globbing, and shell parameter operators such as `${VAR:-default}` are not supported.
+
+`envs` is not passed to hooks solely because it is configured. Proposal sessions use `proposal_session.transport_env` instead; keep ACP-only transport variables there.
+
+Configured and expanded values are not included in command strings or routine logs. Use parent-env references for secrets, for example `"ANTHROPIC_API_KEY": "$ANTHROPIC_API_KEY"`.
 
 ## `proposal_session`
 
