@@ -119,6 +119,36 @@ fn test_parallel_dry_run_uses_explicit_targets() {
     assert!(!stdout.contains("  - c"));
 }
 
+#[test]
+fn test_run_stdout_keeps_info_and_suppresses_debug_trace_noise() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+    add_change(tmp.path(), "a");
+    Command::new("git")
+        .arg("init")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["run", "a", "--parallel", "--dry-run"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Starting cflx "), "stdout={stdout}");
+    assert!(stdout.contains("Total changes: 1"), "stdout={stdout}");
+    assert!(!stdout.contains("DEBUG Executing git command"), "stdout={stdout}");
+    assert!(!stdout.contains("TRACE registering event source with poller"), "stdout={stdout}");
+    assert!(!stdout.contains("TRACE deregistering event source from poller"), "stdout={stdout}");
+}
+
 // ── Task 4: --web success path ─────────────────────────────────────────────
 
 #[test]
