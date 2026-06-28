@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use tracing::debug;
 
@@ -289,10 +289,16 @@ pub struct LogsArgs {
 /// Arguments for the run subcommand
 #[derive(Parser, Debug)]
 #[command(
+    group(
+        ArgGroup::new("run_target")
+            .required(true)
+            .multiple(false)
+            .args(["all", "change", "changes"])
+    ),
     long_about = "Execute the OpenSpec change orchestration loop in non-interactive mode.
 
-This mode processes changes sequentially or in parallel (with --parallel flag),
-applying each change using the configured AI agent and archiving when complete.
+This mode requires an explicit target: --all for every current change, positional
+change IDs for selected changes, or legacy --change for comma-separated IDs.
 
 PARALLEL EXECUTION:
   --parallel enables concurrent processing using git worktrees. Changes are
@@ -303,16 +309,24 @@ WEB MONITORING:
   while orchestration runs in background.
 
 EXAMPLES:
-  cflx run                           # Process all changes
-  cflx run --change my-feature       # Process specific change
-  cflx run --parallel --max-concurrent 5  # Parallel with 5 workers
-  cflx run --parallel --dry-run      # Preview parallelization plan
-  cflx run --web --web-port 8080     # Enable web monitoring on port 8080"
+  cflx run --all                           # Process all current changes
+  cflx run my-feature other-change         # Process selected changes
+  cflx run --change my-feature,other-change  # Legacy selected changes
+  cflx run --all --parallel --max-concurrent 5  # Parallel with 5 workers
+  cflx run my-feature --parallel --dry-run      # Preview selected parallel plan
+  cflx run --all --web --web-port 8080     # Enable web monitoring on port 8080"
 )]
 pub struct RunArgs {
+    /// Process all current eligible changes explicitly
+    #[arg(long)]
+    pub all: bool,
+
     /// Process only the specified changes (comma-separated, e.g., --change a,b,c)
     #[arg(long, value_delimiter = ',')]
     pub change: Option<Vec<String>>,
+
+    /// Positional change IDs to process
+    pub changes: Vec<String>,
 
     /// Path to custom configuration file (JSONC format)
     #[arg(long, short = 'c')]
@@ -359,6 +373,19 @@ pub struct RunArgs {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+}
+
+impl RunArgs {
+    /// Returns None for --all and Some(ids) for explicit selected targets.
+    pub fn normalized_target_changes(&self) -> Option<Vec<String>> {
+        if self.all {
+            None
+        } else if !self.changes.is_empty() {
+            Some(self.changes.clone())
+        } else {
+            self.change.clone()
+        }
+    }
 }
 
 /// Arguments for the TUI subcommand
@@ -949,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_config_option() {
-        let cli = Cli::parse_from(["cflx", "run", "--config", "/path/to/config.jsonc"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--config", "/path/to/config.jsonc"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1003,14 +1030,49 @@ mod tests {
     }
 
     #[test]
-    fn test_run_subcommand_no_change_option() {
-        let cli = Cli::parse_from(["cflx", "run"]);
+    fn test_run_subcommand_requires_explicit_target() {
+        let err = Cli::try_parse_from(["cflx", "run"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn test_run_subcommand_all_target() {
+        let cli = Cli::parse_from(["cflx", "run", "--all"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
-                assert!(args.change.is_none());
+                assert!(args.all);
+                assert_eq!(args.normalized_target_changes(), None);
             }
             _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_positional_changes() {
+        let cli = Cli::parse_from(["cflx", "run", "a", "b"]);
+
+        match cli.command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.changes, vec!["a".to_string(), "b".to_string()]);
+                assert_eq!(
+                    args.normalized_target_changes(),
+                    Some(vec!["a".to_string(), "b".to_string()])
+                );
+            }
+            _ => panic!("Expected Run subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_run_subcommand_rejects_target_mode_combinations() {
+        for argv in [
+            vec!["cflx", "run", "--all", "a"],
+            vec!["cflx", "run", "--all", "--change", "a"],
+            vec!["cflx", "run", "--change", "a", "b"],
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
         }
     }
 
@@ -1128,7 +1190,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_iterations_default() {
-        let cli = Cli::parse_from(["cflx", "run"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1140,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_iterations_custom() {
-        let cli = Cli::parse_from(["cflx", "run", "--max-iterations", "100"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--max-iterations", "100"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1152,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_iterations_zero() {
-        let cli = Cli::parse_from(["cflx", "run", "--max-iterations", "0"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--max-iterations", "0"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1164,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_parallel_flag_default() {
-        let cli = Cli::parse_from(["cflx", "run"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1178,7 +1240,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_parallel_flag_enabled() {
-        let cli = Cli::parse_from(["cflx", "run", "--parallel"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1217,7 +1279,14 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_max_concurrent() {
-        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--max-concurrent", "5"]);
+        let cli = Cli::parse_from([
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--max-concurrent",
+            "5",
+        ]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1230,7 +1299,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_dry_run() {
-        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--dry-run"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel", "--dry-run"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1243,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_web_port_default_auto_assign() {
-        let cli = Cli::parse_from(["cflx", "run", "--web"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--web"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1257,7 +1326,7 @@ mod tests {
 
     #[test]
     fn test_run_subcommand_web_port_explicit() {
-        let cli = Cli::parse_from(["cflx", "run", "--web", "--web-port", "9000"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--web", "--web-port", "9000"]);
 
         match cli.command {
             Some(Commands::Run(args)) => {
@@ -1415,7 +1484,7 @@ mod tests {
     #[test]
     fn test_case_4_cflx_run_web() {
         // Case 4: cflx run --web -> Run subcommand with web=true
-        let cli = Cli::try_parse_from(["cflx", "run", "--web"]).unwrap();
+        let cli = Cli::try_parse_from(["cflx", "run", "--all", "--web"]).unwrap();
         match &cli.command {
             Some(Commands::Run(args)) => {
                 assert!(args.web);

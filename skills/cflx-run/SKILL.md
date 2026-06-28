@@ -17,14 +17,14 @@ This skill covers the workflow:
 2. Confirm the working tree is clean.
 3. Optionally sync from upstream when a remote exists.
 4. Confirm the OpenSpec change was already created and committed.
-5. Run `cflx run`.
+5. Run `cflx run --all` or `cflx run <change-id>...` with explicit targets.
 6. Review the resulting merge on the base branch.
 
 ## When to Use This Skill
 
 Trigger this skill when users ask to:
 
-- Run `cflx run`
+- Run `cflx run --all`, `cflx run <change-id>...`, or legacy `cflx run --change <ids>`
 - Start Conflux orchestration
 - Execute the standard Conflux development flow
 - Continue from a completed `cflx-proposal` into implementation
@@ -34,7 +34,9 @@ Trigger this skill when users ask to:
 - If `openspec/CONSTITUTION.md` exists, read it before running `cflx run` and treat it as higher-priority project law than proposal/spec deltas.
 - Do not start orchestration from a base branch state that knowingly violates `openspec/CONSTITUTION.md`.
 - Treat the currently checked out branch as the candidate base branch.
-- Before running `cflx run`, verify the repository is clean with `git status`.
+- Before running `cflx run --all` or `cflx run <change-id>...`, verify the repository is clean with `git status`.
+- Use `cflx run <change-id>...` for TUI-style selected rows, `cflx run --all` for TUI `x` bulk selection, and legacy `cflx run --change a,b` only for compatibility.
+- Do not run bare `cflx run`; it has no implicit all-changes target.
 - If the working tree is dirty, stop and tell the user exactly what must be cleaned up first.
 - If the repository has an upstream remote, check whether syncing is needed and use `git pull` when appropriate.
 - Do not create or edit proposal files in this skill; proposal authoring belongs to `cflx-proposal`.
@@ -97,8 +99,17 @@ If no committed change is ready yet, switch to the `cflx-proposal` skill first.
 Start orchestration from the clean base branch:
 
 ```bash
-cflx run
+cflx run <change-id>...
+# or, for all current eligible changes:
+cflx run --all
 ```
+
+Target expectations:
+
+- Positional change IDs match TUI selected rows.
+- `--all` matches the TUI `x` bulk mark.
+- Legacy `--change a,b` remains supported and uses the same validation as positional IDs.
+- Bare `cflx run` fails before orchestration starts.
 
 Execution expectations:
 
@@ -224,7 +235,7 @@ git fetch --all --prune
 git status
 ls openspec/changes
 git log --oneline -n 5
-cflx run
+cflx run <change-id>...
 git status
 git log --oneline --decorate -n 10
 git diff HEAD~1..HEAD -- openspec/specs/

@@ -20,7 +20,7 @@ use crate::task_parser::TaskProgress;
 use crate::tui::log_deduplicator;
 use crate::vcs::git::commands as git_commands;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -588,29 +588,59 @@ impl Orchestrator {
         }
     }
 
+    fn filter_requested_changes(&self, changes: &[Change]) -> Result<Vec<Change>> {
+        let Some(targets) = &self.target_changes else {
+            return Ok(changes.to_vec());
+        };
+
+        let by_id: HashMap<&str, &Change> = changes
+            .iter()
+            .map(|change| (change.id.as_str(), change))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        let mut duplicates = Vec::new();
+        let mut filtered = Vec::new();
+
+        for target in targets {
+            let id = target.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if !seen.insert(id.to_string()) {
+                duplicates.push(id.to_string());
+                continue;
+            }
+            match by_id.get(id) {
+                Some(change) => filtered.push((*change).clone()),
+                None => missing.push(id.to_string()),
+            }
+        }
+
+        if !duplicates.is_empty() || !missing.is_empty() {
+            let mut parts = Vec::new();
+            if !duplicates.is_empty() {
+                parts.push(format!("duplicate change IDs: {}", duplicates.join(", ")));
+            }
+            if !missing.is_empty() {
+                parts.push(format!("unknown change IDs: {}", missing.join(", ")));
+            }
+            return Err(OrchestratorError::Parse(format!(
+                "invalid run targets: {}",
+                parts.join("; ")
+            )));
+        }
+
+        Ok(filtered)
+    }
+
     /// Initialize run loop state (shared state, progress display, serial service).
     /// Returns (filtered_initial_changes, serial_service, total_changes).
     async fn initialize_run_loop(
         &mut self,
         initial_changes: Vec<Change>,
     ) -> Result<(Vec<Change>, SerialRunService, usize)> {
-        // Filter by target_changes if specified (early filtering)
-        let filtered_initial = if let Some(targets) = &self.target_changes {
-            // Explicit targets specified via --change option
-            let mut found = Vec::new();
-            for target in targets {
-                let trimmed = target.trim();
-                if let Some(change) = initial_changes.iter().find(|c| c.id == trimmed) {
-                    found.push(change.clone());
-                } else {
-                    warn!("Specified change '{}' not found, skipping", trimmed);
-                }
-            }
-            found
-        } else {
-            // No explicit target: return all changes
-            initial_changes
-        };
+        let filtered_initial = self.filter_requested_changes(&initial_changes)?;
 
         if filtered_initial.is_empty() {
             // Return empty result - caller will handle early exit
@@ -717,15 +747,17 @@ impl Orchestrator {
         // This prevents mid-run proposals from being processed before they are ready.
         let initial_changes = openspec::list_changes_native()?;
 
-        // Handle parallel mode with dry_run
+        // Handle parallel mode with the same target validation as serial mode.
         if self.parallel && self.dry_run {
-            return self.run_parallel_dry_run(&initial_changes).await;
+            let filtered_initial = self.filter_requested_changes(&initial_changes)?;
+            return self.run_parallel_dry_run(&filtered_initial).await;
         }
 
         // Handle parallel execution mode
         if self.parallel {
+            let filtered_initial = self.filter_requested_changes(&initial_changes)?;
             return self
-                .run_parallel(&initial_changes, cancel_token, graceful_stop_flag)
+                .run_parallel(&filtered_initial, cancel_token, graceful_stop_flag)
                 .await;
         }
 
@@ -1432,6 +1464,55 @@ mod tests {
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
         }
+    }
+
+    #[test]
+    fn test_filter_requested_changes_keeps_requested_order() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config(
+            Some(vec!["change-c".to_string(), "change-a".to_string()]),
+            config,
+        )
+        .unwrap();
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+            create_test_change("change-c", 0, 1),
+        ];
+
+        let filtered = orchestrator.filter_requested_changes(&changes).unwrap();
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|change| change.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["change-c", "change-a"]
+        );
+    }
+
+    #[test]
+    fn test_filter_requested_changes_rejects_unknown_and_duplicate_ids() {
+        let config = OrchestratorConfig::default();
+        let orchestrator = Orchestrator::with_config(
+            Some(vec![
+                "change-a".to_string(),
+                "missing".to_string(),
+                "change-a".to_string(),
+            ]),
+            config,
+        )
+        .unwrap();
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-c", 0, 1),
+        ];
+
+        let err = orchestrator.filter_requested_changes(&changes).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("duplicate change IDs: change-a"));
+        assert!(message.contains("unknown change IDs: missing"));
     }
 
     #[test]
