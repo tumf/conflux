@@ -63,7 +63,7 @@ use install_skills::{run_install_skills, InstallSkillsOptions};
 use orchestrator::Orchestrator;
 use std::path::Path;
 use tracing::{error, info, warn, Level};
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::{filter::LevelFilter, prelude::*};
 
 /// Helper: resolve the bearer token from CLI args for a TUI invocation.
 fn resolve_tui_token(args: &TuiArgs) -> Option<String> {
@@ -214,7 +214,8 @@ fn init_logging(enable_stdout: bool) -> Result<()> {
             .with_target(false)
             .with_thread_ids(false)
             .with_file(false)
-            .with_line_number(false);
+            .with_line_number(false)
+            .with_filter(LevelFilter::INFO);
 
         registry.with(stdout_layer).init();
     } else {
