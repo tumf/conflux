@@ -68,7 +68,7 @@ pub struct ChangeStatus {
     pub dependencies: Vec<String>,
     /// Queue status (for parallel/serial execution tracking)
     /// Aligned with canonical display taxonomy values: "not queued", "queued", "blocked", "stalled", "applying",
-    /// "accepting", "archiving", "archived", "merged", "rejected", "merge wait", "resolving", "resolve pending", "reject pending", "error"
+    /// "accepting", "archiving", "archived", "merged", "pushed", "rejected", "merge wait", "resolving", "resolve pending", "reject pending", "error"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_status: Option<String>,
     /// Current iteration number for apply/archive loops
@@ -163,7 +163,7 @@ impl OrchestratorStateSnapshot {
             .filter(|c| {
                 c.queue_status
                     .as_ref()
-                    .is_some_and(|s| s == "archived" || s == "merged")
+                    .is_some_and(|s| s == "archived" || s == "merged" || s == "pushed")
             })
             .count();
         let in_progress = change_statuses
@@ -623,10 +623,28 @@ impl WebState {
                     }
                 }
 
-                // Merge events
-                ExecutionEvent::MergeCompleted { change_id, .. } => {
+                // Post-archive terminal events
+                ExecutionEvent::MergeCompleted { change_id, .. }
+                | ExecutionEvent::PushCompleted { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.status = "complete".to_string();
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::PushFailed {
+                    change_id,
+                    error: _,
+                    ..
+                } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.status = "error".to_string();
+                        updated = true;
+                    }
+                }
+                ExecutionEvent::PushStarted { change_id, .. } => {
+                    if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
+                        change.progress_percent =
+                            progress_percent(change.completed_tasks, change.total_tasks);
                         updated = true;
                     }
                 }
@@ -1800,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_web_snapshot_exposes_post_archive_statuses_from_reducer() {
+    fn pushed_status_web_snapshot_exposes_post_archive_statuses_from_reducer() {
         use crate::events::ExecutionEvent;
         use crate::orchestration::state::{ExecutionMode, OrchestratorState};
 
@@ -1809,6 +1827,7 @@ mod tests {
                 "resolving-a".to_string(),
                 "resolve-b".to_string(),
                 "merge-c".to_string(),
+                "push-d".to_string(),
             ],
             0,
             ExecutionMode::Parallel,
@@ -1817,6 +1836,7 @@ mod tests {
             create_test_change("resolving-a", 0, 1),
             create_test_change("resolve-b", 0, 1),
             create_test_change("merge-c", 0, 1),
+            create_test_change("push-d", 0, 1),
         ];
 
         shared.apply_execution_event(&ExecutionEvent::ChangeArchived("resolving-a".to_string()));
@@ -1829,6 +1849,11 @@ mod tests {
             change_id: "merge-c".to_string(),
             reason: "base dirty".to_string(),
             auto_resumable: false,
+        });
+        shared.apply_execution_event(&ExecutionEvent::PushCompleted {
+            change_id: "push-d".to_string(),
+            remote: "origin".to_string(),
+            branch: "push-d".to_string(),
         });
 
         let snapshot =
@@ -1844,6 +1869,8 @@ mod tests {
         assert_eq!(status("resolving-a"), Some("resolving"));
         assert_eq!(status("resolve-b"), Some("resolve pending"));
         assert_eq!(status("merge-c"), Some("merge wait"));
+        assert_eq!(status("push-d"), Some("pushed"));
+        assert_eq!(snapshot.completed_changes, 1);
     }
 
     #[test]

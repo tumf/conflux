@@ -73,16 +73,13 @@ pub enum SchedulerLifetime {
 }
 
 /// Terminal action after a change has been archived in parallel mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PostArchiveAction {
+    #[default]
     MergeToBase,
-    PushToRemote { remote: String },
-}
-
-impl Default for PostArchiveAction {
-    fn default() -> Self {
-        Self::MergeToBase
-    }
+    PushToRemote {
+        remote: String,
+    },
 }
 
 /// Global lock for serializing all merge/resolve operations to base branch.
