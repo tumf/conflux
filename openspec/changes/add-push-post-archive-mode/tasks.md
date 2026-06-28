@@ -29,3 +29,7 @@ Expected archive gate before archive: `cflx openspec validate add-push-post-arch
 - Add `on_pushed` hook semantics if users need post-push automation.
 - Add remote branch collision policy or protected-branch checks if same-name push proves too permissive in production workflows.
 - Add provider-specific PR creation in a separate proposal if remote push should open review requests automatically.
+
+## Acceptance Notes
+
+- Added heavy integration coverage in `src/parallel/tests/executor.rs` for push success cleanup, no base merge, failure workspace preservation, and `on_merged` suppression in push mode.
