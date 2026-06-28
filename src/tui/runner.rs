@@ -413,6 +413,7 @@ async fn run_tui_loop(
     let mut ai_runner = AiCommandRunner::new(queue_config.clone(), shared_stagger_state.clone());
     ai_runner.set_stream_json_textify(stream_json_textify);
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+    ai_runner.set_command_envs(config.get_command_envs());
 
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);

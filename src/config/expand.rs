@@ -66,6 +66,49 @@ pub fn expand_worktree_command(template: &str, workspace_dir: &str, repo_root: &
     expand_placeholder(&command, PLACEHOLDER_REPO_ROOT, repo_root)
 }
 
+pub fn expand_env_value(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            result.push(ch);
+            continue;
+        }
+
+        if chars.peek() == Some(&'{') {
+            chars.next();
+            let mut name = String::new();
+            for next in chars.by_ref() {
+                if next == '}' {
+                    break;
+                }
+                name.push(next);
+            }
+            result.push_str(&std::env::var(name).unwrap_or_default());
+            continue;
+        }
+
+        let mut name = String::new();
+        while let Some(&next) = chars.peek() {
+            if next == '_' || next.is_ascii_alphanumeric() {
+                name.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        if name.is_empty() {
+            result.push('$');
+        } else {
+            result.push_str(&std::env::var(name).unwrap_or_default());
+        }
+    }
+
+    result
+}
+
 pub(crate) fn expand_placeholder(template: &str, placeholder: &str, value: &str) -> String {
     if !template.contains(placeholder) {
         return template.to_string();
@@ -165,6 +208,26 @@ fn is_within_single_quotes(template: &str, index: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_expand_env_value_from_parent_environment() {
+        unsafe {
+            std::env::set_var("CFLX_EXPAND_A", "alpha");
+            std::env::set_var("CFLX_EXPAND_B", "beta");
+            std::env::remove_var("CFLX_EXPAND_MISSING");
+        }
+
+        assert_eq!(
+            expand_env_value(
+                "$CFLX_EXPAND_A/${CFLX_EXPAND_B}/$CFLX_EXPAND_MISSING/${CFLX_EXPAND_A}"
+            ),
+            "alpha/beta//alpha"
+        );
+        assert_eq!(
+            expand_env_value("$(echo nope) `${CFLX_EXPAND_A:-x}`"),
+            "$(echo nope) ``"
+        );
+    }
 
     #[test]
     fn test_expand_change_id() {

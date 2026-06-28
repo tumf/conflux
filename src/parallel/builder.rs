@@ -129,7 +129,8 @@ impl ParallelExecutor {
         };
 
         // Create shared AI command runner
-        let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
+        ai_runner.set_command_envs(config.get_command_envs());
 
         Self {
             workspace_manager,

@@ -1320,6 +1320,7 @@ impl AgentRunner {
         // Clone command queue and command string for background task
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
+        let command_envs = self.config.get_command_envs();
         let operation_type_owned = operation_type.map(|s| s.to_string());
         let change_id_owned = change_id.map(|s| s.to_string());
 
@@ -1330,7 +1331,7 @@ impl AgentRunner {
         tokio::spawn(async move {
             let result = command_queue
                 .execute_with_retry_streaming(
-                    || build_command(&command_str),
+                    || build_command(&command_str, &command_envs),
                     Some(output_callback),
                     operation_type_owned.as_deref(),
                     change_id_owned.as_deref(),
@@ -1445,6 +1446,7 @@ impl AgentRunner {
         // Clone command queue, command string, and cwd for background task
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
+        let command_envs = self.config.get_command_envs();
         let cwd_path = cwd.to_path_buf();
         let operation_type_owned = operation_type.map(|s| s.to_string());
         let change_id_owned = change_id.map(|s| s.to_string());
@@ -1456,7 +1458,7 @@ impl AgentRunner {
         tokio::spawn(async move {
             let result = command_queue
                 .execute_with_retry_streaming(
-                    || build_command_in_dir(&command_str, &cwd_path),
+                    || build_command_in_dir(&command_str, &cwd_path, &command_envs),
                     Some(output_callback),
                     operation_type_owned.as_deref(),
                     change_id_owned.as_deref(),
@@ -1531,10 +1533,11 @@ impl AgentRunner {
 
         // Use command queue for stagger and retry
         let command_str = command.to_string();
+        let command_envs = self.config.get_command_envs();
         let (status, _stderr) = self
             .command_queue
             .execute_with_retry_streaming(
-                || build_command(&command_str),
+                || build_command(&command_str, &command_envs),
                 None::<
                     fn(
                         StreamingOutputLine,
@@ -1585,10 +1588,11 @@ impl AgentRunner {
 
         // Use command queue for stagger and retry
         let command_str = command.to_string();
+        let command_envs = self.config.get_command_envs();
         let (status, _stderr_buf) = self
             .command_queue
             .execute_with_retry_streaming(
-                || build_command(&command_str),
+                || build_command(&command_str, &command_envs),
                 Some(output_callback),
                 None,
                 None,
@@ -1631,7 +1635,10 @@ impl AgentRunner {
 }
 
 /// Build a command for execution (extracted for use with command queue)
-fn build_command(command: &str) -> Command {
+fn build_command(
+    command: &str,
+    command_envs: &std::collections::HashMap<String, String>,
+) -> Command {
     if cfg!(target_os = "windows") {
         debug!("Building shell command: cmd /C {}", command);
         let mut cmd = Command::new("cmd");
@@ -1639,6 +1646,11 @@ fn build_command(command: &str) -> Command {
             .arg(command)
             .env_clear()
             .envs(std::env::vars())
+            .envs(
+                command_envs
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
             // Disable terminal-related environment variables
             .env("NO_COLOR", "1")
             .env("CLICOLOR", "0")
@@ -1664,6 +1676,11 @@ fn build_command(command: &str) -> Command {
             .arg(command)
             .env_clear()
             .envs(std::env::vars())
+            .envs(
+                command_envs
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
             // Disable terminal-related environment variables
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
@@ -1699,7 +1716,11 @@ fn build_command(command: &str) -> Command {
 }
 
 /// Build a command for execution in a specific directory
-fn build_command_in_dir(command: &str, cwd: &Path) -> Command {
+fn build_command_in_dir(
+    command: &str,
+    cwd: &Path,
+    command_envs: &std::collections::HashMap<String, String>,
+) -> Command {
     if cfg!(target_os = "windows") {
         debug!("Building shell command: cmd /C {}", command);
         let mut cmd = Command::new("cmd");
@@ -1708,6 +1729,11 @@ fn build_command_in_dir(command: &str, cwd: &Path) -> Command {
             .current_dir(cwd)
             .env_clear()
             .envs(std::env::vars())
+            .envs(
+                command_envs
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
             // Disable terminal-related environment variables
             .env("NO_COLOR", "1")
             .env("CLICOLOR", "0")
@@ -1734,6 +1760,11 @@ fn build_command_in_dir(command: &str, cwd: &Path) -> Command {
             .current_dir(cwd)
             .env_clear()
             .envs(std::env::vars())
+            .envs(
+                command_envs
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str())),
+            )
             // Disable terminal-related environment variables
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
@@ -1794,6 +1825,47 @@ fn create_dummy_child() -> Result<tokio::process::Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn build_command_applies_configured_env_without_global_mutation() {
+        unsafe { std::env::remove_var("CFLX_AGENT_RUNNER_ENV") };
+        let command_envs = std::collections::HashMap::from([(
+            "CFLX_AGENT_RUNNER_ENV".to_string(),
+            "runner-value".to_string(),
+        )]);
+
+        let output = build_command("printf %s \"$CFLX_AGENT_RUNNER_ENV\"", &command_envs)
+            .output()
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "runner-value");
+        assert!(std::env::var("CFLX_AGENT_RUNNER_ENV").is_err());
+    }
+
+    #[tokio::test]
+    async fn build_command_in_dir_applies_configured_env_without_global_mutation() {
+        unsafe { std::env::remove_var("CFLX_AGENT_RUNNER_DIR_ENV") };
+        let command_envs = std::collections::HashMap::from([(
+            "CFLX_AGENT_RUNNER_DIR_ENV".to_string(),
+            "dir-value".to_string(),
+        )]);
+        let cwd = std::env::current_dir().unwrap();
+
+        let output = build_command_in_dir(
+            "printf %s \"$CFLX_AGENT_RUNNER_DIR_ENV\"",
+            &cwd,
+            &command_envs,
+        )
+        .output()
+        .await
+        .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "dir-value");
+        assert!(std::env::var("CFLX_AGENT_RUNNER_DIR_ENV").is_err());
+    }
 
     #[test]
     fn analyze_append_prompt_is_appended_once_during_command_expansion() {

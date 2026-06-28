@@ -129,6 +129,7 @@ pub async fn resolve_conflicts_with_retry(
     let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
     ai_runner.set_stream_json_textify(stream_json_textify);
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+    ai_runner.set_command_envs(config.get_command_envs());
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = crate::agent::append_optional_prompt(
@@ -507,6 +508,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
     ai_runner.set_stream_json_textify(stream_json_textify);
     ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+    ai_runner.set_command_envs(config.get_command_envs());
 
     // Build initial resolve command to send in ResolveStarted event (before retry loop)
     let initial_resolve_prompt = crate::agent::append_optional_prompt(

@@ -169,6 +169,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_command_envs_config() {
+        let _guard = env_test_lock();
+        set_env_var("CFLX_ENV_PARENT", "parent-value");
+        let config = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "envs": {
+                    "CFLX_LITERAL": "literal-value",
+                    "CFLX_EXPANDED": "$CFLX_ENV_PARENT/${CFLX_ENV_PARENT}"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let envs = config.get_command_envs();
+        assert_eq!(envs.get("CFLX_LITERAL").unwrap(), "literal-value");
+        assert_eq!(
+            envs.get("CFLX_EXPANDED").unwrap(),
+            "parent-value/parent-value"
+        );
+    }
+
+    #[test]
+    fn test_merge_command_envs_key_wise() {
+        let mut lower = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "envs": {
+                    "KEEP": "lower",
+                    "OVERRIDE": "lower"
+                }
+            }"#,
+        )
+        .unwrap();
+        let higher = OrchestratorConfig::parse_jsonc(
+            r#"{
+                "envs": {
+                    "OVERRIDE": "higher",
+                    "HIGH_ONLY": "higher"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        lower.merge(higher);
+        let envs = lower.get_command_envs();
+        assert_eq!(envs.get("KEEP").unwrap(), "lower");
+        assert_eq!(envs.get("OVERRIDE").unwrap(), "higher");
+        assert_eq!(envs.get("HIGH_ONLY").unwrap(), "higher");
+    }
+
+    #[test]
     fn test_parse_logging_config() {
         let jsonc = r#"{
             "logging": {

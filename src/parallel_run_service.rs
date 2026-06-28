@@ -80,6 +80,7 @@ impl ParallelRunService {
         let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
         ai_runner.set_stream_json_textify(config.get_stream_json_textify());
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+        ai_runner.set_command_envs(config.get_command_envs());
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
             crate::orchestration::state::OrchestratorState::with_mode(
@@ -132,6 +133,7 @@ impl ParallelRunService {
         let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
         ai_runner.set_stream_json_textify(config.get_stream_json_textify());
         ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+        ai_runner.set_command_envs(config.get_command_envs());
 
         let shared_orchestrator_state = Arc::new(tokio::sync::RwLock::new(
             crate::orchestration::state::OrchestratorState::with_mode(

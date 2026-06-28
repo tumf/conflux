@@ -8,6 +8,7 @@ use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::error::{OrchestratorError, Result};
 use crate::process_manager::{cleanup_process_group, ManagedChild, StreamingChildHandle};
 use crate::stream_json_textifier::{process_stdout_line, StreamJsonTextBuffer};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -48,6 +49,7 @@ pub struct AiCommandRunner {
     /// process group after every command outcome (success, failure, cancellation, or
     /// inactivity timeout) to prevent orphaned background processes.
     strict_process_cleanup: bool,
+    command_envs: HashMap<String, String>,
 }
 
 impl AiCommandRunner {
@@ -65,7 +67,12 @@ impl AiCommandRunner {
             command_queue: CommandQueue::new_with_shared_state(config, shared_state),
             stream_json_textify: true,
             strict_process_cleanup: true,
+            command_envs: HashMap::new(),
         }
+    }
+
+    pub fn set_command_envs(&mut self, envs: HashMap<String, String>) {
+        self.command_envs = envs;
     }
 
     /// Override stream-JSON textification setting.
@@ -150,6 +157,7 @@ impl AiCommandRunner {
         let pid_arc = current_pid.clone();
         let stream_json_textify = self.stream_json_textify;
         let strict_process_cleanup = self.strict_process_cleanup;
+        let command_envs = self.command_envs.clone();
 
         // Spawn the background retry task. It owns the real child processes and responds
         // to the cancel signal by terminating the current process group via SIGTERM/SIGKILL.
@@ -185,6 +193,11 @@ impl AiCommandRunner {
                 if let Some(ref dir) = cwd_owned {
                     cmd.current_dir(dir);
                 }
+                cmd.envs(
+                    command_envs
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                );
 
                 // Set the spawned process as its own process group leader (PGID = PID).
                 // This allows killpg to reach all pipeline children.
@@ -782,6 +795,44 @@ mod tests {
             "Stagger delay not applied: {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_with_retry_applies_configured_envs_without_logging_values() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 0,
+            retry_delay_ms: 0,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 10,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let mut runner = AiCommandRunner::new(config, shared_state);
+        runner.set_command_envs(HashMap::from([(
+            "CFLX_TEST_AGENT_ENV".to_string(),
+            "secret-value".to_string(),
+        )]));
+
+        let command = "printf %s \"$CFLX_TEST_AGENT_ENV\"";
+        assert!(!command.contains("secret-value"));
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry(command, None, Some("test"), None)
+            .await
+            .unwrap();
+
+        let mut stdout = String::new();
+        while let Some(line) = rx.recv().await {
+            if let OutputLine::Stdout(s) = line {
+                stdout.push_str(&s);
+            }
+        }
+        let status = handle.wait().await.unwrap();
+        assert!(status.success());
+        assert_eq!(stdout, "secret-value");
     }
 
     /// Verify that execute_streaming_with_retry returns a real child PID (not 0).
