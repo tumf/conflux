@@ -144,9 +144,18 @@ fn test_run_stdout_keeps_info_and_suppresses_debug_trace_noise() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Starting cflx "), "stdout={stdout}");
     assert!(stdout.contains("Total changes: 1"), "stdout={stdout}");
-    assert!(!stdout.contains("DEBUG Executing git command"), "stdout={stdout}");
-    assert!(!stdout.contains("TRACE registering event source with poller"), "stdout={stdout}");
-    assert!(!stdout.contains("TRACE deregistering event source from poller"), "stdout={stdout}");
+    assert!(
+        !stdout.contains("DEBUG Executing git command"),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("TRACE registering event source with poller"),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("TRACE deregistering event source from poller"),
+        "stdout={stdout}"
+    );
 }
 
 // ── Task 4: --web success path ─────────────────────────────────────────────
