@@ -1252,7 +1252,7 @@ mod tests {
 
     #[test]
     fn cli_push_defaults_to_origin() {
-        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--push"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel", "--push"]);
         match cli.command {
             Some(Commands::Run(args)) => assert_eq!(args.push.as_deref(), Some("origin")),
             _ => panic!("Expected Run subcommand"),
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[test]
     fn cli_push_accepts_remote_name() {
-        let cli = Cli::parse_from(["cflx", "run", "--parallel", "--push", "upstream"]);
+        let cli = Cli::parse_from(["cflx", "run", "--all", "--parallel", "--push", "upstream"]);
         match cli.command {
             Some(Commands::Run(args)) => assert_eq!(args.push.as_deref(), Some("upstream")),
             _ => panic!("Expected Run subcommand"),
@@ -1270,8 +1270,15 @@ mod tests {
 
     #[test]
     fn cli_push_rejects_branch_selection() {
-        let err = Cli::try_parse_from(["cflx", "run", "--parallel", "--push", "origin:main"])
-            .unwrap_err();
+        let err = Cli::try_parse_from([
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--push",
+            "origin:main",
+        ])
+        .unwrap_err();
         assert!(err
             .to_string()
             .contains("branch selection is not supported"));
