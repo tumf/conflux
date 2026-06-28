@@ -4,7 +4,7 @@ This reference expands the standard operating flow for the `cflx-run` skill.
 
 ## Preconditions
 
-Before running `cflx run`, verify all of the following:
+Before running `cflx run --all` or `cflx run <change-id>...`, verify all of the following:
 
 1. You are already on the branch that should receive the final merged work.
 2. `git status` is clean.
@@ -20,7 +20,8 @@ git status
 git remote -v
 git fetch --all --prune
 git status
-cflx run
+cflx run <change-id>...
+# or: cflx run --all
 git status
 ```
 
@@ -51,6 +52,10 @@ Pull first so Conflux starts from the latest base branch state.
 ### If the proposal is not committed
 
 Stop and complete the proposal commit before orchestration.
+
+### Target selection
+
+Use `cflx run <change-id>...` for TUI-style selected rows, `cflx run --all` for the TUI `x` bulk mark, and `cflx run --change a,b` only when preserving legacy command syntax. Bare `cflx run` is invalid and should fail before orchestration starts.
 
 ### If `cflx run` partially succeeds
 
