@@ -61,6 +61,7 @@ use config::OrchestratorConfig;
 use error::Result;
 use install_skills::{run_install_skills, InstallSkillsOptions};
 use orchestrator::Orchestrator;
+use parallel::PostArchiveAction;
 use std::path::Path;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::prelude::*;
@@ -68,6 +69,20 @@ use tracing_subscriber::prelude::*;
 /// Helper: resolve the bearer token from CLI args for a TUI invocation.
 fn resolve_tui_token(args: &TuiArgs) -> Option<String> {
     remote::RemoteClient::resolve_token(args.server_token.clone(), args.server_token_env.as_deref())
+}
+
+fn tui_post_archive_action(args: &TuiArgs) -> Result<PostArchiveAction> {
+    if args.push.is_some() && args.server.is_some() {
+        return Err(error::OrchestratorError::ConfigLoad(
+            "--push is not supported with TUI --server mode".to_string(),
+        ));
+    }
+
+    Ok(args
+        .push
+        .clone()
+        .map(|remote| PostArchiveAction::PushToRemote { remote })
+        .unwrap_or_default())
 }
 
 /// Helper: load the initial change list for remote mode.
@@ -478,10 +493,12 @@ async fn main() -> Result<()> {
                 web: cli.web,
                 web_port: cli.web_port,
                 web_bind: cli.web_bind,
+                push: cli.push,
                 server: cli.server,
                 server_token: cli.server_token,
                 server_token_env: cli.server_token_env,
             };
+            let post_archive_action = tui_post_archive_action(&tui_args)?;
 
             // Load config
             let config = OrchestratorConfig::load(tui_args.config.as_deref())?;
@@ -543,12 +560,15 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "web-monitoring")]
                 web_state_opt,
                 remote_client,
+                post_archive_action,
             )
             .await?;
         }
 
         // TUI subcommand: launch interactive TUI dashboard
         Some(Commands::Tui(tui_args)) => {
+            let post_archive_action = tui_post_archive_action(&tui_args)?;
+
             // Initialize logging: file only (avoid stdout noise in TUI)
             init_logging(false)?;
             log_startup("tui");
@@ -613,6 +633,7 @@ async fn main() -> Result<()> {
                 #[cfg(feature = "web-monitoring")]
                 web_state_opt,
                 remote_client,
+                post_archive_action,
             )
             .await?;
         }

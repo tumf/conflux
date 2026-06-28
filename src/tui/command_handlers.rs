@@ -5,6 +5,7 @@
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::orchestration::state::{ReduceOutcome, ReducerCommand};
+use crate::parallel::PostArchiveAction;
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use crate::tui::orchestrator::{run_orchestrator, run_orchestrator_parallel};
 use crate::tui::queue::DynamicQueue;
@@ -88,6 +89,7 @@ pub struct TuiCommandContext<'a> {
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub dynamic_queue: &'a DynamicQueue,
     pub remote_client: Option<crate::remote::RemoteClient>,
+    pub post_archive_action: PostArchiveAction,
     pub orchestrator_running: bool,
     #[cfg(feature = "web-monitoring")]
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
@@ -163,6 +165,7 @@ pub async fn handle_start_processing_command(
             let orch_graceful_stop = graceful_stop_flag.clone();
             let orch_shared_state = shared_state.clone();
             let orch_manual_resolve = manual_resolve_counter.clone();
+            let post_archive_action = ctx.post_archive_action.clone();
             *orchestrator_cancel = Some(orch_cancel.clone());
             let use_parallel = ctx.app.parallel_mode;
             #[cfg(feature = "web-monitoring")]
@@ -180,6 +183,7 @@ pub async fn handle_start_processing_command(
                         orch_graceful_stop,
                         orch_shared_state,
                         orch_manual_resolve.clone(),
+                        post_archive_action.clone(),
                         orch_web_state,
                     )
                     .await
@@ -207,6 +211,7 @@ pub async fn handle_start_processing_command(
                         orch_graceful_stop,
                         orch_shared_state,
                         orch_manual_resolve,
+                        post_archive_action,
                     )
                     .await
                 } else {
@@ -688,6 +693,7 @@ pub async fn handle_tui_command(
                 let orch_graceful_stop = graceful_stop_flag.clone();
                 let orch_shared_state = shared_state.clone();
                 let orch_manual_resolve = manual_resolve_counter.clone();
+                let post_archive_action = ctx.post_archive_action.clone();
                 *orchestrator_cancel = Some(orch_cancel.clone());
 
                 #[cfg(feature = "web-monitoring")]
@@ -704,6 +710,7 @@ pub async fn handle_tui_command(
                         orch_graceful_stop,
                         orch_shared_state,
                         orch_manual_resolve,
+                        post_archive_action.clone(),
                         orch_web_state,
                     )
                     .await;
@@ -718,6 +725,7 @@ pub async fn handle_tui_command(
                         orch_graceful_stop,
                         orch_shared_state,
                         orch_manual_resolve,
+                        post_archive_action,
                     )
                     .await;
 
@@ -787,6 +795,7 @@ mod tests {
             tx,
             dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: false,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -897,6 +906,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: false,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -967,6 +977,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1021,6 +1032,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: false,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1054,6 +1066,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1107,6 +1120,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1173,6 +1187,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1235,6 +1250,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1287,6 +1303,7 @@ mod tests {
                 tx: &tx,
                 dynamic_queue: &dynamic_queue,
                 remote_client: None,
+                post_archive_action: PostArchiveAction::MergeToBase,
                 orchestrator_running: running,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &None,
@@ -1322,6 +1339,7 @@ mod tests {
             tx: &tx,
             dynamic_queue: &dynamic_queue,
             remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,

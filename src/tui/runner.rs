@@ -5,6 +5,7 @@
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
 use crate::openspec::Change;
+use crate::parallel::PostArchiveAction;
 use crate::vcs::{GitWorkspaceManager, WorkspaceManager};
 use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
 use ratatui::DefaultTerminal;
@@ -47,6 +48,7 @@ pub async fn run_tui(
         #[cfg(feature = "web-monitoring")]
         web_state,
         None,
+        PostArchiveAction::MergeToBase,
     )
     .await
 }
@@ -234,6 +236,7 @@ pub async fn run_tui_with_remote(
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
+    post_archive_action: PostArchiveAction,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -256,6 +259,7 @@ pub async fn run_tui_with_remote(
         #[cfg(feature = "web-monitoring")]
         web_state,
         remote_client,
+        post_archive_action,
     )
     .await;
 
@@ -273,6 +277,7 @@ async fn run_tui_loop(
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
+    post_archive_action: PostArchiveAction,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()?;
 
@@ -994,6 +999,7 @@ async fn run_tui_loop(
                 tx: &tx,
                 dynamic_queue: &dynamic_queue,
                 remote_client: remote_client_actions.clone(),
+                post_archive_action: post_archive_action.clone(),
                 orchestrator_running: orchestrator_handle
                     .as_ref()
                     .is_some_and(|handle| !handle.is_finished()),
