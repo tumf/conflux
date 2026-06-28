@@ -1,9 +1,10 @@
-//! Regression tests for `cflx run` exit-on-success behavior.
+//! Regression tests for `cflx run --all` exit-on-success behavior.
 //!
-//! Verifies that `cflx run` exits promptly with status 0 after successful
+//! Verifies that `cflx run --all` exits promptly with status 0 after successful
 //! orchestration rather than waiting for an external stop signal.
 
 use std::fs;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Minimal `.cflx.jsonc` for testing — no AI commands needed when there are no changes.
@@ -21,6 +22,13 @@ const MINIMAL_CONFIG: &str = r#"{
 fn setup_empty_project(dir: &std::path::Path) {
     fs::write(dir.join(".cflx.jsonc"), MINIMAL_CONFIG).unwrap();
     fs::create_dir_all(dir.join("openspec/changes")).unwrap();
+}
+
+fn add_change(dir: &std::path::Path, id: &str) {
+    let change_dir = dir.join("openspec/changes").join(id);
+    fs::create_dir_all(&change_dir).unwrap();
+    fs::write(change_dir.join("proposal.md"), format!("# {id}\n")).unwrap();
+    fs::write(change_dir.join("tasks.md"), "- [ ] task\n").unwrap();
 }
 
 /// Run `cflx run` from `cwd` and assert it exits within `timeout`.
@@ -69,12 +77,46 @@ fn test_run_exits_promptly_on_success_no_web() {
 
     // With no pending changes the orchestrator returns Ok(()) immediately.
     // The process must exit within 10 seconds without any external signal.
-    let status = run_cflx_with_timeout(tmp.path(), &[], Duration::from_secs(10));
+    let status = run_cflx_with_timeout(tmp.path(), &["--all"], Duration::from_secs(10));
     assert!(
         status.success(),
-        "cflx run should exit with status 0 on success, got: {:?}",
+        "cflx run --all should exit with status 0 on success, got: {:?}",
         status
     );
+}
+
+#[test]
+fn test_run_rejects_bare_target_before_execution() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+
+    let bare = run_cflx_with_timeout(tmp.path(), &[], Duration::from_secs(10));
+    assert!(!bare.success());
+}
+
+#[test]
+fn test_parallel_dry_run_uses_explicit_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+    add_change(tmp.path(), "a");
+    add_change(tmp.path(), "c");
+    Command::new("git")
+        .arg("init")
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
+        .args(["run", "a", "--parallel", "--dry-run"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Total changes: 1"));
+    assert!(stdout.contains("  - a"));
+    assert!(!stdout.contains("  - c"));
 }
 
 // ── Task 4: --web success path ─────────────────────────────────────────────
@@ -88,7 +130,7 @@ fn test_run_exits_promptly_on_success_with_web() {
     // Use port 0 so the OS auto-assigns an available port (no conflicts).
     let status = run_cflx_with_timeout(
         tmp.path(),
-        &["--web", "--web-port", "0"],
+        &["--all", "--web", "--web-port", "0"],
         Duration::from_secs(15),
     );
     assert!(

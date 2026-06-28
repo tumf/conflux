@@ -11,7 +11,7 @@ Conflux uses a **router + per-operation skill** architecture. New orchestrator p
                 ↓
         [Committed change on base branch]
                 ↓
-           cflx-run → `cflx run` orchestration
+           cflx-run → explicit-target `cflx run` orchestration
                 ↓
         ┌─────────────────────────────────────┐
         │  Orchestrator loads dedicated skills │
@@ -40,7 +40,7 @@ Conflux uses a **router + per-operation skill** architecture. New orchestrator p
 
 ### cflx-run
 
-**Purpose**: Prepare a clean base branch and run `cflx run` for committed OpenSpec changes.
+**Purpose**: Prepare a clean base branch and run `cflx run --all`, `cflx run <change-id>...`, or legacy `cflx run --change a,b` for committed OpenSpec changes.
 
 **Characteristics**:
 - Human-invoked operational mode

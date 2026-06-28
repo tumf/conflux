@@ -825,8 +825,8 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // Clone args for use in restart loop
-            let change_ids = args.change.clone();
+            // Clone normalized targets for use in restart loop: None means explicit --all.
+            let change_ids = args.normalized_target_changes();
             let config_path = args.config.clone();
             let max_iterations = args.max_iterations;
             let max_concurrent = args.max_concurrent;
