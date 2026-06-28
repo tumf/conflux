@@ -149,6 +149,8 @@ pub enum TerminalState {
     Archived,
     /// Successfully merged to the base branch (parallel only).
     Merged,
+    /// Successfully pushed to a remote branch (parallel only).
+    Pushed,
     /// Rejected after acceptance blocker detection.
     Rejected(String),
     /// Encountered a non-recoverable error.
@@ -294,6 +296,7 @@ impl ChangeRuntimeState {
         match &self.terminal {
             TerminalState::Archived => return "archived",
             TerminalState::Merged => return "merged",
+            TerminalState::Pushed => return "pushed",
             TerminalState::Rejected(_) => return "rejected",
             TerminalState::Error(_) => return "error",
             TerminalState::Stopped => return "stopped",
@@ -1114,7 +1117,10 @@ impl OrchestratorState {
             .map(|rt| {
                 matches!(
                     rt.terminal,
-                    TerminalState::Archived | TerminalState::Merged | TerminalState::Rejected(_)
+                    TerminalState::Archived
+                        | TerminalState::Merged
+                        | TerminalState::Pushed
+                        | TerminalState::Rejected(_)
                 )
             })
             .unwrap_or(false)
@@ -1290,7 +1296,10 @@ impl OrchestratorState {
         let rt = self.runtime_entry(&change_id);
         if matches!(
             rt.terminal,
-            TerminalState::Archived | TerminalState::Merged | TerminalState::Rejected(_)
+            TerminalState::Archived
+                | TerminalState::Merged
+                | TerminalState::Pushed
+                | TerminalState::Rejected(_)
         ) {
             return ReduceOutcome::NoOp;
         }
@@ -1745,6 +1754,24 @@ impl OrchestratorState {
                     self.transition_change_to_merged(change_id);
                 }
             }
+            ExecutionEvent::PushStarted { change_id, .. } => {
+                let rt = self.runtime_entry(change_id);
+                if !rt.is_terminal() && !rt.dequeued {
+                    rt.activity = ActivityState::Resolving;
+                    rt.wait_state = WaitState::None;
+                }
+            }
+            ExecutionEvent::PushCompleted { change_id, .. } => {
+                let rt = self.runtime_entry(change_id);
+                if rt.can_success_supersede_terminal() {
+                    rt.transition_to_terminal(TerminalState::Pushed);
+                }
+            }
+            ExecutionEvent::PushFailed {
+                change_id, error, ..
+            } => {
+                self.transition_change_to_error(change_id, error.clone());
+            }
             ExecutionEvent::ResolveStarted { change_id, .. } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
@@ -1834,7 +1861,10 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if matches!(
                     rt.terminal,
-                    TerminalState::Archived | TerminalState::Merged | TerminalState::Rejected(_)
+                    TerminalState::Archived
+                        | TerminalState::Merged
+                        | TerminalState::Pushed
+                        | TerminalState::Rejected(_)
                 ) {
                     return;
                 }
@@ -2171,6 +2201,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(error.display_status(), "error");
+    }
+
+    #[test]
+    fn pushed_terminal_status_is_distinct_from_merged() {
+        let mut state =
+            OrchestratorState::with_mode(vec!["c".to_string()], 1, ExecutionMode::Parallel);
+        state.apply_execution_event(&crate::events::ExecutionEvent::PushCompleted {
+            change_id: "c".to_string(),
+            remote: "origin".to_string(),
+            branch: "c".to_string(),
+        });
+        assert_eq!(state.display_status("c"), "pushed");
+        assert!(matches!(
+            state.runtime_entry("c").terminal,
+            TerminalState::Pushed
+        ));
     }
 
     #[test]

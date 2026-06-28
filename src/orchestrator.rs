@@ -11,6 +11,7 @@ use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::state::OrchestratorState;
 use crate::orchestration::LogOutputHandler;
+use crate::parallel::PostArchiveAction;
 use crate::parallel_run_service::ParallelRunService;
 use crate::progress::ProgressDisplay;
 use crate::serial_run_service::SerialRunService;
@@ -63,6 +64,8 @@ pub struct Orchestrator {
     vcs_backend: VcsBackend,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Terminal action after successful archive in parallel mode.
+    post_archive_action: PostArchiveAction,
     /// Shared orchestration state (single source of truth for state tracking)
     /// Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
     shared_state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
@@ -93,6 +96,7 @@ impl Orchestrator {
         dry_run: bool,
         vcs_override: Option<VcsBackend>,
         no_resume: bool,
+        post_archive_action: PostArchiveAction,
     ) -> Result<Self> {
         let config = OrchestratorConfig::load(config_path.as_deref())?;
         log_deduplicator::configure_logging(config.get_logging());
@@ -159,6 +163,7 @@ impl Orchestrator {
             dry_run,
             vcs_backend,
             no_resume,
+            post_archive_action,
             shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
@@ -257,6 +262,7 @@ impl Orchestrator {
             dry_run: false,
             vcs_backend: VcsBackend::Auto,
             no_resume: false,
+            post_archive_action: PostArchiveAction::MergeToBase,
             shared_state,
             #[cfg(feature = "web-monitoring")]
             web_state: None,
@@ -1191,6 +1197,7 @@ impl Orchestrator {
         let repo_root = std::env::current_dir()?;
         let mut service = ParallelRunService::new(repo_root.clone(), self.config.clone());
         service.set_no_resume(self.no_resume);
+        service.set_post_archive_action(self.post_archive_action.clone());
         service.set_shared_orchestrator_state(self.shared_state.clone());
 
         // Check if Git is available for true parallel execution

@@ -694,6 +694,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -811,6 +812,7 @@ async fn test_resolve_merge_aborts_when_base_dirty() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -919,6 +921,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -1076,6 +1079,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -1288,6 +1292,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -1492,6 +1497,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -1702,6 +1708,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         scheduler_lifetime: SchedulerLifetime::Finite,
+        post_archive_action: super::super::PostArchiveAction::MergeToBase,
         shared_orchestrator_state: None,
         last_dispatched_resolve_wait_changes: HashSet::new(),
         last_dispatched_reject_wait_changes: HashSet::new(),
@@ -7203,6 +7210,236 @@ async fn test_resumed_archived_dispatch_clears_reducer_queue_intent() {
     }
     assert!(!saw_apply_started);
     assert!(saw_archived);
+}
+
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn push_post_archive_success_cleans_workspace_and_does_not_merge_base() {
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::GitWorkspaceManager;
+
+    let repo = TempDir::new().or_fail("create repo tempdir");
+    let remote = TempDir::new().or_fail("create remote tempdir");
+    let workspace_base = repo.path().join("worktrees");
+    init_git_repo(repo.path()).await;
+    Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(remote.path())
+        .output()
+        .await
+        .or_fail("init bare remote");
+    Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().or_fail("remote path utf8"),
+        ])
+        .current_dir(repo.path())
+        .output()
+        .await
+        .or_fail("add origin remote");
+
+    let base_head = get_current_commit(repo.path())
+        .await
+        .or_fail("read base head before push");
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let mut manager = GitWorkspaceManager::new(
+        workspace_base.clone(),
+        repo.path().to_path_buf(),
+        1,
+        config.clone(),
+    );
+    let workspace = manager
+        .create_workspace("alpha", None)
+        .await
+        .or_fail("create alpha workspace");
+    std::fs::create_dir_all(workspace.path.join("openspec/changes/archive/alpha"))
+        .or_fail("create archive dir");
+    std::fs::write(
+        workspace
+            .path
+            .join("openspec/changes/archive/alpha/proposal.md"),
+        "# alpha\n",
+    )
+    .or_fail("write archive marker");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git add archive in workspace");
+    Command::new("git")
+        .args(["commit", "-m", "Archive alpha"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git commit archive in workspace");
+    let workspace_head = get_current_commit(&workspace.path)
+        .await
+        .or_fail("read workspace head");
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(repo.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(manager);
+    executor.post_archive_action = PostArchiveAction::PushToRemote {
+        remote: "origin".to_string(),
+    };
+
+    let outcome = executor
+        .handle_merge_and_cleanup(WorkspaceResult {
+            change_id: "alpha".to_string(),
+            workspace_name: workspace.name.clone(),
+            final_revision: Some(workspace_head.clone()),
+            error: None,
+            rejected: None,
+        })
+        .await
+        .or_fail("push post-archive should succeed");
+    assert_eq!(outcome, MergeTaskOutcome::Merged);
+    assert_eq!(
+        get_current_commit(repo.path())
+            .await
+            .or_fail("read base head after push"),
+        base_head,
+        "push mode must not merge into base"
+    );
+    assert!(
+        !workspace.path.exists(),
+        "successful push should cleanup worktree"
+    );
+    let remote_head =
+        crate::vcs::git::commands::run_git(&["rev-parse", "refs/heads/alpha"], remote.path())
+            .await
+            .or_fail("read pushed remote branch");
+    assert_eq!(remote_head, workspace_head);
+
+    let mut saw_push_completed = false;
+    let mut saw_merge_completed = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::PushCompleted { change_id, .. } if change_id == "alpha" => {
+                saw_push_completed = true;
+            }
+            ExecutionEvent::MergeCompleted { change_id, .. } if change_id == "alpha" => {
+                saw_merge_completed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_push_completed);
+    assert!(!saw_merge_completed);
+}
+
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn push_post_archive_failure_preserves_workspace_and_skips_on_merged_hook() {
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use crate::parallel::WorkspaceResult;
+    use crate::vcs::GitWorkspaceManager;
+
+    let repo = TempDir::new().or_fail("create repo tempdir");
+    let workspace_base = repo.path().join("worktrees");
+    init_git_repo(repo.path()).await;
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let mut manager = GitWorkspaceManager::new(
+        workspace_base.clone(),
+        repo.path().to_path_buf(),
+        1,
+        config.clone(),
+    );
+    let workspace = manager
+        .create_workspace("alpha", None)
+        .await
+        .or_fail("create alpha workspace");
+    std::fs::create_dir_all(workspace.path.join("openspec/changes/archive/alpha"))
+        .or_fail("create archive dir");
+    std::fs::write(
+        workspace
+            .path
+            .join("openspec/changes/archive/alpha/proposal.md"),
+        "# alpha\n",
+    )
+    .or_fail("write archive marker");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git add archive in workspace");
+    Command::new("git")
+        .args(["commit", "-m", "Archive alpha"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("git commit archive in workspace");
+    let workspace_head = get_current_commit(&workspace.path)
+        .await
+        .or_fail("read workspace head");
+    let hook_marker = repo.path().join("on-merged-ran.txt");
+    let hooks = HookRunner::new(
+        HooksConfig {
+            on_merged: Some(HookConfigValue::Full(HookConfig {
+                command: format!("touch {}", hook_marker.to_string_lossy()),
+                continue_on_failure: false,
+                timeout: 5,
+                git_commit_no_verify: false,
+                max_retries: 0,
+                retry_delay_secs: 1,
+            })),
+            ..Default::default()
+        },
+        repo.path(),
+    );
+    let (tx, mut rx) = mpsc::channel(16);
+    let mut executor = ParallelExecutor::new(repo.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(manager);
+    executor.set_hooks(hooks);
+    executor.post_archive_action = PostArchiveAction::PushToRemote {
+        remote: "missing-remote".to_string(),
+    };
+
+    let error = executor
+        .handle_merge_and_cleanup(WorkspaceResult {
+            change_id: "alpha".to_string(),
+            workspace_name: workspace.name.clone(),
+            final_revision: Some(workspace_head),
+            error: None,
+            rejected: None,
+        })
+        .await
+        .expect_err("push to missing remote should fail");
+    assert!(error.to_string().contains("Failed to push archived alpha"));
+    assert!(
+        workspace.path.exists(),
+        "failed push must preserve worktree for inspection/retry"
+    );
+    assert!(
+        !hook_marker.exists(),
+        "push mode must not execute on_merged hooks"
+    );
+
+    let mut saw_push_failed = false;
+    let mut saw_hook_failed = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::PushFailed { change_id, .. } if change_id == "alpha" => {
+                saw_push_failed = true;
+            }
+            ExecutionEvent::HookFailed { change_id, .. } if change_id == "alpha" => {
+                saw_hook_failed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_push_failed);
+    assert!(!saw_hook_failed);
 }
 
 #[tokio::test]

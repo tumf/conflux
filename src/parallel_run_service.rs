@@ -14,7 +14,7 @@ use crate::error::Result;
 use crate::hooks::HookRunner;
 use crate::openspec::Change;
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
-use crate::parallel::{ParallelEvent, ParallelExecutor};
+use crate::parallel::{ParallelEvent, ParallelExecutor, PostArchiveAction};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +40,8 @@ pub struct ParallelRunService {
     no_resume: bool,
     /// Shared stagger state for coordinating AI command execution delays
     shared_stagger_state: SharedStaggerState,
+    /// Terminal action after successful archive.
+    post_archive_action: PostArchiveAction,
     /// Shared reducer state used by CLI/server/TUI paths for base-mutating lane scheduling.
     shared_orchestrator_state:
         Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
@@ -92,6 +94,7 @@ impl ParallelRunService {
             repo_root,
             no_resume: false,
             shared_stagger_state,
+            post_archive_action: PostArchiveAction::MergeToBase,
             shared_orchestrator_state,
             ai_runner,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
@@ -143,6 +146,7 @@ impl ParallelRunService {
             repo_root,
             no_resume: false,
             shared_stagger_state,
+            post_archive_action: PostArchiveAction::MergeToBase,
             shared_orchestrator_state,
             ai_runner,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
@@ -156,6 +160,15 @@ impl ParallelRunService {
     /// are reused to resume interrupted work.
     pub fn set_no_resume(&mut self, no_resume: bool) {
         self.no_resume = no_resume;
+    }
+
+    pub fn set_post_archive_action(&mut self, action: PostArchiveAction) {
+        self.post_archive_action = action;
+    }
+
+    #[cfg(test)]
+    pub fn post_archive_action(&self) -> &PostArchiveAction {
+        &self.post_archive_action
     }
 
     /// Set shared reducer state for callers that already own UI/server state.
@@ -212,6 +225,7 @@ impl ParallelRunService {
             Some(self.shared_stagger_state.clone()),
         );
         executor.set_no_resume(self.no_resume);
+        executor.set_post_archive_action(self.post_archive_action.clone());
 
         if has_dynamic_queue {
             // Loop-based frontends (TUI/server) should stay alive when idle
@@ -832,6 +846,22 @@ mod tests {
             resolve_command: Some("echo resolve".to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn post_archive_action_propagates_to_service() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+        service.set_post_archive_action(PostArchiveAction::PushToRemote {
+            remote: "upstream".to_string(),
+        });
+        assert_eq!(
+            service.post_archive_action(),
+            &PostArchiveAction::PushToRemote {
+                remote: "upstream".to_string()
+            }
+        );
     }
 
     async fn init_git_repo(temp_dir: &TempDir) -> bool {
