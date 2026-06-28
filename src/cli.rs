@@ -75,6 +75,10 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
 
+    /// Push completed parallel TUI change branches to a remote instead of merging to base.
+    #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
+    pub push: Option<String>,
+
     /// Remote server endpoint URL (e.g., http://host:39876). When set, TUI connects to
     /// a remote Conflux server instead of the local workspace.
     #[arg(long)]
@@ -441,6 +445,10 @@ pub struct TuiArgs {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+
+    /// Push completed parallel TUI change branches to a remote instead of merging to base.
+    #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
+    pub push: Option<String>,
 
     /// Remote server endpoint URL (e.g., http://host:39876). When set, TUI connects to
     /// a remote Conflux server instead of the local workspace.
@@ -1080,6 +1088,54 @@ mod tests {
     fn test_no_subcommand() {
         let cli = Cli::parse_from(["cflx"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn tui_default_push_defaults_to_origin() {
+        let cli = Cli::parse_from(["cflx", "--push"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.push.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn tui_default_push_accepts_remote_name() {
+        let cli = Cli::parse_from(["cflx", "--push", "upstream"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.push.as_deref(), Some("upstream"));
+    }
+
+    #[test]
+    fn tui_default_push_rejects_branch_selection() {
+        let err = Cli::try_parse_from(["cflx", "--push", "origin:main"]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("branch selection is not supported"));
+    }
+
+    #[test]
+    fn tui_subcommand_push_defaults_to_origin() {
+        let cli = Cli::parse_from(["cflx", "tui", "--push"]);
+        match cli.command {
+            Some(Commands::Tui(args)) => assert_eq!(args.push.as_deref(), Some("origin")),
+            _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
+    fn tui_subcommand_push_accepts_remote_name() {
+        let cli = Cli::parse_from(["cflx", "tui", "--push", "upstream"]);
+        match cli.command {
+            Some(Commands::Tui(args)) => assert_eq!(args.push.as_deref(), Some("upstream")),
+            _ => panic!("Expected Tui subcommand"),
+        }
+    }
+
+    #[test]
+    fn tui_subcommand_push_rejects_branch_selection() {
+        let err = Cli::try_parse_from(["cflx", "tui", "--push", "origin:main"]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("branch selection is not supported"));
     }
 
     #[test]

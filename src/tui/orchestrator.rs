@@ -13,6 +13,7 @@ use crate::openspec::Change;
 // as they are handled by SerialRunService internally.
 use crate::events::EventSink;
 use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler, OutputMessage};
+use crate::parallel::PostArchiveAction;
 use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::events::{LogEntry, OrchestratorEvent, TuiEventSink};
 use super::queue::DynamicQueue;
+
+fn configure_parallel_post_archive_action(
+    service: &mut crate::parallel_run_service::ParallelRunService,
+    action: PostArchiveAction,
+) {
+    service.set_post_archive_action(action);
+}
 
 fn post_archive_dispatch_event(
     state: &crate::orchestration::state::OrchestratorState,
@@ -975,6 +983,7 @@ pub async fn run_orchestrator_parallel(
     _graceful_stop_flag: Arc<AtomicBool>,
     shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
+    post_archive_action: PostArchiveAction,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
     use crate::openspec::list_changes_native;
@@ -995,6 +1004,7 @@ pub async fn run_orchestrator_parallel(
     // manual resolve startup observes the same ResolveWait/RejectWait intent that
     // accepted the TUI command.
     let mut service = ParallelRunService::new(repo_root.clone(), config.clone());
+    configure_parallel_post_archive_action(&mut service, post_archive_action);
     service.set_shared_orchestrator_state(shared_state.clone());
 
     // Check if Git is available for parallel execution
@@ -1250,6 +1260,29 @@ pub async fn run_orchestrator_parallel(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    #[test]
+    fn parallel_service_uses_tui_post_archive_action() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut service = crate::parallel_run_service::ParallelRunService::new(
+            temp_dir.path().to_path_buf(),
+            crate::config::OrchestratorConfig::default(),
+        );
+
+        super::configure_parallel_post_archive_action(
+            &mut service,
+            crate::parallel::PostArchiveAction::PushToRemote {
+                remote: "origin".to_string(),
+            },
+        );
+
+        assert_eq!(
+            service.post_archive_action(),
+            &crate::parallel::PostArchiveAction::PushToRemote {
+                remote: "origin".to_string()
+            }
+        );
+    }
 
     /// Test that the archive path uses the correct directory structure.
     /// The archive path should be `openspec/changes/archive/<change_id>`,

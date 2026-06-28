@@ -33,16 +33,15 @@ fn add_change(dir: &std::path::Path, id: &str) {
 
 /// Run `cflx run` from `cwd` and assert it exits within `timeout`.
 /// Returns the `ExitStatus`.
-fn run_cflx_with_timeout(
+fn run_cflx_args_with_timeout(
     cwd: &std::path::Path,
-    extra_args: &[&str],
+    args: &[&str],
     timeout: Duration,
 ) -> std::process::ExitStatus {
     let bin = env!("CARGO_BIN_EXE_cflx");
 
     let mut child = std::process::Command::new(bin)
-        .arg("run")
-        .args(extra_args)
+        .args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -66,6 +65,16 @@ fn run_cflx_with_timeout(
             }
         }
     }
+}
+
+fn run_cflx_with_timeout(
+    cwd: &std::path::Path,
+    extra_args: &[&str],
+    timeout: Duration,
+) -> std::process::ExitStatus {
+    let mut args = vec!["run"];
+    args.extend_from_slice(extra_args);
+    run_cflx_args_with_timeout(cwd, &args, timeout)
 }
 
 // ── Task 3: non-web success path ───────────────────────────────────────────
@@ -92,6 +101,32 @@ fn test_run_rejects_bare_target_before_execution() {
 
     let bare = run_cflx_with_timeout(tmp.path(), &[], Duration::from_secs(10));
     assert!(!bare.success());
+}
+
+#[test]
+fn test_tui_default_rejects_push_with_server_before_tui_init() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+
+    let status = run_cflx_args_with_timeout(
+        tmp.path(),
+        &["--push", "--server", "http://127.0.0.1:39876"],
+        Duration::from_secs(10),
+    );
+    assert!(!status.success());
+}
+
+#[test]
+fn test_tui_subcommand_rejects_push_with_server_before_tui_init() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+
+    let status = run_cflx_args_with_timeout(
+        tmp.path(),
+        &["tui", "--push", "--server", "http://127.0.0.1:39876"],
+        Duration::from_secs(10),
+    );
+    assert!(!status.success());
 }
 
 #[test]
