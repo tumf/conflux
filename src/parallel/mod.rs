@@ -72,6 +72,19 @@ pub enum SchedulerLifetime {
     Persistent,
 }
 
+/// Terminal action after a change has been archived in parallel mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostArchiveAction {
+    MergeToBase,
+    PushToRemote { remote: String },
+}
+
+impl Default for PostArchiveAction {
+    fn default() -> Self {
+        Self::MergeToBase
+    }
+}
+
 /// Global lock for serializing all merge/resolve operations to base branch.
 ///
 /// This ensures that only one merge operation can modify the base branch
@@ -181,6 +194,8 @@ pub struct ParallelExecutor {
     pending_merge_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Scheduler lifetime policy (finite for CLI run, persistent for loop-based frontends).
     scheduler_lifetime: SchedulerLifetime,
+    /// Post-archive terminal action.
+    post_archive_action: PostArchiveAction,
     /// Optional reducer shared state used for scheduler-owned resolve/merge retry intent.
     shared_orchestrator_state: Option<Arc<RwLock<OrchestratorState>>>,
     /// Last resolve-wait snapshot that was dispatched via scheduler retry.

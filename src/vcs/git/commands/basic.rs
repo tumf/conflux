@@ -76,6 +76,21 @@ pub async fn has_uncommitted_changes<P: AsRef<Path>>(cwd: P) -> VcsResult<(bool,
     Ok((has_changes, output))
 }
 
+/// Push a local branch to the same-named branch on the selected remote.
+pub async fn push_same_named_branch<P: AsRef<Path>>(
+    remote: &str,
+    branch: &str,
+    cwd: P,
+) -> VcsResult<String> {
+    if remote.contains(':') || branch.contains(':') {
+        return Err(VcsError::git_command(
+            "branch selection is not supported for push mode",
+        ));
+    }
+    let refspec = format!("{branch}:{branch}");
+    run_git(&["push", remote, &refspec], cwd).await
+}
+
 /// Get the current commit hash (HEAD).
 pub async fn get_current_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<String> {
     run_git(&["rev-parse", "HEAD"], cwd).await

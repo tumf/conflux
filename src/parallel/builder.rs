@@ -20,7 +20,7 @@ use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
 
 use super::{
     dedup::DiagnosticDeduplicationStore, FailedChangeTracker, ParallelEvent, ParallelExecutor,
-    SchedulerLifetime, DEFAULT_MAX_CONFLICT_RETRIES,
+    PostArchiveAction, SchedulerLifetime, DEFAULT_MAX_CONFLICT_RETRIES,
 };
 
 impl ParallelExecutor {
@@ -162,6 +162,7 @@ impl ParallelExecutor {
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             scheduler_lifetime: SchedulerLifetime::Finite,
+            post_archive_action: PostArchiveAction::MergeToBase,
             shared_orchestrator_state: None,
             last_dispatched_resolve_wait_changes: HashSet::new(),
             last_dispatched_reject_wait_changes: HashSet::new(),
@@ -217,6 +218,10 @@ impl ParallelExecutor {
     /// Set the cancellation token for force stop cleanup.
     pub fn set_cancel_token(&mut self, cancel_token: CancellationToken) {
         self.cancel_token = Some(cancel_token);
+    }
+
+    pub fn set_post_archive_action(&mut self, action: PostArchiveAction) {
+        self.post_archive_action = action;
     }
 
     /// Set the dynamic queue for runtime change additions (TUI mode).

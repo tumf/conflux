@@ -110,6 +110,9 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::RejectionReviewCompleted { .. }
         | ExecutionEvent::RejectionReviewFailed { .. }
         | ExecutionEvent::WorkspaceStatusUpdated { .. }
+        | ExecutionEvent::PushStarted { .. }
+        | ExecutionEvent::PushCompleted { .. }
+        | ExecutionEvent::PushFailed { .. }
         | ExecutionEvent::MergeCompleted { .. }
         | ExecutionEvent::MergeDeferred { .. }
         | ExecutionEvent::ResolveStarted { .. }

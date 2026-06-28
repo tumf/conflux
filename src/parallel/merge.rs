@@ -17,6 +17,7 @@ use super::events::send_event;
 use super::MergeTaskOutcome;
 use super::ParallelEvent;
 use super::ParallelExecutor;
+use super::PostArchiveAction;
 
 fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
     format!(
@@ -308,6 +309,16 @@ impl ParallelExecutor {
         if let Some(path) = workspace_path {
             let archive_paths = vec![path];
 
+            if let PostArchiveAction::PushToRemote { remote } = &self.post_archive_action {
+                return self
+                    .push_archived_change_and_cleanup(
+                        &workspace_result,
+                        remote.clone(),
+                        &archive_paths[0],
+                    )
+                    .await;
+            }
+
             tracing::info!(
                 "Merging archived {} (workspace: {})",
                 workspace_result.change_id,
@@ -511,6 +522,121 @@ impl ParallelExecutor {
             tracing::warn!("{}", reason);
             Ok(MergeTaskOutcome::deferred(reason, false))
         }
+    }
+
+    async fn push_archived_change_and_cleanup(
+        &mut self,
+        workspace_result: &super::types::WorkspaceResult,
+        remote: String,
+        archive_path: &Path,
+    ) -> Result<MergeTaskOutcome> {
+        use crate::execution::archive::is_archive_commit_complete;
+
+        let branch = workspace_result.workspace_name.clone();
+        let verification_root = archive_completion_verification_root(&self.repo_root, archive_path);
+        match is_archive_commit_complete(&workspace_result.change_id, Some(verification_root)).await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let reason = format!(
+                    "Archive incomplete for '{}': push skipped and workspace preserved",
+                    workspace_result.change_id
+                );
+                tracing::warn!(%reason);
+                return Ok(MergeTaskOutcome::deferred(reason, false));
+            }
+            Err(error) => {
+                let reason = format!(
+                    "Failed to verify archive completion for '{}': {}",
+                    workspace_result.change_id, error
+                );
+                tracing::warn!(%reason);
+                return Ok(MergeTaskOutcome::deferred(reason, false));
+            }
+        }
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::PushStarted {
+                change_id: workspace_result.change_id.clone(),
+                remote: remote.clone(),
+                branch: branch.clone(),
+            },
+        )
+        .await;
+
+        tracing::info!(
+            change_id = %workspace_result.change_id,
+            remote = %remote,
+            branch = %branch,
+            "Pushing archived change branch"
+        );
+
+        if let Err(error) =
+            git_commands::push_same_named_branch(&remote, &branch, archive_path).await
+        {
+            let message = format!(
+                "Failed to push archived {} branch '{}' to remote '{}': {}",
+                workspace_result.change_id, branch, remote, error
+            );
+            tracing::error!(%message);
+            send_event(
+                &self.event_tx,
+                ParallelEvent::PushFailed {
+                    change_id: workspace_result.change_id.clone(),
+                    remote,
+                    branch,
+                    error: message.clone(),
+                },
+            )
+            .await;
+            return Err(OrchestratorError::GitCommand(message));
+        }
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::PushCompleted {
+                change_id: workspace_result.change_id.clone(),
+                remote,
+                branch,
+            },
+        )
+        .await;
+
+        send_event(
+            &self.event_tx,
+            ParallelEvent::CleanupStarted {
+                workspace: workspace_result.workspace_name.clone(),
+            },
+        )
+        .await;
+        if let Err(err) = self
+            .workspace_manager
+            .cleanup_workspace(&workspace_result.workspace_name)
+            .await
+        {
+            tracing::warn!(
+                "Failed to cleanup worktree '{}' after push: {}",
+                workspace_result.workspace_name,
+                err
+            );
+        } else {
+            if let Err(err) = delete_acceptance_state(archive_path) {
+                tracing::warn!(
+                    "Failed to delete acceptance state for '{}' after push cleanup: {}",
+                    workspace_result.change_id,
+                    err
+                );
+            }
+            send_event(
+                &self.event_tx,
+                ParallelEvent::CleanupCompleted {
+                    workspace: workspace_result.workspace_name.clone(),
+                },
+            )
+            .await;
+        }
+        Ok(MergeTaskOutcome::Merged)
     }
 
     pub(super) async fn attempt_merge(

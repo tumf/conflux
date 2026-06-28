@@ -832,6 +832,11 @@ async fn main() -> Result<()> {
             let max_concurrent = args.max_concurrent;
             let dry_run = args.dry_run;
             let no_resume = args.no_resume;
+            let post_archive_action = args
+                .push
+                .clone()
+                .map(|remote| parallel::PostArchiveAction::PushToRemote { remote })
+                .unwrap_or_default();
 
             // Outer loop for retry/restart support in Run mode
             loop {
@@ -851,6 +856,7 @@ async fn main() -> Result<()> {
                     dry_run,
                     vcs_override,
                     no_resume,
+                    post_archive_action.clone(),
                 )?;
 
                 #[cfg(feature = "web-monitoring")]
