@@ -10,6 +10,7 @@ mod promotion;
 mod rendering;
 mod validation;
 
+use crate::archive_layout;
 use archive::ArchiveEngine;
 use model::{ChangeInfo, DependencyStatusContext, ShowInfo, SpecInfo};
 use regex::Regex;
@@ -43,33 +44,21 @@ impl OpenSpecManager {
         }
     }
 
-    fn find_change_dir(&self, change_id: &str) -> Option<PathBuf> {
+    fn find_change_dir(&self, change_id: &str) -> Result<Option<PathBuf>, String> {
         // Check active changes
         let change_dir = self.changes_dir.join(change_id);
         if change_dir.exists() && change_dir.join("proposal.md").exists() {
-            return Some(change_dir);
+            return Ok(Some(change_dir));
         }
 
-        // Check archive (both direct and dated entries)
-        if !self.archive_dir.exists() {
-            return None;
+        if let Some(error) = archive_layout::invalid_layout_error(change_id, &self.archive_dir) {
+            return Err(error.message());
         }
 
-        fs::read_dir(&self.archive_dir)
-            .ok()?
-            .filter_map(|entry| entry.ok())
-            .find_map(|entry| {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                let candidate = entry.path();
-                if (name_str == change_id || name_str.ends_with(&format!("-{}", change_id)))
-                    && candidate.join("proposal.md").exists()
-                {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            })
+        Ok(
+            archive_layout::find_valid_archive_entry(change_id, &self.archive_dir)
+                .filter(|candidate| candidate.join("proposal.md").exists()),
+        )
     }
 
     fn list_changes(&self) -> Vec<ChangeInfo> {
@@ -187,8 +176,10 @@ impl OpenSpecManager {
         Some(info)
     }
 
-    fn show_change(&self, change_id: &str, deltas_only: bool) -> Option<ShowInfo> {
-        let change_dir = self.find_change_dir(change_id)?;
+    fn show_change(&self, change_id: &str, deltas_only: bool) -> Result<Option<ShowInfo>, String> {
+        let Some(change_dir) = self.find_change_dir(change_id)? else {
+            return Ok(None);
+        };
         let archived = change_dir.to_string_lossy().contains("/archive/");
         let rel_path = change_dir
             .strip_prefix(&self.root_dir)
@@ -260,7 +251,7 @@ impl OpenSpecManager {
         }
 
         if deltas_only {
-            return Some(ShowInfo {
+            return Ok(Some(ShowInfo {
                 id: info.id,
                 path: info.path,
                 archived: info.archived,
@@ -272,10 +263,10 @@ impl OpenSpecManager {
                 dependency_statuses: Vec::new(),
                 design: None,
                 specs: info.specs,
-            });
+            }));
         }
 
-        Some(info)
+        Ok(Some(info))
     }
     fn validate_change(
         &self,
@@ -310,7 +301,7 @@ pub fn cmd_list(show_specs: bool) -> Result<(), String> {
 pub fn cmd_show(change_id: &str, json_output: bool, deltas_only: bool) -> Result<(), String> {
     let mgr = OpenSpecManager::new();
     let info = mgr
-        .show_change(change_id, deltas_only)
+        .show_change(change_id, deltas_only)?
         .ok_or_else(|| format!("Change '{}' not found", change_id))?;
 
     if json_output {
@@ -1329,6 +1320,7 @@ mod openspec_list_show_tests {
         let mgr = OpenSpecManager::new();
         let info = mgr
             .show_change("dependent-change", false)
+            .expect("show should not error")
             .expect("dependent change should resolve via show");
 
         assert_eq!(
@@ -1496,6 +1488,7 @@ mod openspec_list_show_tests {
         let mgr = OpenSpecManager::new();
         let info = mgr
             .show_change("dependent-change", true)
+            .expect("show should not error")
             .expect("dependent change should resolve via deltas-only show");
         let json = render_show_json_value(&info);
         let output = render_show_output(&info);
@@ -1519,6 +1512,7 @@ mod openspec_list_show_tests {
         let mgr = OpenSpecManager::new();
         let info = mgr
             .show_change("archived-change", false)
+            .expect("show should not error")
             .expect("archived change should resolve via show");
 
         assert!(info.archived);
@@ -1541,6 +1535,7 @@ mod openspec_list_show_tests {
         let mgr = OpenSpecManager::new();
         let info = mgr
             .show_change("archived-change", false)
+            .expect("show should not error")
             .expect("dated archived change should resolve via show");
 
         assert!(info.archived);
@@ -1548,6 +1543,24 @@ mod openspec_list_show_tests {
         assert!(info
             .path
             .contains("openspec/changes/archive/2026-04-28-archived-change"));
+    }
+
+    #[test]
+    fn test_show_change_rejects_nested_archived_entry() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let archived_dir = temp
+            .path()
+            .join("openspec/changes/archive/2026-07-09/archived-change");
+        create_change(&archived_dir, "Archived Change", "- [x] archived\n");
+
+        let mgr = OpenSpecManager::new();
+        let Err(err) = mgr.show_change("archived-change", false) else {
+            panic!("nested archive layout should fail");
+        };
+        assert!(err.contains("Invalid archive layout"));
+        assert!(err.contains("2026-07-09/archived-change"));
     }
 
     #[test]

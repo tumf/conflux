@@ -23,9 +23,13 @@ impl<'a> ValidationEngine<'a> {
 
         if let Some(id) = change_id {
             let change_dir = match self.manager.find_change_dir(id) {
-                Some(d) => d,
-                None => {
+                Ok(Some(d)) => d,
+                Ok(None) => {
                     errors.push(format!("Change '{}' not found", id));
+                    return (false, errors, warnings);
+                }
+                Err(error) => {
+                    errors.push(error);
                     return (false, errors, warnings);
                 }
             };

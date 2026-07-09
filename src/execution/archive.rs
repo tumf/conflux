@@ -25,6 +25,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::agent::{AgentRunner, OutputLine};
+use crate::archive_layout;
 use crate::error::{OrchestratorError, Result};
 use crate::hooks::HookContext;
 use crate::task_parser;
@@ -47,6 +48,11 @@ pub enum ArchiveVerificationResult {
         /// The change ID that was not archived.
         change_id: String,
     },
+    /// Archive failed because matching archive evidence uses an invalid layout.
+    InvalidLayout {
+        /// Human-readable invalid-layout diagnostic.
+        message: String,
+    },
 }
 
 impl ArchiveVerificationResult {
@@ -57,19 +63,7 @@ impl ArchiveVerificationResult {
 }
 
 fn archive_entry_exists(change_id: &str, archive_dir: &Path) -> bool {
-    if !archive_dir.exists() {
-        return false;
-    }
-
-    std::fs::read_dir(archive_dir)
-        .map(|entries| {
-            entries.filter_map(|e| e.ok()).any(|entry| {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
-            })
-        })
-        .unwrap_or(false)
+    archive_layout::find_valid_archive_entry(change_id, archive_dir).is_some()
 }
 
 /// Find the path to an archived change directory.
@@ -87,20 +81,7 @@ fn archive_entry_exists(change_id: &str, archive_dir: &Path) -> bool {
 /// * `Some(PathBuf)` - Path to the archived change directory if found
 /// * `None` - Archive entry not found
 fn find_archive_entry_path(change_id: &str, archive_dir: &Path) -> Option<std::path::PathBuf> {
-    if !archive_dir.exists() {
-        return None;
-    }
-
-    std::fs::read_dir(archive_dir)
-        .ok()
-        .and_then(|entries| {
-            entries.filter_map(|e| e.ok()).find(|entry| {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                name_str == change_id || name_str.ends_with(&format!("-{}", change_id))
-            })
-        })
-        .map(|entry| entry.path())
+    archive_layout::find_valid_archive_entry(change_id, archive_dir)
 }
 
 /// Check if a change has already been archived in the given base path.
@@ -121,6 +102,7 @@ pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
     };
 
     let change_exists = change_path.exists();
+    let invalid_layout = archive_layout::invalid_layout_error(change_id, &archive_dir).is_some();
     let archive_exists = archive_entry_exists(change_id, &archive_dir);
 
     debug!(
@@ -129,10 +111,11 @@ pub fn is_change_archived(change_id: &str, base_path: Option<&Path>) -> bool {
         archive_dir = %archive_dir.display(),
         change_exists = change_exists,
         archive_exists = archive_exists,
+        invalid_layout = invalid_layout,
         "is_change_archived: checking paths"
     );
 
-    archive_exists && !change_exists
+    archive_exists && !change_exists && !invalid_layout
 }
 
 /// Check if the archive commit is complete for a change.
@@ -171,8 +154,11 @@ pub async fn is_archive_commit_complete(change_id: &str, base_path: Option<&Path
     let change_path = repo_root.join("openspec/changes").join(change_id);
     let change_exists = change_path.exists();
 
-    // Check if archive entry exists
+    // Check if archive entry exists and no invalid nested archive evidence exists.
     let archive_dir = repo_root.join("openspec/changes/archive");
+    if let Some(error) = archive_layout::invalid_layout_error(change_id, &archive_dir) {
+        return Err(OrchestratorError::AgentCommand(error.message()));
+    }
     let archive_exists = archive_entry_exists(change_id, &archive_dir);
 
     debug!(
@@ -307,7 +293,9 @@ Requirements:\n\
 2) If there are changes, run `git add -A` and commit with message \"Archive: {change_id}\".\n\
 3) If a pre-commit hook modifies files or stops the commit, re-run `git add -A` and commit with the same message.\n\
 4) If the latest commit already has subject \"Archive: {change_id}\" and the working tree is clean, do nothing.\n\
-5) Do not use destructive commands like `git reset --hard`.\n\n\
+5) Do not use destructive commands like `git reset --hard`.\n\
+6) Do not create or move archive directories manually with mkdir, mv, git mv, scripts, or equivalent filesystem writes under openspec/changes/archive/.\n\
+7) If archive layout is invalid, stop with the layout diagnostic; do not create an archive-success commit.\n\n\
 Current archive finalization state:\n\
 - git status --porcelain:\n{status}\n\
 - active change directory exists: {change_exists}\n\
@@ -781,9 +769,7 @@ pub fn verify_archive_completion(
     };
 
     let change_exists = change_path.exists();
-
-    // Check if archive directory contains this change
-    // Supports both direct match and date-prefixed format
+    let invalid_layout = archive_layout::invalid_layout_error(change_id, &archive_dir);
     let archive_exists = archive_entry_exists(change_id, &archive_dir);
 
     debug!(
@@ -792,15 +778,17 @@ pub fn verify_archive_completion(
         archive_dir = %archive_dir.display(),
         change_exists = change_exists,
         archive_exists = archive_exists,
+        invalid_layout = invalid_layout.as_ref().map(|e| e.path.display().to_string()).as_deref(),
         "verify_archive_completion: checking paths"
     );
 
-    // Archive is successful ONLY if:
-    // 1. Change no longer exists in openspec/changes/{change_id}
-    // If the change directory exists, the archive is incomplete regardless of
-    // whether an archive entry exists (the archive command may have failed
-    // to move/remove the original change directory).
-    if !change_exists {
+    if let Some(error) = invalid_layout {
+        return ArchiveVerificationResult::InvalidLayout {
+            message: error.message(),
+        };
+    }
+
+    if !change_exists && archive_exists {
         ArchiveVerificationResult::Success
     } else {
         ArchiveVerificationResult::NotArchived {
@@ -1278,6 +1266,26 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_archive_rejects_nested_archive_layout() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let (_changes_dir, archive_dir) = make_openspec_dirs(base);
+
+        let change_id = "my-change";
+        fs::create_dir_all(archive_dir.join("2026-07-09").join(change_id)).unwrap();
+
+        let result = verify_archive_completion(change_id, Some(base));
+        assert!(matches!(
+            result,
+            ArchiveVerificationResult::InvalidLayout { .. }
+        ));
+        if let ArchiveVerificationResult::InvalidLayout { message } = result {
+            assert!(message.contains("Invalid archive layout"));
+            assert!(message.contains("2026-07-09/my-change"));
+        }
+    }
+
+    #[test]
     fn test_verify_archive_change_removed() {
         let temp_dir = TempDir::new().unwrap();
         let base = temp_dir.path();
@@ -1286,9 +1294,9 @@ mod tests {
         let (_changes_dir, _archive_dir) = make_openspec_dirs(base);
 
         let change_id = "my-change";
-        // Neither path exists - considered success (change was removed)
+        // Neither path exists - archive evidence is missing, so completion is invalid.
         let result = verify_archive_completion(change_id, Some(base));
-        assert!(result.is_success());
+        assert!(!result.is_success());
     }
 
     #[test]
