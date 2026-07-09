@@ -109,6 +109,8 @@ Bundled proposal guidance MUST instruct authors to inspect canonical spec requir
 
 Final validation guidance, when present, MUST be represented as non-checkbox archive-gate text, such as a `## Final Validation` section.
 
+Archive-side guidance MUST instruct agents that the only supported archive mutation command is `cflx openspec archive <change_id> --yes`, or `cflx openspec archive <change_id> --yes --skip-specs` for tooling-only changes. Archive-side guidance MUST explicitly prohibit direct archive layout mutation with `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem operations under `openspec/changes/archive/`. If the CLI archive command fails, archive-side guidance MUST require terminal failure rather than manual archive repair.
+
 #### Scenario: proposal guidance requires canonical heading lookup
 
 **Given**: bundled `cflx-proposal` guidance is used to author a spec delta
@@ -117,12 +119,20 @@ Final validation guidance, when present, MUST be represented as non-checkbox arc
 **And**: it tells the author to use the canonical target heading for `MODIFIED` or `REMOVED`
 **And**: it tells the author to use `ADDED` when no canonical target exists
 
-#### Scenario: proposal guidance validates target selection before handoff
+#### Scenario: final validation is not represented as checkbox task
 
-**Given**: a proposal with spec deltas has been authored
-**When**: proposal authoring is complete
-**Then**: bundled guidance requires running `cflx openspec validate <id> --strict`
-**And**: missing `MODIFIED` or `REMOVED` targets are treated as proposal authoring errors rather than deferred archive blockers
+**Given**: proposal or archive guidance includes final OpenSpec validation
+**When**: tasks are written
+**Then**: final validation is represented outside checkbox task lists
+**And**: archive-gate validation remains the authoritative final gate
+
+#### Scenario: archive guidance prohibits manual archive fallback
+
+- **GIVEN** archive-side guidance is used after acceptance passes
+- **WHEN** `cflx openspec archive <change_id> --yes` fails
+- **THEN** the guidance instructs the agent to stop with terminal archive failure
+- **AND** the guidance does not permit `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem operations to create or move `openspec/changes/archive/` entries
+- **AND** the guidance does not permit a success-style archive commit after the failed CLI archive command
 
 ### Requirement: acceptance システムプロンプトは差分レビューの優先指示を含める
 acceptance システムプロンプトは、`<acceptance_diff_context>` が存在する場合に変更ファイルの確認を優先するよう明示的に指示しなければならない（MUST）。
@@ -327,6 +337,8 @@ Bundled proposal guidance MUST instruct authors to inspect canonical spec requir
 
 Final validation guidance, when present, MUST be represented as non-checkbox archive-gate text, such as a `## Final Validation` section.
 
+Archive-side guidance MUST instruct agents that the only supported archive mutation command is `cflx openspec archive <change_id> --yes`, or `cflx openspec archive <change_id> --yes --skip-specs` for tooling-only changes. Archive-side guidance MUST explicitly prohibit direct archive layout mutation with `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem operations under `openspec/changes/archive/`. If the CLI archive command fails, archive-side guidance MUST require terminal failure rather than manual archive repair.
+
 #### Scenario: proposal guidance requires canonical heading lookup
 
 **Given**: bundled `cflx-proposal` guidance is used to author a spec delta
@@ -335,12 +347,20 @@ Final validation guidance, when present, MUST be represented as non-checkbox arc
 **And**: it tells the author to use the canonical target heading for `MODIFIED` or `REMOVED`
 **And**: it tells the author to use `ADDED` when no canonical target exists
 
-#### Scenario: proposal guidance validates target selection before handoff
+#### Scenario: final validation is not represented as checkbox task
 
-**Given**: a proposal with spec deltas has been authored
-**When**: proposal authoring is complete
-**Then**: bundled guidance requires running `cflx openspec validate <id> --strict`
-**And**: missing `MODIFIED` or `REMOVED` targets are treated as proposal authoring errors rather than deferred archive blockers
+**Given**: proposal or archive guidance includes final OpenSpec validation
+**When**: tasks are written
+**Then**: final validation is represented outside checkbox task lists
+**And**: archive-gate validation remains the authoritative final gate
+
+#### Scenario: archive guidance prohibits manual archive fallback
+
+- **GIVEN** archive-side guidance is used after acceptance passes
+- **WHEN** `cflx openspec archive <change_id> --yes` fails
+- **THEN** the guidance instructs the agent to stop with terminal archive failure
+- **AND** the guidance does not permit `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem operations to create or move `openspec/changes/archive/` entries
+- **AND** the guidance does not permit a success-style archive commit after the failed CLI archive command
 
 ### Requirement: cflx-workflow MUST support cleanup-review operation prompts
 
@@ -376,6 +396,8 @@ Bundled proposal guidance MUST instruct authors to inspect canonical spec requir
 
 Final validation guidance, when present, MUST be represented as non-checkbox archive-gate text, such as a `## Final Validation` section.
 
+Archive-side guidance MUST instruct agents that the only supported archive mutation command is `cflx openspec archive <change_id> --yes`, or `cflx openspec archive <change_id> --yes --skip-specs` for tooling-only changes. Archive-side guidance MUST explicitly prohibit direct archive layout mutation with `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem operations under `openspec/changes/archive/`. If the CLI archive command fails, archive-side guidance MUST require terminal failure rather than manual archive repair.
+
 #### Scenario: proposal guidance requires canonical heading lookup
 
 **Given**: bundled `cflx-proposal` guidance is used to author a spec delta
@@ -384,12 +406,20 @@ Final validation guidance, when present, MUST be represented as non-checkbox arc
 **And**: it tells the author to use the canonical target heading for `MODIFIED` or `REMOVED`
 **And**: it tells the author to use `ADDED` when no canonical target exists
 
-#### Scenario: proposal guidance validates target selection before handoff
+#### Scenario: final validation is not represented as checkbox task
 
-**Given**: a proposal with spec deltas has been authored
-**When**: proposal authoring is complete
-**Then**: bundled guidance requires running `cflx openspec validate <id> --strict`
-**And**: missing `MODIFIED` or `REMOVED` targets are treated as proposal authoring errors rather than deferred archive blockers
+**Given**: proposal or archive guidance includes final OpenSpec validation
+**When**: tasks are written
+**Then**: final validation is represented outside checkbox task lists
+**And**: archive-gate validation remains the authoritative final gate
+
+#### Scenario: archive guidance prohibits manual archive fallback
+
+- **GIVEN** archive-side guidance is used after acceptance passes
+- **WHEN** `cflx openspec archive <change_id> --yes` fails
+- **THEN** the guidance instructs the agent to stop with terminal archive failure
+- **AND** the guidance does not permit `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem operations to create or move `openspec/changes/archive/` entries
+- **AND** the guidance does not permit a success-style archive commit after the failed CLI archive command
 
 ### Requirement: Operation-specific prompts MUST load dedicated skills
 

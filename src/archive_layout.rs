@@ -79,7 +79,8 @@ pub(crate) fn invalid_layout_error(
     })
 }
 
-pub(crate) fn is_valid_archive_entry_name(name: &str, change_id: &str) -> bool {
+#[cfg(test)]
+fn is_valid_archive_entry_name(name: &str, change_id: &str) -> bool {
     name == change_id || is_valid_dated_archive_name(name, change_id)
 }
 
