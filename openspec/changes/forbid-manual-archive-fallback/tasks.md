@@ -13,3 +13,6 @@
 
 Archive validation itself remains the authoritative final OpenSpec gate.
 Expected archive gate: `cflx openspec validate forbid-manual-archive-fallback --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] Binary crate cflx fails to compile: src/main.rs is missing `mod archive_layout;` declaration. cargo check reports 8 errors (E0432 unresolved import + cascading E0282 type inference failures). The binary cannot be built, which blocks the archive commit path. Fix: add `mod archive_layout;` to src/main.rs alongside the other module declarations.

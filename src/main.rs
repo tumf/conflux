@@ -4,6 +4,7 @@ mod acceptance;
 mod agent;
 mod ai_command_runner;
 mod analyzer;
+mod archive_layout;
 mod embedded_skills;
 mod install_skills;
 
