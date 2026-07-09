@@ -3,6 +3,7 @@
 //! This module provides native parsing of task checkboxes in markdown files,
 //! supporting both bullet lists (`- [ ]`) and numbered lists (`1. [ ]`).
 
+use crate::archive_layout;
 use crate::error::{OrchestratorError, Result};
 use crate::tui::log_deduplicator;
 use regex::Regex;
@@ -307,35 +308,19 @@ pub fn parse_change_with_worktree_fallback(
 /// - `{date}-{change_id}` - Date-prefixed archive (e.g., `2024-01-15-add-feature`)
 ///
 /// Returns the path to the archive directory if found.
-fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<std::path::PathBuf> {
-    let archive_dir = match base_path {
+fn archive_root(base_path: Option<&Path>) -> PathBuf {
+    match base_path {
         Some(base) => base.join("openspec/changes/archive"),
         None => Path::new("openspec/changes/archive").to_path_buf(),
-    };
-
-    if !archive_dir.exists() {
-        return None;
     }
+}
 
-    // Try exact match first
-    let exact_match = archive_dir.join(change_id);
-    if exact_match.exists() && exact_match.is_dir() {
-        return Some(exact_match);
-    }
+fn invalid_archive_layout_error(change_id: &str, base_path: Option<&Path>) -> Option<String> {
+    archive_layout::invalid_layout_error(change_id, &archive_root(base_path)).map(|e| e.message())
+}
 
-    // Try date-prefixed match
-    if let Ok(entries) = std::fs::read_dir(&archive_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            // Check if it ends with "-{change_id}" and is a directory
-            if name_str.ends_with(&format!("-{}", change_id)) && entry.path().is_dir() {
-                return Some(entry.path());
-            }
-        }
-    }
-
-    None
+fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<std::path::PathBuf> {
+    archive_layout::find_valid_archive_entry(change_id, &archive_root(base_path))
 }
 
 /// Parse task progress from the archive directory.
@@ -354,6 +339,10 @@ fn find_archive_directory(change_id: &str, base_path: Option<&Path>) -> Option<s
 )]
 #[allow(dead_code)]
 pub fn parse_archived_change(change_id: &str) -> Result<TaskProgress> {
+    if let Some(message) = invalid_archive_layout_error(change_id, None) {
+        return Err(OrchestratorError::ConfigLoad(message));
+    }
+
     let location = resolve_archived_progress_location(change_id, None).ok_or_else(|| {
         let archive_root = Path::new("openspec/changes/archive");
         if find_archive_directory(change_id, None).is_some() {
@@ -403,6 +392,15 @@ pub fn parse_archived_change_with_worktree_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
+    if let Some(wt_path) = worktree_path {
+        if let Some(message) = invalid_archive_layout_error(change_id, Some(wt_path)) {
+            return Err(OrchestratorError::ConfigLoad(message));
+        }
+    }
+    if let Some(message) = invalid_archive_layout_error(change_id, None) {
+        return Err(OrchestratorError::ConfigLoad(message));
+    }
+
     let location =
         resolve_archived_progress_location(change_id, worktree_path).ok_or_else(|| {
             OrchestratorError::ConfigLoad(format!(
@@ -459,6 +457,15 @@ pub fn parse_progress_with_fallback(
     change_id: &str,
     worktree_path: Option<&Path>,
 ) -> Result<TaskProgress> {
+    if let Some(wt_path) = worktree_path {
+        if let Some(message) = invalid_archive_layout_error(change_id, Some(wt_path)) {
+            return Err(OrchestratorError::ConfigLoad(message));
+        }
+    }
+    if let Some(message) = invalid_archive_layout_error(change_id, None) {
+        return Err(OrchestratorError::ConfigLoad(message));
+    }
+
     if let Some(location) = resolve_progress_location(change_id, worktree_path) {
         debug!(
             "Reading progress from {}: {:?}",
@@ -544,6 +551,10 @@ pub fn resolve_acceptance_follow_up_tasks_path(
 
     if active_path.exists() {
         return Ok(active_path);
+    }
+
+    if let Some(message) = invalid_archive_layout_error(change_id, Some(worktree_path)) {
+        return Err(OrchestratorError::ConfigLoad(message));
     }
 
     if let Some(archive_path) = find_archive_directory(change_id, Some(worktree_path)) {
@@ -1258,6 +1269,22 @@ mod tests {
         let result = find_archive_directory("my-feature", Some(base_path));
         assert!(result.is_some());
         assert_eq!(result.unwrap(), date_archive);
+    }
+
+    #[test]
+    fn test_parse_progress_rejects_nested_archive_layout() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let nested_tasks = temp_dir
+            .path()
+            .join("openspec/changes/archive/2026-07-09/my-feature/tasks.md");
+        write_tasks(&nested_tasks, "- [x] archived\n");
+
+        let err = parse_progress_with_fallback("my-feature", Some(temp_dir.path())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Invalid archive layout"));
+        assert!(message.contains("2026-07-09/my-feature"));
     }
 
     // ====================

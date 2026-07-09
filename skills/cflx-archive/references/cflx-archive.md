@@ -23,6 +23,9 @@ $ARGUMENTS
    - If you still cannot identify a single change ID, stop and tell the user you cannot archive anything yet.
 2. Validate the change ID by running `cflx openspec list` (or `cflx openspec show <id>`) and stop if the change is missing, already archived, or otherwise not ready to archive.
 3. Run `cflx openspec archive <id> --yes` so the CLI moves the change and applies spec updates without prompts (use `--skip-specs` only for tooling-only work).
+   - These are the only supported archive mutation commands: `cflx openspec archive <id> --yes` and, for tooling-only changes, `cflx openspec archive <id> --yes --skip-specs`.
+   - Do not create or move archive directories directly with `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem writes under `openspec/changes/archive/`.
+   - If the CLI archive command fails, the archive attempt is terminal for the archive agent. Stop with the command failure; do not repair layout manually and do not create a success-style archive commit.
 4. Review the command output to confirm the target specs were updated and the change landed in `changes/archive/`.
 5. **Verify the canonical spec diff**: run `git diff openspec/specs/` and confirm each touched `openspec/specs/**` file shows the expected requirement additions, replacements, or removals. Do not treat `Specs updated: [...]` output alone as sufficient evidence that specs changed correctly.
 6. Validate with `cflx openspec validate --strict` and inspect with `cflx openspec show <id>` if anything looks off.

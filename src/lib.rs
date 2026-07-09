@@ -25,6 +25,7 @@ mod acceptance;
 mod agent;
 mod ai_command_runner;
 mod analyzer;
+mod archive_layout;
 mod cli;
 mod command_queue;
 pub mod completion;

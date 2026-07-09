@@ -57,6 +57,9 @@ acceptance output rather than working around it here.
    ```bash
    cflx openspec archive <id> --yes
    ```
+   - Archive mutation MUST be performed only by `cflx openspec archive <id> --yes` or, for tooling-only changes, `cflx openspec archive <id> --yes --skip-specs`.
+   - Direct archive directory creation or movement with `mkdir`, `mv`, `git mv`, scripts, or equivalent filesystem writes under `openspec/changes/archive/` is forbidden.
+   - If the CLI archive command fails, stop with terminal archive failure. Do not manually repair archive layout and do not create an archive-success commit.
    - Use `--skip-specs` only for tooling-only changes
 
 4. **Verify Results**
@@ -73,7 +76,7 @@ acceptance output rather than working around it here.
 
 ## Archive Completion Criteria
 
-- Change moved to `openspec/changes/archive/<id>/`
+- Change moved by `cflx openspec archive <id> --yes` to `openspec/changes/archive/YYYY-MM-DD-<id>/` (`openspec/changes/archive/<id>/` is read-compatibility only)
 - Canonical specs updated (unless `--skip-specs`)
 - Validation passes with `--strict`
 - `git diff openspec/specs/` confirms expected requirement additions, replacements, or removals for each touched spec
