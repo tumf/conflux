@@ -17,3 +17,9 @@
 ## Final Validation
 
 Expected archive gate: `cflx openspec validate add-post-integration-verification-contracts --archive-gate` exits 0.
+
+## Acceptance Notes
+
+- `proposal.md` の pre-integration rerun/evidence を実行可能な `cargo test openspec_cmd` に修正し、`cargo test openspec_cmd` の成功で確認した。
+- `.github/workflows/release-validation.yml` を追加し、default branch push と `workflow_dispatch` で `./scripts/release.sh --dry-run patch` を実行、ログを `release-validation-log` artifact として公開する配線を追加した。
+- `src/openspec_cmd.rs` に missing fields、absolute path、external symlink、non-regular file、hybrid/prose contradiction、complete pre/post contract、ownerless post-integration gate の検証を追加し、`cargo test openspec_cmd` の77件成功で確認した。

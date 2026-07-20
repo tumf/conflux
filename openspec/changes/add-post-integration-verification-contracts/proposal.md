@@ -9,8 +9,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Cargo.toml
-    evidence: cargo test openspec::tests openspec_cmd
-    rerun: cargo test openspec::tests openspec_cmd
+    evidence: cargo test openspec_cmd
+    rerun: cargo test openspec_cmd
     prerequisites: []
   - id: release-validation
     requirement: Installed skills preserve post-integration verification guidance

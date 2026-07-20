@@ -1,0 +1,28 @@
+name: Release validation
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate release procedure
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/release.sh --dry-run patch | tee release-validation.log
+
+      - name: Publish validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-validation-log
+          path: release-validation.log

@@ -1715,6 +1715,175 @@ mod openspec_list_show_tests {
     }
 
     #[test]
+    fn test_strict_validation_rejects_missing_verification_fields() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/missing-fields");
+        create_strict_valid_change(&change_dir, "Missing Fields");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal
+                .replace("    requirement: archive behavior\n", "")
+                .replace("    prerequisites: []\n", ""),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("missing-fields"), true, "off");
+
+        assert!(!valid);
+        assert!(errors.iter().any(|error| error.contains("missing non-empty requirement")));
+        assert!(errors.iter().any(|error| error.contains("missing prerequisites list")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_absolute_automation_path() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/absolute-automation");
+        create_strict_valid_change(&change_dir, "Absolute Automation");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: /tmp/automation.sh"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("absolute-automation"), true, "off");
+
+        assert!(!valid);
+        assert!(errors.iter().any(|error| error.contains("unsafe automation path")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_strict_validation_rejects_external_automation_symlink() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/external-symlink");
+        create_strict_valid_change(&change_dir, "External Symlink");
+        let external = TempDir::new().unwrap();
+        fs::write(external.path().join("automation.sh"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(
+            external.path().join("automation.sh"),
+            temp.path().join("automation.sh"),
+        )
+        .unwrap();
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: automation.sh"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("external-symlink"), true, "off");
+
+        assert!(!valid);
+        assert!(errors.iter().any(|error| error.contains("escapes repository")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_non_regular_automation_path() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/directory-automation");
+        create_strict_valid_change(&change_dir, "Directory Automation");
+        fs::create_dir("automation").unwrap();
+        track_file(temp.path(), "automation");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: automation"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("directory-automation"), true, "off");
+
+        assert!(!valid);
+        assert!(errors.iter().any(|error| error.contains("is not a regular file")));
+    }
+
+    #[test]
+    fn test_strict_validation_requires_pre_integration_for_hybrid_despite_prose() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/hybrid-post-only");
+        create_strict_valid_change(&change_dir, "Hybrid Post Only");
+        fs::write("post.sh", "#!/bin/sh\n").unwrap();
+        track_file(temp.path(), "post.sh");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal
+                .replace("phase: pre-integration", "phase: post-integration")
+                .replace("owner: conflux-acceptance", "owner: repository-automation")
+                .replace("automation: Cargo.toml", "automation: post.sh")
+                .replace("**Change Type**: implementation", "**Change Type**: hybrid")
+                + "\nThis check runs before integration.\n",
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("hybrid-post-only"), true, "off");
+
+        assert!(!valid);
+        assert!(errors.iter().any(|error| error.contains("require at least one pre-integration")));
+    }
+
+    #[test]
+    fn test_strict_validation_accepts_complete_pre_and_post_contract() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/complete-contract");
+        create_strict_valid_change(&change_dir, "Complete Contract");
+        fs::write("post.sh", "#!/bin/sh\n").unwrap();
+        track_file(temp.path(), "post.sh");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace(
+                "    prerequisites: []\n---",
+                "    prerequisites: []\n  - id: deploy\n    requirement: release validation\n    phase: post-integration\n    owner: repository-automation\n    trigger: default-branch-integration\n    automation: post.sh\n    evidence: workflow artifact\n    rerun: workflow_dispatch\n    prerequisites: []\n---",
+            ),
+        )
+        .unwrap();
+
+        assert!(OpenSpecManager::new()
+            .validate_change(Some("complete-contract"), true, "off")
+            .0);
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_ownerless_cyclic_post_integration_gate() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/ownerless-cyclic-gate");
+        create_strict_valid_change(&change_dir, "Ownerless Cyclic Gate");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal
+                .replace("phase: pre-integration", "phase: post-integration")
+                .replace("trigger: pull request", "trigger: waits for its own integration")
+                .replace("prerequisites: []", "prerequisites: [integration complete]"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) = OpenSpecManager::new().validate_change(
+            Some("ownerless-cyclic-gate"),
+            true,
+            "off",
+        );
+
+        assert!(!valid);
+        assert!(errors.iter().any(|error| error.contains("post-integration requires owner")));
+    }
+
+    #[test]
     fn test_strict_validation_rejects_untracked_automation() {
         let temp = TempDir::new().unwrap();
         let _guard = CwdTestGuard::enter(temp.path());
