@@ -502,6 +502,13 @@ fn normalize_acceptance_findings(findings: &[String]) -> Vec<String> {
     normalized_findings
 }
 
+fn acceptance_finding_identity(finding: &str) -> &str {
+    finding
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']').map(|end| &finding[..=end + 1]))
+        .unwrap_or(finding)
+}
+
 fn render_acceptance_follow_up_section(findings: &[String]) -> String {
     let mut section = String::new();
     for finding in findings {
@@ -678,16 +685,20 @@ pub fn ensure_acceptance_follow_up(
         .first()
         .map(|range| content[range.clone()].to_string())
         .unwrap_or_default();
+    let completed_identities = existing_section
+        .lines()
+        .filter_map(|line| {
+            ["- [x] ", "- [X] "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+                .map(acceptance_finding_identity)
+        })
+        .collect::<Vec<_>>();
     let lines = normalized_findings
         .iter()
         .map(|finding| {
-            let checked = format!("- [x] {finding}");
-            let checked_upper = format!("- [X] {finding}");
-            if existing_section
-                .lines()
-                .any(|line| line == checked || line == checked_upper)
-            {
-                checked
+            if completed_identities.contains(&acceptance_finding_identity(finding)) {
+                format!("- [x] {finding}")
             } else {
                 format!("- [ ] {finding}")
             }
@@ -925,6 +936,44 @@ mod tests {
         assert!(content.contains("- [ ] latest finding"));
         let progress = parse_file(&tasks_path, None).unwrap();
         assert_eq!(progress, TaskProgress::with_counts(2, 3));
+    }
+
+    #[test]
+    fn acceptance_finding_identity_uses_complete_leading_code() {
+        assert_eq!(
+            acceptance_finding_identity("[SERIAL_STALLED_MARKER_MISSING] details"),
+            "[SERIAL_STALLED_MARKER_MISSING]"
+        );
+        assert_eq!(
+            acceptance_finding_identity("plain finding"),
+            "plain finding"
+        );
+    }
+
+    #[test]
+    fn ensure_acceptance_follow_up_preserves_completed_finding_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [x] [SERIAL_STALLED_MARKER_MISSING] fixed and verified\n",
+        )
+        .unwrap();
+
+        ensure_acceptance_follow_up(
+            &tasks_path,
+            2,
+            &["[SERIAL_STALLED_MARKER_MISSING] detailed original finding".to_string()],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("- [x] [SERIAL_STALLED_MARKER_MISSING] detailed original finding"));
+        assert!(!content.contains("- [ ] [SERIAL_STALLED_MARKER_MISSING]"));
+        assert_eq!(
+            parse_file(&tasks_path, None).unwrap(),
+            TaskProgress::with_counts(2, 2)
+        );
     }
 
     #[test]
