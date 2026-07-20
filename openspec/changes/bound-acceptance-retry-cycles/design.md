@@ -2,58 +2,34 @@
 
 ## Context
 
-A FAIL is only useful when apply can change repository evidence. Repeating the same review with no repository progress wastes agent cycles and can end as an irreversible-looking terminal error. At the same time, stopping on the first repeated text is unsafe because findings can remain valid while a real partial fix is in progress.
+既存runtimeはgeneric stalled lifecycleとpermission denial向け判定を持つが、一般のFAILは進捗を評価せずapplyへ戻る。commit hashだけではruntime bookkeeping commitを実装進捗と誤認する。
 
 ## Decision
 
 ### Finding identity
 
-The portable verdict continues to accept string findings. Runtime normalizes each finding into an identity equivalent to:
-
-```text
-scope + stable code + repository path + normalized message core
-```
-
-Structured findings may provide these components directly. Legacy strings use deterministic extraction and normalization. Comparison sorts and deduplicates the identity set; presentation order is not significant. Human-readable detail remains available separately.
-
-Repository-fixable and external findings are classified per finding, not by concatenating the full set. Ambiguous findings default to repository-fixable for the initial retry so the runtime does not hide a potentially repairable defect.
+String findingsを後方互換で受理し、`scope + stable code + repository path + normalized message core`相当へ正規化する。比較前にsort/dedupし、順序、重複、表示上の空白を無視する。曖昧なfindingは初回のみrepository-fixableとして扱う。
 
 ### Semantic progress
 
-A snapshot represents repository-visible implementation semantics between acceptance attempts. It includes tracked and untracked changes in source, tests, configuration, proposal/spec content, and substantive task content, whether committed or not.
-
-Before comparison, runtime-managed `Current Acceptance Follow-up` content and legacy numbered acceptance follow-up sections are stripped from `tasks.md`. `APPLY_BLOCKED/marker.md`, acceptance attempt counters, external logs, and UI/history state are excluded. A changed HEAD alone is not progress if its only semantic change is excluded bookkeeping.
+Tracked/untrackedのsource、test、configuration、spec、substantive task contentをfingerprint化する。runtime-managed acceptance follow-up、`APPLY_BLOCKED` marker、attempt counter、logs、UI/history stateを除外する。HEAD変更だけでは進捗としない。
 
 ### Retry decision
 
-1. Initial FAIL writes current follow-up and always permits one apply retry.
-2. After apply, acceptance runs again.
-3. If the finding identity set changed or semantic progress occurred, another retry remains eligible, bounded by the existing cycle ceiling.
-4. If the identity set is unchanged and no semantic progress occurred, runtime writes a resumable stalled marker and stops before apply.
-5. At cycle 10, runtime writes an `acceptance_cycle_limit_exhausted` stalled marker rather than emitting terminal Error.
+1. 初回FAILは1回applyを許可する。
+2. 次のacceptance前後でfinding identity集合とsemantic fingerprintを比較し、先行changeのworkspace-local checkpointへ更新する。
+3. findingが変化した、またはsemantic progressがあればceiling内でretryする。
+4. findingが同一でprogressがなければ`repeated_acceptance_findings` stalledとする。
+5. cycle 10では`acceptance_cycle_limit_exhausted` stalledとする。
+6. stalled evidenceは先行changeのworkspace-local marker APIへ渡す。
 
-### Follow-up ownership
+### Shared semantics
 
-Acceptance remains read-only. Runtime owns exactly one `## Current Acceptance Follow-up` section. Repository-fixable findings are unchecked tasks; external blockers are non-checkbox metadata with owner/evidence/next action. Replacing the section removes obsolete findings. A persistence error is reported but does not replace the primary acceptance verdict.
-
-### Durable stalled state
-
-The existing `openspec/changes/<id>/APPLY_BLOCKED/marker.md` is reused. Acceptance-generated markers identify their origin and include reason, retry count, normalized finding identities, current findings, external blockers, resumability, and next action.
-
-Ordinary dispatch honors the marker. Explicit retry may consume only a resumable acceptance-generated marker, after surfacing its context; it must not clear unrelated apply-generated blockers. This makes restart behavior derivable from workspace files.
-
-### Prompt context
-
-The next acceptance receives current diff and latest normalized findings. Full attempt history is not injected. Latest raw output is included only when no finalized FAIL finding payload exists, such as CONTINUE or command diagnostics.
+判定をpure shared helperに置き、serial/parallelはloop制御だけを担当する。CONTINUEの個別default問題は本changeへ混ぜない。
 
 ## Alternatives Rejected
 
-- Commit hash comparison: runtime bookkeeping commits create false progress.
-- Exact free-form text comparison: line numbers and wording drift create false differences.
-- Immediate stall on first FAIL: denies apply any repair opportunity.
-- Keeping terminal cycle-limit Error: destroys resumable workflow intent.
-- New state database: violates workspace-local routing law.
-
-## Migration
-
-On the next FAIL, runtime replaces all legacy numbered acceptance follow-up sections with the current managed section. Existing `APPLY_BLOCKED` markers without acceptance origin keep their current semantics and are never auto-cleared by this change.
+- Commit hash比較: bookkeeping commitでfalse progressになる。
+- Exact text比較: line numberやwording driftでfalse differenceになる。
+- 初回FAILで即stall: applyへ修正機会を与えない。
+- terminal cycle-limit Error維持: explicit retry可能なworkflow intentと合わない。

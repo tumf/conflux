@@ -4,7 +4,7 @@
 
 When acceptance returns FAIL, execution MUST permit at least one apply retry for repository-fixable findings regardless of whether the workspace started fresh or resumed. Before a later apply retry, runtime MUST compare the current normalized finding identity set and repository-visible semantic progress with the previous failed attempt. If the same findings recur after the permitted apply and no semantic progress exists, execution MUST enter a resumable stalled hold before invoking apply again.
 
-Semantic progress MUST include substantive repository changes and MUST exclude runtime-managed acceptance follow-up content, acceptance blocker markers, attempt counters, logs, and other observability-only state. String finding order, duplicate entries, and presentation-only whitespace MUST NOT create false progress or distinct finding sets.
+Semantic progress MUST include substantive committed and uncommitted repository changes and MUST exclude runtime-managed acceptance follow-up content, blocker markers, attempt counters, logs, and observability-only state. Finding order, duplicates, and presentation-only whitespace MUST NOT create distinct identity sets. Previous finding identities, semantic baseline, and cycle count MUST be loaded from and updated through the workspace-local retry checkpoint so process restart cannot reset the retry decision.
 
 #### Scenario: resumed workspace gets one repair attempt
 
@@ -20,48 +20,46 @@ Semantic progress MUST include substantive repository changes and MUST exclude r
 - **AND** the workspace has no semantic progress since the previous failed attempt
 - **WHEN** runtime chooses the next action
 - **THEN** it records `repeated_acceptance_findings` as a resumable stalled hold
-- **AND** it does not invoke apply again
-- **AND** it does not emit terminal Error solely for the repetition
+- **AND** it does not invoke apply again or emit terminal Error solely for repetition
 
-#### Scenario: real repository progress permits another bounded retry
+#### Scenario: real progress permits another bounded retry
 
 - **GIVEN** acceptance returns the same finding identity after apply
 - **AND** source, test, configuration, spec, or substantive task content changed
 - **WHEN** runtime evaluates progress
 - **THEN** the change remains eligible for another bounded apply retry
-- **AND** runtime-owned follow-up changes alone would not produce this result
+- **AND** runtime-owned bookkeeping alone would not produce this result
 
 ## ADDED Requirements
 
 ### Requirement: Acceptance retry safeguards are mode-independent
 
-Serial and parallel execution MUST use equivalent finding normalization, semantic progress, retry, mixed-blocker, and stalled classification. The existing apply+acceptance ceiling of ten cycles MUST remain a safety ceiling, but exhaustion MUST produce a resumable `acceptance_cycle_limit_exhausted` stalled hold with preserved workspace evidence instead of terminal Error.
+Serial and parallel execution MUST use equivalent finding normalization, semantic progress, retry, mixed-blocker, and stalled classification. The existing apply+acceptance ceiling of ten cycles MUST remain a safety ceiling, but exhaustion MUST produce a resumable `acceptance_cycle_limit_exhausted` stalled hold with workspace-local evidence instead of terminal Error.
 
 #### Scenario: cycle ceiling preserves resumability
 
 - **GIVEN** a change reaches the tenth apply+acceptance cycle without acceptance PASS
-- **WHEN** the runtime enforces the safety ceiling
-- **THEN** it enters a resumable stalled hold
-- **AND** it preserves the worktree, current findings, retry count, and next action
+- **WHEN** runtime enforces the safety ceiling
+- **THEN** it enters `acceptance_cycle_limit_exhausted` stalled
+- **AND** it preserves the worktree and retry evidence
 - **AND** it does not classify the ceiling as terminal implementation failure
 
-#### Scenario: serial and parallel classify the same observation equally
+#### Scenario: serial and parallel classify equivalent observations equally
 
-- **GIVEN** serial and parallel execution observe equivalent prior findings, current findings, and workspace progress
+- **GIVEN** serial and parallel observe equivalent prior findings, current findings, and workspace progress
 - **WHEN** each computes its retry decision
-- **THEN** both choose the same apply-retry or stalled outcome
-- **AND** both use the same stalled reason
+- **THEN** both choose the same apply-retry or stalled outcome and reason
 
 ### Requirement: Acceptance findings retain repository and external scopes
 
-Runtime MUST classify findings individually as repository-fixable or external/non-mockable. Repository-fixable findings MUST remain actionable FAIL follow-up. External blockers MUST be retained as non-checkbox metadata and MUST NOT disappear when repository findings are present. If repository findings are resolved and only an unresolved external blocker remains, runtime MUST preserve it through the stalled-hold path.
+Runtime MUST classify findings individually as repository-fixable or external/non-mockable. Repository-fixable findings MUST remain actionable repair input. External blockers MUST be retained and MUST NOT disappear when repository findings are present. If repository findings are resolved and only an unresolved external blocker remains, runtime MUST preserve it through the stalled path.
 
 #### Scenario: mixed findings preserve both responsibilities
 
-- **GIVEN** acceptance identifies a repository defect and an external deployment prerequisite
-- **WHEN** runtime persists the FAIL follow-up
-- **THEN** the repository defect is an unchecked repair task
-- **AND** the external prerequisite is non-checkbox blocker metadata
+- **GIVEN** acceptance identifies a repository defect and an external prerequisite
+- **WHEN** runtime evaluates the FAIL
+- **THEN** the repository defect remains apply-repairable
+- **AND** the external prerequisite remains blocker evidence
 - **AND** apply is not instructed to satisfy the external prerequisite by repository edits
 
 #### Scenario: external blocker remains after repository repair
@@ -70,23 +68,3 @@ Runtime MUST classify findings individually as repository-fixable or external/no
 - **AND** an external non-mockable blocker remains
 - **WHEN** acceptance runs again
 - **THEN** the blocker is preserved in a resumable stalled hold
-- **AND** it is not discarded or converted into a repository checkbox
-
-### Requirement: Acceptance stalled retry evidence is workspace-local
-
-A repeated-finding or cycle-limit stalled hold MUST be represented by workspace-local evidence using the existing apply-blocked marker contract or an equivalent workspace file. Ordinary dispatch MUST honor that evidence after restart. Explicit retry MAY consume a resumable acceptance-generated marker, but MUST NOT clear unrelated apply blockers.
-
-#### Scenario: restart reconstructs acceptance stalled state
-
-- **GIVEN** a workspace contains an acceptance-generated resumable blocker marker
-- **AND** out-of-worktree Conflux state is absent
-- **WHEN** Conflux detects the workspace after restart
-- **THEN** it reconstructs the stalled hold and next action from workspace evidence
-- **AND** ordinary dispatch does not start apply
-
-#### Scenario: explicit retry clears only acceptance-generated marker
-
-- **GIVEN** an operator explicitly retries a stalled acceptance change
-- **WHEN** runtime prepares the workspace for retry
-- **THEN** it consumes the resumable acceptance-generated marker
-- **AND** an unrelated apply-generated blocker marker is not silently cleared
