@@ -1099,6 +1099,22 @@ verifications:
     }
 
     #[test]
+    fn test_parse_verification_declarations_preserves_duplicate_invalid_and_empty_values() {
+        let parsed = parse_proposal_frontmatter_strict(
+            "---\nverifications:\n  - id: duplicate\n    phase: invalid\n    prerequisites: []\n  - id: duplicate\n    phase: pre-integration\n    prerequisites: []\n---\n# Change",
+            Path::new("proposal.md"),
+        );
+
+        assert!(parsed.diagnostics.is_empty());
+        let declarations = &parsed.metadata.unwrap().verifications;
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations[0].id.as_deref(), Some("duplicate"));
+        assert_eq!(declarations[0].phase.as_deref(), Some("invalid"));
+        assert_eq!(declarations[0].prerequisites, Some(Vec::new()));
+        assert_eq!(declarations[1].id.as_deref(), Some("duplicate"));
+    }
+
+    #[test]
     fn test_parse_proposal_metadata_falls_back_to_body_dependencies() {
         let proposal = r#"---
 change_type: implementation

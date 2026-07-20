@@ -14,11 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Validate release procedure
+      - name: Validate release procedure and installed skills
         shell: bash
         run: |
           set -o pipefail
           ./scripts/release.sh --dry-run patch | tee release-validation.log
+          cargo test --test install_skills_test | tee -a release-validation.log
 
       - name: Publish validation evidence
         if: always()
