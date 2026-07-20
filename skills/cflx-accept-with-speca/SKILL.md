@@ -45,6 +45,12 @@ Backward-compatible fallback markers:
 
 Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the portable Conflux acceptance interface. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
 
+## Declared Verification Phases
+
+Apply the same structured verification-phase semantics as `cflx-accept`. `pre-integration` declarations require current-revision repository evidence and runnable local verification. `post-integration` declarations require review of repository-automation ownership, tracked repository automation, trigger, evidence publication, rerun action, prerequisites, and fixture/local evidence; do not fetch an undeployed or external target.
+
+Missing, placeholder, or incorrectly wired repository automation is a repository-fixable FAIL. A correctly wired post-integration declaration with pending operational evidence is not a FAIL. A non-mockable external prerequisite that makes the declared automation unusable is a stalled hold with the prerequisite owner and next rerun or unblock action preserved. Never claim an unobserved operational outcome succeeded.
+
 ## Official NyxFoundation/speca Runner Adapter (Optional)
 
 Attempt the official NyxFoundation/speca runner when it is locally available and usable. This runner is a supporting proof/falsification helper only; it is not required for acceptance and it never replaces repository evidence or the final Conflux verdict contract.

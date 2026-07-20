@@ -252,6 +252,35 @@ mod tests {
     ];
 
     #[test]
+    fn test_verification_phase_guidance_is_embedded() {
+        for required in [
+            "pre-integration",
+            "post-integration",
+            "repository-automation",
+        ] {
+            assert!(CFLX_PROPOSAL_SKILL_MD.contains(required));
+            assert!(CFLX_ACCEPT_SKILL_MD.contains(required));
+            assert!(CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(required));
+        }
+        for required in [
+            "external HTTP/API checks",
+            "id`, `requirement`, `phase`, `owner`, `trigger`, `automation`, `evidence`, `rerun`, and `prerequisites`",
+        ] {
+            assert!(CFLX_PROPOSAL_SKILL_MD.contains(required));
+        }
+        for required in [
+            "undeployed or external target",
+            "repository-fixable FAIL",
+            "is not a FAIL",
+            "stalled hold",
+            "unobserved",
+        ] {
+            assert!(CFLX_ACCEPT_SKILL_MD.contains(required));
+            assert!(CFLX_ACCEPT_WITH_SPECA_SKILL_MD.contains(required));
+        }
+    }
+
+    #[test]
     fn test_cflx_accept_skill_defines_portable_contract() {
         for required in &[
             "portable Conflux acceptance interface",

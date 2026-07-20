@@ -173,8 +173,31 @@ change_type: spec-only # or: implementation | hybrid
 priority: medium # high | medium | low
 dependencies: [] # optional change-id list; overrides body `## Dependencies`
 references: [] # optional string list of related files/specs/changes
+verifications:
+  - id: local-tests
+    requirement: Repository behavior covered before integration
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull-request-validation
+    automation: path/to/tracked-test-or-script
+    evidence: local test result or repository evidence location
+    rerun: concrete local rerun command
+    prerequisites: []
+  - id: deployed-smoke
+    requirement: Operational outcome verified after integration
+    phase: post-integration
+    owner: repository-automation
+    trigger: default-branch-integration
+    automation: path/to/tracked-workflow-or-script
+    evidence: expected published evidence location
+    rerun: concrete recovery or rerun action
+    prerequisites: []
 ---
 ```
+
+Every implementation or hybrid proposal MUST declare at least one complete `pre-integration` verification. Every claimed post-integration outcome MUST use a complete `post-integration` declaration. `id`, `requirement`, `phase`, `owner`, `trigger`, `automation`, `evidence`, `rerun`, and `prerequisites` are required. `pre-integration` requires `owner: conflux-acceptance`; `post-integration` requires `owner: repository-automation`. `automation` must be a safe repository-relative tracked regular file.
+
+Classify outcomes structurally. Do not put deployment URLs, external HTTP/API checks, or results available only after default-branch integration into pre-integration checkbox acceptance conditions. Record those as post-integration automation with evidence publication and rerun ownership.
 
 Keep the human-readable line near the top as well for backward-compatible readability:
 

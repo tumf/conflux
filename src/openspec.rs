@@ -27,7 +27,28 @@ pub struct ProposalMetadata {
     pub dependencies: Vec<String>,
     pub references: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verifications: Vec<VerificationDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationDeclaration {
+    pub id: Option<String>,
+    pub requirement: Option<String>,
+    pub phase: Option<String>,
+    pub owner: Option<String>,
+    pub trigger: Option<String>,
+    pub automation: Option<String>,
+    pub evidence: Option<String>,
+    pub rerun: Option<String>,
+    pub prerequisites: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProposalFrontmatterParse {
+    pub metadata: Option<ProposalFrontmatterMetadata>,
+    pub diagnostics: Vec<String>,
 }
 
 fn proposal_priority_label(priority: ProposalPriority) -> String {
@@ -60,6 +81,7 @@ fn frontmatter_metadata_to_metadata(metadata: ProposalFrontmatterMetadata) -> Pr
             }),
         dependencies: metadata.dependencies.unwrap_or_default(),
         references: metadata.references,
+        verifications: metadata.verifications,
         warnings: warnings_to_strings(&metadata.warnings),
     }
 }
@@ -113,6 +135,7 @@ pub fn parse_proposal_metadata_from_file(path: &Path) -> ProposalMetadata {
             priority: None,
             dependencies: proposal.body_dependencies,
             references: Vec::new(),
+            verifications: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -152,19 +175,45 @@ fn parse_frontmatter_metadata(
     frontmatter: &str,
     path: &Path,
 ) -> Option<ProposalFrontmatterMetadata> {
+    let parsed = parse_frontmatter_metadata_strict(frontmatter, path);
+    parsed.metadata
+}
+
+pub fn parse_proposal_frontmatter_strict(content: &str, path: &Path) -> ProposalFrontmatterParse {
+    split_frontmatter(content)
+        .0
+        .map(|frontmatter| parse_frontmatter_metadata_strict(frontmatter, path))
+        .unwrap_or_default()
+}
+
+pub fn parse_frontmatter_metadata_strict(
+    frontmatter: &str,
+    path: &Path,
+) -> ProposalFrontmatterParse {
     let value: Value = match serde_yaml::from_str(frontmatter) {
         Ok(value) => value,
         Err(error) => {
+            let diagnostic = format!("Failed to parse proposal frontmatter YAML: {error}");
             warn!(proposal = %path.display(), error = %error, "Failed to parse proposal frontmatter YAML");
-            return None;
+            return ProposalFrontmatterParse {
+                metadata: None,
+                diagnostics: vec![diagnostic],
+            };
         }
     };
 
     let mut warnings = Vec::new();
+    let mut diagnostics = Vec::new();
     if let Value::Mapping(mapping) = &value {
-        let known_keys: HashSet<&str> = ["change_type", "priority", "dependencies", "references"]
-            .into_iter()
-            .collect();
+        let known_keys: HashSet<&str> = [
+            "change_type",
+            "priority",
+            "dependencies",
+            "references",
+            "verifications",
+        ]
+        .into_iter()
+        .collect();
 
         for key in mapping.keys() {
             if let Some(key) = key.as_str() {
@@ -178,13 +227,49 @@ fn parse_frontmatter_metadata(
                 }
             }
         }
+
+        if let Some(Value::Sequence(verifications)) =
+            mapping.get(Value::String("verifications".to_string()))
+        {
+            let known_verification_keys: HashSet<&str> = [
+                "id",
+                "requirement",
+                "phase",
+                "owner",
+                "trigger",
+                "automation",
+                "evidence",
+                "rerun",
+                "prerequisites",
+            ]
+            .into_iter()
+            .collect();
+            for (index, verification) in verifications.iter().enumerate() {
+                if let Value::Mapping(verification) = verification {
+                    for key in verification.keys() {
+                        if let Some(key) = key.as_str() {
+                            if !known_verification_keys.contains(key) {
+                                diagnostics.push(format!(
+                                    "Unknown verification declaration key at index {}: {}",
+                                    index, key
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let raw: RawProposalFrontmatter = match serde_yaml::from_value(value) {
         Ok(raw) => raw,
         Err(error) => {
+            let diagnostic = format!("Failed to decode proposal frontmatter fields: {error}");
             warn!(proposal = %path.display(), error = %error, "Failed to decode proposal frontmatter fields");
-            return None;
+            return ProposalFrontmatterParse {
+                metadata: None,
+                diagnostics: vec![diagnostic],
+            };
         }
     };
 
@@ -203,10 +288,14 @@ fn parse_frontmatter_metadata(
         priority: raw.priority.map(proposal_priority_label),
         dependencies: (!dependencies.is_empty()).then_some(dependencies),
         references: raw.references.unwrap_or_default(),
+        verifications: raw.verifications.unwrap_or_default(),
         warnings,
     };
 
-    (!metadata.is_empty()).then_some(metadata)
+    ProposalFrontmatterParse {
+        metadata: (!metadata.is_empty()).then_some(metadata),
+        diagnostics,
+    }
 }
 
 /// Represents a change from openspec list
@@ -250,6 +339,7 @@ pub struct ProposalFrontmatterMetadata {
     pub priority: Option<String>,
     pub dependencies: Option<Vec<String>>,
     pub references: Vec<String>,
+    pub verifications: Vec<VerificationDeclaration>,
     pub warnings: Vec<ProposalFrontmatterWarning>,
 }
 
@@ -259,6 +349,7 @@ impl ProposalFrontmatterMetadata {
             && self.priority.is_none()
             && self.dependencies.is_none()
             && self.references.is_empty()
+            && self.verifications.is_empty()
             && self.warnings.is_empty()
     }
 }
@@ -269,6 +360,7 @@ struct RawProposalFrontmatter {
     priority: Option<ProposalPriority>,
     dependencies: Option<Vec<String>>,
     references: Option<Vec<String>>,
+    verifications: Option<Vec<VerificationDeclaration>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -948,6 +1040,62 @@ references:
         );
         assert_eq!(metadata.references, vec!["src/openspec.rs".to_string()]);
         assert!(metadata.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_parse_verification_declarations_and_strict_diagnostics() {
+        let proposal = r#"---
+change_type: implementation
+verifications:
+  - id: local
+    requirement: parser behavior
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull request
+    automation: Cargo.toml
+    evidence: cargo test
+    rerun: cargo test
+    prerequisites: []
+  - id: deployed
+    requirement: deployment behavior
+    phase: post-integration
+    owner: repository-automation
+    trigger: default branch integration
+    automation: Cargo.toml
+    evidence: CI result
+    rerun: rerun CI
+    prerequisites:
+      - deployment approval
+---
+# Change: Example
+"#;
+        let parsed = parse_proposal_frontmatter_strict(proposal, Path::new("proposal.md"));
+        assert!(parsed.diagnostics.is_empty());
+        let metadata = parsed.metadata.expect("metadata");
+        assert_eq!(metadata.verifications.len(), 2);
+        assert!(metadata.warnings.is_empty());
+        assert_eq!(metadata.verifications[0].id.as_deref(), Some("local"));
+        assert_eq!(
+            metadata.verifications[1].prerequisites,
+            Some(vec!["deployment approval".to_string()])
+        );
+
+        let malformed = parse_proposal_frontmatter_strict(
+            "---\nverifications: [\n---\n# Change",
+            Path::new("proposal.md"),
+        );
+        assert!(malformed.metadata.is_none());
+        assert!(!malformed.diagnostics.is_empty());
+
+        let unknown_nested = parse_proposal_frontmatter_strict(
+            "---\nverifications:\n  - id: local\n    unexpected: value\n---\n# Change",
+            Path::new("proposal.md"),
+        );
+        assert_eq!(unknown_nested.metadata.unwrap().verifications.len(), 1);
+        assert_eq!(
+            unknown_nested.diagnostics,
+            vec!["Unknown verification declaration key at index 0: unexpected"]
+        );
     }
 
     #[test]

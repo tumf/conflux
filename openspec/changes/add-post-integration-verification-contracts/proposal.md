@@ -2,6 +2,25 @@
 change_type: implementation
 priority: high
 dependencies: []
+verifications:
+  - id: verification-contract-tests
+    requirement: Typed parsing and strict validation enforce verification contracts
+    phase: pre-integration
+    owner: conflux-acceptance
+    trigger: pull-request-validation
+    automation: Cargo.toml
+    evidence: cargo test openspec::tests openspec_cmd
+    rerun: cargo test openspec::tests openspec_cmd
+    prerequisites: []
+  - id: release-validation
+    requirement: Installed skills preserve post-integration verification guidance
+    phase: post-integration
+    owner: repository-automation
+    trigger: default-branch-integration
+    automation: scripts/release.sh
+    evidence: release CI logs
+    rerun: rerun the release validation workflow
+    prerequisites: []
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/proposal-metadata/spec.md

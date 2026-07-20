@@ -179,6 +179,21 @@ fn test_embedded_install_without_skills_dir() {
         );
     }
 
+    for (name, required) in [
+        ("cflx-proposal", "prerequisites"),
+        ("cflx-accept", "operational result is pending is not a FAIL"),
+        (
+            "cflx-accept-with-speca",
+            "pending operational evidence is not a FAIL",
+        ),
+    ] {
+        let content = fs::read_to_string(skills_base.join(name).join("SKILL.md")).unwrap();
+        assert!(
+            content.contains(required),
+            "{name}: installed skill must preserve verification guidance"
+        );
+    }
+
     // Verify scripts/cflx.py is NOT distributed in any skill (replaced by native CLI)
     for name in &expected_skills {
         assert!(
