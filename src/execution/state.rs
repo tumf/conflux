@@ -37,6 +37,7 @@ use tracing::debug;
 
 use crate::error::{OrchestratorError, Result};
 use crate::execution::archive::is_archive_commit_complete;
+use crate::parallel::acceptance_state::parse_blocked_marker;
 
 /// Workspace state for resume detection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +436,7 @@ pub async fn detect_workspace_state(
         .join("APPLY_BLOCKED")
         .join("marker.md");
     if blocked_marker_path.exists() {
+        parse_blocked_marker(repo_root, change_id)?;
         debug!(
             change_id = %change_id,
             blocked_marker_path = %blocked_marker_path.display(),

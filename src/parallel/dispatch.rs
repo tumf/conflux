@@ -26,6 +26,10 @@ use crate::orchestration::{
 use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
+use super::acceptance_state::{
+    mark_acceptance_failed, mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
+    write_acceptance_blocked_marker,
+};
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
@@ -1573,6 +1577,17 @@ impl ParallelExecutor {
                     };
                 }
 
+                if let Err(error) = mark_apply_completed(&workspace.path, &revision, &change_id) {
+                    cancel_monitor.abort();
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: Some(format!("Failed to persist acceptance checkpoint after apply: {error}")),
+                        rejected: None,
+                    };
+                }
+
                 // Send ApplyCompleted event
                 if let Some(ref tx) = event_tx {
                     let _ = tx
@@ -1617,6 +1632,16 @@ impl ParallelExecutor {
                     }
                     Ok((crate::orchestration::AcceptanceResult::Pass, 0))
                 } else {
+                    if let Err(error) = mark_acceptance_started(&workspace.path, &revision, &change_id) {
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!("Failed to persist acceptance start checkpoint: {error}")),
+                            rejected: None,
+                        };
+                    }
                     agent.seed_acceptance_history(acceptance_history.lock().await.clone());
                     execute_acceptance_in_workspace(
                         &change_id,
@@ -1635,6 +1660,16 @@ impl ParallelExecutor {
 
                 match acceptance_result {
                     Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
+                        if let Err(error) = mark_acceptance_passed(&workspace.path, &revision, Some(&change_id)) {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Failed to persist acceptance pass checkpoint: {error}")),
+                                rejected: None,
+                            };
+                        }
                         info!("Acceptance passed for {}, proceeding to archive", change_id);
                         match task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
                             &change_id,
@@ -1826,6 +1861,19 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::PermissionStalled { blocker },
                         acceptance_iteration,
                     )) => {
+                        let evidence = vec![blocker.summary()];
+                        if let Err(error) = mark_acceptance_failed(&workspace.path, &revision, Some(&change_id))
+                            .and_then(|()| write_acceptance_blocked_marker(&workspace.path, &change_id, "permission_stalled", &evidence, true, "explicit retry"))
+                        {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Failed to persist acceptance stalled evidence: {error}")),
+                                rejected: None,
+                            };
+                        }
                         warn!(
                             "Acceptance stalled for {} on repeated unresolved permission/tool policy denial (cycle {}): {}",
                             change_id,
