@@ -17,7 +17,7 @@ jobs:
       - name: Validate release procedure and installed skills
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           ./scripts/release.sh --dry-run patch | tee release-validation.log
           cargo test --test install_skills_test | tee -a release-validation.log
 
