@@ -139,6 +139,7 @@ where
 
     // Stream output until channel closes or acceptance marker detected + grace period
     let mut marker_detected = false;
+    let mut verdict_stream_detector = crate::acceptance::VerdictStreamDetector::default();
     let mut marker_deadline: Option<tokio::time::Instant> = None;
     let mut early_terminated = false;
 
@@ -201,7 +202,7 @@ where
                 // and, as fallback, the legacy standalone plain-text
                 // marker. Malformed markers with trailing text (for example
                 // "ACCEPTANCE: PASSAll ...") do NOT trigger early completion.
-                if !marker_detected && crate::acceptance::detect_verdict_in_line(&s).is_some() {
+                if !marker_detected && verdict_stream_detector.detect(&s).is_some() {
                     marker_detected = true;
                     marker_deadline = Some(tokio::time::Instant::now() + MARKER_GRACE_PERIOD);
                     info!(
@@ -299,14 +300,12 @@ where
         } => {
             info!("Acceptance test failed for: {}", change.id);
             output.on_warn("Acceptance test: FAIL");
-            // Use findings parsed from the FINDINGS section of the output so that
-            // the verdict and its findings share a single data source (full_stdout).
-            (
-                AcceptanceResult::Fail {
-                    findings: parsed_findings,
-                },
-                false,
-            )
+            let findings = if parsed_findings.is_empty() {
+                vec!["Investigate acceptance failure and apply the required fix".to_string()]
+            } else {
+                parsed_findings
+            };
+            (AcceptanceResult::Fail { findings }, false)
         }
         crate::acceptance::AcceptanceResult::Continue => {
             info!("Acceptance requires continuation for: {}", change.id);
@@ -320,18 +319,36 @@ where
         }
     };
 
+    let history_findings = match &result {
+        AcceptanceResult::Fail { findings } => Some(findings.clone()),
+        AcceptanceResult::Continue => {
+            Some(vec!["Investigation incomplete - continue later".to_string()])
+        }
+        AcceptanceResult::Gated => Some(vec!["Implementation blocker detected".to_string()]),
+        AcceptanceResult::Pass => None,
+        AcceptanceResult::CommandFailed { .. }
+        | AcceptanceResult::PermissionStalled { .. }
+        | AcceptanceResult::Cancelled => Some(tail_findings.clone()),
+    };
     let attempt_number = agent.next_acceptance_attempt_number(&change.id);
     let attempt = AcceptanceAttempt {
         attempt: attempt_number,
         passed,
         duration: start_time.elapsed(),
-        findings: Some(tail_findings.clone()),
+        findings: history_findings,
         exit_code: status.code(),
         stdout_tail,
         stderr_tail,
         commit_hash: commit_hash.clone(),
     };
     agent.record_acceptance_attempt(&change.id, attempt);
+    match &result {
+        AcceptanceResult::Fail { findings } => {
+            agent.record_acceptance_follow_up(&change.id, attempt_number, findings.clone());
+        }
+        AcceptanceResult::Pass => agent.clear_acceptance_follow_up(&change.id),
+        _ => {}
+    }
     Ok((result, attempt_number, command))
 }
 

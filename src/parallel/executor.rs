@@ -217,6 +217,37 @@ async fn run_post_apply_cleanup_review(
     Ok(())
 }
 
+async fn mark_acceptance_context_injected(
+    agent: &AgentRunner,
+    change_id: &str,
+    acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
+) {
+    if agent.acceptance_context_was_injected(change_id) {
+        acceptance_tail_injected
+            .lock()
+            .await
+            .insert(change_id.to_string(), true);
+    }
+}
+
+async fn prepare_acceptance_context_for_apply(
+    agent: &mut AgentRunner,
+    change_id: &str,
+    acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
+    acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
+) {
+    agent.seed_acceptance_history(acceptance_history.lock().await.clone());
+    let already_injected = acceptance_tail_injected
+        .lock()
+        .await
+        .get(change_id)
+        .copied()
+        .unwrap_or(false);
+    if already_injected {
+        let _ = agent.get_acceptance_tail_context_for_apply(change_id);
+    }
+}
+
 /// Execute apply command in a single workspace, repeating until tasks are 100% complete.
 ///
 /// Returns (revision, final_iteration_count) on success.
@@ -234,8 +265,8 @@ pub async fn execute_apply_in_workspace(
     ai_runner: &AiCommandRunner,
     repo_root: &Path,
     _apply_history: &Arc<Mutex<crate::history::ApplyHistory>>,
-    _acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
-    _acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
+    acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
+    acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
     _initial_iteration: u32,
 ) -> Result<(
     String,
@@ -288,6 +319,13 @@ pub async fn execute_apply_in_workspace(
 
     // Create AgentRunner for execute_apply_loop
     let mut agent = AgentRunner::new(config.clone());
+    prepare_acceptance_context_for_apply(
+        &mut agent,
+        change_id,
+        acceptance_history,
+        acceptance_tail_injected,
+    )
+    .await;
 
     // Clone event_tx for permission error handling before moving it to event_handler
     let event_tx_for_permission = event_tx.clone();
@@ -410,6 +448,14 @@ pub async fn execute_apply_in_workspace(
         }
         Err(e) => return Err(e),
     };
+
+    if let Some((attempt, findings)) = agent.get_acceptance_follow_up(change_id) {
+        acceptance_history
+            .lock()
+            .await
+            .set_follow_up_findings(change_id, attempt, findings);
+    }
+    mark_acceptance_context_injected(&agent, change_id, acceptance_tail_injected).await;
 
     if apply_result.blocked_handoff.is_none() && apply_result.rejected_handoff.is_none() {
         let (is_dirty, dirty_status) =
@@ -1391,6 +1437,7 @@ pub async fn execute_acceptance_in_workspace(
     let verdict_grace_period = acceptance_verdict_grace_period();
 
     let mut verdict_detected = false;
+    let mut verdict_stream_detector = crate::acceptance::VerdictStreamDetector::default();
     let mut verdict_deadline: Option<tokio::time::Instant> = None;
     let mut early_terminated = false;
 
@@ -1486,7 +1533,7 @@ pub async fn execute_acceptance_in_workspace(
                 // a supported agent JSONL event). Fallback: strict plain-text
                 // standalone canonical marker. Trailing-text concatenation on
                 // the plain-text marker does NOT count.
-                if !verdict_detected && crate::acceptance::detect_verdict_in_line(&s).is_some() {
+                if !verdict_detected && verdict_stream_detector.detect(&s).is_some() {
                     verdict_detected = true;
                     verdict_deadline = Some(tokio::time::Instant::now() + verdict_grace_period);
                     info!(
@@ -1638,12 +1685,8 @@ pub async fn execute_acceptance_in_workspace(
             stderr_tail: stderr_tail.clone(),
             commit_hash: revision_to_history_commit_hash(&end_revision),
         };
-        // Record to both agent history (local) and shared acceptance history
         agent.record_acceptance_attempt(change_id, attempt.clone());
         acceptance_history.lock().await.record(change_id, attempt);
-        // Reset acceptance tail injection flag so next apply can receive new output
-
-        acceptance_tail_injected.lock().await.remove(change_id);
 
         if let Some(ref tx) = event_tx {
             let _ = tx
@@ -1685,11 +1728,12 @@ pub async fn execute_acceptance_in_workspace(
                 stderr_tail: stderr_tail.clone(),
                 commit_hash: revision_to_history_commit_hash(&end_revision),
             };
-            // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
-            acceptance_history.lock().await.record(change_id, attempt);
-            // Reset acceptance tail injection flag so next apply can receive new output
-
+            agent.clear_acceptance_follow_up(change_id);
+            let mut shared_history = acceptance_history.lock().await;
+            shared_history.record(change_id, attempt);
+            shared_history.clear_follow_up_findings(change_id);
+            drop(shared_history);
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
@@ -1796,7 +1840,7 @@ pub async fn execute_acceptance_in_workspace(
         }
         ParseResult::Fail { findings } => {
             let findings_for_tasks = if findings.is_empty() {
-                tail_findings.clone()
+                vec!["Investigate acceptance failure and apply the required fix".to_string()]
             } else {
                 findings
             };
@@ -1869,11 +1913,20 @@ pub async fn execute_acceptance_in_workspace(
                 stderr_tail: stderr_tail.clone(),
                 commit_hash: revision_to_history_commit_hash(&end_revision),
             };
-            // Record to both agent history (local) and shared acceptance history
             agent.record_acceptance_attempt(change_id, attempt.clone());
-            acceptance_history.lock().await.record(change_id, attempt);
-            // Reset acceptance tail injection flag so next apply can receive new output
-
+            agent.record_acceptance_follow_up(
+                change_id,
+                attempt_number,
+                findings_for_tasks.clone(),
+            );
+            let mut shared_history = acceptance_history.lock().await;
+            shared_history.record(change_id, attempt);
+            shared_history.set_follow_up_findings(
+                change_id,
+                attempt_number,
+                findings_for_tasks.clone(),
+            );
+            drop(shared_history);
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
@@ -1907,9 +1960,11 @@ pub async fn execute_acceptance_in_workspace(
 #[cfg(test)]
 mod tests {
     use super::{
-        format_acceptance_failure_log_message, resolve_acceptance_state_revision,
+        format_acceptance_failure_log_message, mark_acceptance_context_injected,
+        prepare_acceptance_context_for_apply, resolve_acceptance_state_revision,
         run_post_apply_cleanup_review,
     };
+    use crate::agent::AgentRunner;
     use crate::ai_command_runner::AiCommandRunner;
     use crate::command_queue::CommandQueueConfig;
     use crate::config::defaults::default_retry_patterns;
@@ -1919,6 +1974,45 @@ mod tests {
     use tempfile::TempDir;
     use tokio::process::Command;
     use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn latest_shared_acceptance_findings_seed_parallel_apply_runner() {
+        use crate::history::{AcceptanceAttempt, AcceptanceHistory};
+        use std::time::Duration;
+
+        let mut history = AcceptanceHistory::new();
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 3,
+                passed: false,
+                duration: Duration::from_secs(1),
+                findings: Some(vec!["fix canonical finding".to_string()]),
+                exit_code: Some(0),
+                stdout_tail: Some("unstructured noise".to_string()),
+                stderr_tail: None,
+                commit_hash: None,
+            },
+        );
+        history.set_follow_up_findings("change-a", 3, vec!["fix canonical finding".to_string()]);
+        let history = Arc::new(Mutex::new(history));
+        let injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut first_agent = AgentRunner::new(OrchestratorConfig::default());
+        prepare_acceptance_context_for_apply(&mut first_agent, "change-a", &history, &injected)
+            .await;
+
+        let context = first_agent.get_acceptance_tail_context_for_apply("change-a");
+        assert!(context.contains("fix canonical finding"));
+        assert!(!context.contains("unstructured noise"));
+        mark_acceptance_context_injected(&first_agent, "change-a", &injected).await;
+
+        let mut resumed_agent = AgentRunner::new(OrchestratorConfig::default());
+        prepare_acceptance_context_for_apply(&mut resumed_agent, "change-a", &history, &injected)
+            .await;
+        assert!(resumed_agent
+            .get_acceptance_tail_context_for_apply("change-a")
+            .is_empty());
+    }
 
     #[test]
     fn test_progress_commit_message_format() {

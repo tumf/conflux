@@ -969,6 +969,38 @@ impl AgentRunner {
         self.acceptance_history.last_findings(change_id)
     }
 
+    pub fn seed_acceptance_history(&mut self, history: crate::history::AcceptanceHistory) {
+        self.acceptance_history = history;
+        self.acceptance_tail_injected.clear();
+    }
+
+    pub fn record_acceptance_follow_up(
+        &mut self,
+        change_id: &str,
+        attempt: u32,
+        findings: Vec<String>,
+    ) {
+        self.acceptance_history
+            .set_follow_up_findings(change_id, attempt, findings);
+        self.reset_acceptance_tail_injection(change_id);
+    }
+
+    pub fn get_acceptance_follow_up(&self, change_id: &str) -> Option<(u32, Vec<String>)> {
+        self.acceptance_history.last_follow_up_findings(change_id)
+    }
+
+    pub fn clear_acceptance_follow_up(&mut self, change_id: &str) {
+        self.acceptance_history.clear_follow_up_findings(change_id);
+        self.acceptance_tail_injected.remove(change_id);
+    }
+
+    pub fn acceptance_context_was_injected(&self, change_id: &str) -> bool {
+        self.acceptance_tail_injected
+            .get(change_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Get acceptance tail context for apply prompt.
     /// Returns the formatted context block if:
     /// 1. There is a previous acceptance attempt with output
@@ -986,14 +1018,11 @@ impl AgentRunner {
             return String::new();
         }
 
-        // Get stdout/stderr tails from the last acceptance attempt
-        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
-        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
-
-        // If we have output, build the context and mark as injected
-        use super::prompt::build_last_acceptance_output_context;
-        let context =
-            build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
+        let context = self
+            .acceptance_history
+            .last_follow_up_findings(change_id)
+            .map(|(_, findings)| super::prompt::build_acceptance_findings_context(&findings))
+            .unwrap_or_default();
 
         if !context.is_empty() {
             // Mark as injected
@@ -1018,13 +1047,10 @@ impl AgentRunner {
             return String::new();
         }
 
-        // Get stdout/stderr tails from the last acceptance attempt
-        let stdout_tail = self.acceptance_history.last_stdout_tail(change_id);
-        let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
-
-        // Build the context without marking as injected
-        use super::prompt::build_last_acceptance_output_context;
-        build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref())
+        self.acceptance_history
+            .last_follow_up_findings(change_id)
+            .map(|(_, findings)| super::prompt::build_acceptance_findings_context(&findings))
+            .unwrap_or_default()
     }
 
     /// Reset acceptance tail injection flag for a change.

@@ -32,7 +32,7 @@ use crate::vcs::VcsBackend;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Service for serial execution of changes.
 ///
@@ -613,6 +613,31 @@ impl SerialRunService {
         match acceptance_result {
             AcceptanceResult::Pass => {
                 info!("Acceptance passed for {}, ready for archive", change_id);
+                match task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
+                    change_id,
+                    workspace_path,
+                ) {
+                    Ok(Some(tasks_path)) => {
+                        if let Err(err) = task_parser::clear_acceptance_follow_up(&tasks_path) {
+                            return ChangeProcessResult::AcceptanceCommandFailed {
+                                error: format!(
+                                    "Acceptance passed but follow-up cleanup failed at {}: {}",
+                                    tasks_path.display(),
+                                    err
+                                ),
+                            };
+                        }
+                    }
+                    Ok(None) => debug!("No acceptance follow-up to clear for {}", change_id),
+                    Err(err) => {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!(
+                                "Acceptance passed but follow-up path resolution failed: {}",
+                                err
+                            ),
+                        };
+                    }
+                }
                 ChangeProcessResult::AcceptancePassed
             }
             AcceptanceResult::Continue => {
@@ -660,7 +685,10 @@ impl SerialRunService {
                     Ok(tasks_path) => {
                         if let Err(err) = task_parser::record_acceptance_follow_up(
                             &tasks_path,
-                            agent.next_acceptance_attempt_number(change_id),
+                            agent
+                                .get_last_acceptance_attempt(change_id)
+                                .map(|attempt| attempt.attempt)
+                                .unwrap_or(1),
                             &findings,
                         ) {
                             warn!(
@@ -914,6 +942,66 @@ mod tests {
     }
 
     #[test]
+    fn acceptance_fail_uses_recorded_attempt_number_for_follow_up() {
+        use crate::agent::AgentRunner;
+        use crate::history::AcceptanceAttempt;
+        use crate::orchestration::AcceptanceResult;
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+        agent.record_acceptance_attempt(
+            "test-change",
+            AcceptanceAttempt {
+                attempt: 1,
+                passed: false,
+                duration: Duration::from_secs(1),
+                findings: Some(vec!["first".to_string()]),
+                exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: None,
+            },
+        );
+        agent.record_acceptance_attempt(
+            "test-change",
+            AcceptanceAttempt {
+                attempt: 2,
+                passed: false,
+                duration: Duration::from_secs(1),
+                findings: Some(vec!["second".to_string()]),
+                exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: None,
+            },
+        );
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "- [x] done\n").unwrap();
+
+        service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Fail {
+                findings: vec!["canonical second".to_string()],
+            },
+            || false,
+        );
+
+        let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
+        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
+        assert!(!content.contains("## Acceptance #3 Failure Follow-up"));
+    }
+
+    #[test]
     fn test_process_acceptance_result_fail_uses_archive_tasks_fallback_when_active_missing() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
@@ -984,6 +1072,41 @@ mod tests {
             ChangeProcessResult::AcceptanceFailed { findings: returned }
             if returned == findings
         ));
+    }
+
+    #[test]
+    fn acceptance_pass_clears_runtime_follow_up() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [x] fixed\n",
+        )
+        .unwrap();
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Pass,
+            || false,
+        );
+
+        assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
+        let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
+        assert!(!content.contains("Failure Follow-up"));
+        assert!(content.contains("## Implementation Tasks\n- [x] done"));
     }
 
     #[test]

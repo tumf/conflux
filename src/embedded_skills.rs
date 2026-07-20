@@ -535,6 +535,28 @@ mod tests {
     }
 
     #[test]
+    fn apply_skill_preserves_runtime_owned_acceptance_follow_up() {
+        for (label, content) in &[
+            ("cflx-apply", CFLX_APPLY_SKILL_MD),
+            ("cflx-apply reference", CFLX_APPLY_REF),
+        ] {
+            assert!(
+                content.contains("runtime-owned acceptance follow-up"),
+                "{label} must identify acceptance follow-up ownership"
+            );
+            assert!(
+                content.contains("Do not delete or move"),
+                "{label} must preserve unresolved acceptance findings"
+            );
+            assert!(
+                content.contains("mark each existing finding `[x]`")
+                    || content.contains("mark each existing finding `- [x]`"),
+                "{label} must close findings only after fixing and verifying them"
+            );
+        }
+    }
+
+    #[test]
     fn test_apply_and_acceptance_skills_keep_recoverable_infra_blockers_non_terminal() {
         for (label, content) in &[
             ("cflx-apply", CFLX_APPLY_SKILL_MD),

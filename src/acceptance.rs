@@ -98,26 +98,6 @@ pub(crate) fn parse_json_verdict(text: &str) -> Option<(&'static str, Vec<String
 /// Returns `None` when no verdict is recognized. This helper is used both for
 /// streaming verdict detection (grace-period trigger) and for full-output
 /// parsing fallback.
-pub fn detect_verdict_in_line(line: &str) -> Option<&'static str> {
-    if let Some((kind, _)) = parse_json_verdict(line) {
-        return Some(kind);
-    }
-    if let Some(text) = crate::stream_json_textifier::extract_text_from_stream_json(line) {
-        for inner in text.lines() {
-            if let Some((kind, _)) = parse_json_verdict(inner) {
-                return Some(kind);
-            }
-        }
-        for inner in text.lines() {
-            if let Some(kind) = canonical_verdict_kind(inner) {
-                return Some(kind);
-            }
-        }
-        return None;
-    }
-    canonical_verdict_kind(line)
-}
-
 /// Returns the canonical verdict kind for a single output line, or `None` when
 /// the line is not a standalone canonical verdict.
 ///
@@ -131,6 +111,68 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
         .iter()
         .find(|(marker, _)| normalized == *marker)
         .map(|(_, kind)| *kind)
+}
+
+#[cfg(test)]
+fn detect_verdict_in_line(line: &str) -> Option<&'static str> {
+    VerdictStreamDetector::default().detect(line)
+}
+
+#[derive(Default)]
+pub(crate) struct VerdictStreamDetector {
+    code_fence: Option<(char, usize)>,
+}
+
+impl VerdictStreamDetector {
+    pub(crate) fn detect(&mut self, line: &str) -> Option<&'static str> {
+        if let Some(text) = crate::stream_json_textifier::extract_text_from_stream_json(line.trim())
+        {
+            for inner in text.lines() {
+                if let Some(kind) = self.detect_unwrapped(inner) {
+                    return Some(kind);
+                }
+            }
+            return None;
+        }
+        self.detect_unwrapped(line)
+    }
+
+    fn detect_unwrapped(&mut self, line: &str) -> Option<&'static str> {
+        let trimmed = line.trim();
+        if let Some((marker, length, closing)) = verdict_markdown_fence(trimmed, self.code_fence) {
+            if closing {
+                self.code_fence = None;
+            } else if self.code_fence.is_none() {
+                self.code_fence = Some((marker, length));
+            }
+            return None;
+        }
+        if self.code_fence.is_some() {
+            return None;
+        }
+        parse_json_verdict(trimmed)
+            .map(|(kind, _)| kind)
+            .or_else(|| canonical_verdict_kind(trimmed))
+    }
+}
+
+fn verdict_markdown_fence(line: &str, open: Option<(char, usize)>) -> Option<(char, usize, bool)> {
+    let marker = line.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    let length = line
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    if length < 3 {
+        return None;
+    }
+    let remainder = &line[length..];
+    let closing = open.is_some_and(|(open_marker, open_length)| {
+        marker == open_marker && length >= open_length && remainder.trim().is_empty()
+    });
+    Some((marker, length, closing))
 }
 
 /// Parse acceptance output text and determine pass/fail/continue/gated status.
@@ -156,43 +198,42 @@ pub(crate) fn canonical_verdict_kind(line: &str) -> Option<&'static str> {
 /// so the acceptance loop can retry.
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let mut fallback_kind: Option<&'static str> = None;
-    let mut in_code_block = false;
+    let mut fallback_findings = Vec::new();
+    let mut collecting_findings = false;
+    let mut detector = VerdictStreamDetector::default();
 
     for raw_line in output.lines() {
-        let trimmed = raw_line.trim();
-
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-
-        if in_code_block {
-            continue;
-        }
-
-        // Collect scan candidates: the raw line, plus unwrapped event text when
-        // the line is a supported JSONL event wrapper from an agent runtime.
-        let mut candidates: Vec<String> = vec![trimmed.to_string()];
-        if let Some(text) = crate::stream_json_textifier::extract_text_from_stream_json(trimmed) {
-            for inner in text.lines() {
-                candidates.push(inner.to_string());
+        let unwrapped = crate::stream_json_textifier::extract_text_from_stream_json(raw_line)
+            .unwrap_or_else(|| raw_line.to_string());
+        for line in unwrapped.lines() {
+            let candidate = line.trim();
+            let fence = verdict_markdown_fence(candidate, detector.code_fence);
+            let detected = detector.detect_unwrapped(candidate);
+            if fence.is_some() || detector.code_fence.is_some() {
+                continue;
             }
-        }
 
-        for candidate in &candidates {
-            let cand = candidate.trim();
-            if let Some((kind, findings)) = parse_json_verdict(cand) {
-                return match kind {
-                    "pass" => AcceptanceResult::Pass,
-                    "fail" => AcceptanceResult::Fail { findings },
-                    "continue" => AcceptanceResult::Continue,
-                    "gated" | "blocked" => AcceptanceResult::Gated,
-                    _ => AcceptanceResult::Continue,
-                };
+            if let Some((kind, findings)) = parse_json_verdict(candidate) {
+                return acceptance_result_from_kind(kind, findings);
             }
+
             if fallback_kind.is_none() {
-                if let Some(kind) = canonical_verdict_kind(cand) {
+                if let Some(kind) = detected {
                     fallback_kind = Some(kind);
+                    collecting_findings = false;
+                }
+                continue;
+            }
+
+            if fallback_kind == Some("fail") {
+                if candidate == "FINDINGS:" {
+                    collecting_findings = true;
+                } else if collecting_findings {
+                    if let Some(finding) = candidate.strip_prefix("- ") {
+                        fallback_findings.push(finding.to_string());
+                    } else if !candidate.is_empty() {
+                        collecting_findings = false;
+                    }
                 }
             }
         }
@@ -202,10 +243,19 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
         Some("pass") => AcceptanceResult::Pass,
         Some("continue") => AcceptanceResult::Continue,
         Some("gated") => AcceptanceResult::Gated,
-        Some("fail") => {
-            let findings = parse_findings(output);
-            AcceptanceResult::Fail { findings }
-        }
+        Some("fail") => AcceptanceResult::Fail {
+            findings: fallback_findings,
+        },
+        _ => AcceptanceResult::Continue,
+    }
+}
+
+fn acceptance_result_from_kind(kind: &str, findings: Vec<String>) -> AcceptanceResult {
+    match kind {
+        "pass" => AcceptanceResult::Pass,
+        "fail" => AcceptanceResult::Fail { findings },
+        "continue" => AcceptanceResult::Continue,
+        "gated" | "blocked" => AcceptanceResult::Gated,
         _ => AcceptanceResult::Continue,
     }
 }
@@ -233,33 +283,6 @@ pub(crate) fn strip_markdown_decorations(text: &str) -> String {
     // Strip leading bullet markers (e.g., "- ")
     let trimmed = trimmed.trim_start_matches('-');
     trimmed.trim().to_string()
-}
-
-/// Parse findings from acceptance output.
-/// Looks for lines starting with `- ` after a `FINDINGS:` header.
-fn parse_findings(output: &str) -> Vec<String> {
-    let lines: Vec<&str> = output.lines().collect();
-    let mut findings = Vec::new();
-    let mut in_findings_section = false;
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "FINDINGS:" {
-            in_findings_section = true;
-            continue;
-        }
-
-        if in_findings_section {
-            if let Some(finding) = trimmed.strip_prefix("- ") {
-                findings.push(finding.to_string());
-            } else if !trimmed.is_empty() && !trimmed.starts_with('-') {
-                // End of findings section if we encounter a non-finding line
-                break;
-            }
-        }
-    }
-
-    findings
 }
 
 #[cfg(test)]
@@ -503,6 +526,41 @@ Result:
 ACCEPTANCE: PASS
 "#;
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_ignores_tilde_fenced_verdicts() {
+        let output =
+            "~~~json\n{\"acceptance\":\"pass\"}\n~~~\nACCEPTANCE: FAIL\nFINDINGS:\n- real failure";
+
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::Fail {
+                findings: vec!["real failure".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_does_not_close_fence_with_info_string() {
+        let output = "```text\n```json\n{\"acceptance\":\"pass\"}\nACCEPTANCE: FAIL";
+
+        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+    }
+
+    #[test]
+    fn verdict_stream_detector_ignores_fenced_verdicts() {
+        let mut detector = VerdictStreamDetector::default();
+
+        assert_eq!(detector.detect("~~~json"), None);
+        assert_eq!(detector.detect(r#"{\"acceptance\":\"pass\"}"#), None);
+        assert_eq!(detector.detect("~~~"), None);
+        assert_eq!(detector.detect("ACCEPTANCE: FAIL"), Some("fail"));
+
+        let mut detector = VerdictStreamDetector::default();
+        assert_eq!(detector.detect("```json"), None);
+        assert_eq!(detector.detect(r#"{"acceptance":"pass"}"#), None);
+        assert_eq!(detector.detect("```"), None);
     }
 
     #[test]
@@ -955,6 +1013,40 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         let event = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"{\"acceptance\":\"pass\"}"}]}}"#;
         let output = format!("{}\n", event);
         assert_eq!(parse_acceptance_output(&output), AcceptanceResult::Pass);
+    }
+
+    #[test]
+    fn test_parse_acceptance_output_ignores_fenced_verdict_inside_agent_event() {
+        let event = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": "~~~json\n{\"acceptance\":\"pass\"}\n~~~\nACCEPTANCE: FAIL\nFINDINGS:\n- real"
+                }]
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_acceptance_output(&event),
+            AcceptanceResult::Fail {
+                findings: vec!["real".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_fail_ignores_findings_before_verdict_and_inside_fences() {
+        let output = "FINDINGS:\n- stale\n```text\nFINDINGS:\n- injected\n```\nACCEPTANCE: FAIL\nFINDINGS:\n- canonical";
+
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::Fail {
+                findings: vec!["canonical".to_string()]
+            }
+        );
     }
 
     #[test]

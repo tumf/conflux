@@ -103,6 +103,35 @@ enum ApplyCompletionKind {
     RejectingHandoff,
 }
 
+fn hydrate_runtime_acceptance_follow_up(
+    workspace_path: &Path,
+    change_id: &str,
+    agent: &mut AgentRunner,
+) -> Result<()> {
+    if agent.get_acceptance_follow_up(change_id).is_some() {
+        return Ok(());
+    }
+    let tasks_path =
+        crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace_path)?;
+    if let Some((attempt, findings)) = crate::task_parser::read_acceptance_follow_up(&tasks_path)? {
+        agent.record_acceptance_follow_up(change_id, attempt, findings);
+    }
+    Ok(())
+}
+
+fn ensure_runtime_acceptance_follow_up(
+    workspace_path: &Path,
+    change_id: &str,
+    agent: &AgentRunner,
+) -> Result<()> {
+    let Some((attempt, findings)) = agent.get_acceptance_follow_up(change_id) else {
+        return Ok(());
+    };
+    let tasks_path =
+        crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace_path)?;
+    crate::task_parser::ensure_acceptance_follow_up(&tasks_path, attempt, &findings)
+}
+
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
     if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
         return Some(ApplyCompletionKind::BlockedHandoff);
@@ -733,6 +762,7 @@ where
     F: FnMut(OutputLine) -> Fut,
     Fut: Future<Output = ()>,
 {
+    hydrate_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
     let max_iterations = config.get_max_iterations();
     let mut iteration = 0;
     let mut first_apply = true;
@@ -780,6 +810,8 @@ where
 
             return Err(OrchestratorError::AgentCommand(error_msg));
         }
+
+        ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
 
         // Check current task progress
         let progress = check_task_progress(workspace_path, change_id)?;
@@ -1102,6 +1134,8 @@ where
 
             return Err(OrchestratorError::AgentCommand(error_msg));
         }
+
+        ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
 
         // Check task progress after apply
         let new_progress = check_task_progress(workspace_path, change_id)?;
@@ -1660,6 +1694,79 @@ mod tests {
             blocker_path,
             "detected handoff should point to APPLY_BLOCKED marker"
         );
+    }
+
+    #[test]
+    fn non_fail_acceptance_attempt_does_not_create_follow_up() {
+        use crate::history::AcceptanceAttempt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "- [x] done\n").unwrap();
+        let mut history = crate::history::AcceptanceHistory::new();
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 2,
+                passed: false,
+                duration: Duration::from_secs(1),
+                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: None,
+            },
+        );
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+        agent.seed_acceptance_history(history);
+
+        ensure_runtime_acceptance_follow_up(workspace, "change-a", &agent).unwrap();
+
+        let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
+        assert!(!content.contains("Failure Follow-up"));
+        assert_eq!(check_task_progress(workspace, "change-a").unwrap().total, 1);
+    }
+
+    #[test]
+    fn deleted_acceptance_follow_up_is_restored_before_completion() {
+        use crate::history::AcceptanceAttempt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n",
+        )
+        .unwrap();
+        let mut history = crate::history::AcceptanceHistory::new();
+        history.record(
+            "change-a",
+            AcceptanceAttempt {
+                attempt: 2,
+                passed: false,
+                duration: Duration::from_secs(1),
+                findings: Some(vec!["fix missing coverage".to_string()]),
+                exit_code: Some(0),
+                stdout_tail: None,
+                stderr_tail: None,
+                commit_hash: None,
+            },
+        );
+        history.set_follow_up_findings("change-a", 2, vec!["fix missing coverage".to_string()]);
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+        agent.seed_acceptance_history(history);
+
+        ensure_runtime_acceptance_follow_up(workspace, "change-a", &agent).unwrap();
+
+        let progress = check_task_progress(workspace, "change-a").unwrap();
+        assert_eq!(progress, TaskProgress::with_counts(1, 2));
+        let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
+        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
+        assert!(content.contains("- [ ] fix missing coverage"));
     }
 
     #[test]

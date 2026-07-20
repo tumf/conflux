@@ -26,7 +26,7 @@ Implement the approved change fully, updating `tasks.md` as progress is made, an
 - **TASK COMPLETION RESPONSIBILITY** - Marking every task `[x]` in tasks.md constitutes apply completion responsibility
 - **COMMIT WHEN INSTRUCTED** - If an explicit commit instruction exists in context or current task, perform the commit to finalize completion
 - **NO UNCHECKED TASKS** - Apply MUST NOT declare completion or exit while any `[ ]` unchecked tasks remain in tasks.md; all must be `[x]` or moved to Future Work before finishing
-- **DO NOT CHECKLIST ACCEPTANCE FAILURES** - Acceptance findings are review feedback, not implementation tasks. Do not append `## Acceptance #N Failure Follow-up` active checkbox sections for acceptance failures. Fix the underlying repository issue directly, then update existing implementation tasks only when their repository evidence changes.
+- **PRESERVE ACCEPTANCE FOLLOW-UP** - The runtime-owned acceptance follow-up is the authoritative retry checklist. Do not delete or move it. Fix and verify every finding, then mark each existing finding `[x]`; the runtime clears the section only after acceptance PASS.
 - **FINAL VALIDATION IS NOT A TASK** - Do not create checkbox tasks whose completion depends on final OpenSpec validation, archive-gate validation, or archive readiness. Keep final validation commands/results only in a non-checkbox `## Final Validation` or notes section.
 
 ## Execution Steps
@@ -137,8 +137,8 @@ Never mark a task complete based only on any of the following:
 **Active sections**: Must have checkboxes `- [ ]` or `- [x]` only for implementation, test, documentation, configuration, or verification work that changes or verifies repository behavior.
 
 **Do not add checkboxes for review-process meta work**:
-- Do not add `Acceptance #N Failure Follow-up` checkbox sections.
-- Do not turn acceptance findings into tasks verbatim.
+- Do not create acceptance follow-up sections; the runtime owns them.
+- Do not delete or move a runtime-owned acceptance follow-up. Fix and verify each existing finding, then mark each existing finding `[x]`.
 - Do not add checkbox tasks for final OpenSpec validation, archive-gate validation, archive readiness, or "move validation out of checkboxes" cleanup.
 - If acceptance reports an archive-gate or verification-note issue, edit the affected existing task note or move final validation text to a non-checkbox section; do not create a new active task to describe that cleanup.
 

@@ -19,7 +19,7 @@ $ARGUMENTS
 - Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
 - Keep changes tightly scoped to the requested outcome.
 - Do not run any archive command during apply. Archiving is handled by the orchestrator.
-- Do not append `## Acceptance #N Failure Follow-up` checkbox sections. Acceptance findings are review feedback; fix the underlying repository issue directly and update existing implementation tasks only when their evidence changes.
+- The runtime-owned acceptance follow-up is the authoritative retry checklist. Do not delete or move it. Fix and verify every finding, then mark each existing finding `- [x]`; the runtime clears the section only after acceptance PASS.
 - Do not create checkbox tasks for final OpenSpec validation, archive-gate validation, archive readiness, or cleanup whose only purpose is moving validation text. Keep that information in non-checkbox `## Final Validation` or notes sections.
 
 **Steps**

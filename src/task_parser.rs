@@ -488,9 +488,8 @@ fn acceptance_follow_up_heading(attempt: u32) -> String {
 fn normalize_acceptance_findings(findings: &[String]) -> Vec<String> {
     let mut normalized_findings = findings
         .iter()
-        .map(|finding| finding.trim())
+        .map(|finding| finding.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|finding| !finding.is_empty())
-        .map(str::to_string)
         .collect::<Vec<_>>();
     normalized_findings.sort();
     normalized_findings.dedup();
@@ -511,32 +510,96 @@ fn render_acceptance_follow_up_section(findings: &[String]) -> String {
     section
 }
 
-fn upsert_acceptance_follow_up_section(content: &mut String, heading: &str, findings: &[String]) {
-    let new_section = render_acceptance_follow_up_section(findings);
-
-    if let Some(section_start) = content.find(heading) {
-        let section_body_start = content[section_start..]
-            .find('\n')
-            .map(|offset| section_start + offset + 1)
-            .unwrap_or(content.len());
-        let section_end = content[section_body_start..]
-            .find("\n## ")
-            .map(|offset| section_body_start + offset + 1)
-            .unwrap_or(content.len());
-        let existing_section = &content[section_body_start..section_end];
-        if existing_section.trim() != new_section.trim() {
-            content.replace_range(section_body_start..section_end, &new_section);
-        }
-    } else {
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        if !content.ends_with("\n\n") {
-            content.push('\n');
-        }
-        let _ = writeln!(content, "{}", heading);
-        content.push_str(&new_section);
+fn markdown_fence(line: &str) -> Option<(char, usize, bool)> {
+    let trimmed = line.trim_start();
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
     }
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then_some((marker, length, trimmed[length..].trim().is_empty()))
+}
+
+fn acceptance_follow_up_ranges(content: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    let mut section_start = None;
+    let mut code_fence = None;
+
+    for line in content.split_inclusive('\n') {
+        let heading = line.trim_end_matches(['\r', '\n']);
+        if let Some((marker, length, empty_remainder)) = markdown_fence(heading) {
+            match code_fence {
+                Some((open_marker, open_length))
+                    if marker == open_marker && length >= open_length && empty_remainder =>
+                {
+                    code_fence = None;
+                }
+                None => code_fence = Some((marker, length)),
+                _ => {}
+            }
+        } else if code_fence.is_none() && heading.starts_with("## ") {
+            if let Some(start) = section_start.take() {
+                ranges.push(start..offset);
+            }
+            if heading.starts_with("## Acceptance #") && heading.ends_with(" Failure Follow-up") {
+                section_start = Some(offset);
+            }
+        }
+        offset += line.len();
+    }
+
+    if let Some(start) = section_start {
+        ranges.push(start..content.len());
+    }
+    ranges
+}
+
+fn remove_acceptance_follow_up_sections(content: &mut String) -> Result<()> {
+    let ranges = acceptance_follow_up_ranges(content);
+    for range in &ranges {
+        let mut lines = content[range.clone()].lines();
+        let _ = lines.next();
+        if lines.any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("- [ ] ")
+                && !trimmed.starts_with("- [x] ")
+                && !trimmed.starts_with("- [X] ")
+        }) {
+            return Err(OrchestratorError::ConfigLoad(
+                "Acceptance follow-up contains non-runtime content; refusing destructive update"
+                    .to_string(),
+            ));
+        }
+    }
+    for range in ranges.into_iter().rev() {
+        content.replace_range(range, "");
+    }
+    while content.ends_with("\n\n\n") {
+        content.pop();
+    }
+    Ok(())
+}
+
+fn upsert_acceptance_follow_up_section(
+    content: &mut String,
+    heading: &str,
+    findings: &[String],
+) -> Result<()> {
+    remove_acceptance_follow_up_sections(content)?;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+    let _ = writeln!(content, "{}", heading);
+    content.push_str(&render_acceptance_follow_up_section(findings));
+    Ok(())
 }
 
 pub fn resolve_acceptance_follow_up_tasks_path(
@@ -571,6 +634,26 @@ pub fn resolve_acceptance_follow_up_tasks_path(
     )))
 }
 
+pub fn resolve_acceptance_follow_up_tasks_path_for_cleanup(
+    change_id: &str,
+    worktree_path: &Path,
+) -> Result<Option<std::path::PathBuf>> {
+    let active_path = worktree_path
+        .join("openspec")
+        .join("changes")
+        .join(change_id)
+        .join("tasks.md");
+    if active_path.exists() {
+        return Ok(Some(active_path));
+    }
+    if let Some(message) = invalid_archive_layout_error(change_id, Some(worktree_path)) {
+        return Err(OrchestratorError::ConfigLoad(message));
+    }
+    Ok(find_archive_directory(change_id, Some(worktree_path))
+        .map(|archive_path| archive_path.join("tasks.md"))
+        .filter(|tasks_path| tasks_path.exists()))
+}
+
 pub fn record_acceptance_follow_up(
     tasks_path: &Path,
     attempt: u32,
@@ -580,7 +663,84 @@ pub fn record_acceptance_follow_up(
     let heading = acceptance_follow_up_heading(attempt);
     let normalized_findings = normalize_acceptance_findings(findings);
 
-    upsert_acceptance_follow_up_section(&mut content, &heading, &normalized_findings);
+    upsert_acceptance_follow_up_section(&mut content, &heading, &normalized_findings)?;
+    write_tasks_file(tasks_path, content)
+}
+
+pub fn ensure_acceptance_follow_up(
+    tasks_path: &Path,
+    attempt: u32,
+    findings: &[String],
+) -> Result<()> {
+    let mut content = read_tasks_file(tasks_path)?;
+    let normalized_findings = normalize_acceptance_findings(findings);
+    let existing_section = acceptance_follow_up_ranges(&content)
+        .first()
+        .map(|range| content[range.clone()].to_string())
+        .unwrap_or_default();
+    let lines = normalized_findings
+        .iter()
+        .map(|finding| {
+            let checked = format!("- [x] {finding}");
+            let checked_upper = format!("- [X] {finding}");
+            if existing_section
+                .lines()
+                .any(|line| line == checked || line == checked_upper)
+            {
+                checked
+            } else {
+                format!("- [ ] {finding}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    remove_acceptance_follow_up_sections(&mut content)?;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+    let _ = writeln!(content, "{}", acceptance_follow_up_heading(attempt));
+    content.push_str(&lines);
+    content.push('\n');
+    write_tasks_file(tasks_path, content)
+}
+
+pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<String>)>> {
+    let content = read_tasks_file(tasks_path)?;
+    let ranges = acceptance_follow_up_ranges(&content);
+    let Some(range) = ranges.last() else {
+        return Ok(None);
+    };
+    let section = &content[range.clone()];
+    let mut lines = section.lines();
+    let heading = lines.next().unwrap_or_default();
+    let attempt = heading
+        .strip_prefix("## Acceptance #")
+        .and_then(|value| value.strip_suffix(" Failure Follow-up"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            OrchestratorError::ConfigLoad(format!(
+                "Invalid acceptance follow-up heading in {}",
+                tasks_path.display()
+            ))
+        })?;
+    let findings = lines
+        .filter_map(|line| {
+            ["- [ ] ", "- [x] ", "- [X] "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    Ok((!findings.is_empty()).then_some((attempt, findings)))
+}
+
+pub fn clear_acceptance_follow_up(tasks_path: &Path) -> Result<()> {
+    let mut content = read_tasks_file(tasks_path)?;
+    remove_acceptance_follow_up_sections(&mut content)?;
     write_tasks_file(tasks_path, content)
 }
 
@@ -701,6 +861,174 @@ mod tests {
     }
 
     #[test]
+    fn record_acceptance_follow_up_replaces_previous_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] stale\n",
+        )
+        .unwrap();
+
+        record_acceptance_follow_up(&tasks_path, 2, &["latest finding".to_string()]).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(!content.contains("## Acceptance #1 Failure Follow-up"));
+        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
+        assert!(content.contains("- [ ] latest finding"));
+    }
+
+    #[test]
+    fn ensure_acceptance_follow_up_restores_deleted_runtime_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
+
+        ensure_acceptance_follow_up(
+            &tasks_path,
+            2,
+            &[
+                "latest finding".to_string(),
+                "add regression test".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
+        assert!(content.contains("- [ ] latest finding"));
+        assert!(content.contains("- [ ] add regression test"));
+    }
+
+    #[test]
+    fn ensure_acceptance_follow_up_restores_deleted_finding_and_preserves_completed_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [x] add regression test\n",
+        )
+        .unwrap();
+
+        ensure_acceptance_follow_up(
+            &tasks_path,
+            2,
+            &[
+                "latest finding".to_string(),
+                "add regression test".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("- [x] add regression test"));
+        assert!(content.contains("- [ ] latest finding"));
+        let progress = parse_file(&tasks_path, None).unwrap();
+        assert_eq!(progress, TaskProgress::with_counts(2, 3));
+    }
+
+    #[test]
+    fn acceptance_follow_up_normalizes_multiline_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
+
+        record_acceptance_follow_up(
+            &tasks_path,
+            2,
+            &["finding\n## injected heading\n- [ ] injected task".to_string()],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("- [ ] finding ## injected heading - [ ] injected task"));
+        assert_eq!(
+            content
+                .matches("## Acceptance #2 Failure Follow-up")
+                .count(),
+            1
+        );
+        assert_eq!(parse_file(&tasks_path, None).unwrap().total, 2);
+    }
+
+    #[test]
+    fn clear_acceptance_follow_up_ignores_examples_in_code_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Notes\n```md\n## Acceptance #9 Failure Follow-up\n- [ ] example\n```\n\n## Acceptance #2 Failure Follow-up\n- [x] fixed\n",
+        )
+        .unwrap();
+
+        clear_acceptance_follow_up(&tasks_path).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Acceptance #9 Failure Follow-up\n- [ ] example"));
+        assert!(!content.contains("## Acceptance #2 Failure Follow-up"));
+    }
+
+    #[test]
+    fn clear_acceptance_follow_up_ignores_tilde_fence_examples() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Notes\n~~~md\n## Acceptance #9 Failure Follow-up\n- [ ] example\n~~~\n",
+        )
+        .unwrap();
+
+        clear_acceptance_follow_up(&tasks_path).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Acceptance #9 Failure Follow-up\n- [ ] example"));
+    }
+
+    #[test]
+    fn clear_acceptance_follow_up_does_not_close_fence_with_info_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        let original =
+            "## Notes\n```text\n```md\n## Acceptance #9 Failure Follow-up\n- [ ] example\n```\n";
+        std::fs::write(&tasks_path, original).unwrap();
+
+        clear_acceptance_follow_up(&tasks_path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&tasks_path).unwrap(), original);
+    }
+
+    #[test]
+    fn clear_acceptance_follow_up_rejects_non_runtime_section_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        let original = "## Acceptance #2 Failure Follow-up\n- [x] fixed\n```md\n## injected\n```\n";
+        std::fs::write(&tasks_path, original).unwrap();
+
+        let error = clear_acceptance_follow_up(&tasks_path).unwrap_err();
+
+        assert!(error.to_string().contains("non-runtime content"));
+        assert_eq!(std::fs::read_to_string(&tasks_path).unwrap(), original);
+    }
+
+    #[test]
+    fn clear_acceptance_follow_up_removes_runtime_sections_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [x] fixed\n\n## Final Validation\nvalidation passed\n",
+        )
+        .unwrap();
+
+        clear_acceptance_follow_up(&tasks_path).unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(!content.contains("Failure Follow-up"));
+        assert!(content.contains("## Implementation Tasks\n- [x] done"));
+        assert!(content.contains("## Final Validation\nvalidation passed"));
+    }
+
+    #[test]
     fn test_record_acceptance_follow_up_uses_default_finding_for_empty_input() {
         let dir = tempfile::tempdir().unwrap();
         let tasks_path = dir.path().join("tasks.md");
@@ -752,6 +1080,30 @@ mod tests {
 
         let resolved = resolve_acceptance_follow_up_tasks_path(change_id, dir.path()).unwrap();
         assert_eq!(resolved, archive_tasks);
+    }
+
+    #[test]
+    fn cleanup_resolver_returns_none_when_follow_up_tasks_are_absent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            resolve_acceptance_follow_up_tasks_path_for_cleanup("change-c", dir.path()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_resolver_rejects_invalid_archive_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_tasks = dir
+            .path()
+            .join("openspec/changes/archive/2026-07-09/change-c/tasks.md");
+        write_tasks(&nested_tasks, "- [x] archived\n");
+
+        let error = resolve_acceptance_follow_up_tasks_path_for_cleanup("change-c", dir.path())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Invalid archive layout"));
     }
 
     #[test]

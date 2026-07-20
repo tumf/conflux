@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
@@ -863,6 +863,7 @@ impl ParallelExecutor {
             // Create agent for acceptance testing
             let mut agent =
                 AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
+            agent.seed_acceptance_history(acceptance_history.lock().await.clone());
 
             // Track apply+acceptance cycles to prevent infinite loops
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
@@ -1616,6 +1617,7 @@ impl ParallelExecutor {
                     }
                     Ok((crate::orchestration::AcceptanceResult::Pass, 0))
                 } else {
+                    agent.seed_acceptance_history(acceptance_history.lock().await.clone());
                     execute_acceptance_in_workspace(
                         &change_id,
                         &workspace.path,
@@ -1634,6 +1636,42 @@ impl ParallelExecutor {
                 match acceptance_result {
                     Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
                         info!("Acceptance passed for {}, proceeding to archive", change_id);
+                        match task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
+                            &change_id,
+                            workspace.path.as_path(),
+                        ) {
+                            Ok(Some(tasks_path)) => {
+                                if let Err(err) = task_parser::clear_acceptance_follow_up(&tasks_path)
+                                {
+                                    return WorkspaceResult {
+                                        change_id,
+                                        workspace_name: workspace.name,
+                                        final_revision: None,
+                                        error: Some(format!(
+                                            "Acceptance passed but follow-up cleanup failed at {}: {}",
+                                            tasks_path.display(),
+                                            err
+                                        )),
+                                        rejected: None,
+                                    };
+                                }
+                            }
+                            Ok(None) => {
+                                debug!("No acceptance follow-up to clear for {}", change_id)
+                            }
+                            Err(err) => {
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(format!(
+                                        "Acceptance passed but follow-up path resolution failed: {}",
+                                        err
+                                    )),
+                                    rejected: None,
+                                };
+                            }
+                        }
                         // Break out of loop, proceed to archive
                         break revision;
                     }
