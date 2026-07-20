@@ -27,8 +27,8 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::{
-    mark_acceptance_failed, mark_acceptance_passed, mark_acceptance_started, mark_apply_completed,
-    write_acceptance_blocked_marker,
+    load_acceptance_state, mark_acceptance_failed, mark_acceptance_passed, mark_acceptance_started,
+    mark_apply_completed, record_acceptance_retry_context, write_acceptance_blocked_marker,
 };
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
@@ -871,7 +871,10 @@ impl ParallelExecutor {
 
             // Track apply+acceptance cycles to prevent infinite loops
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
-            let mut cycle_count = 0u32;
+            let mut cycle_count = load_acceptance_state(&workspace.path)
+                .ok()
+                .flatten()
+                .map_or(0, |state| state.cycle_count);
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
             // Create a per-change cancel token that monitors both global cancel and single-change stop
@@ -1839,6 +1842,22 @@ impl ParallelExecutor {
                                         .await;
                                 }
                             }
+                        }
+                        if let Err(error) = record_acceptance_retry_context(
+                            &workspace.path,
+                            &revision,
+                            &change_id,
+                            &findings,
+                            cycle_count,
+                        ) {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Failed to persist acceptance retry checkpoint: {error}")),
+                                rejected: None,
+                            };
                         }
                         if let Some(ref tx) = event_tx {
                             let _ = tx

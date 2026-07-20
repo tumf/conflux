@@ -6,6 +6,7 @@ use crate::error::{OrchestratorError, Result};
 
 const CHECKPOINT_FILE: &str = "ACCEPTANCE_STATE.json";
 const BLOCKED_MARKER_FILE: &str = "APPLY_BLOCKED/marker.md";
+const MARKER_VERSION: &str = "acceptance-stalled-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,7 +43,12 @@ pub enum BlockedMarkerOrigin {
 pub struct BlockedMarker {
     pub origin: BlockedMarkerOrigin,
     pub reason: String,
+    pub phase: String,
     pub evidence: Vec<String>,
+    pub finding_identities: Vec<String>,
+    pub retry_count: u32,
+    pub semantic_fingerprint: Option<String>,
+    pub external_blockers: Vec<String>,
     pub resumable: bool,
     pub next_action: String,
 }
@@ -53,6 +59,10 @@ fn change_dir(workspace_path: &Path, change_id: &str) -> PathBuf {
 
 fn checkpoint_path(workspace_path: &Path) -> PathBuf {
     workspace_path.join(CHECKPOINT_FILE)
+}
+
+fn marker_path(workspace_path: &Path, change_id: &str) -> PathBuf {
+    change_dir(workspace_path, change_id).join(BLOCKED_MARKER_FILE)
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
@@ -88,15 +98,20 @@ fn state_for(
     revision: &str,
     change_id: Option<&str>,
 ) -> AcceptanceState {
+    let previous = load_acceptance_state(workspace_path).ok().flatten();
     AcceptanceState {
         state,
         revision: revision.to_string(),
         updated_at: chrono::Utc::now().to_rfc3339(),
         workspace_path: workspace_path.display().to_string(),
         change_id: change_id.map(str::to_string),
-        previous_finding_identities: Vec::new(),
-        semantic_fingerprint: None,
-        cycle_count: 0,
+        previous_finding_identities: previous
+            .as_ref()
+            .map_or_else(Vec::new, |value| value.previous_finding_identities.clone()),
+        semantic_fingerprint: previous
+            .as_ref()
+            .and_then(|value| value.semantic_fingerprint.clone()),
+        cycle_count: previous.map_or(0, |value| value.cycle_count),
     }
 }
 
@@ -176,6 +191,31 @@ pub fn mark_acceptance_failed(
     )
 }
 
+pub fn record_acceptance_retry_context(
+    workspace_path: &Path,
+    revision: &str,
+    change_id: &str,
+    findings: &[String],
+    cycle_count: u32,
+) -> Result<()> {
+    let identities = findings
+        .iter()
+        .map(|finding| finding.trim().to_ascii_lowercase())
+        .filter(|finding| !finding.is_empty())
+        .collect::<Vec<_>>();
+    let semantic_fingerprint = (!identities.is_empty()).then(|| identities.join("\n"));
+    let mut state = state_for(
+        workspace_path,
+        AcceptanceStateStatus::Failed,
+        revision,
+        Some(change_id),
+    );
+    state.previous_finding_identities = identities;
+    state.semantic_fingerprint = semantic_fingerprint;
+    state.cycle_count = cycle_count;
+    save_acceptance_state(workspace_path, state)
+}
+
 pub fn has_durable_acceptance_pass(workspace_path: &Path, current_revision: &str) -> Result<bool> {
     Ok(load_acceptance_state(workspace_path)?.is_some_and(|state| {
         state.state == AcceptanceStateStatus::Passed && state.revision == current_revision
@@ -197,51 +237,118 @@ pub fn write_acceptance_blocked_marker(
     resumable: bool,
     next_action: &str,
 ) -> Result<()> {
+    let state = load_acceptance_state(workspace_path)?.unwrap_or_else(|| {
+        state_for(
+            workspace_path,
+            AcceptanceStateStatus::Failed,
+            "unknown",
+            Some(change_id),
+        )
+    });
     let marker = format!(
-        "origin: acceptance\nreason: {reason}\nresumable: {resumable}\nnext_action: {next_action}\nevidence:\n{}",
+        "schema: {MARKER_VERSION}\norigin: acceptance\nreason: {reason}\nphase: acceptance\nretry_count: {}\nsemantic_fingerprint: {}\nresumable: {resumable}\nnext_action: {next_action}\nfinding_identities:\n{}external_blockers:\nevidence:\n{}",
+        state.cycle_count,
+        state.semantic_fingerprint.as_deref().unwrap_or("none"),
+        state.previous_finding_identities.iter().map(|value| format!("- {value}\n")).collect::<String>(),
         evidence.iter().map(|value| format!("- {value}\n")).collect::<String>(),
     );
-    atomic_write(
-        &change_dir(workspace_path, change_id).join(BLOCKED_MARKER_FILE),
-        marker.as_bytes(),
-    )
+    atomic_write(&marker_path(workspace_path, change_id), marker.as_bytes())
+}
+
+fn field(content: &str, name: &str) -> Option<String> {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name}: ")).map(str::to_string))
+}
+
+fn list_after(content: &str, heading: &str) -> Vec<String> {
+    content
+        .lines()
+        .skip_while(|line| *line != heading)
+        .skip(1)
+        .take_while(|line| !line.ends_with(':'))
+        .filter_map(|line| line.strip_prefix("- ").map(str::to_string))
+        .collect()
 }
 
 pub fn parse_blocked_marker(
     workspace_path: &Path,
     change_id: &str,
 ) -> Result<Option<BlockedMarker>> {
-    let path = change_dir(workspace_path, change_id).join(BLOCKED_MARKER_FILE);
+    let path = marker_path(workspace_path, change_id);
     if !path.exists() {
         return Ok(None);
     }
     let content = fs::read_to_string(path)?;
-    let field = |name: &str| {
-        content
-            .lines()
-            .find_map(|line| line.strip_prefix(&format!("{name}: ")).map(str::to_string))
-    };
-    let origin = match field("origin").as_deref() {
+    let schema = field(&content, "schema");
+    if schema.as_deref() != Some(MARKER_VERSION) {
+        return Ok(Some(BlockedMarker {
+            origin: match field(&content, "origin").as_deref() {
+                Some("apply") => BlockedMarkerOrigin::Apply,
+                _ => BlockedMarkerOrigin::Unknown,
+            },
+            reason: field(&content, "reason")
+                .unwrap_or_else(|| "legacy blocked marker".to_string()),
+            phase: "unknown".to_string(),
+            evidence: content
+                .lines()
+                .filter_map(|line| line.strip_prefix("- ").map(str::to_string))
+                .collect(),
+            finding_identities: Vec::new(),
+            retry_count: 0,
+            semantic_fingerprint: None,
+            external_blockers: Vec::new(),
+            resumable: false,
+            next_action: "preserve marker and inspect evidence".to_string(),
+        }));
+    }
+    let resumable = field(&content, "resumable")
+        .ok_or_else(|| {
+            OrchestratorError::AgentCommand("acceptance marker missing resumable".to_string())
+        })?
+        .parse::<bool>()
+        .map_err(|_| {
+            OrchestratorError::AgentCommand("acceptance marker has invalid resumable".to_string())
+        })?;
+    let retry_count = field(&content, "retry_count")
+        .ok_or_else(|| {
+            OrchestratorError::AgentCommand("acceptance marker missing retry_count".to_string())
+        })?
+        .parse::<u32>()
+        .map_err(|_| {
+            OrchestratorError::AgentCommand("acceptance marker has invalid retry_count".to_string())
+        })?;
+    let origin = match field(&content, "origin").as_deref() {
         Some("acceptance") => BlockedMarkerOrigin::Acceptance,
-        Some("apply") => BlockedMarkerOrigin::Apply,
-        _ => BlockedMarkerOrigin::Unknown,
+        _ => {
+            return Err(OrchestratorError::AgentCommand(
+                "acceptance marker has invalid origin".to_string(),
+            ))
+        }
     };
-    let evidence = content
-        .lines()
-        .filter_map(|line| line.strip_prefix("- ").map(str::to_string))
-        .collect();
     Ok(Some(BlockedMarker {
         origin,
-        reason: field("reason").unwrap_or_else(|| "legacy blocked marker".to_string()),
-        evidence,
-        resumable: field("resumable").is_some_and(|value| value == "true"),
-        next_action: field("next_action")
-            .unwrap_or_else(|| "preserve marker and inspect evidence".to_string()),
+        reason: field(&content, "reason").ok_or_else(|| {
+            OrchestratorError::AgentCommand("acceptance marker missing reason".to_string())
+        })?,
+        phase: field(&content, "phase").ok_or_else(|| {
+            OrchestratorError::AgentCommand("acceptance marker missing phase".to_string())
+        })?,
+        evidence: list_after(&content, "evidence:"),
+        finding_identities: list_after(&content, "finding_identities:"),
+        retry_count,
+        semantic_fingerprint: field(&content, "semantic_fingerprint")
+            .filter(|value| value != "none"),
+        external_blockers: list_after(&content, "external_blockers:"),
+        resumable,
+        next_action: field(&content, "next_action").ok_or_else(|| {
+            OrchestratorError::AgentCommand("acceptance marker missing next_action".to_string())
+        })?,
     }))
 }
 
 pub fn consume_resumable_acceptance_marker(workspace_path: &Path, change_id: &str) -> Result<bool> {
-    let path = change_dir(workspace_path, change_id).join(BLOCKED_MARKER_FILE);
+    let path = marker_path(workspace_path, change_id);
     if !matches!(
         parse_blocked_marker(workspace_path, change_id)?,
         Some(BlockedMarker {
@@ -262,41 +369,47 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn checkpoint_and_acceptance_marker_round_trip() {
+    fn checkpoint_round_trip_preserves_retry_context() {
         let temp = TempDir::new().unwrap();
-        mark_apply_completed(temp.path(), "abc", "change").unwrap();
-        assert_eq!(
-            load_acceptance_state(temp.path()).unwrap().unwrap().state,
-            AcceptanceStateStatus::Pending
-        );
+        record_acceptance_retry_context(
+            temp.path(),
+            "abc",
+            "change",
+            &["Finding A".to_string()],
+            2,
+        )
+        .unwrap();
+        let state = load_acceptance_state(temp.path()).unwrap().unwrap();
+        assert_eq!(state.previous_finding_identities, ["finding a"]);
+        assert_eq!(state.cycle_count, 2);
+        assert_eq!(state.semantic_fingerprint.as_deref(), Some("finding a"));
+    }
+
+    #[test]
+    fn marker_round_trip_legacy_and_malformed_input() {
+        let temp = TempDir::new().unwrap();
+        record_acceptance_retry_context(temp.path(), "abc", "change", &["evidence".to_string()], 2)
+            .unwrap();
         write_acceptance_blocked_marker(
             temp.path(),
             "change",
             "blocked",
-            &["evidence".to_string()],
+            &["external".to_string()],
             true,
-            "retry",
+            "explicit retry",
         )
         .unwrap();
-        assert_eq!(
-            parse_blocked_marker(temp.path(), "change")
-                .unwrap()
-                .unwrap()
-                .origin,
-            BlockedMarkerOrigin::Acceptance
-        );
         assert!(consume_resumable_acceptance_marker(temp.path(), "change").unwrap());
-    }
-
-    #[test]
-    fn malformed_checkpoint_is_an_error_and_foreign_marker_is_preserved() {
-        let temp = TempDir::new().unwrap();
-        fs::write(checkpoint_path(temp.path()), "{").unwrap();
-        assert!(load_acceptance_state(temp.path()).is_err());
-        let marker = change_dir(temp.path(), "change").join(BLOCKED_MARKER_FILE);
-        fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        fs::write(&marker, "legacy marker").unwrap();
+        let path = marker_path(temp.path(), "change");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "legacy marker").unwrap();
         assert!(!consume_resumable_acceptance_marker(temp.path(), "change").unwrap());
-        assert!(marker.exists());
+        fs::write(
+            &path,
+            "schema: acceptance-stalled-v1\norigin: acceptance\nresumable: nope",
+        )
+        .unwrap();
+        assert!(parse_blocked_marker(temp.path(), "change").is_err());
+        assert!(path.exists());
     }
 }
