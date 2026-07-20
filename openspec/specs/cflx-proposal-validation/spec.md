@@ -97,43 +97,45 @@ Conflux skill sources, active canonical specs, and repository-facing validator g
 
 ### Requirement: Native validator owns behavior-centric proposal checks
 
-The native `cflx openspec validate` implementation MUST enforce deterministic proposal authoring contracts such as structural validity, verification-note presence, supported evidence enum usage, spec delta target existence, and other repository-verifiable formatting rules. It MUST NOT infer implementation-task adequacy solely from wording heuristics about runtime behavior claims or whether tasks appear implementation-facing.
+The native `cflx openspec validate` implementation MUST enforce deterministic proposal authoring contracts, including structured verification declarations, without using natural-language inference as workflow-control authority. In strict and archive-gate modes, malformed declarations, missing required fields, duplicate IDs, invalid phase/owner relationships, empty required values, unsafe automation paths, and automation paths that do not identify an existing tracked repository regular file MUST fail validation with actionable diagnostics.
 
-For strict validation, every `MODIFIED Requirements` and `REMOVED Requirements` block MUST target a requirement identity that exists in the corresponding canonical `openspec/specs/<capability>/spec.md` file. Missing targets MUST fail validation before archive promotion.
+Implementation and hybrid proposals MUST declare at least one pre-integration verification. Spec-only proposals MAY omit verification declarations. A post-integration declaration MUST identify repository automation ownership, trigger, evidence location, rerun action, and prerequisites. Validation MUST NOT access a network, external API, or deployed target to validate any declaration.
 
-#### Scenario: validator rejects missing modified target before archive
+#### Scenario: strict validation accepts a complete post-integration contract
 
-**Given**: a change delta under `openspec/changes/alpha/specs/demo/spec.md` contains `## MODIFIED Requirements`
-**And**: it includes `### Requirement: Missing Requirement`
-**And**: canonical `openspec/specs/demo/spec.md` does not contain that requirement identity
-**When**: `cflx openspec validate alpha --strict` is executed
-**Then**: validation fails
-**And**: the diagnostic says `MODIFIED target not found in canonical spec`
-**And**: archive promotion is not required to discover the missing target
+**Given**: an implementation proposal has a pre-integration verification
+**And**: it declares a post-integration verification whose automation path is a tracked repository workflow file
+**And**: all required fields and phase/owner relationships are valid
+**When**: `cflx openspec validate alpha --strict` runs
+**Then**: verification declaration validation succeeds without accessing the external target
 
-#### Scenario: validator rejects missing removed target before archive
+#### Scenario: strict validation rejects ownerless cyclic gate
 
-**Given**: a change delta under `openspec/changes/alpha/specs/demo/spec.md` contains `## REMOVED Requirements`
-**And**: it includes `### Requirement: Missing Requirement`
-**And**: canonical `openspec/specs/demo/spec.md` does not contain that requirement identity
-**When**: `cflx openspec validate alpha --strict` is executed
-**Then**: validation fails
-**And**: the diagnostic says `REMOVED target not found in canonical spec`
-**And**: archive promotion is not required to discover the missing target
+**Given**: an implementation proposal requires an outcome available only after integration
+**And**: its post-integration declaration omits repository automation ownership or a rerun action
+**When**: strict validation runs
+**Then**: validation fails before apply
+**And**: the diagnostic identifies the missing declaration field
 
-#### Scenario: added requirements do not require existing canonical targets
+#### Scenario: unsafe automation path is rejected
 
-**Given**: a change delta under `openspec/changes/alpha/specs/demo/spec.md` contains `## ADDED Requirements`
-**And**: it includes `### Requirement: New Requirement`
-**And**: canonical `openspec/specs/demo/spec.md` does not contain that requirement identity
-**When**: `cflx openspec validate alpha --strict` is executed
-**Then**: validation does not fail because the added requirement lacks a canonical target
+**Given**: a verification declaration uses an absolute path, parent traversal, external symlink, missing file, or non-regular file as `automation`
+**When**: strict or archive-gate validation runs
+**Then**: validation fails with the offending verification ID and path
 
-#### Scenario: archive gate reports the same missing target blocker
+#### Scenario: natural-language phase inference is advisory only
 
-**Given**: a change delta contains a missing `MODIFIED` or `REMOVED` target
-**When**: `cflx openspec validate alpha --archive-gate` is executed
-**Then**: validation fails with the missing-target diagnostic before `cflx openspec archive alpha --yes` is needed
+**Given**: proposal prose appears to describe a different verification phase from its structured declaration
+**When**: validation runs
+**Then**: the structured phase remains authoritative
+**And**: any prose-based diagnostic is advisory and cannot create or change workflow routing
+
+#### Scenario: implementation proposal requires repository-verifiable pre-integration evidence
+
+**Given**: an implementation or hybrid proposal has no pre-integration verification declaration
+**When**: strict validation runs
+**Then**: validation fails with guidance to declare repository-verifiable implementation evidence
+**And**: a spec-only proposal without declarations remains valid
 
 ### Requirement: self-referential-final-validation-task-guard
 

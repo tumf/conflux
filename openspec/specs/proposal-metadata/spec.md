@@ -2,21 +2,27 @@
 
 ### Requirement: proposal.md frontmatter metadata
 
-`openspec/changes/<change-id>/proposal.md` は YAML frontmatter を任意で持てなければならない（MAY）。frontmatter が存在しない proposal も有効でなければならない（MUST）。frontmatter を持つ場合、proposal tooling は本文より前の frontmatter ブロックを metadata として解釈できなければならない（MUST）。
+`openspec/changes/<change-id>/proposal.md` MAY contain YAML frontmatter, and a proposal without frontmatter MUST remain readable. When frontmatter contains `verifications`, proposal tooling MUST parse it as an ordered list of structured verification declarations and MUST preserve the declarations when the proposal is read or archived. Explicit verification metadata MUST remain authoritative over natural-language phase hints.
 
-#### Scenario: proposal with frontmatter metadata is accepted
+#### Scenario: proposal with verification metadata is accepted
 
-**Given**: `proposal.md` が先頭に YAML frontmatter を持ち、その後に `# Change:` 見出しと本文セクションを持つ
-**When**: proposal tooling または proposal-aware code path がその proposal を読む
-**Then**: frontmatter は metadata として解釈される
-**And**: 本文の title と本文セクションは従来どおり利用できる
+**Given**: `proposal.md` contains valid frontmatter with pre-integration and post-integration verification declarations
+**When**: proposal-aware tooling reads the proposal
+**Then**: both declarations are retained with their original IDs, phases, owners, paths, evidence locations, rerun actions, and prerequisites
+**And**: the proposal body remains available unchanged
 
-#### Scenario: proposal without frontmatter remains valid
+#### Scenario: legacy proposal remains readable
 
-**Given**: `proposal.md` が YAML frontmatter を持たず、従来どおり `# Change:` 見出しから始まる
-**When**: proposal tooling または proposal-aware code path がその proposal を読む
-**Then**: proposal は有効な proposal として扱われる
-**And**: title と本文セクションは従来どおり利用できる
+**Given**: `proposal.md` has no frontmatter or no `verifications` field
+**When**: tolerant proposal tooling reads it
+**Then**: the proposal remains readable
+**And**: no verification declaration is invented from prose
+
+#### Scenario: archived proposal preserves declarations
+
+**Given**: an active proposal contains valid verification declarations
+**When**: the change is archived through the native archive command
+**Then**: the archived `proposal.md` retains declarations equivalent to the active proposal
 
 ### Requirement: proposal priority field
 
@@ -76,3 +82,27 @@ frontmatter の `references` フィールドは文字列配列でなければな
 **Then**: 3 件すべての reference が順序を保って保持される
 
 > Canonical archive expectation: `proposal-metadata` capability は proposal frontmatter の形式・意味・後方互換ルールを canonical spec として保持する。
+
+### Requirement: proposal verification declarations
+
+Each verification declaration MUST contain a unique non-empty `id`, a non-empty `requirement`, a `phase`, an `owner`, a non-empty `trigger`, a safe repository-relative `automation` path, a non-empty `evidence` location, a non-empty `rerun` action, and a `prerequisites` string list. `phase` MUST be `pre-integration` or `post-integration`. A pre-integration declaration MUST use `owner: conflux-acceptance`; a post-integration declaration MUST use `owner: repository-automation`.
+
+#### Scenario: pre-integration declaration identifies repository verification
+
+**Given**: an implementation proposal declares `phase: pre-integration`
+**When**: metadata is parsed
+**Then**: the declaration identifies Conflux acceptance ownership and a tracked repository automation file
+
+#### Scenario: post-integration declaration identifies operational ownership
+
+**Given**: a proposal declares `phase: post-integration`
+**When**: metadata is parsed
+**Then**: the declaration identifies repository automation ownership, its trigger, evidence location, rerun action, and external prerequisites
+
+#### Scenario: explicit phase wins over contradictory prose
+
+**Given**: a structured declaration says `phase: post-integration`
+**And**: proposal prose could be interpreted as pre-integration
+**When**: tooling classifies the verification phase
+**Then**: it uses `post-integration`
+**And**: prose analysis may emit an advisory warning but cannot change routing semantics
