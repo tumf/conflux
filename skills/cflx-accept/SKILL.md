@@ -57,6 +57,12 @@ Do not emit alternate schemas, extra machine-readable verdict objects, or provid
 
 ## Scoped Guidance
 
+### Declared Verification Phases
+
+Structured `proposal.md` frontmatter verification declarations are authoritative over prose. For `pre-integration`, evaluate current-revision repository evidence and runnable local verification. For `post-integration`, evaluate repository-automation ownership, the tracked automation, trigger, evidence publication contract, rerun action, prerequisites, and fixture/local evidence without fetching an undeployed or external target.
+
+Missing, placeholder, or incorrectly wired repository automation is a repository-fixable FAIL. A correctly wired post-integration declaration whose operational result is pending is not a FAIL. A non-mockable external prerequisite that makes declared automation unusable is a stalled hold; preserve the prerequisite owner and next rerun or unblock action. Never describe an unobserved post-integration operational outcome as successful.
+
 ### Verification Planning & Ownership
 
 Acceptance owns proposal-quality judgment for behavior-changing work. When runtime or user-visible behavior is claimed, acceptance MUST determine whether tasks and repository evidence identify concrete implementation-facing work and integration points. Missing adequacy is an acceptance FAIL finding (not an archive blocker).

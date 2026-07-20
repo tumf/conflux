@@ -977,16 +977,31 @@ mod openspec_list_show_tests {
         fs::write(dir.join("tasks.md"), tasks).unwrap();
     }
 
+    fn track_file(root: &Path, path: &str) {
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "--", path])
+            .current_dir(root)
+            .status()
+            .unwrap();
+    }
+
     fn create_strict_valid_change(dir: &Path, proposal_title: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(
             dir.join("proposal.md"),
             format!(
-                "# {}\n\n**Change Type**: implementation\n\n## Problem\narchive behavior update\n",
+                "---\nverifications:\n  - id: local\n    requirement: archive behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test\n    rerun: cargo test\n    prerequisites: []\n---\n# {}\n\n**Change Type**: implementation\n\n## Problem\narchive behavior update\n",
                 proposal_title
             ),
         )
         .unwrap();
+        fs::write("Cargo.toml", "[package]\nname = \"fixture\"\n").unwrap();
+        track_file(&env::current_dir().unwrap(), "Cargo.toml");
         fs::write(
             dir.join("tasks.md"),
             "- [ ] 1. archive destination update (verification: unit - cargo test src::openspec_cmd::openspec_list_show_tests -- --nocapture)\n",
@@ -1006,9 +1021,11 @@ mod openspec_list_show_tests {
         fs::create_dir_all(dir).unwrap();
         fs::write(
             dir.join("proposal.md"),
-            "# Strict validation fixture\n\n**Change Type**: implementation\n\n## Problem\nvalidator fixture\n",
+            "---\nverifications:\n  - id: local\n    requirement: validator behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test\n    rerun: cargo test\n    prerequisites: []\n---\n# Strict validation fixture\n\n**Change Type**: implementation\n\n## Problem\nvalidator fixture\n",
         )
         .unwrap();
+        fs::write("Cargo.toml", "[package]\nname = \"fixture\"\n").unwrap();
+        track_file(&env::current_dir().unwrap(), "Cargo.toml");
         fs::write(
             dir.join("tasks.md"),
             "- [ ] 1. validator update (verification: unit - cargo test openspec_cmd --lib)\n",
@@ -1669,6 +1686,263 @@ mod openspec_list_show_tests {
     }
 
     #[test]
+    fn test_strict_validation_enforces_verification_contracts() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/verification-contract");
+        create_strict_valid_change(&change_dir, "Verification Contract");
+        let mgr = OpenSpecManager::new();
+        assert!(
+            mgr.validate_change(Some("verification-contract"), true, "off")
+                .0
+        );
+
+        let invalid = "---\nverifications:\n  - id: duplicate\n    requirement: x\n    phase: post-integration\n    owner: conflux-acceptance\n    trigger: x\n    automation: ../outside\n    evidence: x\n    rerun: x\n    prerequisites: []\n  - id: duplicate\n    requirement: x\n    phase: invalid\n    owner: repository-automation\n    trigger: x\n    automation: missing\n    evidence: x\n    rerun: x\n    prerequisites: []\n---\n# Invalid\n\n**Change Type**: implementation\n";
+        fs::write(change_dir.join("proposal.md"), invalid).unwrap();
+        let (valid, errors, _) = mgr.validate_change(Some("verification-contract"), true, "off");
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicate verification id")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("post-integration requires owner")));
+        assert!(errors.iter().any(|error| error.contains("invalid phase")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsafe automation path")));
+        assert!(errors.iter().any(|error| error.contains("does not exist")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_missing_verification_fields() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/missing-fields");
+        create_strict_valid_change(&change_dir, "Missing Fields");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal
+                .replace("    requirement: archive behavior\n", "")
+                .replace("    prerequisites: []\n", ""),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("missing-fields"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing non-empty requirement")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing prerequisites list")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_absolute_automation_path() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/absolute-automation");
+        create_strict_valid_change(&change_dir, "Absolute Automation");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: /tmp/automation.sh"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("absolute-automation"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsafe automation path")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_strict_validation_rejects_external_automation_symlink() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/external-symlink");
+        create_strict_valid_change(&change_dir, "External Symlink");
+        let external = TempDir::new().unwrap();
+        fs::write(external.path().join("automation.sh"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(
+            external.path().join("automation.sh"),
+            temp.path().join("automation.sh"),
+        )
+        .unwrap();
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: automation.sh"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("external-symlink"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("escapes repository")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_non_regular_automation_path() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/directory-automation");
+        create_strict_valid_change(&change_dir, "Directory Automation");
+        fs::create_dir("automation").unwrap();
+        track_file(temp.path(), "automation");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: automation"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("directory-automation"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("is not a regular file")));
+    }
+
+    #[test]
+    fn test_strict_validation_requires_pre_integration_for_hybrid_despite_prose() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/hybrid-post-only");
+        create_strict_valid_change(&change_dir, "Hybrid Post Only");
+        fs::write("post.sh", "#!/bin/sh\n").unwrap();
+        track_file(temp.path(), "post.sh");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal
+                .replace("phase: pre-integration", "phase: post-integration")
+                .replace("owner: conflux-acceptance", "owner: repository-automation")
+                .replace("automation: Cargo.toml", "automation: post.sh")
+                .replace("**Change Type**: implementation", "**Change Type**: hybrid")
+                + "\nThis check runs before integration.\n",
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("hybrid-post-only"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("require at least one pre-integration")));
+    }
+
+    #[test]
+    fn test_strict_validation_accepts_complete_pre_and_post_contract() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/complete-contract");
+        create_strict_valid_change(&change_dir, "Complete Contract");
+        fs::write("post.sh", "#!/bin/sh\n").unwrap();
+        track_file(temp.path(), "post.sh");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace(
+                "    prerequisites: []\n---",
+                "    prerequisites: []\n  - id: deploy\n    requirement: release validation\n    phase: post-integration\n    owner: repository-automation\n    trigger: default-branch-integration\n    automation: post.sh\n    evidence: workflow artifact\n    rerun: workflow_dispatch\n    prerequisites: []\n---",
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            OpenSpecManager::new()
+                .validate_change(Some("complete-contract"), true, "off")
+                .0
+        );
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_ownerless_cyclic_post_integration_gate() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/ownerless-cyclic-gate");
+        create_strict_valid_change(&change_dir, "Ownerless Cyclic Gate");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal
+                .replace("phase: pre-integration", "phase: post-integration")
+                .replace(
+                    "trigger: pull request",
+                    "trigger: waits for its own integration",
+                )
+                .replace("prerequisites: []", "prerequisites: [integration complete]"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("ownerless-cyclic-gate"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("post-integration requires owner")));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_untracked_automation() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/untracked-automation");
+        create_strict_valid_change(&change_dir, "Untracked Automation");
+        fs::write("untracked.sh", "#!/bin/sh\n").unwrap();
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replace("automation: Cargo.toml", "automation: untracked.sh"),
+        )
+        .unwrap();
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("untracked-automation"), true, "off");
+
+        assert!(!valid);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("is not tracked by git")));
+    }
+
+    #[test]
+    fn test_strict_validation_allows_spec_only_without_verifications() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        let change_dir = temp.path().join("openspec/changes/spec-only-contract");
+        fs::create_dir_all(change_dir.join("specs/example")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            "# Spec Only\n\n**Change Type**: spec-only\n",
+        )
+        .unwrap();
+        fs::write(change_dir.join("tasks.md"), "- [ ] document behavior\n").unwrap();
+        fs::write(change_dir.join("specs/example/spec.md"), "## ADDED Requirements\n\n### Requirement: Example\n\n#### Scenario: Example\n- WHEN read\n- THEN valid\n").unwrap();
+        assert!(
+            OpenSpecManager::new()
+                .validate_change(Some("spec-only-contract"), true, "off")
+                .0
+        );
+    }
+
+    #[test]
     fn test_archive_gate_validation_rejects_missing_delta_target() {
         let temp = TempDir::new().unwrap();
         let _guard = CwdTestGuard::enter(temp.path());
@@ -1733,6 +2007,9 @@ mod openspec_list_show_tests {
         let change_dir = temp.path().join("openspec/changes").join(change_id);
         create_strict_valid_change(&change_dir, "Archive Target");
 
+        let expected_verifications =
+            crate::openspec::parse_proposal_metadata_from_file(&change_dir.join("proposal.md"))
+                .verifications;
         let mgr = OpenSpecManager::new();
         let message = mgr
             .archive_change(change_id, true)
@@ -1752,6 +2029,9 @@ mod openspec_list_show_tests {
         ));
         assert!(archive_dest.exists());
         assert!(!change_dir.exists());
+        let metadata =
+            crate::openspec::parse_proposal_metadata_from_file(&archive_dest.join("proposal.md"));
+        assert_eq!(metadata.verifications, expected_verifications);
     }
 
     #[test]

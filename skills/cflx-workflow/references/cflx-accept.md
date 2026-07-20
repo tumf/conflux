@@ -15,6 +15,8 @@ IMPORTANT:
 
 Review the implementation to verify it meets the specification requirements.
 
+Declared verification phases are authoritative over proposal prose. For `pre-integration`, verify current-revision repository evidence and runnable local checks. For `post-integration`, verify tracked repository automation, trigger, evidence publication, rerun action, prerequisites, and fixture/local evidence without fetching an undeployed or external target. Missing or incorrectly wired automation is FAIL; operational evidence pending integration is not FAIL. A non-mockable external prerequisite that makes automation unusable is a stalled hold with its owner and next action preserved. Never claim an unobserved operational outcome succeeded.
+
 External dependency policy (production-first; mocks/stubs are test-only):
 - Any requirement that AI cannot resolve or verify autonomously is an external dependency
 - Production code MUST NOT rely on mocks/stubs/fakes as the default runtime implementation.

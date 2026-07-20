@@ -1298,6 +1298,7 @@ mod tests {
                 priority: Some(crate::openspec::ProposalPriority::High),
                 dependencies: vec!["base-change".to_string()],
                 references: vec!["src/demo.py".to_string()],
+                verifications: vec![],
                 warnings: vec![],
             },
         };

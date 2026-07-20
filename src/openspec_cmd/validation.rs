@@ -3,8 +3,10 @@ use crate::openspec_cmd::dependency_status::classify_proposal_dependency_targets
 use crate::openspec_cmd::promotion::merge_spec_delta;
 use crate::openspec_cmd::rendering::truncate_for_display;
 use regex::Regex;
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
+use std::process::Command;
 use std::sync::OnceLock;
 
 pub(super) struct ValidationEngine<'a> {
@@ -100,16 +102,12 @@ impl<'a> ValidationEngine<'a> {
                 // Validate Change Type field in strict mode
                 if strict {
                     let change_type = extract_change_type(&content);
-                    match change_type {
-                        None => {
-                            errors.push(format!(
-                                "{}: proposal.md missing 'Change Type' field (must be one of: hybrid, implementation, spec-only)",
-                                change_id
-                            ));
-                        }
-                        Some(ref ct)
-                            if ct != "spec-only" && ct != "implementation" && ct != "hybrid" =>
-                        {
+                    match change_type.as_deref() {
+                        None => errors.push(format!(
+                            "{}: proposal.md missing 'Change Type' field (must be one of: hybrid, implementation, spec-only)",
+                            change_id
+                        )),
+                        Some(ct) if !matches!(ct, "spec-only" | "implementation" | "hybrid") => {
                             errors.push(format!(
                                 "{}: proposal.md has invalid Change Type '{}' (must be one of: hybrid, implementation, spec-only)",
                                 change_id, ct
@@ -117,6 +115,13 @@ impl<'a> ValidationEngine<'a> {
                         }
                         _ => {}
                     }
+                    errors.extend(validate_verification_declarations(
+                        &content,
+                        &proposal_file,
+                        &self.manager.root_dir,
+                        &change_id,
+                        change_type.as_deref(),
+                    ));
                 }
 
                 let dependency_diagnostics =
@@ -365,6 +370,173 @@ pub(super) fn extract_change_type(proposal_content: &str) -> Option<String> {
             .to_lowercase();
         value
     })
+}
+
+fn validate_verification_declarations(
+    proposal_content: &str,
+    proposal_file: &Path,
+    root_dir: &Path,
+    change_id: &str,
+    change_type: Option<&str>,
+) -> Vec<String> {
+    let parsed =
+        crate::openspec::parse_proposal_frontmatter_strict(proposal_content, proposal_file);
+    let mut errors = parsed
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            format!(
+                "{}: proposal.md verification metadata: {}",
+                change_id, diagnostic
+            )
+        })
+        .collect::<Vec<_>>();
+    let verifications = parsed
+        .metadata
+        .map(|metadata| metadata.verifications)
+        .unwrap_or_default();
+    let mut ids = HashSet::new();
+    let mut has_pre_integration = false;
+
+    for verification in &verifications {
+        let label = verification.id.as_deref().unwrap_or("<missing id>");
+        for (field, value) in [
+            ("id", verification.id.as_deref()),
+            ("requirement", verification.requirement.as_deref()),
+            ("phase", verification.phase.as_deref()),
+            ("owner", verification.owner.as_deref()),
+            ("trigger", verification.trigger.as_deref()),
+            ("automation", verification.automation.as_deref()),
+            ("evidence", verification.evidence.as_deref()),
+            ("rerun", verification.rerun.as_deref()),
+        ] {
+            if value.is_none_or(|value| value.trim().is_empty()) {
+                errors.push(format!(
+                    "{}: verification '{}': missing non-empty {}",
+                    change_id, label, field
+                ));
+            }
+        }
+        match verification.prerequisites.as_deref() {
+            None => errors.push(format!(
+                "{}: verification '{}': missing prerequisites list",
+                change_id, label
+            )),
+            Some(prerequisites) if prerequisites.iter().any(|item| item.trim().is_empty()) => {
+                errors.push(format!(
+                    "{}: verification '{}': prerequisites must not contain empty values",
+                    change_id, label
+                ));
+            }
+            Some(_) => {}
+        }
+        if let Some(id) = verification
+            .id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            if !ids.insert(id) {
+                errors.push(format!("{}: duplicate verification id '{}'", change_id, id));
+            }
+        }
+        match verification.phase.as_deref() {
+            Some("pre-integration") => {
+                has_pre_integration = true;
+                if verification.owner.as_deref() != Some("conflux-acceptance") {
+                    errors.push(format!(
+                        "{}: verification '{}': pre-integration requires owner: conflux-acceptance",
+                        change_id, label
+                    ));
+                }
+            }
+            Some("post-integration") => {
+                if verification.owner.as_deref() != Some("repository-automation") {
+                    errors.push(format!("{}: verification '{}': post-integration requires owner: repository-automation", change_id, label));
+                }
+            }
+            Some(phase) => errors.push(format!(
+                "{}: verification '{}': invalid phase '{}'",
+                change_id, label, phase
+            )),
+            None => {}
+        }
+        if let Some(automation) = verification.automation.as_deref() {
+            errors.extend(validate_automation_path(
+                root_dir, change_id, label, automation,
+            ));
+        }
+    }
+
+    if matches!(change_type, Some("implementation" | "hybrid")) && !has_pre_integration {
+        errors.push(format!("{}: implementation and hybrid proposals require at least one pre-integration verification with repository-verifiable evidence", change_id));
+    }
+    errors
+}
+
+fn validate_automation_path(
+    root_dir: &Path,
+    change_id: &str,
+    id: &str,
+    automation: &str,
+) -> Vec<String> {
+    let path = Path::new(automation);
+    if automation.trim().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return vec![format!(
+            "{}: verification '{}': unsafe automation path '{}'",
+            change_id, id, automation
+        )];
+    }
+    let candidate = root_dir.join(path);
+    let canonical_root = match root_dir.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            return vec![format!(
+                "{}: verification '{}': cannot resolve repository root",
+                change_id, id
+            )]
+        }
+    };
+    let canonical_candidate = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            return vec![format!(
+                "{}: verification '{}': automation path '{}' does not exist",
+                change_id, id, automation
+            )]
+        }
+    };
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return vec![format!(
+            "{}: verification '{}': automation path '{}' escapes repository",
+            change_id, id, automation
+        )];
+    }
+    if !canonical_candidate.is_file() {
+        return vec![format!(
+            "{}: verification '{}': automation path '{}' is not a regular file",
+            change_id, id, automation
+        )];
+    }
+    match Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--", automation])
+        .current_dir(root_dir)
+        .output()
+    {
+        Ok(output) if output.status.success() => Vec::new(),
+        Ok(_) => vec![format!(
+            "{}: verification '{}': automation path '{}' is not tracked by git",
+            change_id, id, automation
+        )],
+        Err(error) => vec![format!(
+            "{}: verification '{}': cannot verify tracked automation path '{}': {}",
+            change_id, id, automation, error
+        )],
+    }
 }
 
 /// Evidence hint patterns
