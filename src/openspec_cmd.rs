@@ -1733,8 +1733,12 @@ mod openspec_list_show_tests {
             OpenSpecManager::new().validate_change(Some("missing-fields"), true, "off");
 
         assert!(!valid);
-        assert!(errors.iter().any(|error| error.contains("missing non-empty requirement")));
-        assert!(errors.iter().any(|error| error.contains("missing prerequisites list")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing non-empty requirement")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing prerequisites list")));
     }
 
     #[test]
@@ -1754,7 +1758,9 @@ mod openspec_list_show_tests {
             OpenSpecManager::new().validate_change(Some("absolute-automation"), true, "off");
 
         assert!(!valid);
-        assert!(errors.iter().any(|error| error.contains("unsafe automation path")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsafe automation path")));
     }
 
     #[cfg(unix)]
@@ -1782,7 +1788,9 @@ mod openspec_list_show_tests {
             OpenSpecManager::new().validate_change(Some("external-symlink"), true, "off");
 
         assert!(!valid);
-        assert!(errors.iter().any(|error| error.contains("escapes repository")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("escapes repository")));
     }
 
     #[test]
@@ -1804,7 +1812,9 @@ mod openspec_list_show_tests {
             OpenSpecManager::new().validate_change(Some("directory-automation"), true, "off");
 
         assert!(!valid);
-        assert!(errors.iter().any(|error| error.contains("is not a regular file")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("is not a regular file")));
     }
 
     #[test]
@@ -1831,7 +1841,9 @@ mod openspec_list_show_tests {
             OpenSpecManager::new().validate_change(Some("hybrid-post-only"), true, "off");
 
         assert!(!valid);
-        assert!(errors.iter().any(|error| error.contains("require at least one pre-integration")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("require at least one pre-integration")));
     }
 
     #[test]
@@ -1852,9 +1864,11 @@ mod openspec_list_show_tests {
         )
         .unwrap();
 
-        assert!(OpenSpecManager::new()
-            .validate_change(Some("complete-contract"), true, "off")
-            .0);
+        assert!(
+            OpenSpecManager::new()
+                .validate_change(Some("complete-contract"), true, "off")
+                .0
+        );
     }
 
     #[test]
@@ -1868,19 +1882,21 @@ mod openspec_list_show_tests {
             change_dir.join("proposal.md"),
             proposal
                 .replace("phase: pre-integration", "phase: post-integration")
-                .replace("trigger: pull request", "trigger: waits for its own integration")
+                .replace(
+                    "trigger: pull request",
+                    "trigger: waits for its own integration",
+                )
                 .replace("prerequisites: []", "prerequisites: [integration complete]"),
         )
         .unwrap();
 
-        let (valid, errors, _) = OpenSpecManager::new().validate_change(
-            Some("ownerless-cyclic-gate"),
-            true,
-            "off",
-        );
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("ownerless-cyclic-gate"), true, "off");
 
         assert!(!valid);
-        assert!(errors.iter().any(|error| error.contains("post-integration requires owner")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("post-integration requires owner")));
     }
 
     #[test]
