@@ -685,19 +685,28 @@ pub fn ensure_acceptance_follow_up(
         .first()
         .map(|range| content[range.clone()].to_string())
         .unwrap_or_default();
-    let completed_identities = existing_section
+    let existing_tasks = existing_section
         .lines()
         .filter_map(|line| {
-            ["- [x] ", "- [X] "]
+            ["- [ ] ", "- [x] ", "- [X] "]
                 .iter()
-                .find_map(|prefix| line.strip_prefix(prefix))
-                .map(acceptance_finding_identity)
+                .position(|prefix| line.starts_with(prefix))
+                .map(|index| (index > 0, &line[6..]))
         })
         .collect::<Vec<_>>();
+    let completed_identities = existing_tasks
+        .iter()
+        .filter(|(completed, _)| *completed)
+        .map(|(_, finding)| acceptance_finding_identity(finding))
+        .collect::<Vec<_>>();
+    let all_existing_tasks_completed = existing_tasks.len() == normalized_findings.len()
+        && existing_tasks.iter().all(|(completed, _)| *completed);
     let lines = normalized_findings
         .iter()
         .map(|finding| {
-            if completed_identities.contains(&acceptance_finding_identity(finding)) {
+            if all_existing_tasks_completed
+                || completed_identities.contains(&acceptance_finding_identity(finding))
+            {
                 format!("- [x] {finding}")
             } else {
                 format!("- [ ] {finding}")
@@ -947,6 +956,32 @@ mod tests {
         assert_eq!(
             acceptance_finding_identity("plain finding"),
             "plain finding"
+        );
+    }
+
+    #[test]
+    fn ensure_acceptance_follow_up_preserves_all_completed_plain_findings_after_rewording() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [x] fixed and verified with regression coverage\n",
+        )
+        .unwrap();
+
+        ensure_acceptance_follow_up(
+            &tasks_path,
+            2,
+            &["missing repository coverage at src/example.rs:10".to_string()],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("- [x] missing repository coverage at src/example.rs:10"));
+        assert!(!content.contains("- [ ] missing repository coverage"));
+        assert_eq!(
+            parse_file(&tasks_path, None).unwrap(),
+            TaskProgress::with_counts(2, 2)
         );
     }
 

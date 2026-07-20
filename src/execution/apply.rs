@@ -48,9 +48,20 @@ tokio::task_local! {
     pub(crate) static APPLY_COMPLETION_CHECK_INTERVAL_OVERRIDE_MS: u64;
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static APPLY_COMPLETION_GRACE_OVERRIDE_MS: u64;
+}
+
 /// Returns the grace period applied after detecting apply completion. Tests may
 /// override via [`scoped_apply_completion_grace_secs_for_test`].
 pub(crate) fn apply_completion_grace_period() -> Duration {
+    #[cfg(test)]
+    if let Ok(ms) = APPLY_COMPLETION_GRACE_OVERRIDE_MS.try_with(|ms| *ms) {
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
     let secs = APPLY_COMPLETION_GRACE_OVERRIDE_SECS
         .try_with(|secs| *secs)
         .ok()
@@ -77,6 +88,14 @@ where
     F: std::future::Future<Output = R>,
 {
     APPLY_COMPLETION_GRACE_OVERRIDE_SECS.scope(secs, fut).await
+}
+
+#[cfg(test)]
+async fn scoped_apply_completion_grace_ms_for_test<F, R>(ms: u64, fut: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    APPLY_COMPLETION_GRACE_OVERRIDE_MS.scope(ms, fut).await
 }
 
 /// Run `fut` with the apply-completion check interval overridden to `ms`.
@@ -1015,15 +1034,23 @@ where
                 Err(_) => {
                     if let Some(deadline) = completion_deadline {
                         if tokio::time::Instant::now() >= deadline {
-                            info!(
-                                change_id = change_id,
-                                kind = ?completion_kind,
-                                grace_secs = grace_period.as_secs(),
-                                "Apply completion grace period expired; terminating lingering apply child"
-                            );
-                            let _ = child.terminate();
-                            early_terminated = true;
-                            break;
+                            let current_completion =
+                                detect_apply_completion(workspace_path, change_id);
+                            if current_completion == completion_kind {
+                                info!(
+                                    change_id = change_id,
+                                    kind = ?completion_kind,
+                                    grace_secs = grace_period.as_secs(),
+                                    "Apply completion grace period expired; terminating lingering apply child"
+                                );
+                                let _ = child.terminate();
+                                early_terminated = true;
+                                break;
+                            }
+                            completion_kind = current_completion;
+                            completion_deadline = current_completion
+                                .map(|_| tokio::time::Instant::now() + grace_period);
+                            next_check_at = tokio::time::Instant::now() + check_interval;
                         }
                     }
                     // Periodic wakeup: loop back and re-probe workspace state.
@@ -1138,7 +1165,7 @@ where
         ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
 
         // Check task progress after apply
-        let new_progress = check_task_progress(workspace_path, change_id)?;
+        let mut new_progress = check_task_progress(workspace_path, change_id)?;
 
         // Send progress event after apply
         if new_progress.total > 0 {
@@ -1290,6 +1317,7 @@ where
                                 change_id, count
                             );
 
+                            let mut diagnosis_completed = false;
                             if config.get_apply_stall_diagnose_command().is_some() {
                                 info!(
                                     change_id = change_id,
@@ -1306,6 +1334,8 @@ where
                                     .await
                                 {
                                     Ok((status, stdout_tail, stderr_tail, diagnose_command)) => {
+                                        let diagnosed_progress =
+                                            check_task_progress(workspace_path, change_id)?;
                                         info!(
                                             change_id = change_id,
                                             success = status.success(),
@@ -1313,8 +1343,17 @@ where
                                             command = %diagnose_command,
                                             stdout_tail = ?stdout_tail,
                                             stderr_tail = ?stderr_tail,
-                                            "Apply stall diagnosis completed; preserving primary empty-WIP stall outcome"
+                                            completed = diagnosed_progress.completed,
+                                            total = diagnosed_progress.total,
+                                            "Apply stall diagnosis completed"
                                         );
+                                        if status.success()
+                                            && is_progress_complete(&diagnosed_progress)
+                                        {
+                                            new_progress = diagnosed_progress;
+                                            stall_detector.clear_change(change_id);
+                                            diagnosis_completed = true;
+                                        }
                                         if !status.success() {
                                             warn!(
                                                 change_id = change_id,
@@ -1333,8 +1372,10 @@ where
                                 }
                             }
 
-                            warn!("{} (threshold {})", message, threshold);
-                            return Err(OrchestratorError::AgentCommand(message));
+                            if !diagnosis_completed {
+                                warn!("{} (threshold {})", message, threshold);
+                                return Err(OrchestratorError::AgentCommand(message));
+                            }
                         }
                     }
                     Err(e) => {
@@ -2051,6 +2092,79 @@ mod tests {
 
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
+    async fn test_apply_loop_accepts_tasks_completed_by_stall_diagnosis() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "diagnose-complete";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] pending\n",
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "openspec"])
+            .current_dir(workspace)
+            .output()
+            .expect("git add openspec should run");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add change"])
+            .current_dir(workspace)
+            .output()
+            .expect("git commit change should run");
+
+        let config = OrchestratorConfig {
+            apply_command: Some("true".to_string()),
+            apply_stall_diagnose_command: Some(
+                "sh -c 'printf \"## Implementation Tasks\\n- [x] pending\\n\" > openspec/changes/{change_id}/tasks.md'"
+                    .to_string(),
+            ),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 1,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            Some(&workspace_manager),
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await
+        .expect("tasks completed by successful stall diagnosis should complete apply");
+
+        assert!(result.completed);
+        assert_eq!(
+            check_task_progress(workspace, change_id).unwrap().completed,
+            1
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
     async fn test_apply_loop_runs_diagnosis_once_and_preserves_stall_error() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
@@ -2200,6 +2314,112 @@ mod tests {
         assert_eq!(
             result.iterations, 1,
             "tasks-complete grace-terminated run should exit in a single iteration"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn test_execute_apply_loop_keeps_child_running_when_tasks_become_incomplete_during_grace()
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "transient-complete";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        let apply_cmd = "sh -c 'printf \"## Implementation Tasks\\n- [x] one\\n\" > openspec/changes/{change_id}/tasks.md; sleep 0.05; printf \"## Implementation Tasks\\n- [ ] one\\n\" > openspec/changes/{change_id}/tasks.md; sleep 0.15; printf \"## Implementation Tasks\\n- [x] one\\n\" > openspec/changes/{change_id}/tasks.md'".to_string();
+        let config = OrchestratorConfig {
+            apply_command: Some(apply_cmd),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+
+        let result = scoped_apply_completion_grace_ms_for_test(
+            100,
+            scoped_apply_completion_check_interval_ms_for_test(
+                10,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Auto,
+                    None,
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect("transient task completion must not terminate the active apply child");
+
+        assert!(result.completed);
+        assert_eq!(result.iterations, 1);
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn test_apply_loop_preserves_reworded_completed_acceptance_follow_up() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_id = "completed-follow-up";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [ ] missing repository coverage at src/example.rs:10\n",
+        )
+        .unwrap();
+
+        let apply_cmd = "sh -c 'printf \"## Implementation Tasks\\n- [x] done\\n\\n## Acceptance #2 Failure Follow-up\\n- [x] fixed and verified with regression coverage\\n\" > openspec/changes/{change_id}/tasks.md'".to_string();
+        let config = OrchestratorConfig {
+            apply_command: Some(apply_cmd),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut history = crate::history::AcceptanceHistory::new();
+        history.set_follow_up_findings(
+            change_id,
+            2,
+            vec!["missing repository coverage at src/example.rs:10".to_string()],
+        );
+        let mut agent = AgentRunner::new(config.clone());
+        agent.seed_acceptance_history(history);
+        let ai_runner = make_test_ai_runner();
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Auto,
+            None,
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await
+        .expect("completed acceptance follow-up must remain complete after runtime persistence");
+
+        assert!(result.completed);
+        assert_eq!(result.iterations, 1);
+        assert_eq!(
+            check_task_progress(workspace, change_id).unwrap(),
+            TaskProgress::with_counts(2, 2)
         );
     }
 
