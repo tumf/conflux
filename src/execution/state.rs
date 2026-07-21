@@ -519,6 +519,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detect_workspace_state_blocks_acceptance_marker_after_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+        crate::parallel::acceptance_state::record_acceptance_retry_context(
+            repo_root,
+            "revision",
+            "test-change",
+            &["finding".to_string()],
+            2,
+        )
+        .unwrap();
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+            repo_root,
+            "test-change",
+            "permission_stalled",
+            &["external blocker".to_string()],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_workspace_state("test-change", repo_root, "main")
+                .await
+                .unwrap(),
+            WorkspaceState::Blocked
+        );
+        let marker =
+            crate::parallel::acceptance_state::parse_blocked_marker(repo_root, "test-change")
+                .unwrap()
+                .unwrap();
+        assert_eq!(marker.retry_count, 2);
+        assert_eq!(marker.next_action, "explicit retry");
+    }
+
+    #[tokio::test]
     async fn test_detect_workspace_state_created() {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();

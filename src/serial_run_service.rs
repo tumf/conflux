@@ -24,9 +24,15 @@ use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
     OutputHandler,
 };
+use crate::parallel::acceptance_state::{
+    consume_resumable_acceptance_marker, mark_acceptance_failed, mark_acceptance_passed,
+    mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
+    record_acceptance_retry_context, write_acceptance_blocked_marker,
+};
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser;
 use crate::task_parser::TaskProgress;
+use crate::vcs::git::commands::basic::get_current_commit;
 use crate::vcs::VcsBackend;
 
 use std::collections::{HashMap, HashSet};
@@ -188,6 +194,24 @@ impl SerialRunService {
         self.stalled_change_ids.insert(change_id.to_string());
     }
 
+    /// Consume a resumable acceptance marker for an explicit serial retry.
+    pub fn consume_explicit_acceptance_retry(&mut self, change_id: &str) -> Result<bool> {
+        let consumed = consume_resumable_acceptance_marker(&self.repo_root, change_id)?;
+        if consumed {
+            self.stalled_change_ids.remove(change_id);
+        }
+        Ok(consumed)
+    }
+
+    fn preflight_blocked_marker(&mut self, change_id: &str) -> Result<Option<ChangeProcessResult>> {
+        if let Some(marker) = parse_blocked_marker(&self.repo_root, change_id)? {
+            let error = format!("Blocked marker ({:?}): {}", marker.origin, marker.reason);
+            self.mark_stalled(change_id, &error);
+            return Ok(Some(ChangeProcessResult::Stalled { error }));
+        }
+        Ok(None)
+    }
+
     /// Process a single iteration for a change.
     ///
     /// This includes:
@@ -218,6 +242,10 @@ impl SerialRunService {
     {
         self.iteration += 1;
         let change_id = &change.id;
+
+        if let Some(result) = self.preflight_blocked_marker(change_id)? {
+            return Ok(result);
+        }
 
         // Check if this is a new change
         let is_new_change = self.current_change_id.as_ref() != Some(change_id);
@@ -500,6 +528,14 @@ impl SerialRunService {
                         change.id
                     );
 
+                    let revision = get_current_commit(&self.repo_root).await.map_err(|error| {
+                        crate::error::OrchestratorError::AgentCommand(format!(
+                            "Failed to determine acceptance revision: {error}"
+                        ))
+                    })?;
+                    mark_apply_completed(&self.repo_root, &revision, &change.id)?;
+                    mark_acceptance_started(&self.repo_root, &revision, &change.id)?;
+
                     // Update operation to "acceptance" before running acceptance test
                     Self::update_operation_tracker(&operation_tracker, "acceptance");
 
@@ -527,6 +563,7 @@ impl SerialRunService {
                             .process_acceptance_result(
                                 &change.id,
                                 &self.repo_root,
+                                &revision,
                                 agent,
                                 result,
                                 is_single_change_stopped,
@@ -603,6 +640,7 @@ impl SerialRunService {
         &self,
         change_id: &str,
         workspace_path: &std::path::Path,
+        revision: &str,
         agent: &AgentRunner,
         acceptance_result: AcceptanceResult,
         is_single_change_stopped: F,
@@ -612,6 +650,13 @@ impl SerialRunService {
     {
         match acceptance_result {
             AcceptanceResult::Pass => {
+                if let Err(error) =
+                    mark_acceptance_passed(workspace_path, revision, Some(change_id))
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance pass checkpoint: {error}"),
+                    };
+                }
                 info!("Acceptance passed for {}, ready for archive", change_id);
                 match task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
                     change_id,
@@ -645,6 +690,19 @@ impl SerialRunService {
                 let max_continues = self.config.get_acceptance_max_continues();
 
                 if continue_count >= max_continues {
+                    if let Err(error) = record_acceptance_retry_context(
+                        workspace_path,
+                        revision,
+                        change_id,
+                        &[],
+                        continue_count,
+                    ) {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!(
+                                "Failed to persist acceptance retry checkpoint: {error}"
+                            ),
+                        };
+                    }
                     warn!(
                         "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
                         max_continues, change_id
@@ -659,6 +717,24 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Gated => {
+                if let Err(error) =
+                    mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
+                        |()| {
+                            write_acceptance_blocked_marker(
+                                workspace_path,
+                                change_id,
+                                "acceptance_gated",
+                                &[],
+                                true,
+                                "explicit retry",
+                            )
+                        },
+                    )
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance stalled evidence: {error}"),
+                    };
+                }
                 warn!(
                     "Acceptance gated for {} - preserving change as stalled/resumable",
                     change_id
@@ -668,6 +744,27 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Fail { findings } => {
+                let retry_count = agent
+                    .get_last_acceptance_attempt(change_id)
+                    .map(|attempt| attempt.attempt)
+                    .unwrap_or(1);
+                if let Err(error) =
+                    mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
+                        |()| {
+                            record_acceptance_retry_context(
+                                workspace_path,
+                                revision,
+                                change_id,
+                                &findings,
+                                retry_count,
+                            )
+                        },
+                    )
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance failure checkpoint: {error}"),
+                    };
+                }
                 let blocking_gate_context = findings
                     .first()
                     .cloned()
@@ -718,6 +815,25 @@ impl SerialRunService {
                 ChangeProcessResult::AcceptanceCommandFailed { error }
             }
             AcceptanceResult::PermissionStalled { blocker } => {
+                let evidence = vec![blocker.summary()];
+                if let Err(error) =
+                    mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
+                        |()| {
+                            write_acceptance_blocked_marker(
+                                workspace_path,
+                                change_id,
+                                "permission_stalled",
+                                &evidence,
+                                true,
+                                &blocker.next_action,
+                            )
+                        },
+                    )
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance stalled evidence: {error}"),
+                    };
+                }
                 warn!(
                     "Acceptance stalled for {} due to repeated unresolved permission/tool policy blocker: {}",
                     change_id, blocker.next_action
@@ -927,6 +1043,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -989,6 +1106,7 @@ mod tests {
         service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: vec!["canonical second".to_string()],
@@ -1028,6 +1146,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -1060,6 +1179,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -1098,6 +1218,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Pass,
             || false,
@@ -1123,6 +1244,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Pass,
             || false,
@@ -1145,6 +1267,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Gated,
             || false, // Not a single-change stop
@@ -1155,6 +1278,58 @@ mod tests {
             ChangeProcessResult::Stalled { ref error }
             if error == "Acceptance gated with recoverable blocker"
         ));
+    }
+
+    #[test]
+    fn serial_preflight_suppresses_apply_and_archive_for_any_marker() {
+        use crate::parallel::acceptance_state::write_acceptance_blocked_marker;
+
+        let temp_dir = TempDir::new().unwrap();
+        write_acceptance_blocked_marker(
+            temp_dir.path(),
+            "complete-change",
+            "stalled",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let result = service.preflight_blocked_marker("complete-change").unwrap();
+
+        assert!(matches!(result, Some(ChangeProcessResult::Stalled { .. })));
+        assert!(service.is_stalled("complete-change"));
+    }
+
+    #[test]
+    fn explicit_serial_retry_consumes_only_resumable_acceptance_marker() {
+        use crate::parallel::acceptance_state::write_acceptance_blocked_marker;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        write_acceptance_blocked_marker(
+            temp_dir.path(),
+            "acceptance",
+            "stalled",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        assert!(service
+            .consume_explicit_acceptance_retry("acceptance")
+            .unwrap());
+
+        let apply_marker = temp_dir
+            .path()
+            .join("openspec/changes/apply/APPLY_BLOCKED/marker.md");
+        std::fs::create_dir_all(apply_marker.parent().unwrap()).unwrap();
+        std::fs::write(&apply_marker, "origin: apply\nreason: blocked\n").unwrap();
+        assert!(!service.consume_explicit_acceptance_retry("apply").unwrap());
+        assert!(apply_marker.exists());
     }
 
     #[test]
