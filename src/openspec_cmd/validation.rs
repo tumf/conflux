@@ -704,7 +704,7 @@ pub(super) fn validate_tasks_content(
             let section_name = line.trim_start_matches('#').trim().to_lowercase();
             in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
             in_runtime_acceptance_follow_up = section_name.starts_with("acceptance #")
-                && section_name.ends_with("failure follow-up");
+                && section_name.ends_with(" failure follow-up");
             continue;
         }
 
