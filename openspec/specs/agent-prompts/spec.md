@@ -522,6 +522,10 @@ The dedicated `cflx-accept` skill MUST provide operation identity, scoped accept
 
 The primary acceptance verdict contract MUST be a strict JSON object emitted as the final machine-readable verdict payload. The runtime MAY continue to accept legacy plain-text standalone lines such as `ACCEPTANCE: PASS` as a backward-compatible fallback, but canonical guidance MUST prefer the JSON contract.
 
+Repository-fixable findings MUST be atomic and SHOULD include a stable finding code. Implementation defects and missing verification evidence MUST be separate findings when they can be resolved or verified independently. Acceptance MUST evaluate the current worktree before re-reporting a prior finding and MUST NOT add a broad duplicate finding that merely aggregates test work already owned by specific findings.
+
+Apply guidance MUST treat runtime-owned acceptance finding text as immutable task identity metadata. The general rule allowing task descriptions to be refined MUST NOT apply to runtime-owned acceptance findings; remediation and verification evidence MUST be recorded separately.
+
 #### Scenario: cflx-accept defines JSON-primary verdict contract
 
 - **GIVEN** the acceptance prompt loads `cflx-accept`
@@ -537,6 +541,22 @@ The primary acceptance verdict contract MUST be a strict JSON object emitted as 
 - **THEN** they reference the same JSON-primary verdict contract
 - **AND** they do not redefine a conflicting text-only canonical output rule
 - **AND** they do not treat runtime-specific command templates as the authoritative source for the skill interface
+
+#### Scenario: acceptance emits atomic current-state findings
+
+- **GIVEN** a prior FAIL reported implementation and verification defects
+- **WHEN** acceptance reviews a newer worktree state
+- **THEN** it re-evaluates each defect against current repository evidence
+- **AND** it reports implementation and verification defects separately when independently actionable
+- **AND** it does not add an aggregate finding that duplicates their verification work
+- **AND** each repository finding includes a stable code when the reviewer can provide one
+
+#### Scenario: apply preserves runtime-owned finding text
+
+- **GIVEN** runtime persisted an acceptance finding as a follow-up task
+- **WHEN** apply fixes and verifies that finding
+- **THEN** apply marks the existing task complete without rewriting its finding text
+- **AND** remediation or verification evidence is recorded separately
 
 ### Requirement: Dedicated analyze and resolve skills MUST own fixed operation guidance
 
