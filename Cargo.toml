@@ -12,12 +12,6 @@ keywords = ["ai", "codegen", "orchestration", "git", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
   "/src/**",
-  "!/src/.tldr/**",
-  "!/src/.tldrignore",
-  "!/src/server/.tldr/**",
-  "!/src/server/.tldrignore",
-  "!/src/tui/.tldr/**",
-  "!/src/tui/.tldrignore",
   "/tests/**",
   "/skills/**",
   "!/skills/.pytest_cache/**",

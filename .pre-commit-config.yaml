@@ -1,5 +1,4 @@
 default_install_hook_types: [pre-commit]
-exclude: ^graphify-out/
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -7,11 +6,11 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
-        exclude: ^(graphify-out/(graph\.html|graph\.json|GRAPH_REPORT\.md)|dashboard/dist/assets/index-.*\.(js|css))$
+        exclude: ^dashboard/dist/assets/index-.*\.(js|css)$
       - id: check-yaml
       - id: check-toml
       - id: check-added-large-files
-        exclude: ^(graphify-out/(graph\.html|graph\.json|GRAPH_REPORT\.md)|dashboard/dist/assets/index-.*\.js)$
+        exclude: ^dashboard/dist/assets/index-.*\.js$
   - repo: local
     hooks:
       - id: beads-pre-commit

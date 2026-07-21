@@ -206,22 +206,8 @@ fn test_embedded_install_without_skills_dir() {
 
     // Verify reference auxiliary files are present for skills that have them
     assert!(
-        skills_base
-            .join("cflx-workflow/references/cflx-accept.md")
-            .exists(),
-        "cflx-workflow must have references/cflx-accept.md"
-    );
-    assert!(
-        skills_base
-            .join("cflx-workflow/references/cflx-apply.md")
-            .exists(),
-        "cflx-workflow must have references/cflx-apply.md"
-    );
-    assert!(
-        skills_base
-            .join("cflx-workflow/references/cflx-archive.md")
-            .exists(),
-        "cflx-workflow must have references/cflx-archive.md"
+        !skills_base.join("cflx-workflow/references").exists(),
+        "cflx-workflow must remain a self-contained compatibility router"
     );
     assert!(
         skills_base.join("cflx-run/references/cflx-run.md").exists(),

@@ -1,25 +1,13 @@
 /target
 error.log
-/src/.tldr/
-.tldr/
-/.leann/
 .agents/.skill-lock.json
 .playwright-cli/
-.tldrignore
 .cflx/acceptance-state.json
 .cflx.jsonc
-graphify-out/cache/
-graphify-out/manifest.json
-graphify-out/cost.json
 .opencode/
 .venv/
 dashboard/node_modules/
 skills/.pytest_cache/
-.tldr/
-src/.tldr/
-src/server/.tldr/
-src/tui/.tldr/
-src/tui/.tldrignore
 
 # Beads / Dolt files (added by bd init)
 .dolt/

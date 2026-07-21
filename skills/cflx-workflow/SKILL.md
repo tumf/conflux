@@ -1,271 +1,99 @@
 ---
 name: cflx-workflow
-description: Legacy compatibility router for Conflux workflow operations. Routes apply/rejecting/cleanup-review/accept/archive to self-contained operation guidance. New orchestrator prompts should use dedicated operation-specific skills (cflx-apply, cflx-accept, etc.) instead. CRITICAL - This skill CANNOT ask questions or request user input.
+description: Legacy compatibility router for Conflux apply, rejecting, cleanup-review, accept, and archive operations. New orchestrator prompts use dedicated cflx-* operation skills. CRITICAL - This skill CANNOT ask questions or request user input.
 ---
 
 # Conflux Workflow Compatibility Router
 
-Self-contained legacy compatibility router for Conflux workflow operations. New orchestrator prompts use dedicated operation-specific skills (`cflx-analyze`, `cflx-apply`, `cflx-rejecting`, `cflx-cleanup-review`, `cflx-accept`, `cflx-archive`, `cflx-resolve`). This router ensures older prompts using `load skills: cflx-workflow` continue to work without additional skill loads or cross-skill references.
+Use this skill only for legacy prompts that load `cflx-workflow`. New orchestrator prompts load `cflx-apply`, `cflx-rejecting`, `cflx-cleanup-review`, `cflx-accept`, or `cflx-archive` directly; those dedicated skills are the authoritative guidance for new runs.
 
-**CRITICAL**: This skill CANNOT ask questions to users. All decisions must be made autonomously based on available context.
+This router is self-contained so legacy prompts do not need another skill or reference file.
 
-## Constitutional Priority
+## Shared Rules
 
-- If `openspec/CONSTITUTION.md` exists, read it before routing or executing any operation and treat it as higher-priority project law than proposal/spec deltas.
-- Do not route, approve, or implement changes that violate `openspec/CONSTITUTION.md` unless that constitution is explicitly changed first.
+- Never ask questions or wait for user input.
+- If `openspec/CONSTITUTION.md` exists, read it first and treat it as higher priority than proposal or spec deltas.
+- Base completion and routing only on repository-verifiable evidence.
+- Choose exactly one operation from the prompt context and follow only that section.
 
-## Operation Selection
+## Apply
 
-Parse the invocation to determine the operation:
+Implement the approved change; do not only inspect, summarize, or plan.
 
-- If change ID with "apply" or "implement" context -> Execute **Apply**
-- If "rejecting" or "rejection review" context -> Execute **Rejecting Review**
-- If "cleanup-review" context -> Execute **Cleanup Review**
-- If "accept" or "acceptance" context -> Execute **Accept**
-- If "archive" context -> Execute **Archive**
+1. Read `proposal.md`, optional `design.md`, and `tasks.md` under `openspec/changes/<change-id>/`.
+2. Implement each active unchecked task and run its planned verification.
+3. Mark a task `[x]` only after its implementation artifact, runtime wiring when applicable, and verification evidence exist.
+4. Update `tasks.md` after each completed task. Internal agent todos are not OpenSpec completion evidence.
+5. Finish only when all active tasks are complete or validly moved to a non-checkbox Future Work section.
 
----
+Unit-test claims require isolated tests using mocks, fakes, or in-memory doubles. Tests using real filesystem, process, VCS, network, database, clock, credentials, or OS state are integration or e2e evidence and cannot satisfy a unit-test task.
 
-## Apply (Implementation)
+Recoverable infrastructure failures such as Docker, DNS, registry, credential, port, rate-limit, or pending managed-job failures are non-terminal stalled holds. Record concrete evidence and recovery actions; do not create `REJECTED.md` for these cases.
 
-**Purpose**: Implement an approved change autonomously with task tracking.
-
-**CRITICAL CONSTRAINTS**:
-- **NO QUESTIONS** - Make autonomous decisions based on available context
-- **NO DEFERRAL** - Do not defer tasks based on difficulty or complexity
-- **IMMEDIATE UPDATES** - Update `tasks.md` after EVERY completed task
-- **COMPLETE ALL TRUTHFULLY** - A task may be marked `[x]` only when the corresponding repository change and required verification actually exist
-- **ESCALATE BLOCKERS** - If implementation is impossible, record an Implementation Blocker for acceptance review
-- **NO CHECKLIST-ONLY COMPLETION** - Do not mark implementation tasks complete based only on proposal/spec/tasks edits when the task requires code, tests, or runtime wiring
-
-### Execution Steps
-
-1. **Read Proposal**
-   ```bash
-   cflx openspec show <change-id>
-   ```
-   - Read `openspec/changes/<id>/proposal.md`
-   - Read `openspec/changes/<id>/design.md` (if exists)
-   - Read `openspec/changes/<id>/tasks.md`
-
-2. **Work Through Tasks Sequentially**
-    - Start with first uncompleted task
-    - Implement the change
-    - Run verification (build/test/lint)
-    - Mark task as `[x]` in `tasks.md` immediately after the implementation and verification evidence exist
-    - Proceed to next task
-
-3. **Handle Ambiguity Autonomously**
-   - Use existing code patterns as reference
-   - Make reasonable assumptions
-   - Document decisions in code comments
-   - Prefer simpler solutions
-
-4. **Update Progress Continuously** - Update `tasks.md` after each task; never batch updates
-
-5. **Verify Completion** - Ensure all tasks are `[x]` or in Future Work; run final validation; confirm integration points
-
-### Truthful Completion Rules
-
-Before changing any task to `[x]`, verify:
-1. The repository contains the required implementation artifact for that task.
-2. The artifact is reachable from the intended flow when the task claims runtime integration.
-3. The relevant verification command has been run successfully, or concrete blocker evidence has been recorded.
-4. The task description still matches reality.
-5. Unit-test completion is valid only when tests are genuinely unit-scoped (mocks/fakes/in-memory doubles only).
-6. The evidence type is consistent with the planned verification type; mismatches MUST be recorded as follow-up work.
-
-Never mark a task complete based only on `openspec/` edits, `tasks.md` normalization, archived/merged proposals, or stub placeholders.
-
-### Task Management
-
-**Move to Future Work ONLY if**: requires human judgment, external system access, long-wait verification (>1 day), or already marked '(future work)'.
-
-**Do NOT move to Future Work**: difficult tasks, tests, linting, documentation, any automatable task.
-
-**Checkbox Rules**: Active sections must have checkboxes. Excluded sections (Future Work, Out of Scope, Notes) must NOT have checkboxes.
-
-### Implementation Blocker Escalation
-
-If implementation is impossible, add `## Implementation Blocker #<n>` to `tasks.md` with category, summary, evidence, impact, unblock_actions, owner, and decision_due. Create `REJECTED.md` as an apply-generated rejection proposal artifact. Output `IMPLEMENTATION_BLOCKER:` marker.
-
-### Apply Completion Criteria
-
-- All tasks marked `[x]` or moved to Future Work (without checkboxes)
-- Code compiles/builds, tests pass, lint passes
-- Integration points verified
-- Non-OpenSpec evidence exists for implementation tasks
-
-**For detailed guidance**, read [references/cflx-apply.md](references/cflx-apply.md).
-
----
+For a terminally invalid change intent, record a non-checkbox `## Implementation Blocker #<n>` in `tasks.md`, create `REJECTED.md` as a review proposal, and end with an `IMPLEMENTATION_BLOCKER:` payload containing category, evidence location, and required action.
 
 ## Rejecting Review
 
-**Purpose**: Review apply-generated rejection proposals in `REJECTED.md` before any terminal reject decision.
+Review apply-generated `REJECTED.md` and the matching `Implementation Blocker` evidence. Return exactly one standalone final marker:
 
-### Required Checks
+- `REJECTION_REVIEW: CONFIRM` when evidence proves the change intent is invalid, obsolete, contradictory, or constitution-violating.
+- `REJECTION_REVIEW: RESUME` when repository-only work can resolve the issue or evidence is insufficient.
+- `REJECTION_REVIEW: BLOCK` when the intent remains valid but a real external or infrastructure prerequisite creates a non-terminal stalled hold.
 
-1. Confirm `REJECTED.md` exists and contains a concrete reason.
-2. Confirm blocker evidence in `tasks.md` (`## Implementation Blocker #N`) is specific and actionable.
-3. Decide one outcome only:
-   - `CONFIRM`: terminal rejection evidence proves invalid/obsolete/contradictory/constitution-violating change intent.
-   - `RESUME`: reject proposal is dismissed; change returns to apply.
-   - `BLOCK`: rejection proposal describes a real non-terminal infrastructure/pending-verification blocker; change becomes stalled.
-4. Output exactly one final marker line: `REJECTION_REVIEW: CONFIRM`, `REJECTION_REVIEW: RESUME`, or `REJECTION_REVIEW: BLOCK`
-
-### Outcome Rules
-
-- On CONFIRM, runtime finalizes rejection flow and may write base-branch `REJECTED.md`.
-- On RESUME, runtime removes worktree-local `REJECTED.md` and appends recovery task.
-- On BLOCK, runtime removes worktree-local `REJECTED.md`, preserves the worktree, records a stalled hold, and MUST NOT write base-branch `REJECTED.md`.
-- MUST NOT output `ACCEPTANCE: GATED`.
-
----
+Do not emit acceptance markers.
 
 ## Cleanup Review
 
-**Purpose**: Ensure a task-complete but dirty managed worktree is made handoff-ready before acceptance starts.
+Clean only apply-generated dirty state before acceptance.
 
-### Required Behavior
+1. Inspect every dirty file with `git status --porcelain`.
+2. Keep and stage only intentional handoff files.
+3. Never use `git add -A` or `git add .`.
+4. Verify the worktree is clean.
+5. On success, emit exactly one standalone final line: `CLEANUP_REVIEW: CLEAN`.
 
-1. Run inside the managed worktree for the given change.
-2. Review dirty files and clean only post-apply handoff artifacts.
-3. **NEVER** use blind staging such as `git add -A` or `git add .`.
-4. Stage/commit only intentional cleanup changes required for clean handoff.
-5. Verify worktree cleanliness before finishing.
-6. Output exactly one success marker line on success: `CLEANUP_REVIEW: CLEAN`
+Do not perform new implementation or emit acceptance/rejection markers.
 
-### Output Rules
+## Acceptance
 
-- Success output MUST contain exactly one standalone marker line: `CLEANUP_REVIEW: CLEAN`
-- Do not emit alternate verdict markers or wrap the marker in code fences.
-- If cleanup cannot be completed, fail loudly instead of inventing a different marker.
+Acceptance is read-only review. Do not implement fixes or edit `tasks.md`.
 
----
+Review the proposal, tasks, spec deltas, implementation diff, planned verification ownership, tests, working-tree cleanliness, and actual commit-path blockers. Every FAIL finding must cite actionable repository evidence such as a file, symbol, or line.
 
-## Accept (Acceptance Review)
+Use these outcomes:
 
-**Purpose**: Verify implementation meets specifications with automated checks.
+- `pass`: all requirements and active task claims have repository evidence.
+- `fail`: repository-only work can resolve the finding.
+- `continue`: review is incomplete and another acceptance attempt is required.
+- `gated`: compatibility token for a valid non-terminal stalled hold that repository-only apply work cannot resolve.
 
-**CRITICAL**: Output exactly ONE verdict at the end.
+The canonical verdict is strict JSON on its own line:
 
-### Spec-Only Change Detection
+- `{"acceptance":"pass"}`
+- `{"acceptance":"fail","findings":["<evidence>"]}`
+- `{"acceptance":"continue"}`
+- `{"acceptance":"gated"}`
 
-Read `proposal.md` and detect `Change Type`:
-- If `Change Type: spec-only` -> apply Spec-Only Acceptance path
-- Otherwise -> standard implementation acceptance path
+During compatibility rollout, emit the matching legacy marker as the next and final line:
 
-### Required Checks
+- `ACCEPTANCE: PASS`
+- `ACCEPTANCE: FAIL`
+- `ACCEPTANCE: CONTINUE`
+- `ACCEPTANCE: GATED`
 
-1. **Git Working Tree Clean** - `git status --porcelain` must output empty
-2. **Task Completion** - All tasks `[x]` or in Future Work; no checkboxes in excluded sections
-3. **Spec Matching** - Implementation matches specification
-4. **Integration Check** *(skip for spec-only)* - Feature executed in real flow
-5. **Dead Code Check** *(skip for spec-only)* - All code is invoked
-6. **No Stubbed Runtime Check** *(skip for spec-only)* - No mock/stub/fake in production path
-7. **Regression Check** - Existing features not broken
-8. **Evidence Citation** - Cite file path + function/method
-9. **Checklist Truthfulness** - FAIL if tasks claim completion without repo evidence
+`ACCEPTANCE: BLOCKED` is accepted only as legacy input compatibility. Do not wrap verdicts in headings, blockquotes, bullets, emphasis, or code fences, and do not append text to verdict lines.
 
-### Output Format
-
-Output exactly ONE machine-readable verdict on its own line with NO markdown
-formatting.
-
-**Primary (preferred)** — strict JSON verdict object:
-
-- PASS:     `{"acceptance":"pass"}`
-- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}` (findings mirrors the FINDINGS section)
-- CONTINUE: `{"acceptance":"continue"}`
-- STALLED HOLD (compatibility token): `{"acceptance":"gated"}`
-
-**Fallback (backward-compatible)** — legacy standalone plain-text markers:
-
-- `ACCEPTANCE: PASS` - All checks pass
-- `ACCEPTANCE: FAIL` - Checks fail (followed by FINDINGS and tasks.md update)
-- `ACCEPTANCE: CONTINUE` - Verification incomplete
-- `ACCEPTANCE: GATED` - Legacy fallback for a valid Implementation Blocker stalled hold
-- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
-
-The JSON verdict is primary; legacy markers remain supported so existing runs
-do not break. When both are present, the JSON verdict wins.
-
-**Transition guidance — emit BOTH during rollout** — until all running
-Conflux orchestrator processes have been rebuilt with the JSON-aware
-acceptance parser, the agent MUST emit BOTH payloads as the final two lines
-of stdout (JSON verdict first, legacy marker second), each on its own line
-with no markdown wrapping. Newer runtimes resolve the JSON verdict and
-finalize; older runtimes still finalize on the legacy marker. The canonical
-contract remains JSON-primary.
-
-Do NOT wrap the verdict in headings (`##`), blockquotes (`>`), bullets (`-`), bold (`**`), or code fences.
-
-### Accept Rules
-
-- Each finding must include concrete evidence (file path, function, line)
-- Missing secrets MUST NOT cause CONTINUE if mocking is possible
-- Dirty working tree is always FAIL
-- Valid `Implementation Blocker #<n>` creates a stalled acceptance hold; emit `{"acceptance":"gated"}` only as the current compatibility token for that hold
-- Recoverable infrastructure blockers are non-terminal stalled holds, not terminal rejection evidence. Representative classes include Docker daemon/image pull failures, DNS/network timeouts, package registry outages, missing non-mockable credentials, port conflicts, and pending managed verification jobs.
-
-**For detailed guidance**, read [references/cflx-accept.md](references/cflx-accept.md).
-
----
+A valid `Implementation Blocker` produces a stalled hold only when repository-only work cannot resolve it. Recoverable infrastructure failures remain non-terminal stalled holds. Missing or ambiguous verification planning, false unit-test claims, dirty worktrees, and missing repository implementation are FAIL findings.
 
 ## Archive
 
-**Purpose**: Archive deployed change and update canonical specs.
+Archive only after acceptance passes and all active tasks are complete.
 
-### Execution Steps
+1. Verify the change exists and is archive-ready.
+2. Run `cflx openspec archive <change-id> --yes`; use `--skip-specs` only for tooling-only changes.
+3. Never create or move archive entries directly with `mkdir`, `mv`, `git mv`, or scripts. A failed CLI archive command is terminal for this operation.
+4. Run strict/archive-gate validation as applicable.
+5. Review `git diff openspec/specs/` and confirm each canonical spec change matches the delta.
+6. Confirm the active change is no longer left unarchived.
 
-1. **Validate Change Status**
-   ```bash
-   cflx openspec list
-   cflx openspec show <id>
-   ```
-2. **Run Archive**
-   ```bash
-   cflx openspec archive <id> --yes
-   ```
-3. **Verify Results** - Confirm moved to `changes/archive/`, specs updated, `cflx openspec validate --strict` passes
-4. **Review canonical spec diff** - Run `git diff openspec/specs/` and verify expected requirement changes
-
-**For detailed guidance**, read [references/cflx-archive.md](references/cflx-archive.md).
-
----
-
-## Built-in Tools
-
-```bash
-cflx openspec list                          # List changes
-cflx openspec list --specs                  # List specs
-cflx openspec show <id>                     # Show change details
-cflx openspec show <id> --json              # Show JSON output
-cflx openspec show <id> --json --deltas-only # Show deltas only
-cflx openspec validate <id> --strict        # Validate change
-cflx openspec validate --strict             # Validate all
-cflx openspec archive <id> --yes            # Archive change
-cflx openspec archive <id> --yes --skip-specs # Archive without spec updates
-```
-
-## Autonomous Decision Framework
-
-1. **Existing patterns** - Follow patterns in the codebase
-2. **Specification** - Refer to spec deltas and scenarios
-3. **Simplicity** - Choose simpler implementation
-4. **Documentation** - Document decision in code comments
-
-**Never**: Ask user for clarification, stop and wait for input, leave tasks incomplete due to uncertainty.
-
-## Summary
-
-| Operation | Trigger | Output | Constraints |
-|-----------|---------|--------|-------------|
-| Apply | "apply \<id\>" | Completed tasks + code | No questions, update immediately |
-| Rejecting | "rejecting \<id\>" | CONFIRM / RESUME | Review blocker evidence |
-| Cleanup | "cleanup-review \<id\>" | CLEANUP_REVIEW: CLEAN | No blind staging |
-| Accept | "accept" | PASS/FAIL/CONTINUE/STALLED HOLD (`gated` compatibility token) | Output once, cite evidence |
-| Archive | "archive \<id\>" | Archived change | Validate before/after |
-
-**REMEMBER**: This skill operates autonomously. Never ask questions. Make decisions based on available context.
+Do not perform feature implementation during archive.
