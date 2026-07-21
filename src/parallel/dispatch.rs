@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_follow_up_reopens_completed_tasks_for_apply_resume() {
+    fn parallel_latest_fail_reconciles_completed_findings_for_apply_resume() {
         let tmp = TempDir::new().unwrap();
         init_git_workspace(tmp.path());
         let change_id = "change-follow-up";
@@ -341,21 +341,36 @@ mod tests {
             "---\nchange_type: implementation\n---\n# Change\n",
         )
         .unwrap();
+        let tasks_path = change_dir.join("tasks.md");
         fs::write(
-            change_dir.join("tasks.md"),
-            "## Implementation Tasks\n- [x] done\n",
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 1\n- [x] [SAME_FINDING] fixed wording\n- [x] [RETIRED_FINDING] fixed and not reported again\n- [x] [DIFFERENT_FINDING] unrelated completed defect\n",
         )
         .unwrap();
 
         crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
-            &change_dir.join("tasks.md"),
-            1,
-            &["restore missing repository test".to_string()],
+            &tasks_path,
+            2,
+            &[
+                "[SAME_FINDING] defect still present with new evidence".to_string(),
+                "[NEW_FINDING] distinct newly reported defect".to_string(),
+            ],
         )
         .unwrap();
 
-        let action = decide_resume_action(change_id, tmp.path(), &WorkspaceState::Applied);
-        assert_eq!(action, ResumeAction::Apply);
+        let content = fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("- [ ] [SAME_FINDING] defect still present with new evidence"));
+        assert!(content.contains("- [ ] [NEW_FINDING] distinct newly reported defect"));
+        assert!(!content.contains("RETIRED_FINDING"));
+        assert!(!content.contains("DIFFERENT_FINDING"));
+        assert_eq!(
+            crate::task_parser::parse_file(&tasks_path, None).unwrap(),
+            crate::task_parser::TaskProgress::with_counts(1, 3)
+        );
+        assert_eq!(
+            decide_resume_action(change_id, tmp.path(), &WorkspaceState::Applied),
+            ResumeAction::Apply
+        );
     }
 
     #[test]
