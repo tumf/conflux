@@ -20,8 +20,8 @@ use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
 use crate::orchestration::acceptance::{
-    decide_acceptance_retry, normalize_findings, repository_findings,
-    semantic_progress_fingerprint, AcceptanceRetryDecision, MAX_ACCEPTANCE_RETRY_CYCLES,
+    decide_acceptance_retry, normalize_findings, semantic_progress_fingerprint,
+    AcceptanceRetryDecision, MAX_ACCEPTANCE_RETRY_CYCLES,
 };
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
@@ -2007,10 +2007,9 @@ impl ParallelExecutor {
                             cancel_monitor.abort();
                             return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: None, rejected: None };
                         }
-                        let repository_findings = repository_findings(&findings);
-                        if !repository_findings.is_empty() {
+                        if !findings.is_empty() {
                             if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(&change_id, workspace.path.as_path()) {
-                                if let Err(err) = task_parser::record_acceptance_follow_up(&tasks_path, acceptance_iteration, &repository_findings) {
+                                if let Err(err) = task_parser::record_acceptance_follow_up(&tasks_path, acceptance_iteration, &findings) {
                                     warn!("Acceptance follow-up persistence degraded for {} at {}: {}", change_id, tasks_path.display(), err);
                                 }
                             }

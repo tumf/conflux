@@ -871,7 +871,7 @@ impl SerialRunService {
                     blocking_gate_context
                 );
                 let repository_findings = repository_findings(&findings);
-                if !repository_findings.is_empty() {
+                if !findings.is_empty() {
                     if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(
                         change_id,
                         workspace_path,
@@ -882,7 +882,7 @@ impl SerialRunService {
                                 .get_last_acceptance_attempt(change_id)
                                 .map(|attempt| attempt.attempt)
                                 .unwrap_or(1),
-                            &repository_findings,
+                            &findings,
                         ) {
                             warn!(
                                 "Acceptance follow-up persistence degraded for {} at {}: {}",
@@ -1521,8 +1521,12 @@ mod tests {
         );
 
         let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
-        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
-        assert!(!content.contains("## Acceptance #3 Failure Follow-up"));
+        assert!(content.contains("## Current Acceptance Follow-up"));
+        assert!(content.contains("- attempt: 2"));
+        assert_eq!(
+            content.matches("## Current Acceptance Follow-up").count(),
+            1
+        );
     }
 
     #[test]
@@ -1567,7 +1571,8 @@ mod tests {
         ));
 
         let content = std::fs::read_to_string(archive_dir.join("tasks.md")).unwrap();
-        assert!(content.contains("## Acceptance #1 Failure Follow-up"));
+        assert!(content.contains("## Current Acceptance Follow-up"));
+        assert!(content.contains("- attempt: 1"));
         assert!(content.contains("- [ ] archive fallback finding"));
     }
 
