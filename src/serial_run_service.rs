@@ -1358,7 +1358,7 @@ mod tests {
             "current-revision",
             &agent,
             AcceptanceResult::Fail {
-                findings: vec!["network unavailable".to_string()],
+                findings: vec!["external non-mockable prerequisite unavailable".to_string()],
             },
             || false,
         );

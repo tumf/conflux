@@ -645,6 +645,56 @@ mod tests {
     }
 
     #[test]
+    fn alternating_continue_and_fail_keeps_fail_retry_history_deterministic() {
+        let findings = normalize_findings(&["src/lib.rs:10 missing regression coverage".into()]);
+        let identities = findings
+            .iter()
+            .map(|finding| finding.identity.clone())
+            .collect::<Vec<_>>();
+
+        // CONTINUE never enters the FAIL retry decision; the first later FAIL
+        // remains the repair opportunity and the repeated FAIL then stalls.
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &findings, "unchanged", 1),
+            AcceptanceRetryDecision::Retry {
+                reason: "first_acceptance_failure"
+            }
+        ));
+        assert!(matches!(
+            decide_acceptance_retry(&identities, Some("unchanged"), &findings, "unchanged", 2),
+            AcceptanceRetryDecision::Stall {
+                reason: "repeated_acceptance_findings",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serial_and_parallel_same_inputs_have_retry_outcome_parity() {
+        let findings = normalize_findings(&[
+            "src/lib.rs:10 missing regression coverage".into(),
+            "external non-mockable prerequisite unavailable".into(),
+        ]);
+        let previous = findings
+            .iter()
+            .map(|finding| finding.identity.clone())
+            .collect::<Vec<_>>();
+
+        // Both execution modes call this shared pure decision with checkpoint
+        // state. Keep an explicit parity fixture for their common boundary.
+        let serial = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
+        let parallel = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
+        assert_eq!(serial, parallel);
+        assert!(matches!(
+            serial,
+            AcceptanceRetryDecision::Stall {
+                reason: "repeated_acceptance_findings",
+                ref external_blockers
+            } if external_blockers.len() == 1
+        ));
+    }
+
+    #[test]
     fn retry_decision_handles_mixed_and_findingless_failures() {
         let mixed = normalize_findings(&[
             "src/lib.rs:1 fix test".into(),
