@@ -690,6 +690,7 @@ pub(super) fn validate_tasks_content(
 
     let excluded_sections = ["future work", "out of scope", "notes"];
     let mut in_excluded = false;
+    let mut in_runtime_acceptance_follow_up = false;
 
     let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
 
@@ -702,6 +703,12 @@ pub(super) fn validate_tasks_content(
         if line.starts_with("##") {
             let section_name = line.trim_start_matches('#').trim().to_lowercase();
             in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
+            in_runtime_acceptance_follow_up = section_name.starts_with("acceptance #")
+                && section_name.ends_with(" failure follow-up");
+            continue;
+        }
+
+        if in_runtime_acceptance_follow_up {
             continue;
         }
 

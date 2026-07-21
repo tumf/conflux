@@ -810,6 +810,22 @@ mod validation_tests {
     }
 
     #[test]
+    fn test_ignores_runtime_acceptance_follow_up_during_archive_validation() {
+        let content = "## Implementation Tasks\n- [x] Implement feature (verification: unit - cargo test openspec_cmd --lib)\n\n## Acceptance #2 Failure Follow-up\n- [x] Archive commit path remains blocked: run cflx openspec validate alpha --archive-gate\n- [x] Restore semantic fingerprint after restart\n";
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
     fn test_preserves_ordinary_repository_evidence() {
         let content = "- [ ] Rust verification (verification: unit - cargo test openspec_cmd --lib)\n- [ ] Frontend verification (verification: integration - npm run test)\n- [ ] Go verification (verification: integration - go test ./...)\n- [ ] Path verification (verification: unit - src/openspec_cmd.rs and tests/fixtures cover this)\n";
         let (errors, warnings) = validate_tasks_content(
