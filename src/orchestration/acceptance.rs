@@ -13,6 +13,160 @@ use tracing::{info, warn};
 use super::output::OutputHandler;
 
 const ACCEPTANCE_OUTPUT_FALLBACK: &str = "No acceptance output captured";
+pub const MAX_ACCEPTANCE_RETRY_CYCLES: u32 = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedFinding {
+    pub identity: String,
+    pub external: bool,
+}
+
+pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
+    let mut normalized = findings
+        .iter()
+        .filter_map(|finding| {
+            let normalized = finding.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!normalized.is_empty()).then(|| {
+                let lower = normalized.to_ascii_lowercase();
+                let external = [
+                    "permission denied",
+                    "credential",
+                    "api key",
+                    "network",
+                    "rate limit",
+                    "unavailable",
+                ]
+                .iter()
+                .any(|needle| lower.contains(needle));
+                let path = lower
+                    .split_whitespace()
+                    .find(|word| {
+                        word.contains('/') || word.ends_with(".rs") || word.ends_with(".md")
+                    })
+                    .unwrap_or("")
+                    .trim_end_matches(|character: char| {
+                        character == ':' || character.is_ascii_digit()
+                    });
+                let message = lower
+                    .replace(path, "")
+                    .split_whitespace()
+                    .filter(|word| !word.chars().all(|character| character.is_ascii_digit()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                NormalizedFinding {
+                    identity: format!(
+                        "{}|{}|{}",
+                        if external { "external" } else { "repository" },
+                        path,
+                        message
+                    ),
+                    external,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| left.identity.cmp(&right.identity));
+    normalized.dedup_by(|left, right| left.identity == right.identity);
+    normalized
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptanceRetryDecision {
+    Retry {
+        reason: &'static str,
+    },
+    Stall {
+        reason: &'static str,
+        external_blockers: Vec<String>,
+    },
+}
+
+pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Result<String> {
+    fn include(path: &str) -> bool {
+        !path.starts_with(".git/")
+            && !path.starts_with(".cflx/")
+            && !path.contains("/APPLY_BLOCKED/")
+            && !path.starts_with("logs/")
+            && !path.starts_with("history/")
+            && (path.starts_with("src/")
+                || path.starts_with("tests/")
+                || path.starts_with("config/")
+                || path.starts_with("openspec/specs/")
+                || path.ends_with("Cargo.toml")
+                || path.ends_with("tasks.md"))
+    }
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        output: &mut Vec<(String, Vec<u8>)>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, output)?;
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if include(&relative) {
+                output.push((relative, std::fs::read(path)?));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(workspace, workspace, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let hash = files
+        .into_iter()
+        .flat_map(|(path, bytes)| path.into_bytes().into_iter().chain(bytes))
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        });
+    Ok(format!("{hash:016x}"))
+}
+
+pub fn decide_acceptance_retry(
+    previous_identities: &[String],
+    previous_fingerprint: Option<&str>,
+    findings: &[NormalizedFinding],
+    semantic_fingerprint: &str,
+    cycle_count: u32,
+) -> AcceptanceRetryDecision {
+    let identities = findings
+        .iter()
+        .map(|finding| finding.identity.clone())
+        .collect::<Vec<_>>();
+    let external_blockers = findings
+        .iter()
+        .filter(|finding| finding.external)
+        .map(|finding| finding.identity.clone())
+        .collect();
+    if cycle_count >= MAX_ACCEPTANCE_RETRY_CYCLES {
+        return AcceptanceRetryDecision::Stall {
+            reason: "acceptance_cycle_limit_exhausted",
+            external_blockers,
+        };
+    }
+    if previous_identities.is_empty() {
+        return AcceptanceRetryDecision::Retry {
+            reason: "first_acceptance_failure",
+        };
+    }
+    if previous_identities != identities || previous_fingerprint != Some(semantic_fingerprint) {
+        return AcceptanceRetryDecision::Retry {
+            reason: "finding_or_semantic_progress_changed",
+        };
+    }
+    AcceptanceRetryDecision::Stall {
+        reason: "repeated_acceptance_findings",
+        external_blockers,
+    }
+}
 
 pub fn build_acceptance_tail_findings(
     stdout_tail: Option<String>,
@@ -355,6 +509,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_fingerprint_excludes_runtime_bookkeeping() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "one").unwrap();
+        let before = semantic_progress_fingerprint(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join(".cflx")).unwrap();
+        std::fs::write(temp.path().join(".cflx/acceptance-state.json"), "runtime").unwrap();
+        assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+        std::fs::write(temp.path().join("src/lib.rs"), "two").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn retry_decision_normalizes_order_whitespace_duplicates_and_stalls_repeats() {
+        let findings = normalize_findings(&[
+            " src/lib.rs:10   missing  test ".to_string(),
+            "src/lib.rs:10 missing test".to_string(),
+        ]);
+        assert_eq!(findings.len(), 1);
+        let decision = decide_acceptance_retry(
+            &[findings[0].identity.clone()],
+            Some("unchanged"),
+            &findings,
+            "unchanged",
+            2,
+        );
+        assert!(matches!(
+            decision,
+            AcceptanceRetryDecision::Stall {
+                reason: "repeated_acceptance_findings",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retry_decision_allows_first_progress_changed_and_preserves_external() {
+        let findings = normalize_findings(&["network unavailable for src/lib.rs".to_string()]);
+        assert!(findings[0].external);
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &findings, "one", 1),
+            AcceptanceRetryDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            decide_acceptance_retry(&["different".to_string()], Some("one"), &findings, "two", 2),
+            AcceptanceRetryDecision::Retry { .. }
+        ));
+        assert!(
+            matches!(decide_acceptance_retry(&[], None, &findings, "one", MAX_ACCEPTANCE_RETRY_CYCLES), AcceptanceRetryDecision::Stall { reason: "acceptance_cycle_limit_exhausted", external_blockers } if external_blockers.len() == 1)
+        );
+    }
 
     #[test]
     fn test_build_acceptance_tail_findings_prefers_stdout() {

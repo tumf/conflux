@@ -20,6 +20,10 @@ use crate::error::Result;
 use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
+use crate::orchestration::acceptance::{
+    decide_acceptance_retry, normalize_findings, semantic_progress_fingerprint,
+    AcceptanceRetryDecision,
+};
 use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
     OutputHandler,
@@ -27,7 +31,8 @@ use crate::orchestration::{
 use crate::parallel::acceptance_state::{
     consume_resumable_acceptance_marker, mark_acceptance_failed, mark_acceptance_passed,
     mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
-    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context,
+    record_acceptance_retry_checkpoint, record_acceptance_retry_context,
+    write_acceptance_blocked_marker_with_context,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser;
@@ -766,14 +771,11 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Fail { findings } => {
-                let retry_count = match crate::parallel::acceptance_state::load_acceptance_state(
+                let previous = match crate::parallel::acceptance_state::load_acceptance_state_for(
                     workspace_path,
+                    change_id,
                 ) {
-                    Ok(Some(state)) => state.cycle_count.saturating_add(1),
-                    Ok(None) => agent
-                        .get_last_acceptance_attempt(change_id)
-                        .map(|attempt| attempt.attempt)
-                        .unwrap_or(1),
+                    Ok(state) => state,
                     Err(error) => {
                         return ChangeProcessResult::AcceptanceCommandFailed {
                             error: format!(
@@ -782,14 +784,48 @@ impl SerialRunService {
                         };
                     }
                 };
+                let retry_count = previous.as_ref().map_or_else(
+                    || {
+                        agent
+                            .get_last_acceptance_attempt(change_id)
+                            .map(|attempt| attempt.attempt)
+                            .unwrap_or(1)
+                    },
+                    |state| state.cycle_count.saturating_add(1),
+                );
+                let fingerprint = match semantic_progress_fingerprint(workspace_path) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!("Failed to fingerprint acceptance progress: {error}"),
+                        };
+                    }
+                };
+                let normalized = normalize_findings(&findings);
+                let identities = normalized
+                    .iter()
+                    .map(|finding| finding.identity.clone())
+                    .collect::<Vec<_>>();
+                let decision = decide_acceptance_retry(
+                    previous.as_ref().map_or(&[] as &[String], |state| {
+                        state.previous_finding_identities.as_slice()
+                    }),
+                    previous
+                        .as_ref()
+                        .and_then(|state| state.semantic_fingerprint.as_deref()),
+                    &normalized,
+                    &fingerprint,
+                    retry_count,
+                );
                 if let Err(error) =
                     mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
                         |()| {
-                            record_acceptance_retry_context(
+                            record_acceptance_retry_checkpoint(
                                 workspace_path,
                                 revision,
                                 change_id,
-                                &findings,
+                                identities.clone(),
+                                Some(fingerprint),
                                 retry_count,
                             )
                         },
@@ -797,6 +833,31 @@ impl SerialRunService {
                 {
                     return ChangeProcessResult::AcceptanceCommandFailed {
                         error: format!("Failed to persist acceptance failure checkpoint: {error}"),
+                    };
+                }
+                if let AcceptanceRetryDecision::Stall {
+                    reason,
+                    external_blockers,
+                } = decision
+                {
+                    if let Err(error) = write_acceptance_blocked_marker_with_context(
+                        workspace_path,
+                        change_id,
+                        reason,
+                        &identities,
+                        "no_semantic_progress",
+                        &external_blockers,
+                        true,
+                        "explicit retry",
+                    ) {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!(
+                                "Failed to persist acceptance stalled evidence: {error}"
+                            ),
+                        };
+                    }
+                    return ChangeProcessResult::Stalled {
+                        error: reason.to_string(),
                     };
                 }
                 let blocking_gate_context = findings
@@ -1152,7 +1213,7 @@ mod tests {
         assert_eq!(checkpoint.cycle_count, 3);
         assert_eq!(
             checkpoint.previous_finding_identities,
-            ["repeated serial finding"]
+            ["repository||repeated serial finding"]
         );
 
         std::fs::write(change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
@@ -1203,7 +1264,7 @@ mod tests {
         assert_eq!(checkpoint.cycle_count, 1);
         assert_eq!(
             checkpoint.previous_finding_identities,
-            ["repeated serial finding"]
+            ["repository||repeated serial finding"]
         );
     }
 
@@ -1232,12 +1293,104 @@ mod tests {
         assert_eq!(agent.next_acceptance_attempt_number("test-change"), 3);
         assert_eq!(
             agent.get_last_acceptance_findings("test-change"),
-            Some(vec!["missing regression coverage".to_string()])
+            Some(vec!["repository||missing regression coverage".to_string()])
         );
         assert_eq!(
             agent.get_restored_acceptance_semantic_fingerprint("test-change"),
-            Some("missing regression coverage".to_string())
+            Some("cbf29ce484222325".to_string())
         );
+    }
+
+    #[test]
+    fn serial_repeated_findings_without_progress_stall_before_another_apply() {
+        use crate::orchestration::acceptance::normalize_findings;
+        use crate::parallel::acceptance_state::record_acceptance_retry_checkpoint;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let findings = vec!["src/lib.rs:10 missing regression coverage".to_string()];
+        let fingerprint = semantic_progress_fingerprint(temp_dir.path()).unwrap();
+        record_acceptance_retry_checkpoint(
+            temp_dir.path(),
+            "previous-revision",
+            "test-change",
+            normalize_findings(&findings)
+                .into_iter()
+                .map(|finding| finding.identity)
+                .collect(),
+            Some(fingerprint),
+            1,
+        )
+        .unwrap();
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            "current-revision",
+            &agent,
+            AcceptanceResult::Fail { findings },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::Stalled { ref error }
+            if error == "repeated_acceptance_findings"
+        ));
+        assert_eq!(
+            crate::parallel::acceptance_state::parse_blocked_marker(temp_dir.path(), "test-change")
+                .unwrap()
+                .unwrap()
+                .reason,
+            "repeated_acceptance_findings"
+        );
+    }
+
+    #[test]
+    fn serial_cycle_limit_stalls_with_workspace_marker() {
+        use crate::orchestration::acceptance::{normalize_findings, MAX_ACCEPTANCE_RETRY_CYCLES};
+        use crate::parallel::acceptance_state::record_acceptance_retry_checkpoint;
+
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let findings = vec!["new finding at ceiling".to_string()];
+        record_acceptance_retry_checkpoint(
+            temp_dir.path(),
+            "previous-revision",
+            "test-change",
+            normalize_findings(&["older finding".to_string()])
+                .into_iter()
+                .map(|finding| finding.identity)
+                .collect(),
+            Some("previous-progress".to_string()),
+            MAX_ACCEPTANCE_RETRY_CYCLES - 1,
+        )
+        .unwrap();
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            "current-revision",
+            &agent,
+            AcceptanceResult::Fail { findings },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::Stalled { ref error }
+            if error == "acceptance_cycle_limit_exhausted"
+        ));
+        let marker =
+            crate::parallel::acceptance_state::parse_blocked_marker(temp_dir.path(), "test-change")
+                .unwrap()
+                .unwrap();
+        assert_eq!(marker.reason, "acceptance_cycle_limit_exhausted");
+        assert_eq!(marker.retry_count, MAX_ACCEPTANCE_RETRY_CYCLES);
     }
 
     #[test]
