@@ -2123,7 +2123,7 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
 
     let acceptance_config = create_test_config_with(OrchestratorConfig {
         acceptance_command: Some(
-            "sh -c 'echo ACCEPTANCE: FAIL; echo; echo FINDINGS:; echo - missing regression test; echo - add repo coverage'"
+            "sh -c 'echo ACCEPTANCE: FAIL; echo; echo FINDINGS:; echo - missing regression test; echo - add repo coverage; echo - external non-mockable prerequisite unavailable'"
                 .to_string(),
         ),
         ..Default::default()
@@ -2164,10 +2164,18 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
 
     match result {
         crate::orchestration::AcceptanceResult::Fail { findings } => {
-            assert_eq!(findings.len(), 2);
+            assert_eq!(findings.len(), 3);
         }
         other => panic!("expected acceptance fail, got {:?}", other),
     }
+
+    assert_eq!(
+        agent
+            .get_acceptance_follow_up(change_id)
+            .or_fail("acceptance follow-up should be recorded")
+            .1,
+        ["missing regression test", "add repo coverage"]
+    );
 
     crate::task_parser::record_acceptance_follow_up(
         &tasks_dir.join("tasks.md"),

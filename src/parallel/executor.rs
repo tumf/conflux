@@ -1914,18 +1914,24 @@ pub async fn execute_acceptance_in_workspace(
                 commit_hash: revision_to_history_commit_hash(&end_revision),
             };
             agent.record_acceptance_attempt(change_id, attempt.clone());
-            agent.record_acceptance_follow_up(
-                change_id,
-                attempt_number,
-                findings_for_tasks.clone(),
-            );
+            let repository_findings =
+                crate::orchestration::acceptance::repository_findings(&findings_for_tasks);
+            if !repository_findings.is_empty() {
+                agent.record_acceptance_follow_up(
+                    change_id,
+                    attempt_number,
+                    repository_findings.clone(),
+                );
+            }
             let mut shared_history = acceptance_history.lock().await;
             shared_history.record(change_id, attempt);
-            shared_history.set_follow_up_findings(
-                change_id,
-                attempt_number,
-                findings_for_tasks.clone(),
-            );
+            if !repository_findings.is_empty() {
+                shared_history.set_follow_up_findings(
+                    change_id,
+                    attempt_number,
+                    repository_findings,
+                );
+            }
             drop(shared_history);
             acceptance_tail_injected.lock().await.remove(change_id);
 
