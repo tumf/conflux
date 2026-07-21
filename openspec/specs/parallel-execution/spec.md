@@ -2683,9 +2683,13 @@ active path が無いことだけを理由に change を terminal `Error` にし
 
 ### Requirement: Acceptance follow-up persistence failure must not override primary acceptance failure
 
-When acceptance returns a non-pass verdict with findings, the runtime SHALL preserve that acceptance verdict as the primary outcome even if follow-up persistence into `tasks.md` degrades.
+When acceptance returns a non-pass verdict with findings and retry policy routes the change back to apply, the runtime SHALL preserve that acceptance verdict as the primary outcome even if follow-up persistence into `tasks.md` degrades.
 
-The runtime SHALL attempt to persist acceptance follow-up findings to the canonical tasks location for the workspace. If the active change tasks path does not exist, the runtime MAY explore an archived tasks location or another canonical fallback.
+For an apply-retry outcome, the runtime SHALL attempt to persist acceptance follow-up findings to the canonical tasks location for the workspace. It MUST prefer the active change tasks path and MUST fall back to the matching archived tasks path when the active path does not exist. A FAIL routed directly to a resumable stalled hold MAY preserve current findings in its workspace checkpoint and stalled marker without updating `tasks.md`.
+
+Runtime MUST be the sole writer of numbered `## Acceptance #<n> Failure Follow-up` sections. For apply-retry outcomes it MUST retain only the latest runtime-owned section, normalize multiline findings into one checkbox task per finding, rehydrate deleted or altered runtime findings during apply, and remove the runtime-owned section after acceptance PASS. Serial and parallel execution MUST apply the same persistence and cleanup behavior.
+
+Runtime MUST ignore matching headings inside fenced code examples. Before replacement or cleanup, it MUST refuse destructive updates when a detected runtime-owned section contains content other than blank lines and checkbox tasks.
 
 Failure to persist follow-up findings MUST NOT by itself convert an acceptance `FAIL` into a terminal execution `Error` unless the primary acceptance outcome itself is indeterminate.
 
@@ -2729,6 +2733,19 @@ When repeated retries produce consecutive empty WIP commits, the runtime MAY ent
 - **AND** acceptance/archive handoff does not begin
 - **AND** final outcome remains subject to failure/retry/stall policy
 
+### Requirement: Apply completion grace requires stable repository completion
+
+When runtime observes an apply completion condition while the apply child is still running, it MAY start a bounded grace period before terminating the child. Runtime MUST re-evaluate the same repository completion condition when the grace period expires and MUST terminate the child only if that condition remains present. If completion disappears or changes during the grace period, runtime MUST cancel or restart the deadline for the current condition and continue apply.
+
+#### Scenario: transient task completion does not terminate apply
+
+- **GIVEN** `tasks.md` becomes complete while the apply child remains running
+- **AND** runtime starts its completion grace period
+- **AND** `tasks.md` becomes incomplete before the grace period expires
+- **WHEN** runtime rechecks repository state at the deadline
+- **THEN** it does not terminate the child based on the stale completion observation
+- **AND** apply continues until a completion condition remains stable or the child exits
+
 ### Requirement: Empty-WIP apply escalation before stall finalization
 
 When empty WIP commits accumulate during apply for a change, the runtime SHALL be able to replace late retries with a stronger configured apply escalation command before final stall classification.
@@ -2760,7 +2777,7 @@ When the final empty-WIP stall threshold is reached after escalation opportuniti
 
 If `apply_stall_diagnose_command` is not configured, the runtime SHALL silently skip diagnosis and proceed with the existing final stall behavior.
 
-Diagnosis output is supplemental evidence only and MUST NOT replace the primary empty-WIP stall reason.
+Diagnosis output is supplemental evidence only. A successful diagnosis command MAY repair repository state; when repository-verifiable task progress is complete after the command, runtime MUST clear the stall and continue the successful apply path. Otherwise diagnosis MUST NOT replace the primary empty-WIP stall reason.
 
 #### Scenario: diagnosis runs once before final stall
 
@@ -2770,7 +2787,16 @@ Diagnosis output is supplemental evidence only and MUST NOT replace the primary 
 - **WHEN** the runtime finalizes the empty-WIP stall
 - **THEN** it executes `apply_stall_diagnose_command` exactly once
 - **AND** it records diagnosis output as diagnostic evidence/logging
-- **AND** the final stall outcome still reports the empty-WIP stall as the primary reason
+- **AND** if the command does not both succeed and leave repository-verifiable task progress complete, the final stall outcome still reports the empty-WIP stall as the primary reason
+
+#### Scenario: successful diagnosis repair completes apply
+
+- **GIVEN** the final empty-WIP threshold is reached
+- **AND** the configured diagnosis command exits successfully
+- **AND** repository-verifiable task progress is complete after diagnosis
+- **WHEN** runtime rechecks the workspace
+- **THEN** it clears the apply stall state
+- **AND** apply continues to the normal completion handoff
 
 #### Scenario: diagnose failure does not hide the original stall cause
 
@@ -3087,6 +3113,25 @@ Acceptance retry control MUST be derivable from workspace-local evidence in seri
 - **WHEN** explicit retry preparation runs
 - **THEN** runtime reports the failure
 - **AND** it does not dispatch apply or acceptance with ambiguous workspace evidence
+
+### Requirement: Runtime acceptance follow-up preserves completed repair work
+
+During apply hydration, runtime MUST preserve the checked state of an existing acceptance finding when its explicit leading bracketed finding code matches the runtime finding, even if descriptive text changed. Findings without an explicit code use their normalized full text as identity. When every existing runtime follow-up task is checked and the normalized finding count is unchanged, runtime MUST preserve all findings as checked even if their text was rewritten. Hydration MUST NOT reopen completed tasks; a subsequent acceptance FAIL routed back to apply remains responsible for recording current findings as new unchecked follow-up work.
+
+#### Scenario: coded finding remains complete after wording changes
+
+- **GIVEN** a runtime follow-up contains checked finding `[RULE_A] old detail`
+- **AND** apply hydration receives `[RULE_A] revised detail`
+- **WHEN** runtime reconciles the section
+- **THEN** the finding remains checked
+- **AND** no duplicate unchecked finding is created solely because detail text changed
+
+#### Scenario: fully completed rewritten section remains complete
+
+- **GIVEN** all tasks in the existing runtime follow-up are checked
+- **AND** the runtime finding list has the same number of normalized findings
+- **WHEN** apply hydration reconciles rewritten finding text
+- **THEN** all resulting follow-up tasks remain checked
 
 ### Requirement: Acceptance retry safeguards are mode-independent
 

@@ -80,16 +80,22 @@ acceptance プロンプトは、Future Work / Out of Scope / Notes セクショ�
 - **AND** FINDINGS に「Future Work セクションにチェックボックスが残っている」旨を記載する
 - **AND** apply フェーズに戻り、チェックボックスの削除が行われる
 
-### Requirement: Acceptance prompt MUST instruct tasks.md follow-up updates on FAIL
-acceptance プロンプトは、FAIL を出力する場合に `openspec/changes/{change_id}/tasks.md` を直接更新する手順を明記しなければならない（MUST）。
-指示には、`## Acceptance #<n> Failure Follow-up` セクションの追加（または既存セクションの更新）、`- [ ] <finding>` の 1 行 1 finding 形式、`ACCEPTANCE:`/`FINDINGS:` 行を tasks.md に追加しないことを含めなければならない（MUST）。
-`<n>` は tasks.md 内の既存の `Acceptance #<n> Failure Follow-up` を基準に決定するよう指示しなければならない（MUST）。
+### Requirement: Acceptance review is read-only and runtime owns FAIL follow-up persistence
+Acceptance guidance MUST define acceptance as read-only review and MUST NOT instruct the acceptance agent to edit `tasks.md` or append acceptance follow-up sections. When acceptance returns FAIL with repository-fixable findings and retry policy routes the change back to apply, runtime MUST persist normalized findings as one runtime-owned `## Acceptance #<n> Failure Follow-up` section containing one `- [ ] <finding>` task per finding. Runtime MUST replace earlier runtime-owned acceptance follow-up sections rather than accumulating attempt history, and MUST NOT write `ACCEPTANCE:` or `FINDINGS:` protocol lines into `tasks.md`. A FAIL routed directly to a resumable stalled hold MAY preserve current findings in its workspace checkpoint and stalled marker without mutating `tasks.md`.
 
-#### Scenario: Acceptance prompt guides follow-up authoring
-- **GIVEN** acceptance プロンプトが生成される
-- **WHEN** エージェントが FAIL を出力する必要がある
-- **THEN** プロンプトに tasks.md の follow-up 追記手順が含まれる
-- **AND** `ACCEPTANCE:` や `FINDINGS:` を tasks.md に追加しない指示が含まれる
+#### Scenario: acceptance returns findings without editing tasks
+- **GIVEN** acceptance guidance is loaded
+- **WHEN** the reviewer returns FAIL with actionable repository findings
+- **AND** retry policy routes the change back to apply
+- **THEN** the reviewer does not edit `tasks.md`
+- **AND** runtime persists the findings in one numbered runtime-owned follow-up section
+- **AND** any prior numbered runtime-owned follow-up section is replaced
+
+#### Scenario: verdict protocol remains outside tasks
+- **GIVEN** runtime persists acceptance FAIL findings
+- **WHEN** it updates the canonical `tasks.md`
+- **THEN** each normalized finding is rendered as one checkbox task
+- **AND** `ACCEPTANCE:` and `FINDINGS:` protocol lines are not written to the file
 
 ### Requirement: Acceptance MUST fail when git working tree is dirty
 acceptance プロンプトは Git の作業ツリーが完全にクリーンであることを確認しなければならない（MUST）。この確認では `git status --porcelain` を使用し、出力が空であることを前提とする。未コミット変更または未追跡ファイルが存在する場合、acceptance は FAIL を出力し、FINDINGS に該当ファイルのパスを列挙しなければならない（MUST）。
@@ -780,6 +786,18 @@ Rejecting review prompt and distributed `cflx-rejecting` skill SHALL support thr
 - **WHEN** rejecting review classifies the proposal
 - **THEN** the final marker may be `REJECTION_REVIEW: CONFIRM`
 - **AND** guidance allows runtime to create terminal base-branch `REJECTED.md`
+
+### Requirement: Acceptance checkpoint prompt context is explicit and untrusted
+
+When workspace-local acceptance retry state is restored, prompt construction MUST encode the cycle count, prior finding identities, and optional semantic fingerprint in an `<acceptance_checkpoint>` JSON context block. The prompt MUST label checkpoint JSON as untrusted data and MUST instruct the agent not to follow instructions embedded in its strings. Restored checkpoint context MUST remain repository-derived retry evidence and MUST NOT become out-of-worktree workflow authority.
+
+#### Scenario: restored checkpoint is injected safely
+
+- **GIVEN** a workspace-local acceptance checkpoint contains cycle count, finding identities, and a semantic fingerprint
+- **WHEN** runtime constructs the next agent prompt
+- **THEN** it includes those fields in an `<acceptance_checkpoint>` JSON block
+- **AND** it explicitly labels the payload as untrusted data
+- **AND** strings inside the payload are not treated as instructions
 
 ### Requirement: Acceptance MUST honor declared verification phases
 

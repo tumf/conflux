@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Acceptance prompt MUST instruct tasks.md follow-up updates on FAIL
+### Requirement: Acceptance review is read-only and runtime owns FAIL follow-up persistence
 
 Acceptance guidance MUST define acceptance as read-only review and MUST NOT instruct the acceptance agent to edit `tasks.md`. When acceptance returns FAIL, runtime MUST own persistence of one `## Current Acceptance Follow-up` section, replacing prior runtime-managed numbered follow-up sections rather than accumulating attempt history.
 

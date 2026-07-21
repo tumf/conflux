@@ -1984,7 +1984,7 @@ The `cflx openspec show --deltas-only <change-id>` output MUST remain focused on
 
 Archived changes MAY still be resolved by detail-oriented subcommands such as `cflx openspec show <change-id>`, but nested archive paths such as `openspec/changes/archive/YYYY-MM-DD/<change-id>` MUST NOT be resolved as archived changes.
 
-The native `cflx openspec archive <change-id>` subcommand MUST archive successful changes into a date-prefixed destination under `openspec/changes/archive/` using the format `YYYY-MM-DD-<change-id>`.
+The native `cflx openspec archive <change-id>` subcommand MUST archive successful changes into a date-prefixed destination under `openspec/changes/archive/` using the format `YYYY-MM-DD-<change-id>`. Pre-archive validation errors or an invalid result MUST prevent archive mutation, while advisory validation warnings alone MUST NOT prevent archive.
 
 #### Scenario: show displays pending active dependency
 
@@ -2062,6 +2062,18 @@ Versioned startup logs MUST use a consistent version/build representation so ope
 - **WHEN** the CLI starts the server runtime
 - **THEN** the startup log includes the cflx version and build number
 - **AND** the startup log identifies the mode as server
+
+### Requirement: Serial run resolves workflow state from its captured repository root
+
+Serial orchestration MUST load workspace-local acceptance checkpoints, rediscover changes after apply, and evaluate subsequent acceptance state relative to the repository root captured when the service was created. Ambient process working-directory changes MUST NOT redirect those operations to another repository.
+
+#### Scenario: ambient working directory does not redirect serial resume
+
+- **GIVEN** serial run was created for repository `alpha`
+- **AND** the process working directory later points at repository `beta`
+- **WHEN** serial run restores acceptance context or refreshes the change after apply
+- **THEN** it reads repository `alpha`
+- **AND** repository `beta` does not influence workflow routing
 
 ### Requirement: CLI acceptance failure reporting distinguishes verdict failure from follow-up persistence degradation
 
