@@ -17,4 +17,4 @@
 `cflx openspec validate persist-acceptance-stalled-state --archive-gate` exits 0.
 
 ## Acceptance #1 Failure Follow-up
-- [x] 作業ツリーが未コミットであり、受入・archive commitability を満たさない。`src/history.rs`、`src/parallel/dispatch.rs`、`src/parallel/tests/executor.rs`、`src/serial_run_service.rs` と本follow-upを実装コミットへ含め、作業ツリーをcleanにして再受入した。checkpoint round-trip、serial/parallel再起動経路、marker dispatch suppression、explicit retry、clippy、fmt、pre-commit、archive-gateは成功した。
+- [x] 作業ツリーが未コミットであり、受入・archive commitability を満たさない。`git status --porcelain=v1` で `openspec/changes/persist-acceptance-stalled-state/tasks.md`、`src/history.rs`、`src/parallel/dispatch.rs`、`src/parallel/tests/executor.rs`、`src/serial_run_service.rs` の5ファイルが変更済み。これらを実装コミットへ含め、作業ツリーをcleanにして再受入すること。なおactive taskの未チェック項目はなく、checkpoint round-trip、serial/parallel再起動経路、marker dispatch suppression、explicit retry、clippy、fmt、pre-commit、archive-gateは成功した。
