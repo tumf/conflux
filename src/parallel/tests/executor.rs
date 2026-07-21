@@ -462,7 +462,13 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
         "resolve blocks only its dependent"
     );
 
-    let mut queued = vec![make_test_change("dependent"), make_test_change("unrelated")];
+    let mut queued = vec![
+        crate::openspec::Change {
+            dependencies: vec!["resolving".to_string()],
+            ..make_test_change("dependent")
+        },
+        make_test_change("unrelated"),
+    ];
     let mut in_flight = HashSet::new();
     let semaphore = Arc::new(Semaphore::new(2));
     let mut join_set = JoinSet::new();
@@ -477,7 +483,7 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             max_parallelism: 2,
             iteration: 1,
             reanalysis_reason: ReanalysisReason::QueueNotification,
-            analyzer: &ready_analysis_result,
+            analyzer: &dependent_ready_analysis_result,
             semaphore,
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
@@ -530,7 +536,7 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
             max_parallelism: 2,
             iteration: 2,
             reanalysis_reason: ReanalysisReason::ResolveCompletion,
-            analyzer: &ready_analysis_result,
+            analyzer: &dependent_ready_analysis_result,
             semaphore: Arc::new(Semaphore::new(2)),
             join_set: &mut join_set,
             cleanup_guard: &mut cleanup_guard,
@@ -538,9 +544,10 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
         .await
         .or_fail("merged dependency dispatch");
     while join_set.join_next().await.is_some() {}
-    tokio::task::yield_now().await;
     let mut saw_dependent_after_merge = false;
-    while let Ok(event) = rx.try_recv() {
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+    {
         if matches!(
             event,
             ExecutionEvent::ApplyStarted { change_id, .. } if change_id == "dependent"
@@ -551,6 +558,107 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
     assert!(
         saw_dependent_after_merge,
         "dependent must emit ApplyStarted after merge evidence"
+    );
+}
+
+#[tokio::test]
+async fn resolving_dependency_diagnostic_dedupes_and_reemits_after_signature_change() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    init_git_repo(temp.path()).await;
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        temp.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["resolving-a".to_string(), "dependent".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "resolving-a".to_string(),
+            command: "resolve".to_string(),
+        });
+    executor.set_shared_orchestrator_state(shared.clone());
+    let resolving_analysis = crate::analyzer::AnalysisResult {
+        order: vec!["dependent".to_string()],
+        dependencies: HashMap::from([("dependent".to_string(), vec!["resolving-a".to_string()])]),
+        groups: None,
+    };
+    let in_flight = HashSet::new();
+
+    assert!(executor
+        .select_changes_for_dispatch(&resolving_analysis, 1, &in_flight)
+        .await
+        .is_empty());
+    assert!(executor
+        .select_changes_for_dispatch(&resolving_analysis, 1, &in_flight)
+        .await
+        .is_empty());
+    assert_eq!(
+        drain_dependency_events(&mut event_rx, "dependent"),
+        vec!["blocked:resolving-a".to_string()],
+        "unchanged resolving blocker must emit one diagnostic event"
+    );
+
+    shared
+        .write()
+        .await
+        .apply_execution_event(&ExecutionEvent::ResolveFailed {
+            change_id: "resolving-a".to_string(),
+            error: "conflict remains".to_string(),
+        });
+    assert!(executor
+        .select_changes_for_dispatch(&resolving_analysis, 1, &in_flight)
+        .await
+        .is_empty());
+    assert_eq!(
+        drain_dependency_events(&mut event_rx, "dependent"),
+        vec!["blocked:resolving-a".to_string()],
+        "changed blocker signature must re-emit a diagnostic event"
+    );
+}
+
+#[tokio::test]
+async fn metadata_read_failure_blocks_dispatch_even_without_analyzer_dependencies() {
+    let temp = TempDir::new().or_fail("unexpected error");
+    init_git_repo(temp.path()).await;
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        temp.path().to_path_buf(),
+        create_test_config(),
+        Some(event_tx),
+    );
+    let proposal_dir = temp.path().join("openspec/changes/missing-proposal");
+    std::fs::create_dir_all(&proposal_dir).or_fail("create invalid proposal fixture");
+    std::fs::write(
+        proposal_dir.join("proposal.md"),
+        "---\ndependencies: [broken\n---\n# Invalid\n",
+    )
+    .or_fail("write invalid proposal fixture");
+    let analysis = crate::analyzer::AnalysisResult {
+        order: vec!["missing-proposal".to_string()],
+        dependencies: HashMap::new(),
+        groups: None,
+    };
+
+    assert!(executor
+        .select_changes_for_dispatch(&analysis, 1, &HashSet::new())
+        .await
+        .is_empty());
+    let mut saw_metadata_error = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if let ExecutionEvent::Error { message } = event {
+            saw_metadata_error |= message.contains("dependency metadata could not be read");
+        }
+    }
+    assert!(
+        saw_metadata_error,
+        "metadata read failure must block dispatch visibly"
     );
 }
 
@@ -2632,6 +2740,22 @@ async fn capacity_zero_dispatch_diagnostic_guard_suppresses_identical_keys_and_e
             .any(|message| message.contains("max_parallelism=2")),
         "changed max_parallelism should emit a fresh diagnostic; saw {diagnostics:?}"
     );
+}
+
+fn dependent_ready_analysis_result<'a>(
+    changes: &'a [crate::openspec::Change],
+    _in_flight: &'a [String],
+    _iteration: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
+{
+    let order = changes.iter().map(|change| change.id.clone()).collect();
+    Box::pin(async move {
+        crate::analyzer::AnalysisResult {
+            order,
+            dependencies: HashMap::from([("dependent".to_string(), vec!["resolving".to_string()])]),
+            groups: None,
+        }
+    })
 }
 
 fn ready_analysis_result<'a>(
@@ -5686,6 +5810,8 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
 
 #[tokio::test]
 async fn resolve_give_up_promotes_next_waiter_without_user_action() {
+    // This test spawns a retry that uses the process-global merge lock.
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     let repo_dir = TempDir::new().or_fail("create temp repo");
     init_git_repo(repo_dir.path()).await;
     let mut executor =
@@ -5748,13 +5874,11 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
             .contains(&"first".to_string()));
         assert!(guard.global_invariants_hold());
     }
-    let retry_result = tokio::time::timeout(
-        std::time::Duration::from_millis(200),
-        merge_result_rx.recv(),
-    )
-    .await
-    .or_fail("second retry result should arrive")
-    .or_fail("second retry result channel should remain open");
+    let retry_result =
+        tokio::time::timeout(std::time::Duration::from_secs(2), merge_result_rx.recv())
+            .await
+            .or_fail("second retry result should arrive")
+            .or_fail("second retry result channel should remain open");
     assert_eq!(retry_result.change_id, "second");
     assert_eq!(retry_result.origin, MergeResultOrigin::ResolveWaitRetry);
 }

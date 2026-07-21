@@ -16,3 +16,8 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-resolve-dependency-dispatch --archive-gate`
+
+## Acceptance #1 Failure Follow-up
+- [x] Task 6の宣言済みverificationが不足している。`openspec/changes/fix-resolve-dependency-dispatch/tasks.md:8`はresolve継続中の同一blockerが1回だけ診断され、signature変更後に再出力されるintegration検証を要求するが、`src/parallel/tests/executor.rs:558-613`はmissingからrejectedへの変更だけを検証し、resolving blockerを検証していない。resolving状態での診断件数とsignature変更後の再出力をevent receiverで検証する必要がある。なおtasks.mdのactive checkboxは全て[x]、strict/archive-gate validationは成功、worktreeはclean、実行可能pre-commit hookはなく、別のarchive commit-path blockerは確認されなかった。
+- [x] 依存metadataの取得・解析失敗がfail-openになる。`src/openspec.rs:89-104,123-140`はproposal読取失敗または不正YAMLを空のdependenciesへ変換し、`src/parallel/queue_state.rs:604-621`は解析成功可否を確認せずanalyzer出力と結合する。このためanalyzerにも依存がない場合、仕様の「dependency metadata取得失敗はfail-closed」を満たさずdispatch可能になる。厳格なmetadata読取結果をdispatch gateへ渡し、読取・解析失敗時に候補をblockする必要がある。
+- [x] 対象品質gateが成功していない。`cargo test parallel::tests::executor`で`src/parallel/tests/executor.rs`の`resolve_give_up_promotes_next_waiter_without_user_action`が`second retry result should arrive: deadline has elapsed`により失敗した（101 passed、1 failed、1 ignored）。`openspec/changes/fix-resolve-dependency-dispatch/tasks.md:9`の全コマンド成功という完了記録と矛盾する。失敗を修正して対象suite全体を再実行する必要がある。

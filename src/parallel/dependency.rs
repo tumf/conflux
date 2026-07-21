@@ -122,10 +122,7 @@ impl DependencyContext {
             &self.rejected_ids,
         );
 
-        if matches!(
-            class,
-            DependencyTargetClass::Missing | DependencyTargetClass::Rejected
-        ) {
+        if matches!(class, DependencyTargetClass::Rejected) {
             return class;
         }
 
@@ -357,6 +354,10 @@ mod tests {
         assert_eq!(
             context.classify("archived-a"),
             DependencyTargetClass::Archived
+        );
+        assert_eq!(
+            context.classify("resolving-a"),
+            DependencyTargetClass::Resolving
         );
         assert_eq!(
             context.classify("resolving-a"),

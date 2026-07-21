@@ -601,14 +601,43 @@ impl ParallelExecutor {
             }
 
             // Check if change has unresolved dependencies
-            let metadata_dependencies = crate::openspec::parse_proposal_metadata_from_file(
-                &self
-                    .repo_root
-                    .join("openspec/changes")
-                    .join(change_id)
-                    .join("proposal.md"),
-            )
-            .dependencies;
+            let proposal_path = self
+                .repo_root
+                .join("openspec/changes")
+                .join(change_id)
+                .join("proposal.md");
+            let metadata_dependencies = if proposal_path.exists() {
+                match crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal_path)
+                {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => {
+                        let message = format!(
+                            "Change '{}' blocked because dependency metadata could not be read from '{}': {}",
+                            change_id,
+                            proposal_path.display(),
+                            error
+                        );
+                        warn!("{}", message);
+                        if self.should_emit_dependency_blocked_transition(
+                            change_id,
+                            &[(change_id.clone(), DependencyTargetClass::Error)],
+                        ) {
+                            send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::DependencyBlocked {
+                                    change_id: change_id.clone(),
+                                    dependency_ids: vec![change_id.clone()],
+                                },
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let mut dependencies = analysis_result
                 .dependencies
                 .get(change_id)
@@ -2250,14 +2279,29 @@ impl ParallelExecutor {
                 continue;
             }
 
-            let metadata_dependencies = crate::openspec::parse_proposal_metadata_from_file(
-                &self
-                    .repo_root
-                    .join("openspec/changes")
-                    .join(&change.id)
-                    .join("proposal.md"),
-            )
-            .dependencies;
+            let proposal_path = self
+                .repo_root
+                .join("openspec/changes")
+                .join(&change.id)
+                .join("proposal.md");
+            let metadata_dependencies = if proposal_path.exists() {
+                match crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal_path)
+                {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => {
+                        warn!(
+                            change_id = %change.id,
+                            proposal = %proposal_path.display(),
+                            error = %error,
+                            "Blocking queue classification because dependency metadata could not be read"
+                        );
+                        classification.dependency_blocked.push(change.id.clone());
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let mut dependencies = change.dependencies.clone();
             for dep_id in metadata_dependencies {
                 if dep_id != change.id && !dependencies.contains(&dep_id) {
