@@ -1007,14 +1007,6 @@ pub async fn run_orchestrator_parallel(
     // Get repo root
     let repo_root = std::env::current_dir()?;
 
-    if explicit_retry {
-        for change_id in &change_ids {
-            crate::parallel::acceptance_state::consume_resumable_acceptance_marker(
-                &repo_root, change_id,
-            )?;
-        }
-    }
-
     // Create ParallelRunService and bind it to the caller-owned reducer so empty
     // manual resolve startup observes the same ResolveWait/RejectWait intent that
     // accepted the TUI command.
@@ -1190,6 +1182,7 @@ pub async fn run_orchestrator_parallel(
             Some(Arc::new(dynamic_queue.clone())),
             Some(manual_resolve_counter.clone()),
             Some(shared_state.clone()),
+            explicit_retry,
         ) => {
             result
         }

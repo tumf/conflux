@@ -7,7 +7,7 @@ static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 use crate::error::{OrchestratorError, Result};
 
-const CHECKPOINT_FILE: &str = "ACCEPTANCE_STATE.json";
+const CHECKPOINT_FILE: &str = ".cflx/acceptance-state.json";
 const BLOCKED_MARKER_FILE: &str = "APPLY_BLOCKED/marker.md";
 const MARKER_VERSION: &str = "acceptance-stalled-v1";
 
@@ -230,11 +230,35 @@ pub fn record_acceptance_retry_context(
     save_acceptance_state(workspace_path, state)
 }
 
+#[allow(dead_code)]
 pub fn write_acceptance_blocked_marker(
     workspace_path: &Path,
     change_id: &str,
     reason: &str,
     evidence: &[String],
+    resumable: bool,
+    next_action: &str,
+) -> Result<()> {
+    write_acceptance_blocked_marker_with_context(
+        workspace_path,
+        change_id,
+        reason,
+        evidence,
+        "unknown",
+        &[],
+        resumable,
+        next_action,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_acceptance_blocked_marker_with_context(
+    workspace_path: &Path,
+    change_id: &str,
+    reason: &str,
+    evidence: &[String],
+    semantic_progress: &str,
+    external_blockers: &[String],
     resumable: bool,
     next_action: &str,
 ) -> Result<()> {
@@ -257,8 +281,8 @@ pub fn write_acceptance_blocked_marker(
             finding_identities: state.previous_finding_identities,
             retry_count: state.cycle_count,
             semantic_fingerprint: state.semantic_fingerprint,
-            semantic_progress: "stalled".to_string(),
-            external_blockers: Vec::new(),
+            semantic_progress: semantic_progress.to_string(),
+            external_blockers: external_blockers.to_vec(),
             resumable,
             next_action: next_action.to_string(),
             worktree_preserved: true,
@@ -376,6 +400,22 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_write_failure_leaves_no_partial_state() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join(".cflx"), "not a directory").unwrap();
+
+        assert!(record_acceptance_retry_context(
+            temp.path(),
+            "abc",
+            "change",
+            &["Finding A".to_string()],
+            1,
+        )
+        .is_err());
+        assert!(!checkpoint_path(temp.path()).exists());
+    }
+
+    #[test]
     fn marker_round_trip_preserves_structured_evidence_and_foreign_markers() {
         let temp = TempDir::new().unwrap();
         record_acceptance_retry_context(temp.path(), "abc", "change", &["evidence".to_string()], 2)
@@ -395,6 +435,8 @@ mod tests {
         assert_eq!(marker.origin, BlockedMarkerOrigin::Acceptance);
         assert_eq!(marker.finding_identities, ["evidence"]);
         assert_eq!(marker.evidence, ["external: detail\n- nested"]);
+        assert_eq!(marker.semantic_progress, "unknown");
+        assert!(marker.external_blockers.is_empty());
         assert!(marker.worktree_preserved);
         assert!(consume_resumable_acceptance_marker(temp.path(), "change").unwrap());
 

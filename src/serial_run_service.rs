@@ -27,7 +27,7 @@ use crate::orchestration::{
 use crate::parallel::acceptance_state::{
     consume_resumable_acceptance_marker, mark_acceptance_failed, mark_acceptance_passed,
     mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
-    record_acceptance_retry_context, write_acceptance_blocked_marker,
+    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context,
 };
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser;
@@ -550,15 +550,6 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok((AcceptanceResult::Gated, _attempt_number, _command)) => {
-                            warn!(
-                                change_id = %change.id,
-                                "Acceptance reported recoverable blocker; returning stalled for explicit unblock/resume"
-                            );
-                            Ok(ChangeProcessResult::Stalled {
-                                error: "Acceptance gated with recoverable blocker".to_string(),
-                            })
-                        }
                         Ok((result, _attempt_number, _command)) => Ok(self
                             .process_acceptance_result(
                                 &change.id,
@@ -720,11 +711,13 @@ impl SerialRunService {
                 if let Err(error) =
                     mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
                         |()| {
-                            write_acceptance_blocked_marker(
+                            write_acceptance_blocked_marker_with_context(
                                 workspace_path,
                                 change_id,
                                 "acceptance_gated",
-                                &[],
+                                &["acceptance emitted gated compatibility token".to_string()],
+                                "stalled",
+                                &["recoverable acceptance gate".to_string()],
                                 true,
                                 "explicit retry",
                             )
@@ -744,10 +737,22 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Fail { findings } => {
-                let retry_count = agent
-                    .get_last_acceptance_attempt(change_id)
-                    .map(|attempt| attempt.attempt)
-                    .unwrap_or(1);
+                let retry_count = match crate::parallel::acceptance_state::load_acceptance_state(
+                    workspace_path,
+                ) {
+                    Ok(Some(state)) => state.cycle_count.saturating_add(1),
+                    Ok(None) => agent
+                        .get_last_acceptance_attempt(change_id)
+                        .map(|attempt| attempt.attempt)
+                        .unwrap_or(1),
+                    Err(error) => {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!(
+                                "Failed to restore acceptance retry checkpoint: {error}"
+                            ),
+                        };
+                    }
+                };
                 if let Err(error) =
                     mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
                         |()| {
@@ -819,10 +824,12 @@ impl SerialRunService {
                 if let Err(error) =
                     mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
                         |()| {
-                            write_acceptance_blocked_marker(
+                            write_acceptance_blocked_marker_with_context(
                                 workspace_path,
                                 change_id,
                                 "permission_stalled",
+                                &evidence,
+                                "stalled",
                                 &evidence,
                                 true,
                                 &blocker.next_action,
@@ -1278,6 +1285,13 @@ mod tests {
             ChangeProcessResult::Stalled { ref error }
             if error == "Acceptance gated with recoverable blocker"
         ));
+        let marker =
+            crate::parallel::acceptance_state::parse_blocked_marker(temp_dir.path(), "test-change")
+                .unwrap()
+                .unwrap();
+        assert_eq!(marker.reason, "acceptance_gated");
+        assert_eq!(marker.semantic_progress, "stalled");
+        assert_eq!(marker.external_blockers, ["recoverable acceptance gate"]);
     }
 
     #[test]

@@ -27,8 +27,9 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::{
-    load_acceptance_state, mark_acceptance_failed, mark_acceptance_passed, mark_acceptance_started,
-    mark_apply_completed, record_acceptance_retry_context, write_acceptance_blocked_marker,
+    consume_resumable_acceptance_marker, load_acceptance_state, mark_acceptance_failed,
+    mark_acceptance_passed, mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
+    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context,
 };
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
@@ -79,6 +80,43 @@ mod tests {
             .current_dir(path)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn explicit_retry_consumes_only_the_resolved_workspace_marker() {
+        let base = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+            base.path(),
+            "change",
+            "base marker",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+            workspace.path(),
+            "change",
+            "workspace marker",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+
+        assert!(
+            crate::parallel::acceptance_state::consume_resumable_acceptance_marker(
+                workspace.path(),
+                "change",
+            )
+            .unwrap()
+        );
+        assert!(
+            crate::parallel::acceptance_state::parse_blocked_marker(base.path(), "change")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -638,6 +676,10 @@ impl ParallelExecutor {
         )
         .await?;
 
+        if self.explicit_retry {
+            consume_resumable_acceptance_marker(&workspace_val.path, &change_id)?;
+        }
+
         // Track workspace for cleanup
         cleanup_guard.track(workspace_val.name.clone(), workspace_val.path.clone());
 
@@ -695,11 +737,13 @@ impl ParallelExecutor {
                         state
                     }
                     Err(e) => {
-                        warn!(
-                            "State detection failed for '{}': {}, treating as Created",
-                            change_id, e
-                        );
-                        WorkspaceState::Created
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!("Failed to detect workspace state: {e}")),
+                            rejected: None,
+                        };
                     }
                 }
             } else {
@@ -746,6 +790,28 @@ impl ParallelExecutor {
             // duplicate apply commits or masks already-complete work as a fresh start.
             if matches!(resume_action, ResumeAction::Blocked) {
                 if let Some(ref tx) = event_tx {
+                    if let Ok(Some(marker)) = parse_blocked_marker(&workspace.path, &change_id) {
+                        let summary = format!(
+                            "{}; evidence: {}; resumable: {}; next action: {}",
+                            marker.reason,
+                            marker.evidence.join(" | "),
+                            marker.resumable,
+                            marker.next_action,
+                        );
+                        let blocker = crate::events::StalledBlocker::acceptance_infrastructure(summary);
+                        let event = if matches!(marker.origin, crate::parallel::acceptance_state::BlockedMarkerOrigin::Acceptance) {
+                            ParallelEvent::AcceptanceGated {
+                                change_id: change_id.clone(),
+                                blocker,
+                            }
+                        } else {
+                            ParallelEvent::ExecutionBlocked {
+                                change_id: change_id.clone(),
+                                blocker,
+                            }
+                        };
+                        let _ = tx.send(event).await;
+                    }
                     let _ = tx
                         .send(ParallelEvent::WorkspaceStatusUpdated {
                             change_id: change_id.clone(),
@@ -864,17 +930,36 @@ impl ParallelExecutor {
                 }
             }
 
-            // Create agent for acceptance testing
+            // Create agent for acceptance testing.
             let mut agent =
                 AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
-            agent.seed_acceptance_history(acceptance_history.lock().await.clone());
+            let mut restored_history = acceptance_history.lock().await.clone();
 
-            // Track apply+acceptance cycles to prevent infinite loops
+            // Track apply+acceptance cycles to prevent infinite loops.
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
-            let mut cycle_count = load_acceptance_state(&workspace.path)
-                .ok()
-                .flatten()
-                .map_or(0, |state| state.cycle_count);
+            let checkpoint = match load_acceptance_state(&workspace.path) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: Some(format!("Failed to restore acceptance checkpoint: {error}")),
+                        rejected: None,
+                    };
+                }
+            };
+            if let Some(state) = checkpoint.as_ref() {
+                if !state.previous_finding_identities.is_empty() {
+                    restored_history.set_follow_up_findings(
+                        &change_id,
+                        state.cycle_count,
+                        state.previous_finding_identities.clone(),
+                    );
+                }
+            }
+            agent.seed_acceptance_history(restored_history);
+            let mut cycle_count = checkpoint.as_ref().map_or(0, |state| state.cycle_count);
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
             // Create a per-change cancel token that monitors both global cancel and single-change stop
@@ -1882,7 +1967,16 @@ impl ParallelExecutor {
                     )) => {
                         let evidence = vec![blocker.summary()];
                         if let Err(error) = mark_acceptance_failed(&workspace.path, &revision, Some(&change_id))
-                            .and_then(|()| write_acceptance_blocked_marker(&workspace.path, &change_id, "permission_stalled", &evidence, true, "explicit retry"))
+                            .and_then(|()| write_acceptance_blocked_marker_with_context(
+                                &workspace.path,
+                                &change_id,
+                                "permission_stalled",
+                                &evidence,
+                                "stalled",
+                                &evidence,
+                                true,
+                                "explicit retry",
+                            ))
                         {
                             cancel_monitor.abort();
                             return WorkspaceResult {
@@ -1979,6 +2073,34 @@ impl ParallelExecutor {
                                 "acceptance emitted gated compatibility token without a dedicated blocker artifact".to_string()
                             });
                         let blocker = crate::events::StalledBlocker::acceptance_infrastructure(blocker_summary);
+                        let evidence = vec![blocker.summary()];
+                        if let Err(error) = mark_acceptance_failed(
+                            &workspace.path,
+                            &base_revision,
+                            Some(&change_id),
+                        )
+                        .and_then(|()| {
+                            write_acceptance_blocked_marker_with_context(
+                                &workspace.path,
+                                &change_id,
+                                "acceptance_gated",
+                                &evidence,
+                                "stalled",
+                                &evidence,
+                                true,
+                                "explicit retry",
+                            )
+                        }) {
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Failed to persist acceptance stalled evidence: {error}"
+                                )),
+                                rejected: None,
+                            };
+                        }
                         warn!(
                             "Acceptance gated for {} - recording non-terminal stalled hold",
                             change_id
