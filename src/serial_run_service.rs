@@ -1467,6 +1467,57 @@ mod tests {
     }
 
     #[test]
+    fn serial_latest_fail_reconciles_completed_findings_with_parallel_parity() {
+        let temp_dir = TempDir::new().unwrap();
+        let change_id = "test-change";
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 1\n- [x] [SAME_FINDING] fixed wording\n- [x] [RETIRED_FINDING] fixed and not reported again\n- [x] [DIFFERENT_FINDING] unrelated completed defect\n",
+        )
+        .unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let findings = vec![
+            "[SAME_FINDING] defect still present with new evidence".to_string(),
+            "[NEW_FINDING] distinct newly reported defect".to_string(),
+        ];
+
+        let result = service.process_acceptance_result(
+            change_id,
+            temp_dir.path(),
+            "test-revision",
+            &agent,
+            AcceptanceResult::Fail {
+                findings: findings.clone(),
+            },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { findings: returned }
+            if returned == findings
+        ));
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("- [ ] [SAME_FINDING] defect still present with new evidence"));
+        assert!(content.contains("- [ ] [NEW_FINDING] distinct newly reported defect"));
+        assert!(!content.contains("RETIRED_FINDING"));
+        assert!(!content.contains("DIFFERENT_FINDING"));
+        assert_eq!(
+            crate::task_parser::parse_file(&tasks_path, None).unwrap(),
+            TaskProgress::with_counts(1, 3)
+        );
+    }
+
+    #[test]
     fn acceptance_fail_uses_recorded_attempt_number_for_follow_up() {
         use crate::agent::AgentRunner;
         use crate::history::AcceptanceAttempt;
