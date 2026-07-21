@@ -966,7 +966,18 @@ impl AgentRunner {
     /// Get the last findings from the most recent acceptance attempt.
     /// Returns None if there are no previous attempts or the last attempt has no findings.
     pub fn get_last_acceptance_findings(&self, change_id: &str) -> Option<Vec<String>> {
-        self.acceptance_history.last_findings(change_id)
+        self.acceptance_history
+            .last_findings(change_id)
+            .or_else(|| {
+                self.acceptance_history
+                    .last_follow_up_findings(change_id)
+                    .map(|(_, findings)| findings)
+            })
+    }
+
+    #[allow(dead_code)] // Exposes restart-restored baseline for serial acceptance regression coverage.
+    pub fn get_restored_acceptance_semantic_fingerprint(&self, change_id: &str) -> Option<String> {
+        self.acceptance_history.semantic_fingerprint(change_id)
     }
 
     pub fn seed_acceptance_history(&mut self, history: crate::history::AcceptanceHistory) {

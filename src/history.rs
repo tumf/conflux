@@ -380,6 +380,8 @@ pub struct AcceptanceHistory {
     attempts: HashMap<String, Vec<AcceptanceAttempt>>,
     /// Canonical FAIL findings pending the next apply retry.
     follow_up_findings: HashMap<String, (u32, Vec<String>)>,
+    /// Workspace checkpoint semantic baseline for restart-safe acceptance retries.
+    semantic_fingerprints: HashMap<String, String>,
 }
 
 impl AcceptanceHistory {
@@ -388,6 +390,7 @@ impl AcceptanceHistory {
         Self {
             attempts: HashMap::new(),
             follow_up_findings: HashMap::new(),
+            semantic_fingerprints: HashMap::new(),
         }
     }
 
@@ -424,6 +427,7 @@ impl AcceptanceHistory {
     pub fn clear(&mut self, change_id: &str) {
         self.attempts.remove(change_id);
         self.follow_up_findings.remove(change_id);
+        self.semantic_fingerprints.remove(change_id);
     }
 
     pub fn set_follow_up_findings(&mut self, change_id: &str, attempt: u32, findings: Vec<String>) {
@@ -433,6 +437,26 @@ impl AcceptanceHistory {
 
     pub fn clear_follow_up_findings(&mut self, change_id: &str) {
         self.follow_up_findings.remove(change_id);
+        self.semantic_fingerprints.remove(change_id);
+    }
+
+    pub fn set_checkpoint(
+        &mut self,
+        change_id: &str,
+        attempt: u32,
+        findings: Vec<String>,
+        semantic_fingerprint: Option<String>,
+    ) {
+        self.set_follow_up_findings(change_id, attempt, findings);
+        if let Some(fingerprint) = semantic_fingerprint {
+            self.semantic_fingerprints
+                .insert(change_id.to_string(), fingerprint);
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by restart diagnostics and serial checkpoint regression coverage.
+    pub fn semantic_fingerprint(&self, change_id: &str) -> Option<String> {
+        self.semantic_fingerprints.get(change_id).cloned()
     }
 
     pub fn last_follow_up_findings(&self, change_id: &str) -> Option<(u32, Vec<String>)> {

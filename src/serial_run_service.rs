@@ -203,6 +203,31 @@ impl SerialRunService {
         Ok(consumed)
     }
 
+    fn restore_acceptance_checkpoint_history(
+        &self,
+        change_id: &str,
+        agent: &mut AgentRunner,
+    ) -> Result<()> {
+        let Some(state) =
+            crate::parallel::acceptance_state::load_acceptance_state(&self.repo_root)?
+        else {
+            return Ok(());
+        };
+        if state.previous_finding_identities.is_empty() {
+            return Ok(());
+        }
+
+        let mut history = crate::history::AcceptanceHistory::new();
+        history.set_checkpoint(
+            change_id,
+            state.cycle_count,
+            state.previous_finding_identities,
+            state.semantic_fingerprint,
+        );
+        agent.seed_acceptance_history(history);
+        Ok(())
+    }
+
     fn preflight_blocked_marker(&mut self, change_id: &str) -> Result<Option<ChangeProcessResult>> {
         if let Some(marker) = parse_blocked_marker(&self.repo_root, change_id)? {
             let error = format!("Blocked marker ({:?}): {}", marker.origin, marker.reason);
@@ -535,6 +560,7 @@ impl SerialRunService {
                     })?;
                     mark_apply_completed(&self.repo_root, &revision, &change.id)?;
                     mark_acceptance_started(&self.repo_root, &revision, &change.id)?;
+                    self.restore_acceptance_checkpoint_history(&change.id, agent)?;
 
                     // Update operation to "acceptance" before running acceptance test
                     Self::update_operation_tracker(&operation_tracker, "acceptance");
@@ -1019,6 +1045,39 @@ mod tests {
         // but select_next_change returns the first match which would be 'b' if it's complete)
         // Actually, reading the implementation, it prioritizes incomplete first, so should be 'a'
         assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn serial_restart_restores_checkpoint_history_before_next_acceptance() {
+        use crate::agent::AgentRunner;
+        use crate::parallel::acceptance_state::record_acceptance_retry_context;
+
+        let temp_dir = TempDir::new().unwrap();
+        record_acceptance_retry_context(
+            temp_dir.path(),
+            "test-revision",
+            "test-change",
+            &["Missing regression coverage".to_string()],
+            2,
+        )
+        .unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+
+        service
+            .restore_acceptance_checkpoint_history("test-change", &mut agent)
+            .unwrap();
+
+        assert_eq!(agent.next_acceptance_attempt_number("test-change"), 3);
+        assert_eq!(
+            agent.get_last_acceptance_findings("test-change"),
+            Some(vec!["missing regression coverage".to_string()])
+        );
+        assert_eq!(
+            agent.get_restored_acceptance_semantic_fingerprint("test-change"),
+            Some("missing regression coverage".to_string())
+        );
     }
 
     #[test]
