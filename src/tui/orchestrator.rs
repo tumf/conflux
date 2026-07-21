@@ -109,6 +109,7 @@ async fn initialize_parallel_shared_state(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator(
     change_ids: Vec<String>,
+    explicit_retry: bool,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
@@ -160,6 +161,11 @@ pub async fn run_orchestrator(
     // Create serial run service for shared state and helpers
     let repo_root = std::env::current_dir()?;
     let mut serial_service = SerialRunService::new(repo_root, config);
+    if explicit_retry {
+        for change_id in &change_ids {
+            serial_service.consume_explicit_acceptance_retry(change_id)?;
+        }
+    }
 
     let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(TuiEventSink::new(tx.clone()))];
     #[cfg(feature = "web-monitoring")]
@@ -976,6 +982,7 @@ pub async fn run_orchestrator(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
+    explicit_retry: bool,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
@@ -1175,6 +1182,7 @@ pub async fn run_orchestrator_parallel(
             Some(Arc::new(dynamic_queue.clone())),
             Some(manual_resolve_counter.clone()),
             Some(shared_state.clone()),
+            explicit_retry,
         ) => {
             result
         }

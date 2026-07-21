@@ -11,7 +11,7 @@
 //! - `dispatch`: per-change dispatch logic
 //! - `orchestration`: order-based re-analysis scheduler loop
 
-mod acceptance_state;
+pub(crate) mod acceptance_state;
 mod archive_state;
 mod builder;
 mod cleanup;
@@ -138,6 +138,8 @@ pub struct ParallelExecutor {
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
+    /// Consume a resumable acceptance marker after resolving its workspace.
+    explicit_retry: bool,
     /// Tracker for failed changes to enable skipping dependent changes
     failed_tracker: FailedChangeTracker,
     /// Change-level dependencies (change_id -> dependency ids)

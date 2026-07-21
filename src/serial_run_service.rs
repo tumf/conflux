@@ -24,9 +24,15 @@ use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
     OutputHandler,
 };
+use crate::parallel::acceptance_state::{
+    consume_resumable_acceptance_marker, mark_acceptance_failed, mark_acceptance_passed,
+    mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
+    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context,
+};
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser;
 use crate::task_parser::TaskProgress;
+use crate::vcs::git::commands::basic::get_current_commit;
 use crate::vcs::VcsBackend;
 
 use std::collections::{HashMap, HashSet};
@@ -188,6 +194,51 @@ impl SerialRunService {
         self.stalled_change_ids.insert(change_id.to_string());
     }
 
+    /// Consume a resumable acceptance marker for an explicit serial retry.
+    pub fn consume_explicit_acceptance_retry(&mut self, change_id: &str) -> Result<bool> {
+        let consumed = consume_resumable_acceptance_marker(&self.repo_root, change_id)?;
+        if consumed {
+            self.stalled_change_ids.remove(change_id);
+        }
+        Ok(consumed)
+    }
+
+    fn restore_acceptance_checkpoint_history(
+        &self,
+        change_id: &str,
+        agent: &mut AgentRunner,
+    ) -> Result<()> {
+        let Some(state) = crate::parallel::acceptance_state::load_acceptance_state_for(
+            &self.repo_root,
+            change_id,
+        )?
+        else {
+            return Ok(());
+        };
+        if state.previous_finding_identities.is_empty() {
+            return Ok(());
+        }
+
+        let mut history = crate::history::AcceptanceHistory::new();
+        history.set_checkpoint(
+            change_id,
+            state.cycle_count,
+            state.previous_finding_identities,
+            state.semantic_fingerprint,
+        );
+        agent.seed_acceptance_history(history);
+        Ok(())
+    }
+
+    fn preflight_blocked_marker(&mut self, change_id: &str) -> Result<Option<ChangeProcessResult>> {
+        if let Some(marker) = parse_blocked_marker(&self.repo_root, change_id)? {
+            let error = format!("Blocked marker ({:?}): {}", marker.origin, marker.reason);
+            self.mark_stalled(change_id, &error);
+            return Ok(Some(ChangeProcessResult::Stalled { error }));
+        }
+        Ok(None)
+    }
+
     /// Process a single iteration for a change.
     ///
     /// This includes:
@@ -218,6 +269,10 @@ impl SerialRunService {
     {
         self.iteration += 1;
         let change_id = &change.id;
+
+        if let Some(result) = self.preflight_blocked_marker(change_id)? {
+            return Ok(result);
+        }
 
         // Check if this is a new change
         let is_new_change = self.current_change_id.as_ref() != Some(change_id);
@@ -476,7 +531,7 @@ impl SerialRunService {
             self.increment_apply_count(&change.id);
 
             // Re-fetch change to get updated task counts after apply
-            let (updated_change, is_complete) = Self::refetch_change_after_apply(&change.id);
+            let (updated_change, is_complete) = self.refetch_change_after_apply(&change.id);
 
             if is_complete || apply_blocked_handoff.is_some() {
                 let updated_change = updated_change.unwrap_or_else(|| change.clone());
@@ -500,6 +555,15 @@ impl SerialRunService {
                         change.id
                     );
 
+                    let revision = get_current_commit(&self.repo_root).await.map_err(|error| {
+                        crate::error::OrchestratorError::AgentCommand(format!(
+                            "Failed to determine acceptance revision: {error}"
+                        ))
+                    })?;
+                    mark_apply_completed(&self.repo_root, &revision, &change.id)?;
+                    mark_acceptance_started(&self.repo_root, &revision, &change.id)?;
+                    self.restore_acceptance_checkpoint_history(&change.id, agent)?;
+
                     // Update operation to "acceptance" before running acceptance test
                     Self::update_operation_tracker(&operation_tracker, "acceptance");
 
@@ -514,19 +578,11 @@ impl SerialRunService {
                     )
                     .await
                     {
-                        Ok((AcceptanceResult::Gated, _attempt_number, _command)) => {
-                            warn!(
-                                change_id = %change.id,
-                                "Acceptance reported recoverable blocker; returning stalled for explicit unblock/resume"
-                            );
-                            Ok(ChangeProcessResult::Stalled {
-                                error: "Acceptance gated with recoverable blocker".to_string(),
-                            })
-                        }
                         Ok((result, _attempt_number, _command)) => Ok(self
                             .process_acceptance_result(
                                 &change.id,
                                 &self.repo_root,
+                                &revision,
                                 agent,
                                 result,
                                 is_single_change_stopped,
@@ -588,8 +644,9 @@ impl SerialRunService {
     /// Re-fetch change to get updated task counts after apply.
     ///
     /// Returns the updated change and whether it's complete.
-    fn refetch_change_after_apply(change_id: &str) -> (Option<Change>, bool) {
-        let updated_changes = openspec::list_changes_native().unwrap_or_default();
+    fn refetch_change_after_apply(&self, change_id: &str) -> (Option<Change>, bool) {
+        let updated_changes =
+            openspec::list_changes_native_from(&self.repo_root).unwrap_or_default();
         let updated_change = updated_changes.iter().find(|c| c.id == change_id).cloned();
         let is_complete = updated_change.as_ref().is_some_and(|c| c.is_complete());
         (updated_change, is_complete)
@@ -603,6 +660,7 @@ impl SerialRunService {
         &self,
         change_id: &str,
         workspace_path: &std::path::Path,
+        revision: &str,
         agent: &AgentRunner,
         acceptance_result: AcceptanceResult,
         is_single_change_stopped: F,
@@ -612,6 +670,13 @@ impl SerialRunService {
     {
         match acceptance_result {
             AcceptanceResult::Pass => {
+                if let Err(error) =
+                    mark_acceptance_passed(workspace_path, revision, Some(change_id))
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance pass checkpoint: {error}"),
+                    };
+                }
                 info!("Acceptance passed for {}, ready for archive", change_id);
                 match task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
                     change_id,
@@ -645,6 +710,19 @@ impl SerialRunService {
                 let max_continues = self.config.get_acceptance_max_continues();
 
                 if continue_count >= max_continues {
+                    if let Err(error) = record_acceptance_retry_context(
+                        workspace_path,
+                        revision,
+                        change_id,
+                        &[],
+                        continue_count,
+                    ) {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!(
+                                "Failed to persist acceptance retry checkpoint: {error}"
+                            ),
+                        };
+                    }
                     warn!(
                         "Acceptance CONTINUE limit ({}) exceeded for {}, treating as FAIL",
                         max_continues, change_id
@@ -659,6 +737,26 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Gated => {
+                if let Err(error) =
+                    mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
+                        |()| {
+                            write_acceptance_blocked_marker_with_context(
+                                workspace_path,
+                                change_id,
+                                "acceptance_gated",
+                                &["acceptance emitted gated compatibility token".to_string()],
+                                "no_semantic_progress",
+                                &["recoverable acceptance gate".to_string()],
+                                true,
+                                "explicit retry",
+                            )
+                        },
+                    )
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance stalled evidence: {error}"),
+                    };
+                }
                 warn!(
                     "Acceptance gated for {} - preserving change as stalled/resumable",
                     change_id
@@ -668,6 +766,39 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::Fail { findings } => {
+                let retry_count = match crate::parallel::acceptance_state::load_acceptance_state(
+                    workspace_path,
+                ) {
+                    Ok(Some(state)) => state.cycle_count.saturating_add(1),
+                    Ok(None) => agent
+                        .get_last_acceptance_attempt(change_id)
+                        .map(|attempt| attempt.attempt)
+                        .unwrap_or(1),
+                    Err(error) => {
+                        return ChangeProcessResult::AcceptanceCommandFailed {
+                            error: format!(
+                                "Failed to restore acceptance retry checkpoint: {error}"
+                            ),
+                        };
+                    }
+                };
+                if let Err(error) =
+                    mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
+                        |()| {
+                            record_acceptance_retry_context(
+                                workspace_path,
+                                revision,
+                                change_id,
+                                &findings,
+                                retry_count,
+                            )
+                        },
+                    )
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance failure checkpoint: {error}"),
+                    };
+                }
                 let blocking_gate_context = findings
                     .first()
                     .cloned()
@@ -718,6 +849,27 @@ impl SerialRunService {
                 ChangeProcessResult::AcceptanceCommandFailed { error }
             }
             AcceptanceResult::PermissionStalled { blocker } => {
+                let evidence = vec![blocker.summary()];
+                if let Err(error) =
+                    mark_acceptance_failed(workspace_path, revision, Some(change_id)).and_then(
+                        |()| {
+                            write_acceptance_blocked_marker_with_context(
+                                workspace_path,
+                                change_id,
+                                "permission_stalled",
+                                &evidence,
+                                "no_semantic_progress",
+                                &evidence,
+                                true,
+                                &blocker.next_action,
+                            )
+                        },
+                    )
+                {
+                    return ChangeProcessResult::AcceptanceCommandFailed {
+                        error: format!("Failed to persist acceptance stalled evidence: {error}"),
+                    };
+                }
                 warn!(
                     "Acceptance stalled for {} due to repeated unresolved permission/tool policy blocker: {}",
                     change_id, blocker.next_action
@@ -831,9 +983,15 @@ impl<'a, O: OutputHandler> common_apply::ApplyEventHandler for SerialApplyEventH
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::default_retry_patterns;
     use crate::config::OrchestratorConfig;
+    use crate::hooks::{HookRunner, HooksConfig};
     use crate::openspec::ProposalMetadata;
+    use crate::orchestration::output::NullOutputHandler;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -898,6 +1056,190 @@ mod tests {
         assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
     }
 
+    #[tokio::test]
+    async fn serial_process_change_restores_checkpoint_before_next_acceptance() {
+        use crate::parallel::acceptance_state::record_acceptance_retry_context;
+
+        let temp_dir = TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test User"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp_dir.path())
+                .output()
+                .unwrap();
+        }
+        let change_id = "serial-restart";
+        let change_dir = temp_dir.path().join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# serial restart\n").unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        record_acceptance_retry_context(
+            temp_dir.path(),
+            "checkpoint-revision",
+            change_id,
+            &["Prior serial finding".to_string()],
+            2,
+        )
+        .unwrap();
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c \"printf '%s\\n' '- [x] done' > openspec/changes/{change_id}/tasks.md\""
+            )),
+            acceptance_command: Some(
+                "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated serial finding'"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = AiCommandRunner::new(
+            CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: default_retry_patterns(),
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 0,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            },
+            Arc::new(Mutex::new(None)),
+        );
+
+        let result = service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                &mut agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+        let checkpoint = crate::parallel::acceptance_state::load_acceptance_state_for(
+            temp_dir.path(),
+            change_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(checkpoint.cycle_count, 3);
+        assert_eq!(
+            checkpoint.previous_finding_identities,
+            ["repeated serial finding"]
+        );
+
+        std::fs::write(change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "prepare foreign checkpoint test"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        record_acceptance_retry_context(
+            temp_dir.path(),
+            "foreign-revision",
+            "foreign-change",
+            &["Foreign serial finding".to_string()],
+            9,
+        )
+        .unwrap();
+        let mut foreign_agent = AgentRunner::new(config);
+        let result = service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                &mut foreign_agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+        let checkpoint = crate::parallel::acceptance_state::load_acceptance_state_for(
+            temp_dir.path(),
+            change_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(checkpoint.cycle_count, 1);
+        assert_eq!(
+            checkpoint.previous_finding_identities,
+            ["repeated serial finding"]
+        );
+    }
+
+    #[test]
+    fn serial_restart_restores_checkpoint_history_before_next_acceptance() {
+        use crate::agent::AgentRunner;
+        use crate::parallel::acceptance_state::record_acceptance_retry_context;
+
+        let temp_dir = TempDir::new().unwrap();
+        record_acceptance_retry_context(
+            temp_dir.path(),
+            "test-revision",
+            "test-change",
+            &["Missing regression coverage".to_string()],
+            2,
+        )
+        .unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+
+        service
+            .restore_acceptance_checkpoint_history("test-change", &mut agent)
+            .unwrap();
+
+        assert_eq!(agent.next_acceptance_attempt_number("test-change"), 3);
+        assert_eq!(
+            agent.get_last_acceptance_findings("test-change"),
+            Some(vec!["missing regression coverage".to_string()])
+        );
+        assert_eq!(
+            agent.get_restored_acceptance_semantic_fingerprint("test-change"),
+            Some("missing regression coverage".to_string())
+        );
+    }
+
     #[test]
     fn test_process_acceptance_result_archive_readiness_fail_blocks_archive_progression() {
         use crate::agent::AgentRunner;
@@ -927,6 +1269,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -989,6 +1332,7 @@ mod tests {
         service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: vec!["canonical second".to_string()],
@@ -1028,6 +1372,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -1060,6 +1405,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Fail {
                 findings: findings.clone(),
@@ -1098,6 +1444,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Pass,
             || false,
@@ -1123,6 +1470,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Pass,
             || false,
@@ -1145,6 +1493,7 @@ mod tests {
         let result = service.process_acceptance_result(
             "test-change",
             temp_dir.path(),
+            "test-revision",
             &agent,
             AcceptanceResult::Gated,
             || false, // Not a single-change stop
@@ -1155,6 +1504,137 @@ mod tests {
             ChangeProcessResult::Stalled { ref error }
             if error == "Acceptance gated with recoverable blocker"
         ));
+        let marker =
+            crate::parallel::acceptance_state::parse_blocked_marker(temp_dir.path(), "test-change")
+                .unwrap()
+                .unwrap();
+        assert_eq!(marker.reason, "acceptance_gated");
+        assert_eq!(marker.semantic_progress, "no_semantic_progress");
+        assert_eq!(marker.external_blockers, ["recoverable acceptance gate"]);
+    }
+
+    #[tokio::test]
+    async fn serial_process_change_stops_at_workspace_marker_before_archive() {
+        use crate::parallel::acceptance_state::write_acceptance_blocked_marker;
+
+        let temp_dir = TempDir::new().unwrap();
+        write_acceptance_blocked_marker(
+            temp_dir.path(),
+            "complete-change",
+            "stalled",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+        let ai_runner = AiCommandRunner::new(
+            CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: default_retry_patterns(),
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 0,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            },
+            Arc::new(Mutex::new(None)),
+        );
+        let result = service
+            .process_change(
+                &create_test_change("complete-change", 1, 1),
+                &mut agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, ChangeProcessResult::Stalled { .. }));
+        assert!(service.is_stalled("complete-change"));
+        assert!(crate::parallel::acceptance_state::parse_blocked_marker(
+            temp_dir.path(),
+            "complete-change"
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn serial_preflight_suppresses_apply_and_archive_for_any_marker() {
+        use crate::parallel::acceptance_state::write_acceptance_blocked_marker;
+
+        let temp_dir = TempDir::new().unwrap();
+        write_acceptance_blocked_marker(
+            temp_dir.path(),
+            "complete-change",
+            "stalled",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        let result = service.preflight_blocked_marker("complete-change").unwrap();
+
+        assert!(matches!(result, Some(ChangeProcessResult::Stalled { .. })));
+        assert!(service.is_stalled("complete-change"));
+    }
+
+    #[test]
+    fn malformed_marker_stops_serial_preflight_and_is_preserved() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join("openspec/changes/blocked/APPLY_BLOCKED/marker.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ malformed").unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        assert!(service.preflight_blocked_marker("blocked").is_err());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn explicit_serial_retry_consumes_only_resumable_acceptance_marker() {
+        use crate::parallel::acceptance_state::write_acceptance_blocked_marker;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        write_acceptance_blocked_marker(
+            temp_dir.path(),
+            "acceptance",
+            "stalled",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        assert!(service
+            .consume_explicit_acceptance_retry("acceptance")
+            .unwrap());
+
+        let apply_marker = temp_dir
+            .path()
+            .join("openspec/changes/apply/APPLY_BLOCKED/marker.md");
+        std::fs::create_dir_all(apply_marker.parent().unwrap()).unwrap();
+        std::fs::write(&apply_marker, "origin: apply\nreason: blocked\n").unwrap();
+        assert!(!service.consume_explicit_acceptance_retry("apply").unwrap());
+        assert!(apply_marker.exists());
     }
 
     #[test]

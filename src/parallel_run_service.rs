@@ -502,8 +502,9 @@ impl ParallelRunService {
         shared_orchestrator_state: Option<
             std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
         >,
+        explicit_retry: bool,
     ) -> Result<()> {
-        let executor = self.create_executor_with_queue_state(
+        let mut executor = self.create_executor_with_queue_state(
             Some(event_tx.clone()),
             cancel_token,
             shared_queue_change,
@@ -511,6 +512,7 @@ impl ParallelRunService {
             manual_resolve_counter,
             shared_orchestrator_state,
         );
+        executor.set_explicit_retry(explicit_retry);
         // Use order-based execution (aligned with spec)
         self.run_parallel_order_based_with_executor(executor, changes, event_tx)
             .await

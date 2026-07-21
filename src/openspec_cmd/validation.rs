@@ -708,6 +708,8 @@ pub(super) fn validate_tasks_content(
             continue;
         }
 
+        // Runtime-owned acceptance findings are not implementation tasks and have no
+        // implementation verification contract. The runtime removes them after PASS.
         if in_runtime_acceptance_follow_up {
             continue;
         }

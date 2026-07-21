@@ -141,6 +141,7 @@ impl ParallelExecutor {
             max_conflict_retries: DEFAULT_MAX_CONFLICT_RETRIES,
             repo_root,
             no_resume: false,
+            explicit_retry: false,
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             resolve_wait_changes: HashSet::new(),
@@ -196,6 +197,10 @@ impl ParallelExecutor {
     /// are reused to resume interrupted work.
     pub fn set_no_resume(&mut self, no_resume: bool) {
         self.no_resume = no_resume;
+    }
+
+    pub fn set_explicit_retry(&mut self, explicit_retry: bool) {
+        self.explicit_retry = explicit_retry;
     }
 
     /// Set shared reducer state for scheduler-owned resolve retry intent.

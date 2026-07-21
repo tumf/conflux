@@ -26,6 +26,12 @@ use crate::orchestration::{
 use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
+use super::acceptance_state::{
+    consume_resumable_acceptance_marker, load_acceptance_state_for, mark_acceptance_failed,
+    mark_acceptance_passed, mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
+    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context, BlockedMarker,
+    BlockedMarkerOrigin,
+};
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
@@ -37,6 +43,40 @@ use super::workspace;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 
+fn stalled_blocker_from_marker(marker: &BlockedMarker) -> crate::events::StalledBlocker {
+    crate::events::StalledBlocker {
+        category: "acceptance_marker".to_string(),
+        phase: marker.phase.clone(),
+        gate: marker.reason.clone(),
+        error_summary: marker.reason.clone(),
+        evidence: marker.evidence.clone(),
+        next_action: marker.next_action.clone(),
+        resumable: marker.resumable,
+        worktree_preserved: marker.worktree_preserved,
+    }
+}
+
+fn restore_acceptance_checkpoint(
+    history: &mut crate::history::AcceptanceHistory,
+    change_id: &str,
+    checkpoint: Option<&super::acceptance_state::AcceptanceState>,
+) {
+    let Some(state) = checkpoint else {
+        return;
+    };
+    if !state.previous_finding_identities.is_empty()
+        || state.semantic_fingerprint.is_some()
+        || state.cycle_count > 0
+    {
+        history.set_checkpoint(
+            change_id,
+            state.cycle_count,
+            state.previous_finding_identities.clone(),
+            state.semantic_fingerprint.clone(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -44,6 +84,9 @@ mod tests {
         resume_cycle_flags, should_run_apply, ResumeAction,
     };
     use crate::execution::state::WorkspaceState;
+    use crate::parallel::acceptance_state::{
+        AcceptanceState, AcceptanceStateStatus, BlockedMarker, BlockedMarkerOrigin,
+    };
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -75,6 +118,117 @@ mod tests {
             .current_dir(path)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn resumed_marker_restores_structured_stalled_metadata() {
+        let marker = BlockedMarker {
+            origin: BlockedMarkerOrigin::Acceptance,
+            reason: "acceptance_gated".to_string(),
+            phase: "acceptance".to_string(),
+            evidence: vec!["verification output".to_string()],
+            finding_identities: vec!["finding-a".to_string()],
+            retry_count: 2,
+            semantic_fingerprint: Some("finding-a".to_string()),
+            semantic_progress: "no_semantic_progress".to_string(),
+            external_blockers: vec!["verification unavailable".to_string()],
+            resumable: false,
+            next_action: "inspect evidence".to_string(),
+            worktree_preserved: true,
+        };
+
+        let blocker = super::stalled_blocker_from_marker(&marker);
+
+        assert_eq!(blocker.phase, "acceptance");
+        assert_eq!(blocker.gate, "acceptance_gated");
+        assert_eq!(blocker.evidence, ["verification output"]);
+        assert!(!blocker.resumable);
+        assert_eq!(blocker.next_action, "inspect evidence");
+    }
+
+    #[test]
+    fn parallel_restart_restores_acceptance_checkpoint_semantic_fingerprint() {
+        let checkpoint = AcceptanceState {
+            state: AcceptanceStateStatus::Failed,
+            revision: "revision".to_string(),
+            updated_at: "now".to_string(),
+            workspace_path: "/workspace".to_string(),
+            change_id: Some("change".to_string()),
+            previous_finding_identities: vec!["missing regression coverage".to_string()],
+            semantic_fingerprint: Some("semantic baseline".to_string()),
+            cycle_count: 2,
+        };
+        let mut history = crate::history::AcceptanceHistory::new();
+
+        super::restore_acceptance_checkpoint(&mut history, "change", Some(&checkpoint));
+
+        assert_eq!(
+            history.last_follow_up_findings("change"),
+            Some((2, vec!["missing regression coverage".to_string()]))
+        );
+        assert_eq!(
+            history.semantic_fingerprint("change"),
+            Some("semantic baseline".to_string())
+        );
+    }
+
+    #[test]
+    fn parallel_restart_ignores_foreign_checkpoint() {
+        let checkpoint = AcceptanceState {
+            state: AcceptanceStateStatus::Failed,
+            revision: "revision".to_string(),
+            updated_at: "now".to_string(),
+            workspace_path: "/workspace".to_string(),
+            change_id: Some("first-change".to_string()),
+            previous_finding_identities: vec!["finding-a".to_string()],
+            semantic_fingerprint: Some("semantic baseline".to_string()),
+            cycle_count: 2,
+        };
+        let mut history = crate::history::AcceptanceHistory::new();
+
+        // Dispatch loads this through load_acceptance_state_for, which returns None.
+        super::restore_acceptance_checkpoint(&mut history, "second-change", None);
+
+        assert_eq!(history.count("second-change"), 0);
+        assert_eq!(history.semantic_fingerprint("second-change"), None);
+        assert_eq!(checkpoint.change_id.as_deref(), Some("first-change"));
+    }
+
+    #[test]
+    fn explicit_retry_consumes_only_the_resolved_workspace_marker() {
+        let base = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+            base.path(),
+            "change",
+            "base marker",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+            workspace.path(),
+            "change",
+            "workspace marker",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+
+        assert!(
+            crate::parallel::acceptance_state::consume_resumable_acceptance_marker(
+                workspace.path(),
+                "change",
+            )
+            .unwrap()
+        );
+        assert!(
+            crate::parallel::acceptance_state::parse_blocked_marker(base.path(), "change")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -634,6 +788,10 @@ impl ParallelExecutor {
         )
         .await?;
 
+        if self.explicit_retry {
+            consume_resumable_acceptance_marker(&workspace_val.path, &change_id)?;
+        }
+
         // Track workspace for cleanup
         cleanup_guard.track(workspace_val.name.clone(), workspace_val.path.clone());
 
@@ -691,11 +849,13 @@ impl ParallelExecutor {
                         state
                     }
                     Err(e) => {
-                        warn!(
-                            "State detection failed for '{}': {}, treating as Created",
-                            change_id, e
-                        );
-                        WorkspaceState::Created
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!("Failed to detect workspace state: {e}")),
+                            rejected: None,
+                        };
                     }
                 }
             } else {
@@ -742,6 +902,21 @@ impl ParallelExecutor {
             // duplicate apply commits or masks already-complete work as a fresh start.
             if matches!(resume_action, ResumeAction::Blocked) {
                 if let Some(ref tx) = event_tx {
+                    if let Ok(Some(marker)) = parse_blocked_marker(&workspace.path, &change_id) {
+                        let blocker = stalled_blocker_from_marker(&marker);
+                        let event = if matches!(marker.origin, BlockedMarkerOrigin::Acceptance) {
+                            ParallelEvent::AcceptanceGated {
+                                change_id: change_id.clone(),
+                                blocker,
+                            }
+                        } else {
+                            ParallelEvent::ExecutionBlocked {
+                                change_id: change_id.clone(),
+                                blocker,
+                            }
+                        };
+                        let _ = tx.send(event).await;
+                    }
                     let _ = tx
                         .send(ParallelEvent::WorkspaceStatusUpdated {
                             change_id: change_id.clone(),
@@ -860,14 +1035,33 @@ impl ParallelExecutor {
                 }
             }
 
-            // Create agent for acceptance testing
+            // Create agent for acceptance testing.
             let mut agent =
                 AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
-            agent.seed_acceptance_history(acceptance_history.lock().await.clone());
 
-            // Track apply+acceptance cycles to prevent infinite loops
+            // Track apply+acceptance cycles to prevent infinite loops.
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
-            let mut cycle_count = 0u32;
+            let checkpoint = match load_acceptance_state_for(&workspace.path, &change_id) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: Some(format!("Failed to restore acceptance checkpoint: {error}")),
+                        rejected: None,
+                    };
+                }
+            };
+            {
+                let mut shared_history = acceptance_history.lock().await;
+                restore_acceptance_checkpoint(
+                    &mut shared_history,
+                    &change_id,
+                    checkpoint.as_ref(),
+                );
+            }
+            let mut cycle_count = checkpoint.as_ref().map_or(0, |state| state.cycle_count);
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
             // Create a per-change cancel token that monitors both global cancel and single-change stop
@@ -1142,6 +1336,25 @@ impl ParallelExecutor {
                 resume_cycle_flags(resume_action);
 
             let _apply_revision = loop {
+                cycle_count += 1;
+                if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
+                    error!(
+                        "Max apply+acceptance cycles ({}) reached for {}",
+                        MAX_APPLY_ACCEPTANCE_CYCLES, change_id
+                    );
+                    cancel_monitor.abort();
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: Some(format!(
+                            "Max apply+acceptance cycles ({}) reached",
+                            MAX_APPLY_ACCEPTANCE_CYCLES
+                        )),
+                        rejected: None,
+                    };
+                }
+
                 // Skip apply only for the first cycle when resuming from an already-applied state.
                 // Even when apply is skipped, this cycle must still execute acceptance unless
                 // resume_action explicitly allows archive continuation.
@@ -1206,25 +1419,6 @@ impl ParallelExecutor {
 
 
                     }
-                }
-
-                cycle_count += 1;
-                if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
-                    error!(
-                        "Max apply+acceptance cycles ({}) reached for {}",
-                        MAX_APPLY_ACCEPTANCE_CYCLES, change_id
-                    );
-                    cancel_monitor.abort();
-                    return WorkspaceResult {
-                        change_id,
-                        workspace_name: workspace.name,
-                        final_revision: None,
-                        error: Some(format!(
-                            "Max apply+acceptance cycles ({}) reached",
-                            MAX_APPLY_ACCEPTANCE_CYCLES
-                        )),
-                        rejected: None,
-                    };
                 }
 
                 // Step 1: Execute apply with cumulative iteration count
@@ -1573,6 +1767,17 @@ impl ParallelExecutor {
                     };
                 }
 
+                if let Err(error) = mark_apply_completed(&workspace.path, &revision, &change_id) {
+                    cancel_monitor.abort();
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: Some(format!("Failed to persist acceptance checkpoint after apply: {error}")),
+                        rejected: None,
+                    };
+                }
+
                 // Send ApplyCompleted event
                 if let Some(ref tx) = event_tx {
                     let _ = tx
@@ -1617,6 +1822,16 @@ impl ParallelExecutor {
                     }
                     Ok((crate::orchestration::AcceptanceResult::Pass, 0))
                 } else {
+                    if let Err(error) = mark_acceptance_started(&workspace.path, &revision, &change_id) {
+                        cancel_monitor.abort();
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(format!("Failed to persist acceptance start checkpoint: {error}")),
+                            rejected: None,
+                        };
+                    }
                     agent.seed_acceptance_history(acceptance_history.lock().await.clone());
                     execute_acceptance_in_workspace(
                         &change_id,
@@ -1635,6 +1850,16 @@ impl ParallelExecutor {
 
                 match acceptance_result {
                     Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
+                        if let Err(error) = mark_acceptance_passed(&workspace.path, &revision, Some(&change_id)) {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Failed to persist acceptance pass checkpoint: {error}")),
+                                rejected: None,
+                            };
+                        }
                         info!("Acceptance passed for {}, proceeding to archive", change_id);
                         match task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
                             &change_id,
@@ -1805,6 +2030,22 @@ impl ParallelExecutor {
                                 }
                             }
                         }
+                        if let Err(error) = record_acceptance_retry_context(
+                            &workspace.path,
+                            &revision,
+                            &change_id,
+                            &findings,
+                            cycle_count,
+                        ) {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Failed to persist acceptance retry checkpoint: {error}")),
+                                rejected: None,
+                            };
+                        }
                         if let Some(ref tx) = event_tx {
                             let _ = tx
                                 .send(ParallelEvent::Log(
@@ -1826,6 +2067,28 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::PermissionStalled { blocker },
                         acceptance_iteration,
                     )) => {
+                        let evidence = vec![blocker.summary()];
+                        if let Err(error) = mark_acceptance_failed(&workspace.path, &revision, Some(&change_id))
+                            .and_then(|()| write_acceptance_blocked_marker_with_context(
+                                &workspace.path,
+                                &change_id,
+                                "permission_stalled",
+                                &evidence,
+                                "no_semantic_progress",
+                                &evidence,
+                                true,
+                                "explicit retry",
+                            ))
+                        {
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!("Failed to persist acceptance stalled evidence: {error}")),
+                                rejected: None,
+                            };
+                        }
                         warn!(
                             "Acceptance stalled for {} on repeated unresolved permission/tool policy denial (cycle {}): {}",
                             change_id,
@@ -1912,6 +2175,34 @@ impl ParallelExecutor {
                                 "acceptance emitted gated compatibility token without a dedicated blocker artifact".to_string()
                             });
                         let blocker = crate::events::StalledBlocker::acceptance_infrastructure(blocker_summary);
+                        let evidence = vec![blocker.summary()];
+                        if let Err(error) = mark_acceptance_failed(
+                            &workspace.path,
+                            &base_revision,
+                            Some(&change_id),
+                        )
+                        .and_then(|()| {
+                            write_acceptance_blocked_marker_with_context(
+                                &workspace.path,
+                                &change_id,
+                                "acceptance_gated",
+                                &evidence,
+                                "no_semantic_progress",
+                                &evidence,
+                                true,
+                                "explicit retry",
+                            )
+                        }) {
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(format!(
+                                    "Failed to persist acceptance stalled evidence: {error}"
+                                )),
+                                rejected: None,
+                            };
+                        }
                         warn!(
                             "Acceptance gated for {} - recording non-terminal stalled hold",
                             change_id

@@ -621,6 +621,22 @@ mod validation_tests {
     }
 
     #[test]
+    fn test_validate_tasks_excludes_runtime_acceptance_follow_ups_from_evidence_checks() {
+        let content = "## Implementation Tasks\n- [x] Implement state persistence (verification: unit - `src/state.rs` with `cargo test state`)\n\n## Acceptance #6 Failure Follow-up\n- [ ] Archive gate is blocked until implementation evidence is recorded\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "error", Some("implementation"), None);
+
+        assert!(
+            errors.is_empty(),
+            "runtime follow-up must not fail archive validation: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "runtime follow-up must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_tasks_with_verification_hint() {
         let content =
             "- [ ] Add a new feature (verification: unit - cargo test covers the feature)\n";

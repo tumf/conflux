@@ -1192,25 +1192,18 @@ The scheduler SHALL be able to re-own and resume archive finalization repair for
 
 ### Requirement: Stalled blocker metadata
 
-When a change enters non-terminal stalled state because of an infrastructure, external dependency, credential, or pending-verification blocker, reducer-owned state SHALL preserve operator-facing metadata sufficient to distinguish the blocker from dependency blocking and terminal rejection.
+When a change enters non-terminal stalled state, reducer-owned state and workspace-local blocker evidence MUST preserve operator-facing metadata sufficient to distinguish the blocker from dependency blocking and terminal rejection. Acceptance-generated evidence MUST include failed phase, stable reason, observed finding summary and identities when available, retry count, semantic progress result, retained external blockers, resumability, recommended next action, origin, and worktree preservation context.
 
-The metadata SHALL include, either as individual fields or an equivalent structured string, the failed gate or phase, observed error summary, resumability, recommended next action, and worktree preservation context.
+#### Scenario: acceptance stalled evidence survives runtime-state deletion
 
-#### Scenario: stalled blocker records next action
+- **GIVEN** an acceptance-generated stalled marker exists in the workspace
+- **WHEN** out-of-worktree runtime state is deleted and Conflux restarts
+- **THEN** the same stalled reason, evidence, resumability, and next action are derived from the workspace
+- **AND** display status remains execution `stalled`
 
-- **GIVEN** acceptance cannot run an API startup smoke gate because Docker image pull failed with DNS timeout
-- **WHEN** the change enters stalled state
-- **THEN** blocked metadata identifies the blocker as infrastructure or equivalent
-- **AND** the metadata includes the failed gate or phase
-- **AND** the metadata summarizes the observed Docker/DNS error
-- **AND** the metadata states the hold is resumable
-- **AND** the metadata recommends restoring Docker image or network/DNS availability and rerunning the gate
+#### Scenario: acceptance and apply blockers remain distinguishable
 
-#### Scenario: dependency blocked and execution stalled remain distinguishable
-
-- **GIVEN** change `beta` is waiting on an unresolved dependency
-- **AND** change `gamma` is held by an infrastructure verification blocker
-- **WHEN** display statuses are derived from reducer-owned state
-- **THEN** `beta` displays as dependency `blocked`
-- **AND** `gamma` displays as execution `stalled`
-- **AND** neither state is derived from base-branch `REJECTED.md`
+- **GIVEN** workspace blocker evidence is loaded
+- **WHEN** runtime determines whether explicit acceptance retry may consume it
+- **THEN** marker origin and resumability are available to the decision
+- **AND** legacy or unknown-origin evidence is not assumed to be acceptance-generated

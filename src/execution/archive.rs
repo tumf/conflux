@@ -362,6 +362,8 @@ async fn try_direct_archive_commit(
         "Attempting direct archive commit before AI resolve"
     );
 
+    crate::parallel::acceptance_state::delete_acceptance_state(repo_root)?;
+
     let add_output = Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
@@ -1482,6 +1484,60 @@ mod tests {
             .await
             .unwrap();
         assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_direct_archive_commit_excludes_acceptance_checkpoint() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        init_git_repo(repo_root);
+
+        fs::write(repo_root.join("README.md"), "base").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Base"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        let archive_dir = repo_root.join("openspec/changes/archive/change-a");
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(archive_dir.join("archive.txt"), "archived").unwrap();
+        let checkpoint = repo_root.join(".cflx/acceptance-state.json");
+        fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
+        fs::write(&checkpoint, "{}\n").unwrap();
+
+        let config = OrchestratorConfig {
+            resolve_command: Some("sh -c 'exit 42'".to_string()),
+            ..Default::default()
+        };
+        let agent = AgentRunner::new(config.clone());
+        let ai_runner = make_ai_runner(&config);
+
+        ensure_archive_commit(
+            "change-a",
+            repo_root,
+            &agent,
+            &ai_runner,
+            VcsBackend::Git,
+            |_| async {},
+        )
+        .await
+        .unwrap();
+
+        assert!(!checkpoint.exists());
+        let committed_files = Command::new("git")
+            .args(["show", "--format=", "--name-only", "HEAD"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&committed_files.stdout)
+            .contains(".cflx/acceptance-state.json"));
     }
 
     #[cfg(unix)]
