@@ -7,12 +7,6 @@ const CFLX_PROPOSAL_SKILL_MD: &str = include_str!("../skills/cflx-proposal/SKILL
 
 // cflx-workflow skill files (compatibility router)
 const CFLX_WORKFLOW_SKILL_MD: &str = include_str!("../skills/cflx-workflow/SKILL.md");
-const CFLX_WORKFLOW_REF_ACCEPT: &str =
-    include_str!("../skills/cflx-workflow/references/cflx-accept.md");
-const CFLX_WORKFLOW_REF_APPLY: &str =
-    include_str!("../skills/cflx-workflow/references/cflx-apply.md");
-const CFLX_WORKFLOW_REF_ARCHIVE: &str =
-    include_str!("../skills/cflx-workflow/references/cflx-archive.md");
 
 // cflx-run skill files
 const CFLX_RUN_SKILL_MD: &str = include_str!("../skills/cflx-run/SKILL.md");
@@ -40,14 +34,7 @@ const CFLX_RESOLVE_SKILL_MD: &str = include_str!("../skills/cflx-resolve/SKILL.m
 pub fn get_cflx_embedded_skills() -> Result<Vec<Skill>> {
     let proposal = register_embedded_skill(CFLX_PROPOSAL_SKILL_MD, &[])?;
 
-    let workflow = register_embedded_skill(
-        CFLX_WORKFLOW_SKILL_MD,
-        &[
-            ("references/cflx-accept.md", CFLX_WORKFLOW_REF_ACCEPT),
-            ("references/cflx-apply.md", CFLX_WORKFLOW_REF_APPLY),
-            ("references/cflx-archive.md", CFLX_WORKFLOW_REF_ARCHIVE),
-        ],
-    )?;
+    let workflow = register_embedded_skill(CFLX_WORKFLOW_SKILL_MD, &[])?;
 
     let run = register_embedded_skill(
         CFLX_RUN_SKILL_MD,
@@ -144,30 +131,9 @@ mod tests {
             "cflx-proposal must NOT have scripts/cflx.py (replaced by native CLI)"
         );
 
-        // cflx-workflow: compatibility router with references, no scripts/cflx.py
+        // cflx-workflow: self-contained compatibility router, no auxiliary files
         let workflow = skills.iter().find(|s| s.name == "cflx-workflow").unwrap();
-        assert!(
-            !workflow.auxiliary_files.contains_key("scripts/cflx.py"),
-            "cflx-workflow must NOT have scripts/cflx.py (replaced by native CLI)"
-        );
-        assert!(
-            workflow
-                .auxiliary_files
-                .contains_key("references/cflx-accept.md"),
-            "cflx-workflow must have references/cflx-accept.md"
-        );
-        assert!(
-            workflow
-                .auxiliary_files
-                .contains_key("references/cflx-apply.md"),
-            "cflx-workflow must have references/cflx-apply.md"
-        );
-        assert!(
-            workflow
-                .auxiliary_files
-                .contains_key("references/cflx-archive.md"),
-            "cflx-workflow must have references/cflx-archive.md"
-        );
+        assert!(workflow.auxiliary_files.is_empty());
 
         // cflx-run: has reference
         let run = skills.iter().find(|s| s.name == "cflx-run").unwrap();
@@ -588,10 +554,6 @@ mod tests {
             ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
             ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
             ("cflx-workflow", CFLX_WORKFLOW_SKILL_MD),
-            (
-                "cflx-workflow references/cflx-accept.md",
-                CFLX_WORKFLOW_REF_ACCEPT,
-            ),
             (".opencode/commands/cflx-accept.md", CFLX_ACCEPT_COMMAND_MD),
         ] {
             assert!(
@@ -634,19 +596,10 @@ mod tests {
             );
         }
 
-        // cflx-workflow references/cflx-accept.md must mention all canonical markers
-        for marker in &canonical_markers {
-            assert!(
-                CFLX_WORKFLOW_REF_ACCEPT.contains(marker),
-                "cflx-workflow references/cflx-accept.md must document verdict marker '{}'",
-                marker
-            );
-        }
-
         // Legacy compatibility marker should remain documented during migration.
         assert!(
-            CFLX_WORKFLOW_REF_ACCEPT.contains("ACCEPTANCE: BLOCKED"),
-            "cflx-workflow references/cflx-accept.md must document legacy acceptance marker 'ACCEPTANCE: BLOCKED'"
+            CFLX_WORKFLOW_SKILL_MD.contains("ACCEPTANCE: BLOCKED"),
+            "cflx-workflow must document legacy acceptance marker 'ACCEPTANCE: BLOCKED'"
         );
     }
 
@@ -655,27 +608,17 @@ mod tests {
         // Verify the cflx-workflow skill includes formatting prohibitions
         // to prevent drift in legacy-path output.
         assert!(
-            CFLX_WORKFLOW_SKILL_MD.contains("Do NOT wrap the verdict"),
+            CFLX_WORKFLOW_SKILL_MD.contains("Do not wrap verdicts"),
             "cflx-workflow SKILL.md must include verdict formatting prohibition"
         );
     }
 
     #[test]
-    fn test_cflx_workflow_reference_documents_strict_canonical_contract() {
-        // The runtime parser enforces standalone-line canonical matching and
-        // rejects trailing-text/heading-concatenation verdicts. The embedded
-        // workflow reference MUST document both the trailing-text rejection
-        // example and the heading-concatenation rejection example so agents
-        // are warned about the failure modes that drove this contract.
-        for required in &[
-            "NO trailing text",
-            "PASSAll",
-            "NO heading concatenation",
-            "PASS## Acceptance Review Summary",
-        ] {
+    fn test_cflx_workflow_documents_strict_canonical_contract() {
+        for required in &["do not append text", "headings", "code fences"] {
             assert!(
-                CFLX_WORKFLOW_REF_ACCEPT.contains(required),
-                "cflx-workflow references/cflx-accept.md must document '{}'",
+                CFLX_WORKFLOW_SKILL_MD.contains(required),
+                "cflx-workflow must document '{}'",
                 required
             );
         }

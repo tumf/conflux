@@ -1507,7 +1507,7 @@ mod tests {
 
         let prompt = build_apply_prompt(&config, "change-a", "history ctx", "acceptance ctx");
 
-        assert!(prompt.contains("Apply change id: change-a"));
+        assert!(prompt.contains("change_id: change-a"));
         assert!(prompt.ends_with("apply tail {change_id}"));
         assert!(!prompt.contains("wrong archive tail"));
         assert!(!prompt.contains("wrong acceptance tail"));
