@@ -29,6 +29,8 @@ pub(super) struct DependencyContext {
     archived_ids: HashSet<String>,
     rejected_ids: HashSet<String>,
     terminal_error_ids: HashSet<String>,
+    resolving_ids: HashSet<String>,
+    resolve_wait_ids: HashSet<String>,
     effective_dependency_base: Option<String>,
 }
 
@@ -52,15 +54,26 @@ impl DependencyContext {
         in_flight: &HashSet<String>,
         shared_orchestrator_state: Option<&std::sync::Arc<RwLock<OrchestratorState>>>,
     ) -> Self {
-        let terminal_error_ids = shared_orchestrator_state
+        let (terminal_error_ids, resolving_ids, resolve_wait_ids) = shared_orchestrator_state
             .and_then(|state| state.try_read().ok())
             .map(|state| {
-                state
-                    .initial_change_ids()
-                    .iter()
-                    .filter(|id| state.is_terminal_error_change(id))
-                    .cloned()
-                    .collect::<HashSet<_>>()
+                (
+                    state
+                        .initial_change_ids()
+                        .iter()
+                        .filter(|id| state.is_terminal_error_change(id))
+                        .cloned()
+                        .collect::<HashSet<_>>(),
+                    state
+                        .active_change_ids()
+                        .into_iter()
+                        .filter(|id| state.display_status(id) == "resolving")
+                        .collect::<HashSet<_>>(),
+                    state
+                        .resolve_wait_change_ids()
+                        .into_iter()
+                        .collect::<HashSet<_>>(),
+                )
             })
             .unwrap_or_default();
 
@@ -80,6 +93,8 @@ impl DependencyContext {
             archived = archived_ids.len(),
             rejected = rejected_ids.len(),
             terminal_error = terminal_error_ids.len(),
+            resolving = resolving_ids.len(),
+            resolve_wait = resolve_wait_ids.len(),
             "Built dependency classification context"
         );
 
@@ -91,6 +106,8 @@ impl DependencyContext {
             archived_ids,
             rejected_ids,
             terminal_error_ids,
+            resolving_ids,
+            resolve_wait_ids,
             effective_dependency_base: None,
         }
     }
@@ -114,6 +131,8 @@ impl DependencyContext {
 
         if self.terminal_error_ids.contains(dep_id) {
             DependencyTargetClass::Error
+        } else if self.resolving_ids.contains(dep_id) || self.resolve_wait_ids.contains(dep_id) {
+            DependencyTargetClass::Resolving
         } else {
             class
         }
@@ -123,27 +142,34 @@ impl DependencyContext {
         self.terminal_error_ids.contains(change_id)
     }
 
-    pub(super) fn is_blocked(
-        &self,
+    pub(super) async fn is_blocked(
+        &mut self,
         dependencies: &[String],
+        workspace_manager: &dyn WorkspaceManager,
     ) -> Option<DependencyBlockerFingerprint> {
-        let blockers = dependencies
-            .iter()
-            .filter_map(|dep_id| {
-                let class = self.classify(dep_id);
-                if matches!(class, DependencyTargetClass::Archived) {
-                    None
-                } else {
-                    Some((dep_id.clone(), class.as_str().to_string()))
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut blockers = Vec::new();
 
-        if blockers.is_empty() {
-            None
-        } else {
-            Some(blockers)
+        for dep_id in dependencies {
+            let class = self.classify(dep_id);
+            if !matches!(class, DependencyTargetClass::Archived) {
+                blockers.push((dep_id.clone(), class.as_str().to_string()));
+                continue;
+            }
+
+            // Archive presence alone is not integration evidence. Keep the same effective-base
+            // check used by dispatch selection so pre-analysis cannot classify an unmerged
+            // dependency as dispatchable.
+            let resolved = self
+                .is_dependency_resolved_with_base(dep_id, workspace_manager)
+                .await
+                .map(|(resolved, _)| resolved)
+                .unwrap_or(false);
+            if !resolved {
+                blockers.push((dep_id.clone(), class.as_str().to_string()));
+            }
         }
+
+        (!blockers.is_empty()).then_some(blockers)
     }
 
     pub(super) async fn effective_dependency_base(
@@ -280,10 +306,11 @@ mod tests {
         std::fs::write(change_dir.join("proposal.md"), "# Change\n").unwrap();
     }
 
-    #[test]
-    fn context_classifies_from_single_collected_evidence_snapshot() {
+    #[tokio::test]
+    async fn context_classifies_from_single_collected_evidence_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         write_change(temp_dir.path(), "active-a");
+        write_change(temp_dir.path(), "resolving-a");
         let archive_dir = temp_dir
             .path()
             .join("openspec/changes/archive/2026-06-17-archived-a");
@@ -299,11 +326,23 @@ mod tests {
         .unwrap();
 
         let in_flight = HashSet::from(["flight-a".to_string()]);
+        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["resolving-a".to_string()],
+            1,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        )));
+        state
+            .write()
+            .await
+            .apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
+                change_id: "resolving-a".to_string(),
+                command: "resolve".to_string(),
+            });
         let context = DependencyContext::from_parts(
             temp_dir.path().to_path_buf(),
             ["queued-a"],
             &in_flight,
-            None,
+            Some(&state),
         );
 
         assert_eq!(context.classify("queued-a"), DependencyTargetClass::Queued);
@@ -318,6 +357,10 @@ mod tests {
         assert_eq!(
             context.classify("archived-a"),
             DependencyTargetClass::Archived
+        );
+        assert_eq!(
+            context.classify("resolving-a"),
+            DependencyTargetClass::Resolving
         );
         assert_eq!(
             context.classify("rejected-a"),

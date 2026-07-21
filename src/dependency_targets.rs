@@ -14,6 +14,7 @@ use tracing::warn;
 pub(crate) enum DependencyTargetClass {
     Queued,
     InFlight,
+    Resolving,
     ActiveButNotQueued,
     Archived,
     Rejected,
@@ -26,6 +27,7 @@ impl DependencyTargetClass {
         match self {
             Self::Queued => "queued",
             Self::InFlight => "in-flight",
+            Self::Resolving => "resolving",
             Self::ActiveButNotQueued => "active-but-not-queued",
             Self::Archived => "archived",
             Self::Rejected => "rejected",

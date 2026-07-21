@@ -36,7 +36,9 @@ impl DependencyStatusContext {
             &self.rejected_ids,
         ) {
             DependencyTargetClass::Archived => DependencyListStatus::Done,
-            DependencyTargetClass::InFlight => DependencyListStatus::Running,
+            DependencyTargetClass::InFlight | DependencyTargetClass::Resolving => {
+                DependencyListStatus::Running
+            }
             DependencyTargetClass::Queued | DependencyTargetClass::ActiveButNotQueued => {
                 DependencyListStatus::Pending
             }
@@ -89,6 +91,10 @@ pub(super) fn classify_proposal_dependency_targets(
                 ),
                 DependencyTargetClass::InFlight => format!(
                     "{}: proposal dependency '{}' classified as in-flight (workspace execution marker)",
+                    change_id, dependency
+                ),
+                DependencyTargetClass::Resolving => format!(
+                    "{}: proposal dependency '{}' classified as resolving",
                     change_id, dependency
                 ),
                 DependencyTargetClass::ActiveButNotQueued => format!(

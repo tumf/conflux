@@ -429,7 +429,12 @@ impl ParallelExecutor {
         blockers: &[(String, DependencyTargetClass)],
     ) {
         for (dep_id, class) in blockers {
-            let message = if matches!(class, DependencyTargetClass::Archived) {
+            let message = if matches!(class, DependencyTargetClass::Resolving) {
+                format!(
+                    "Change '{}' blocked by resolving dependency '{}' and will remain queued",
+                    change_id, dep_id
+                )
+            } else if matches!(class, DependencyTargetClass::Archived) {
                 match self.effective_dependency_base().await {
                     Ok(effective_base) => format!(
                         "Change '{}' blocked by archived-but-not-merged dependency '{}' on effective dependency base '{}' and will remain queued",
@@ -454,6 +459,7 @@ impl ParallelExecutor {
                 | DependencyTargetClass::Error => warn!("{}", message),
                 DependencyTargetClass::Queued
                 | DependencyTargetClass::InFlight
+                | DependencyTargetClass::Resolving
                 | DependencyTargetClass::ActiveButNotQueued => info!("{}", message),
                 DependencyTargetClass::Archived => info!("{}", message),
             }
@@ -595,10 +601,29 @@ impl ParallelExecutor {
             }
 
             // Check if change has unresolved dependencies
-            if let Some(deps) = analysis_result.dependencies.get(change_id) {
+            let metadata_dependencies = crate::openspec::parse_proposal_metadata_from_file(
+                &self
+                    .repo_root
+                    .join("openspec/changes")
+                    .join(change_id)
+                    .join("proposal.md"),
+            )
+            .dependencies;
+            let mut dependencies = analysis_result
+                .dependencies
+                .get(change_id)
+                .cloned()
+                .unwrap_or_default();
+            for dep_id in metadata_dependencies {
+                if dep_id != *change_id && !dependencies.contains(&dep_id) {
+                    dependencies.push(dep_id);
+                }
+            }
+
+            if !dependencies.is_empty() {
                 let mut unresolved_deps = Vec::new();
                 let mut blockers = Vec::new();
-                for dep_id in deps {
+                for dep_id in &dependencies {
                     let class = dependency_context.classify(dep_id);
                     match class {
                         DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
@@ -618,6 +643,11 @@ impl ParallelExecutor {
                         }
                         DependencyTargetClass::Archived => {
                             DependencyContext::log_archived_dependency_check(change_id, dep_id);
+                        }
+                        DependencyTargetClass::Resolving => {
+                            unresolved_deps.push(dep_id.clone());
+                            blockers.push((dep_id.clone(), class));
+                            continue;
                         }
                         DependencyTargetClass::Queued
                         | DependencyTargetClass::InFlight
@@ -2171,7 +2201,7 @@ impl ParallelExecutor {
     ) -> BlockedOnlyQueueClassification {
         let mut classification = BlockedOnlyQueueClassification::default();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        let dependency_context = DependencyContext::from_executor(
+        let mut dependency_context = DependencyContext::from_executor(
             self,
             queued.iter().map(|change| change.id.as_str()),
             in_flight,
@@ -2220,8 +2250,23 @@ impl ParallelExecutor {
                 continue;
             }
 
+            let metadata_dependencies = crate::openspec::parse_proposal_metadata_from_file(
+                &self
+                    .repo_root
+                    .join("openspec/changes")
+                    .join(&change.id)
+                    .join("proposal.md"),
+            )
+            .dependencies;
+            let mut dependencies = change.dependencies.clone();
+            for dep_id in metadata_dependencies {
+                if dep_id != change.id && !dependencies.contains(&dep_id) {
+                    dependencies.push(dep_id);
+                }
+            }
             let blocked = dependency_context
-                .is_blocked(&change.dependencies)
+                .is_blocked(&dependencies, self.workspace_manager.as_ref())
+                .await
                 .is_some();
 
             if blocked {
