@@ -112,7 +112,10 @@ fn state_for(
     revision: &str,
     change_id: Option<&str>,
 ) -> Result<AcceptanceState> {
-    let previous = load_acceptance_state(workspace_path)?;
+    let previous = match change_id {
+        Some(change_id) => load_acceptance_state_for(workspace_path, change_id)?,
+        None => load_acceptance_state(workspace_path)?,
+    };
     Ok(AcceptanceState {
         state,
         revision: revision.to_string(),
@@ -135,6 +138,16 @@ pub fn load_acceptance_state(workspace_path: &Path) -> Result<Option<AcceptanceS
         return Ok(None);
     }
     Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+/// Returns the workspace checkpoint only when it belongs to `change_id`.
+/// A workspace may be reused by another change, so its retry context is never transferable.
+pub fn load_acceptance_state_for(
+    workspace_path: &Path,
+    change_id: &str,
+) -> Result<Option<AcceptanceState>> {
+    Ok(load_acceptance_state(workspace_path)?
+        .filter(|state| state.change_id.as_deref() == Some(change_id)))
 }
 
 pub fn delete_acceptance_state(workspace_path: &Path) -> Result<()> {
@@ -262,7 +275,7 @@ pub fn write_acceptance_blocked_marker_with_context(
     resumable: bool,
     next_action: &str,
 ) -> Result<()> {
-    let state = match load_acceptance_state(workspace_path)? {
+    let state = match load_acceptance_state_for(workspace_path, change_id)? {
         Some(state) => state,
         None => state_for(
             workspace_path,
@@ -377,6 +390,29 @@ mod tests {
         assert_eq!(state.previous_finding_identities, ["finding a"]);
         assert_eq!(state.cycle_count, 2);
         assert_eq!(state.semantic_fingerprint.as_deref(), Some("finding a"));
+    }
+
+    #[test]
+    fn checkpoint_is_not_reused_across_changes() {
+        let temp = TempDir::new().unwrap();
+        record_acceptance_retry_context(
+            temp.path(),
+            "abc",
+            "first-change",
+            &["Finding A".to_string()],
+            2,
+        )
+        .unwrap();
+
+        assert!(load_acceptance_state_for(temp.path(), "second-change")
+            .unwrap()
+            .is_none());
+        mark_apply_completed(temp.path(), "def", "second-change").unwrap();
+        let state = load_acceptance_state(temp.path()).unwrap().unwrap();
+        assert_eq!(state.change_id.as_deref(), Some("second-change"));
+        assert!(state.previous_finding_identities.is_empty());
+        assert_eq!(state.semantic_fingerprint, None);
+        assert_eq!(state.cycle_count, 0);
     }
 
     #[test]

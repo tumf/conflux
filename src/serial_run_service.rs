@@ -208,8 +208,10 @@ impl SerialRunService {
         change_id: &str,
         agent: &mut AgentRunner,
     ) -> Result<()> {
-        let Some(state) =
-            crate::parallel::acceptance_state::load_acceptance_state(&self.repo_root)?
+        let Some(state) = crate::parallel::acceptance_state::load_acceptance_state_for(
+            &self.repo_root,
+            change_id,
+        )?
         else {
             return Ok(());
         };

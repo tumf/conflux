@@ -27,7 +27,7 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::{
-    consume_resumable_acceptance_marker, load_acceptance_state, mark_acceptance_failed,
+    consume_resumable_acceptance_marker, load_acceptance_state_for, mark_acceptance_failed,
     mark_acceptance_passed, mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
     record_acceptance_retry_context, write_acceptance_blocked_marker_with_context, BlockedMarker,
     BlockedMarkerOrigin,
@@ -170,6 +170,28 @@ mod tests {
             history.semantic_fingerprint("change"),
             Some("semantic baseline".to_string())
         );
+    }
+
+    #[test]
+    fn parallel_restart_ignores_foreign_checkpoint() {
+        let checkpoint = AcceptanceState {
+            state: AcceptanceStateStatus::Failed,
+            revision: "revision".to_string(),
+            updated_at: "now".to_string(),
+            workspace_path: "/workspace".to_string(),
+            change_id: Some("first-change".to_string()),
+            previous_finding_identities: vec!["finding-a".to_string()],
+            semantic_fingerprint: Some("semantic baseline".to_string()),
+            cycle_count: 2,
+        };
+        let mut history = crate::history::AcceptanceHistory::new();
+
+        // Dispatch loads this through load_acceptance_state_for, which returns None.
+        super::restore_acceptance_checkpoint(&mut history, "second-change", None);
+
+        assert_eq!(history.count("second-change"), 0);
+        assert_eq!(history.semantic_fingerprint("second-change"), None);
+        assert_eq!(checkpoint.change_id.as_deref(), Some("first-change"));
     }
 
     #[test]
@@ -1020,7 +1042,7 @@ impl ParallelExecutor {
 
             // Track apply+acceptance cycles to prevent infinite loops.
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
-            let checkpoint = match load_acceptance_state(&workspace.path) {
+            let checkpoint = match load_acceptance_state_for(&workspace.path, &change_id) {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
                     return WorkspaceResult {
@@ -1033,7 +1055,9 @@ impl ParallelExecutor {
                 }
             };
             restore_acceptance_checkpoint(&mut restored_history, &change_id, checkpoint.as_ref());
-            agent.seed_acceptance_history(restored_history);
+            agent.seed_acceptance_history(restored_history.clone());
+            // Later acceptance seeds clone this shared history; persist the restored checkpoint there.
+            *acceptance_history.lock().await = restored_history;
             let mut cycle_count = checkpoint.as_ref().map_or(0, |state| state.cycle_count);
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
@@ -1805,7 +1829,9 @@ impl ParallelExecutor {
                             rejected: None,
                         };
                     }
-                    agent.seed_acceptance_history(acceptance_history.lock().await.clone());
+                    let mut history = acceptance_history.lock().await.clone();
+                    restore_acceptance_checkpoint(&mut history, &change_id, checkpoint.as_ref());
+                    agent.seed_acceptance_history(history);
                     execute_acceptance_in_workspace(
                         &change_id,
                         &workspace.path,
