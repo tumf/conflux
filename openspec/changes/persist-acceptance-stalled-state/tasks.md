@@ -17,6 +17,4 @@
 `cflx openspec validate persist-acceptance-stalled-state --archive-gate` exits 0.
 
 ## Acceptance #1 Failure Follow-up
-- [x] Checkpointがworkspaceごとの単一`.cflx/acceptance-state.json`であり、読み込み時に`change_id`を検証していない。`src/parallel/acceptance_state.rs:109-129`は以前のfinding identities、fingerprint、cycle countをchange境界なしで継承し、`src/serial_run_service.rs:206-227`は保存済み`change_id`を確認せず要求されたchangeへ復元する。serialで複数changeを処理すると別changeのretry contextを引き継げるため、change単位で保存するか一致検証が必要。
-- [x] `openspec/changes/persist-acceptance-stalled-state/tasks.md`のtask 4と6は実際のrestart/dispatch integration検証を完了済みとするが、対応テストは`restore_acceptance_checkpoint`、`restore_acceptance_checkpoint_history`、`preflight_blocked_marker`などhelper直接呼び出しに留まり、上記の実行経路上書きとchange間汚染を検出できない。実際のparallel/serial resume経路を通すintegration testへ置き換える必要がある。Targeted tests、fmt、clippy、archive-gateは成功し、worktreeはclean、実commit pathのpre-commit相当clippyにも失敗はなかった。
-- [x] 並列再起動時のcheckpoint復元がacceptance直前に破棄される。`src/parallel/dispatch.rs:1019-1036`はworkspace checkpointを`agent`へ復元するが、`src/parallel/dispatch.rs:1808`が`acceptance_history`のcloneで再度`seed_acceptance_history`し、復元したfinding identitiesとsemantic fingerprintを上書きする。acceptance直前の再seedへcheckpointを統合し、実際の再起動経路で次のFAILが初回扱いされないことを検証する必要がある。
+- [x] 作業ツリーが未コミットであり、受入・archive commitability を満たさない。`src/history.rs`、`src/parallel/dispatch.rs`、`src/parallel/tests/executor.rs`、`src/serial_run_service.rs` と本follow-upを実装コミットへ含め、作業ツリーをcleanにして再受入した。checkpoint round-trip、serial/parallel再起動経路、marker dispatch suppression、explicit retry、clippy、fmt、pre-commit、archive-gateは成功した。

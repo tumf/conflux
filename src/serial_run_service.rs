@@ -531,7 +531,7 @@ impl SerialRunService {
             self.increment_apply_count(&change.id);
 
             // Re-fetch change to get updated task counts after apply
-            let (updated_change, is_complete) = Self::refetch_change_after_apply(&change.id);
+            let (updated_change, is_complete) = self.refetch_change_after_apply(&change.id);
 
             if is_complete || apply_blocked_handoff.is_some() {
                 let updated_change = updated_change.unwrap_or_else(|| change.clone());
@@ -644,8 +644,9 @@ impl SerialRunService {
     /// Re-fetch change to get updated task counts after apply.
     ///
     /// Returns the updated change and whether it's complete.
-    fn refetch_change_after_apply(change_id: &str) -> (Option<Change>, bool) {
-        let updated_changes = openspec::list_changes_native().unwrap_or_default();
+    fn refetch_change_after_apply(&self, change_id: &str) -> (Option<Change>, bool) {
+        let updated_changes =
+            openspec::list_changes_native_from(&self.repo_root).unwrap_or_default();
         let updated_change = updated_changes.iter().find(|c| c.id == change_id).cloned();
         let is_complete = updated_change.as_ref().is_some_and(|c| c.is_complete());
         (updated_change, is_complete)
@@ -1053,6 +1054,157 @@ mod tests {
         // but select_next_change returns the first match which would be 'b' if it's complete)
         // Actually, reading the implementation, it prioritizes incomplete first, so should be 'a'
         assert_eq!(next.map(|c| c.id.as_str()), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn serial_process_change_restores_checkpoint_before_next_acceptance() {
+        use crate::parallel::acceptance_state::record_acceptance_retry_context;
+
+        let temp_dir = TempDir::new().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test User"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(temp_dir.path())
+                .output()
+                .unwrap();
+        }
+        let change_id = "serial-restart";
+        let change_dir = temp_dir.path().join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("proposal.md"), "# serial restart\n").unwrap();
+        std::fs::write(change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "base"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        record_acceptance_retry_context(
+            temp_dir.path(),
+            "checkpoint-revision",
+            change_id,
+            &["Prior serial finding".to_string()],
+            2,
+        )
+        .unwrap();
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c \"printf '%s\\n' '- [x] done' > openspec/changes/{change_id}/tasks.md\""
+            )),
+            acceptance_command: Some(
+                "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated serial finding'"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = AiCommandRunner::new(
+            CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: default_retry_patterns(),
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 0,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            },
+            Arc::new(Mutex::new(None)),
+        );
+
+        let result = service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                &mut agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+        let checkpoint = crate::parallel::acceptance_state::load_acceptance_state_for(
+            temp_dir.path(),
+            change_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(checkpoint.cycle_count, 3);
+        assert_eq!(
+            checkpoint.previous_finding_identities,
+            ["repeated serial finding"]
+        );
+
+        std::fs::write(change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "prepare foreign checkpoint test"])
+            .current_dir(temp_dir.path())
+            .output()
+            .unwrap();
+        record_acceptance_retry_context(
+            temp_dir.path(),
+            "foreign-revision",
+            "foreign-change",
+            &["Foreign serial finding".to_string()],
+            9,
+        )
+        .unwrap();
+        let mut foreign_agent = AgentRunner::new(config);
+        let result = service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                &mut foreign_agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+        let checkpoint = crate::parallel::acceptance_state::load_acceptance_state_for(
+            temp_dir.path(),
+            change_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(checkpoint.cycle_count, 1);
+        assert_eq!(
+            checkpoint.previous_finding_identities,
+            ["repeated serial finding"]
+        );
     }
 
     #[test]

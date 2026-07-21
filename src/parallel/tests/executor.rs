@@ -6486,6 +6486,175 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
 }
 
 #[tokio::test]
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+async fn test_resumed_checkpoint_seeds_parallel_acceptance_before_next_fail() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    init_git_repo(repo_dir.path()).await;
+
+    let change_id = "acceptance-restart";
+    let change_dir = repo_dir.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create active change dir");
+    std::fs::write(change_dir.join("proposal.md"), "# Acceptance restart\n")
+        .or_fail("write active proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("write active tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git add active change");
+    Command::new("git")
+        .args(["commit", "-m", "Add active change"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git commit active change");
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let workspace_path = workspace_base.path().join(change_id);
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            change_id,
+            workspace_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("create resumed worktree");
+    Command::new("git")
+        .args([
+            "commit",
+            "--allow-empty",
+            "-m",
+            &format!("Apply: {change_id}"),
+        ])
+        .current_dir(&workspace_path)
+        .output()
+        .await
+        .or_fail("create applied resume commit");
+    crate::parallel::acceptance_state::record_acceptance_retry_context(
+        &workspace_path,
+        "checkpoint-revision",
+        change_id,
+        &["Prior finding".to_string()],
+        2,
+    )
+    .or_fail("write restart checkpoint");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'exit 42'".to_string()),
+        acceptance_command: Some(
+            "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated finding'".to_string(),
+        ),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision.clone(),
+            semaphore.clone(),
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch resumed checkpoint workspace");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Apply failed")),
+        "resumed acceptance must run before returning to the apply loop: {:?}",
+        result.error
+    );
+
+    let checkpoint =
+        crate::parallel::acceptance_state::load_acceptance_state_for(&workspace_path, change_id)
+            .or_fail("load resumed checkpoint")
+            .or_fail("checkpoint should still belong to resumed change");
+    assert_eq!(checkpoint.cycle_count, 3);
+    assert_eq!(
+        checkpoint.previous_finding_identities,
+        ["repeated finding".to_string()]
+    );
+    assert_eq!(
+        checkpoint.semantic_fingerprint.as_deref(),
+        Some("repeated finding")
+    );
+
+    crate::parallel::acceptance_state::record_acceptance_retry_context(
+        &workspace_path,
+        "foreign-revision",
+        "foreign-change",
+        &["Foreign finding".to_string()],
+        9,
+    )
+    .or_fail("write foreign checkpoint");
+    in_flight.remove(change_id);
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch resumed foreign-checkpoint workspace");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("foreign checkpoint workspace task should exist")
+        .or_fail("foreign checkpoint workspace task join should succeed");
+    assert!(result
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("Apply failed")));
+    let checkpoint =
+        crate::parallel::acceptance_state::load_acceptance_state_for(&workspace_path, change_id)
+            .or_fail("load foreign-checkpoint result")
+            .or_fail("next failure must replace foreign checkpoint");
+    assert_eq!(checkpoint.cycle_count, 1);
+    assert_eq!(checkpoint.previous_finding_identities, ["repeated finding"]);
+
+    let mut saw_third_acceptance = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::AcceptanceStarted { change_id: id, .. } = event {
+            saw_third_acceptance |= id == change_id;
+        }
+    }
+    assert!(saw_third_acceptance);
+}
+
+#[tokio::test]
 async fn test_resumed_workspace_marker_stops_parallel_dispatch_before_apply_acceptance_and_archive()
 {
     let repo_dir = TempDir::new().or_fail("create temp repo");

@@ -1038,7 +1038,6 @@ impl ParallelExecutor {
             // Create agent for acceptance testing.
             let mut agent =
                 AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
-            let mut restored_history = acceptance_history.lock().await.clone();
 
             // Track apply+acceptance cycles to prevent infinite loops.
             const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
@@ -1054,10 +1053,14 @@ impl ParallelExecutor {
                     };
                 }
             };
-            restore_acceptance_checkpoint(&mut restored_history, &change_id, checkpoint.as_ref());
-            agent.seed_acceptance_history(restored_history.clone());
-            // Later acceptance seeds clone this shared history; persist the restored checkpoint there.
-            *acceptance_history.lock().await = restored_history;
+            {
+                let mut shared_history = acceptance_history.lock().await;
+                restore_acceptance_checkpoint(
+                    &mut shared_history,
+                    &change_id,
+                    checkpoint.as_ref(),
+                );
+            }
             let mut cycle_count = checkpoint.as_ref().map_or(0, |state| state.cycle_count);
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
@@ -1333,6 +1336,25 @@ impl ParallelExecutor {
                 resume_cycle_flags(resume_action);
 
             let _apply_revision = loop {
+                cycle_count += 1;
+                if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
+                    error!(
+                        "Max apply+acceptance cycles ({}) reached for {}",
+                        MAX_APPLY_ACCEPTANCE_CYCLES, change_id
+                    );
+                    cancel_monitor.abort();
+                    return WorkspaceResult {
+                        change_id,
+                        workspace_name: workspace.name,
+                        final_revision: None,
+                        error: Some(format!(
+                            "Max apply+acceptance cycles ({}) reached",
+                            MAX_APPLY_ACCEPTANCE_CYCLES
+                        )),
+                        rejected: None,
+                    };
+                }
+
                 // Skip apply only for the first cycle when resuming from an already-applied state.
                 // Even when apply is skipped, this cycle must still execute acceptance unless
                 // resume_action explicitly allows archive continuation.
@@ -1397,25 +1419,6 @@ impl ParallelExecutor {
 
 
                     }
-                }
-
-                cycle_count += 1;
-                if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
-                    error!(
-                        "Max apply+acceptance cycles ({}) reached for {}",
-                        MAX_APPLY_ACCEPTANCE_CYCLES, change_id
-                    );
-                    cancel_monitor.abort();
-                    return WorkspaceResult {
-                        change_id,
-                        workspace_name: workspace.name,
-                        final_revision: None,
-                        error: Some(format!(
-                            "Max apply+acceptance cycles ({}) reached",
-                            MAX_APPLY_ACCEPTANCE_CYCLES
-                        )),
-                        rejected: None,
-                    };
                 }
 
                 // Step 1: Execute apply with cumulative iteration count
@@ -1829,9 +1832,7 @@ impl ParallelExecutor {
                             rejected: None,
                         };
                     }
-                    let mut history = acceptance_history.lock().await.clone();
-                    restore_acceptance_checkpoint(&mut history, &change_id, checkpoint.as_ref());
-                    agent.seed_acceptance_history(history);
+                    agent.seed_acceptance_history(acceptance_history.lock().await.clone());
                     execute_acceptance_in_workspace(
                         &change_id,
                         &workspace.path,
