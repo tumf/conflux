@@ -180,6 +180,8 @@ The validator SHALL allow non-checkbox final validation guidance sections to men
 
 Conflux SHALL provide a documented local validation command whose failure policy matches archive readiness. Users and agents MUST be able to reproduce archive-blocking evidence findings before invoking archive.
 
+Validation errors and an invalid validation result MUST block archive. Advisory warnings, including archived dependency reference warnings, MUST NOT block archive when no validation error exists. The archive-equivalent validation command and actual archive operation MUST apply the same blocking distinction between errors and warnings.
+
 #### Scenario: local archive gate fails on evidence findings
 
 **Given**: an active change `alpha` has an evidence finding that would block archive

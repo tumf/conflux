@@ -407,9 +407,15 @@ mod tests {
         )
         .unwrap();
         let state = load_acceptance_state(temp.path()).unwrap().unwrap();
-        assert_eq!(state.previous_finding_identities, ["finding a"]);
+        assert_eq!(state.previous_finding_identities, ["repository||finding a"]);
         assert_eq!(state.cycle_count, 2);
-        assert_eq!(state.semantic_fingerprint.as_deref(), Some("finding a"));
+        assert_eq!(
+            state.semantic_fingerprint,
+            Some(
+                crate::orchestration::acceptance::semantic_progress_fingerprint(temp.path())
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
@@ -449,7 +455,7 @@ mod tests {
         .unwrap();
         mark_apply_completed(temp.path(), "def", "change").unwrap();
         let state = load_acceptance_state(temp.path()).unwrap().unwrap();
-        assert_eq!(state.previous_finding_identities, ["finding a"]);
+        assert_eq!(state.previous_finding_identities, ["repository||finding a"]);
         assert_eq!(state.cycle_count, 2);
         fs::write(checkpoint_path(temp.path()), "not json").unwrap();
         assert!(mark_apply_completed(temp.path(), "ghi", "change").is_err());
@@ -512,7 +518,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(marker.origin, BlockedMarkerOrigin::Acceptance);
-        assert_eq!(marker.finding_identities, ["evidence"]);
+        assert_eq!(marker.finding_identities, ["repository||evidence"]);
         assert_eq!(marker.evidence, ["external: detail\n- nested"]);
         assert_eq!(marker.semantic_progress, "no_semantic_progress");
         assert_eq!(
