@@ -56,6 +56,27 @@ fn stalled_blocker_from_marker(marker: &BlockedMarker) -> crate::events::Stalled
     }
 }
 
+fn restore_acceptance_checkpoint(
+    history: &mut crate::history::AcceptanceHistory,
+    change_id: &str,
+    checkpoint: Option<&super::acceptance_state::AcceptanceState>,
+) {
+    let Some(state) = checkpoint else {
+        return;
+    };
+    if !state.previous_finding_identities.is_empty()
+        || state.semantic_fingerprint.is_some()
+        || state.cycle_count > 0
+    {
+        history.set_checkpoint(
+            change_id,
+            state.cycle_count,
+            state.previous_finding_identities.clone(),
+            state.semantic_fingerprint.clone(),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -63,7 +84,9 @@ mod tests {
         resume_cycle_flags, should_run_apply, ResumeAction,
     };
     use crate::execution::state::WorkspaceState;
-    use crate::parallel::acceptance_state::{BlockedMarker, BlockedMarkerOrigin};
+    use crate::parallel::acceptance_state::{
+        AcceptanceState, AcceptanceStateStatus, BlockedMarker, BlockedMarkerOrigin,
+    };
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -121,6 +144,32 @@ mod tests {
         assert_eq!(blocker.evidence, ["verification output"]);
         assert!(!blocker.resumable);
         assert_eq!(blocker.next_action, "inspect evidence");
+    }
+
+    #[test]
+    fn parallel_restart_restores_acceptance_checkpoint_semantic_fingerprint() {
+        let checkpoint = AcceptanceState {
+            state: AcceptanceStateStatus::Failed,
+            revision: "revision".to_string(),
+            updated_at: "now".to_string(),
+            workspace_path: "/workspace".to_string(),
+            change_id: Some("change".to_string()),
+            previous_finding_identities: vec!["missing regression coverage".to_string()],
+            semantic_fingerprint: Some("semantic baseline".to_string()),
+            cycle_count: 2,
+        };
+        let mut history = crate::history::AcceptanceHistory::new();
+
+        super::restore_acceptance_checkpoint(&mut history, "change", Some(&checkpoint));
+
+        assert_eq!(
+            history.last_follow_up_findings("change"),
+            Some((2, vec!["missing regression coverage".to_string()]))
+        );
+        assert_eq!(
+            history.semantic_fingerprint("change"),
+            Some("semantic baseline".to_string())
+        );
     }
 
     #[test]
@@ -983,15 +1032,7 @@ impl ParallelExecutor {
                     };
                 }
             };
-            if let Some(state) = checkpoint.as_ref() {
-                if !state.previous_finding_identities.is_empty() {
-                    restored_history.set_follow_up_findings(
-                        &change_id,
-                        state.cycle_count,
-                        state.previous_finding_identities.clone(),
-                    );
-                }
-            }
+            restore_acceptance_checkpoint(&mut restored_history, &change_id, checkpoint.as_ref());
             agent.seed_acceptance_history(restored_history);
             let mut cycle_count = checkpoint.as_ref().map_or(0, |state| state.cycle_count);
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
