@@ -28,13 +28,18 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
             let normalized = finding.split_whitespace().collect::<Vec<_>>().join(" ");
             (!normalized.is_empty()).then(|| {
                 let lower = normalized.to_ascii_lowercase();
+                // Only an explicit non-repository prerequisite is external. Generic
+                // error words are actionable because an apply can add a fixture, repair
+                // configuration, or improve the repository's diagnostics.
                 let external = [
-                    "permission denied",
-                    "credential",
-                    "api key",
-                    "network",
+                    "external non-mockable",
+                    "non-mockable external",
+                    "external prerequisite",
+                    "external service outage",
+                    "missing non-mockable external credential",
                     "rate limit",
-                    "unavailable",
+                    "network unreachable",
+                    "dns resolution failed",
                 ]
                 .iter()
                 .any(|needle| lower.contains(needle));
@@ -104,6 +109,9 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
                 || path.starts_with("tests/")
                 || path.starts_with("config/")
                 || path.starts_with("openspec/specs/")
+                || path.contains("/specs/")
+                || path == ".cflx.jsonc"
+                || path.ends_with("/.cflx.jsonc")
                 || path.ends_with("Cargo.toml")
                 || path.ends_with("tasks.md"))
     }
@@ -579,7 +587,7 @@ mod tests {
 
     #[test]
     fn retry_decision_stalls_external_only_and_allows_progress_changed() {
-        let findings = normalize_findings(&["network unavailable for src/lib.rs".to_string()]);
+        let findings = normalize_findings(&["external service outage for src/lib.rs".to_string()]);
         assert!(findings[0].external);
         assert!(matches!(
             decide_acceptance_retry(&[], None, &findings, "one", 1),
@@ -594,20 +602,54 @@ mod tests {
     }
 
     #[test]
-    fn semantic_fingerprint_excludes_runtime_follow_up_section() {
+    fn semantic_fingerprint_tracks_change_specs_and_jsonc_but_excludes_runtime_follow_up() {
         let temp = tempfile::TempDir::new().unwrap();
         let tasks = temp.path().join("openspec/changes/example/tasks.md");
-        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        let spec = temp
+            .path()
+            .join("openspec/changes/example/specs/runtime/spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
         std::fs::write(&tasks, "## Implementation Tasks\n- [x] work\n").unwrap();
+        std::fs::write(&spec, "requirement one").unwrap();
+        std::fs::write(temp.path().join(".cflx.jsonc"), "{ \"mode\": 1 }").unwrap();
         let before = semantic_progress_fingerprint(temp.path()).unwrap();
         std::fs::write(&tasks, "## Implementation Tasks\n- [x] work\n\n## Acceptance #2 Failure Follow-up\n- [ ] runtime finding\n").unwrap();
         assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+        std::fs::write(&spec, "requirement two").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+        std::fs::write(temp.path().join(".cflx.jsonc"), "{ \"mode\": 2 }").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn generic_credential_and_unavailable_errors_remain_repository_fixable() {
+        let findings = normalize_findings(&[
+            "missing API key in test fixture".to_string(),
+            "src/client.rs: unavailable fallback".to_string(),
+            "missing non-mockable external credential".to_string(),
+        ]);
+        assert_eq!(
+            findings.iter().filter(|finding| finding.external).count(),
+            1
+        );
+        assert!(findings[0].identity.starts_with("external|"));
+        assert_eq!(
+            repository_findings(&[
+                "missing API key in test fixture".to_string(),
+                "src/client.rs: unavailable fallback".to_string(),
+                "missing non-mockable external credential".to_string(),
+            ])
+            .len(),
+            2
+        );
     }
 
     #[test]
     fn retry_decision_handles_mixed_and_findingless_failures() {
-        let mixed =
-            normalize_findings(&["src/lib.rs:1 fix test".into(), "network unavailable".into()]);
+        let mixed = normalize_findings(&[
+            "src/lib.rs:1 fix test".into(),
+            "external service outage".into(),
+        ]);
         assert!(matches!(
             decide_acceptance_retry(&[], None, &mixed, "one", 1),
             AcceptanceRetryDecision::Retry { .. }
@@ -617,7 +659,10 @@ mod tests {
             AcceptanceRetryDecision::Retry { .. }
         ));
         assert_eq!(
-            repository_findings(&["src/lib.rs:1 fix test".into(), "network unavailable".into()]),
+            repository_findings(&[
+                "src/lib.rs:1 fix test".into(),
+                "external service outage".into(),
+            ]),
             vec!["src/lib.rs:1 fix test"]
         );
     }

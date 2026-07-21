@@ -6,6 +6,7 @@ use crate::command_queue::CommandQueueConfig;
 use crate::config::defaults::default_retry_patterns;
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
+use crate::orchestration::acceptance::MAX_ACCEPTANCE_RETRY_CYCLES;
 use crate::orchestration::state::{ExecutionMode, OrchestratorState, ReducerCommand, WaitState};
 use crate::parallel::dedup::DiagnosticDeduplicationStore;
 use crate::parallel::executor::{
@@ -6485,9 +6486,10 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
     );
 }
 
-#[tokio::test]
-#[cfg_attr(not(feature = "heavy-tests"), ignore)]
-async fn test_resumed_checkpoint_seeds_parallel_acceptance_before_next_fail() {
+async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
+    starting_cycle_count: u32,
+    expected_reason: &str,
+) {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
     init_git_repo(repo_dir.path()).await;
@@ -6499,7 +6501,7 @@ async fn test_resumed_checkpoint_seeds_parallel_acceptance_before_next_fail() {
         .or_fail("write active proposal");
     std::fs::write(
         change_dir.join("tasks.md"),
-        "## Implementation Tasks\n- [x] done\n",
+        "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] verified\n",
     )
     .or_fail("write active tasks");
     Command::new("git")
@@ -6543,18 +6545,21 @@ async fn test_resumed_checkpoint_seeds_parallel_acceptance_before_next_fail() {
         .output()
         .await
         .or_fail("create applied resume commit");
-    crate::parallel::acceptance_state::record_acceptance_retry_context(
+    let fingerprint = crate::orchestration::acceptance::semantic_progress_fingerprint(&workspace_path)
+        .or_fail("fingerprint workspace");
+    crate::parallel::acceptance_state::record_acceptance_retry_checkpoint(
         &workspace_path,
         "checkpoint-revision",
         change_id,
-        &["Prior finding".to_string()],
-        2,
+        vec!["repository||repeated finding".to_string()],
+        Some(fingerprint),
+        starting_cycle_count,
     )
     .or_fail("write restart checkpoint");
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
-        apply_command: Some("sh -c 'exit 42'".to_string()),
+        apply_command: Some("sh -c 'echo unexpected-apply >&2; exit 42'".to_string()),
         acceptance_command: Some(
             "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated finding'".to_string(),
         ),
@@ -6586,72 +6591,57 @@ async fn test_resumed_checkpoint_seeds_parallel_acceptance_before_next_fail() {
         .await
         .or_fail("workspace task should exist")
         .or_fail("workspace task join should succeed");
-    assert!(
-        result
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("Apply failed")),
-        "resumed acceptance must run before returning to the apply loop: {:?}",
-        result.error
-    );
+    assert!(result.error.is_none(), "stalled acceptance is not an error: {:?}", result.error);
 
     let checkpoint =
         crate::parallel::acceptance_state::load_acceptance_state_for(&workspace_path, change_id)
             .or_fail("load resumed checkpoint")
             .or_fail("checkpoint should still belong to resumed change");
-    assert_eq!(checkpoint.cycle_count, 3);
-    assert_eq!(
-        checkpoint.previous_finding_identities,
-        ["repeated finding".to_string()]
-    );
-    assert_eq!(
-        checkpoint.semantic_fingerprint.as_deref(),
-        Some("repeated finding")
-    );
+    assert_eq!(checkpoint.cycle_count, starting_cycle_count + 1);
+    assert_eq!(checkpoint.previous_finding_identities, ["repository||repeated finding"]);
+    let marker = crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
+        .or_fail("load stalled marker")
+        .or_fail("acceptance failure must persist a stalled marker");
+    assert_eq!(marker.reason, expected_reason);
 
-    crate::parallel::acceptance_state::record_acceptance_retry_context(
-        &workspace_path,
-        "foreign-revision",
-        "foreign-change",
-        &["Foreign finding".to_string()],
-        9,
-    )
-    .or_fail("write foreign checkpoint");
-    in_flight.remove(change_id);
-    executor
-        .dispatch_change_to_workspace(
-            change_id.to_string(),
-            base_revision,
-            semaphore,
-            &mut join_set,
-            &mut in_flight,
-            &mut cleanup_guard,
-        )
-        .await
-        .or_fail("dispatch resumed foreign-checkpoint workspace");
-    let result = join_set
-        .join_next()
-        .await
-        .or_fail("foreign checkpoint workspace task should exist")
-        .or_fail("foreign checkpoint workspace task join should succeed");
-    assert!(result
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("Apply failed")));
-    let checkpoint =
-        crate::parallel::acceptance_state::load_acceptance_state_for(&workspace_path, change_id)
-            .or_fail("load foreign-checkpoint result")
-            .or_fail("next failure must replace foreign checkpoint");
-    assert_eq!(checkpoint.cycle_count, 1);
-    assert_eq!(checkpoint.previous_finding_identities, ["repeated finding"]);
-
-    let mut saw_third_acceptance = false;
+    let mut acceptance_count = 0;
+    let mut apply_count = 0;
+    let mut saw_error = false;
     while let Ok(event) = rx.try_recv() {
-        if let ExecutionEvent::AcceptanceStarted { change_id: id, .. } = event {
-            saw_third_acceptance |= id == change_id;
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                acceptance_count += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                apply_count += 1;
+            }
+            ExecutionEvent::ProcessingError { id, .. } if id == change_id => {
+                saw_error = true;
+            }
+            _ => {}
         }
     }
-    assert!(saw_third_acceptance);
+    assert_eq!(acceptance_count, 1, "resumed workspace must run acceptance before stalling");
+    assert_eq!(apply_count, 0, "repeated/cycle-limit stalls must occur before another apply");
+    assert!(!saw_error, "stalled acceptance must not emit ProcessingError");
+}
+
+#[tokio::test]
+async fn parallel_repeated_acceptance_failure_stalls_without_apply_or_error_event() {
+    assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
+        2,
+        "repeated_acceptance_findings",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn parallel_cycle_limit_stalls_without_apply_or_error_event() {
+    assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
+        MAX_ACCEPTANCE_RETRY_CYCLES - 1,
+        "acceptance_cycle_limit_exhausted",
+    )
+    .await;
 }
 
 #[tokio::test]

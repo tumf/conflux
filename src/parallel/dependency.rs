@@ -105,13 +105,6 @@ impl DependencyContext {
             &self.rejected_ids,
         );
 
-        if matches!(
-            class,
-            DependencyTargetClass::Missing | DependencyTargetClass::Rejected
-        ) {
-            return class;
-        }
-
         if self.terminal_error_ids.contains(dep_id) {
             DependencyTargetClass::Error
         } else {
