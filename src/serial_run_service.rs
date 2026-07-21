@@ -876,7 +876,7 @@ impl SerialRunService {
                         change_id,
                         workspace_path,
                     ) {
-                        if let Err(err) = task_parser::record_acceptance_follow_up(
+                        if let Err(err) = task_parser::replace_acceptance_follow_up_from_latest_fail(
                             &tasks_path,
                             agent
                                 .get_last_acceptance_attempt(change_id)
@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(checkpoint.cycle_count, 3);
         assert_eq!(
             checkpoint.previous_finding_identities,
-            ["repository||repeated serial finding"]
+            ["repository|repeated serial finding|implementation"]
         );
 
         std::fs::write(change_dir.join("tasks.md"), "- [ ] pending\n").unwrap();
@@ -1261,7 +1261,7 @@ mod tests {
         assert_eq!(checkpoint.cycle_count, 1);
         assert_eq!(
             checkpoint.previous_finding_identities,
-            ["repository||repeated serial finding"]
+            ["repository|repeated serial finding|implementation"]
         );
     }
 
@@ -1290,7 +1290,9 @@ mod tests {
         assert_eq!(agent.next_acceptance_attempt_number("test-change"), 3);
         assert_eq!(
             agent.get_last_acceptance_findings("test-change"),
-            Some(vec!["repository||missing regression coverage".to_string()])
+            Some(vec![
+                "repository|missing regression coverage|verification".to_string()
+            ])
         );
         assert_eq!(
             agent.get_restored_acceptance_semantic_fingerprint("test-change"),

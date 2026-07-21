@@ -94,9 +94,17 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - If `Change Type: spec-only` -> apply Spec-Only Acceptance path
 - Otherwise -> apply the standard implementation acceptance path
 
+### Current-State Finding Reconciliation
+
+- Re-validate every prior finding against the current worktree. Classify it as fixed or still-open from current repository evidence; a prior report alone is never evidence that it remains open.
+- Emit one atomic defect per finding. Keep implementation defects and missing test or verification evidence in separate findings when independently actionable.
+- Give each repository-fixable finding a stable leading code such as `[RETRY_TEST_MISSING]` when possible. Reuse that code only for the same defect across attempts.
+- Do not emit a broad cross-cutting or aggregate finding that duplicates defects or test work already owned by specific findings.
+- Acceptance remains read-only: return findings to runtime and never edit runtime-owned finding tasks or their checkbox state.
+
 ### Accept Rules
 
-- Each finding must include concrete evidence (file path, function, line)
+- Each finding must include concrete current-worktree evidence (file path, function, line)
 - Each finding must be actionable by AI agent
 - Missing secrets MUST NOT cause CONTINUE if mocking is possible
 - Dirty working tree is always FAIL

@@ -523,6 +523,45 @@ mod tests {
     }
 
     #[test]
+    fn apply_skill_preserves_runtime_finding_text_and_records_evidence_separately() {
+        for (label, content) in &[
+            ("cflx-apply", CFLX_APPLY_SKILL_MD),
+            ("cflx-apply reference", CFLX_APPLY_REF),
+        ] {
+            for required in [
+                "immutable identity metadata",
+                "do not rewrite, split, or refine",
+                "separate indented `evidence:` lines",
+                "immediately mark",
+            ] {
+                assert!(
+                    content.contains(required),
+                    "{label} must define runtime finding reconciliation guidance: {required}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acceptance_skill_requires_atomic_current_state_findings() {
+        for required in [
+            "Re-validate every prior finding against the current worktree",
+            "fixed or still-open",
+            "one atomic defect per finding",
+            "implementation defects and missing test or verification evidence in separate findings",
+            "stable leading code",
+            "broad cross-cutting or aggregate finding",
+            "Acceptance remains read-only",
+        ] {
+            assert!(
+                CFLX_ACCEPT_SKILL_MD.contains(required),
+                "cflx-accept must define stable atomic current-state guidance: {required}"
+            );
+        }
+        assert!(CFLX_ACCEPT_SKILL_MD.contains("never edit runtime-owned finding tasks"));
+    }
+
+    #[test]
     fn test_apply_and_acceptance_skills_keep_recoverable_infra_blockers_non_terminal() {
         for (label, content) in &[
             ("cflx-apply", CFLX_APPLY_SKILL_MD),
