@@ -14,4 +14,12 @@
             "retry_delay_secs": 5,
         },
     },
+
+    "analyze_command": "pi --no-session --model kani/kani/auto -p '{prompt}'",
+    "apply_command": "pi --no-session --model kani/kani/code -p '{prompt}'",
+    "apply_escalation_command": "pi --no-session --model kani/kani/code -p '{prompt}'",
+    "apply_stall_diagnose_command": "pi --no-session --model kani/kani/code -p '{prompt}'",
+    "acceptance_command": "pi --no-session --model kani/kani/deep -p '{prompt}'",
+    "archive_command": "pi --no-session --model kani/kani/auto -p '{prompt}'",
+    "resolve_command": "pi --no-session --model kani/kani/auto -p '{prompt}'",
 }
