@@ -15,6 +15,3 @@
 ## Final Validation
 
 Expected archive gate: `cflx openspec validate compact-acceptance-retry-context --archive-gate` exits 0.
-
-## Acceptance #3 Failure Follow-up
-- [x] [dirty_worktree] `git status --porcelain=v1` が `MM openspec/changes/compact-acceptance-retry-context/tasks.md` を報告している。index と working tree の内容が不一致であり、現状の archive commit では未コミット差分が残る。最終内容を確認して同ファイルを再stageし、`git status --porcelain=v1` を空にすること。なお archive gate、対象テスト、`cargo fmt --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` は成功済み。
