@@ -15,6 +15,3 @@
 ## Final Validation
 
 Expected archive gate: `cflx openspec validate harden-acceptance-finding-reconciliation --archive-gate` exits 0.
-
-## Acceptance #1 Failure Follow-up
-- [x] [RECONCILIATION_PARITY_TEST_MISSING] openspec/changes/harden-acceptance-finding-reconciliation/tasks.md Task 3 claims serial/parallel integration coverage for same-identity reopen, retirement, different-identity non-reopen, and completion-transition parity, but src/parallel/dispatch.rs:333-357 only tests fresh follow-up routing and src/serial_run_service.rs contains no equivalent completed-finding transition fixture. Add serial/parallel regression coverage or correct the declared verification ownership.
