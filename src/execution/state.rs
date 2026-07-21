@@ -554,7 +554,10 @@ mod tests {
             marker.origin,
             crate::parallel::acceptance_state::BlockedMarkerOrigin::Acceptance
         );
-        assert_eq!(marker.finding_identities, ["repository||finding a"]);
+        assert_eq!(
+            marker.finding_identities,
+            ["repository|finding a|implementation"]
+        );
         assert_eq!(marker.retry_count, 2);
         assert!(
             crate::parallel::acceptance_state::consume_resumable_acceptance_marker(

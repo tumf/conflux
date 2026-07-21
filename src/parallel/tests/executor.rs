@@ -6843,11 +6843,15 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
     let fingerprint =
         crate::orchestration::acceptance::semantic_progress_fingerprint(&workspace_path)
             .or_fail("fingerprint workspace");
+    let finding_identity =
+        crate::orchestration::acceptance::normalize_findings(&["repeated finding".to_string()])[0]
+            .identity
+            .clone();
     crate::parallel::acceptance_state::record_acceptance_retry_checkpoint(
         &workspace_path,
         "checkpoint-revision",
         change_id,
-        vec!["repository||repeated finding".to_string()],
+        vec![finding_identity.clone()],
         Some(fingerprint),
         starting_cycle_count,
     )
@@ -6898,10 +6902,7 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
             .or_fail("load resumed checkpoint")
             .or_fail("checkpoint should still belong to resumed change");
     assert_eq!(checkpoint.cycle_count, starting_cycle_count + 1);
-    assert_eq!(
-        checkpoint.previous_finding_identities,
-        ["repository||repeated finding"]
-    );
+    assert_eq!(checkpoint.previous_finding_identities, [finding_identity]);
     let marker =
         crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
             .or_fail("load stalled marker")
