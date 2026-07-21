@@ -15,6 +15,3 @@
 ## Final Validation
 
 Expected archive gate: `cflx openspec validate compact-acceptance-retry-context --archive-gate` exits 0.
-
-## Acceptance #1 Failure Follow-up
-- [x] [ARCHIVE_GATE_MODIFIED_TARGET_MISMATCH] `cflx openspec validate compact-acceptance-retry-context --archive-gate` が失敗する。`openspec/changes/compact-acceptance-retry-context/specs/agent-prompts/spec.md:3` は旧見出し `Acceptance prompt MUST instruct tasks.md follow-up updates on FAIL` を MODIFIED 対象にしているが、canonical `openspec/specs/agent-prompts/spec.md:83` は既に `Acceptance review MUST be read-only and runtime MUST own FAIL follow-up` に変更済み。delta の対象見出しをcanonicalと一致させ、本文・scenarioの矛盾も解消してarchive gateを再実行すること。対象テスト、fmt、clippyは成功し、作業ツリーはclean。
