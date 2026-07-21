@@ -98,6 +98,7 @@ pub struct TuiCommandContext<'a> {
 /// Handle TuiCommand::StartProcessing
 pub async fn handle_start_processing_command(
     ids: Vec<String>,
+    explicit_retry: bool,
     ctx: &mut TuiCommandContext<'_>,
     graceful_stop_flag: &Arc<std::sync::atomic::AtomicBool>,
     shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
@@ -105,6 +106,7 @@ pub async fn handle_start_processing_command(
     orchestrator_cancel: &mut Option<CancellationToken>,
 ) -> Option<tokio::task::JoinHandle<Result<()>>> {
     // Handle web control Start command (empty ids vec) or regular Start
+    let explicit_retry = explicit_retry || (ids.is_empty() && ctx.app.mode == AppMode::Error);
     let cmd = if ids.is_empty() {
         // Web control start - determine which command based on app mode
         if ctx.app.mode == AppMode::Error {
@@ -176,6 +178,7 @@ pub async fn handle_start_processing_command(
                 let result = if use_parallel {
                     run_orchestrator_parallel(
                         selected_ids,
+                        explicit_retry,
                         orch_config,
                         orch_tx.clone(),
                         orch_cancel,
@@ -190,6 +193,7 @@ pub async fn handle_start_processing_command(
                 } else {
                     run_orchestrator(
                         selected_ids,
+                        explicit_retry,
                         orch_config,
                         orch_tx.clone(),
                         orch_cancel,
@@ -204,6 +208,7 @@ pub async fn handle_start_processing_command(
                 let result = if use_parallel {
                     run_orchestrator_parallel(
                         selected_ids,
+                        explicit_retry,
                         orch_config,
                         orch_tx.clone(),
                         orch_cancel,
@@ -217,6 +222,7 @@ pub async fn handle_start_processing_command(
                 } else {
                     run_orchestrator(
                         selected_ids,
+                        explicit_retry,
                         orch_config,
                         orch_tx.clone(),
                         orch_cancel,
@@ -252,6 +258,7 @@ pub async fn handle_tui_command(
         TuiCommand::StartProcessing(ids) => {
             let handle = handle_start_processing_command(
                 ids,
+                false,
                 ctx,
                 graceful_stop_flag,
                 shared_state,
@@ -468,6 +475,7 @@ pub async fn handle_tui_command(
                     // Handle StartProcessing directly to avoid recursion
                     let handle = handle_start_processing_command(
                         ids,
+                        true,
                         ctx,
                         graceful_stop_flag,
                         shared_state,
@@ -703,6 +711,7 @@ pub async fn handle_tui_command(
                     #[cfg(feature = "web-monitoring")]
                     let result = run_orchestrator_parallel(
                         Vec::new(),
+                        false,
                         orch_config,
                         orch_tx,
                         orch_cancel,
@@ -718,6 +727,7 @@ pub async fn handle_tui_command(
                     #[cfg(not(feature = "web-monitoring"))]
                     let result = run_orchestrator_parallel(
                         Vec::new(),
+                        false,
                         orch_config,
                         orch_tx,
                         orch_cancel,

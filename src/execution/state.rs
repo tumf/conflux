@@ -518,6 +518,70 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn acceptance_checkpoint_and_marker_contract_is_workspace_local() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        assert!(
+            crate::parallel::acceptance_state::load_acceptance_state(workspace)
+                .unwrap()
+                .is_none()
+        );
+
+        crate::parallel::acceptance_state::record_acceptance_retry_context(
+            workspace,
+            "revision",
+            "test-change",
+            &["Finding A".to_string()],
+            2,
+        )
+        .unwrap();
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+            workspace,
+            "test-change",
+            "permission_stalled",
+            &["external blocker".to_string()],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+
+        let marker =
+            crate::parallel::acceptance_state::parse_blocked_marker(workspace, "test-change")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            marker.origin,
+            crate::parallel::acceptance_state::BlockedMarkerOrigin::Acceptance
+        );
+        assert_eq!(marker.finding_identities, ["finding a"]);
+        assert_eq!(marker.retry_count, 2);
+        assert!(
+            crate::parallel::acceptance_state::consume_resumable_acceptance_marker(
+                workspace,
+                "test-change"
+            )
+            .unwrap()
+        );
+
+        let path = workspace.join("openspec/changes/test-change/APPLY_BLOCKED/marker.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "origin: apply\nreason: blocked\n").unwrap();
+        assert!(
+            !crate::parallel::acceptance_state::consume_resumable_acceptance_marker(
+                workspace,
+                "test-change"
+            )
+            .unwrap()
+        );
+        assert!(path.exists());
+        std::fs::write(&path, "{ malformed").unwrap();
+        assert!(
+            crate::parallel::acceptance_state::parse_blocked_marker(workspace, "test-change")
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn test_detect_workspace_state_blocks_acceptance_marker_after_restart() {
         let temp_dir = TempDir::new().unwrap();

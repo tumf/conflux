@@ -230,19 +230,6 @@ pub fn record_acceptance_retry_context(
     save_acceptance_state(workspace_path, state)
 }
 
-pub fn has_durable_acceptance_pass(workspace_path: &Path, current_revision: &str) -> Result<bool> {
-    Ok(load_acceptance_state(workspace_path)?.is_some_and(|state| {
-        state.state == AcceptanceStateStatus::Passed && state.revision == current_revision
-    }))
-}
-
-pub fn acceptance_resume_ready_for_archive(
-    workspace_path: &Path,
-    current_revision: &str,
-) -> Result<bool> {
-    has_durable_acceptance_pass(workspace_path, current_revision)
-}
-
 pub fn write_acceptance_blocked_marker(
     workspace_path: &Path,
     change_id: &str,
