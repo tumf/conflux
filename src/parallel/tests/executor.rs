@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 trait TestAssertionExt<T> {
@@ -6482,6 +6483,127 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
         retry_required_diagnostic_count, 1,
         "reconciliation should emit one retry-required diagnostic while bounding unchanged repeats"
     );
+}
+
+#[tokio::test]
+async fn test_resumed_workspace_marker_stops_parallel_dispatch_before_apply_acceptance_and_archive()
+{
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    init_git_repo(repo_dir.path()).await;
+
+    let change_id = "acceptance-stalled";
+    let change_dir = repo_dir.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create active change dir");
+    std::fs::write(change_dir.join("proposal.md"), "# Acceptance stalled\n")
+        .or_fail("write active proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("write active tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git add active change");
+    Command::new("git")
+        .args(["commit", "-m", "Add active change"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git commit active change");
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let workspace_path = workspace_base.path().join(format!("cflx-{change_id}"));
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            change_id,
+            workspace_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("create resumed worktree");
+    crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+        &workspace_path,
+        change_id,
+        "acceptance stalled",
+        &[],
+        true,
+        "explicit retry",
+    )
+    .or_fail("write acceptance marker");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'echo unexpected-apply >&2; exit 42'".to_string()),
+        acceptance_command: Some("sh -c 'echo unexpected-acceptance >&2; exit 43'".to_string()),
+        archive_command: Some("sh -c 'echo unexpected-archive >&2; exit 44'".to_string()),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch resumed blocked workspace");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    assert!(result.error.is_none());
+    assert!(result.final_revision.is_none());
+    assert!(
+        crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
+            .or_fail("read preserved marker")
+            .is_some()
+    );
+
+    let mut saw_apply_started = false;
+    let mut saw_acceptance_started = false;
+    let mut saw_archive_started = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                saw_apply_started = true;
+            }
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                saw_acceptance_started = true;
+            }
+            ExecutionEvent::ArchiveStarted { change_id: id, .. } if id == change_id => {
+                saw_archive_started = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(!saw_apply_started);
+    assert!(!saw_acceptance_started);
+    assert!(!saw_archive_started);
 }
 
 #[tokio::test]

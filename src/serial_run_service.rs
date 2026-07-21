@@ -982,9 +982,15 @@ impl<'a, O: OutputHandler> common_apply::ApplyEventHandler for SerialApplyEventH
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_queue::CommandQueueConfig;
+    use crate::config::defaults::default_retry_patterns;
     use crate::config::OrchestratorConfig;
+    use crate::hooks::{HookRunner, HooksConfig};
     use crate::openspec::ProposalMetadata;
+    use crate::orchestration::output::NullOutputHandler;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -1353,6 +1359,63 @@ mod tests {
         assert_eq!(marker.reason, "acceptance_gated");
         assert_eq!(marker.semantic_progress, "no_semantic_progress");
         assert_eq!(marker.external_blockers, ["recoverable acceptance gate"]);
+    }
+
+    #[tokio::test]
+    async fn serial_process_change_stops_at_workspace_marker_before_archive() {
+        use crate::parallel::acceptance_state::write_acceptance_blocked_marker;
+
+        let temp_dir = TempDir::new().unwrap();
+        write_acceptance_blocked_marker(
+            temp_dir.path(),
+            "complete-change",
+            "stalled",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+        let ai_runner = AiCommandRunner::new(
+            CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: default_retry_patterns(),
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 0,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            },
+            Arc::new(Mutex::new(None)),
+        );
+        let result = service
+            .process_change(
+                &create_test_change("complete-change", 1, 1),
+                &mut agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, ChangeProcessResult::Stalled { .. }));
+        assert!(service.is_stalled("complete-change"));
+        assert!(crate::parallel::acceptance_state::parse_blocked_marker(
+            temp_dir.path(),
+            "complete-change"
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
