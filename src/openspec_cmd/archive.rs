@@ -24,16 +24,9 @@ impl<'a> ArchiveEngine<'a> {
         }
 
         // Validate before archiving
-        let (is_valid, errors, warnings) =
-            self.manager.validate_change(Some(change_id), true, "error");
+        let (is_valid, errors, _) = self.manager.validate_change(Some(change_id), true, "error");
         if !is_valid {
             return Err(format!("Validation failed:\n{}", errors.join("\n")));
-        }
-        if !warnings.is_empty() {
-            return Err(format!(
-                "Validation warnings must be resolved before archive:\n{}",
-                warnings.join("\n")
-            ));
         }
 
         // Simulate spec promotion

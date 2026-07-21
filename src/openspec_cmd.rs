@@ -2067,6 +2067,48 @@ mod openspec_list_show_tests {
     }
 
     #[test]
+    fn test_archive_change_allows_archived_dependency_warning() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        let change_id = "archive-with-archived-dependency";
+        let change_dir = temp.path().join("openspec/changes").join(change_id);
+        create_strict_valid_change(&change_dir, "Archive With Archived Dependency");
+        let proposal = fs::read_to_string(change_dir.join("proposal.md")).unwrap();
+        fs::write(
+            change_dir.join("proposal.md"),
+            proposal.replacen("---\n", "---\ndependencies:\n  - archived-dep\n", 1),
+        )
+        .unwrap();
+        create_change(
+            &temp
+                .path()
+                .join("openspec/changes/archive/2026-07-21-archived-dep"),
+            "Archived Dependency",
+            "- [x] done\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (is_valid, errors, warnings) = mgr.validate_change(Some(change_id), true, "error");
+        assert!(is_valid, "archive gate should allow advisory: {errors:?}");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("archived dependency reference")));
+
+        mgr.archive_change(change_id, true)
+            .expect("archive should use the same failure policy as archive gate");
+
+        assert!(!change_dir.exists());
+        assert!(temp
+            .path()
+            .join(format!(
+                "openspec/changes/archive/{}-{change_id}",
+                Local::now().format("%Y-%m-%d")
+            ))
+            .exists());
+    }
+
+    #[test]
     fn test_archive_change_rejects_existing_dated_destination() {
         let temp = TempDir::new().unwrap();
         let _guard = CwdTestGuard::enter(temp.path());
