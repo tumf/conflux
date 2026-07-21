@@ -416,15 +416,38 @@ mod tests {
     }
 
     #[test]
+    fn marker_write_failure_leaves_no_partial_marker() {
+        let temp = TempDir::new().unwrap();
+        let change_dir = temp.path().join("openspec/changes/change");
+        fs::create_dir_all(&change_dir).unwrap();
+        fs::write(change_dir.join("APPLY_BLOCKED"), "not a directory").unwrap();
+
+        assert!(write_acceptance_blocked_marker_with_context(
+            temp.path(),
+            "change",
+            "acceptance_gated",
+            &[],
+            "no_semantic_progress",
+            &[],
+            true,
+            "explicit retry",
+        )
+        .is_err());
+        assert!(!marker_path(temp.path(), "change").exists());
+    }
+
+    #[test]
     fn marker_round_trip_preserves_structured_evidence_and_foreign_markers() {
         let temp = TempDir::new().unwrap();
         record_acceptance_retry_context(temp.path(), "abc", "change", &["evidence".to_string()], 2)
             .unwrap();
-        write_acceptance_blocked_marker(
+        write_acceptance_blocked_marker_with_context(
             temp.path(),
             "change",
             "blocked: details\nnext line",
             &["external: detail\n- nested".to_string()],
+            "no_semantic_progress",
+            &["recoverable verification blocker".to_string()],
             true,
             "explicit retry",
         )
@@ -435,8 +458,11 @@ mod tests {
         assert_eq!(marker.origin, BlockedMarkerOrigin::Acceptance);
         assert_eq!(marker.finding_identities, ["evidence"]);
         assert_eq!(marker.evidence, ["external: detail\n- nested"]);
-        assert_eq!(marker.semantic_progress, "unknown");
-        assert!(marker.external_blockers.is_empty());
+        assert_eq!(marker.semantic_progress, "no_semantic_progress");
+        assert_eq!(
+            marker.external_blockers,
+            ["recoverable verification blocker"]
+        );
         assert!(marker.worktree_preserved);
         assert!(consume_resumable_acceptance_marker(temp.path(), "change").unwrap());
 

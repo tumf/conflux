@@ -583,6 +583,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_detect_workspace_state_rejects_malformed_marker_without_consuming_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+        init_git_repo(repo_root);
+        commit(repo_root, "Initial commit");
+        let path = repo_root.join("openspec/changes/test-change/APPLY_BLOCKED/marker.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ malformed").unwrap();
+
+        assert!(detect_workspace_state("test-change", repo_root, "main")
+            .await
+            .is_err());
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
     async fn test_detect_workspace_state_blocks_acceptance_marker_after_restart() {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();

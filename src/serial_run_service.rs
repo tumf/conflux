@@ -716,7 +716,7 @@ impl SerialRunService {
                                 change_id,
                                 "acceptance_gated",
                                 &["acceptance emitted gated compatibility token".to_string()],
-                                "stalled",
+                                "no_semantic_progress",
                                 &["recoverable acceptance gate".to_string()],
                                 true,
                                 "explicit retry",
@@ -829,7 +829,7 @@ impl SerialRunService {
                                 change_id,
                                 "permission_stalled",
                                 &evidence,
-                                "stalled",
+                                "no_semantic_progress",
                                 &evidence,
                                 true,
                                 &blocker.next_action,
@@ -1290,7 +1290,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(marker.reason, "acceptance_gated");
-        assert_eq!(marker.semantic_progress, "stalled");
+        assert_eq!(marker.semantic_progress, "no_semantic_progress");
         assert_eq!(marker.external_blockers, ["recoverable acceptance gate"]);
     }
 
@@ -1315,6 +1315,21 @@ mod tests {
 
         assert!(matches!(result, Some(ChangeProcessResult::Stalled { .. })));
         assert!(service.is_stalled("complete-change"));
+    }
+
+    #[test]
+    fn malformed_marker_stops_serial_preflight_and_is_preserved() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir
+            .path()
+            .join("openspec/changes/blocked/APPLY_BLOCKED/marker.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ malformed").unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+
+        assert!(service.preflight_blocked_marker("blocked").is_err());
+        assert!(path.exists());
     }
 
     #[test]

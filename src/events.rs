@@ -200,6 +200,7 @@ pub struct StalledBlocker {
     pub phase: String,
     pub gate: String,
     pub error_summary: String,
+    pub evidence: Vec<String>,
     pub next_action: String,
     pub resumable: bool,
     pub worktree_preserved: bool,
@@ -255,6 +256,7 @@ impl StalledBlocker {
                 denial.denied_target,
                 denial.evidence
             ),
+            evidence: vec![denial.evidence.clone()],
             next_action: denial.format_guidance(),
             resumable: true,
             worktree_preserved: true,
@@ -267,6 +269,7 @@ impl StalledBlocker {
             category: classify_stalled_blocker_category(&error_summary).to_string(),
             phase: "acceptance".to_string(),
             gate: "acceptance".to_string(),
+            evidence: vec![error_summary.clone()],
             error_summary,
             next_action: "resolve the external verification blocker and rerun acceptance"
                 .to_string(),
@@ -277,10 +280,11 @@ impl StalledBlocker {
 
     pub fn summary(&self) -> String {
         format!(
-            "category={}, phase={}, gate={}, resumable={}, next_action={}, error={}",
+            "category={}, phase={}, gate={}, evidence={}, resumable={}, next_action={}, error={}",
             self.category,
             self.phase,
             self.gate,
+            self.evidence.join(" | "),
             self.resumable,
             self.next_action,
             self.error_summary

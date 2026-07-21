@@ -29,7 +29,8 @@ use crate::vcs::WorkspaceStatus;
 use super::acceptance_state::{
     consume_resumable_acceptance_marker, load_acceptance_state, mark_acceptance_failed,
     mark_acceptance_passed, mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
-    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context,
+    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context, BlockedMarker,
+    BlockedMarkerOrigin,
 };
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
@@ -42,6 +43,19 @@ use super::workspace;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 
+fn stalled_blocker_from_marker(marker: &BlockedMarker) -> crate::events::StalledBlocker {
+    crate::events::StalledBlocker {
+        category: "acceptance_marker".to_string(),
+        phase: marker.phase.clone(),
+        gate: marker.reason.clone(),
+        error_summary: marker.reason.clone(),
+        evidence: marker.evidence.clone(),
+        next_action: marker.next_action.clone(),
+        resumable: marker.resumable,
+        worktree_preserved: marker.worktree_preserved,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -49,6 +63,7 @@ mod tests {
         resume_cycle_flags, should_run_apply, ResumeAction,
     };
     use crate::execution::state::WorkspaceState;
+    use crate::parallel::acceptance_state::{BlockedMarker, BlockedMarkerOrigin};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -80,6 +95,32 @@ mod tests {
             .current_dir(path)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn resumed_marker_restores_structured_stalled_metadata() {
+        let marker = BlockedMarker {
+            origin: BlockedMarkerOrigin::Acceptance,
+            reason: "acceptance_gated".to_string(),
+            phase: "acceptance".to_string(),
+            evidence: vec!["verification output".to_string()],
+            finding_identities: vec!["finding-a".to_string()],
+            retry_count: 2,
+            semantic_fingerprint: Some("finding-a".to_string()),
+            semantic_progress: "no_semantic_progress".to_string(),
+            external_blockers: vec!["verification unavailable".to_string()],
+            resumable: false,
+            next_action: "inspect evidence".to_string(),
+            worktree_preserved: true,
+        };
+
+        let blocker = super::stalled_blocker_from_marker(&marker);
+
+        assert_eq!(blocker.phase, "acceptance");
+        assert_eq!(blocker.gate, "acceptance_gated");
+        assert_eq!(blocker.evidence, ["verification output"]);
+        assert!(!blocker.resumable);
+        assert_eq!(blocker.next_action, "inspect evidence");
     }
 
     #[test]
@@ -791,15 +832,8 @@ impl ParallelExecutor {
             if matches!(resume_action, ResumeAction::Blocked) {
                 if let Some(ref tx) = event_tx {
                     if let Ok(Some(marker)) = parse_blocked_marker(&workspace.path, &change_id) {
-                        let summary = format!(
-                            "{}; evidence: {}; resumable: {}; next action: {}",
-                            marker.reason,
-                            marker.evidence.join(" | "),
-                            marker.resumable,
-                            marker.next_action,
-                        );
-                        let blocker = crate::events::StalledBlocker::acceptance_infrastructure(summary);
-                        let event = if matches!(marker.origin, crate::parallel::acceptance_state::BlockedMarkerOrigin::Acceptance) {
+                        let blocker = stalled_blocker_from_marker(&marker);
+                        let event = if matches!(marker.origin, BlockedMarkerOrigin::Acceptance) {
                             ParallelEvent::AcceptanceGated {
                                 change_id: change_id.clone(),
                                 blocker,
@@ -1972,7 +2006,7 @@ impl ParallelExecutor {
                                 &change_id,
                                 "permission_stalled",
                                 &evidence,
-                                "stalled",
+                                "no_semantic_progress",
                                 &evidence,
                                 true,
                                 "explicit retry",
@@ -2085,7 +2119,7 @@ impl ParallelExecutor {
                                 &change_id,
                                 "acceptance_gated",
                                 &evidence,
-                                "stalled",
+                                "no_semantic_progress",
                                 &evidence,
                                 true,
                                 "explicit retry",
