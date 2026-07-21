@@ -17,7 +17,7 @@
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-resolve-dependency-dispatch --archive-gate`
 
-## Acceptance #2 Failure Follow-up
-- [x] Task 1の宣言済みunit verificationが不足している。`openspec/changes/fix-resolve-dependency-dispatch/tasks.md:3`はdependency target classごとのtable-driven testを要求するが、`src/parallel/dependency.rs:303-370`はtable-drivenではなく、`resolving-a`の同一assertionを2回繰り返しておりresolve-wait分類を検証していない。resolve-waitを含む各target classのunit evidenceを追加する必要がある。対象品質gate、strict validation、archive-gate validationは成功し、tasks.mdに未チェック項目はなく、worktreeはcleanで実行可能commit hookも確認されなかった。
-- [x] resolve lifecycle evidenceとeffective-base取得の失敗がfail-openになり得る。`src/parallel/dependency.rs:57-78`はshared stateの`try_read()`失敗を空のresolving/resolve-wait集合へ変換し、`src/parallel/dependency.rs:187-202`はcurrent integration branch取得失敗時にoriginal branchへフォールバックする。取得失敗時は判定不能としてdependentをblockする必要がある。
-- [x] 依存metadata取得失敗がなおfail-openになる。`src/parallel/queue_state.rs:609-639`と`src/parallel/queue_state.rs:2287-2310`は`proposal.md`が存在しない場合を取得失敗としてblockせず、空のdependency listへ変換する。仕様の「dependency evidence failure is fail-closed」に従い、dispatch候補に対するproposal欠落もblockし、診断を出す必要がある。
+## Acceptance #3 Failure Follow-up
+- [x] `src/parallel/dependency.rs:57-78`はshared orchestrator stateの`try_read()`失敗を空集合へ変換するため、resolve lifecycle evidence取得不能時にdependent dispatchがfail-openになり得る。lock取得失敗を判定不能として保持し、dependentをblockする必要がある。
+- [x] worktreeがdirtyでarchive commit readinessを満たさない。`openspec/changes/fix-resolve-dependency-dispatch/tasks.md:22`に未コミット変更と未完了checkboxがある。なお実際のcommit-path hook相当である`prek run --all-files`と`cflx openspec validate fix-resolve-dependency-dispatch --archive-gate`は成功した。
+- [x] 宣言済みintegration verificationが失敗する。`cargo test parallel::tests::executor::resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch --lib`は`src/parallel/tests/executor.rs:558`で失敗し、merge evidence後のdependent `ApplyStarted`を観測できない。resolve完了後の再分析・dispatch経路を修正する必要がある。

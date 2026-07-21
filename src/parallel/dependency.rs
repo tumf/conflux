@@ -31,6 +31,7 @@ pub(super) struct DependencyContext {
     terminal_error_ids: HashSet<String>,
     resolving_ids: HashSet<String>,
     resolve_wait_ids: HashSet<String>,
+    lifecycle_evidence_available: bool,
     effective_dependency_base: Option<String>,
 }
 
@@ -54,28 +55,31 @@ impl DependencyContext {
         in_flight: &HashSet<String>,
         shared_orchestrator_state: Option<&std::sync::Arc<RwLock<OrchestratorState>>>,
     ) -> Self {
-        let (terminal_error_ids, resolving_ids, resolve_wait_ids) = shared_orchestrator_state
-            .and_then(|state| state.try_read().ok())
-            .map(|state| {
-                (
-                    state
-                        .initial_change_ids()
-                        .iter()
-                        .filter(|id| state.is_terminal_error_change(id))
-                        .cloned()
-                        .collect::<HashSet<_>>(),
-                    state
-                        .active_change_ids()
-                        .into_iter()
-                        .filter(|id| state.display_status(id) == "resolving")
-                        .collect::<HashSet<_>>(),
-                    state
-                        .resolve_wait_change_ids()
-                        .into_iter()
-                        .collect::<HashSet<_>>(),
-                )
-            })
-            .unwrap_or_default();
+        let (terminal_error_ids, resolving_ids, resolve_wait_ids, lifecycle_evidence_available) =
+            match shared_orchestrator_state {
+                Some(state) => match state.try_read() {
+                    Ok(state) => (
+                        state
+                            .initial_change_ids()
+                            .iter()
+                            .filter(|id| state.is_terminal_error_change(id))
+                            .cloned()
+                            .collect::<HashSet<_>>(),
+                        state
+                            .active_change_ids()
+                            .into_iter()
+                            .filter(|id| state.display_status(id) == "resolving")
+                            .collect::<HashSet<_>>(),
+                        state
+                            .resolve_wait_change_ids()
+                            .into_iter()
+                            .collect::<HashSet<_>>(),
+                        true,
+                    ),
+                    Err(_) => (HashSet::new(), HashSet::new(), HashSet::new(), false),
+                },
+                None => (HashSet::new(), HashSet::new(), HashSet::new(), true),
+            };
 
         let queued_ids = queued_ids
             .into_iter()
@@ -95,6 +99,7 @@ impl DependencyContext {
             terminal_error = terminal_error_ids.len(),
             resolving = resolving_ids.len(),
             resolve_wait = resolve_wait_ids.len(),
+            lifecycle_evidence_available,
             "Built dependency classification context"
         );
 
@@ -108,6 +113,7 @@ impl DependencyContext {
             terminal_error_ids,
             resolving_ids,
             resolve_wait_ids,
+            lifecycle_evidence_available,
             effective_dependency_base: None,
         }
     }
@@ -124,6 +130,9 @@ impl DependencyContext {
 
         if matches!(class, DependencyTargetClass::Rejected) {
             return class;
+        }
+        if !self.lifecycle_evidence_available {
+            return DependencyTargetClass::Error;
         }
 
         if self.terminal_error_ids.contains(dep_id) {
@@ -297,6 +306,29 @@ mod tests {
         let change_dir = root.join("openspec/changes").join(id);
         std::fs::create_dir_all(&change_dir).unwrap();
         std::fs::write(change_dir.join("proposal.md"), "# Change\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_blocks_dependencies_when_lifecycle_evidence_lock_is_unavailable() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["resolving-a".to_string()],
+            1,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        )));
+        let _write_guard = state.write().await;
+        let context = DependencyContext::from_parts(
+            temp_dir.path().to_path_buf(),
+            ["dependent"],
+            &HashSet::new(),
+            Some(&state),
+        );
+
+        assert_eq!(
+            context.classify("resolving-a"),
+            DependencyTargetClass::Error,
+            "unavailable lifecycle evidence must fail closed"
+        );
     }
 
     #[tokio::test]

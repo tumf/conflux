@@ -2564,7 +2564,7 @@ impl ParallelExecutor {
 
     async fn prepare_dispatch_candidates(
         &mut self,
-        queued: &mut Vec<crate::openspec::Change>,
+        queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         iteration: u32,
@@ -2605,10 +2605,9 @@ impl ParallelExecutor {
             return ReanalysisFlowDecision::done(false, iteration);
         }
 
-        if queued.len() != classification.dispatchable.len() {
-            *queued = classification.dispatchable;
-        }
-
+        // Keep temporarily dependency-blocked candidates in `queued`: a later reanalysis,
+        // such as ResolveCompletion, must re-evaluate them after repository-visible evidence
+        // changes. Dispatch selection applies the per-pass gate without dropping them.
         ReanalysisFlowDecision::Continue
     }
 
