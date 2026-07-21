@@ -28,3 +28,5 @@ src/tui/.tldrignore
 
 .review-gauntlet/*
 !.review-gauntlet/checkpoints/
+
+/target-acceptance

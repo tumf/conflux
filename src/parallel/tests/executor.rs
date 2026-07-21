@@ -716,126 +716,40 @@ fn test_skip_reason_for_merge_deferred_dependency() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_resolve_merge_aborts_when_base_dirty() {
-    let temp_dir = tempfile::TempDir::new().or_fail("unexpected error");
-    let repo_root = temp_dir.path();
-    let base_dir = repo_root.join("worktrees");
-
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
+    let repo_dir = tempfile::TempDir::new().or_fail("create temp repo");
+    let worktree_dir = tempfile::TempDir::new().or_fail("create worktree base");
+    let repo_root = repo_dir.path();
     init_git_repo(repo_root).await;
 
     let config = create_test_config_with(OrchestratorConfig {
-        resolve_command: Some("sh merge-resolver.sh \"{prompt}\"".to_string()),
+        workspace_base_dir: Some(worktree_dir.path().to_string_lossy().to_string()),
         ..Default::default()
     });
-    let mut manager =
-        GitWorkspaceManager::new(base_dir.clone(), repo_root.to_path_buf(), 1, config.clone());
-
-    let workspace_a = manager
+    let mut manager = GitWorkspaceManager::new(
+        worktree_dir.path().to_path_buf(),
+        repo_root.to_path_buf(),
+        1,
+        config.clone(),
+    );
+    let workspace = manager
         .create_workspace("change-a", None)
         .await
-        .or_fail("unexpected error");
+        .or_fail("create workspace");
+    commit_workspace_change(&workspace, "change-a.txt", "A", "Apply: change-a").await;
 
-    std::fs::write(workspace_a.path.join("change-a.txt"), "A").or_fail("unexpected error");
-    Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(&workspace_a.path)
+    std::fs::write(repo_root.join("dirty.txt"), "dirty").or_fail("dirty base");
+
+    let result = resolve_deferred_merge(repo_root.to_path_buf(), config, "change-a").await;
+    assert!(result.is_err(), "dirty base must abort deferred merge");
+
+    let merge_log = Command::new("git")
+        .args(["log", "--merges", "--format=%s"])
+        .current_dir(repo_root)
         .output()
         .await
-        .or_fail("unexpected error");
-    Command::new("git")
-        .args(["commit", "-m", "Apply: change-a"])
-        .current_dir(&workspace_a.path)
-        .output()
-        .await
-        .or_fail("unexpected error");
-
-    let resolver_script = repo_root.join("merge-resolver.sh");
-    let script_contents = format!(
-        "#!/bin/sh\nset -e\n\
-            if [ -f .git/merge-in-progress-marker ]; then\n\
-              git commit -m 'Merge change: change-a'\n\
-              exit 0\n\
-            fi\n\
-            git checkout main\n\
-            git merge --no-ff --no-commit {}\n\
-            touch .git/merge-in-progress-marker\n",
-        workspace_a.name
-    );
-    std::fs::write(&resolver_script, script_contents).or_fail("unexpected error");
-
-    // Create test AI runner
-
-    let shared_stagger_state = Arc::new(Mutex::new(None));
-
-    let queue_config = CommandQueueConfig {
-        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
-
-        max_retries: DEFAULT_MAX_RETRIES,
-
-        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
-
-        retry_error_patterns: default_retry_patterns(),
-
-        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
-        inactivity_timeout_secs: 0,
-        inactivity_kill_grace_secs: 10,
-        inactivity_timeout_max_retries: 0,
-        strict_process_cleanup: true,
-    };
-
-    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
-
-    let executor = ParallelExecutor {
-        workspace_manager: Box::new(manager),
-        config,
-        apply_command: String::new(),
-        archive_command: String::new(),
-        event_tx: None,
-        max_conflict_retries: 2,
-        repo_root: repo_root.to_path_buf(),
-        no_resume: false,
-        explicit_retry: false,
-        failed_tracker: FailedChangeTracker::new(),
-        change_dependencies: HashMap::new(),
-        resolve_wait_changes: HashSet::new(),
-        reject_wait_changes: HashSet::new(),
-        merge_wait_changes: HashSet::new(),
-        dependency_blocker_fingerprints: HashMap::new(),
-        force_recreate_worktree: HashSet::new(),
-        hooks: None,
-        cancel_token: None,
-        last_queue_change_at: Arc::new(Mutex::new(None)),
-        last_available_slots: None,
-        dynamic_queue: None,
-        ai_runner,
-        apply_history: Arc::new(Mutex::new(crate::history::ApplyHistory::new())),
-        archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
-        acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
-        acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
-        shared_stagger_state,
-        manual_resolve_count: None,
-        auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        scheduler_lifetime: SchedulerLifetime::Finite,
-        post_archive_action: super::super::PostArchiveAction::MergeToBase,
-        shared_orchestrator_state: None,
-        last_dispatched_resolve_wait_changes: HashSet::new(),
-        last_dispatched_reject_wait_changes: HashSet::new(),
-        resolve_wait_retry_triggered: false,
-        last_resolve_wait_base_dirty: None,
-        diagnostic_dedup: DiagnosticDeduplicationStore::new(),
-    };
-
-    let revisions = vec![workspace_a.name];
-    let change_ids = vec!["change-a".to_string()];
-
-    executor
-        .merge_and_resolve_with(
-            &revisions,
-            &change_ids,
-            |_revs, _details| async move { Ok(()) },
-        )
-        .await
-        .or_fail("unexpected error");
+        .or_fail("read merge log");
+    assert!(!String::from_utf8_lossy(&merge_log.stdout).contains("Merge change: change-a"));
 }
 
 #[cfg(feature = "heavy-tests")]
@@ -5797,6 +5711,7 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
 
 #[tokio::test]
 async fn test_manual_resolve_wait_retries_after_in_flight_apply_completes() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use crate::parallel::WorkspaceResult;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -8287,6 +8202,7 @@ async fn test_attempt_merge_deferred_when_resolve_active() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_deferred_when_worktree_dirty() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -8388,6 +8304,7 @@ async fn test_merge_deferred_when_worktree_dirty() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_deferred_when_archive_entry_missing() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -8472,6 +8389,7 @@ async fn test_merge_deferred_when_archive_entry_missing() {
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
 async fn test_merge_proceeds_when_archive_complete() {
+    let _merge_lock_test_guard = merge_lock_test_mutex().lock().await;
     use std::fs;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
