@@ -16,6 +16,3 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate fix-resolve-dependency-dispatch --archive-gate`
-
-## Acceptance #4 Failure Follow-up
-- [x] 宣言済みintegration verificationが回帰testを実行していない。`openspec/changes/fix-resolve-dependency-dispatch/proposal.md`と`tasks.md:9`は`cargo test parallel::tests::executor`を証拠としているが、これでは`src/parallel/tests/executor.rs:397`の`resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch`が実行されず、個別指定でも0 testsとなる。`--features heavy-tests`付きでは同testが1件実行され成功したため、宣言・taskの検証コマンドを実際のfeature gateに合わせる必要がある。なお、lifecycle lock取得失敗のfail-closed化、resolve後のdependent dispatch、品質gate、archive-gate、clean worktreeは確認できた。
