@@ -28,32 +28,35 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
             let normalized = finding.split_whitespace().collect::<Vec<_>>().join(" ");
             (!normalized.is_empty()).then(|| {
                 let lower = normalized.to_ascii_lowercase();
-                // Only an explicit non-repository prerequisite is external. Generic
-                // error words are actionable because an apply can add a fixture, repair
-                // configuration, or improve the repository's diagnostics.
-                let external = [
-                    "external non-mockable",
-                    "non-mockable external",
-                    "external prerequisite",
-                    "external service outage",
-                    "missing non-mockable external credential",
-                    "rate limit",
-                    "network unreachable",
-                    "dns resolution failed",
-                ]
-                .iter()
-                .any(|needle| lower.contains(needle));
-                let path = lower
+                let path_token = lower
                     .split_whitespace()
                     .find(|word| {
                         word.contains('/') || word.ends_with(".rs") || word.ends_with(".md")
                     })
-                    .unwrap_or("")
-                    .trim_end_matches(|character: char| {
-                        character == ':' || character.is_ascii_digit()
-                    });
+                    .unwrap_or("");
+                // Coordinates are unstable finding context, not identity. Remove the
+                // complete token so `src/lib.rs:10:2` cannot leave `:10:2` behind.
+                let path = path_token
+                    .trim_matches(|character: char| matches!(character, '`' | '(' | ')' | ','))
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                // An explicit non-mockable prerequisite is external only when the
+                // finding has no repository target or requested repository repair.
+                let external = path.is_empty()
+                    && !lower.contains("fix ")
+                    && !lower.contains("repair ")
+                    && [
+                        "external non-mockable",
+                        "non-mockable external",
+                        "external prerequisite",
+                        "external service outage",
+                        "missing non-mockable external credential",
+                    ]
+                    .iter()
+                    .any(|needle| lower.contains(needle));
                 let message = lower
-                    .replace(path, "")
+                    .replace(path_token, "")
                     .split_whitespace()
                     .filter(|word| !word.chars().all(|character| character.is_ascii_digit()))
                     .collect::<Vec<_>>()
@@ -566,7 +569,7 @@ mod tests {
     fn retry_decision_normalizes_order_whitespace_duplicates_and_stalls_repeats() {
         let findings = normalize_findings(&[
             " src/lib.rs:10   missing  test ".to_string(),
-            "src/lib.rs:10 missing test".to_string(),
+            "src/lib.rs:11 missing test".to_string(),
         ]);
         assert_eq!(findings.len(), 1);
         let decision = decide_acceptance_retry(
@@ -587,7 +590,7 @@ mod tests {
 
     #[test]
     fn retry_decision_stalls_external_only_and_allows_progress_changed() {
-        let findings = normalize_findings(&["external service outage for src/lib.rs".to_string()]);
+        let findings = normalize_findings(&["external service outage".to_string()]);
         assert!(findings[0].external);
         assert!(matches!(
             decide_acceptance_retry(&[], None, &findings, "one", 1),
@@ -625,7 +628,9 @@ mod tests {
     fn generic_credential_and_unavailable_errors_remain_repository_fixable() {
         let findings = normalize_findings(&[
             "missing API key in test fixture".to_string(),
-            "src/client.rs: unavailable fallback".to_string(),
+            "src/client.rs: rate limit retry missing".to_string(),
+            "network unreachable: fix retry handling".to_string(),
+            "dns resolution failed while repairing src/client.rs".to_string(),
             "missing non-mockable external credential".to_string(),
         ]);
         assert_eq!(
@@ -636,11 +641,13 @@ mod tests {
         assert_eq!(
             repository_findings(&[
                 "missing API key in test fixture".to_string(),
-                "src/client.rs: unavailable fallback".to_string(),
+                "src/client.rs: rate limit retry missing".to_string(),
+                "network unreachable: fix retry handling".to_string(),
+                "dns resolution failed while repairing src/client.rs".to_string(),
                 "missing non-mockable external credential".to_string(),
             ])
             .len(),
-            2
+            4
         );
     }
 

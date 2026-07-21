@@ -16,6 +16,6 @@
 
 Expected archive gate: `cflx openspec validate bound-acceptance-retry-cycles --archive-gate` exits 0.
 
-## Acceptance #3 Failure Follow-up
-- [x] `openspec/changes/bound-acceptance-retry-cycles/tasks.md:3-8` は全項目を完了扱いにしているが、task 3 の alternating CONTINUE/FAIL fixture、および task 6 の serial/parallel outcome parity 検証が実装されていない。`src/orchestration/acceptance.rs:552-675`、`src/serial_run_service.rs:1301-1421`、`src/parallel/tests/executor.rs:6489-6663` には個別分岐テストはあるが、宣言された交互verdictと同一入力のmode parityを実証するテストがない。チェック済みの検証契約を満たす回帰テストを追加するか、tasks.mdの完了表示を実証可能な内容へ修正すること。
-- [x] `openspec/changes/bound-acceptance-retry-cycles/tasks.md:9` は品質ゲートを完了済みにしているが、宣言されたコマンド列は失敗する。クリーン再ビルド後の `cargo test serial_run_service` で `src/serial_run_service.rs:1348-1369` の `serial_external_only_failure_stalls_without_apply_findings` が失敗した。fixture は `network unavailable` を external と期待する一方、`src/orchestration/acceptance.rs:34-43` の classifier はこの文字列を repository-fixable と分類する。前回修正方針に合わせ、external/non-mockable を明示するfixtureへ直すか、意図した分類契約と実装を一致させてゲートを成功させること。
+## Acceptance #4 Failure Follow-up
+- [x] `src/orchestration/acceptance.rs:34-43` は `rate limit`、`network unreachable`、`dns resolution failed` を文脈なしでexternal扱いするため、`src/client.rs: rate limit retry missing` のようなrepository-fixable findingもapply入力から除外してstalledにする。specのrepository/external個別分類に反する。external/non-mockable prerequisiteが明示された場合だけexternalにするか、repository path・修正要求を優先し、誤分類の回帰テストを追加すること。品質ゲート、pre-commit hook、archive-gate、unchecked taskなし、clean worktreeは確認済み。
+- [x] `src/orchestration/acceptance.rs:46-60` は `src/lib.rs:10 missing test` の path から `src/lib.rs` を除去した後、`:10` を message に残すため、同じfindingが11行目へ移動すると別identityになる。`tasks.md:3` の stable code/path と spec の normalized finding identity 契約に反し、実質同一findingでもretryを継続できる。行番号・列番号など不安定な位置情報をidentityから除外し、異なる行番号が同一identityになる回帰テストを追加すること。
