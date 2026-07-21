@@ -606,7 +606,7 @@ impl ParallelExecutor {
                 .join("openspec/changes")
                 .join(change_id)
                 .join("proposal.md");
-            let metadata_dependencies = if proposal_path.exists() {
+            let metadata_dependencies = if self.repo_root.join("openspec/changes").exists() {
                 match crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal_path)
                 {
                     Ok(dependencies) => dependencies,
@@ -2284,7 +2284,7 @@ impl ParallelExecutor {
                 .join("openspec/changes")
                 .join(&change.id)
                 .join("proposal.md");
-            let metadata_dependencies = if proposal_path.exists() {
+            let metadata_dependencies = if self.repo_root.join("openspec/changes").exists() {
                 match crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal_path)
                 {
                     Ok(dependencies) => dependencies,

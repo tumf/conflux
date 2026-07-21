@@ -625,41 +625,51 @@ async fn resolving_dependency_diagnostic_dedupes_and_reemits_after_signature_cha
 
 #[tokio::test]
 async fn metadata_read_failure_blocks_dispatch_even_without_analyzer_dependencies() {
-    let temp = TempDir::new().or_fail("unexpected error");
-    init_git_repo(temp.path()).await;
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-    let mut executor = ParallelExecutor::new(
-        temp.path().to_path_buf(),
-        create_test_config(),
-        Some(event_tx),
-    );
-    let proposal_dir = temp.path().join("openspec/changes/missing-proposal");
-    std::fs::create_dir_all(&proposal_dir).or_fail("create invalid proposal fixture");
-    std::fs::write(
-        proposal_dir.join("proposal.md"),
-        "---\ndependencies: [broken\n---\n# Invalid\n",
-    )
-    .or_fail("write invalid proposal fixture");
-    let analysis = crate::analyzer::AnalysisResult {
-        order: vec!["missing-proposal".to_string()],
-        dependencies: HashMap::new(),
-        groups: None,
-    };
-
-    assert!(executor
-        .select_changes_for_dispatch(&analysis, 1, &HashSet::new())
-        .await
-        .is_empty());
-    let mut saw_metadata_error = false;
-    while let Ok(event) = event_rx.try_recv() {
-        if let ExecutionEvent::Error { message } = event {
-            saw_metadata_error |= message.contains("dependency metadata could not be read");
+    for (change_id, proposal) in [
+        ("missing-proposal", None),
+        (
+            "invalid-proposal",
+            Some("---\ndependencies: [broken\n---\n# Invalid\n"),
+        ),
+    ] {
+        let temp = TempDir::new().or_fail("unexpected error");
+        init_git_repo(temp.path()).await;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
+        let mut executor = ParallelExecutor::new(
+            temp.path().to_path_buf(),
+            create_test_config(),
+            Some(event_tx),
+        );
+        let proposal_dir = temp.path().join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&proposal_dir).or_fail("create proposal fixture");
+        if let Some(proposal) = proposal {
+            std::fs::write(proposal_dir.join("proposal.md"), proposal)
+                .or_fail("write invalid proposal fixture");
         }
+        let analysis = crate::analyzer::AnalysisResult {
+            order: vec![change_id.to_string()],
+            dependencies: HashMap::new(),
+            groups: None,
+        };
+
+        assert!(
+            executor
+                .select_changes_for_dispatch(&analysis, 1, &HashSet::new())
+                .await
+                .is_empty(),
+            "{change_id} must not dispatch"
+        );
+        let mut saw_metadata_error = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let ExecutionEvent::Error { message } = event {
+                saw_metadata_error |= message.contains("dependency metadata could not be read");
+            }
+        }
+        assert!(
+            saw_metadata_error,
+            "{change_id} metadata failure must block dispatch visibly"
+        );
     }
-    assert!(
-        saw_metadata_error,
-        "metadata read failure must block dispatch visibly"
-    );
 }
 
 #[tokio::test]

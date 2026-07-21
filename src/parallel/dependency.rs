@@ -196,10 +196,9 @@ impl DependencyContext {
                 Err(err) => {
                     warn!(
                         error = %err,
-                        original_branch = %original_branch,
-                        "Failed to determine current branch for dependency base; using original branch"
+                        "Failed to determine current branch for effective dependency base"
                     );
-                    original_branch
+                    return Err(OrchestratorError::from_vcs_error(err));
                 }
             };
 
@@ -308,6 +307,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         write_change(temp_dir.path(), "active-a");
         write_change(temp_dir.path(), "resolving-a");
+        write_change(temp_dir.path(), "resolve-wait-a");
         let archive_dir = temp_dir
             .path()
             .join("openspec/changes/archive/2026-06-17-archived-a");
@@ -324,17 +324,19 @@ mod tests {
 
         let in_flight = HashSet::from(["flight-a".to_string()]);
         let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
-            vec!["resolving-a".to_string()],
+            vec!["resolving-a".to_string(), "resolve-wait-a".to_string()],
             1,
             crate::orchestration::state::ExecutionMode::Parallel,
         )));
-        state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
-                change_id: "resolving-a".to_string(),
-                command: "resolve".to_string(),
-            });
+        let mut state_guard = state.write().await;
+        state_guard.apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
+            change_id: "resolving-a".to_string(),
+            command: "resolve".to_string(),
+        });
+        state_guard.apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+            "resolve-wait-a".to_string(),
+        ));
+        drop(state_guard);
         let context = DependencyContext::from_parts(
             temp_dir.path().to_path_buf(),
             ["queued-a"],
@@ -342,34 +344,18 @@ mod tests {
             Some(&state),
         );
 
-        assert_eq!(context.classify("queued-a"), DependencyTargetClass::Queued);
-        assert_eq!(
-            context.classify("flight-a"),
-            DependencyTargetClass::InFlight
-        );
-        assert_eq!(
-            context.classify("active-a"),
-            DependencyTargetClass::ActiveButNotQueued
-        );
-        assert_eq!(
-            context.classify("archived-a"),
-            DependencyTargetClass::Archived
-        );
-        assert_eq!(
-            context.classify("resolving-a"),
-            DependencyTargetClass::Resolving
-        );
-        assert_eq!(
-            context.classify("resolving-a"),
-            DependencyTargetClass::Resolving
-        );
-        assert_eq!(
-            context.classify("rejected-a"),
-            DependencyTargetClass::Rejected
-        );
-        assert_eq!(
-            context.classify("missing-a"),
-            DependencyTargetClass::Missing
-        );
+        let cases = [
+            ("queued-a", DependencyTargetClass::Queued),
+            ("flight-a", DependencyTargetClass::InFlight),
+            ("active-a", DependencyTargetClass::ActiveButNotQueued),
+            ("archived-a", DependencyTargetClass::Archived),
+            ("resolving-a", DependencyTargetClass::Resolving),
+            ("resolve-wait-a", DependencyTargetClass::Resolving),
+            ("rejected-a", DependencyTargetClass::Rejected),
+            ("missing-a", DependencyTargetClass::Missing),
+        ];
+        for (target, expected) in cases {
+            assert_eq!(context.classify(target), expected, "target={target}");
+        }
     }
 }
