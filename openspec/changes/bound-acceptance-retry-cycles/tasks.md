@@ -16,6 +16,5 @@
 
 Expected archive gate: `cflx openspec validate bound-acceptance-retry-cycles --archive-gate` exits 0.
 
-## Acceptance #4 Failure Follow-up
-- [x] `src/orchestration/acceptance.rs:34-43` は `rate limit`、`network unreachable`、`dns resolution failed` を文脈なしでexternal扱いするため、`src/client.rs: rate limit retry missing` のようなrepository-fixable findingもapply入力から除外してstalledにする。specのrepository/external個別分類に反する。external/non-mockable prerequisiteが明示された場合だけexternalにするか、repository path・修正要求を優先し、誤分類の回帰テストを追加すること。品質ゲート、pre-commit hook、archive-gate、unchecked taskなし、clean worktreeは確認済み。
-- [x] `src/orchestration/acceptance.rs:46-60` は `src/lib.rs:10 missing test` の path から `src/lib.rs` を除去した後、`:10` を message に残すため、同じfindingが11行目へ移動すると別identityになる。`tasks.md:3` の stable code/path と spec の normalized finding identity 契約に反し、実質同一findingでもretryを継続できる。行番号・列番号など不安定な位置情報をidentityから除外し、異なる行番号が同一identityになる回帰テストを追加すること。
+## Acceptance #1 Failure Follow-up
+- [x] 品質ゲート未達。`openspec/changes/bound-acceptance-retry-cycles/tasks.md:9` が成功済みとしている `cargo test parallel::tests::executor` は exit 101 で失敗し、`src/parallel/tests/executor.rs` の30件が失敗する。例: `test_slot_release_reanalyzes_and_dispatches_queued_follow_up_changes`（4395行）、`resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch`（558行）。失敗を修正し、宣言済みの全テストコマンドを成功させること。`cargo fmt --check`、clippy、pre-commit、archive-gate、clean worktreeは確認済み。
