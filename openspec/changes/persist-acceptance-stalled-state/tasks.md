@@ -16,5 +16,5 @@
 
 `cflx openspec validate persist-acceptance-stalled-state --archive-gate` exits 0.
 
-## Acceptance #5 Failure Follow-up
-- [x] 作業ツリーが未コミットです。`git status --short` は `openspec/changes/persist-acceptance-stalled-state/tasks.md` を `M` と報告しています。前回指摘のチェックボックスは削除され、全active taskは `[x]`、`cflx openspec validate persist-acceptance-stalled-state --archive-gate` と宣言済みCargoテスト・fmt・clippyは成功していますが、acceptance規約上dirty working treeではPASSにできません。`tasks.md:19` の空の `## Acceptance #4 Failure Follow-up` 見出しも除去し、必要なtasks.md修正をコミットして作業ツリーをcleanにしてください。
+## Acceptance #6 Failure Follow-up
+- [x] Archive validation excludes runtime-owned acceptance findings from implementation-task verification checks. (verification: unit - `src/openspec_cmd/validation.rs` and `src/openspec_cmd.rs::test_validate_tasks_excludes_runtime_acceptance_follow_ups_from_evidence_checks` cover the exclusion; `cargo fmt --check`, `cargo test test_validate_tasks_excludes_runtime_acceptance_follow_ups_from_evidence_checks --lib`, and `cargo run --quiet -- openspec validate persist-acceptance-stalled-state --archive-gate` pass; completion condition: archive validation accepts this runtime-owned follow-up while preserving active implementation verification checks)
