@@ -6545,8 +6545,9 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
         .output()
         .await
         .or_fail("create applied resume commit");
-    let fingerprint = crate::orchestration::acceptance::semantic_progress_fingerprint(&workspace_path)
-        .or_fail("fingerprint workspace");
+    let fingerprint =
+        crate::orchestration::acceptance::semantic_progress_fingerprint(&workspace_path)
+            .or_fail("fingerprint workspace");
     crate::parallel::acceptance_state::record_acceptance_retry_checkpoint(
         &workspace_path,
         "checkpoint-revision",
@@ -6591,17 +6592,25 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
         .await
         .or_fail("workspace task should exist")
         .or_fail("workspace task join should succeed");
-    assert!(result.error.is_none(), "stalled acceptance is not an error: {:?}", result.error);
+    assert!(
+        result.error.is_none(),
+        "stalled acceptance is not an error: {:?}",
+        result.error
+    );
 
     let checkpoint =
         crate::parallel::acceptance_state::load_acceptance_state_for(&workspace_path, change_id)
             .or_fail("load resumed checkpoint")
             .or_fail("checkpoint should still belong to resumed change");
     assert_eq!(checkpoint.cycle_count, starting_cycle_count + 1);
-    assert_eq!(checkpoint.previous_finding_identities, ["repository||repeated finding"]);
-    let marker = crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
-        .or_fail("load stalled marker")
-        .or_fail("acceptance failure must persist a stalled marker");
+    assert_eq!(
+        checkpoint.previous_finding_identities,
+        ["repository||repeated finding"]
+    );
+    let marker =
+        crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
+            .or_fail("load stalled marker")
+            .or_fail("acceptance failure must persist a stalled marker");
     assert_eq!(marker.reason, expected_reason);
 
     let mut acceptance_count = 0;
@@ -6621,9 +6630,18 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
             _ => {}
         }
     }
-    assert_eq!(acceptance_count, 1, "resumed workspace must run acceptance before stalling");
-    assert_eq!(apply_count, 0, "repeated/cycle-limit stalls must occur before another apply");
-    assert!(!saw_error, "stalled acceptance must not emit ProcessingError");
+    assert_eq!(
+        acceptance_count, 1,
+        "resumed workspace must run acceptance before stalling"
+    );
+    assert_eq!(
+        apply_count, 0,
+        "repeated/cycle-limit stalls must occur before another apply"
+    );
+    assert!(
+        !saw_error,
+        "stalled acceptance must not emit ProcessingError"
+    );
 }
 
 #[tokio::test]
