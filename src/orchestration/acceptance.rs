@@ -23,6 +23,29 @@ pub struct NormalizedFinding {
 }
 
 pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
+    fn rule_kind(text: &str) -> &'static str {
+        if ["test", "coverage", "verification", "evidence"]
+            .iter()
+            .any(|word| text.contains(word))
+        {
+            "verification"
+        } else if ["spec", "proposal", "requirement"]
+            .iter()
+            .any(|word| text.contains(word))
+        {
+            "specification"
+        } else if ["task", "checklist", "truthful"]
+            .iter()
+            .any(|word| text.contains(word))
+        {
+            "task-truthfulness"
+        } else if text.contains("dirty working tree") {
+            "workspace-cleanliness"
+        } else {
+            "implementation"
+        }
+    }
+
     let mut normalized = findings
         .iter()
         .filter_map(|finding| {
@@ -39,10 +62,10 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
                         word.contains('/') || word.ends_with(".rs") || word.ends_with(".md")
                     })
                     .unwrap_or("");
-                // Coordinates are unstable finding context, not identity. Remove the
-                // complete token so `src/lib.rs:10:2` cannot leave `:10:2` behind.
                 let path = path_token
-                    .trim_matches(|character: char| matches!(character, '`' | '(' | ')' | ','))
+                    .trim_matches(|character: char| {
+                        matches!(character, '`' | '(' | ')' | '[' | ']' | ',' | '.' | ';')
+                    })
                     .split(':')
                     .next()
                     .unwrap_or("");
@@ -60,29 +83,18 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
                     ]
                     .iter()
                     .any(|needle| lower.contains(needle));
-                let message = lower
-                    .replace(path_token, "")
-                    .split_whitespace()
-                    .filter(|word| !word.chars().all(|character| character.is_ascii_digit()))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let scope = if external { "external" } else { "repository" };
                 NormalizedFinding {
                     identity: finding_code.map_or_else(
                         || {
-                            format!(
-                                "{}|{}|{}",
-                                if external { "external" } else { "repository" },
-                                path,
-                                message
-                            )
+                            let location = if path.is_empty() {
+                                lower.as_str()
+                            } else {
+                                path
+                            };
+                            format!("{scope}|{location}|{}", rule_kind(&lower))
                         },
-                        |code| {
-                            format!(
-                                "{}|code|{}",
-                                if external { "external" } else { "repository" },
-                                code
-                            )
-                        },
+                        |code| format!("{scope}|code|{code}"),
                     ),
                     text: normalized,
                     external,
@@ -582,6 +594,37 @@ mod tests {
         assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
         std::fs::write(temp.path().join("src/lib.rs"), "two").unwrap();
         assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn finding_identity_prefers_code_and_uses_structural_fallback() {
+        let coded = normalize_findings(&[
+            "[MISSING_RETRY_TEST] old evidence at src/run.rs:10".into(),
+            "[MISSING_RETRY_TEST] changed summary at tests/run.rs:99".into(),
+        ]);
+        assert_eq!(coded.len(), 1);
+        assert_eq!(coded[0].identity, "repository|code|[missing_retry_test]");
+
+        let changed_detail = normalize_findings(&[
+            "Missing retry test at src/run.rs:10 because the branch is uncovered".into(),
+            "Regression coverage absent in src/run.rs:77; add a focused test".into(),
+        ]);
+        assert_eq!(changed_detail.len(), 1);
+        assert_eq!(
+            changed_detail[0].identity,
+            "repository|src/run.rs|verification"
+        );
+
+        let distinct = normalize_findings(&[
+            "Missing test at src/run.rs:10".into(),
+            "Incorrect implementation at src/run.rs:11".into(),
+            "Missing test at src/other.rs:10".into(),
+        ]);
+        assert_eq!(
+            distinct.len(),
+            3,
+            "rule and location must prevent collisions"
+        );
     }
 
     #[test]

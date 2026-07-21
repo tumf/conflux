@@ -148,7 +148,7 @@ fn ensure_runtime_acceptance_follow_up(
     };
     let tasks_path =
         crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace_path)?;
-    crate::task_parser::ensure_acceptance_follow_up(&tasks_path, attempt, &findings)
+    crate::task_parser::merge_acceptance_follow_up_apply_progress(&tasks_path, attempt, &findings)
 }
 
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
@@ -2395,7 +2395,7 @@ mod tests {
 
     #[cfg_attr(windows, ignore)]
     #[tokio::test]
-    async fn test_apply_loop_reopens_reworded_acceptance_follow_up_without_stable_identity() {
+    async fn test_apply_loop_preserves_reworded_acceptance_follow_up_by_fallback_identity() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
         let change_id = "completed-follow-up";
@@ -2403,11 +2403,11 @@ mod tests {
         std::fs::create_dir_all(&change_dir).unwrap();
         std::fs::write(
             change_dir.join("tasks.md"),
-            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [ ] missing repository coverage at src/example.rs:10\n",
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #2 Failure Follow-up\n- [ ] missing regression coverage at src/example.rs:10\n",
         )
         .unwrap();
 
-        let apply_cmd = "sh -c 'printf \"## Implementation Tasks\\n- [x] done\\n\\n## Acceptance #2 Failure Follow-up\\n- [x] fixed and verified with regression coverage\\n\" > openspec/changes/{change_id}/tasks.md'".to_string();
+        let apply_cmd = "sh -c 'printf \"## Implementation Tasks\\n- [x] done\\n\\n## Current Acceptance Follow-up\\n- attempt: 2\\n- [x] regression coverage added at src/example.rs:99\\n  evidence: cargo test example passes\\n\" > openspec/changes/{change_id}/tasks.md'".to_string();
         let config = OrchestratorConfig {
             apply_command: Some(apply_cmd),
             max_iterations: Some(1),
@@ -2417,13 +2417,13 @@ mod tests {
         history.set_follow_up_findings(
             change_id,
             2,
-            vec!["missing repository coverage at src/example.rs:10".to_string()],
+            vec!["missing regression coverage at src/example.rs:10".to_string()],
         );
         let mut agent = AgentRunner::new(config.clone());
         agent.seed_acceptance_history(history);
         let ai_runner = make_test_ai_runner();
 
-        let error = execute_apply_loop(
+        let result = execute_apply_loop(
             change_id,
             workspace,
             &config,
@@ -2438,13 +2438,16 @@ mod tests {
             |_line| async move {},
         )
         .await
-        .expect_err("reworded finding without a stable identity must be reopened");
+        .expect("apply hydration must preserve completed fallback identity");
 
-        assert!(error.to_string().contains("Max iterations (1) reached"));
+        assert!(result.completed);
         assert_eq!(
             check_task_progress(workspace, change_id).unwrap(),
-            TaskProgress::with_counts(1, 2)
+            TaskProgress::with_counts(2, 2)
         );
+        let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
+        assert!(content.contains("- [x] regression coverage added at src/example.rs:99"));
+        assert!(content.contains("evidence: cargo test example passes"));
     }
 
     #[cfg_attr(windows, ignore)]

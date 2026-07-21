@@ -495,17 +495,73 @@ fn normalize_acceptance_findings(
     normalized
 }
 
-fn acceptance_finding_identity(finding: &str) -> &str {
-    finding
-        .strip_prefix('[')
-        .and_then(|rest| rest.find(']').map(|end| &finding[..=end + 1]))
-        .unwrap_or(finding)
+#[derive(Debug, PartialEq, Eq)]
+struct ExistingAcceptanceFinding {
+    finding: crate::orchestration::acceptance::NormalizedFinding,
+    completed: bool,
+    evidence: Vec<String>,
+}
+
+fn existing_acceptance_findings(section: &str) -> Vec<ExistingAcceptanceFinding> {
+    let mut findings = Vec::new();
+    for line in section.lines() {
+        if let Some((completed, text)) = ["- [ ] ", "- [x] ", "- [X] "]
+            .iter()
+            .enumerate()
+            .find_map(|(index, prefix)| line.strip_prefix(prefix).map(|text| (index > 0, text)))
+        {
+            if let Some(finding) =
+                crate::orchestration::acceptance::normalize_findings(&[text.to_string()])
+                    .into_iter()
+                    .next()
+            {
+                findings.push(ExistingAcceptanceFinding {
+                    finding,
+                    completed,
+                    evidence: Vec::new(),
+                });
+            }
+        } else if let Some(evidence) = line.trim().strip_prefix("evidence: ") {
+            if let Some(finding) = findings.last_mut() {
+                finding.evidence.push(evidence.to_string());
+            }
+        }
+    }
+    findings
+}
+
+fn reconcile_apply_progress(
+    mut runtime_findings: Vec<crate::orchestration::acceptance::NormalizedFinding>,
+    existing_findings: &[ExistingAcceptanceFinding],
+) -> (
+    Vec<crate::orchestration::acceptance::NormalizedFinding>,
+    Vec<String>,
+    std::collections::HashMap<String, Vec<String>>,
+) {
+    let mut completed_identities = Vec::new();
+    let mut evidence_by_identity = std::collections::HashMap::new();
+    for candidate in &mut runtime_findings {
+        if let Some(existing) = existing_findings
+            .iter()
+            .find(|existing| existing.finding.identity == candidate.identity)
+        {
+            candidate.text.clone_from(&existing.finding.text);
+            if existing.completed {
+                completed_identities.push(candidate.identity.clone());
+            }
+            if !existing.evidence.is_empty() {
+                evidence_by_identity.insert(candidate.identity.clone(), existing.evidence.clone());
+            }
+        }
+    }
+    (runtime_findings, completed_identities, evidence_by_identity)
 }
 
 fn render_acceptance_follow_up_section(
     attempt: u32,
     findings: &[crate::orchestration::acceptance::NormalizedFinding],
     completed_identities: &[String],
+    evidence_by_identity: &std::collections::HashMap<String, Vec<String>>,
 ) -> String {
     let mut section = format!("- attempt: {attempt}\n");
     for finding in findings.iter().filter(|finding| !finding.external) {
@@ -515,6 +571,11 @@ fn render_acceptance_follow_up_section(
             " "
         };
         let _ = writeln!(&mut section, "- [{checked}] {}", finding.text);
+        if let Some(evidence) = evidence_by_identity.get(&finding.identity) {
+            for item in evidence {
+                let _ = writeln!(&mut section, "  evidence: {item}");
+            }
+        }
     }
     let external = findings
         .iter()
@@ -624,6 +685,7 @@ fn upsert_acceptance_follow_up_section(
     attempt: u32,
     findings: &[crate::orchestration::acceptance::NormalizedFinding],
     completed_identities: &[String],
+    evidence_by_identity: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<()> {
     remove_acceptance_follow_up_sections(content)?;
     if !content.ends_with('\n') {
@@ -637,6 +699,7 @@ fn upsert_acceptance_follow_up_section(
         attempt,
         findings,
         completed_identities,
+        evidence_by_identity,
     ));
     Ok(())
 }
@@ -693,7 +756,7 @@ pub fn resolve_acceptance_follow_up_tasks_path_for_cleanup(
         .filter(|tasks_path| tasks_path.exists()))
 }
 
-pub fn record_acceptance_follow_up(
+pub fn replace_acceptance_follow_up_from_latest_fail(
     tasks_path: &Path,
     attempt: u32,
     findings: &[String],
@@ -701,11 +764,17 @@ pub fn record_acceptance_follow_up(
     let mut content = read_tasks_file(tasks_path)?;
     let normalized_findings = normalize_acceptance_findings(findings);
 
-    upsert_acceptance_follow_up_section(&mut content, attempt, &normalized_findings, &[])?;
+    upsert_acceptance_follow_up_section(
+        &mut content,
+        attempt,
+        &normalized_findings,
+        &[],
+        &std::collections::HashMap::new(),
+    )?;
     write_tasks_file(tasks_path, content)
 }
 
-pub fn ensure_acceptance_follow_up(
+pub fn merge_acceptance_follow_up_apply_progress(
     tasks_path: &Path,
     attempt: u32,
     findings: &[String],
@@ -716,34 +785,16 @@ pub fn ensure_acceptance_follow_up(
         .first()
         .map(|range| content[range.clone()].to_string())
         .unwrap_or_default();
-    let existing_tasks = existing_section
-        .lines()
-        .filter_map(|line| {
-            ["- [ ] ", "- [x] ", "- [X] "]
-                .iter()
-                .position(|prefix| line.starts_with(prefix))
-                .map(|index| (index > 0, &line[6..]))
-        })
-        .collect::<Vec<_>>();
-    let completed_identities = normalized_findings
-        .iter()
-        .filter(|candidate| {
-            existing_tasks.iter().any(|(completed, finding)| {
-                *completed
-                    && (candidate.identity.ends_with(&format!(
-                        "|code|{}",
-                        acceptance_finding_identity(finding).to_ascii_lowercase()
-                    )) || candidate.text == *finding)
-            })
-        })
-        .map(|candidate| candidate.identity.clone())
-        .collect::<Vec<_>>();
+    let existing_findings = existing_acceptance_findings(&existing_section);
+    let (merged_findings, completed_identities, evidence_by_identity) =
+        reconcile_apply_progress(normalized_findings, &existing_findings);
 
     upsert_acceptance_follow_up_section(
         &mut content,
         attempt,
-        &normalized_findings,
+        &merged_findings,
         &completed_identities,
+        &evidence_by_identity,
     )?;
     write_tasks_file(tasks_path, content)
 }
@@ -817,6 +868,52 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn stable_finding_identity_is_code_first_and_structural_without_code() {
+        let findings = normalize_acceptance_findings(&[
+            "[RETRY_MISSING] old evidence at src/run.rs:10".into(),
+            "[RETRY_MISSING] changed evidence at tests/run.rs:90".into(),
+            "Missing retry test at src/run.rs:11".into(),
+            "Different prose: regression coverage absent in src/run.rs:99".into(),
+            "Incorrect implementation at src/run.rs:12".into(),
+            "Missing retry test at src/other.rs:10".into(),
+        ]);
+        let identities = findings
+            .iter()
+            .map(|finding| finding.identity.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 4);
+        assert!(identities.contains(&"repository|code|[retry_missing]"));
+        assert!(identities.contains(&"repository|src/run.rs|verification"));
+        assert!(identities.contains(&"repository|src/run.rs|implementation"));
+        assert!(identities.contains(&"repository|src/other.rs|verification"));
+    }
+
+    #[test]
+    fn apply_reconciliation_is_monotonic_and_preserves_text_and_evidence() {
+        let existing = existing_acceptance_findings(
+            "- [x] Missing retry test at src/run.rs:10\n  evidence: cargo test retry passes\n- [ ] Broken implementation at src/other.rs:4\n",
+        );
+        let incoming = normalize_acceptance_findings(&[
+            "Regression coverage absent in src/run.rs:99".into(),
+            "Incorrect implementation at src/other.rs:40".into(),
+        ]);
+
+        let (merged, completed, evidence) = reconcile_apply_progress(incoming, &existing);
+
+        assert!(merged
+            .iter()
+            .any(|finding| finding.text == "Missing retry test at src/run.rs:10"));
+        assert!(merged
+            .iter()
+            .any(|finding| finding.text == "Broken implementation at src/other.rs:4"));
+        assert_eq!(completed, ["repository|src/run.rs|verification"]);
+        assert_eq!(
+            evidence["repository|src/run.rs|verification"],
+            ["cargo test retry passes"]
+        );
+    }
+
     // ====================
     // Bullet list format tests
     // ====================
@@ -879,7 +976,7 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
-        record_acceptance_follow_up(
+        replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
             &[
@@ -909,7 +1006,12 @@ mod tests {
         )
         .unwrap();
 
-        record_acceptance_follow_up(&tasks_path, 1, &["fresh finding".to_string()]).unwrap();
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            1,
+            &["fresh finding".to_string()],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert!(content.contains("## Current Acceptance Follow-up"));
@@ -928,7 +1030,12 @@ mod tests {
         )
         .unwrap();
 
-        record_acceptance_follow_up(&tasks_path, 2, &["latest finding".to_string()]).unwrap();
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            &["latest finding".to_string()],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert!(!content.contains("## Acceptance #1 Failure Follow-up"));
@@ -945,7 +1052,7 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
-        ensure_acceptance_follow_up(
+        merge_acceptance_follow_up_apply_progress(
             &tasks_path,
             2,
             &[
@@ -971,7 +1078,7 @@ mod tests {
         )
         .unwrap();
 
-        ensure_acceptance_follow_up(
+        merge_acceptance_follow_up_apply_progress(
             &tasks_path,
             2,
             &[
@@ -989,39 +1096,33 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_finding_identity_uses_complete_leading_code() {
-        assert_eq!(
-            acceptance_finding_identity("[SERIAL_STALLED_MARKER_MISSING] details"),
-            "[SERIAL_STALLED_MARKER_MISSING]"
-        );
-        assert_eq!(
-            acceptance_finding_identity("plain finding"),
-            "plain finding"
-        );
-    }
-
-    #[test]
-    fn ensure_acceptance_follow_up_reopens_reworded_plain_finding_without_stable_code() {
+    fn apply_progress_preserves_completed_fallback_identity_text_and_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(
             &tasks_path,
-            "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- [x] fixed and verified with regression coverage\n",
+            "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 1\n- [x] Missing retry coverage at src/example.rs:10\n  evidence: cargo test retry passes\n- [ ] Incorrect implementation at src/other.rs:4\n",
         )
         .unwrap();
 
-        ensure_acceptance_follow_up(
+        merge_acceptance_follow_up_apply_progress(
             &tasks_path,
             2,
-            &["missing repository coverage at src/example.rs:10".to_string()],
+            &[
+                "Regression test absent in src/example.rs:99 with changed detail".to_string(),
+                "Incorrect implementation at src/other.rs:40 with new evidence".to_string(),
+            ],
         )
         .unwrap();
 
         let content = std::fs::read_to_string(&tasks_path).unwrap();
-        assert!(content.contains("- [ ] missing repository coverage at src/example.rs:10"));
+        assert!(content.contains("- [x] Missing retry coverage at src/example.rs:10"));
+        assert!(content.contains("evidence: cargo test retry passes"));
+        assert!(content.contains("- [ ] Incorrect implementation at src/other.rs:4"));
+        assert!(!content.contains("changed detail"));
         assert_eq!(
             parse_file(&tasks_path, None).unwrap(),
-            TaskProgress::with_counts(1, 2)
+            TaskProgress::with_counts(2, 3)
         );
     }
 
@@ -1035,7 +1136,7 @@ mod tests {
         )
         .unwrap();
 
-        ensure_acceptance_follow_up(
+        merge_acceptance_follow_up_apply_progress(
             &tasks_path,
             2,
             &["[SERIAL_STALLED_MARKER_MISSING] detailed original finding".to_string()],
@@ -1043,7 +1144,7 @@ mod tests {
         .unwrap();
 
         let content = std::fs::read_to_string(&tasks_path).unwrap();
-        assert!(content.contains("- [x] [SERIAL_STALLED_MARKER_MISSING] detailed original finding"));
+        assert!(content.contains("- [x] [SERIAL_STALLED_MARKER_MISSING] fixed and verified"));
         assert_eq!(
             parse_file(&tasks_path, None).unwrap(),
             TaskProgress::with_counts(2, 2)
@@ -1060,7 +1161,7 @@ mod tests {
         )
         .unwrap();
 
-        record_acceptance_follow_up(
+        replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
             &["[SERIAL_STALLED_MARKER_MISSING] still missing at src/run.rs:42".to_string()],
@@ -1079,7 +1180,7 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
-        record_acceptance_follow_up(
+        replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             3,
             &[
@@ -1131,7 +1232,7 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
-        record_acceptance_follow_up(
+        replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
             &["finding\n## injected heading\n- [ ] injected task".to_string()],
@@ -1230,7 +1331,12 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done\n").unwrap();
 
-        record_acceptance_follow_up(&tasks_path, 3, &[" ".to_string(), "\t".to_string()]).unwrap();
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            3,
+            &[" ".to_string(), "\t".to_string()],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert!(content.contains("## Current Acceptance Follow-up"));
@@ -1243,7 +1349,12 @@ mod tests {
         let tasks_path = dir.path().join("tasks.md");
         std::fs::write(&tasks_path, "## Implementation Tasks\n- [x] done").unwrap();
 
-        record_acceptance_follow_up(&tasks_path, 4, &["fresh finding".to_string()]).unwrap();
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            4,
+            &["fresh finding".to_string()],
+        )
+        .unwrap();
 
         let content = std::fs::read_to_string(&tasks_path).unwrap();
         assert_eq!(

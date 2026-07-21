@@ -19,7 +19,7 @@ $ARGUMENTS
 - Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
 - Keep changes tightly scoped to the requested outcome.
 - Do not run any archive command during apply. Archiving is handled by the orchestrator.
-- The runtime-owned acceptance follow-up is the authoritative retry checklist. Do not delete or move it. Fix and verify every finding, then mark each existing finding `- [x]`; the runtime clears the section only after acceptance PASS.
+- The runtime-owned acceptance follow-up is the authoritative retry checklist. Do not delete or move it. Its finding text is immutable identity metadata and is exempt from task-description refinement: do not rewrite, split, or refine it. Record remediation and verification on separate indented `evidence:` lines, then immediately mark each existing finding `- [x]` after its fix is verified; the runtime clears the section only after acceptance PASS.
 - Do not create checkbox tasks for final OpenSpec validation, archive-gate validation, archive readiness, or cleanup whose only purpose is moving validation text. Keep that information in non-checkbox `## Final Validation` or notes sections.
 
 **Steps**

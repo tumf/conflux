@@ -347,7 +347,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::task_parser::record_acceptance_follow_up(
+        crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
             &change_dir.join("tasks.md"),
             1,
             &["restore missing repository test".to_string()],
@@ -2009,7 +2009,7 @@ impl ParallelExecutor {
                         }
                         if !findings.is_empty() {
                             if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(&change_id, workspace.path.as_path()) {
-                                if let Err(err) = task_parser::record_acceptance_follow_up(&tasks_path, acceptance_iteration, &findings) {
+                                if let Err(err) = task_parser::replace_acceptance_follow_up_from_latest_fail(&tasks_path, acceptance_iteration, &findings) {
                                     warn!("Acceptance follow-up persistence degraded for {} at {}: {}", change_id, tasks_path.display(), err);
                                 }
                             }

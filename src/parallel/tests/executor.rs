@@ -2177,7 +2177,7 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
         ["missing regression test", "add repo coverage"]
     );
 
-    crate::task_parser::record_acceptance_follow_up(
+    crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
         &tasks_dir.join("tasks.md"),
         iteration,
         &[
