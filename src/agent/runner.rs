@@ -83,9 +83,13 @@ fn touch_legacy_api_symbols() {
     let _ = AgentRunner::run_acceptance_streaming;
     let _ = AgentRunner::get_last_acceptance_attempt;
     let _ = AgentRunner::run_archive;
+    let _ = AgentRunner::analyze_dependencies;
+    let _ = AgentRunner::analyze_dependencies_with_runner;
     let _ = AgentRunner::analyze_dependencies_streaming;
     let _ = AgentRunner::run_resolve_streaming_in_dir;
     let _ = AgentRunner::execute_shell_command;
+    let _ = OrchestratorConfig::get_analyze_skill;
+    let _ = OrchestratorError::NoChanges;
 }
 
 /// Manages agent process execution based on configuration

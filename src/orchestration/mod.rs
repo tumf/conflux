@@ -1,18 +1,6 @@
-//! Shared orchestration logic for CLI and TUI modes.
+//! Shared orchestration operations for CLI and TUI modes.
 //!
-//! This module provides common implementations for:
-//! - Archive operations
-//! - Apply operations
-//! - Acceptance test operations
-//! - State management
-//! - Hook context helpers
-//! - Change selection logic
-//!
-//! Both CLI (`src/orchestrator.rs`) and TUI (`src/tui/orchestrator.rs`)
-//! use these shared functions to avoid code duplication.
-//!
-//! Note: Some items are currently unused as CLI/TUI integration is in progress.
-//! These will be used as the refactoring continues in subsequent phases.
+//! Contains acceptance, apply, archive, rejection, state, hook, and output helpers.
 
 pub mod acceptance;
 pub mod apply;
@@ -20,7 +8,6 @@ pub mod archive;
 pub mod hooks;
 pub mod output;
 pub mod rejection;
-pub mod selection;
 pub mod state;
 
 // Re-exports for convenient access.
