@@ -141,7 +141,7 @@ Implementation and hybrid proposals MUST declare at least one pre-integration ve
 
 The native `cflx openspec validate` implementation SHALL reject checkbox tasks that require final OpenSpec validation of the same change as implementation evidence. Final OpenSpec validation is an archive gate, not an implementation checkbox task.
 
-The validator SHALL allow non-checkbox final validation guidance sections to mention the same validation command.
+The validator SHALL allow non-checkbox final validation guidance sections to mention the same validation command. Runtime-owned `## Acceptance #N Failure Follow-up` sections SHALL NOT be treated as implementation task declarations for self-referential final-validation or repository-evidence validation because they mirror acceptance findings rather than proposal-authored implementation tasks.
 
 #### Scenario: same-change final validation checkbox fails
 
@@ -159,6 +159,15 @@ The validator SHALL allow non-checkbox final validation guidance sections to men
 **And**: all implementation checkbox tasks have valid repository-verifiable evidence notes
 **When**: `cflx openspec validate alpha --strict --evidence error` is executed
 **Then**: validation passes without a self-referential final validation diagnostic
+
+#### Scenario: runtime-owned acceptance follow-up is not revalidated as implementation tasks
+
+**Given**: an active change `alpha`
+**And**: `openspec/changes/alpha/tasks.md` contains a runtime-owned `## Acceptance #2 Failure Follow-up` section
+**And**: that section mirrors an archive-gate or repository-fixable acceptance finding as a checkbox without a proposal verification declaration
+**When**: `cflx openspec validate alpha --strict --evidence error` is executed
+**Then**: validation does not emit self-referential final-validation or missing-verification diagnostics for that runtime-owned checkbox
+**And**: ordinary implementation tasks outside the runtime-owned section remain subject to those diagnostics
 
 #### Scenario: ordinary repository evidence remains accepted
 
