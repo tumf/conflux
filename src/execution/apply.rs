@@ -1806,8 +1806,33 @@ mod tests {
         let progress = check_task_progress(workspace, "change-a").unwrap();
         assert_eq!(progress, TaskProgress::with_counts(1, 2));
         let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
-        assert!(content.contains("## Acceptance #2 Failure Follow-up"));
+        assert!(content.contains("## Current Acceptance Follow-up"));
         assert!(content.contains("- [ ] fix missing coverage"));
+    }
+
+    #[test]
+    fn restart_resume_preserves_mixed_acceptance_follow_up_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Current Acceptance Follow-up\n- attempt: 3\n- [x] fix repository regression at src/run.rs:4\n\n### External blockers\n- identity: `external||vendor approval|plain`\n  evidence: external non-mockable prerequisite: vendor approval\n  next action: Resolve the external prerequisite, then retry acceptance.\n",
+        )
+        .unwrap();
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+
+        hydrate_runtime_acceptance_follow_up(workspace, "change-a", &mut agent).unwrap();
+        ensure_runtime_acceptance_follow_up(workspace, "change-a", &agent).unwrap();
+
+        let content = std::fs::read_to_string(tasks_path).unwrap();
+        assert!(content.contains("- [x] fix repository regression at src/run.rs:4"));
+        assert!(content.contains("### External blockers"));
+        assert!(content.contains("evidence: external non-mockable prerequisite: vendor approval"));
+        assert!(content
+            .contains("next action: Resolve the external prerequisite, then retry acceptance."));
     }
 
     #[test]

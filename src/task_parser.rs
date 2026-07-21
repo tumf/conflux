@@ -774,14 +774,25 @@ pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<S
             tasks_path.display()
         ))
     })?;
-    let findings = lines
-        .filter_map(|line| {
-            ["- [ ] ", "- [x] ", "- [X] "]
-                .iter()
-                .find_map(|prefix| line.strip_prefix(prefix))
-                .map(str::to_string)
-        })
-        .collect::<Vec<_>>();
+    let mut findings = Vec::new();
+    let mut in_external_blockers = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "### External blockers" {
+            in_external_blockers = true;
+            continue;
+        }
+        if let Some(finding) = ["- [ ] ", "- [x] ", "- [X] "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        {
+            findings.push(finding.to_string());
+        } else if in_external_blockers {
+            if let Some(evidence) = trimmed.strip_prefix("evidence: ") {
+                findings.push(evidence.to_string());
+            }
+        }
+    }
     Ok((!findings.is_empty()).then_some((attempt, findings)))
 }
 
@@ -1087,6 +1098,30 @@ mod tests {
         assert_eq!(
             parse_file(&tasks_path, None).unwrap(),
             TaskProgress::with_counts(1, 2)
+        );
+    }
+
+    #[test]
+    fn read_acceptance_follow_up_restores_mixed_repository_and_external_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Current Acceptance Follow-up\n- attempt: 3\n- [x] fix repository regression at src/run.rs:4\n\n### External blockers\n- identity: `external||vendor approval|plain`\n  evidence: external non-mockable prerequisite: vendor approval\n  next action: Resolve the external prerequisite, then retry acceptance.\n",
+        )
+        .unwrap();
+
+        let follow_up = read_acceptance_follow_up(&tasks_path).unwrap();
+
+        assert_eq!(
+            follow_up,
+            Some((
+                3,
+                vec![
+                    "fix repository regression at src/run.rs:4".to_string(),
+                    "external non-mockable prerequisite: vendor approval".to_string(),
+                ],
+            ))
         );
     }
 

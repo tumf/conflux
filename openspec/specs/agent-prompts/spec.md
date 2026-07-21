@@ -83,11 +83,12 @@ acceptance プロンプトは、Future Work / Out of Scope / Notes セクショ�
 ### Requirement: Acceptance review MUST be read-only and runtime MUST own FAIL follow-up
 acceptance guidance は read-only review を定義し、acceptance agent に `tasks.md` の編集を指示してはならない（MUST NOT）。FAIL 時は runtime が単一の `## Current Acceptance Follow-up` を更新し、legacy numbered follow-up sections を置換しなければならない（MUST）。Repository-fixable findings のみを unchecked task とし、external blocker は evidence と next action を含む non-checkbox metadata として保持しなければならない（MUST）。
 
-#### Scenario: Acceptance prompt guides follow-up authoring
-- **GIVEN** acceptance プロンプトが生成される
-- **WHEN** エージェントが FAIL を出力する必要がある
-- **THEN** プロンプトに tasks.md の follow-up 追記手順が含まれる
-- **AND** `ACCEPTANCE:` や `FINDINGS:` を tasks.md に追加しない指示が含まれる
+#### Scenario: Runtime persists acceptance follow-up without agent edits
+- **GIVEN** acceptance agent が FAIL と normalized findings を返す
+- **WHEN** runtime が acceptance follow-up を永続化する
+- **THEN** runtime が `tasks.md` の単一の `## Current Acceptance Follow-up` を更新する
+- **AND** acceptance agent は `tasks.md` を編集しない
+- **AND** `ACCEPTANCE:` や `FINDINGS:` verdict payload は `tasks.md` に追加されない
 
 ### Requirement: Acceptance MUST fail when git working tree is dirty
 acceptance プロンプトは Git の作業ツリーが完全にクリーンであることを確認しなければならない（MUST）。この確認では `git status --porcelain` を使用し、出力が空であることを前提とする。未コミット変更または未追跡ファイルが存在する場合、acceptance は FAIL を出力し、FINDINGS に該当ファイルのパスを列挙しなければならない（MUST）。
