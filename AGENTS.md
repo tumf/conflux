@@ -49,16 +49,6 @@ It also depends on `cflx-*` skills developed under the `skills/` directory.
 The skill files are embedded into the Rust binary via `include_str!` at compile time.
 **NEVER EDIT** `~/.agents/skills/cflx-*` skills. These will be overwritten by `cflx install-skills --global`.
 
-## Graphify
-
-This repository keeps a graphify knowledge graph in `graphify-out/`.
-
-- Before answering architecture or cross-module questions, read `graphify-out/GRAPH_REPORT.md` first.
-- If `graphify-out/wiki/index.md` exists, prefer navigating it instead of reading raw files.
-- For cross-module "how does X relate to Y" questions, prefer `graphify query "<question>"`, `graphify path "<A>" "<B>"`, or `graphify explain "<concept>"` over grep.
-- Do not run `graphify update .` on every intermediate code edit.
-- Run `graphify update .` only when the final repository state that will land on main has been finalized, and include the resulting `graphify-out/` changes in that same final commit when they changed.
-
 ## Unit Tests
 
 Tests taking over 1 second must either be optimized to run in under 1 second or, if that is not practical, marked with `#[cfg_attr(not(feature = "heavy"), ignore)]`. Heavy tests must not run as part of the default test suite.
