@@ -206,23 +206,21 @@ fn test_build_apply_prompt_with_only_system_prompt() {
 
     assert!(result.contains("$cflx-apply"));
     assert!(result.contains("load skills: cflx-apply"));
-    assert!(result.contains("Apply change id: my-change"));
-    assert!(result.contains("This is an implementation task, not a review or summary."));
-    assert!(result.contains("Internal agent todos do not count as OpenSpec task completion."));
-    assert!(result.contains("openspec/changes/my-change/tasks.md has no unchecked [ ] items"));
-    assert!(result.contains("APPLY_INCOMPLETE"));
+    assert!(result.contains("change_id: my-change"));
+    assert!(result.contains("proposal_path: openspec/changes/my-change/proposal.md"));
+    assert!(result.contains("tasks_path: openspec/changes/my-change/tasks.md"));
+    assert!(result.contains("workspace_path: ."));
+    assert!(!result.contains("APPLY_INCOMPLETE"));
     assert!(result.contains(APPLY_SYSTEM_PROMPT));
 }
 
 #[test]
-fn test_build_apply_prompt_requires_real_diff_and_tasks_md_completion() {
+fn test_build_apply_prompt_keeps_fixed_guidance_out_of_variable_context() {
     let result = build_apply_prompt("real-change", "", "", "");
 
-    assert!(result.contains("Modify repository source, test, or config files"));
-    assert!(result.contains("git diff --stat shows real non-OpenSpec implementation"));
-    assert!(result.contains("Do not exit successfully when required implementation diff is empty."));
-    assert!(result
-        .contains("Do not confuse internal TODO/TodoWrite completion with tasks.md completion."));
+    assert!(!result.contains("Modify repository source, test, or config files"));
+    assert!(!result.contains("git diff --stat shows real non-OpenSpec implementation"));
+    assert!(!result.contains("Do not exit successfully"));
 }
 
 #[test]
@@ -351,7 +349,7 @@ fn test_build_archive_prompt_with_all_parts() {
 
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
-    assert!(result.contains("Archive change id: my-change"));
+    assert!(result.contains("change_id: my-change"));
     assert!(result.contains("Please archive this change"));
     assert!(result.contains("<last_archive attempt=\"1\">"));
     assert!(result.contains("status: failed"));
@@ -376,7 +374,7 @@ fn test_build_archive_prompt_with_empty_history() {
 
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
-    assert!(result.contains("Archive change id: my-change"));
+    assert!(result.contains("change_id: my-change"));
     assert!(result.contains("Please archive this change"));
 }
 
@@ -388,5 +386,5 @@ fn test_build_archive_prompt_both_empty() {
 
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
-    assert!(result.contains("Archive change id: my-change"));
+    assert!(result.contains("change_id: my-change"));
 }
