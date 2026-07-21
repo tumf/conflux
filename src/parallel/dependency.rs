@@ -179,28 +179,25 @@ impl DependencyContext {
                 .await
                 .map_err(OrchestratorError::from_vcs_error)?;
 
-            let effective_base = match crate::vcs::git::commands::get_current_branch(
-                &self.repo_root,
-            )
-            .await
-            {
-                Ok(Some(current_branch)) if current_branch != original_branch => {
-                    debug!(
-                        original_branch = %original_branch,
-                        effective_dependency_base = %current_branch,
-                        "Using current integration branch as effective dependency base"
-                    );
-                    current_branch
-                }
-                Ok(Some(_)) | Ok(None) => original_branch,
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        "Failed to determine current branch for effective dependency base"
-                    );
-                    return Err(OrchestratorError::from_vcs_error(err));
-                }
-            };
+            let effective_base =
+                match crate::vcs::git::commands::get_current_branch(&self.repo_root).await {
+                    Ok(Some(current_branch)) if current_branch != original_branch => {
+                        debug!(
+                            original_branch = %original_branch,
+                            effective_dependency_base = %current_branch,
+                            "Using current integration branch as effective dependency base"
+                        );
+                        current_branch
+                    }
+                    Ok(Some(_)) | Ok(None) => original_branch,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Failed to determine current branch for effective dependency base"
+                        );
+                        return Err(OrchestratorError::from_vcs_error(err));
+                    }
+                };
 
             self.effective_dependency_base = Some(effective_base);
         }
