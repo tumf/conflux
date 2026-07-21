@@ -18,6 +18,7 @@ pub const MAX_ACCEPTANCE_RETRY_CYCLES: u32 = 10;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedFinding {
     pub identity: String,
+    pub text: String,
     pub external: bool,
 }
 
@@ -28,6 +29,10 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
             let normalized = finding.split_whitespace().collect::<Vec<_>>().join(" ");
             (!normalized.is_empty()).then(|| {
                 let lower = normalized.to_ascii_lowercase();
+                let finding_code = lower
+                    .split_whitespace()
+                    .next()
+                    .filter(|word| word.starts_with('[') && word.ends_with(']'));
                 let path_token = lower
                     .split_whitespace()
                     .find(|word| {
@@ -62,12 +67,24 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
                     .collect::<Vec<_>>()
                     .join(" ");
                 NormalizedFinding {
-                    identity: format!(
-                        "{}|{}|{}",
-                        if external { "external" } else { "repository" },
-                        path,
-                        message
+                    identity: finding_code.map_or_else(
+                        || {
+                            format!(
+                                "{}|{}|{}",
+                                if external { "external" } else { "repository" },
+                                path,
+                                message
+                            )
+                        },
+                        |code| {
+                            format!(
+                                "{}|code|{}",
+                                if external { "external" } else { "repository" },
+                                code
+                            )
+                        },
                     ),
+                    text: normalized,
                     external,
                 }
             })
@@ -140,6 +157,9 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
                 if relative.ends_with("tasks.md") {
                     let text = String::from_utf8_lossy(&contents);
                     contents = text
+                        .split("\n## Current Acceptance Follow-up")
+                        .next()
+                        .unwrap_or(&text)
                         .split("\n## Acceptance #")
                         .next()
                         .unwrap_or(&text)
@@ -537,9 +557,8 @@ where
     agent.record_acceptance_attempt(&change.id, attempt);
     match &result {
         AcceptanceResult::Fail { findings } => {
-            let repository_findings = repository_findings(findings);
-            if !repository_findings.is_empty() {
-                agent.record_acceptance_follow_up(&change.id, attempt_number, repository_findings);
+            if !findings.is_empty() {
+                agent.record_acceptance_follow_up(&change.id, attempt_number, findings.clone());
             }
         }
         AcceptanceResult::Pass => agent.clear_acceptance_follow_up(&change.id),

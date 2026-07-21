@@ -214,7 +214,7 @@ mod tests {
         "OpenCode",
         "agent-exec run --",
         "On mini",
-        "## Acceptance #",
+        "append `Acceptance #N",
     ];
 
     #[test]

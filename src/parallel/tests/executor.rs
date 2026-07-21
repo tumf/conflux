@@ -2181,7 +2181,8 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
 
     let updated_tasks =
         std::fs::read_to_string(tasks_dir.join("tasks.md")).or_fail("unexpected error");
-    assert!(updated_tasks.contains("## Acceptance #1 Failure Follow-up"));
+    assert!(updated_tasks.contains("## Current Acceptance Follow-up"));
+    assert!(updated_tasks.contains("- attempt: 1"));
     assert!(updated_tasks.contains("- [ ] missing regression test"));
     assert!(updated_tasks.contains("- [ ] add repo coverage"));
 

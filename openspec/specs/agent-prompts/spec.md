@@ -80,10 +80,8 @@ acceptance プロンプトは、Future Work / Out of Scope / Notes セクショ�
 - **AND** FINDINGS に「Future Work セクションにチェックボックスが残っている」旨を記載する
 - **AND** apply フェーズに戻り、チェックボックスの削除が行われる
 
-### Requirement: Acceptance prompt MUST instruct tasks.md follow-up updates on FAIL
-acceptance プロンプトは、FAIL を出力する場合に `openspec/changes/{change_id}/tasks.md` を直接更新する手順を明記しなければならない（MUST）。
-指示には、`## Acceptance #<n> Failure Follow-up` セクションの追加（または既存セクションの更新）、`- [ ] <finding>` の 1 行 1 finding 形式、`ACCEPTANCE:`/`FINDINGS:` 行を tasks.md に追加しないことを含めなければならない（MUST）。
-`<n>` は tasks.md 内の既存の `Acceptance #<n> Failure Follow-up` を基準に決定するよう指示しなければならない（MUST）。
+### Requirement: Acceptance review MUST be read-only and runtime MUST own FAIL follow-up
+acceptance guidance は read-only review を定義し、acceptance agent に `tasks.md` の編集を指示してはならない（MUST NOT）。FAIL 時は runtime が単一の `## Current Acceptance Follow-up` を更新し、legacy numbered follow-up sections を置換しなければならない（MUST）。Repository-fixable findings のみを unchecked task とし、external blocker は evidence と next action を含む non-checkbox metadata として保持しなければならない（MUST）。
 
 #### Scenario: Acceptance prompt guides follow-up authoring
 - **GIVEN** acceptance プロンプトが生成される
