@@ -1,8 +1,6 @@
 ---
 change_type: implementation
 priority: high
-dependencies:
-  - persist-acceptance-stalled-state
 verifications:
   - id: acceptance-retry-decision-tests
     requirement: Serial and parallel acceptance retries stop on repeated findings without semantic progress

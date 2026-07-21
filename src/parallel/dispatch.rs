@@ -19,6 +19,10 @@ use crate::agent::AgentRunner;
 use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
+use crate::orchestration::acceptance::{
+    decide_acceptance_retry, normalize_findings, repository_findings,
+    semantic_progress_fingerprint, AcceptanceRetryDecision, MAX_ACCEPTANCE_RETRY_CYCLES,
+};
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
     run_rejection_review, RejectionReviewVerdict,
@@ -29,8 +33,7 @@ use crate::vcs::WorkspaceStatus;
 use super::acceptance_state::{
     consume_resumable_acceptance_marker, load_acceptance_state_for, mark_acceptance_failed,
     mark_acceptance_passed, mark_acceptance_started, mark_apply_completed, parse_blocked_marker,
-    record_acceptance_retry_context, write_acceptance_blocked_marker_with_context, BlockedMarker,
-    BlockedMarkerOrigin,
+    write_acceptance_blocked_marker_with_context, BlockedMarker, BlockedMarkerOrigin,
 };
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
@@ -1040,7 +1043,6 @@ impl ParallelExecutor {
                 AgentRunner::new_with_shared_state(config.clone(), shared_stagger_state.clone());
 
             // Track apply+acceptance cycles to prevent infinite loops.
-            const MAX_APPLY_ACCEPTANCE_CYCLES: u32 = 10;
             let checkpoint = match load_acceptance_state_for(&workspace.path, &change_id) {
                 Ok(checkpoint) => checkpoint,
                 Err(error) => {
@@ -1337,22 +1339,17 @@ impl ParallelExecutor {
 
             let _apply_revision = loop {
                 cycle_count += 1;
-                if cycle_count > MAX_APPLY_ACCEPTANCE_CYCLES {
-                    error!(
-                        "Max apply+acceptance cycles ({}) reached for {}",
-                        MAX_APPLY_ACCEPTANCE_CYCLES, change_id
-                    );
+                if cycle_count > MAX_ACCEPTANCE_RETRY_CYCLES {
+                    let evidence = vec![format!("acceptance cycle limit {} reached", MAX_ACCEPTANCE_RETRY_CYCLES)];
+                    if let Err(error) = write_acceptance_blocked_marker_with_context(
+                        &workspace.path, &change_id, "acceptance_cycle_limit_exhausted", &evidence,
+                        "no_semantic_progress", &[], true, "explicit retry",
+                    ) {
+                        cancel_monitor.abort();
+                        return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(format!("Failed to persist acceptance stalled evidence: {error}")), rejected: None };
+                    }
                     cancel_monitor.abort();
-                    return WorkspaceResult {
-                        change_id,
-                        workspace_name: workspace.name,
-                        final_revision: None,
-                        error: Some(format!(
-                            "Max apply+acceptance cycles ({}) reached",
-                            MAX_APPLY_ACCEPTANCE_CYCLES
-                        )),
-                        rejected: None,
-                    };
+                    return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: None, rejected: None };
                 }
 
                 // Skip apply only for the first cycle when resuming from an already-applied state.
@@ -1978,73 +1975,45 @@ impl ParallelExecutor {
                             cycle_count,
                             blocking_gate_context
                         );
-                        match task_parser::resolve_acceptance_follow_up_tasks_path(
-                            &change_id,
-                            workspace.path.as_path(),
-                        ) {
-                            Ok(tasks_path) => {
-                                if let Err(err) = task_parser::record_acceptance_follow_up(
-                                    &tasks_path,
-                                    acceptance_iteration,
-                                    &findings,
-                                ) {
-                                    warn!(
-                                        "Acceptance follow-up persistence degraded for {} at {}: {}",
-                                        change_id,
-                                        tasks_path.display(),
-                                        err
-                                    );
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx
-                                            .send(ParallelEvent::Log(
-                                                LogEntry::warn(format!(
-                                                    "Acceptance follow-up persistence degraded at {}: {}",
-                                                    tasks_path.display(),
-                                                    err
-                                                ))
-                                                .with_change_id(&change_id)
-                                                .with_operation("acceptance")
-                                                .with_iteration(acceptance_iteration),
-                                            ))
-                                            .await;
-                                    }
-                                }
+                        let previous = load_acceptance_state_for(&workspace.path, &change_id).ok().flatten();
+                        let fingerprint = match semantic_progress_fingerprint(&workspace.path) {
+                            Ok(fingerprint) => fingerprint,
+                            Err(error) => {
+                                cancel_monitor.abort();
+                                return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(format!("Failed to fingerprint acceptance progress: {error}")), rejected: None };
                             }
-                            Err(err) => {
-                                warn!(
-                                    "Acceptance follow-up persistence path resolution degraded for {}: {}",
-                                    change_id, err
-                                );
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx
-                                        .send(ParallelEvent::Log(
-                                            LogEntry::warn(format!(
-                                                "Acceptance follow-up persistence path unavailable: {}",
-                                                err
-                                            ))
-                                            .with_change_id(&change_id)
-                                            .with_operation("acceptance")
-                                            .with_iteration(acceptance_iteration),
-                                        ))
-                                        .await;
-                                }
-                            }
-                        }
-                        if let Err(error) = record_acceptance_retry_context(
-                            &workspace.path,
-                            &revision,
-                            &change_id,
-                            &findings,
-                            cycle_count,
+                        };
+                        let normalized = normalize_findings(&findings);
+                        let identities = normalized.iter().map(|finding| finding.identity.clone()).collect::<Vec<_>>();
+                        let decision = decide_acceptance_retry(
+                            previous.as_ref().map_or(&[] as &[String], |state| state.previous_finding_identities.as_slice()),
+                            previous.as_ref().and_then(|state| state.semantic_fingerprint.as_deref()),
+                            &normalized, &fingerprint, cycle_count,
+                        );
+                        if let Err(error) = crate::parallel::acceptance_state::record_acceptance_retry_checkpoint(
+                            &workspace.path, &revision, &change_id, identities.clone(), Some(fingerprint), cycle_count,
                         ) {
                             cancel_monitor.abort();
-                            return WorkspaceResult {
-                                change_id,
-                                workspace_name: workspace.name,
-                                final_revision: None,
-                                error: Some(format!("Failed to persist acceptance retry checkpoint: {error}")),
-                                rejected: None,
-                            };
+                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(format!("Failed to persist acceptance retry checkpoint: {error}")), rejected: None };
+                        }
+                        if let AcceptanceRetryDecision::Stall { reason, external_blockers } = decision {
+                            if let Err(error) = write_acceptance_blocked_marker_with_context(
+                                &workspace.path, &change_id, reason, &identities, "no_semantic_progress",
+                                &external_blockers, true, "explicit retry",
+                            ) {
+                                cancel_monitor.abort();
+                                return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(format!("Failed to persist acceptance stalled evidence: {error}")), rejected: None };
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: None, rejected: None };
+                        }
+                        let repository_findings = repository_findings(&findings);
+                        if !repository_findings.is_empty() {
+                            if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(&change_id, workspace.path.as_path()) {
+                                if let Err(err) = task_parser::record_acceptance_follow_up(&tasks_path, acceptance_iteration, &repository_findings) {
+                                    warn!("Acceptance follow-up persistence degraded for {} at {}: {}", change_id, tasks_path.display(), err);
+                                }
+                            }
                         }
                         if let Some(ref tx) = event_tx {
                             let _ = tx

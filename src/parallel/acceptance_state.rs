@@ -225,12 +225,32 @@ pub fn record_acceptance_retry_context(
     findings: &[String],
     cycle_count: u32,
 ) -> Result<()> {
-    let identities = findings
-        .iter()
-        .map(|finding| finding.trim().to_ascii_lowercase())
-        .filter(|finding| !finding.is_empty())
+    let identities = crate::orchestration::acceptance::normalize_findings(findings)
+        .into_iter()
+        .map(|finding| finding.identity)
         .collect::<Vec<_>>();
-    let semantic_fingerprint = (!identities.is_empty()).then(|| identities.join("\n"));
+    let semantic_fingerprint =
+        crate::orchestration::acceptance::semantic_progress_fingerprint(workspace_path)
+            .ok()
+            .or_else(|| (!identities.is_empty()).then(|| identities.join("\n")));
+    record_acceptance_retry_checkpoint(
+        workspace_path,
+        revision,
+        change_id,
+        identities,
+        semantic_fingerprint,
+        cycle_count,
+    )
+}
+
+pub fn record_acceptance_retry_checkpoint(
+    workspace_path: &Path,
+    revision: &str,
+    change_id: &str,
+    identities: Vec<String>,
+    semantic_fingerprint: Option<String>,
+    cycle_count: u32,
+) -> Result<()> {
     let mut state = state_for(
         workspace_path,
         AcceptanceStateStatus::Failed,

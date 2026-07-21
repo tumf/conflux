@@ -16,3 +16,5 @@ skills/.pytest_cache/
 
 .review-gauntlet/*
 !.review-gauntlet/checkpoints/
+
+/target-acceptance

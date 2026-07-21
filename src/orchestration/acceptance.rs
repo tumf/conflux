@@ -13,6 +13,199 @@ use tracing::{info, warn};
 use super::output::OutputHandler;
 
 const ACCEPTANCE_OUTPUT_FALLBACK: &str = "No acceptance output captured";
+pub const MAX_ACCEPTANCE_RETRY_CYCLES: u32 = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedFinding {
+    pub identity: String,
+    pub external: bool,
+}
+
+pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
+    let mut normalized = findings
+        .iter()
+        .filter_map(|finding| {
+            let normalized = finding.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!normalized.is_empty()).then(|| {
+                let lower = normalized.to_ascii_lowercase();
+                let path_token = lower
+                    .split_whitespace()
+                    .find(|word| {
+                        word.contains('/') || word.ends_with(".rs") || word.ends_with(".md")
+                    })
+                    .unwrap_or("");
+                // Coordinates are unstable finding context, not identity. Remove the
+                // complete token so `src/lib.rs:10:2` cannot leave `:10:2` behind.
+                let path = path_token
+                    .trim_matches(|character: char| matches!(character, '`' | '(' | ')' | ','))
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                // An explicit non-mockable prerequisite is external only when the
+                // finding has no repository target or requested repository repair.
+                let external = path.is_empty()
+                    && !lower.contains("fix ")
+                    && !lower.contains("repair ")
+                    && [
+                        "external non-mockable",
+                        "non-mockable external",
+                        "external prerequisite",
+                        "external service outage",
+                        "missing non-mockable external credential",
+                    ]
+                    .iter()
+                    .any(|needle| lower.contains(needle));
+                let message = lower
+                    .replace(path_token, "")
+                    .split_whitespace()
+                    .filter(|word| !word.chars().all(|character| character.is_ascii_digit()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                NormalizedFinding {
+                    identity: format!(
+                        "{}|{}|{}",
+                        if external { "external" } else { "repository" },
+                        path,
+                        message
+                    ),
+                    external,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| left.identity.cmp(&right.identity));
+    normalized.dedup_by(|left, right| left.identity == right.identity);
+    normalized
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptanceRetryDecision {
+    Retry {
+        reason: &'static str,
+    },
+    Stall {
+        reason: &'static str,
+        external_blockers: Vec<String>,
+    },
+}
+
+pub fn repository_findings(findings: &[String]) -> Vec<String> {
+    findings
+        .iter()
+        .filter(|finding| {
+            normalize_findings(std::slice::from_ref(*finding))
+                .first()
+                .is_some_and(|normalized| !normalized.external)
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Result<String> {
+    fn include(path: &str) -> bool {
+        !path.starts_with(".git/")
+            && !path.starts_with(".cflx/")
+            && !path.contains("/APPLY_BLOCKED/")
+            && !path.starts_with("logs/")
+            && !path.starts_with("history/")
+            && (path.starts_with("src/")
+                || path.starts_with("tests/")
+                || path.starts_with("config/")
+                || path.starts_with("openspec/specs/")
+                || path.contains("/specs/")
+                || path == ".cflx.jsonc"
+                || path.ends_with("/.cflx.jsonc")
+                || path.ends_with("Cargo.toml")
+                || path.ends_with("tasks.md"))
+    }
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        output: &mut Vec<(String, Vec<u8>)>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, output)?;
+                continue;
+            }
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if include(&relative) {
+                let mut contents = std::fs::read(path)?;
+                if relative.ends_with("tasks.md") {
+                    let text = String::from_utf8_lossy(&contents);
+                    contents = text
+                        .split("\n## Acceptance #")
+                        .next()
+                        .unwrap_or(&text)
+                        .as_bytes()
+                        .to_vec();
+                }
+                output.push((relative, contents));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(workspace, workspace, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let hash = files
+        .into_iter()
+        .flat_map(|(path, bytes)| path.into_bytes().into_iter().chain(bytes))
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        });
+    Ok(format!("{hash:016x}"))
+}
+
+pub fn decide_acceptance_retry(
+    previous_identities: &[String],
+    previous_fingerprint: Option<&str>,
+    findings: &[NormalizedFinding],
+    semantic_fingerprint: &str,
+    cycle_count: u32,
+) -> AcceptanceRetryDecision {
+    let identities = findings
+        .iter()
+        .map(|finding| finding.identity.clone())
+        .collect::<Vec<_>>();
+    let external_blockers = findings
+        .iter()
+        .filter(|finding| finding.external)
+        .map(|finding| finding.identity.clone())
+        .collect();
+    if cycle_count >= MAX_ACCEPTANCE_RETRY_CYCLES {
+        return AcceptanceRetryDecision::Stall {
+            reason: "acceptance_cycle_limit_exhausted",
+            external_blockers,
+        };
+    }
+    if !findings.is_empty() && findings.iter().all(|finding| finding.external) {
+        return AcceptanceRetryDecision::Stall {
+            reason: "external_acceptance_blocker",
+            external_blockers,
+        };
+    }
+    if previous_identities.is_empty() {
+        return AcceptanceRetryDecision::Retry {
+            reason: "first_acceptance_failure",
+        };
+    }
+    if previous_identities != identities || previous_fingerprint != Some(semantic_fingerprint) {
+        return AcceptanceRetryDecision::Retry {
+            reason: "finding_or_semantic_progress_changed",
+        };
+    }
+    AcceptanceRetryDecision::Stall {
+        reason: "repeated_acceptance_findings",
+        external_blockers,
+    }
+}
 
 pub fn build_acceptance_tail_findings(
     stdout_tail: Option<String>,
@@ -344,7 +537,10 @@ where
     agent.record_acceptance_attempt(&change.id, attempt);
     match &result {
         AcceptanceResult::Fail { findings } => {
-            agent.record_acceptance_follow_up(&change.id, attempt_number, findings.clone());
+            let repository_findings = repository_findings(findings);
+            if !repository_findings.is_empty() {
+                agent.record_acceptance_follow_up(&change.id, attempt_number, repository_findings);
+            }
         }
         AcceptanceResult::Pass => agent.clear_acceptance_follow_up(&change.id),
         _ => {}
@@ -355,6 +551,178 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_fingerprint_excludes_runtime_bookkeeping() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "one").unwrap();
+        let before = semantic_progress_fingerprint(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join(".cflx")).unwrap();
+        std::fs::write(temp.path().join(".cflx/acceptance-state.json"), "runtime").unwrap();
+        assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+        std::fs::write(temp.path().join("src/lib.rs"), "two").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn retry_decision_normalizes_order_whitespace_duplicates_and_stalls_repeats() {
+        let findings = normalize_findings(&[
+            " src/lib.rs:10   missing  test ".to_string(),
+            "src/lib.rs:11 missing test".to_string(),
+        ]);
+        assert_eq!(findings.len(), 1);
+        let decision = decide_acceptance_retry(
+            &[findings[0].identity.clone()],
+            Some("unchanged"),
+            &findings,
+            "unchanged",
+            2,
+        );
+        assert!(matches!(
+            decision,
+            AcceptanceRetryDecision::Stall {
+                reason: "repeated_acceptance_findings",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retry_decision_stalls_external_only_and_allows_progress_changed() {
+        let findings = normalize_findings(&["external service outage".to_string()]);
+        assert!(findings[0].external);
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &findings, "one", 1),
+            AcceptanceRetryDecision::Stall {
+                reason: "external_acceptance_blocker",
+                ..
+            }
+        ));
+        assert!(
+            matches!(decide_acceptance_retry(&[], None, &findings, "one", MAX_ACCEPTANCE_RETRY_CYCLES), AcceptanceRetryDecision::Stall { reason: "acceptance_cycle_limit_exhausted", external_blockers } if external_blockers.len() == 1)
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_tracks_change_specs_and_jsonc_but_excludes_runtime_follow_up() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let tasks = temp.path().join("openspec/changes/example/tasks.md");
+        let spec = temp
+            .path()
+            .join("openspec/changes/example/specs/runtime/spec.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, "## Implementation Tasks\n- [x] work\n").unwrap();
+        std::fs::write(&spec, "requirement one").unwrap();
+        std::fs::write(temp.path().join(".cflx.jsonc"), "{ \"mode\": 1 }").unwrap();
+        let before = semantic_progress_fingerprint(temp.path()).unwrap();
+        std::fs::write(&tasks, "## Implementation Tasks\n- [x] work\n\n## Acceptance #2 Failure Follow-up\n- [ ] runtime finding\n").unwrap();
+        assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+        std::fs::write(&spec, "requirement two").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+        std::fs::write(temp.path().join(".cflx.jsonc"), "{ \"mode\": 2 }").unwrap();
+        assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn generic_credential_and_unavailable_errors_remain_repository_fixable() {
+        let findings = normalize_findings(&[
+            "missing API key in test fixture".to_string(),
+            "src/client.rs: rate limit retry missing".to_string(),
+            "network unreachable: fix retry handling".to_string(),
+            "dns resolution failed while repairing src/client.rs".to_string(),
+            "missing non-mockable external credential".to_string(),
+        ]);
+        assert_eq!(
+            findings.iter().filter(|finding| finding.external).count(),
+            1
+        );
+        assert!(findings[0].identity.starts_with("external|"));
+        assert_eq!(
+            repository_findings(&[
+                "missing API key in test fixture".to_string(),
+                "src/client.rs: rate limit retry missing".to_string(),
+                "network unreachable: fix retry handling".to_string(),
+                "dns resolution failed while repairing src/client.rs".to_string(),
+                "missing non-mockable external credential".to_string(),
+            ])
+            .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn alternating_continue_and_fail_keeps_fail_retry_history_deterministic() {
+        let findings = normalize_findings(&["src/lib.rs:10 missing regression coverage".into()]);
+        let identities = findings
+            .iter()
+            .map(|finding| finding.identity.clone())
+            .collect::<Vec<_>>();
+
+        // CONTINUE never enters the FAIL retry decision; the first later FAIL
+        // remains the repair opportunity and the repeated FAIL then stalls.
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &findings, "unchanged", 1),
+            AcceptanceRetryDecision::Retry {
+                reason: "first_acceptance_failure"
+            }
+        ));
+        assert!(matches!(
+            decide_acceptance_retry(&identities, Some("unchanged"), &findings, "unchanged", 2),
+            AcceptanceRetryDecision::Stall {
+                reason: "repeated_acceptance_findings",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serial_and_parallel_same_inputs_have_retry_outcome_parity() {
+        let findings = normalize_findings(&[
+            "src/lib.rs:10 missing regression coverage".into(),
+            "external non-mockable prerequisite unavailable".into(),
+        ]);
+        let previous = findings
+            .iter()
+            .map(|finding| finding.identity.clone())
+            .collect::<Vec<_>>();
+
+        // Both execution modes call this shared pure decision with checkpoint
+        // state. Keep an explicit parity fixture for their common boundary.
+        let serial = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
+        let parallel = decide_acceptance_retry(&previous, Some("same"), &findings, "same", 2);
+        assert_eq!(serial, parallel);
+        assert!(matches!(
+            serial,
+            AcceptanceRetryDecision::Stall {
+                reason: "repeated_acceptance_findings",
+                ref external_blockers
+            } if external_blockers.len() == 1
+        ));
+    }
+
+    #[test]
+    fn retry_decision_handles_mixed_and_findingless_failures() {
+        let mixed = normalize_findings(&[
+            "src/lib.rs:1 fix test".into(),
+            "external service outage".into(),
+        ]);
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &mixed, "one", 1),
+            AcceptanceRetryDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &[], "one", 1),
+            AcceptanceRetryDecision::Retry { .. }
+        ));
+        assert_eq!(
+            repository_findings(&[
+                "src/lib.rs:1 fix test".into(),
+                "external service outage".into(),
+            ]),
+            vec!["src/lib.rs:1 fix test"]
+        );
+    }
 
     #[test]
     fn test_build_acceptance_tail_findings_prefers_stdout() {
