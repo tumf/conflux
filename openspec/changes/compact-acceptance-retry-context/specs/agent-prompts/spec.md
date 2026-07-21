@@ -1,6 +1,6 @@
 ## MODIFIED Requirements
 
-### Requirement: Acceptance prompt MUST instruct tasks.md follow-up updates on FAIL
+### Requirement: Acceptance review MUST be read-only and runtime MUST own FAIL follow-up
 
 Acceptance guidance MUST define acceptance as read-only review and MUST NOT instruct the acceptance agent to edit `tasks.md`. When acceptance returns FAIL, runtime MUST own persistence of one `## Current Acceptance Follow-up` section, replacing prior runtime-managed numbered follow-up sections rather than accumulating attempt history.
 
@@ -14,12 +14,12 @@ The current section MUST represent repository-fixable findings from the latest F
 - **AND** repository findings appear once as tasks
 - **AND** prior numbered runtime follow-up sections are replaced
 
-#### Scenario: acceptance agent remains read-only
+#### Scenario: Acceptance review remains read-only
 
-- **GIVEN** authoritative acceptance guidance is loaded
-- **WHEN** reviewer prepares a FAIL verdict
-- **THEN** it returns actionable findings without editing `tasks.md`
-- **AND** runtime remains the sole follow-up writer
+- **GIVEN** acceptance guidance is used to review a change
+- **WHEN** the reviewer prepares a FAIL verdict
+- **THEN** the reviewer returns actionable findings without editing `tasks.md`
+- **AND** runtime persists the current follow-up without writing verdict protocol markers
 
 #### Scenario: external blocker is not converted into implementation work
 
