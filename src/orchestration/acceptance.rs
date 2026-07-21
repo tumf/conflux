@@ -81,6 +81,18 @@ pub enum AcceptanceRetryDecision {
     },
 }
 
+pub fn repository_findings(findings: &[String]) -> Vec<String> {
+    findings
+        .iter()
+        .filter(|finding| {
+            normalize_findings(std::slice::from_ref(*finding))
+                .first()
+                .is_some_and(|normalized| !normalized.external)
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Result<String> {
     fn include(path: &str) -> bool {
         !path.starts_with(".git/")
@@ -113,7 +125,17 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
                 .to_string_lossy()
                 .replace('\\', "/");
             if include(&relative) {
-                output.push((relative, std::fs::read(path)?));
+                let mut contents = std::fs::read(path)?;
+                if relative.ends_with("tasks.md") {
+                    let text = String::from_utf8_lossy(&contents);
+                    contents = text
+                        .split("\n## Acceptance #")
+                        .next()
+                        .unwrap_or(&text)
+                        .as_bytes()
+                        .to_vec();
+                }
+                output.push((relative, contents));
             }
         }
         Ok(())
@@ -149,6 +171,12 @@ pub fn decide_acceptance_retry(
     if cycle_count >= MAX_ACCEPTANCE_RETRY_CYCLES {
         return AcceptanceRetryDecision::Stall {
             reason: "acceptance_cycle_limit_exhausted",
+            external_blockers,
+        };
+    }
+    if !findings.is_empty() && findings.iter().all(|finding| finding.external) {
+        return AcceptanceRetryDecision::Stall {
+            reason: "external_acceptance_blocker",
             external_blockers,
         };
     }
@@ -498,7 +526,10 @@ where
     agent.record_acceptance_attempt(&change.id, attempt);
     match &result {
         AcceptanceResult::Fail { findings } => {
-            agent.record_acceptance_follow_up(&change.id, attempt_number, findings.clone());
+            let repository_findings = repository_findings(findings);
+            if !repository_findings.is_empty() {
+                agent.record_acceptance_follow_up(&change.id, attempt_number, repository_findings);
+            }
         }
         AcceptanceResult::Pass => agent.clear_acceptance_follow_up(&change.id),
         _ => {}
@@ -547,19 +578,47 @@ mod tests {
     }
 
     #[test]
-    fn retry_decision_allows_first_progress_changed_and_preserves_external() {
+    fn retry_decision_stalls_external_only_and_allows_progress_changed() {
         let findings = normalize_findings(&["network unavailable for src/lib.rs".to_string()]);
         assert!(findings[0].external);
         assert!(matches!(
             decide_acceptance_retry(&[], None, &findings, "one", 1),
-            AcceptanceRetryDecision::Retry { .. }
-        ));
-        assert!(matches!(
-            decide_acceptance_retry(&["different".to_string()], Some("one"), &findings, "two", 2),
-            AcceptanceRetryDecision::Retry { .. }
+            AcceptanceRetryDecision::Stall {
+                reason: "external_acceptance_blocker",
+                ..
+            }
         ));
         assert!(
             matches!(decide_acceptance_retry(&[], None, &findings, "one", MAX_ACCEPTANCE_RETRY_CYCLES), AcceptanceRetryDecision::Stall { reason: "acceptance_cycle_limit_exhausted", external_blockers } if external_blockers.len() == 1)
+        );
+    }
+
+    #[test]
+    fn semantic_fingerprint_excludes_runtime_follow_up_section() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let tasks = temp.path().join("openspec/changes/example/tasks.md");
+        std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+        std::fs::write(&tasks, "## Implementation Tasks\n- [x] work\n").unwrap();
+        let before = semantic_progress_fingerprint(temp.path()).unwrap();
+        std::fs::write(&tasks, "## Implementation Tasks\n- [x] work\n\n## Acceptance #2 Failure Follow-up\n- [ ] runtime finding\n").unwrap();
+        assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
+    }
+
+    #[test]
+    fn retry_decision_handles_mixed_and_findingless_failures() {
+        let mixed =
+            normalize_findings(&["src/lib.rs:1 fix test".into(), "network unavailable".into()]);
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &mixed, "one", 1),
+            AcceptanceRetryDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            decide_acceptance_retry(&[], None, &[], "one", 1),
+            AcceptanceRetryDecision::Retry { .. }
+        ));
+        assert_eq!(
+            repository_findings(&["src/lib.rs:1 fix test".into(), "network unavailable".into()]),
+            vec!["src/lib.rs:1 fix test"]
         );
     }
 

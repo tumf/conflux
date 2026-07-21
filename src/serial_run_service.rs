@@ -21,8 +21,8 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::acceptance::{
-    decide_acceptance_retry, normalize_findings, semantic_progress_fingerprint,
-    AcceptanceRetryDecision,
+    decide_acceptance_retry, normalize_findings, repository_findings,
+    semantic_progress_fingerprint, AcceptanceRetryDecision,
 };
 use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
@@ -870,18 +870,19 @@ impl SerialRunService {
                     findings.len(),
                     blocking_gate_context
                 );
-                match task_parser::resolve_acceptance_follow_up_tasks_path(
-                    change_id,
-                    workspace_path,
-                ) {
-                    Ok(tasks_path) => {
+                let repository_findings = repository_findings(&findings);
+                if !repository_findings.is_empty() {
+                    if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(
+                        change_id,
+                        workspace_path,
+                    ) {
                         if let Err(err) = task_parser::record_acceptance_follow_up(
                             &tasks_path,
                             agent
                                 .get_last_acceptance_attempt(change_id)
                                 .map(|attempt| attempt.attempt)
                                 .unwrap_or(1),
-                            &findings,
+                            &repository_findings,
                         ) {
                             warn!(
                                 "Acceptance follow-up persistence degraded for {} at {}: {}",
@@ -891,14 +892,10 @@ impl SerialRunService {
                             );
                         }
                     }
-                    Err(err) => {
-                        warn!(
-                            "Acceptance follow-up persistence path resolution degraded for {}: {}",
-                            change_id, err
-                        );
-                    }
                 }
-                ChangeProcessResult::AcceptanceFailed { findings }
+                ChangeProcessResult::AcceptanceFailed {
+                    findings: repository_findings,
+                }
             }
             AcceptanceResult::CommandFailed {
                 error,
@@ -1346,6 +1343,36 @@ mod tests {
                 .reason,
             "repeated_acceptance_findings"
         );
+    }
+
+    #[test]
+    fn serial_external_only_failure_stalls_without_apply_findings() {
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            "current-revision",
+            &agent,
+            AcceptanceResult::Fail {
+                findings: vec!["network unavailable".to_string()],
+            },
+            || false,
+        );
+
+        assert!(matches!(
+            result,
+            ChangeProcessResult::Stalled { ref error } if error == "external_acceptance_blocker"
+        ));
+        assert!(crate::parallel::acceptance_state::parse_blocked_marker(
+            temp_dir.path(),
+            "test-change"
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
