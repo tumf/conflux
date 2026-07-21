@@ -16,8 +16,8 @@ verifications:
     owner: conflux-acceptance
     trigger: acceptance-review
     automation: Cargo.toml
-    evidence: cargo test parallel::tests::executor && cargo test parallel::tests::manual_resolve
-    rerun: cargo test parallel::tests::executor && cargo test parallel::tests::manual_resolve
+    evidence: cargo test --features heavy-tests parallel::tests::executor::resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch -- --exact && cargo test --features heavy-tests parallel::tests::manual_resolve
+    rerun: cargo test --features heavy-tests parallel::tests::executor::resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch -- --exact && cargo test --features heavy-tests parallel::tests::manual_resolve
     prerequisites: []
 ---
 
@@ -54,7 +54,7 @@ Parallel schedulerはresolve処理中でも空きslotへ独立changeをdispatch�
 - schedulerがdependentを選択する直前にrepository-visible effective-base merge evidenceを確認し、analyzer出力だけで依存充足を決めない。
 - integration testsが、依存resolve中のdependent抑止、独立changeの並列dispatch、resolve完了後のdependent dispatchを実際のscheduler eventで検証する。
 - regression testが`ApplyStarted`を観測し、stub、no-op、単なるclassification helperの変更では通らない。
-- `cargo test parallel::tests::executor`と`cargo test parallel::tests::manual_resolve`が成功する。
+- `cargo test --features heavy-tests parallel::tests::executor::resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch -- --exact`と`cargo test --features heavy-tests parallel::tests::manual_resolve`が成功する。
 
 ## Out of Scope
 

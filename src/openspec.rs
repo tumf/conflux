@@ -141,6 +141,40 @@ pub fn parse_proposal_metadata_from_file(path: &Path) -> ProposalMetadata {
     }
 }
 
+/// Read proposal dependencies for scheduler dispatch gates.
+///
+/// Unlike the display-oriented metadata parser, this fails when proposal metadata
+/// cannot be read or decoded. Dispatch must not treat unavailable dependency
+/// declarations as an empty dependency list.
+pub fn parse_proposal_dependencies_strict_from_file(path: &Path) -> Result<Vec<String>> {
+    let content = fs::read_to_string(path)?;
+    let (frontmatter, body) = split_frontmatter(&content);
+    if content.starts_with("---\n") && frontmatter.is_none() {
+        return Err(OrchestratorError::Parse(format!(
+            "Failed to find closing frontmatter delimiter in {}",
+            path.display()
+        )));
+    }
+
+    let mut dependencies = match frontmatter {
+        Some(frontmatter) => {
+            let parsed = parse_frontmatter_metadata_strict(frontmatter, path);
+            if !parsed.diagnostics.is_empty() {
+                return Err(OrchestratorError::Parse(parsed.diagnostics.join("; ")));
+            }
+            parsed
+                .metadata
+                .and_then(|metadata| metadata.dependencies)
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    if dependencies.is_empty() {
+        dependencies = parse_body_dependencies(body, path);
+    }
+    Ok(dependencies)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_proposal_metadata(content: &str, path: &Path) -> ProposalMetadata {
     let (frontmatter, body) = split_frontmatter(content);
@@ -935,6 +969,17 @@ mod tests {
             proposal.dependencies_for_analysis(),
             vec!["body-dep".to_string()]
         );
+    }
+
+    #[test]
+    fn test_strict_dependency_metadata_rejects_unreadable_or_invalid_frontmatter() {
+        let temp_dir = TempDir::new().unwrap();
+        let missing = temp_dir.path().join("missing.md");
+        assert!(parse_proposal_dependencies_strict_from_file(&missing).is_err());
+
+        let invalid = temp_dir.path().join("invalid.md");
+        fs::write(&invalid, "---\ndependencies: [broken\n---\n# Change\n").unwrap();
+        assert!(parse_proposal_dependencies_strict_from_file(&invalid).is_err());
     }
 
     #[test]

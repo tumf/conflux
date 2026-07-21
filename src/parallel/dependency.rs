@@ -29,6 +29,9 @@ pub(super) struct DependencyContext {
     archived_ids: HashSet<String>,
     rejected_ids: HashSet<String>,
     terminal_error_ids: HashSet<String>,
+    resolving_ids: HashSet<String>,
+    resolve_wait_ids: HashSet<String>,
+    lifecycle_evidence_available: bool,
     effective_dependency_base: Option<String>,
 }
 
@@ -52,17 +55,31 @@ impl DependencyContext {
         in_flight: &HashSet<String>,
         shared_orchestrator_state: Option<&std::sync::Arc<RwLock<OrchestratorState>>>,
     ) -> Self {
-        let terminal_error_ids = shared_orchestrator_state
-            .and_then(|state| state.try_read().ok())
-            .map(|state| {
-                state
-                    .initial_change_ids()
-                    .iter()
-                    .filter(|id| state.is_terminal_error_change(id))
-                    .cloned()
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
+        let (terminal_error_ids, resolving_ids, resolve_wait_ids, lifecycle_evidence_available) =
+            match shared_orchestrator_state {
+                Some(state) => match state.try_read() {
+                    Ok(state) => (
+                        state
+                            .initial_change_ids()
+                            .iter()
+                            .filter(|id| state.is_terminal_error_change(id))
+                            .cloned()
+                            .collect::<HashSet<_>>(),
+                        state
+                            .active_change_ids()
+                            .into_iter()
+                            .filter(|id| state.display_status(id) == "resolving")
+                            .collect::<HashSet<_>>(),
+                        state
+                            .resolve_wait_change_ids()
+                            .into_iter()
+                            .collect::<HashSet<_>>(),
+                        true,
+                    ),
+                    Err(_) => (HashSet::new(), HashSet::new(), HashSet::new(), false),
+                },
+                None => (HashSet::new(), HashSet::new(), HashSet::new(), true),
+            };
 
         let queued_ids = queued_ids
             .into_iter()
@@ -80,6 +97,9 @@ impl DependencyContext {
             archived = archived_ids.len(),
             rejected = rejected_ids.len(),
             terminal_error = terminal_error_ids.len(),
+            resolving = resolving_ids.len(),
+            resolve_wait = resolve_wait_ids.len(),
+            lifecycle_evidence_available,
             "Built dependency classification context"
         );
 
@@ -91,6 +111,9 @@ impl DependencyContext {
             archived_ids,
             rejected_ids,
             terminal_error_ids,
+            resolving_ids,
+            resolve_wait_ids,
+            lifecycle_evidence_available,
             effective_dependency_base: None,
         }
     }
@@ -105,8 +128,17 @@ impl DependencyContext {
             &self.rejected_ids,
         );
 
+        if matches!(class, DependencyTargetClass::Rejected) {
+            return class;
+        }
+        if !self.lifecycle_evidence_available {
+            return DependencyTargetClass::Error;
+        }
+
         if self.terminal_error_ids.contains(dep_id) {
             DependencyTargetClass::Error
+        } else if self.resolving_ids.contains(dep_id) || self.resolve_wait_ids.contains(dep_id) {
+            DependencyTargetClass::Resolving
         } else {
             class
         }
@@ -116,27 +148,34 @@ impl DependencyContext {
         self.terminal_error_ids.contains(change_id)
     }
 
-    pub(super) fn is_blocked(
-        &self,
+    pub(super) async fn is_blocked(
+        &mut self,
         dependencies: &[String],
+        workspace_manager: &dyn WorkspaceManager,
     ) -> Option<DependencyBlockerFingerprint> {
-        let blockers = dependencies
-            .iter()
-            .filter_map(|dep_id| {
-                let class = self.classify(dep_id);
-                if matches!(class, DependencyTargetClass::Archived) {
-                    None
-                } else {
-                    Some((dep_id.clone(), class.as_str().to_string()))
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut blockers = Vec::new();
 
-        if blockers.is_empty() {
-            None
-        } else {
-            Some(blockers)
+        for dep_id in dependencies {
+            let class = self.classify(dep_id);
+            if !matches!(class, DependencyTargetClass::Archived) {
+                blockers.push((dep_id.clone(), class.as_str().to_string()));
+                continue;
+            }
+
+            // Archive presence alone is not integration evidence. Keep the same effective-base
+            // check used by dispatch selection so pre-analysis cannot classify an unmerged
+            // dependency as dispatchable.
+            let resolved = self
+                .is_dependency_resolved_with_base(dep_id, workspace_manager)
+                .await
+                .map(|(resolved, _)| resolved)
+                .unwrap_or(false);
+            if !resolved {
+                blockers.push((dep_id.clone(), class.as_str().to_string()));
+            }
         }
+
+        (!blockers.is_empty()).then_some(blockers)
     }
 
     pub(super) async fn effective_dependency_base(
@@ -149,29 +188,25 @@ impl DependencyContext {
                 .await
                 .map_err(OrchestratorError::from_vcs_error)?;
 
-            let effective_base = match crate::vcs::git::commands::get_current_branch(
-                &self.repo_root,
-            )
-            .await
-            {
-                Ok(Some(current_branch)) if current_branch != original_branch => {
-                    debug!(
-                        original_branch = %original_branch,
-                        effective_dependency_base = %current_branch,
-                        "Using current integration branch as effective dependency base"
-                    );
-                    current_branch
-                }
-                Ok(Some(_)) | Ok(None) => original_branch,
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        original_branch = %original_branch,
-                        "Failed to determine current branch for dependency base; using original branch"
-                    );
-                    original_branch
-                }
-            };
+            let effective_base =
+                match crate::vcs::git::commands::get_current_branch(&self.repo_root).await {
+                    Ok(Some(current_branch)) if current_branch != original_branch => {
+                        debug!(
+                            original_branch = %original_branch,
+                            effective_dependency_base = %current_branch,
+                            "Using current integration branch as effective dependency base"
+                        );
+                        current_branch
+                    }
+                    Ok(Some(_)) | Ok(None) => original_branch,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Failed to determine current branch for effective dependency base"
+                        );
+                        return Err(OrchestratorError::from_vcs_error(err));
+                    }
+                };
 
             self.effective_dependency_base = Some(effective_base);
         }
@@ -273,10 +308,35 @@ mod tests {
         std::fs::write(change_dir.join("proposal.md"), "# Change\n").unwrap();
     }
 
-    #[test]
-    fn context_classifies_from_single_collected_evidence_snapshot() {
+    #[tokio::test]
+    async fn context_blocks_dependencies_when_lifecycle_evidence_lock_is_unavailable() {
+        let temp_dir = TempDir::new().unwrap();
+        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["resolving-a".to_string()],
+            1,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        )));
+        let _write_guard = state.write().await;
+        let context = DependencyContext::from_parts(
+            temp_dir.path().to_path_buf(),
+            ["dependent"],
+            &HashSet::new(),
+            Some(&state),
+        );
+
+        assert_eq!(
+            context.classify("resolving-a"),
+            DependencyTargetClass::Error,
+            "unavailable lifecycle evidence must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_classifies_from_single_collected_evidence_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         write_change(temp_dir.path(), "active-a");
+        write_change(temp_dir.path(), "resolving-a");
+        write_change(temp_dir.path(), "resolve-wait-a");
         let archive_dir = temp_dir
             .path()
             .join("openspec/changes/archive/2026-06-17-archived-a");
@@ -292,33 +352,39 @@ mod tests {
         .unwrap();
 
         let in_flight = HashSet::from(["flight-a".to_string()]);
+        let state = std::sync::Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["resolving-a".to_string(), "resolve-wait-a".to_string()],
+            1,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        )));
+        let mut state_guard = state.write().await;
+        state_guard.apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
+            change_id: "resolving-a".to_string(),
+            command: "resolve".to_string(),
+        });
+        state_guard.apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+            "resolve-wait-a".to_string(),
+        ));
+        drop(state_guard);
         let context = DependencyContext::from_parts(
             temp_dir.path().to_path_buf(),
             ["queued-a"],
             &in_flight,
-            None,
+            Some(&state),
         );
 
-        assert_eq!(context.classify("queued-a"), DependencyTargetClass::Queued);
-        assert_eq!(
-            context.classify("flight-a"),
-            DependencyTargetClass::InFlight
-        );
-        assert_eq!(
-            context.classify("active-a"),
-            DependencyTargetClass::ActiveButNotQueued
-        );
-        assert_eq!(
-            context.classify("archived-a"),
-            DependencyTargetClass::Archived
-        );
-        assert_eq!(
-            context.classify("rejected-a"),
-            DependencyTargetClass::Rejected
-        );
-        assert_eq!(
-            context.classify("missing-a"),
-            DependencyTargetClass::Missing
-        );
+        let cases = [
+            ("queued-a", DependencyTargetClass::Queued),
+            ("flight-a", DependencyTargetClass::InFlight),
+            ("active-a", DependencyTargetClass::ActiveButNotQueued),
+            ("archived-a", DependencyTargetClass::Archived),
+            ("resolving-a", DependencyTargetClass::Resolving),
+            ("resolve-wait-a", DependencyTargetClass::Resolving),
+            ("rejected-a", DependencyTargetClass::Rejected),
+            ("missing-a", DependencyTargetClass::Missing),
+        ];
+        for (target, expected) in cases {
+            assert_eq!(context.classify(target), expected, "target={target}");
+        }
     }
 }

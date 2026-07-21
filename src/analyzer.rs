@@ -724,6 +724,7 @@ Rules:
                 ) {
                     DependencyTargetClass::Queued
                     | DependencyTargetClass::InFlight
+                    | DependencyTargetClass::Resolving
                     | DependencyTargetClass::ActiveButNotQueued => {}
                     DependencyTargetClass::Error => unreachable!(
                         "repository-visible dependency classification cannot produce terminal-error state"

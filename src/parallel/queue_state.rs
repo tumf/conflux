@@ -429,7 +429,12 @@ impl ParallelExecutor {
         blockers: &[(String, DependencyTargetClass)],
     ) {
         for (dep_id, class) in blockers {
-            let message = if matches!(class, DependencyTargetClass::Archived) {
+            let message = if matches!(class, DependencyTargetClass::Resolving) {
+                format!(
+                    "Change '{}' blocked by resolving dependency '{}' and will remain queued",
+                    change_id, dep_id
+                )
+            } else if matches!(class, DependencyTargetClass::Archived) {
                 match self.effective_dependency_base().await {
                     Ok(effective_base) => format!(
                         "Change '{}' blocked by archived-but-not-merged dependency '{}' on effective dependency base '{}' and will remain queued",
@@ -454,6 +459,7 @@ impl ParallelExecutor {
                 | DependencyTargetClass::Error => warn!("{}", message),
                 DependencyTargetClass::Queued
                 | DependencyTargetClass::InFlight
+                | DependencyTargetClass::Resolving
                 | DependencyTargetClass::ActiveButNotQueued => info!("{}", message),
                 DependencyTargetClass::Archived => info!("{}", message),
             }
@@ -595,10 +601,58 @@ impl ParallelExecutor {
             }
 
             // Check if change has unresolved dependencies
-            if let Some(deps) = analysis_result.dependencies.get(change_id) {
+            let proposal_path = self
+                .repo_root
+                .join("openspec/changes")
+                .join(change_id)
+                .join("proposal.md");
+            let metadata_dependencies = if self.repo_root.join("openspec/changes").exists() {
+                match crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal_path)
+                {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => {
+                        let message = format!(
+                            "Change '{}' blocked because dependency metadata could not be read from '{}': {}",
+                            change_id,
+                            proposal_path.display(),
+                            error
+                        );
+                        warn!("{}", message);
+                        if self.should_emit_dependency_blocked_transition(
+                            change_id,
+                            &[(change_id.clone(), DependencyTargetClass::Error)],
+                        ) {
+                            send_event(&self.event_tx, ParallelEvent::Error { message }).await;
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::DependencyBlocked {
+                                    change_id: change_id.clone(),
+                                    dependency_ids: vec![change_id.clone()],
+                                },
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let mut dependencies = analysis_result
+                .dependencies
+                .get(change_id)
+                .cloned()
+                .unwrap_or_default();
+            for dep_id in metadata_dependencies {
+                if dep_id != *change_id && !dependencies.contains(&dep_id) {
+                    dependencies.push(dep_id);
+                }
+            }
+
+            if !dependencies.is_empty() {
                 let mut unresolved_deps = Vec::new();
                 let mut blockers = Vec::new();
-                for dep_id in deps {
+                for dep_id in &dependencies {
                     let class = dependency_context.classify(dep_id);
                     match class {
                         DependencyTargetClass::Missing | DependencyTargetClass::Rejected => {
@@ -618,6 +672,11 @@ impl ParallelExecutor {
                         }
                         DependencyTargetClass::Archived => {
                             DependencyContext::log_archived_dependency_check(change_id, dep_id);
+                        }
+                        DependencyTargetClass::Resolving => {
+                            unresolved_deps.push(dep_id.clone());
+                            blockers.push((dep_id.clone(), class));
+                            continue;
                         }
                         DependencyTargetClass::Queued
                         | DependencyTargetClass::InFlight
@@ -2171,7 +2230,7 @@ impl ParallelExecutor {
     ) -> BlockedOnlyQueueClassification {
         let mut classification = BlockedOnlyQueueClassification::default();
         let mut seen_ids: HashSet<String> = HashSet::new();
-        let dependency_context = DependencyContext::from_executor(
+        let mut dependency_context = DependencyContext::from_executor(
             self,
             queued.iter().map(|change| change.id.as_str()),
             in_flight,
@@ -2220,8 +2279,38 @@ impl ParallelExecutor {
                 continue;
             }
 
+            let proposal_path = self
+                .repo_root
+                .join("openspec/changes")
+                .join(&change.id)
+                .join("proposal.md");
+            let metadata_dependencies = if self.repo_root.join("openspec/changes").exists() {
+                match crate::openspec::parse_proposal_dependencies_strict_from_file(&proposal_path)
+                {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => {
+                        warn!(
+                            change_id = %change.id,
+                            proposal = %proposal_path.display(),
+                            error = %error,
+                            "Blocking queue classification because dependency metadata could not be read"
+                        );
+                        classification.dependency_blocked.push(change.id.clone());
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let mut dependencies = change.dependencies.clone();
+            for dep_id in metadata_dependencies {
+                if dep_id != change.id && !dependencies.contains(&dep_id) {
+                    dependencies.push(dep_id);
+                }
+            }
             let blocked = dependency_context
-                .is_blocked(&change.dependencies)
+                .is_blocked(&dependencies, self.workspace_manager.as_ref())
+                .await
                 .is_some();
 
             if blocked {
@@ -2475,7 +2564,7 @@ impl ParallelExecutor {
 
     async fn prepare_dispatch_candidates(
         &mut self,
-        queued: &mut Vec<crate::openspec::Change>,
+        queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         iteration: u32,
@@ -2516,10 +2605,9 @@ impl ParallelExecutor {
             return ReanalysisFlowDecision::done(false, iteration);
         }
 
-        if queued.len() != classification.dispatchable.len() {
-            *queued = classification.dispatchable;
-        }
-
+        // Keep temporarily dependency-blocked candidates in `queued`: a later reanalysis,
+        // such as ResolveCompletion, must re-evaluate them after repository-visible evidence
+        // changes. Dispatch selection applies the per-pass gate without dropping them.
         ReanalysisFlowDecision::Continue
     }
 
