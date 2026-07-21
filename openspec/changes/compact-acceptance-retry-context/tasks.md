@@ -16,6 +16,5 @@
 
 Expected archive gate: `cflx openspec validate compact-acceptance-retry-context --archive-gate` exits 0.
 
-## Acceptance #2 Failure Follow-up
-- [x] [canonical_scenario_contradiction] `openspec/specs/agent-prompts/spec.md:86-91` の既存 Scenario は、read-only/runtime-owned に変更した Requirement と矛盾し、引き続き acceptance agent に `tasks.md` の follow-up 追記手順を要求している。Scenario を runtime が follow-up を永続化し、agent は `tasks.md` を編集しない内容へ更新すること。
-- [x] [external_metadata_lost_on_resume] `src/task_parser.rs:751-783` の `read_acceptance_follow_up` は checkbox finding だけを復元し、`### External blockers` metadata を読み戻さない。さらに `src/execution/apply.rs:125-151` の hydrate/ensure 経路が復元した repository findings だけで section を再生成するため、mixed finding の external evidence/next action が再開時に消える。external metadata を構造化して復元・再描画し、restart/resume の回帰テストを追加すること。
+## Acceptance #3 Failure Follow-up
+- [x] [dirty_worktree] `git status --porcelain=v1` が `MM openspec/changes/compact-acceptance-retry-context/tasks.md` を報告している。index と working tree の内容が不一致であり、現状の archive commit では未コミット差分が残る。最終内容を確認して同ファイルを再stageし、`git status --porcelain=v1` を空にすること。なお archive gate、対象テスト、`cargo fmt --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` は成功済み。
