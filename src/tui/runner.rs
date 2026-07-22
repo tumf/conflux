@@ -389,36 +389,9 @@ async fn run_tui_loop(
 
     // Create shared stagger state for all AI commands (worktree, apply, archive, acceptance)
     use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
-    use crate::command_queue::CommandQueueConfig;
-    use crate::config::defaults::*;
     let shared_stagger_state: SharedStaggerState = Arc::new(tokio::sync::Mutex::new(None));
-    let queue_config = CommandQueueConfig {
-        stagger_delay_ms: config
-            .command_queue_stagger_delay_ms
-            .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-        max_retries: config
-            .command_queue_max_retries
-            .unwrap_or(DEFAULT_MAX_RETRIES),
-        retry_delay_ms: config
-            .command_queue_retry_delay_ms
-            .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-        retry_error_patterns: config
-            .command_queue_retry_patterns
-            .clone()
-            .unwrap_or_else(default_retry_patterns),
-        retry_if_duration_under_secs: config
-            .command_queue_retry_if_duration_under_secs
-            .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-        inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-        inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-        inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
-        strict_process_cleanup: config.get_command_strict_process_cleanup(),
-    };
-    let stream_json_textify = config.get_stream_json_textify();
-    let mut ai_runner = AiCommandRunner::new(queue_config.clone(), shared_stagger_state.clone());
-    ai_runner.set_stream_json_textify(stream_json_textify);
-    ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
-    ai_runner.set_command_envs(config.get_command_envs());
+    let ai_runner =
+        AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);

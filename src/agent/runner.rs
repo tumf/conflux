@@ -8,7 +8,6 @@ use super::prompt::{
 };
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine};
-use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{
@@ -112,29 +111,7 @@ impl AgentRunner {
     pub fn new(config: OrchestratorConfig) -> Self {
         let _ = touch_legacy_api_symbols as fn();
 
-        // Build command queue configuration from orchestrator config
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
-            strict_process_cleanup: config.get_command_strict_process_cleanup(),
-        };
+        let queue_config = CommandQueueConfig::from(&config);
 
         Self {
             config,
@@ -161,29 +138,7 @@ impl AgentRunner {
         config: OrchestratorConfig,
         shared_state: Arc<Mutex<Option<Instant>>>,
     ) -> Self {
-        // Build command queue configuration from orchestrator config
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
-            strict_process_cleanup: config.get_command_strict_process_cleanup(),
-        };
+        let queue_config = CommandQueueConfig::from(&config);
 
         Self {
             config,
