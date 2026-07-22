@@ -2143,6 +2143,55 @@ impl ParallelExecutor {
                         };
                     }
                     Ok((
+                        crate::orchestration::AcceptanceResult::MissingVerdict { findings },
+                        acceptance_iteration,
+                    )) => {
+                        // The acceptance command completed without a canonical
+                        // verdict. This is a protocol failure distinct from an
+                        // explicit CONTINUE: it does not touch the CONTINUE
+                        // retry counter and does not silently loop.
+                        let evidence = findings
+                            .iter()
+                            .take(5)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        let error = format!(
+                            "Acceptance completed without a canonical verdict (missing-verdict \
+                             protocol failure); status-only or waiting output is not a verdict. \
+                             Evidence: {}",
+                            if evidence.is_empty() {
+                                "no acceptance output captured".to_string()
+                            } else {
+                                evidence
+                            }
+                        );
+                        error!(
+                            "Missing acceptance verdict for {} (cycle {}): {}",
+                            change_id, cycle_count, error
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx
+                                .send(ParallelEvent::Log(
+                                    LogEntry::error(format!(
+                                        "Missing acceptance verdict (cycle {}): {}",
+                                        cycle_count, error
+                                    ))
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance")
+                                    .with_iteration(acceptance_iteration),
+                                ))
+                                .await;
+                        }
+                        return WorkspaceResult {
+                            change_id,
+                            workspace_name: workspace.name,
+                            final_revision: None,
+                            error: Some(error),
+                            rejected: None,
+                        };
+                    }
+                    Ok((
                         crate::orchestration::AcceptanceResult::Gated,
                         acceptance_iteration,
                     )) => {

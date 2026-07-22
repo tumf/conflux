@@ -55,6 +55,17 @@ canonical contract remains JSON-primary.
 
 Do not emit alternate schemas, extra machine-readable verdict objects, or provider-specific terminal markers.
 
+## Verification Completion Ownership
+
+The parent acceptance agent retains ownership of every verification it starts and MUST wait for the final result of every command, sub-agent, job, or monitored verification before emitting the final verdict.
+
+- If a verification result arrives asynchronously (for example through a completion notification or a background job), keep waiting until the final result is received and evaluated. Do not exit while owned verification work is still running.
+- Progress prose, a waiting/status message, or a promise to decide after a future completion notification is not a valid terminal acceptance response. Only the canonical verdict terminates acceptance.
+- After the final verification result is received, evaluate the evidence and emit exactly one canonical verdict as the final machine-readable payload.
+- This rule is portable and does not depend on a named runtime-specific monitoring tool. Whatever mechanism the current runtime uses to run or observe verification work, the parent agent must obtain the final result before terminating.
+
+The Conflux runtime classifies a completed acceptance run that emits no canonical verdict as a missing-verdict protocol failure. It is not treated as an intentional `CONTINUE` and does not use the explicit-CONTINUE retry path.
+
 ## Scoped Guidance
 
 ### Declared Verification Phases

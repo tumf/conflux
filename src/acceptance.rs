@@ -26,6 +26,11 @@ pub enum AcceptanceResult {
     Continue,
     /// Acceptance gated due to implementation blocker
     Gated,
+    /// No canonical verdict was found in the output. The acceptance command
+    /// completed without emitting the machine-readable verdict it owes
+    /// (for example a status-only or waiting narrative), which is a protocol
+    /// failure distinct from an intentional [`AcceptanceResult::Continue`].
+    MissingVerdict,
 }
 
 /// Canonical plain-text verdict variants. These remain supported as a
@@ -35,7 +40,7 @@ pub enum AcceptanceResult {
 /// of these markers (after stripping tolerated markdown decorations).
 /// Trailing-text concatenation such as `ACCEPTANCE: PASSAll ...` or
 /// `ACCEPTANCE: PASS## ...` does NOT satisfy the fallback contract and falls
-/// through to the CONTINUE default.
+/// through to the missing-verdict protocol failure.
 pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
     ("ACCEPTANCE: PASS", "pass"),
     ("ACCEPTANCE: FAIL", "fail"),
@@ -194,8 +199,12 @@ fn verdict_markdown_fence(line: &str, open: Option<(char, usize)>) -> Option<(ch
 ///   `ACCEPTANCE: PASS## ...`) is NOT a canonical marker. When no JSON verdict
 ///   is found, the first canonical fallback line wins.
 ///
-/// If neither is observed, the result defaults to [`AcceptanceResult::Continue`]
-/// so the acceptance loop can retry.
+/// If neither is observed, the result is [`AcceptanceResult::MissingVerdict`]:
+/// the acceptance command completed without emitting a canonical verdict. This
+/// is an explicit protocol failure and is intentionally distinct from an
+/// agent-emitted canonical `CONTINUE`, so a premature agent exit (for example a
+/// status-only "waiting for verification" narrative) cannot masquerade as an
+/// intentional continuation request.
 pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     let mut fallback_kind: Option<&'static str> = None;
     let mut fallback_findings = Vec::new();
@@ -246,7 +255,9 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
         Some("fail") => AcceptanceResult::Fail {
             findings: fallback_findings,
         },
-        _ => AcceptanceResult::Continue,
+        // No canonical verdict anywhere in the output: explicit protocol
+        // failure, never an implicit CONTINUE.
+        _ => AcceptanceResult::MissingVerdict,
     }
 }
 
@@ -256,7 +267,7 @@ fn acceptance_result_from_kind(kind: &str, findings: Vec<String>) -> AcceptanceR
         "fail" => AcceptanceResult::Fail { findings },
         "continue" => AcceptanceResult::Continue,
         "gated" | "blocked" => AcceptanceResult::Gated,
-        _ => AcceptanceResult::Continue,
+        _ => AcceptanceResult::MissingVerdict,
     }
 }
 
@@ -266,8 +277,8 @@ fn acceptance_result_from_kind(kind: &str, findings: Vec<String>) -> AcceptanceR
 /// add around verdict markers.
 ///
 /// This is a defensive measure — the canonical contract forbids these
-/// wrappers, but the parser tolerates them to prevent silent CONTINUE
-/// fallback when an agent drifts.
+/// wrappers, but the parser tolerates them to prevent a missing-verdict
+/// protocol failure when an agent drifts.
 pub(crate) fn strip_markdown_decorations(text: &str) -> String {
     let mut s = text.to_string();
     // Remove bold pairs first to avoid leaving stray * characters
@@ -360,22 +371,71 @@ FINDINGS:
     #[test]
     fn test_parse_no_status() {
         let output = "Some random output\n";
-        // When no explicit marker is present, default to CONTINUE
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        // When no explicit marker is present, this is a missing-verdict
+        // protocol failure — not an implicit CONTINUE.
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
-    fn test_parse_no_marker_defaults_to_continue() {
-        // Empty output defaults to CONTINUE
-        assert_eq!(parse_acceptance_output(""), AcceptanceResult::Continue);
+    fn test_parse_no_marker_is_missing_verdict() {
+        // Empty output is a missing-verdict protocol failure
+        assert_eq!(parse_acceptance_output(""), AcceptanceResult::MissingVerdict);
 
-        // Output with no acceptance marker defaults to CONTINUE
+        // Output with no acceptance marker is a missing-verdict protocol failure
         let output = "Some debug output\nNo marker here\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
 
-        // Output with findings but no marker defaults to CONTINUE
+        // Output with findings but no marker is a missing-verdict protocol failure
         let output = "FINDINGS:\n- Issue 1\n- Issue 2\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
+    }
+
+    #[test]
+    fn test_parse_status_only_waiting_output_is_missing_verdict_not_continue() {
+        // Regression: an acceptance agent that starts verification, reports it
+        // is waiting for a completion notification, and exits without a
+        // canonical verdict must be classified as a missing-verdict protocol
+        // failure — never as an intentional CONTINUE.
+        let output = "Started long-running verification job.\n\
+                      Monitoring verification; I will evaluate the evidence and \
+                      emit the final verdict once the completion notification arrives.\n";
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
+        assert_ne!(
+            parse_acceptance_output(output),
+            AcceptanceResult::Continue,
+            "status-only exit must remain distinguishable from explicit CONTINUE"
+        );
+    }
+
+    #[test]
+    fn test_explicit_continue_remains_distinct_from_missing_verdict() {
+        // Canonical CONTINUE — via JSON and via legacy marker — must keep its
+        // intentional-continuation semantics.
+        assert_eq!(
+            parse_acceptance_output("{\"acceptance\":\"continue\"}\n"),
+            AcceptanceResult::Continue
+        );
+        assert_eq!(
+            parse_acceptance_output("ACCEPTANCE: CONTINUE\n"),
+            AcceptanceResult::Continue
+        );
+        // Whereas verdict-free output is a protocol failure.
+        assert_eq!(
+            parse_acceptance_output("waiting for checks to finish\n"),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
@@ -545,7 +605,10 @@ ACCEPTANCE: PASS
     fn test_parse_does_not_close_fence_with_info_string() {
         let output = "```text\n```json\n{\"acceptance\":\"pass\"}\nACCEPTANCE: FAIL";
 
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
@@ -572,13 +635,16 @@ Example:
 ACCEPTANCE: FAIL
 ACCEPTANCE: PASS
 "#;
-        // Both are inside unclosed code block, default to Continue
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        // Both are inside unclosed code block, so no canonical verdict exists.
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     // Trailing-text concatenation is NOT canonical. The runtime parser
-    // rejects malformed verdicts and falls through to CONTINUE so the
-    // acceptance loop can retry instead of locking in a bogus PASS.
+    // rejects malformed verdicts and falls through to the missing-verdict
+    // protocol failure instead of locking in a bogus PASS.
 
     #[test]
     fn test_parse_pass_with_trailing_text_is_not_canonical() {
@@ -586,14 +652,20 @@ ACCEPTANCE: PASS
         // which previously satisfied PASS via starts_with. Strict canonical
         // matching rejects it.
         let output = "ACCEPTANCE: PASSAll acceptance criteria verified:\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
     fn test_parse_pass_with_trailing_heading_is_not_canonical() {
         // Real log: "ACCEPTANCE: PASS## Acceptance Review Summary"
         let output = "ACCEPTANCE: PASS## Acceptance Review Summary\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
@@ -603,7 +675,10 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
 
 1. Git working tree is clean
 "#;
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
@@ -617,29 +692,41 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     #[test]
     fn test_parse_fail_with_trailing_text_is_not_canonical() {
         let output = "ACCEPTANCE: FAILSome additional context\nFINDINGS:\n- Issue 1\n";
-        // Trailing-text FAIL is malformed; falls through to CONTINUE.
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        // Trailing-text FAIL is malformed; falls through to MissingVerdict.
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
     fn test_parse_continue_with_trailing_text_is_not_canonical() {
         let output = "ACCEPTANCE: CONTINUENeeds further investigation\n";
-        // Malformed verdict — falls through to CONTINUE default (same kind by
-        // coincidence, but still via fallback rather than canonical match).
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        // Malformed verdict — falls through to the missing-verdict protocol
+        // failure rather than being read as an intentional CONTINUE.
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
     fn test_parse_blocked_with_trailing_text_is_not_canonical() {
         let output = "ACCEPTANCE: BLOCKEDWaiting for dependency\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
     fn test_parse_passed_word_boundary_is_not_canonical() {
         // "ACCEPTANCE: PASSED" must not match canonical PASS.
         let output = "ACCEPTANCE: PASSED\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Continue);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::MissingVerdict
+        );
     }
 
     #[test]
@@ -866,6 +953,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 AcceptanceResult::Fail { .. } => "fail",
                 AcceptanceResult::Continue => "continue",
                 AcceptanceResult::Gated => "gated",
+                AcceptanceResult::MissingVerdict => "missing-verdict",
             };
             assert_eq!(
                 result_kind, *expected_kind,
@@ -905,7 +993,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         let output = "```\nACCEPTANCE: PASS\n```\n";
         assert_eq!(
             parse_acceptance_output(output),
-            AcceptanceResult::Continue,
+            AcceptanceResult::MissingVerdict,
             "Parser must not match markers inside code fences"
         );
     }

@@ -1797,6 +1797,65 @@ pub async fn execute_acceptance_in_workspace(
                 attempt_number,
             ))
         }
+        ParseResult::MissingVerdict => {
+            // The acceptance command completed but never emitted a canonical
+            // verdict (for example it exited after status-only "waiting for
+            // verification" prose). This is a protocol failure and must stay
+            // distinguishable from an explicit canonical CONTINUE: record a
+            // dedicated diagnostic (never the CONTINUE history marker) so the
+            // consecutive-CONTINUE retry counter is not consumed.
+            warn!(
+                "Acceptance completed without a canonical verdict for: {} (missing-verdict protocol failure)",
+                change_id
+            );
+            let mut evidence = vec![
+                crate::orchestration::acceptance::MISSING_VERDICT_DIAGNOSTIC.to_string(),
+            ];
+            evidence.extend(tail_findings.iter().cloned());
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: attempt_number,
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(evidence.clone()),
+                exit_code: status.code(),
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
+            };
+            // Record to both agent history (local) and shared acceptance history
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
+            acceptance_tail_injected.lock().await.remove(change_id);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::error(
+                            "Acceptance completed without a canonical verdict (missing-verdict \
+                             protocol failure); status-only or waiting output is not a verdict. \
+                             The acceptance agent must wait for owned verification results and \
+                             emit exactly one canonical verdict before exiting.",
+                        )
+                        .with_change_id(change_id)
+                        .with_operation("acceptance")
+                        .with_iteration(attempt_number),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
+            }
+
+            Ok((
+                crate::orchestration::AcceptanceResult::MissingVerdict {
+                    findings: tail_findings,
+                },
+                attempt_number,
+            ))
+        }
         ParseResult::Gated => {
             info!("Acceptance gated for: {}", change_id);
             let attempt_number = agent.next_acceptance_attempt_number(change_id);

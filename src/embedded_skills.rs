@@ -616,6 +616,40 @@ mod tests {
     }
 
     #[test]
+    fn test_acceptance_skills_require_completion_ownership_before_verdict() {
+        // Both acceptance skills must carry the same portable completion-ownership
+        // rule: the parent agent waits for every verification it starts and a
+        // waiting/status narrative is never a terminal acceptance response.
+        for (label, content) in &[
+            ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
+            ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
+        ] {
+            for required in &[
+                "Verification Completion Ownership",
+                "wait for the final result of every command, sub-agent, job, or monitored verification",
+                "not a valid terminal acceptance response",
+                "Only the canonical verdict terminates acceptance",
+                "does not depend on a named runtime-specific monitoring tool",
+                "missing-verdict protocol failure",
+                "not treated as an intentional `CONTINUE`",
+            ] {
+                assert!(
+                    content.contains(required),
+                    "{label} must define portable completion-ownership rule: {required}"
+                );
+            }
+            // The rule must stay portable: no named harness-specific monitoring
+            // tool may be required for correct completion behavior.
+            for forbidden in &["Monitor tool", "the Monitor(", "`Monitor`"] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{label} must not require a runtime-specific monitoring tool: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_acceptance_verdict_contract_consistency() {
         // Verify canonical verdict markers are documented consistently
         // across the parser, OpenCode adapter reference, and the cflx-workflow skill.

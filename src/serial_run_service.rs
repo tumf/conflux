@@ -906,6 +906,30 @@ impl SerialRunService {
                 // while command-level failures are surfaced without forcing local tasks.md updates.
                 ChangeProcessResult::AcceptanceCommandFailed { error }
             }
+            AcceptanceResult::MissingVerdict { findings } => {
+                // A completed acceptance command with no canonical verdict is a
+                // protocol failure, not an intentional CONTINUE. Route it as a
+                // command-level failure so it never consumes the explicit
+                // CONTINUE retry budget, and keep bounded output evidence in
+                // the operator-visible diagnostic.
+                let evidence = findings
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let error = format!(
+                    "Acceptance completed without a canonical verdict (missing-verdict protocol \
+                     failure); status-only or waiting output is not a verdict. Evidence: {}",
+                    if evidence.is_empty() {
+                        "no acceptance output captured".to_string()
+                    } else {
+                        evidence
+                    }
+                );
+                error!("{} for {}", error, change_id);
+                ChangeProcessResult::AcceptanceCommandFailed { error }
+            }
             AcceptanceResult::PermissionStalled { blocker } => {
                 let evidence = vec![blocker.summary()];
                 if let Err(error) =
@@ -1375,6 +1399,72 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    #[test]
+    fn serial_missing_verdict_routes_as_protocol_failure_not_continue() {
+        // A completed acceptance command without a canonical verdict must be
+        // surfaced as an explicit protocol/command failure with actionable
+        // evidence — never as the intentional-CONTINUE retry path.
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            "current-revision",
+            &agent,
+            AcceptanceResult::MissingVerdict {
+                findings: vec![
+                    "Monitoring verification, will report when complete".to_string(),
+                ],
+            },
+            || false,
+        );
+
+        match result {
+            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+                assert!(
+                    error.contains("missing-verdict protocol failure"),
+                    "diagnostic must identify the missing verdict, got: {error}"
+                );
+                assert!(
+                    error.contains("Monitoring verification, will report when complete"),
+                    "diagnostic must retain bounded output evidence, got: {error}"
+                );
+            }
+            other => panic!(
+                "missing verdict must route as acceptance command failure, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn serial_explicit_continue_still_uses_continue_retry_path() {
+        // Control: an explicit canonical CONTINUE keeps its intentional
+        // continuation routing and configured retry policy.
+        let temp_dir = TempDir::new().unwrap();
+        let service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            "current-revision",
+            &agent,
+            AcceptanceResult::Continue,
+            || false,
+        );
+
+        assert!(
+            matches!(result, ChangeProcessResult::AcceptanceContinue),
+            "explicit CONTINUE below the retry limit must retry acceptance, got {:?}",
+            result
+        );
     }
 
     #[test]

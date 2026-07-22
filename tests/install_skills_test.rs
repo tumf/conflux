@@ -194,6 +194,24 @@ fn test_embedded_install_without_skills_dir() {
         );
     }
 
+    // Installed acceptance skills must retain the portable completion-ownership
+    // rule: wait for every started verification and never terminate with only
+    // a waiting/status narrative.
+    for name in ["cflx-accept", "cflx-accept-with-speca"] {
+        let content = fs::read_to_string(skills_base.join(name).join("SKILL.md")).unwrap();
+        for required in [
+            "Verification Completion Ownership",
+            "wait for the final result of every command, sub-agent, job, or monitored verification",
+            "not a valid terminal acceptance response",
+            "missing-verdict protocol failure",
+        ] {
+            assert!(
+                content.contains(required),
+                "{name}: installed skill must retain completion-ownership rule: {required}"
+            );
+        }
+    }
+
     // Verify scripts/cflx.py is NOT distributed in any skill (replaced by native CLI)
     for name in &expected_skills {
         assert!(

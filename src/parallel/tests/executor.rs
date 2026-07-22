@@ -9461,14 +9461,223 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
     .or_fail("unexpected error");
 
     assert!(
-        matches!(result, crate::orchestration::AcceptanceResult::Continue),
-        "trailing-text PASS must NOT satisfy canonical verdict; expected CONTINUE fallback, got {:?}",
+        matches!(
+            result,
+            crate::orchestration::AcceptanceResult::MissingVerdict { .. }
+        ),
+        "trailing-text PASS must NOT satisfy canonical verdict; expected missing-verdict protocol failure, got {:?}",
         result
+    );
+    assert!(
+        !matches!(result, crate::orchestration::AcceptanceResult::Continue),
+        "a malformed verdict must never be classified as an intentional CONTINUE"
     );
 
     assert!(
         !repo_root.path().join("ACCEPTANCE_REPORT.json").exists(),
         "malformed trailing-text verdict must not produce a workspace-root acceptance report"
+    );
+}
+
+/// Regression for `prevent-premature-acceptance-exit`: an acceptance agent
+/// that starts a long-running check, reports it is monitoring/waiting for the
+/// completion result, and exits without that result or a canonical verdict
+/// must be classified as an explicit missing-verdict protocol failure — never
+/// as an intentional `CONTINUE` — and must not consume the explicit-CONTINUE
+/// retry counter.
+#[tokio::test]
+async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    // Simulate a premature acceptance exit: the agent narrates that it is
+    // monitoring a long-running verification and exits without a completion
+    // result or any canonical verdict.
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(
+            "sh -c 'echo Started long-running verification job; \
+             echo Monitoring verification, will emit the verdict once the \
+             completion notification arrives'"
+                .to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("unexpected error");
+
+    match &result {
+        crate::orchestration::AcceptanceResult::MissingVerdict { findings } => {
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.contains("Monitoring verification")),
+                "missing-verdict result must retain bounded output evidence, got {:?}",
+                findings
+            );
+        }
+        other => panic!(
+            "status-only acceptance exit must be a missing-verdict protocol failure, got {:?}",
+            other
+        ),
+    }
+    assert!(
+        !matches!(result, crate::orchestration::AcceptanceResult::Continue),
+        "status-only exit must never be reported as an intentional CONTINUE"
+    );
+    assert_eq!(iteration, 1, "attempt must still be recorded");
+
+    // The recorded attempt must carry the actionable missing-verdict
+    // diagnostic instead of the CONTINUE history marker, so the explicit
+    // CONTINUE retry counter is not consumed.
+    let history_findings = acceptance_history
+        .lock()
+        .await
+        .last_findings("change-a")
+        .or_fail("missing-verdict attempt must be recorded in acceptance history");
+    assert!(
+        history_findings
+            .first()
+            .is_some_and(|first| first.contains("Missing acceptance verdict")),
+        "attempt evidence must identify the missing verdict, got {:?}",
+        history_findings
+    );
+    assert!(
+        !history_findings
+            .iter()
+            .any(|finding| finding.contains("Investigation incomplete - continue later")),
+        "missing-verdict attempt must not record the CONTINUE history marker"
+    );
+    assert_eq!(
+        agent.count_consecutive_acceptance_continues("change-a"),
+        0,
+        "missing verdict must not consume the explicit-CONTINUE retry counter"
+    );
+
+    assert!(
+        !repo_root.path().join("ACCEPTANCE_REPORT.json").exists(),
+        "missing-verdict outcome must not produce a workspace-root acceptance report"
+    );
+}
+
+/// Control case for `prevent-premature-acceptance-exit`: an explicit canonical
+/// `CONTINUE` verdict keeps its intentional-continuation routing and continues
+/// to feed the configured explicit-CONTINUE retry counter.
+#[tokio::test]
+async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
+    let repo_root = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_root.path()).await;
+
+    std::fs::write(repo_root.path().join("feature.rs"), "fn gate() {}\n")
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["add", "feature.rs"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+    Command::new("git")
+        .args(["commit", "-m", "Apply: change-a"])
+        .current_dir(repo_root.path())
+        .output()
+        .await
+        .or_fail("unexpected error");
+
+    let acceptance_config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some(
+            "sh -c 'echo {\\\"acceptance\\\":\\\"continue\\\"}'".to_string(),
+        ),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: DEFAULT_STAGGER_DELAY_MS,
+        max_retries: DEFAULT_MAX_RETRIES,
+        retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: DEFAULT_RETRY_IF_DURATION_UNDER_SECS,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
+    let mut agent = AgentRunner::new(acceptance_config.clone());
+    let acceptance_tail_injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let acceptance_history = Arc::new(Mutex::new(crate::history::AcceptanceHistory::new()));
+
+    let (result, iteration) = execute_acceptance_in_workspace(
+        "change-a",
+        repo_root.path(),
+        &mut agent,
+        None,
+        None,
+        &ai_runner,
+        &acceptance_config,
+        &acceptance_tail_injected,
+        &acceptance_history,
+        Some("main"),
+    )
+    .await
+    .or_fail("unexpected error");
+
+    assert!(
+        matches!(result, crate::orchestration::AcceptanceResult::Continue),
+        "explicit canonical CONTINUE must retain intentional-continuation routing, got {:?}",
+        result
+    );
+    assert_eq!(iteration, 1);
+    assert_eq!(
+        agent.count_consecutive_acceptance_continues("change-a"),
+        1,
+        "explicit CONTINUE must keep feeding the configured retry counter"
     );
 }
 
