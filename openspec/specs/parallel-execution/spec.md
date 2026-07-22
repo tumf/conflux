@@ -215,57 +215,44 @@ These helpers SHALL be pure functions where possible, enabling unit testing.
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: Parallel apply runs in worktree
 parallel mode の apply コマンドは、対象 change の worktree ディレクトリで実行しなければならない（MUST）。これにより base リポジトリの作業ツリーに直接変更が入らないようにする。worktree 以外のパス（base リポジトリなど）が指定された場合、システムはエラーとして扱い実行を中断しなければならない（MUST）。
@@ -1534,57 +1521,44 @@ When parallel merge verification runs after archive completion, a change that is
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: Shared Parallel Orchestration Service
 
@@ -1893,57 +1867,44 @@ The runtime SHALL NOT leave a change in the `Rejecting` activity stage after rej
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: Workspace State Detection
 Existing workspaces SHALL be classified from worktree state in a way that preserves canonical execution ordering for resume.
@@ -2103,113 +2064,87 @@ If the base-mutating lane is occupied, the rejection-review handoff SHALL become
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: Parallel execution acceptance loop
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: ParallelRunService rejection flow on blocked execution
 
@@ -2364,57 +2299,44 @@ runtime は dependency blocked だった change が resolved になったこと�
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: Applied resume uses workspace-local evidence only
 
@@ -2511,57 +2433,44 @@ A change already in reducer-owned `ResolveWait` MUST follow the same classificat
 
 Parallel execution SHALL run `acceptance_command` after a successful apply and before archive in each workspace. The acceptance loop SHALL parse stdout to determine pass/fail/continue/stalled-hold outcomes, and MUST NOT use exit code as the acceptance verdict when a canonical verdict is present.
 
-Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, or stalled-hold outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
+A completed acceptance command that emits no canonical verdict MUST be classified as an explicit missing-verdict protocol failure, not as an intentional `CONTINUE`. The runtime MUST record bounded output evidence and emit an actionable operator-visible diagnostic. Missing-verdict failures MUST NOT consume or enter the configured retry path reserved for explicit canonical `CONTINUE` verdicts. Serial and parallel acceptance paths MUST preserve this distinction.
+
+Acceptance execution MUST NOT create a workspace-root `ACCEPTANCE_REPORT.json` artifact for PASS, command failure, FAIL, CONTINUE, stalled-hold, or missing-verdict outcomes. Acceptance outcomes MAY be recorded in in-memory runtime history, events, or non-authoritative observability logs, but the runtime MUST NOT write a new workspace-root report file as acceptance completion evidence.
 
 Archive and resume routing MUST NOT depend on `ACCEPTANCE_REPORT.json`. The absence of that file MUST NOT prevent existing acceptance history recording, event emission, or subsequent routing behavior that is otherwise valid for the workspace file/git state.
 
 When acceptance returns a stalled-hold compatibility verdict for infrastructure, external dependency, missing non-mockable credential, or pending-verification evidence, parallel execution SHALL record a non-terminal stalled hold and SHALL NOT invoke terminal rejection flow solely because of that verdict.
 
-#### Scenario: acceptance pass does not create report artifact
+#### Scenario: status-only exit is a missing-verdict failure
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command emits a canonical PASS verdict
-- **WHEN** acceptance finalizes the pass
-- **THEN** the runtime records the acceptance attempt in existing acceptance history
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** the pass result does not require any workspace-root report file for later routing
+- **GIVEN** an acceptance command reports that it is waiting for a verification completion notification
+- **AND** the command exits without emitting a canonical verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result is an explicit missing-verdict protocol failure
+- **AND** the result is not classified as `CONTINUE`
+- **AND** operator-visible diagnostics and attempt evidence identify the missing verdict
+- **AND** the configured explicit-CONTINUE retry counter/path is not used
 
-#### Scenario: command failure does not create misleading pass report
+#### Scenario: explicit CONTINUE retains retry semantics
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the acceptance command exits unsuccessfully without a finalized canonical verdict
-- **WHEN** acceptance returns a command-failure result
-- **THEN** the runtime records the failed attempt through existing history paths
-- **AND** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** no JSON artifact is written that could describe the failed attempt as `pass`
+- **GIVEN** an acceptance command emits a canonical JSON or legacy `CONTINUE` verdict
+- **WHEN** acceptance execution classifies the completed command
+- **THEN** the result remains an intentional `CONTINUE`
+- **AND** the configured continuation retry policy applies unchanged
 
-#### Scenario: non-pass verdicts do not create report artifact
+#### Scenario: missing verdict does not create report artifact
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the final acceptance verdict is FAIL, CONTINUE, or a stalled-hold compatibility verdict
-- **WHEN** acceptance finalizes that outcome
+- **GIVEN** an acceptance command exits without a canonical verdict
+- **WHEN** the runtime records the missing-verdict failure
 - **THEN** the workspace root does not contain `ACCEPTANCE_REPORT.json`
-- **AND** any required follow-up information is carried by the existing result, findings, events, or history rather than a workspace-root report file
+- **AND** evidence is carried through existing result, history, event, and observability paths
 
-#### Scenario: infrastructure stalled hold does not become terminal rejection
+#### Scenario: canonical outcomes remain unchanged
 
-- **GIVEN** a parallel workspace runs acceptance for change `alpha`
-- **AND** the change is structurally valid and active
-- **AND** acceptance emits a stalled-hold compatibility verdict because a required Docker image pull failed with DNS or network timeout and the image is not locally available
-- **WHEN** parallel dispatch handles the acceptance result
-- **THEN** `alpha` is recorded as a non-terminal stalled hold
-- **AND** base branch `openspec/changes/alpha/REJECTED.md` is not created
-- **AND** terminal rejection flow is not invoked solely from the infrastructure blocker
-- **AND** the worktree remains available for later resume after Docker image or network availability is restored
-
-#### Scenario: pending managed verification job is non-terminal
-
-- **GIVEN** a required acceptance verification uses a managed job such as agent-exec
-- **AND** the job is still running or lacks terminal pass/fail evidence
-- **WHEN** acceptance or dispatch classifies the verification state
-- **THEN** the change is not marked as accepted
-- **AND** the change is not terminally rejected
-- **AND** the condition is recorded as pending verification or a non-terminal stalled hold with next action to re-check the job or wait for terminal evidence
+- **GIVEN** an acceptance command emits canonical PASS, FAIL, CONTINUE, or stalled-hold output
+- **WHEN** serial or parallel acceptance classifies the output
+- **THEN** each canonical outcome retains its existing routing semantics
+- **AND** missing-verdict handling does not override the canonical verdict
 
 ### Requirement: Archive retry observability is non-authoritative
 

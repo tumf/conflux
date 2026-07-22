@@ -15,6 +15,15 @@ use super::output::OutputHandler;
 const ACCEPTANCE_OUTPUT_FALLBACK: &str = "No acceptance output captured";
 pub const MAX_ACCEPTANCE_RETRY_CYCLES: u32 = 10;
 
+/// First history/finding line recorded when an acceptance command completes
+/// without emitting any canonical verdict. Deliberately distinct from the
+/// explicit-CONTINUE marker ("Investigation incomplete - continue later") so
+/// missing-verdict attempts never count toward the consecutive-CONTINUE retry
+/// budget.
+pub const MISSING_VERDICT_DIAGNOSTIC: &str = "Missing acceptance verdict: acceptance command \
+     exited without emitting a canonical verdict (protocol failure; status-only or waiting \
+     output is not a verdict)";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedFinding {
     pub identity: String,
@@ -286,6 +295,12 @@ pub enum AcceptanceResult {
     PermissionStalled {
         blocker: crate::events::StalledBlocker,
     },
+    /// Acceptance command completed without emitting any canonical verdict.
+    /// This is a protocol failure (for example a status-only "waiting for
+    /// verification" exit) and is intentionally distinct from an explicit
+    /// canonical `Continue`; it must never consume the explicit-CONTINUE
+    /// retry path.
+    MissingVerdict { findings: Vec<String> },
     /// Acceptance was cancelled (e.g., by user or timeout).
     Cancelled,
 }
@@ -545,6 +560,19 @@ where
             output.on_warn("Acceptance test: GATED");
             (AcceptanceResult::Gated, false)
         }
+        crate::acceptance::AcceptanceResult::MissingVerdict => {
+            warn!(
+                "Acceptance completed without a canonical verdict for: {} (missing-verdict protocol failure)",
+                change.id
+            );
+            output.on_error("Acceptance test: MISSING VERDICT (protocol failure — the acceptance command exited without a canonical verdict; status-only or waiting output is not a verdict)");
+            (
+                AcceptanceResult::MissingVerdict {
+                    findings: tail_findings.clone(),
+                },
+                false,
+            )
+        }
     };
 
     let history_findings = match &result {
@@ -554,6 +582,11 @@ where
         }
         AcceptanceResult::Gated => Some(vec!["Implementation blocker detected".to_string()]),
         AcceptanceResult::Pass => None,
+        AcceptanceResult::MissingVerdict { findings } => {
+            let mut evidence = vec![MISSING_VERDICT_DIAGNOSTIC.to_string()];
+            evidence.extend(findings.iter().cloned());
+            Some(evidence)
+        }
         AcceptanceResult::CommandFailed { .. }
         | AcceptanceResult::PermissionStalled { .. }
         | AcceptanceResult::Cancelled => Some(tail_findings.clone()),
@@ -828,6 +861,10 @@ mod tests {
         .is_pass());
         assert!(!AcceptanceResult::PermissionStalled {
             blocker: crate::events::StalledBlocker::acceptance_infrastructure("permission denied"),
+        }
+        .is_pass());
+        assert!(!AcceptanceResult::MissingVerdict {
+            findings: vec!["status-only output".to_string()],
         }
         .is_pass());
         assert!(!AcceptanceResult::Cancelled.is_pass());

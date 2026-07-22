@@ -45,6 +45,16 @@ Backward-compatible fallback markers:
 
 Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the portable Conflux acceptance interface. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
 
+## Verification Completion Ownership
+
+Apply the same completion-ownership rule as `cflx-accept`: the parent acceptance agent retains ownership of every verification it starts and MUST wait for the final result of every command, sub-agent, job, or monitored verification before emitting the final verdict. This includes SPECA runner phases and any other asynchronous or long-running verification work started during acceptance.
+
+- If a verification result arrives asynchronously (for example through a completion notification or a background job), keep waiting until the final result is received and evaluated. Do not exit while owned verification work is still running.
+- Progress prose, a waiting/status message, or a promise to decide after a future completion notification is not a valid terminal acceptance response. Only the canonical verdict terminates acceptance.
+- This rule is portable and does not depend on a named runtime-specific monitoring tool. Whatever mechanism the current runtime uses to run or observe verification work, the parent agent must obtain the final result before terminating.
+
+The Conflux runtime classifies a completed acceptance run that emits no canonical verdict as a missing-verdict protocol failure. It is not treated as an intentional `CONTINUE` and does not use the explicit-CONTINUE retry path.
+
 ## Declared Verification Phases
 
 Apply the same structured verification-phase semantics as `cflx-accept`. `pre-integration` declarations require current-revision repository evidence and runnable local verification. `post-integration` declarations require review of repository-automation ownership, tracked repository automation, trigger, evidence publication, rerun action, prerequisites, and fixture/local evidence; do not fetch an undeployed or external target.
