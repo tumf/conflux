@@ -17,8 +17,3 @@ serial mode自体の廃止判断はruntime behaviorとcanonical specに関わる
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate remove-obsolete-selection-module --archive-gate`
-
-## Current Acceptance Follow-up
-- attempt: 3
-- [x] repository|code|[dirty_worktree]
-  evidence: dirty要因を2点解消した。(1) runtimeがfollow-upとして書き込んだ `tasks.md` の未コミット変更を通常のcommit pathでコミット。(2) archive済みchange `refactor-split-server-api` 由来の古いauto-stash（stash commit `a7f9adc7`、2026-04-03作成。内容は現HEADで大幅発展済みの初期分割版で完全にsuperseded）を `git stash drop` で削除し `git stash list` が空であることを確認。commit直後の `git status --short --branch` はbranch行のみでcleanである。
