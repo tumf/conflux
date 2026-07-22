@@ -133,9 +133,12 @@ impl AppState {
                 .with_change_id(&change_id),
         );
         self.add_log(
-            LogEntry::info(format!("  Command: {}", command))
-                .with_operation("acceptance")
-                .with_change_id(&change_id),
+            LogEntry::info(format!(
+                "  {}",
+                crate::events::command_log_summary(&command)
+            ))
+            .with_operation("acceptance")
+            .with_change_id(&change_id),
         );
     }
 
@@ -306,6 +309,20 @@ mod tests {
         let change = app.changes.iter().find(|c| c.id == "change-a").unwrap();
         assert_eq!(change.display_status_cache, "applying");
         assert!(change.started_at.is_some());
+    }
+
+    #[test]
+    fn acceptance_started_logs_command_metadata_without_prompt() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        let command = format!("claude --print '{}'", "secret prompt".repeat(1000));
+
+        app.handle_acceptance_started("change-a".to_string(), command.clone());
+
+        let entry = app.logs.last().expect("command metadata log");
+        assert!(entry.message.contains("Command metadata:"));
+        assert!(entry.message.contains(&format!("bytes={}", command.len())));
+        assert!(entry.message.contains("hash="));
+        assert!(!entry.message.contains("secret prompt"));
     }
 
     #[test]

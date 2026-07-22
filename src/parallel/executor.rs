@@ -1397,7 +1397,9 @@ pub async fn execute_acceptance_in_workspace(
 
     debug!(
         module = module_path!(),
-        "Executing acceptance command via AiCommandRunner: {} (cwd: {:?})", command, workspace_path
+        command = %crate::events::command_log_summary(&command),
+        cwd = ?workspace_path,
+        "Executing acceptance command via AiCommandRunner"
     );
 
     let start_revision = commit_hash.clone().unwrap_or_else(|| "unknown".to_string());

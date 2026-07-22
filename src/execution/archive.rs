@@ -378,6 +378,7 @@ async fn try_direct_archive_commit(
             stderr.trim()
         )));
     }
+    crate::vcs::git::commands::validate_staged_snapshot(repo_root).await?;
 
     let commit_output = Command::new("git")
         .args(["commit", "-m", &commit_message])
@@ -1140,6 +1141,19 @@ mod tests {
     use std::path::Path;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn direct_archive_commit_rejects_temporary_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        init_git_repo(temp_dir.path());
+        let generated = temp_dir.path().join(".agent-target");
+        fs::create_dir(&generated).unwrap();
+        fs::write(generated.join("artifact"), "x").unwrap();
+
+        assert!(try_direct_archive_commit("change-a", temp_dir.path())
+            .await
+            .is_err());
+    }
 
     // ===========================
     // Test fixture helpers
