@@ -20,5 +20,5 @@ Expected archive gate: `cflx openspec validate remove-obsolete-selection-module 
 
 ## Current Acceptance Follow-up
 - attempt: 3
-- [x] [DIRTY_WORKTREE] `git status --short --branch` で `openspec/changes/remove-obsolete-selection-module/tasks.md` が未コミットの変更として残っている。archive-gate、serial selection tests 21件、all-feature check、format、clippyは成功したが、acceptance規則上dirty working treeはarchive-readyではない。変更を通常のcommit pathでコミットし、clean worktreeを確認すること。
-  evidence: `tasks.md` の未コミット変更をcommit `97bdd94b` で通常のcommit pathにより記録し、直後の `git status --short --branch` がbranch行のみでcleanであることを確認した。
+- [x] repository|code|[dirty_worktree]
+  evidence: dirty要因を2点解消した。(1) runtimeがfollow-upとして書き込んだ `tasks.md` の未コミット変更を通常のcommit pathでコミット。(2) archive済みchange `refactor-split-server-api` 由来の古いauto-stash（stash commit `a7f9adc7`、2026-04-03作成。内容は現HEADで大幅発展済みの初期分割版で完全にsuperseded）を `git stash drop` で削除し `git stash list` が空であることを確認。commit直後の `git status --short --branch` はbranch行のみでcleanである。
