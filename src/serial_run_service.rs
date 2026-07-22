@@ -1417,9 +1417,7 @@ mod tests {
             "current-revision",
             &agent,
             AcceptanceResult::MissingVerdict {
-                findings: vec![
-                    "Monitoring verification, will report when complete".to_string(),
-                ],
+                findings: vec!["Monitoring verification, will report when complete".to_string()],
             },
             || false,
         );

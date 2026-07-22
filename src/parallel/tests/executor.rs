@@ -9629,9 +9629,7 @@ async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
         .or_fail("unexpected error");
 
     let acceptance_config = create_test_config_with(OrchestratorConfig {
-        acceptance_command: Some(
-            "sh -c 'echo {\\\"acceptance\\\":\\\"continue\\\"}'".to_string(),
-        ),
+        acceptance_command: Some("sh -c 'echo {\\\"acceptance\\\":\\\"continue\\\"}'".to_string()),
         ..Default::default()
     });
 

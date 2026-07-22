@@ -1808,9 +1808,8 @@ pub async fn execute_acceptance_in_workspace(
                 "Acceptance completed without a canonical verdict for: {} (missing-verdict protocol failure)",
                 change_id
             );
-            let mut evidence = vec![
-                crate::orchestration::acceptance::MISSING_VERDICT_DIAGNOSTIC.to_string(),
-            ];
+            let mut evidence =
+                vec![crate::orchestration::acceptance::MISSING_VERDICT_DIAGNOSTIC.to_string()];
             evidence.extend(tail_findings.iter().cloned());
             let attempt_number = agent.next_acceptance_attempt_number(change_id);
             let attempt = crate::history::AcceptanceAttempt {

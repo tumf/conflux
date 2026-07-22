@@ -382,7 +382,10 @@ FINDINGS:
     #[test]
     fn test_parse_no_marker_is_missing_verdict() {
         // Empty output is a missing-verdict protocol failure
-        assert_eq!(parse_acceptance_output(""), AcceptanceResult::MissingVerdict);
+        assert_eq!(
+            parse_acceptance_output(""),
+            AcceptanceResult::MissingVerdict
+        );
 
         // Output with no acceptance marker is a missing-verdict protocol failure
         let output = "Some debug output\nNo marker here\n";
