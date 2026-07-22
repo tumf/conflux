@@ -350,7 +350,10 @@ where
 
     // Log acceptance started with command
     output.on_info(&format!("Acceptance started: {}", change.id));
-    output.on_info(&format!("  Command: {}", command));
+    output.on_info(&format!(
+        "  {}",
+        crate::events::command_log_summary(&command)
+    ));
 
     // Create output collector for history and parsing
     let mut output_collector = OutputCollector::new();

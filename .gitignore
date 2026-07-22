@@ -1,4 +1,5 @@
 /target
+/.agent-target*
 error.log
 .agents/.skill-lock.json
 .playwright-cli/

@@ -637,6 +637,22 @@ mod validation_tests {
     }
 
     #[test]
+    fn test_validate_tasks_excludes_current_acceptance_follow_up_section() {
+        let content = "## Implementation Tasks\n- [x] Implement state persistence (verification: unit - `src/state.rs` with `cargo test state`)\n\n## Current Acceptance Follow-up\nattempt: 1\n- [x] [ARCHIVE_GATE_TASK_FORMAT] `cflx openspec validate test --archive-gate` fails because tasks.md has final validation checkbox issues\n  evidence: converted evidence bullets to non-task notes\n- evidence: `src/parallel/builder.rs` follow-up detail bullet\n\n### External blockers\n- identity: `external||vendor approval|plain`\n  evidence: external non-mockable prerequisite: vendor approval\n";
+        let (errors, warnings) =
+            validate_tasks_content(content, "test", true, "error", Some("implementation"), None);
+
+        assert!(
+            errors.is_empty(),
+            "runtime-owned Current Acceptance Follow-up must not fail archive validation: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "runtime-owned Current Acceptance Follow-up must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_tasks_with_verification_hint() {
         let content =
             "- [ ] Add a new feature (verification: unit - cargo test covers the feature)\n";

@@ -1379,10 +1379,7 @@ where
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to create iteration snapshot for {}: {}",
-                            change_id, e
-                        );
+                        return Err(e.into());
                     }
                 }
             }
@@ -1445,9 +1442,7 @@ where
                 "Creating final Apply commit for {} after {} iterations",
                 change_id, iteration
             );
-            if let Err(e) = create_final_commit(ws_mgr, workspace_path, change_id).await {
-                warn!("Failed to create final commit for {}: {}", change_id, e);
-            }
+            create_final_commit(ws_mgr, workspace_path, change_id).await?;
         }
     } else if !apply_succeeded {
         info!(

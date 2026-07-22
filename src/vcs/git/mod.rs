@@ -812,28 +812,21 @@ impl WorkspaceManager for GitWorkspaceManager {
 
         // Stage all changes
         commands::run_git(&["add", "-A"], workspace_path).await?;
+        commands::validate_staged_snapshot(workspace_path).await?;
 
         // Create a new WIP commit with --no-verify --allow-empty to ensure snapshot is created
         // even if there are no file changes. --no-verify bypasses pre-commit hooks to prevent
         // WIP snapshot failures from blocking progress tracking.
-        let result = commands::run_git(
+        commands::run_git(
             &["commit", "--no-verify", "--allow-empty", "-m", &wip_message],
             workspace_path,
         )
-        .await;
+        .await?;
 
-        if let Err(e) = result {
-            warn!(
-                "Failed to create WIP commit for iteration {}: {}",
-                iteration, e
-            );
-        } else {
-            debug!(
-                "Iteration snapshot #{} created for {}",
-                iteration, change_id
-            );
-        }
-
+        debug!(
+            "Iteration snapshot #{} created for {}",
+            iteration, change_id
+        );
         Ok(())
     }
 
@@ -867,6 +860,7 @@ impl WorkspaceManager for GitWorkspaceManager {
         let parent_revision = parent_revision.trim();
 
         commands::run_git(&["reset", "--soft", parent_revision], workspace_path).await?;
+        commands::validate_staged_snapshot(workspace_path).await?;
         commands::run_git(
             &["commit", "--allow-empty", "-m", &apply_message],
             workspace_path,

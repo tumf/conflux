@@ -21,19 +21,6 @@ Or install all at once:
 make setup
 ```
 
-### Repository Secrets (for maintainers)
-
-The following secrets must be configured in GitHub repository settings:
-
-| Secret | Purpose | Required |
-|--------|---------|----------|
-| `HOMEBREW_TAP_TOKEN` | Push formula to tumf/homebrew-tap | Optional |
-
-To create `HOMEBREW_TAP_TOKEN`:
-1. Go to GitHub Settings → Developer settings → Personal access tokens
-2. Create a token with `repo` scope
-3. Add it to repository secrets as `HOMEBREW_TAP_TOKEN`
-
 ## Quick Release
 
 ### Recommended: Using Makefile (cargo-release)
@@ -59,13 +46,13 @@ This will:
 5. Push commit and tag to origin
 
 On non-main branches, the bump targets create a pre-release version by appending a branch-derived suffix,
-e.g. `v1.0.0-develop`. This is useful for producing draft releases and build artifacts without publishing
-Homebrew updates.
+e.g. `v1.0.0-develop`. This is useful for producing draft releases and Linux build artifacts.
 
 GitHub Actions will then automatically:
-1. Build binaries for all platforms
-2. Create GitHub Release with artifacts
-3. Update Homebrew formula (if token configured)
+1. Build Linux ARM64 and x86_64 binaries
+2. Create a GitHub Release with artifacts
+
+macOS binaries are built locally from source. Windows binaries are not provided.
 
 ### Alternative: Direct cargo-release
 
@@ -169,43 +156,29 @@ git checkout main
    - Rust compilation errors
    - Cross-compilation issues
 
-### Homebrew formula not updated
-
-1. Verify `HOMEBREW_TAP_TOKEN` secret is set
-2. Check that tumf/homebrew-tap repository exists
-3. Check workflow logs for push errors
-
 ## Platform Support
 
-Releases include binaries for:
+GitHub Releases include Linux binaries only:
 
 | Platform | Architecture | File |
 |----------|-------------|------|
-| macOS | ARM64 (Apple Silicon) | `openspec-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
-| macOS | x86_64 (Intel) | `openspec-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
-| Linux | ARM64 | `openspec-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux | x86_64 | `openspec-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows | x86_64 | `openspec-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+| Linux | ARM64 | `cflx-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux | x86_64 | `cflx-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` |
+
+macOS binaries are built locally from source:
+
+```bash
+make build
+```
+
+Windows binaries are not provided.
 
 ## Installation Methods
 
-After release, users can install via:
-
-### Shell script (macOS/Linux)
+### Linux shell installer
 ```bash
 curl -fsSL https://github.com/tumf/conflux/releases/latest/download/install.sh | sh
 ```
 
-### PowerShell (Windows)
-```powershell
-irm https://github.com/tumf/conflux/releases/latest/download/install.ps1 | iex
-```
-
-### Homebrew (macOS/Linux)
-```bash
-brew tap tumf/tap
-brew install openspec
-```
-
 ### Direct download
-Download from [GitHub Releases](https://github.com/tumf/conflux/releases).
+Download Linux binaries from [GitHub Releases](https://github.com/tumf/conflux/releases).

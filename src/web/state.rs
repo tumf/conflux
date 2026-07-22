@@ -631,11 +631,7 @@ impl WebState {
                         updated = true;
                     }
                 }
-                ExecutionEvent::PushFailed {
-                    change_id,
-                    error: _,
-                    ..
-                } => {
+                ExecutionEvent::PushFailed { change_id, .. } => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
                         change.status = "error".to_string();
                         updated = true;
