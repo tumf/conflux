@@ -70,13 +70,49 @@ fn ansi_fragment_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"\[[0-9;]{1,}m").expect("Invalid ANSI fragment regex"))
 }
 
+pub fn command_log_summary(command: &str) -> String {
+    let digest = md5::compute(command.as_bytes());
+    format!(
+        "Command metadata: bytes={}, hash={:x}",
+        command.len(),
+        digest
+    )
+}
+
 fn sanitize_log_message(message: &str) -> String {
+    const MAX_LOG_MESSAGE_BYTES: usize = 8_192;
+
     let without_ansi = ansi_csi_regex().replace_all(message, "");
     let without_fragments = ansi_fragment_regex().replace_all(&without_ansi, "");
-    without_fragments
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect()
+    let mut sanitized = String::with_capacity(without_fragments.len());
+    for ch in without_fragments.chars() {
+        match ch {
+            '\n' => sanitized.push_str("\\n"),
+            '\r' => sanitized.push_str("\\r"),
+            '\t' => sanitized.push_str("\\t"),
+            ch if ch.is_control() => {}
+            _ => sanitized.push(ch),
+        }
+    }
+    if sanitized.len() <= MAX_LOG_MESSAGE_BYTES {
+        return sanitized;
+    }
+
+    let mut retained = MAX_LOG_MESSAGE_BYTES;
+    loop {
+        while !sanitized.is_char_boundary(retained) {
+            retained -= 1;
+        }
+        let marker = format!("…[truncated {} bytes]", sanitized.len() - retained);
+        let mut next = MAX_LOG_MESSAGE_BYTES.saturating_sub(marker.len());
+        while !sanitized.is_char_boundary(next) {
+            next -= 1;
+        }
+        if next == retained {
+            return format!("{}{}", &sanitized[..retained], marker);
+        }
+        retained = next;
+    }
 }
 
 impl LogEntry {
@@ -782,6 +818,33 @@ mod tests {
     fn test_log_entry_strips_sgr_fragments() {
         let entry = LogEntry::info("[96m[1m| [0m[90m Read");
         assert_eq!(entry.message, "|  Read");
+    }
+
+    #[test]
+    fn log_entry_replaces_line_breaks_instead_of_joining_words() {
+        let entry = LogEntry::info("first\nsecond\tthird\rfourth");
+        assert_eq!(entry.message, "first\\nsecond\\tthird\\rfourth");
+    }
+
+    #[test]
+    fn log_entry_bounds_large_messages() {
+        let entry = LogEntry::info("x".repeat(1_000_000));
+
+        assert!(entry.message.len() <= 8_192);
+        let marker_start = entry.message.find("…[truncated ").unwrap();
+        let omitted = entry.message[marker_start + "…[truncated ".len()..]
+            .trim_end_matches(" bytes]")
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(omitted, 1_000_000 - marker_start);
+    }
+
+    #[test]
+    fn log_entry_bounds_large_utf8_messages() {
+        let entry = LogEntry::info("日".repeat(3_000));
+
+        assert!(entry.message.len() <= 8_192);
+        assert!(entry.message.contains("[truncated "));
     }
 
     #[test]

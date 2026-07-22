@@ -63,7 +63,12 @@ pub async fn run_vcs_command<P: AsRef<Path>>(
         });
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if args.contains(&"-z") {
+        Ok(stdout.into_owned())
+    } else {
+        Ok(stdout.trim().to_string())
+    }
 }
 
 /// Execute a VCS command without capturing output (fire-and-forget).

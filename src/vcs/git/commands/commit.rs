@@ -7,6 +7,63 @@ use crate::vcs::{VcsError, VcsResult};
 use std::path::Path;
 use tracing::debug;
 
+fn staged_snapshot_anomaly<'a>(paths: impl Iterator<Item = &'a str>) -> Option<String> {
+    const MAX_STAGED_FILES: usize = 5_000;
+
+    let mut by_top_level = std::collections::BTreeMap::<&str, usize>::new();
+    let mut total = 0;
+    for path in paths {
+        total += 1;
+        *by_top_level
+            .entry(path.split('/').next().unwrap_or(path))
+            .or_default() += 1;
+    }
+    if let Some((directory, count)) = by_top_level
+        .iter()
+        .find(|(directory, _)| directory.starts_with(".agent-target"))
+    {
+        return Some(format!("forbidden temporary path {directory}: {count}"));
+    }
+    if total <= MAX_STAGED_FILES {
+        return None;
+    }
+
+    let summary = by_top_level
+        .iter()
+        .take(20)
+        .map(|(directory, count)| format!("{directory}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{total} staged files ({summary})"))
+}
+
+pub async fn validate_staged_snapshot<P: AsRef<Path>>(cwd: P) -> VcsResult<()> {
+    let cwd = cwd.as_ref();
+    let output = run_git(
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "-z",
+        ],
+        cwd,
+    )
+    .await?;
+    let paths = output
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    let Some(summary) = staged_snapshot_anomaly(paths.iter().copied()) else {
+        return Ok(());
+    };
+
+    let _ = run_git(&["reset"], cwd).await;
+    Err(VcsError::git_command(format!(
+        "Refusing suspicious snapshot ({summary}); staged changes were reset"
+    )))
+}
+
 /// Create a WIP archive commit for a retry attempt.
 pub async fn create_archive_wip_commit<P: AsRef<Path>>(
     cwd: P,
@@ -15,6 +72,7 @@ pub async fn create_archive_wip_commit<P: AsRef<Path>>(
 ) -> VcsResult<()> {
     let message = format!("WIP(archive): {} (attempt#{})", change_id, attempt);
     run_git(&["add", "-A"], &cwd).await?;
+    validate_staged_snapshot(&cwd).await?;
     run_git(&["commit", "--allow-empty", "-m", &message], cwd).await?;
     Ok(())
 }
@@ -46,6 +104,7 @@ pub async fn squash_archive_wip_commits<P: AsRef<Path>>(cwd: P, change_id: &str)
     let parent_revision = parent_revision.trim();
 
     run_git(&["reset", "--soft", parent_revision], &cwd).await?;
+    validate_staged_snapshot(&cwd).await?;
     let archive_message = format!("Archive: {}", change_id);
     run_git(&["commit", "--allow-empty", "-m", &archive_message], cwd).await?;
     Ok(())
@@ -93,6 +152,7 @@ pub async fn list_changes_in_head<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<Strin
 #[allow(dead_code)]
 pub async fn add_and_commit<P: AsRef<Path>>(cwd: P, message: &str) -> VcsResult<()> {
     run_git(&["add", "-A"], &cwd).await?;
+    validate_staged_snapshot(&cwd).await?;
     run_git(&["commit", "-m", message], cwd).await?;
     Ok(())
 }
@@ -504,6 +564,100 @@ mod tests {
             .unwrap();
 
         assert_eq!(uncommitted_changes, vec!["change-a".to_string()]);
+    }
+
+    #[test]
+    fn staged_snapshot_anomaly_rejects_thousands_of_files() {
+        let paths = (0..5_001)
+            .map(|index| format!("generated/artifact-{index}"))
+            .collect::<Vec<_>>();
+
+        let anomaly = staged_snapshot_anomaly(paths.iter().map(String::as_str));
+
+        assert!(anomaly.is_some());
+        assert!(anomaly.unwrap().contains("5001 staged files"));
+    }
+
+    #[test]
+    fn staged_snapshot_anomaly_rejects_temporary_paths() {
+        assert!(staged_snapshot_anomaly([".agent-target/debug/artifact"].into_iter()).is_some());
+    }
+
+    #[test]
+    fn staged_snapshot_anomaly_allows_large_legitimate_changes() {
+        let paths = (0..5_000)
+            .map(|index| format!("src/generated-{index}.rs"))
+            .collect::<Vec<_>>();
+
+        assert!(staged_snapshot_anomaly(paths.iter().map(String::as_str)).is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_staged_snapshot_resets_suspicious_index() {
+        let temp_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        let generated = temp_dir.path().join(".agent-target");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(generated.join("artifact"), "x").unwrap();
+        run_git(&["add", "-A"], temp_dir.path()).await.unwrap();
+
+        let error = validate_staged_snapshot(temp_dir.path()).await.unwrap_err();
+        let staged = run_git(&["diff", "--cached", "--name-only"], temp_dir.path())
+            .await
+            .unwrap();
+
+        assert!(error.to_string().contains("forbidden temporary path"));
+        assert!(staged.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_staged_snapshot_supports_non_ascii_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(temp_dir.path().join("　日本語.rs"), "fn main() {}").unwrap();
+        run_git(&["add", "-A"], temp_dir.path()).await.unwrap();
+
+        validate_staged_snapshot(temp_dir.path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_wip_rejects_suspicious_snapshots() {
+        let temp_dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(temp_dir.path())
+            .output()
+            .await
+            .unwrap();
+        let generated = temp_dir.path().join(".agent-target");
+        std::fs::create_dir(&generated).unwrap();
+        std::fs::write(generated.join("artifact"), "x").unwrap();
+
+        assert!(create_archive_wip_commit(temp_dir.path(), "change-a", 1)
+            .await
+            .is_err());
     }
 
     #[test]

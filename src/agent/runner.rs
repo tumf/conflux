@@ -82,9 +82,13 @@ fn touch_legacy_api_symbols() {
     let _ = AgentRunner::run_acceptance_streaming;
     let _ = AgentRunner::get_last_acceptance_attempt;
     let _ = AgentRunner::run_archive;
+    let _ = AgentRunner::analyze_dependencies;
+    let _ = AgentRunner::analyze_dependencies_with_runner;
     let _ = AgentRunner::analyze_dependencies_streaming;
     let _ = AgentRunner::run_resolve_streaming_in_dir;
     let _ = AgentRunner::execute_shell_command;
+    let _ = OrchestratorConfig::get_analyze_skill;
+    let _ = OrchestratorError::NoChanges;
 }
 
 /// Manages agent process execution based on configuration
@@ -718,7 +722,8 @@ impl AgentRunner {
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
-            "Running acceptance command: {}", command
+            command = %crate::events::command_log_summary(&command),
+            "Running acceptance command"
         );
         let (child, rx) = match cwd {
             Some(dir) => {
@@ -805,7 +810,8 @@ impl AgentRunner {
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
-            "Running acceptance command via AiCommandRunner: {}", command
+            command = %crate::events::command_log_summary(&command),
+            "Running acceptance command via AiCommandRunner"
         );
 
         // Execute via AiCommandRunner (with shared stagger state)

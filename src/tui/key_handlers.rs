@@ -1411,9 +1411,13 @@ mod tests {
     async fn plus_handle_invokes_command_runner_boundary_for_valid_worktree() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mut app = worktrees_app();
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
-                .unwrap();
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap();
         let config = plus_config("echo {workspace_dir}");
         let (tx, _rx) = mpsc::channel(1);
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);

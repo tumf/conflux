@@ -1290,7 +1290,11 @@ impl Orchestrator {
                     }
                     ParallelEvent::AcceptanceStarted { change_id, command } => {
                         info!("Acceptance started for {}", change_id);
-                        println!("[{} acceptance] {}", change_id, command);
+                        println!(
+                            "[{} acceptance] {}",
+                            change_id,
+                            crate::events::command_log_summary(&command)
+                        );
                     }
                     ParallelEvent::AcceptanceOutput {
                         change_id,
@@ -1611,8 +1615,6 @@ mod tests {
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0].id, "change-c");
     }
-
-    // Note: build_analysis_prompt tests moved to src/orchestration/selection.rs
 
     #[tokio::test]
     async fn test_orchestrator_creation() {
