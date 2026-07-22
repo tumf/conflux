@@ -107,6 +107,28 @@ fn test_parallel_executor_creation() {
     assert_eq!(executor.max_conflict_retries, 3);
 }
 
+#[test]
+fn test_parallel_executor_preserves_supplied_shared_stagger_state() {
+    let shared_stagger_state = Arc::new(Mutex::new(None));
+    let executor = ParallelExecutor::with_backend_and_queue_and_stagger(
+        PathBuf::from("/tmp/test-repo"),
+        create_test_config(),
+        None,
+        VcsBackend::Git,
+        None,
+        Some(shared_stagger_state.clone()),
+    );
+
+    assert!(Arc::ptr_eq(
+        &executor.shared_stagger_state,
+        &shared_stagger_state
+    ));
+    assert!(Arc::ptr_eq(
+        &executor.ai_runner.shared_stagger_state(),
+        &shared_stagger_state
+    ));
+}
+
 #[allow(dead_code)]
 pub(super) struct TestWorkspaceManager {
     merge_calls: Arc<AtomicUsize>,

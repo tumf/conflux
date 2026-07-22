@@ -114,6 +114,11 @@ impl AiCommandRunner {
         self.command_queue.config()
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_stagger_state(&self) -> SharedStaggerState {
+        self.command_queue.shared_stagger_state()
+    }
+
     /// Execute a command with streaming output, stagger delay, and automatic retry.
     ///
     /// Returns a real process handle ([`StreamingChildHandle`]) that targets the actual
@@ -786,8 +791,10 @@ mod tests {
             ..OrchestratorConfig::default()
         };
 
-        let runner = AiCommandRunner::from_orchestrator_config(&config, Arc::new(Mutex::new(None)));
+        let shared_state = Arc::new(Mutex::new(None));
+        let runner = AiCommandRunner::from_orchestrator_config(&config, shared_state.clone());
 
+        assert!(Arc::ptr_eq(&runner.shared_stagger_state(), &shared_state));
         assert_eq!(runner.queue_config().stagger_delay_ms, 41);
         assert!(!runner.stream_json_textify);
         assert!(!runner.strict_process_cleanup);

@@ -12,8 +12,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
-use crate::command_queue::CommandQueueConfig;
-use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
 use crate::vcs::{GitWorkspaceManager, VcsBackend, WorkspaceManager};
@@ -104,33 +102,9 @@ impl ParallelExecutor {
         let shared_stagger_state =
             shared_stagger_state.unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-        // Build CommandQueue configuration from orchestrator config
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
-            strict_process_cleanup: config.get_command_strict_process_cleanup(),
-        };
-
         // Create shared AI command runner
-        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
-        ai_runner.set_command_envs(config.get_command_envs());
+        let ai_runner =
+            AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
         Self {
             workspace_manager,

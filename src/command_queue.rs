@@ -123,6 +123,11 @@ impl CommandQueue {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_stagger_state(&self) -> Arc<Mutex<Option<Instant>>> {
+        self.last_execution.clone()
+    }
+
     /// Execute a command with staggered start
     ///
     /// Ensures minimum delay between consecutive command executions
