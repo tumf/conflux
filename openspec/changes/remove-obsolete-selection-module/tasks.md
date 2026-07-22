@@ -20,4 +20,5 @@ Expected archive gate: `cflx openspec validate remove-obsolete-selection-module 
 
 ## Current Acceptance Follow-up
 - attempt: 3
-- [ ] [DIRTY_WORKTREE] `git status --short --branch` で `openspec/changes/remove-obsolete-selection-module/tasks.md` が未コミットの変更として残っている。archive-gate、serial selection tests 21件、all-feature check、format、clippyは成功したが、acceptance規則上dirty working treeはarchive-readyではない。変更を通常のcommit pathでコミットし、clean worktreeを確認すること。
+- [x] [DIRTY_WORKTREE] `git status --short --branch` で `openspec/changes/remove-obsolete-selection-module/tasks.md` が未コミットの変更として残っている。archive-gate、serial selection tests 21件、all-feature check、format、clippyは成功したが、acceptance規則上dirty working treeはarchive-readyではない。変更を通常のcommit pathでコミットし、clean worktreeを確認すること。
+  evidence: `tasks.md` の未コミット変更をcommit `97bdd94b` で通常のcommit pathにより記録し、直後の `git status --short --branch` がbranch行のみでcleanであることを確認した。
