@@ -5,6 +5,7 @@
 //! across parallel and serial execution modes.
 
 use crate::command_queue::{CommandQueue, CommandQueueConfig};
+use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::process_manager::{cleanup_process_group, ManagedChild, StreamingChildHandle};
 use crate::stream_json_textifier::{process_stdout_line, StreamJsonTextBuffer};
@@ -69,6 +70,18 @@ impl AiCommandRunner {
             strict_process_cleanup: true,
             command_envs: HashMap::new(),
         }
+    }
+
+    /// Create a runner with every command-related setting from the orchestrator config.
+    pub fn from_orchestrator_config(
+        config: &OrchestratorConfig,
+        shared_state: SharedStaggerState,
+    ) -> Self {
+        let mut runner = Self::new(CommandQueueConfig::from(config), shared_state);
+        runner.set_stream_json_textify(config.get_stream_json_textify());
+        runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
+        runner.set_command_envs(config.get_command_envs());
+        runner
     }
 
     pub fn set_command_envs(&mut self, envs: HashMap<String, String>) {
@@ -759,6 +772,30 @@ fn make_fail_status() -> std::process::ExitStatus {
 mod tests {
     use super::*;
     use crate::config::defaults::*;
+
+    #[test]
+    fn configured_constructor_preserves_runner_settings() {
+        let config = OrchestratorConfig {
+            command_queue_stagger_delay_ms: Some(41),
+            stream_json_textify: Some(false),
+            command_strict_process_cleanup: Some(false),
+            envs: Some(HashMap::from([(
+                "CFLX_TEST_ENV".to_string(),
+                "configured-value".to_string(),
+            )])),
+            ..OrchestratorConfig::default()
+        };
+
+        let runner = AiCommandRunner::from_orchestrator_config(&config, Arc::new(Mutex::new(None)));
+
+        assert_eq!(runner.queue_config().stagger_delay_ms, 41);
+        assert!(!runner.stream_json_textify);
+        assert!(!runner.strict_process_cleanup);
+        assert_eq!(
+            runner.command_envs,
+            HashMap::from([("CFLX_TEST_ENV".to_string(), "configured-value".to_string())])
+        );
+    }
 
     #[tokio::test]
     async fn test_shared_stagger_state() {

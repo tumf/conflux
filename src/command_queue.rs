@@ -1,3 +1,5 @@
+use crate::config::defaults::*;
+use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::process_manager::cleanup_process_group;
 use regex::Regex;
@@ -56,6 +58,33 @@ pub struct CommandQueueConfig {
     /// spawned process group with SIGTERM → SIGKILL to prevent orphaned processes.
     #[allow(dead_code)]
     pub strict_process_cleanup: bool,
+}
+
+impl From<&OrchestratorConfig> for CommandQueueConfig {
+    fn from(config: &OrchestratorConfig) -> Self {
+        Self {
+            stagger_delay_ms: config
+                .command_queue_stagger_delay_ms
+                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
+            max_retries: config
+                .command_queue_max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES),
+            retry_delay_ms: config
+                .command_queue_retry_delay_ms
+                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            retry_error_patterns: config
+                .command_queue_retry_patterns
+                .clone()
+                .unwrap_or_else(default_retry_patterns),
+            retry_if_duration_under_secs: config
+                .command_queue_retry_if_duration_under_secs
+                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
+            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
+            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
+            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
+            strict_process_cleanup: config.get_command_strict_process_cleanup(),
+        }
+    }
 }
 
 /// Command execution queue with staggered start and retry mechanism
@@ -671,6 +700,59 @@ pub enum StreamingOutputLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_queue_config_conversion_preserves_all_values_and_fallbacks() {
+        let configured = OrchestratorConfig {
+            command_queue_stagger_delay_ms: Some(11),
+            command_queue_max_retries: Some(12),
+            command_queue_retry_delay_ms: Some(13),
+            command_queue_retry_patterns: Some(vec!["configured-pattern".to_string()]),
+            command_queue_retry_if_duration_under_secs: Some(14),
+            command_inactivity_timeout_secs: Some(15),
+            command_inactivity_kill_grace_secs: Some(16),
+            command_inactivity_timeout_max_retries: Some(17),
+            command_strict_process_cleanup: Some(false),
+            ..OrchestratorConfig::default()
+        };
+
+        let queue = CommandQueueConfig::from(&configured);
+        assert_eq!(queue.stagger_delay_ms, 11);
+        assert_eq!(queue.max_retries, 12);
+        assert_eq!(queue.retry_delay_ms, 13);
+        assert_eq!(queue.retry_error_patterns, ["configured-pattern"]);
+        assert_eq!(queue.retry_if_duration_under_secs, 14);
+        assert_eq!(queue.inactivity_timeout_secs, 15);
+        assert_eq!(queue.inactivity_kill_grace_secs, 16);
+        assert_eq!(queue.inactivity_timeout_max_retries, 17);
+        assert!(!queue.strict_process_cleanup);
+
+        let defaults = CommandQueueConfig::from(&OrchestratorConfig::default());
+        assert_eq!(defaults.stagger_delay_ms, DEFAULT_STAGGER_DELAY_MS);
+        assert_eq!(defaults.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(defaults.retry_delay_ms, DEFAULT_RETRY_DELAY_MS);
+        assert_eq!(defaults.retry_error_patterns, default_retry_patterns());
+        assert_eq!(
+            defaults.retry_if_duration_under_secs,
+            DEFAULT_RETRY_IF_DURATION_UNDER_SECS
+        );
+        assert_eq!(
+            defaults.inactivity_timeout_secs,
+            DEFAULT_COMMAND_INACTIVITY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            defaults.inactivity_kill_grace_secs,
+            DEFAULT_COMMAND_INACTIVITY_KILL_GRACE_SECS
+        );
+        assert_eq!(
+            defaults.inactivity_timeout_max_retries,
+            DEFAULT_COMMAND_INACTIVITY_TIMEOUT_MAX_RETRIES
+        );
+        assert_eq!(
+            defaults.strict_process_cleanup,
+            DEFAULT_COMMAND_STRICT_PROCESS_CLEANUP
+        );
+    }
 
     fn test_config() -> CommandQueueConfig {
         CommandQueueConfig {

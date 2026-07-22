@@ -1,7 +1,5 @@
 use crate::agent::AgentRunner;
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
-use crate::command_queue::CommandQueueConfig;
-use crate::config::defaults::*;
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::error_history::CircuitBreakerConfig;
@@ -115,32 +113,7 @@ impl Orchestrator {
 
         // Create AiCommandRunner for serial mode execution
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
-            strict_process_cleanup: config.get_command_strict_process_cleanup(),
-        };
-        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
-        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
-        ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
-        ai_runner.set_command_envs(config.get_command_envs());
+        let ai_runner = AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state);
 
         // Initialize shared state (will be populated when run() is called with actual changes)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
@@ -215,32 +188,7 @@ impl Orchestrator {
 
         // Create AiCommandRunner for serial mode execution
         let shared_stagger_state: SharedStaggerState = Arc::new(Mutex::new(None));
-        let queue_config = CommandQueueConfig {
-            stagger_delay_ms: config
-                .command_queue_stagger_delay_ms
-                .unwrap_or(DEFAULT_STAGGER_DELAY_MS),
-            max_retries: config
-                .command_queue_max_retries
-                .unwrap_or(DEFAULT_MAX_RETRIES),
-            retry_delay_ms: config
-                .command_queue_retry_delay_ms
-                .unwrap_or(DEFAULT_RETRY_DELAY_MS),
-            retry_error_patterns: config
-                .command_queue_retry_patterns
-                .clone()
-                .unwrap_or_else(default_retry_patterns),
-            retry_if_duration_under_secs: config
-                .command_queue_retry_if_duration_under_secs
-                .unwrap_or(DEFAULT_RETRY_IF_DURATION_UNDER_SECS),
-            inactivity_timeout_secs: config.get_command_inactivity_timeout_secs(),
-            inactivity_kill_grace_secs: config.get_command_inactivity_kill_grace_secs(),
-            inactivity_timeout_max_retries: config.get_command_inactivity_timeout_max_retries(),
-            strict_process_cleanup: config.get_command_strict_process_cleanup(),
-        };
-        let mut ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state);
-        ai_runner.set_stream_json_textify(config.get_stream_json_textify());
-        ai_runner.set_strict_process_cleanup(config.get_command_strict_process_cleanup());
-        ai_runner.set_command_envs(config.get_command_envs());
+        let ai_runner = AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state);
 
         // Initialize shared state (for testing, will use empty change list)
         // Wrapped in Arc<RwLock<>> to allow sharing with TUI/Web monitoring
