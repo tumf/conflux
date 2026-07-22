@@ -1668,8 +1668,6 @@ mod tests {
         assert_eq!(eligible[0].id, "change-c");
     }
 
-    // Note: build_analysis_prompt tests moved to src/orchestration/selection.rs
-
     #[tokio::test]
     async fn test_orchestrator_creation() {
         let config = OrchestratorConfig::default();
