@@ -104,29 +104,28 @@ fn test_run_rejects_bare_target_before_execution() {
 }
 
 #[test]
-fn test_tui_default_rejects_push_with_server_before_tui_init() {
+fn test_tui_entrypoints_reject_push_with_server_consistently_before_tui_init() {
     let tmp = tempfile::tempdir().unwrap();
     setup_empty_project(tmp.path());
 
-    let status = run_cflx_args_with_timeout(
-        tmp.path(),
-        &["--push", "--server", "http://127.0.0.1:39876"],
-        Duration::from_secs(10),
-    );
-    assert!(!status.success());
-}
+    let bin = env!("CARGO_BIN_EXE_cflx");
+    let endpoint = "http://127.0.0.1:39876";
+    let bare = Command::new(bin)
+        .args(["--push", "--server", endpoint])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let explicit = Command::new(bin)
+        .args(["tui", "--push", "--server", endpoint])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
 
-#[test]
-fn test_tui_subcommand_rejects_push_with_server_before_tui_init() {
-    let tmp = tempfile::tempdir().unwrap();
-    setup_empty_project(tmp.path());
-
-    let status = run_cflx_args_with_timeout(
-        tmp.path(),
-        &["tui", "--push", "--server", "http://127.0.0.1:39876"],
-        Duration::from_secs(10),
-    );
-    assert!(!status.success());
+    assert!(!bare.status.success());
+    assert_eq!(bare.status.code(), explicit.status.code());
+    assert_eq!(bare.stderr, explicit.stderr);
+    assert!(String::from_utf8_lossy(&bare.stderr)
+        .contains("--push is not supported with TUI --server mode"));
 }
 
 #[test]
