@@ -763,7 +763,8 @@ impl AgentRunner {
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
-            "Running acceptance command: {}", command
+            command = %crate::events::command_log_summary(&command),
+            "Running acceptance command"
         );
         let (child, rx) = match cwd {
             Some(dir) => {
@@ -850,7 +851,8 @@ impl AgentRunner {
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
         info!(
             module = module_path!(),
-            "Running acceptance command via AiCommandRunner: {}", command
+            command = %crate::events::command_log_summary(&command),
+            "Running acceptance command via AiCommandRunner"
         );
 
         // Execute via AiCommandRunner (with shared stagger state)

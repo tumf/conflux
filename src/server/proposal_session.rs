@@ -344,7 +344,7 @@ impl ProposalSessionManager {
         let worktree_path = repo_root
             .parent()
             .unwrap_or(repo_root)
-            .join(format!("proposal-{}", &session_id));
+            .join(format!("proposal-{}", session_id));
 
         // Create worktree
         let worktree_path_str = worktree_path

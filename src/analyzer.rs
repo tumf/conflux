@@ -568,43 +568,34 @@ Rules:
     /// Extract JSON from response text (handles markdown code blocks)
     fn extract_json(&self, response: &str) -> Result<String> {
         let trimmed = response.trim();
-
-        // If it starts with {, assume it's pure JSON
-        if trimmed.starts_with('{') {
-            return Ok(trimmed.to_string());
-        }
-
-        // Try to extract from markdown code block
-        if let Some(start) = trimmed.find("```json") {
+        let candidate = if let Some(start) = trimmed.find("```json") {
             let after_marker = &trimmed[start + 7..];
-            if let Some(end) = after_marker.find("```") {
-                return Ok(after_marker[..end].trim().to_string());
-            }
-        }
-
-        // Try to extract from generic code block
-        if let Some(start) = trimmed.find("```") {
+            after_marker
+                .find("```")
+                .map(|end| after_marker[..end].trim())
+        } else if let Some(start) = trimmed.find("```") {
             let after_marker = &trimmed[start + 3..];
-            // Skip language identifier if present
             let content_start = after_marker.find('\n').unwrap_or(0);
             let content = &after_marker[content_start..];
-            if let Some(end) = content.find("```") {
-                return Ok(content[..end].trim().to_string());
-            }
+            content.find("```").map(|end| content[..end].trim())
+        } else {
+            trimmed.find('{').map(|start| &trimmed[start..])
         }
+        .ok_or_else(|| {
+            OrchestratorError::Parse("Could not extract JSON from response".to_string())
+        })?;
 
-        // Try to find JSON object anywhere in response
-        if let Some(start) = trimmed.find('{') {
-            if let Some(end) = trimmed.rfind('}') {
-                if end > start {
-                    return Ok(trimmed[start..=end].to_string());
-                }
-            }
-        }
+        let value = serde_json::Deserializer::from_str(candidate)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .ok_or_else(|| {
+                OrchestratorError::Parse("Could not extract JSON from response".to_string())
+            })?
+            .map_err(|e| OrchestratorError::Parse(format!("Invalid JSON syntax: {}", e)))?;
 
-        Err(OrchestratorError::Parse(
-            "Could not extract JSON from response".to_string(),
-        ))
+        serde_json::to_string(&value).map_err(|e| {
+            OrchestratorError::Parse(format!("Failed to normalize JSON response: {}", e))
+        })
     }
 
     /// Validate that all change IDs in the result exist in the input
@@ -1064,6 +1055,27 @@ mod tests {
 That's all."#;
         let result = analyzer.extract_json(response);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_extract_json_ignores_trailing_agent_output() {
+        let analyzer = create_test_analyzer();
+        let json = r#"{"order":["a"],"dependencies":{}}"#;
+        let response = format!("{json}{json}[tool_use:Read] filePath=/tmp/proposal.md");
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&analyzer.extract_json(&response).unwrap())
+                .unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_extract_json_rejects_malformed_first_object() {
+        let analyzer = create_test_analyzer();
+        let response = r#"{"order":["a"],"dependencies":{} {"valid":true}"#;
+
+        assert!(analyzer.extract_json(response).is_err());
     }
 
     #[test]

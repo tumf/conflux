@@ -100,43 +100,42 @@ The release script SHALL handle git operations for releases.
 - Then a commit with message "chore: release vX.Y.Z" SHALL be created
 - And a tag "vX.Y.Z" SHALL be created
 
-### Requirement: REQ-REL-005 Cross-platform Binary Builds
+### Requirement: REQ-REL-005 Platform Build Policy
 
-GitHub Actions SHALL build binaries for multiple platforms.
+GitHub Actions SHALL build release binaries only for supported Linux targets. macOS builds SHALL be performed locally, and Windows binaries SHALL NOT be provided.
 
 **Priority**: High
 
-#### Scenario: Build for all supported platforms
+#### Scenario: Build release artifacts in CI
 - Given a version tag is pushed to GitHub
 - When the release workflow runs
-- Then binaries SHALL be built for macOS, Linux, and Windows
+- Then binaries SHALL be built for Linux ARM64 and Linux x86_64
+- And no macOS or Windows build jobs SHALL run
+
+#### Scenario: Build on macOS
+- Given a developer needs a macOS binary
+- When the developer builds Conflux on macOS
+- Then the binary SHALL be built locally from source
+
+#### Scenario: Windows release artifacts
+- Given a release is published
+- When a user inspects its artifacts
+- Then no Windows binary or Windows installer SHALL be provided
 
 ### Requirement: REQ-REL-006 GitHub Release Creation
 
-GitHub Actions SHALL create a GitHub Release with artifacts.
+GitHub Actions SHALL create a GitHub Release with Linux artifacts.
 
 **Priority**: High
 
 #### Scenario: Create release with binaries
-- Given all platform builds succeed
+- Given all Linux builds succeed
 - When the host job runs
-- Then a GitHub Release SHALL be created with binaries and checksums
+- Then a GitHub Release SHALL be created with Linux binaries and checksums
 
 #### Scenario: Include installer scripts
 - When the release is created
-- Then shell and PowerShell installer scripts SHALL be included
-
-### Requirement: REQ-REL-007 Homebrew Integration
-
-The release workflow SHALL update the Homebrew formula.
-
-**Priority**: Medium
-
-#### Scenario: Update Homebrew tap
-- Given the release is successfully created
-- And HOMEBREW_TAP_TOKEN is configured
-- When the publish-homebrew-formula job runs
-- Then the formula in tumf/homebrew-tap SHALL be updated
+- Then a Linux shell installer SHALL be included
 
 ### Requirement: REQ-REL-008 Release Documentation
 

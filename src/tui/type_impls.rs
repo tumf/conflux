@@ -21,7 +21,7 @@ impl WorktreeInfo {
     /// Get display branch name (or "(detached)" if detached HEAD)
     pub fn display_branch(&self) -> String {
         if self.is_detached {
-            format!("(detached: {})", &self.head)
+            format!("(detached: {})", self.head)
         } else if self.branch.is_empty() {
             "(no branch)".to_string()
         } else {

@@ -18,12 +18,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./scripts/release.sh --dry-run patch | tee release-validation.log
-          cargo test --test install_skills_test | tee -a release-validation.log
+          LOG_FILE="${RUNNER_TEMP}/release-validation.log"
+          ./scripts/release.sh --dry-run patch | tee "$LOG_FILE"
+          cargo test --test install_skills_test | tee -a "$LOG_FILE"
 
       - name: Publish validation evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: release-validation-log
-          path: release-validation.log
+          path: ${{ runner.temp }}/release-validation.log

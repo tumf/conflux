@@ -649,21 +649,23 @@ fn remove_acceptance_follow_up_sections(content: &mut String) -> Result<()> {
     let ranges = acceptance_follow_up_ranges(content);
     for range in &ranges {
         let section = &content[range.clone()];
-        let current = section.lines().next() == Some(ACCEPTANCE_FOLLOW_UP_HEADING);
         let mut lines = section.lines();
         let _ = lines.next();
+        // Runtime and apply agents have emitted several metadata spellings across
+        // versions (with/without leading dash); all are runtime-owned and safe to drop.
         if lines.any(|line| {
             let trimmed = line.trim();
             !trimmed.is_empty()
                 && !trimmed.starts_with("- [ ] ")
                 && !trimmed.starts_with("- [x] ")
                 && !trimmed.starts_with("- [X] ")
-                && !(current
-                    && (trimmed.starts_with("- attempt: ")
-                        || trimmed == "### External blockers"
-                        || trimmed.starts_with("- identity: ")
-                        || trimmed.starts_with("evidence: ")
-                        || trimmed.starts_with("next action: ")))
+                && !trimmed.starts_with("- attempt: ")
+                && !trimmed.starts_with("attempt: ")
+                && trimmed != "### External blockers"
+                && !trimmed.starts_with("- identity: ")
+                && !trimmed.starts_with("evidence: ")
+                && !trimmed.starts_with("- evidence: ")
+                && !trimmed.starts_with("next action: ")
         }) {
             return Err(OrchestratorError::ConfigLoad(
                 "Acceptance follow-up contains non-runtime content; refusing destructive update"
@@ -1292,6 +1294,29 @@ mod tests {
         clear_acceptance_follow_up(&tasks_path).unwrap();
 
         assert_eq!(std::fs::read_to_string(&tasks_path).unwrap(), original);
+    }
+
+    #[test]
+    fn record_acceptance_follow_up_replaces_legacy_section_with_runtime_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- attempt: 1\n- [x] stale finding\n  evidence: cargo test passed\n",
+        )
+        .unwrap();
+
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            &["latest finding".to_string()],
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(!content.contains("## Acceptance #1 Failure Follow-up"));
+        assert!(content.contains("## Current Acceptance Follow-up\n- attempt: 2"));
+        assert!(content.contains("- [ ] latest finding"));
     }
 
     #[test]

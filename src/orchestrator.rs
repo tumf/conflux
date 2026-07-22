@@ -1342,7 +1342,11 @@ impl Orchestrator {
                     }
                     ParallelEvent::AcceptanceStarted { change_id, command } => {
                         info!("Acceptance started for {}", change_id);
-                        println!("[{} acceptance] {}", change_id, command);
+                        println!(
+                            "[{} acceptance] {}",
+                            change_id,
+                            crate::events::command_log_summary(&command)
+                        );
                     }
                     ParallelEvent::AcceptanceOutput {
                         change_id,

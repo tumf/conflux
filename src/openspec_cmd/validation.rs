@@ -702,10 +702,16 @@ pub(super) fn validate_tasks_content(
         let line_num = i + 1;
 
         if line.starts_with("##") {
+            // Runtime-owned follow-up subsections (e.g. `### External blockers`)
+            // stay excluded until the next top-level section.
+            if line.starts_with("###") && in_runtime_acceptance_follow_up {
+                continue;
+            }
             let section_name = line.trim_start_matches('#').trim().to_lowercase();
             in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
-            in_runtime_acceptance_follow_up = section_name.starts_with("acceptance #")
-                && section_name.ends_with(" failure follow-up");
+            in_runtime_acceptance_follow_up = section_name == "current acceptance follow-up"
+                || (section_name.starts_with("acceptance #")
+                    && section_name.ends_with(" failure follow-up"));
             continue;
         }
 

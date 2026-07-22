@@ -1,6 +1,6 @@
 # Release workflow for Conflux
 # Triggered by version tags (v*.*.*)
-# Uses cargo-dist for cross-platform binary builds
+# Publishes Linux binaries built by GitHub Actions
 
 name: Release
 
@@ -18,14 +18,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Target platforms for cargo-dist
+  # Linux targets built and published by GitHub Actions
   PLAN: >-
     [
-      {"os": "macos-14", "target": "aarch64-apple-darwin"},
-      {"os": "macos-latest", "target": "x86_64-apple-darwin"},
       {"os": "ubuntu-22.04", "target": "x86_64-unknown-linux-gnu"},
-      {"os": "ubuntu-22.04", "target": "aarch64-unknown-linux-gnu"},
-      {"os": "windows-2022", "target": "x86_64-pc-windows-msvc"}
+      {"os": "ubuntu-22.04", "target": "aarch64-unknown-linux-gnu"}
     ]
 
 jobs:
@@ -115,27 +112,17 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           cargo build --release --target ${{ matrix.target }}
 
-      - name: Build (Other platforms)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+      - name: Build (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/cflx dist/
           cd dist
           tar -czvf cflx-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.tar.gz cflx
           rm cflx
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item target/${{ matrix.target }}/release/cflx.exe dist/
-          Compress-Archive -Path dist/cflx.exe -DestinationPath dist/cflx-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.zip
-          Remove-Item dist/cflx.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -174,12 +161,10 @@ jobs:
           REPO="tumf/openspec-orchestrator"
           BINARY="cflx"
 
-          # Detect OS and architecture
           OS=$(uname -s | tr '[:upper:]' '[:lower:]')
           ARCH=$(uname -m)
 
           case "$OS" in
-            darwin) OS="apple-darwin" ;;
             linux) OS="unknown-linux-gnu" ;;
             *) echo "Unsupported OS: $OS"; exit 1 ;;
           esac
@@ -202,57 +187,12 @@ jobs:
           echo "Downloading ${BINARY} for ${TARGET}..."
           curl -fsSL "$DOWNLOAD_URL" | tar -xz
 
-          # Install to ~/.cargo/bin or /usr/local/bin
           INSTALL_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
           mkdir -p "$INSTALL_DIR"
           mv "$BINARY" "$INSTALL_DIR/"
           chmod +x "$INSTALL_DIR/$BINARY"
 
           echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
-          INSTALLER
-
-      - name: Generate PowerShell installer
-        run: |
-          cat > artifacts/install.ps1 << 'INSTALLER'
-          # cflx (Conflux) installer script for Windows
-          $ErrorActionPreference = "Stop"
-
-          $Repo = "tumf/openspec-orchestrator"
-          $Binary = "cflx"
-          $Target = "x86_64-pc-windows-msvc"
-
-          if ($env:VERSION) {
-            $Version = $env:VERSION
-          } else {
-            $Version = "latest"
-          }
-
-          if ($Version -eq "latest") {
-            $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$Binary-$Target.zip"
-          } else {
-            $DownloadUrl = "https://github.com/$Repo/releases/download/$Version/$Binary-$Target.zip"
-          }
-
-          $TempDir = Join-Path $env:TEMP "cflx-install"
-          $ZipPath = Join-Path $TempDir "$Binary.zip"
-
-          New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
-
-          Write-Host "Downloading $Binary..."
-          Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath
-
-          Write-Host "Extracting..."
-          Expand-Archive -Path $ZipPath -DestinationPath $TempDir -Force
-
-          # Install to ~/.cargo/bin
-          $InstallDir = Join-Path $env:USERPROFILE ".cargo\bin"
-          New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-          Move-Item -Path (Join-Path $TempDir "$Binary.exe") -Destination $InstallDir -Force
-
-          Write-Host "Installed $Binary to $InstallDir\$Binary.exe"
-
-          # Cleanup
-          Remove-Item -Recurse -Force $TempDir
           INSTALLER
 
       - name: Upload global artifacts
@@ -286,88 +226,3 @@ jobs:
           prerelease: ${{ contains(needs.plan.outputs.tag, '-') }}
           generate_release_notes: true
           files: artifacts/*
-
-  # Update Homebrew formula
-  publish-homebrew-formula:
-    name: Publish Homebrew Formula
-    needs: [plan, host]
-    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-')
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: artifacts-*
-          merge-multiple: true
-
-      - name: Generate Homebrew formula
-        run: |
-          TAG="${{ needs.plan.outputs.tag }}"
-          VERSION="${TAG#v}"
-
-          # Get SHA256 for each platform
-          DARWIN_ARM64_SHA=$(sha256sum artifacts/cflx-${TAG}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
-          DARWIN_X64_SHA=$(sha256sum artifacts/cflx-${TAG}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
-          LINUX_ARM64_SHA=$(sha256sum artifacts/cflx-${TAG}-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
-          LINUX_X64_SHA=$(sha256sum artifacts/cflx-${TAG}-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
-
-          cat > conflux.rb << FORMULA
-          class Conflux < Formula
-            desc "Conflux - OpenSpec orchestrator for AI-assisted development workflows"
-            homepage "https://github.com/tumf/openspec-orchestrator"
-            version "${VERSION}"
-            license "MIT"
-
-            on_macos do
-              on_arm do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-aarch64-apple-darwin.tar.gz"
-                sha256 "${DARWIN_ARM64_SHA}"
-              end
-              on_intel do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-x86_64-apple-darwin.tar.gz"
-                sha256 "${DARWIN_X64_SHA}"
-              end
-            end
-
-            on_linux do
-              on_arm do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
-                sha256 "${LINUX_ARM64_SHA}"
-              end
-              on_intel do
-                url "https://github.com/tumf/openspec-orchestrator/releases/download/${TAG}/cflx-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
-                sha256 "${LINUX_X64_SHA}"
-              end
-            end
-
-            def install
-              bin.install "cflx"
-            end
-
-            test do
-              system "#{bin}/cflx", "--version"
-            end
-          end
-          FORMULA
-
-      - name: Push to Homebrew tap
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN not set, skipping Homebrew tap update"
-            exit 0
-          fi
-
-          git clone https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/tumf/homebrew-tap.git tap
-          mkdir -p tap/Formula
-          cp conflux.rb tap/Formula/
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/conflux.rb
-          git commit -m "Update conflux to ${{ needs.plan.outputs.tag }}" || exit 0
-          git push
