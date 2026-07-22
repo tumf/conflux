@@ -15,7 +15,3 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate centralize-command-queue-config --archive-gate`
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] repository|code|[production_call_sites_not_migrated]
