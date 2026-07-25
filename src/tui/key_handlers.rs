@@ -642,6 +642,21 @@ pub(crate) fn handle_warning_popup_key(app: &mut AppState, key: KeyEvent) -> boo
     true
 }
 
+/// Handle the bulk execution-mark toggle (`x`) in the Changes view.
+///
+/// Eligibility, mode constraints, and exclusion reporting are enforced in
+/// `AppState::toggle_all_marks`. In Running mode, queue commands
+/// (AddToQueue/RemoveFromQueue) are emitted for eligible NotQueued/Queued rows,
+/// matching single-row Space semantics.
+pub(crate) fn handle_bulk_toggle_key(app: &mut AppState) -> Vec<TuiCommand> {
+    use crate::tui::types::ViewMode;
+    if app.view_mode != ViewMode::Changes {
+        return Vec::new();
+    }
+
+    app.toggle_all_marks()
+}
+
 /// Handle main key events
 ///
 /// Returns Some(TuiCommand) if the key event should trigger the configured start control
@@ -649,10 +664,11 @@ pub async fn handle_key_event(
     key: KeyEvent,
     ctx: &mut KeyEventContext<'_>,
 ) -> Result<Option<TuiCommand>> {
-    let had_warning_message = ctx.app.warning_message.is_some();
+    // Clear the legacy one-line warning message up front so a handler that sets
+    // a new warning during this key press keeps it visible.
+    ctx.app.warning_message = None;
 
     if handle_warning_popup_key(ctx.app, key) {
-        ctx.app.warning_message = None;
         return Ok(None);
     }
 
@@ -724,16 +740,8 @@ pub async fn handle_key_event(
             }
         }
         (KeyCode::Char('x'), _) => {
-            // Toggle all marks in Changes view.
-            // Eligibility and mode constraints are enforced in AppState::toggle_all_marks.
-            // In Running mode, queue commands (AddToQueue/RemoveFromQueue) are emitted
-            // for eligible NotQueued/Queued rows, matching single-row Space semantics.
-            use crate::tui::types::ViewMode;
-            if ctx.app.view_mode == ViewMode::Changes {
-                let commands = ctx.app.toggle_all_marks();
-                for cmd in commands {
-                    let _ = ctx.cmd_tx.send(cmd).await;
-                }
+            for cmd in handle_bulk_toggle_key(ctx.app) {
+                let _ = ctx.cmd_tx.send(cmd).await;
             }
         }
 
@@ -821,11 +829,6 @@ pub async fn handle_key_event(
         _ => {}
     }
 
-    // Clear legacy one-line warning message on any key press.
-    if had_warning_message {
-        ctx.app.warning_message = None;
-    }
-
     Ok(cmd_to_start)
 }
 
@@ -834,6 +837,8 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::config::TuiConfig;
+    use crate::tui::events::LogLevel;
+    use crate::tui::types::ViewMode;
     use crossterm::event::KeyCode;
 
     fn create_test_change(id: &str) -> Change {
@@ -1482,6 +1487,84 @@ mod tests {
             prepared.worktree_path.to_str().unwrap(),
         )
         .await;
+    }
+
+    /// Builds a Changes-view app for bulk toggle boundary tests.
+    fn bulk_toggle_app(rows: &[(&str, &str, bool)]) -> AppState {
+        let changes = rows
+            .iter()
+            .map(|(id, _, _)| create_test_change(id))
+            .collect();
+        let mut app = AppState::new(changes);
+        app.mode = AppMode::Running;
+        for (index, (_, status, selected)) in rows.iter().enumerate() {
+            app.changes[index].display_status_cache = status.to_string();
+            app.changes[index].selected = *selected;
+        }
+        app
+    }
+
+    #[test]
+    fn bulk_toggle_key_surfaces_excluded_rows_with_reasons() {
+        let mut app = bulk_toggle_app(&[
+            ("active", "applying", false),
+            ("rejected", "rejected", false),
+            ("eligible", "not queued", false),
+        ]);
+
+        let commands = handle_bulk_toggle_key(&mut app);
+
+        assert!(matches!(&commands[..], [TuiCommand::AddToQueue(id)] if id == "eligible"));
+        assert!(app.changes[2].selected);
+        assert!(!app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+
+        let warning = app
+            .warning_message
+            .as_ref()
+            .expect("x must surface excluded rows in the Changes view");
+        assert!(
+            warning.contains("2 excluded")
+                && warning.contains("in progress")
+                && warning.contains("rejected"),
+            "warning must explain the exclusions: {}",
+            warning
+        );
+        assert!(app.logs.iter().any(|entry| entry.message == *warning));
+    }
+
+    #[test]
+    fn bulk_toggle_key_with_zero_eligible_targets_is_not_silent() {
+        let mut app = bulk_toggle_app(&[
+            ("active", "applying", false),
+            ("rejected", "rejected", true),
+        ]);
+
+        let commands = handle_bulk_toggle_key(&mut app);
+
+        assert!(commands.is_empty());
+        assert!(!app.changes[0].selected);
+        assert!(app.changes[1].selected, "ineligible rows must not change");
+        assert!(app
+            .warning_message
+            .as_ref()
+            .is_some_and(|msg| msg.contains("no eligible changes")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|entry| entry.level == LogLevel::Warn && entry.message.contains("no eligible")));
+    }
+
+    #[test]
+    fn bulk_toggle_key_is_ignored_outside_changes_view() {
+        let mut app = bulk_toggle_app(&[("eligible", "not queued", false)]);
+        app.view_mode = ViewMode::Worktrees;
+
+        let commands = handle_bulk_toggle_key(&mut app);
+
+        assert!(commands.is_empty());
+        assert!(!app.changes[0].selected);
+        assert!(app.warning_message.is_none());
     }
 
     #[test]
