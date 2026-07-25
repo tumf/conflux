@@ -3,7 +3,6 @@
 error.log
 .agents/.skill-lock.json
 .playwright-cli/
-.cflx/acceptance-state.json
 .cflx.jsonc
 .opencode/
 .venv/

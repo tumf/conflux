@@ -626,7 +626,7 @@ mod tests {
         std::fs::write(temp.path().join("src/lib.rs"), "one").unwrap();
         let before = semantic_progress_fingerprint(temp.path()).unwrap();
         std::fs::create_dir_all(temp.path().join(".cflx")).unwrap();
-        std::fs::write(temp.path().join(".cflx/acceptance-state.json"), "runtime").unwrap();
+        std::fs::write(temp.path().join(".cflx/runtime.json"), "runtime").unwrap();
         assert_eq!(before, semantic_progress_fingerprint(temp.path()).unwrap());
         std::fs::write(temp.path().join("src/lib.rs"), "two").unwrap();
         assert_ne!(before, semantic_progress_fingerprint(temp.path()).unwrap());

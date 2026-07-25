@@ -362,8 +362,6 @@ async fn try_direct_archive_commit(
         "Attempting direct archive commit before AI resolve"
     );
 
-    crate::parallel::acceptance_state::delete_acceptance_state(repo_root)?;
-
     let add_output = Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
@@ -1421,6 +1419,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_is_archive_commit_complete_rejects_invalid_nested_archive_layout() {
+        // Removing acceptance checkpoint cleanup must not weaken the archive
+        // gate: an invalid nested archive layout still fails verification with
+        // concrete evidence instead of being treated as a complete archive.
+        let temp_dir = TempDir::new().unwrap();
+        let repo_root = temp_dir.path();
+
+        init_git_repo(repo_root);
+
+        let nested = repo_root.join("openspec/changes/archive/2026-07-09/change-a");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("proposal.md"), "# Archived").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Archive: change-a"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        let error = is_archive_commit_complete("change-a", Some(repo_root))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid archive layout"),
+            "invalid nested layout must report concrete evidence, got: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_is_archive_commit_complete_false_when_dirty() {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
@@ -1501,7 +1532,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_direct_archive_commit_excludes_acceptance_checkpoint() {
+    async fn test_direct_archive_commit_creates_no_acceptance_checkpoint_and_leaves_clean_worktree()
+    {
         let temp_dir = TempDir::new().unwrap();
         let repo_root = temp_dir.path();
 
@@ -1522,9 +1554,6 @@ mod tests {
         let archive_dir = repo_root.join("openspec/changes/archive/change-a");
         fs::create_dir_all(&archive_dir).unwrap();
         fs::write(archive_dir.join("archive.txt"), "archived").unwrap();
-        let checkpoint = repo_root.join(".cflx/acceptance-state.json");
-        fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
-        fs::write(&checkpoint, "{}\n").unwrap();
 
         let config = OrchestratorConfig {
             resolve_command: Some("sh -c 'exit 42'".to_string()),
@@ -1544,7 +1573,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!checkpoint.exists());
+        // Archive must neither create nor delete a generated acceptance
+        // checkpoint, so the post-archive worktree stays clean and
+        // completion verification cannot report a false incomplete archive.
+        assert!(!repo_root.join(".cflx/acceptance-state.json").exists());
         let committed_files = Command::new("git")
             .args(["show", "--format=", "--name-only", "HEAD"])
             .current_dir(repo_root)
@@ -1552,6 +1584,19 @@ mod tests {
             .unwrap();
         assert!(!String::from_utf8_lossy(&committed_files.stdout)
             .contains(".cflx/acceptance-state.json"));
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "archive commit must leave a clean worktree, got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        assert!(is_archive_commit_complete("change-a", Some(repo_root))
+            .await
+            .unwrap());
     }
 
     #[cfg(unix)]

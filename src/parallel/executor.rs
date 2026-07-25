@@ -8,7 +8,6 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::parallel::output_bridge::ParallelApplyEventHandler;
 
-use super::acceptance_state::delete_acceptance_state;
 use super::archive_state::delete_archive_state;
 use super::events::ParallelEvent;
 use crate::orchestration::build_acceptance_tail_findings;
@@ -566,12 +565,6 @@ pub async fn execute_archive_finalization_in_workspace(
     )
     .await?;
 
-    if let Err(err) = delete_acceptance_state(workspace_path) {
-        warn!(
-            "Failed to delete acceptance state for {} after archive finalization resume: {}",
-            change_id, err
-        );
-    }
     if let Err(err) = delete_archive_state(workspace_path) {
         warn!(
             "Failed to delete archive state for {} after archive finalization resume: {}",
@@ -1170,13 +1163,6 @@ pub async fn execute_archive_in_workspace(
                 return Err(e);
             }
         }
-    }
-
-    if let Err(err) = delete_acceptance_state(workspace_path) {
-        warn!(
-            "Failed to delete acceptance state for {} after archive completion: {}",
-            change_id, err
-        );
     }
 
     // Clear history after successful archive
