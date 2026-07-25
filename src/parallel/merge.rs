@@ -11,7 +11,6 @@ use crate::vcs::{VcsBackend, VcsError};
 use std::path::Path;
 use std::path::PathBuf;
 
-use super::acceptance_state::delete_acceptance_state;
 use super::conflict;
 use super::events::send_event;
 use super::MergeTaskOutcome;
@@ -426,13 +425,6 @@ impl ParallelExecutor {
                             err
                         );
                     } else {
-                        if let Err(err) = delete_acceptance_state(&archive_paths[0]) {
-                            tracing::warn!(
-                                "Failed to delete acceptance state for '{}' after cleanup: {}",
-                                workspace_result.change_id,
-                                err
-                            );
-                        }
                         send_event(
                             &self.event_tx,
                             ParallelEvent::CleanupCompleted {
@@ -621,13 +613,6 @@ impl ParallelExecutor {
                 err
             );
         } else {
-            if let Err(err) = delete_acceptance_state(archive_path) {
-                tracing::warn!(
-                    "Failed to delete acceptance state for '{}' after push cleanup: {}",
-                    workspace_result.change_id,
-                    err
-                );
-            }
             send_event(
                 &self.event_tx,
                 ParallelEvent::CleanupCompleted {
@@ -850,13 +835,6 @@ impl ParallelExecutor {
                         err
                     );
                 } else {
-                    if let Err(err) = delete_acceptance_state(&workspace.path) {
-                        tracing::warn!(
-                            "Failed to delete acceptance state for '{}' after resolve merge cleanup: {}",
-                            change_id,
-                            err
-                        );
-                    }
                     send_event(
                         &self.event_tx,
                         ParallelEvent::CleanupCompleted {

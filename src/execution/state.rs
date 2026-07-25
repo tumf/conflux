@@ -519,32 +519,27 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_checkpoint_and_marker_contract_is_workspace_local() {
+    fn acceptance_marker_contract_is_workspace_local_without_a_checkpoint_file() {
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
-        assert!(
-            crate::parallel::acceptance_state::load_acceptance_state(workspace)
-                .unwrap()
-                .is_none()
-        );
 
-        crate::parallel::acceptance_state::record_acceptance_retry_context(
-            workspace,
-            "revision",
-            "test-change",
-            &["Finding A".to_string()],
-            2,
-        )
-        .unwrap();
-        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker_with_context(
             workspace,
             "test-change",
             "permission_stalled",
             &["external blocker".to_string()],
+            &crate::parallel::acceptance_state::AcceptanceRetryContext {
+                finding_identities: vec!["repository|finding a|implementation".to_string()],
+                semantic_fingerprint: Some("baseline".to_string()),
+                cycle_count: 2,
+            },
+            "no_semantic_progress",
+            &[],
             true,
             "explicit retry",
         )
         .unwrap();
+        assert!(!workspace.join(".cflx/acceptance-state.json").exists());
 
         let marker =
             crate::parallel::acceptance_state::parse_blocked_marker(workspace, "test-change")
@@ -607,24 +602,25 @@ mod tests {
         let repo_root = temp_dir.path();
         init_git_repo(repo_root);
         commit(repo_root, "Initial commit");
-        crate::parallel::acceptance_state::record_acceptance_retry_context(
-            repo_root,
-            "revision",
-            "test-change",
-            &["finding".to_string()],
-            2,
-        )
-        .unwrap();
-        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
+        crate::parallel::acceptance_state::write_acceptance_blocked_marker_with_context(
             repo_root,
             "test-change",
             "permission_stalled",
             &["external blocker".to_string()],
+            &crate::parallel::acceptance_state::AcceptanceRetryContext {
+                finding_identities: vec!["repository|finding|implementation".to_string()],
+                semantic_fingerprint: Some("baseline".to_string()),
+                cycle_count: 2,
+            },
+            "no_semantic_progress",
+            &[],
             true,
             "explicit retry",
         )
         .unwrap();
 
+        // The tracked marker alone reconstructs the stalled hold after restart;
+        // no generated acceptance checkpoint participates in the decision.
         assert_eq!(
             detect_workspace_state("test-change", repo_root, "main")
                 .await

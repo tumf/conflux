@@ -129,7 +129,6 @@ enum QueueReconciliationDiagnosticLevel {
     Warn,
 }
 
-use super::acceptance_state::delete_acceptance_state;
 use super::cleanup::WorkspaceCleanupGuard;
 use super::dependency::DependencyContext;
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
@@ -848,13 +847,6 @@ impl ParallelExecutor {
             .await;
             // Rejected flow is terminal after base-side REJECTED marker commit
             // and should not proceed to merge. Ensure preserved workspace is cleaned up.
-            let workspace_path = self
-                .workspace_manager
-                .find_existing_workspace(&workspace_result.change_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|info| info.path);
             if let Err(e) = self
                 .workspace_manager
                 .cleanup_workspace(&workspace_result.workspace_name)
@@ -864,13 +856,6 @@ impl ParallelExecutor {
                     "Failed to cleanup rejected workspace '{}' for change '{}': {}",
                     workspace_result.workspace_name, workspace_result.change_id, e
                 );
-            } else if let Some(workspace_path) = workspace_path {
-                if let Err(err) = delete_acceptance_state(&workspace_path) {
-                    warn!(
-                        "Failed to delete acceptance state for rejected change '{}': {}",
-                        workspace_result.change_id, err
-                    );
-                }
             }
 
             // Rejection review completion (confirm) also releases the rejecting lane;
@@ -1449,13 +1434,6 @@ impl ParallelExecutor {
                             workspace_info.workspace_name, e
                         );
                     } else {
-                        if let Err(err) = delete_acceptance_state(&workspace_info.path) {
-                            warn!(
-                                "Failed to delete acceptance state for '{}' after deferred merge cleanup: {}",
-                                change_id,
-                                err
-                            );
-                        }
                         send_event(
                             &self.event_tx,
                             ParallelEvent::CleanupCompleted {

@@ -6803,10 +6803,7 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
     );
 }
 
-async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
-    starting_cycle_count: u32,
-    expected_reason: &str,
-) {
+async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoint: bool) {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
     init_git_repo(repo_dir.path()).await;
@@ -6818,7 +6815,7 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
         .or_fail("write active proposal");
     std::fs::write(
         change_dir.join("tasks.md"),
-        "## Implementation Tasks\n- [x] done\n\n## Acceptance #1 Failure Follow-up\n- [x] verified\n",
+        "## Implementation Tasks\n- [x] done\n",
     )
     .or_fail("write active tasks");
     Command::new("git")
@@ -6862,29 +6859,46 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
         .output()
         .await
         .or_fail("create applied resume commit");
-    let fingerprint =
-        crate::orchestration::acceptance::semantic_progress_fingerprint(&workspace_path)
-            .or_fail("fingerprint workspace");
-    let finding_identity =
-        crate::orchestration::acceptance::normalize_findings(&["repeated finding".to_string()])[0]
+
+    let checkpoint_path = workspace_path.join(".cflx/acceptance-state.json");
+    if stale_checkpoint {
+        // A checkpoint left behind by an older Conflux version claims an almost
+        // exhausted retry budget for this exact change. Dispatch must ignore it.
+        let finding_identity =
+            crate::orchestration::acceptance::normalize_findings(&["repeated finding".to_string()])
+                [0]
             .identity
             .clone();
-    crate::parallel::acceptance_state::record_acceptance_retry_checkpoint(
-        &workspace_path,
-        "checkpoint-revision",
-        change_id,
-        vec![finding_identity.clone()],
-        Some(fingerprint),
-        starting_cycle_count,
-    )
-    .or_fail("write restart checkpoint");
+        std::fs::create_dir_all(checkpoint_path.parent().or_fail("checkpoint parent"))
+            .or_fail("create stale checkpoint dir");
+        std::fs::write(
+            &checkpoint_path,
+            format!(
+                "{{\"state\":\"failed\",\"revision\":\"stale\",\"updated_at\":\"now\",                 \"workspace_path\":\"{}\",\"change_id\":\"{change_id}\",                 \"previous_finding_identities\":[\"{finding_identity}\"],                 \"semantic_fingerprint\":\"stale\",\"cycle_count\":{}}}",
+                workspace_path.display(),
+                MAX_ACCEPTANCE_RETRY_CYCLES - 1,
+            ),
+        )
+        .or_fail("write stale checkpoint");
+    }
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
-        apply_command: Some("sh -c 'echo unexpected-apply >&2; exit 42'".to_string()),
+        // Apply only checks off the acceptance follow-up boxes, so the
+        // semantic fingerprint (which ignores follow-up sections) stays
+        // unchanged and only repeated findings drive the stall decision.
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+        )),
         acceptance_command: Some(
             "sh -c 'echo ACCEPTANCE: FAIL; echo FINDINGS:; echo - repeated finding'".to_string(),
         ),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
         ..Default::default()
     });
     let (tx, mut rx) = mpsc::channel(128);
@@ -6907,7 +6921,7 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
             &mut cleanup_guard,
         )
         .await
-        .or_fail("dispatch resumed checkpoint workspace");
+        .or_fail("dispatch resumed workspace");
     let result = join_set
         .join_next()
         .await
@@ -6919,17 +6933,27 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
         result.error
     );
 
-    let checkpoint =
-        crate::parallel::acceptance_state::load_acceptance_state_for(&workspace_path, change_id)
-            .or_fail("load resumed checkpoint")
-            .or_fail("checkpoint should still belong to resumed change");
-    assert_eq!(checkpoint.cycle_count, starting_cycle_count + 1);
-    assert_eq!(checkpoint.previous_finding_identities, [finding_identity]);
     let marker =
         crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
             .or_fail("load stalled marker")
             .or_fail("acceptance failure must persist a stalled marker");
-    assert_eq!(marker.reason, expected_reason);
+    assert_eq!(marker.reason, "repeated_acceptance_findings");
+    assert_eq!(
+        marker.retry_count, 2,
+        "retry count must come from this run only, not from generated state"
+    );
+
+    if stale_checkpoint {
+        assert!(
+            checkpoint_path.exists(),
+            "dispatch must not consume generated acceptance state"
+        );
+    } else {
+        assert!(
+            !checkpoint_path.exists(),
+            "dispatch must never create an acceptance checkpoint"
+        );
+    }
 
     let mut acceptance_count = 0;
     let mut apply_count = 0;
@@ -6949,12 +6973,12 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
         }
     }
     assert_eq!(
-        acceptance_count, 1,
-        "resumed workspace must run acceptance before stalling"
+        acceptance_count, 2,
+        "the first failure must retry apply and only the repeated failure may stall"
     );
     assert_eq!(
-        apply_count, 0,
-        "repeated/cycle-limit stalls must occur before another apply"
+        apply_count, 1,
+        "exactly one apply retry precedes the repeated-finding stall"
     );
     assert!(
         !saw_error,
@@ -6963,21 +6987,162 @@ async fn assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
 }
 
 #[tokio::test]
-async fn parallel_repeated_acceptance_failure_stalls_without_apply_or_error_event() {
-    assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
-        2,
-        "repeated_acceptance_findings",
-    )
-    .await;
+async fn parallel_repeated_acceptance_failure_stalls_without_error_event() {
+    assert_parallel_acceptance_failure_stalls_within_one_run(false).await;
 }
 
 #[tokio::test]
-async fn parallel_cycle_limit_stalls_without_apply_or_error_event() {
-    assert_parallel_acceptance_failure_stalls_without_apply_or_error_event(
-        MAX_ACCEPTANCE_RETRY_CYCLES - 1,
-        "acceptance_cycle_limit_exhausted",
+async fn parallel_restart_ignores_generated_acceptance_state_when_deciding_retries() {
+    assert_parallel_acceptance_failure_stalls_within_one_run(true).await;
+}
+
+/// End-to-end regression for the post-archive false `MergeWait`.
+///
+/// Runs apply -> acceptance PASS -> archive commit -> post-archive merge
+/// verification in one dispatch and proves that no generated acceptance
+/// checkpoint is created, that archive leaves a clean worktree, and that merge
+/// verification therefore never produces a manual deferral.
+#[tokio::test]
+async fn parallel_pass_to_archive_to_merge_never_creates_or_cleans_an_acceptance_checkpoint() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+
+    // The active change is part of the base commit so the dispatched worktree
+    // and the base branch share a head; post-archive merge then exercises the
+    // archive verification path rather than pre-sync handling.
+    let change_id = "post-archive-clean";
+    let change_dir = repo_dir.path().join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create active change dir");
+    std::fs::write(change_dir.join("proposal.md"), "# Post archive\n")
+        .or_fail("write active proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
     )
-    .await;
+    .or_fail("write active tasks");
+    init_git_repo(repo_dir.path()).await;
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some("sh -c 'true'".to_string()),
+        acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS'".to_string()),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch change through the full pipeline");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    assert!(
+        result.error.is_none(),
+        "pass-to-archive pipeline must succeed: {:?}",
+        result.error
+    );
+    assert!(
+        result.final_revision.is_some(),
+        "archive must produce a final revision"
+    );
+
+    let workspace = executor
+        .workspace_manager
+        .find_existing_workspace(change_id)
+        .await
+        .or_fail("look up archived workspace")
+        .or_fail("archived workspace should still exist before merge");
+
+    assert!(
+        !workspace.path.join(".cflx/acceptance-state.json").exists(),
+        "acceptance must never create a workspace checkpoint"
+    );
+    assert!(
+        !repo_dir.path().join(".cflx/acceptance-state.json").exists(),
+        "acceptance must never create a base-repository checkpoint"
+    );
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&workspace.path)
+        .output()
+        .await
+        .or_fail("read post-archive worktree status");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+        "post-archive worktree must be clean, got: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(
+        crate::execution::archive::is_archive_commit_complete(change_id, Some(&workspace.path))
+            .await
+            .or_fail("verify archive completion"),
+        "archive completion verification must succeed without checkpoint cleanup"
+    );
+
+    while rx.try_recv().is_ok() {}
+
+    // Post-archive merge verification must clear the archive gate. The stub
+    // resolve command in this fixture may still fail the later conflict phase;
+    // what this regression asserts is that archive verification never produces
+    // a manual deferral and that the change reaches the resolving stage.
+    let attempt = executor
+        .attempt_merge(
+            std::slice::from_ref(&workspace.workspace_name),
+            &[change_id.to_string()],
+            std::slice::from_ref(&workspace.path),
+        )
+        .await;
+    if let Ok(crate::parallel::merge::MergeAttempt::Deferred(deferred)) = &attempt {
+        assert!(
+            deferred.auto_resumable,
+            "a valid archive must never enter manual MergeWait: {}",
+            deferred.reason
+        );
+    }
+
+    let mut reached_resolving = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ParallelEvent::ResolveStarted { change_id: id, .. } = event {
+            if id == change_id {
+                reached_resolving = true;
+            }
+        }
+    }
+    assert!(
+        reached_resolving,
+        "archive verification must pass and hand the change to the resolving stage"
+    );
 }
 
 #[tokio::test]
