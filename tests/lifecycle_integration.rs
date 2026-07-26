@@ -123,17 +123,29 @@ fn env_probe_adapter(dir: &Path, record_path: &Path) -> PathBuf {
 /// Shutdown deadline short enough to keep the bounded-shutdown assertions meaningful.
 const TIGHT_SHUTDOWN_MS: u64 = 400;
 
+/// Write deadline short enough to keep the "adapter stopped reading" path fast.
+const TIGHT_WRITE_TIMEOUT_MS: u64 = 150;
+
 fn config_for(command: Vec<String>) -> LifecycleIntegrationConfig {
     LifecycleIntegrationConfig {
         command,
-        // A small queue and write timeout keep failure paths fast and
-        // deterministic. The shutdown deadline stays generous on purpose, so a
-        // loaded machine that is slow to `fork`/`exec` a fixture cannot turn a
-        // correctness assertion into a timing flake. Tests that assert bounded
-        // shutdown override it with `TIGHT_SHUTDOWN_MS` and assert against that
-        // pinned deadline instead.
+        // A small queue keeps the backpressure path reachable. Both deadlines
+        // stay generous on purpose, so a loaded machine cannot turn a
+        // correctness assertion into a timing flake:
+        //
+        // - A slow `fork`/`exec` must not shorten the shutdown wait. Tests that
+        //   assert bounded shutdown override it with `TIGHT_SHUTDOWN_MS` and
+        //   assert against that pinned deadline instead.
+        // - A missed write deadline permanently disables reporting and silently
+        //   truncates the stream, so a tight value would make every
+        //   delivery-completeness assertion load-sensitive. These deadlines are
+        //   wall-clock, and each test drives its dispatcher from a
+        //   current-thread runtime, so scheduler starvation alone can expire a
+        //   short one even when the pipe write would have succeeded. Only
+        //   `TIGHT_WRITE_TIMEOUT_MS`, pinned by the test that exercises the
+        //   stopped-reader path on purpose, needs to be short.
         queue_capacity: Some(16),
-        write_timeout_ms: Some(150),
+        write_timeout_ms: Some(5_000),
         shutdown_timeout_ms: Some(5_000),
         ..Default::default()
     }
@@ -394,9 +406,12 @@ async fn adapter_that_stops_reading_cannot_block_workflow_or_shutdown_impl() {
     let adapter = blocked_reader_adapter(dir.path());
 
     // This is the case where the shutdown deadline is what ends the wait, so it
-    // is pinned tight and asserted against explicitly below.
+    // is pinned tight and asserted against explicitly below. The write deadline
+    // is pinned tight too: this adapter never reads, so the stopped-reader path
+    // it exercises is exactly what that deadline is for.
     let config = LifecycleIntegrationConfig {
         shutdown_timeout_ms: Some(TIGHT_SHUTDOWN_MS),
+        write_timeout_ms: Some(TIGHT_WRITE_TIMEOUT_MS),
         ..config_for(vec![adapter.display().to_string()])
     };
     let integration = LifecycleIntegration::start(Some(&config), LifecycleExecutionMode::Run);
