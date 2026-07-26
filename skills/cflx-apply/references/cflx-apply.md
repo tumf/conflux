@@ -239,8 +239,8 @@ Special handling for 'future work' tasks:
 - Do NOT add new '(future work)' markers yourself unless the task meets the strict criteria above (human work, external systems, long-wait verification, or permission auto-reject)
 - When moving a task to Future Work, verify it truly requires human action, external systems, long waiting periods, or permission auto-reject
 
-CRITICAL: Checkbox removal when moving tasks to excluded sections:
-- When moving tasks to "Future Work", "Out of Scope", or "Notes" sections, you MUST remove the checkbox (`- [ ]` or `- [x]`)
+CRITICAL: Checkbox removal when moving tasks to narrative non-task sections:
+- When moving tasks to "Future Work", "Out of Scope", "Notes", "Final Validation", "Acceptance Notes", or "Implementation Blocker #N" sections, you MUST remove the checkbox (`- [ ]` or `- [x]`)
 - Convert checkbox items to plain list items: `- [ ] Task` → `- Task` or just plain text
 - Rationale: Tasks in these sections are excluded from completion tracking. Checkboxes in these sections will prevent archive from succeeding (100% completion requirement).
 - Example:
@@ -249,8 +249,11 @@ CRITICAL: Checkbox removal when moving tasks to excluded sections:
 
 Tasks format requirements:
 - Active implementation/test/documentation/configuration tasks MUST have checkboxes: `- [ ]` or `- [x]`
-- Non-task sections MUST NOT have checkboxes, including `Future Work`, `Out of Scope`, `Notes`, `Final Validation`, `Acceptance Notes`, and acceptance-review history.
+- Narrative non-task sections MUST NOT have checkboxes, including `Future Work`, `Out of Scope`, `Notes`, `Final Validation`, `Acceptance Notes`, `Implementation Blocker #N`, and acceptance-review history. Prose and non-checkbox `- ` bullets are valid inside them and are never counted as tasks.
+- Active task sections MUST NOT contain top-level non-checkbox bullets. `- evidence: ...`, `- note: ...`, and similar lines fail native validation with `Possible task without checkbox` even when every checkbox is `[x]`. Fold that content into the checkbox task line or move it to a narrative non-task section.
+- Keep the two evidence forms distinct: `  evidence: <one-line evidence>` (exactly two leading spaces, no bullet) is the only evidence form allowed inside the runtime-owned acceptance follow-up; `- evidence:` is a plain bullet that belongs only in a narrative non-task section.
 - Do not convert final validation notes, archive-gate notes, or acceptance findings into checkbox tasks.
+- Task-format validity gates acceptance: Conflux validates the workspace-local `tasks.md` before handing off, so a malformed file keeps the change in apply no matter how many checkboxes are `[x]`.
 - Invalid active-task formats that need fixing:
   * `## N. Task` → Convert to `- [ ] N. Task` only when it is real implementation/test/doc/config work
   * `- Task` → Convert to `- [ ] Task` only when it is real implementation/test/doc/config work

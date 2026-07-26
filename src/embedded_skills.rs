@@ -576,6 +576,91 @@ mod tests {
         }
     }
 
+    /// Headings the native validator classifies as narrative non-task sections.
+    /// Distributed guidance must describe exactly these as checkbox-free.
+    const NARRATIVE_SECTION_HEADINGS: &[&str] = &[
+        "Future Work",
+        "Out of Scope",
+        "Notes",
+        "Final Validation",
+        "Acceptance Notes",
+        "Implementation Blocker",
+    ];
+
+    #[test]
+    fn guidance_narrative_sections_match_native_classifier() {
+        use crate::openspec_cmd::validation::{classify_task_section, TaskSectionKind};
+
+        for heading in NARRATIVE_SECTION_HEADINGS {
+            assert_eq!(
+                classify_task_section(&format!("## {heading}")),
+                TaskSectionKind::Narrative,
+                "guidance lists '{heading}' as checkbox-free, so the validator must classify it as narrative"
+            );
+        }
+        // Numbered blocker sections are produced by the escalation template.
+        assert_eq!(
+            classify_task_section("## Implementation Blocker #2"),
+            TaskSectionKind::Narrative
+        );
+        // Active work keeps checkbox enforcement.
+        assert_eq!(
+            classify_task_section("## Implementation Tasks"),
+            TaskSectionKind::Active
+        );
+
+        for (label, content) in &[
+            ("cflx-apply", CFLX_APPLY_SKILL_MD),
+            ("cflx-apply reference", CFLX_APPLY_REF),
+        ] {
+            for heading in NARRATIVE_SECTION_HEADINGS {
+                assert!(
+                    content.contains(heading),
+                    "{label} must name the narrative non-task section '{heading}'"
+                );
+            }
+            assert!(
+                content.contains("Narrative non-task section")
+                    || content.contains("narrative non-task section"),
+                "{label} must use the canonical narrative non-task classification"
+            );
+        }
+    }
+
+    #[test]
+    fn guidance_forbids_active_section_evidence_bullets() {
+        for (label, content) in &[
+            ("cflx-apply", CFLX_APPLY_SKILL_MD),
+            ("cflx-apply reference", CFLX_APPLY_REF),
+            ("cflx-proposal", CFLX_PROPOSAL_SKILL_MD),
+        ] {
+            assert!(
+                content.contains("Possible task without checkbox"),
+                "{label} must name the diagnostic produced by an active-section bare bullet"
+            );
+            assert!(
+                content.contains("- evidence:"),
+                "{label} must call out the invalid top-level `- evidence:` bullet form"
+            );
+        }
+
+        // The exact runtime-owned indented form must stay distinct from the
+        // top-level bullet form in apply guidance.
+        for (label, content) in &[
+            ("cflx-apply", CFLX_APPLY_SKILL_MD),
+            ("cflx-apply reference", CFLX_APPLY_REF),
+        ] {
+            assert!(
+                content.contains("`  evidence: <one-line evidence>`"),
+                "{label} must preserve the exact runtime-owned evidence syntax"
+            );
+            assert!(
+                content.contains("two leading spaces"),
+                "{label} must make the indented evidence form unambiguous"
+            );
+        }
+    }
+
     #[test]
     fn acceptance_skill_requires_atomic_current_state_findings() {
         for required in [

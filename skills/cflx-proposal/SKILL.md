@@ -518,6 +518,10 @@ Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate <id> --archive-gate`
 ```
 
+`Final Validation`, `Implementation Blocker #N`, `Future Work`, `Out of Scope`, `Notes`, and `Acceptance Notes` are narrative non-task sections: plain prose and non-checkbox `- ` bullets belong there, checkboxes do not.
+
+Active task sections are the mirror image: every top-level `- ` or `* ` line must be a checkbox task. Never plan a bare `- evidence: ...` or `- note: ...` bullet inside an active task section — native validation rejects it with `Possible task without checkbox`, and Conflux keeps the change in apply until it is fixed.
+
 ## Best Practices
 
 ### Communication

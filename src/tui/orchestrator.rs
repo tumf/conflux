@@ -438,12 +438,19 @@ pub async fn run_orchestrator(
         let apply_template = agent.config().get_apply_command()?;
         let apply_user_prompt = agent.config().get_apply_prompt();
         let apply_history_context = agent.format_apply_history(&change_id);
+        let apply_task_format_context = crate::agent::build_task_format_repair_context(
+            &crate::execution::apply::pending_task_format_repair(
+                std::path::Path::new("."),
+                &change_id,
+            ),
+        );
         let apply_full_prompt = crate::agent::build_apply_prompt_with_skill(
             agent.config().get_apply_skill(),
             &change_id,
             apply_user_prompt,
             &apply_history_context,
             &acceptance_tail,
+            &apply_task_format_context,
         );
         let apply_expanded_command =
             OrchestratorConfig::expand_change_id(apply_template, &change_id);

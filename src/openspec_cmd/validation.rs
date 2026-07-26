@@ -323,14 +323,73 @@ pub(super) fn count_requirements_in_spec(spec_path: &Path) -> usize {
     }
 }
 
+/// Classification of a top-level `tasks.md` section.
+///
+/// Task counting and task validation share this contract so a section can never
+/// be counted as active work by one and narrative metadata by the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskSectionKind {
+    /// Implementation work. Task-like bullets MUST use checkboxes.
+    Active,
+    /// Human-facing metadata (Final Validation, Implementation Blocker, Future
+    /// Work, Out of Scope, Notes, Acceptance Notes). Ordinary prose and list
+    /// metadata are permitted; checkboxes are not.
+    Narrative,
+    /// Runtime-owned acceptance follow-up. The runtime writes and clears these
+    /// sections, so they keep their own parsing and validation behavior.
+    RuntimeAcceptanceFollowUp,
+}
+
+impl TaskSectionKind {
+    /// Whether checkbox tasks in this section participate in progress totals.
+    fn counts_tasks(self) -> bool {
+        !matches!(self, TaskSectionKind::Narrative)
+    }
+}
+
+/// Narrative section markers matched as substrings of a lowercased heading.
+///
+/// `Recovered Acceptance Notes` and `Acceptance Notes` both match `notes`, and
+/// `Implementation Blocker #3` matches `implementation blocker`.
+const NARRATIVE_SECTION_MARKERS: &[&str] = &[
+    "future work",
+    "out of scope",
+    "notes",
+    "final validation",
+    "implementation blocker",
+];
+
+/// Classify a top-level `tasks.md` heading line (`## ...`).
+///
+/// Runtime ownership wins over narrative matching so runtime-owned sections keep
+/// their dedicated behavior regardless of wording overlap.
+pub(crate) fn classify_task_section(heading_line: &str) -> TaskSectionKind {
+    let section_name = heading_line.trim_start_matches('#').trim().to_lowercase();
+
+    if section_name == "current acceptance follow-up"
+        || (section_name.starts_with("acceptance #")
+            && section_name.ends_with(" failure follow-up"))
+    {
+        return TaskSectionKind::RuntimeAcceptanceFollowUp;
+    }
+
+    if NARRATIVE_SECTION_MARKERS
+        .iter()
+        .any(|marker| section_name.contains(marker))
+    {
+        return TaskSectionKind::Narrative;
+    }
+
+    TaskSectionKind::Active
+}
+
 pub(super) fn count_tasks(content: &str) -> (u32, u32) {
     static CHECKBOX_RE: OnceLock<Regex> = OnceLock::new();
     static CHECKED_RE: OnceLock<Regex> = OnceLock::new();
     let checkbox_re = CHECKBOX_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[[ x]\]").unwrap());
     let checked_re = CHECKED_RE.get_or_init(|| Regex::new(r"^\s*[-*]\s*\[x\]").unwrap());
 
-    let excluded_sections = ["future work", "out of scope", "notes"];
-    let mut in_excluded = false;
+    let mut section = TaskSectionKind::Active;
     let mut completed = 0u32;
     let mut total = 0u32;
     let mut fences = crate::task_parser::FenceTracker::default();
@@ -341,11 +400,15 @@ pub(super) fn count_tasks(content: &str) -> (u32, u32) {
             continue;
         }
         if line.starts_with("##") {
-            let section_name = line.trim_start_matches('#').trim().to_lowercase();
-            in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
+            // Runtime-owned follow-up subsections stay runtime-owned until the
+            // next top-level section, mirroring task validation.
+            if line.starts_with("###") && section == TaskSectionKind::RuntimeAcceptanceFollowUp {
+                continue;
+            }
+            section = classify_task_section(line);
             continue;
         }
-        if in_excluded {
+        if !section.counts_tasks() {
             continue;
         }
         if checkbox_re.is_match(line) {
@@ -671,6 +734,19 @@ pub(super) fn self_referential_final_validation_message(
     )
 }
 
+/// Deterministic task-format validation for a `tasks.md` body.
+///
+/// This is the format-only subset of [`validate_tasks_content`]: it reports
+/// active-section bullets that look like tasks but lack checkboxes, checkboxes
+/// inside narrative non-task sections, and self-referential final-validation
+/// checkboxes. Evidence/verification-ownership policy is intentionally excluded
+/// so the runtime pre-accept gate stays independent of proposal metadata and
+/// evidence mode.
+pub(crate) fn validate_task_format(content: &str, change_id: &str) -> Vec<String> {
+    let (errors, _) = validate_tasks_content(content, change_id, false, "off", None, None);
+    errors
+}
+
 pub(super) fn validate_tasks_content(
     content: &str,
     change_id: &str,
@@ -694,9 +770,7 @@ pub(super) fn validate_tasks_content(
     let verification_continuation_re = VERIFICATION_CONTINUATION_RE
         .get_or_init(|| Regex::new(r"^\s{2,}(?i:verification:)\s*(.+)$").unwrap());
 
-    let excluded_sections = ["future work", "out of scope", "notes"];
-    let mut in_excluded = false;
-    let mut in_runtime_acceptance_follow_up = false;
+    let mut section = TaskSectionKind::Active;
 
     let is_behavior_change = matches!(change_type, Some("implementation" | "hybrid"));
 
@@ -716,24 +790,22 @@ pub(super) fn validate_tasks_content(
         if line.starts_with("##") {
             // Runtime-owned follow-up subsections (e.g. `### External blockers`)
             // stay excluded until the next top-level section.
-            if line.starts_with("###") && in_runtime_acceptance_follow_up {
+            if line.starts_with("###") && section == TaskSectionKind::RuntimeAcceptanceFollowUp {
                 continue;
             }
-            let section_name = line.trim_start_matches('#').trim().to_lowercase();
-            in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
-            in_runtime_acceptance_follow_up = section_name == "current acceptance follow-up"
-                || (section_name.starts_with("acceptance #")
-                    && section_name.ends_with(" failure follow-up"));
+            section = classify_task_section(line);
             continue;
         }
 
         // Runtime-owned acceptance findings are not implementation tasks and have no
         // implementation verification contract. The runtime removes them after PASS.
-        if in_runtime_acceptance_follow_up {
+        if section == TaskSectionKind::RuntimeAcceptanceFollowUp {
             continue;
         }
 
-        // Check for checkboxes in excluded sections
+        let in_excluded = section == TaskSectionKind::Narrative;
+
+        // Check for checkboxes in narrative (non-task) sections
         if in_excluded && checkbox_re.is_match(line) {
             errors.push(format!(
                 "{}: tasks.md:{}: Checkbox found in excluded section (should be removed)",

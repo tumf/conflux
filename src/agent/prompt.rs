@@ -35,17 +35,21 @@ pub fn append_optional_prompt(base_prompt: String, append_prompt: Option<&str>) 
 /// * `user_prompt` - User-customizable apply prompt
 /// * `history_context` - Previous apply attempts context
 /// * `acceptance_tail_context` - Acceptance output tail context (optional)
+/// * `task_format_context` - Pre-accept task-format repair context (optional)
 ///
 /// # Note
 ///
 /// The acceptance_tail_context should be built using `build_last_acceptance_output_context`
 /// and should only be provided for the first apply attempt after acceptance failure.
+/// The task_format_context should be built using `build_task_format_repair_context`
+/// from the workspace-local `tasks.md` diagnostics.
 #[allow(dead_code)]
 pub fn build_apply_prompt(
     change_id: &str,
     user_prompt: &str,
     history_context: &str,
     acceptance_tail_context: &str,
+    task_format_context: &str,
 ) -> String {
     build_apply_prompt_with_skill(
         crate::config::defaults::DEFAULT_APPLY_SKILL,
@@ -53,6 +57,7 @@ pub fn build_apply_prompt(
         user_prompt,
         history_context,
         acceptance_tail_context,
+        task_format_context,
     )
 }
 
@@ -62,6 +67,7 @@ pub fn build_apply_prompt_with_skill(
     user_prompt: &str,
     history_context: &str,
     acceptance_tail_context: &str,
+    task_format_context: &str,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -76,6 +82,12 @@ pub fn build_apply_prompt_with_skill(
 
     parts.push(APPLY_SYSTEM_PROMPT.to_string());
 
+    // The pre-accept task-format repair blocks acceptance, so it precedes the
+    // historical context an attempt may otherwise act on first.
+    if !task_format_context.is_empty() {
+        parts.push(task_format_context.to_string());
+    }
+
     if !acceptance_tail_context.is_empty() {
         parts.push(acceptance_tail_context.to_string());
     }
@@ -85,6 +97,55 @@ pub fn build_apply_prompt_with_skill(
     }
 
     parts.join("\n\n")
+}
+
+/// Maximum number of task-format diagnostics carried into the repair prompt.
+/// Enough to identify the malformed region without flooding the prompt.
+const MAX_TASK_FORMAT_DIAGNOSTICS: usize = 20;
+
+/// Build the pre-accept task-format repair context for the next apply attempt.
+///
+/// The diagnostics are produced by the native validator from the workspace-local
+/// `tasks.md`, so they are re-derived from repository state on every attempt and
+/// survive a restart without durable runtime state. Returns an empty string when
+/// the task format is valid.
+pub fn build_task_format_repair_context(diagnostics: &[String]) -> String {
+    let findings: Vec<&String> = diagnostics
+        .iter()
+        .filter(|diagnostic| !diagnostic.trim().is_empty())
+        .collect();
+    if findings.is_empty() {
+        return String::new();
+    }
+
+    let shown = findings.len().min(MAX_TASK_FORMAT_DIAGNOSTICS);
+    let mut body = String::new();
+    for diagnostic in findings.iter().take(shown) {
+        body.push_str("- ");
+        body.push_str(diagnostic.trim());
+        body.push('\n');
+    }
+    if findings.len() > shown {
+        body.push_str(&format!(
+            "- ... and {} more task-format finding(s)\n",
+            findings.len() - shown
+        ));
+    }
+
+    format!(
+        "<task_format_repair_required>\n\
+         Task progress is complete but `tasks.md` fails the task-format contract, so acceptance has not started. \
+         Repair the reported lines before doing anything else, and preserve every completed implementation evidence claim.\n\
+         \n\
+         Findings (file:line from the native validator):\n\
+         {body}\n\
+         Repair rules:\n\
+         - Active task sections may only contain checkbox tasks (`- [ ]` / `- [x]`). Move narrative or evidence bullets out of them.\n\
+         - Narrative non-task sections (Final Validation, Implementation Blocker, Future Work, Out of Scope, Notes, Acceptance Notes) hold prose and non-checkbox bullets, and must not contain checkboxes.\n\
+         - Inside the runtime-owned acceptance follow-up, one-line evidence uses exactly `  evidence: <one-line evidence>`; never `- evidence:`.\n\
+         - Do not uncheck completed tasks or delete their evidence to satisfy the format.\n\
+         </task_format_repair_required>"
+    )
 }
 
 /// Build archive prompt from the selected skill prelude, variable metadata,
@@ -951,7 +1012,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_operation_prompts_leave_fixed_guidance_to_skills() {
-        let apply = build_apply_prompt("change-123", "", "", "");
+        let apply = build_apply_prompt("change-123", "", "", "", "");
         let archive = build_archive_prompt("change-123", "", "");
         let acceptance = build_acceptance_prompt("change-123", "", "", "", "", "");
         let cleanup = build_cleanup_review_prompt("change-123");
@@ -969,7 +1030,7 @@ pub(crate) mod tests {
     #[test]
     fn test_operation_prompt_builders_use_custom_skill_preludes() {
         let apply =
-            build_apply_prompt_with_skill("team-apply", "change-123", "user", "history", "");
+            build_apply_prompt_with_skill("team-apply", "change-123", "user", "history", "", "");
         assert!(apply.contains("$team-apply"));
         assert!(apply.contains("load skills: team-apply"));
         assert!(!apply.contains("$cflx-apply"));
