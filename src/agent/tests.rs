@@ -124,7 +124,7 @@ async fn test_with_runner_paths_preserve_prompt_and_output() {
     assert!(archive_output.contains("archive:change-1"));
 
     let (mut acceptance_child, mut acceptance_rx, _acceptance_start, acceptance_command) = runner
-        .run_acceptance_streaming_with_runner("change-1", &ai_runner, None, None)
+        .run_acceptance_streaming_with_runner("change-1", &ai_runner, None, None, None)
         .await
         .unwrap();
     let mut acceptance_output = String::new();

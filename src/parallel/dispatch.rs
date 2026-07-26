@@ -21,7 +21,8 @@ use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
 use crate::orchestration::acceptance::{
     decide_acceptance_retry, normalize_findings, semantic_progress_fingerprint,
-    AcceptanceRetryDecision, MAX_ACCEPTANCE_RETRY_CYCLES,
+    AcceptanceRetryDecision, MissingVerdictRetryDriver, MissingVerdictRetryStep,
+    MAX_ACCEPTANCE_RETRY_CYCLES,
 };
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
@@ -1049,6 +1050,12 @@ impl ParallelExecutor {
             // Retry context lives in memory for this dispatch only: a restarted
             // process re-runs acceptance instead of resuming a prior verdict.
             let mut acceptance_retry = AcceptanceRetryContext::default();
+            // Consecutive missing-verdict accounting for this active run only,
+            // shared with serial orchestration. It is independent from the
+            // configured explicit-CONTINUE budget and is never persisted, so a
+            // restart re-runs acceptance from workspace state instead of
+            // resuming a protocol-retry sequence.
+            let mut protocol = MissingVerdictRetryDriver::default();
             let mut cycle_count = 0u32;
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
@@ -1806,9 +1813,21 @@ impl ParallelExecutor {
                         &acceptance_tail_injected,
                         &acceptance_history,
                         Some(base_branch.as_str()),
+                        protocol.take_protocol_retry(),
                     )
                     .await
                 };
+
+                // Any canonical verdict ends the consecutive missing-verdict
+                // sequence; its own routing below is unchanged. Command failure
+                // and cancellation are not verdicts and are never reclassified
+                // as a missing-verdict retry.
+                if acceptance_result
+                    .as_ref()
+                    .is_ok_and(|(result, _)| result.is_canonical_verdict())
+                {
+                    protocol.observe_canonical_verdict();
+                }
 
                 match acceptance_result {
                     Ok((crate::orchestration::AcceptanceResult::Pass, _acceptance_iteration)) => {
@@ -2097,48 +2116,60 @@ impl ParallelExecutor {
                     )) => {
                         // The acceptance command completed without a canonical
                         // verdict. This is a protocol failure distinct from an
-                        // explicit CONTINUE: it does not touch the CONTINUE
-                        // retry counter and does not silently loop.
-                        let evidence = findings
-                            .iter()
-                            .take(5)
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" | ");
-                        let error = format!(
-                            "Acceptance completed without a canonical verdict (missing-verdict \
-                             protocol failure); status-only or waiting output is not a verdict. \
-                             Evidence: {}",
-                            if evidence.is_empty() {
-                                "no acceptance output captured".to_string()
-                            } else {
-                                evidence
+                        // explicit CONTINUE: it uses its own bounded retry budget
+                        // and never touches the CONTINUE retry counter.
+                        match protocol.observe_missing_verdict(&findings) {
+                            MissingVerdictRetryStep::Retry { progress, .. } => {
+                                warn!(
+                                    "Missing acceptance verdict for {} (cycle {}): {}",
+                                    change_id, cycle_count, progress
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::info(format!(
+                                                "{} (cycle {})",
+                                                progress, cycle_count
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                // Re-run the normal configured acceptance command
+                                // with continuation context; apply is not repeated
+                                // because the implementation itself did not fail.
+                                skip_apply_once = true;
+                                continue;
                             }
-                        );
-                        error!(
-                            "Missing acceptance verdict for {} (cycle {}): {}",
-                            change_id, cycle_count, error
-                        );
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(ParallelEvent::Log(
-                                    LogEntry::error(format!(
-                                        "Missing acceptance verdict (cycle {}): {}",
-                                        cycle_count, error
-                                    ))
-                                    .with_change_id(&change_id)
-                                    .with_operation("acceptance")
-                                    .with_iteration(acceptance_iteration),
-                                ))
-                                .await;
+                            MissingVerdictRetryStep::Exhausted { error } => {
+                                error!(
+                                    "Missing acceptance verdict for {} (cycle {}): {}",
+                                    change_id, cycle_count, error
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::error(format!(
+                                                "Missing acceptance verdict (cycle {}): {}",
+                                                cycle_count, error
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(error),
+                                    rejected: None,
+                                };
+                            }
                         }
-                        return WorkspaceResult {
-                            change_id,
-                            workspace_name: workspace.name,
-                            final_revision: None,
-                            error: Some(error),
-                            rejected: None,
-                        };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::Gated,

@@ -13,6 +13,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::history::{
     AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory, OutputCollector,
 };
+use crate::orchestration::acceptance::MissingVerdictRetry;
 use crate::process_manager::{ManagedChild, StreamingChildHandle};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -677,6 +678,7 @@ impl AgentRunner {
         change_id: &str,
         cwd: Option<&Path>,
         base_branch: Option<&str>,
+        protocol_retry: Option<MissingVerdictRetry>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         let start = Instant::now();
         let template = self.config.get_acceptance_command()?;
@@ -694,6 +696,12 @@ impl AgentRunner {
         let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
         let last_output_context =
             build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
+        let protocol_retry_context = self.build_missing_verdict_continuation_context(
+            change_id,
+            protocol_retry,
+            stdout_tail.as_deref(),
+            stderr_tail.as_deref(),
+        );
 
         // Build prompt injected into `{prompt}`
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
@@ -706,6 +714,7 @@ impl AgentRunner {
                 &history_context,
                 &last_output_context,
                 &diff_context,
+                &protocol_retry_context,
             ),
             crate::config::AcceptancePromptMode::ContextOnly => {
                 build_acceptance_prompt_context_only_with_skill(
@@ -715,6 +724,7 @@ impl AgentRunner {
                     &history_context,
                     &last_output_context,
                     &diff_context,
+                    &protocol_retry_context,
                 )
             }
         };
@@ -760,6 +770,7 @@ impl AgentRunner {
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
         base_branch: Option<&str>,
+        protocol_retry: Option<MissingVerdictRetry>,
     ) -> Result<(
         StreamingChildHandle,
         mpsc::Receiver<OutputLine>,
@@ -782,6 +793,12 @@ impl AgentRunner {
         let stderr_tail = self.acceptance_history.last_stderr_tail(change_id);
         let last_output_context =
             build_last_acceptance_output_context(stdout_tail.as_deref(), stderr_tail.as_deref());
+        let protocol_retry_context = self.build_missing_verdict_continuation_context(
+            change_id,
+            protocol_retry,
+            stdout_tail.as_deref(),
+            stderr_tail.as_deref(),
+        );
 
         // Build prompt injected into `{prompt}`
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
@@ -794,6 +811,7 @@ impl AgentRunner {
                 &history_context,
                 &last_output_context,
                 &diff_context,
+                &protocol_retry_context,
             ),
             crate::config::AcceptancePromptMode::ContextOnly => {
                 build_acceptance_prompt_context_only_with_skill(
@@ -803,6 +821,7 @@ impl AgentRunner {
                     &history_context,
                     &last_output_context,
                     &diff_context,
+                    &protocol_retry_context,
                 )
             }
         };
@@ -822,6 +841,30 @@ impl AgentRunner {
         let rx = bridge_ai_output_channel(ai_rx);
 
         Ok((child, rx, start, command))
+    }
+
+    /// Build the missing-verdict continuation context for a protocol retry.
+    ///
+    /// Returns an empty string for ordinary acceptance invocations, so the
+    /// corrective instruction appears only when the previous attempt exited
+    /// without a canonical verdict.
+    fn build_missing_verdict_continuation_context(
+        &self,
+        change_id: &str,
+        protocol_retry: Option<MissingVerdictRetry>,
+        stdout_tail: Option<&str>,
+        stderr_tail: Option<&str>,
+    ) -> String {
+        let Some(retry) = protocol_retry else {
+            return String::new();
+        };
+        let previous_findings = self.acceptance_history.last_findings(change_id);
+        super::prompt::build_missing_verdict_continuation_context(
+            retry,
+            stdout_tail,
+            stderr_tail,
+            previous_findings.as_deref(),
+        )
     }
 
     /// Build acceptance diff context for all acceptance attempts.

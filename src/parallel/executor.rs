@@ -1254,6 +1254,7 @@ pub async fn execute_acceptance_in_workspace(
     acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
     acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
     base_branch: Option<&str>,
+    protocol_retry: Option<crate::orchestration::acceptance::MissingVerdictRetry>,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1348,6 +1349,16 @@ pub async fn execute_acceptance_in_workspace(
         stdout_tail.as_deref(),
         stderr_tail.as_deref(),
     );
+    // Only a missing-verdict protocol retry carries the corrective continuation
+    // block; ordinary acceptance invocations leave it empty.
+    let protocol_retry_context = protocol_retry.map_or_else(String::new, |retry| {
+        crate::agent::build_missing_verdict_continuation_context(
+            retry,
+            stdout_tail.as_deref(),
+            stderr_tail.as_deref(),
+            agent.get_last_acceptance_findings(change_id).as_deref(),
+        )
+    });
 
     // Build prompt injected into `{prompt}`
     let full_prompt = crate::agent::append_optional_prompt(
@@ -1360,6 +1371,7 @@ pub async fn execute_acceptance_in_workspace(
                     &history_context,
                     &last_output_context,
                     &diff_context,
+                    &protocol_retry_context,
                 )
             }
             crate::config::AcceptancePromptMode::ContextOnly => {
@@ -1370,6 +1382,7 @@ pub async fn execute_acceptance_in_workspace(
                     &history_context,
                     &last_output_context,
                     &diff_context,
+                    &protocol_retry_context,
                 )
             }
         },
@@ -1814,9 +1827,11 @@ pub async fn execute_acceptance_in_workspace(
             acceptance_tail_injected.lock().await.remove(change_id);
 
             if let Some(ref tx) = event_tx {
+                // Non-terminal here: the caller owns the protocol-retry budget and
+                // emits either retry progress or the terminal exhaustion error.
                 let _ = tx
                     .send(ParallelEvent::Log(
-                        crate::events::LogEntry::error(
+                        crate::events::LogEntry::warn(
                             "Acceptance completed without a canonical verdict (missing-verdict \
                              protocol failure); status-only or waiting output is not a verdict. \
                              The acceptance agent must wait for owned verification results and \

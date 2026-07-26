@@ -21,8 +21,9 @@ use crate::execution::apply as common_apply;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::acceptance::{
-    decide_acceptance_retry, normalize_findings, repository_findings,
-    semantic_progress_fingerprint, AcceptanceRetryDecision,
+    decide_acceptance_retry, missing_verdict_exhausted_error, normalize_findings,
+    repository_findings, semantic_progress_fingerprint, AcceptanceRetryDecision,
+    MissingVerdictRetryDriver, MissingVerdictRetryStep, MAX_MISSING_VERDICT_RETRIES,
 };
 use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
@@ -580,30 +581,57 @@ impl SerialRunService {
                     // Update operation to "acceptance" before running acceptance test
                     Self::update_operation_tracker(&operation_tracker, "acceptance");
 
-                    // Run acceptance test
-                    match acceptance_test_streaming(
-                        &updated_change,
-                        agent,
-                        ai_runner,
-                        &self.config,
-                        output,
-                        cancel_check,
-                    )
-                    .await
-                    {
-                        Ok((result, _attempt_number, _command)) => {
-                            let repo_root = self.repo_root.clone();
-                            Ok(self.process_acceptance_result(
-                                &change.id,
-                                &repo_root,
-                                agent,
-                                result,
-                                is_single_change_stopped,
-                            ))
-                        }
-                        Err(e) => {
-                            error!("Acceptance error for {}: {}", change.id, e);
-                            Err(e)
+                    // Run acceptance test. A completed command with no canonical
+                    // verdict is a protocol failure, so re-invoke the normal
+                    // configured acceptance command with continuation context
+                    // while the shared missing-verdict budget remains. That
+                    // budget is active-run memory only and never touches the
+                    // configured explicit-CONTINUE budget.
+                    let mut protocol = MissingVerdictRetryDriver::default();
+                    loop {
+                        match acceptance_test_streaming(
+                            &updated_change,
+                            agent,
+                            ai_runner,
+                            &self.config,
+                            output,
+                            cancel_check,
+                            protocol.take_protocol_retry(),
+                        )
+                        .await
+                        {
+                            Ok((
+                                AcceptanceResult::MissingVerdict { findings },
+                                _attempt_number,
+                                _command,
+                            )) => match protocol.observe_missing_verdict(&findings) {
+                                MissingVerdictRetryStep::Retry { progress, .. } => {
+                                    warn!("{} for {}", progress, change.id);
+                                    output.on_warn(&progress);
+                                    continue;
+                                }
+                                MissingVerdictRetryStep::Exhausted { error } => {
+                                    error!("{} for {}", error, change.id);
+                                    break Ok(ChangeProcessResult::AcceptanceCommandFailed {
+                                        error,
+                                    });
+                                }
+                            },
+                            Ok((result, _attempt_number, _command)) => {
+                                protocol.observe_canonical_verdict();
+                                let repo_root = self.repo_root.clone();
+                                break Ok(self.process_acceptance_result(
+                                    &change.id,
+                                    &repo_root,
+                                    agent,
+                                    result,
+                                    is_single_change_stopped,
+                                ));
+                            }
+                            Err(e) => {
+                                error!("Acceptance error for {}: {}", change.id, e);
+                                break Err(e);
+                            }
                         }
                     }
                 }
@@ -889,24 +917,14 @@ impl SerialRunService {
             }
             AcceptanceResult::MissingVerdict { findings } => {
                 // A completed acceptance command with no canonical verdict is a
-                // protocol failure, not an intentional CONTINUE. Route it as a
-                // command-level failure so it never consumes the explicit
-                // CONTINUE retry budget, and keep bounded output evidence in
-                // the operator-visible diagnostic.
-                let evidence = findings
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let error = format!(
-                    "Acceptance completed without a canonical verdict (missing-verdict protocol \
-                     failure); status-only or waiting output is not a verdict. Evidence: {}",
-                    if evidence.is_empty() {
-                        "no acceptance output captured".to_string()
-                    } else {
-                        evidence
-                    }
+                // protocol failure, not an intentional CONTINUE. The acceptance
+                // retry loop owns the dedicated protocol budget and only reaches
+                // terminal routing after exhaustion, so this arm reports the
+                // exhausted diagnostic with bounded output evidence.
+                let error = missing_verdict_exhausted_error(
+                    MAX_MISSING_VERDICT_RETRIES.saturating_add(1),
+                    MAX_MISSING_VERDICT_RETRIES,
+                    &findings,
                 );
                 error!("{} for {}", error, change_id);
                 ChangeProcessResult::AcceptanceCommandFailed { error }
@@ -1315,6 +1333,211 @@ mod tests {
         .is_none());
     }
 
+    /// Configure a stateful fake acceptance command that withholds a canonical
+    /// verdict for its first `missing_attempts` invocations, then emits
+    /// `ACCEPTANCE: PASS`. It is the ordinary configured acceptance command on
+    /// every invocation — no harness session, resume flag, or job identifier.
+    fn serial_missing_verdict_config(
+        change_id: &str,
+        state_dir: &std::path::Path,
+        missing_attempts: u32,
+    ) -> OrchestratorConfig {
+        let counter = state_dir.join("attempts").display().to_string();
+        let prompts = state_dir.join("prompts").display().to_string();
+        std::fs::create_dir_all(state_dir.join("prompts")).unwrap();
+        OrchestratorConfig {
+            acceptance_command: Some(format!(
+                "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"{counter}\"; printf \"%s\" \"$0\" > \"{prompts}/attempt-$n.txt\"; \
+                 if [ $n -gt {missing_attempts} ]; then echo \"ACCEPTANCE: PASS\"; \
+                 else echo \"Monitoring verification, waiting for the owned job to finish\"; fi' \
+                 {{prompt}}"
+            )),
+            ..serial_failing_acceptance_config(change_id)
+        }
+    }
+
+    fn serial_acceptance_invocations(state_dir: &std::path::Path) -> u32 {
+        std::fs::read_to_string(state_dir.join("attempts"))
+            .map(|text| text.trim().parse().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    fn serial_acceptance_prompt(state_dir: &std::path::Path, attempt: u32) -> String {
+        std::fs::read_to_string(
+            state_dir
+                .join("prompts")
+                .join(format!("attempt-{attempt}.txt")),
+        )
+        .unwrap_or_default()
+    }
+
+    async fn run_serial_missing_verdict_change(
+        temp_dir: &std::path::Path,
+        state_dir: &std::path::Path,
+        change_id: &str,
+        missing_attempts: u32,
+    ) -> ChangeProcessResult {
+        let config = serial_missing_verdict_config(change_id, state_dir, missing_attempts);
+        let mut service = SerialRunService::new(temp_dir.to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                &mut agent,
+                &ai_runner,
+                &HookRunner::new(HooksConfig::default(), temp_dir),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Serial parity with parallel: a status-only acceptance exit re-runs the
+    /// normal configured acceptance command with continuation context, and a
+    /// later canonical PASS keeps its existing routing.
+    #[tokio::test]
+    async fn serial_missing_verdict_retries_then_passes() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-missing-verdict-pass";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let result =
+            run_serial_missing_verdict_change(temp_dir.path(), state_dir.path(), change_id, 2)
+                .await;
+
+        assert!(
+            matches!(result, ChangeProcessResult::AcceptancePassed),
+            "a canonical PASS after protocol retries must route as AcceptancePassed, got {result:?}"
+        );
+        assert_eq!(
+            serial_acceptance_invocations(state_dir.path()),
+            3,
+            "the initial attempt plus two protocol retries must run the acceptance command"
+        );
+
+        assert!(
+            !serial_acceptance_prompt(state_dir.path(), 1).contains("<acceptance_protocol_retry>"),
+            "the initial attempt must not receive corrective retry context"
+        );
+        for attempt in [2, 3] {
+            let prompt = serial_acceptance_prompt(state_dir.path(), attempt);
+            assert!(
+                prompt.contains("<acceptance_protocol_retry>"),
+                "retry {attempt} must carry the continuation context"
+            );
+            assert!(prompt.contains("emit exactly one canonical verdict"));
+            assert!(
+                prompt.contains("Monitoring verification"),
+                "retry {attempt} must carry bounded prior acceptance output"
+            );
+            let lower = prompt.to_ascii_lowercase();
+            for forbidden in ["session_id", "--resume", "job_id"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "continuation must stay harness neutral, found `{forbidden}`"
+                );
+            }
+        }
+
+        assert!(
+            !temp_dir.path().join("ACCEPTANCE_REPORT.json").exists(),
+            "protocol retries must not create an acceptance report artifact"
+        );
+    }
+
+    /// Three consecutive missing verdicts exhaust the dedicated budget and
+    /// become the terminal protocol failure.
+    #[tokio::test]
+    async fn serial_missing_verdict_exhaustion_is_terminal() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-missing-verdict-exhausted";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let result = run_serial_missing_verdict_change(
+            temp_dir.path(),
+            state_dir.path(),
+            change_id,
+            u32::MAX,
+        )
+        .await;
+
+        match result {
+            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+                assert!(error.contains("missing-verdict protocol failure"));
+                assert!(error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"));
+                assert!(
+                    error.contains("Monitoring verification"),
+                    "terminal diagnostic must retain bounded evidence, got: {error}"
+                );
+            }
+            other => panic!("exhausted protocol retries must be terminal, got {other:?}"),
+        }
+        assert_eq!(
+            serial_acceptance_invocations(state_dir.path()),
+            3,
+            "no fourth protocol retry may start"
+        );
+        assert!(!temp_dir.path().join("ACCEPTANCE_REPORT.json").exists());
+    }
+
+    /// Constitutional restart behavior: the protocol counter is active-run
+    /// memory, so a fresh run re-runs acceptance with a full budget and cannot
+    /// infer PASS from the previous run's narrative output.
+    #[tokio::test]
+    async fn serial_restart_reruns_acceptance_after_missing_verdict_exhaustion() {
+        let temp_dir = TempDir::new().unwrap();
+        let change_id = "serial-missing-verdict-restart";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let first_state = TempDir::new().unwrap();
+        let first = run_serial_missing_verdict_change(
+            temp_dir.path(),
+            first_state.path(),
+            change_id,
+            u32::MAX,
+        )
+        .await;
+        assert!(matches!(
+            first,
+            ChangeProcessResult::AcceptanceCommandFailed { .. }
+        ));
+        assert_eq!(serial_acceptance_invocations(first_state.path()), 3);
+
+        // A fresh service/agent owns no prior runtime state.
+        let second_state = TempDir::new().unwrap();
+        let second = run_serial_missing_verdict_change(
+            temp_dir.path(),
+            second_state.path(),
+            change_id,
+            u32::MAX,
+        )
+        .await;
+
+        assert!(
+            matches!(second, ChangeProcessResult::AcceptanceCommandFailed { .. }),
+            "an unarchived change must not be treated as accepted from prior output, got {second:?}"
+        );
+        assert_eq!(
+            serial_acceptance_invocations(second_state.path()),
+            3,
+            "a restarted run must re-run acceptance with a full, fresh protocol budget"
+        );
+        assert!(
+            !temp_dir.path().join(".cflx/acceptance-state.json").exists(),
+            "protocol retries must not create a durable acceptance checkpoint"
+        );
+    }
+
     #[test]
     fn serial_acceptance_pass_hands_off_in_memory_without_writing_a_checkpoint() {
         let temp_dir = TempDir::new().unwrap();
@@ -1441,6 +1664,10 @@ mod tests {
                 assert!(
                     error.contains("missing-verdict protocol failure"),
                     "diagnostic must identify the missing verdict, got: {error}"
+                );
+                assert!(
+                    error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"),
+                    "terminal routing must report the exhausted attempts, got: {error}"
                 );
                 assert!(
                     error.contains("Monitoring verification, will report when complete"),
