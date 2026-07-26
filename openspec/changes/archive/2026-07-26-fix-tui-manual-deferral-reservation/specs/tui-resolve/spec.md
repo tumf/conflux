@@ -1,8 +1,4 @@
-## Purpose
-
-TUI における resolve 操作のライフサイクル（自動トリガー、直列化、キューイング）を定義し、resolve 操作同士の排他制御と apply/accept/archive パイプラインの非ブロック保証を規定する。
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: auto-resumable-merge-deferred-triggers-resolve
 
@@ -96,30 +92,3 @@ When a manual merge retry starts through the resolve lifecycle and the successfu
 **Then**: the TUI starts or schedules manual retry work
 **And**: the TUI does not log successful zero-change completion while `ResolveWait(alpha)` remains in shared reducer state
 **And**: `alpha` eventually becomes `resolving`, `merged`, `merge wait` with visible reason, or explicit error/stalled state
-
-### Requirement: resolve-merge-exclusive-execution
-
-When a user requests merge resolution (`M` key) on a `MergeWait` change while another resolve is in progress, the change must transition to `ResolveWait` and remain in that state until the resolve is actually started or explicitly cancelled. The transition must be synchronized to both the TUI-local state and the shared orchestrator reducer.
-
-A queued resolve MUST be advanced when the active resolve lifecycle completes through either `ResolveCompleted` or `MergeCompleted`, because parallel manual merge retry reports successful repository integration with `MergeCompleted`.
-
-<!-- Expected canonical result after archive: `tui-resolve-queue` will specify that queued resolve advancement is triggered by both ResolveCompleted and MergeCompleted success events when they close an active resolve lifecycle. -->
-
-#### Scenario: queued-resolve-survives-refresh
-
-**Given**: Change A is in `Resolving` state and Change B is in `MergeWait` state in the TUI
-**When**: The user presses `M` on Change B, then a `ChangesRefreshed` event fires with Change B's workspace still in `Archived` state
-**Then**: Change B remains in `ResolveWait` ("resolve pending") in both the TUI display and the shared reducer state
-
-#### Scenario: queued-resolve-eventually-executes
-
-**Given**: Change B has been queued for resolve via `M` key while Change A was resolving
-**When**: Change A's resolve completes
-**Then**: Change B's resolve is started from the queue
-
-#### Scenario: queued-resolve-advances-after-merge-completed
-
-**Given**: Change A was started from the TUI resolve lifecycle and has Change B queued behind it
-**When**: Change A emits `MergeCompleted` instead of `ResolveCompleted`
-**Then**: Change B's resolve retry command is emitted from the queue
-**And**: Change B does not remain indefinitely in `resolve pending` because the prior resolve lifecycle ended with a merge completion event

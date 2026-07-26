@@ -1275,35 +1275,77 @@ fn log_navigation_hint() -> &'static str {
     "PgUp/PgDn: older/newer Home/End: oldest/newest l: hide"
 }
 
-fn logs_panel_title(
+/// Full selected-proposal filter hint, naming the active target when known.
+fn selected_proposal_filter_hint(filter_enabled: bool, filter_target: Option<&str>) -> String {
+    match (filter_enabled, filter_target) {
+        (false, _) => compact_selected_proposal_filter_hint(false).to_string(),
+        (true, Some(target)) => format!("f: filter={}", target),
+        (true, None) => compact_selected_proposal_filter_hint(true).to_string(),
+    }
+}
+
+/// Width-constrained equivalent: keeps the `f` key and the off/on meaning.
+fn compact_selected_proposal_filter_hint(filter_enabled: bool) -> &'static str {
+    if filter_enabled {
+        "f: filter on"
+    } else {
+        "f: filter off"
+    }
+}
+
+/// Inputs the Logs panel title is derived from.
+///
+/// All line/range values are already computed from the filtered entry set.
+struct LogsPanelTitle<'a> {
     log_scroll_offset: usize,
     log_auto_scroll: bool,
     total_display_lines: usize,
     visible_height: usize,
     start_line: usize,
     end_line: usize,
-) -> String {
-    let auto_scroll_indicator = if log_auto_scroll { "▼" } else { "⏸" };
+    filter_enabled: bool,
+    filter_target: Option<&'a str>,
+    panel_width: usize,
+}
+
+fn logs_panel_title(params: LogsPanelTitle<'_>) -> String {
+    let auto_scroll_indicator = if params.log_auto_scroll { "▼" } else { "⏸" };
     let help = log_navigation_hint();
 
-    if total_display_lines > visible_height {
-        let visible_start = start_line + 1;
-        let visible_end = end_line;
-        format!(
-            " Logs [{}-{}/{}] logs_off={} {} ({}) ",
-            visible_start,
-            visible_end,
-            total_display_lines,
-            log_scroll_offset,
-            auto_scroll_indicator,
-            help
-        )
-    } else {
-        format!(
-            " Logs logs_off={} {} ({}) ",
-            log_scroll_offset, auto_scroll_indicator, help
-        )
+    let build = |filter_hint: &str| {
+        if params.total_display_lines > params.visible_height {
+            let visible_start = params.start_line + 1;
+            let visible_end = params.end_line;
+            format!(
+                " Logs [{}-{}/{}] logs_off={} {} ({} | {}) ",
+                visible_start,
+                visible_end,
+                params.total_display_lines,
+                params.log_scroll_offset,
+                auto_scroll_indicator,
+                filter_hint,
+                help
+            )
+        } else {
+            format!(
+                " Logs logs_off={} {} ({} | {}) ",
+                params.log_scroll_offset, auto_scroll_indicator, filter_hint, help
+            )
+        }
+    };
+
+    let title = build(&selected_proposal_filter_hint(
+        params.filter_enabled,
+        params.filter_target,
+    ));
+
+    // Fall back to the compact wording when naming the target would push the
+    // title past the panel width; the key and the off/on meaning are preserved.
+    if params.panel_width > 0 && title.chars().count() > params.panel_width {
+        return build(compact_selected_proposal_filter_hint(params.filter_enabled));
     }
+
+    title
 }
 
 fn wrap_log_message(
@@ -1388,9 +1430,13 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
         message_style: Style,
     }
 
+    // Select the visible entry set BEFORE any wrapping, line counting, visible
+    // range, or scroll math so every downstream calculation is derived from the
+    // filtered set (including the zero-match case). `app.logs` is never mutated.
     let rendered_logs: Vec<RenderedLog> = app
         .logs
         .iter()
+        .filter(|entry| app.log_entry_visible_for_selected_proposal_filter(entry))
         .map(|entry| {
             let timestamp = format!("{} ", entry.timestamp);
             let timestamp_style = Style::default().fg(Color::DarkGray);
@@ -1519,14 +1565,17 @@ fn render_logs(frame: &mut Frame, app: &AppState, area: Rect) {
     }
 
     // Build title with scroll position indicator, auto-scroll status, and compact navigation help.
-    let title = logs_panel_title(
-        app.log_scroll_offset,
-        app.log_auto_scroll,
+    let title = logs_panel_title(LogsPanelTitle {
+        log_scroll_offset: app.log_scroll_offset,
+        log_auto_scroll: app.log_auto_scroll,
         total_display_lines,
         visible_height,
         start_line,
         end_line,
-    );
+        filter_enabled: app.selected_proposal_log_filter,
+        filter_target: app.selected_proposal_log_filter_target(),
+        panel_width: area.width as usize,
+    });
 
     // Do NOT use Paragraph::wrap - we handle wrapping manually
     let logs = Paragraph::new(log_items).block(
@@ -3117,9 +3166,177 @@ mod tests {
         );
     }
 
+    /// Extract only the Logs panel rows from a rendered frame.
+    ///
+    /// Change rows carry their own per-change log preview, so whole-buffer
+    /// assertions cannot distinguish Logs-panel content from list previews.
+    fn logs_panel_content(buffer: &Buffer) -> String {
+        let title_row = find_row_containing(buffer, "f: filter").expect("logs panel title row");
+        let mut lines = Vec::new();
+        for y in title_row..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                line.push_str(buffer[(x, y)].symbol());
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+
+    /// Changes-view app with alpha/beta proposal logs plus one unscoped entry.
+    fn mixed_proposal_log_app() -> AppState {
+        let mut app = create_test_app(vec![
+            create_test_change("alpha"),
+            create_test_change("beta"),
+        ]);
+        app.mode = AppMode::Running;
+        app.add_log(LogEntry::info("alpha-apply-output").with_change_id("alpha"));
+        app.add_log(LogEntry::info("beta-apply-output").with_change_id("beta"));
+        app.add_log(LogEntry::info("global-orchestration-output"));
+        app
+    }
+
+    #[test]
+    fn logs_panel_shows_all_entries_while_filter_is_disabled() {
+        let mut app = mixed_proposal_log_app();
+
+        let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+
+        assert!(content.contains("alpha-apply-output"));
+        assert!(content.contains("beta-apply-output"));
+        assert!(content.contains("global-orchestration-output"));
+    }
+
+    #[test]
+    fn logs_panel_shows_only_cursor_proposal_entries_while_filter_is_enabled() {
+        let mut app = mixed_proposal_log_app();
+        app.toggle_selected_proposal_log_filter();
+
+        let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+
+        assert!(content.contains("alpha-apply-output"));
+        assert!(!content.contains("beta-apply-output"));
+        assert!(!content.contains("global-orchestration-output"));
+        // The buffer is untouched; only the visible set changed.
+        assert_eq!(app.logs.len(), 3);
+    }
+
+    #[test]
+    fn logs_panel_filter_follows_cursor_movement() {
+        let mut app = mixed_proposal_log_app();
+        app.toggle_selected_proposal_log_filter();
+        app.cursor_down();
+
+        let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+
+        assert!(content.contains("beta-apply-output"));
+        assert!(!content.contains("alpha-apply-output"));
+    }
+
+    #[test]
+    fn logs_panel_filter_hides_global_only_buffers_without_panicking() {
+        let mut app = create_test_app(vec![create_test_change("alpha")]);
+        app.mode = AppMode::Running;
+        app.add_log(LogEntry::info("global-orchestration-output"));
+        app.toggle_selected_proposal_log_filter();
+
+        let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+
+        assert!(!content.contains("global-orchestration-output"));
+        assert!(content.contains("f: filter"));
+        assert_eq!(app.logs.len(), 1);
+    }
+
+    #[test]
+    fn logs_panel_filter_renders_zero_matches_from_the_filtered_line_counts() {
+        let mut app = mixed_proposal_log_app();
+        // Many unrelated entries would overflow the panel if counted.
+        for index in 0..80 {
+            app.add_log(LogEntry::info(format!("beta-noise-{index}")).with_change_id("beta"));
+        }
+        app.logs
+            .retain(|entry| entry.change_id.as_deref() != Some("alpha"));
+        app.toggle_selected_proposal_log_filter();
+        app.log_scroll_offset = 40;
+
+        let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+
+        assert!(!content.contains("beta-noise-"));
+        assert!(!content.contains("global-orchestration-output"));
+        // Ranges are computed from the empty filtered set, so no range is shown.
+        assert!(!content.contains("Logs ["));
+        assert!(content.contains("f: filter=alpha"));
+    }
+
+    #[test]
+    fn logs_panel_filter_scroll_bounds_use_the_filtered_entry_set() {
+        let mut app = create_test_app(vec![
+            create_test_change("alpha"),
+            create_test_change("beta"),
+        ]);
+        app.mode = AppMode::Running;
+        for index in 0..40 {
+            app.add_log(LogEntry::info(format!("beta-noise-{index}")).with_change_id("beta"));
+        }
+        for index in 0..6 {
+            app.add_log(LogEntry::info(format!("alpha-line-{index}")).with_change_id("alpha"));
+        }
+        app.toggle_selected_proposal_log_filter();
+
+        let content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+
+        // Six matching single-line entries fit, so no scroll range is rendered
+        // even though the unfiltered buffer is far larger than the panel.
+        assert!(!content.contains("Logs ["));
+        assert!(content.contains("alpha-line-0"));
+        assert!(content.contains("alpha-line-5"));
+        assert!(!content.contains("beta-noise-"));
+    }
+
+    #[test]
+    fn logs_panel_buffer_shows_filter_key_and_state() {
+        let mut app = mixed_proposal_log_app();
+
+        let off_content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+        assert!(off_content.contains("f: filter off"));
+
+        app.toggle_selected_proposal_log_filter();
+        let on_content = logs_panel_content(&render_buffer(&mut app, 140, 24));
+        assert!(on_content.contains("f: filter=alpha"));
+        // Existing navigation guidance is not regressed by the new hint.
+        assert!(on_content.contains("PgUp/PgDn"));
+        assert!(on_content.contains("Home/End"));
+        assert!(on_content.contains("l: hide"));
+    }
+
+    /// Title params for a panel that fits its content on screen.
+    fn title_params(filter_enabled: bool, filter_target: Option<&str>) -> LogsPanelTitle<'_> {
+        LogsPanelTitle {
+            log_scroll_offset: 0,
+            log_auto_scroll: true,
+            total_display_lines: 4,
+            visible_height: 10,
+            start_line: 0,
+            end_line: 4,
+            filter_enabled,
+            filter_target,
+            panel_width: 200,
+        }
+    }
+
     #[test]
     fn logs_panel_title_preserves_position_and_shows_navigation_guidance() {
-        let title = logs_panel_title(3, false, 42, 10, 20, 30);
+        let title = logs_panel_title(LogsPanelTitle {
+            log_scroll_offset: 3,
+            log_auto_scroll: false,
+            total_display_lines: 42,
+            visible_height: 10,
+            start_line: 20,
+            end_line: 30,
+            filter_enabled: false,
+            filter_target: Some("alpha"),
+            panel_width: 200,
+        });
 
         assert!(title.contains("Logs [21-30/42]"));
         assert!(title.contains("logs_off=3"));
@@ -3127,6 +3344,41 @@ mod tests {
         assert!(title.contains("PgUp/PgDn: older/newer"));
         assert!(title.contains("Home/End: oldest/newest"));
         assert!(title.contains("l: hide"));
+    }
+
+    #[test]
+    fn logs_panel_title_reports_disabled_selected_proposal_filter() {
+        let title = logs_panel_title(title_params(false, Some("alpha")));
+
+        assert!(title.contains("f: filter off"));
+        assert!(!title.contains("filter=alpha"));
+        assert!(title.contains("l: hide"));
+    }
+
+    #[test]
+    fn logs_panel_title_reports_active_filter_target() {
+        let title = logs_panel_title(title_params(true, Some("alpha")));
+
+        assert!(title.contains("f: filter=alpha"));
+    }
+
+    #[test]
+    fn logs_panel_title_falls_back_to_compact_filter_hint_for_narrow_panels() {
+        let long_id = "a-very-long-proposal-identifier-that-will-not-fit";
+        let title = logs_panel_title(LogsPanelTitle {
+            panel_width: 80,
+            ..title_params(true, Some(long_id))
+        });
+
+        assert!(title.contains("f: filter on"));
+        assert!(!title.contains(long_id));
+    }
+
+    #[test]
+    fn logs_panel_title_reports_active_filter_without_a_cursor_proposal() {
+        let title = logs_panel_title(title_params(true, None));
+
+        assert!(title.contains("f: filter on"));
     }
 
     #[test]

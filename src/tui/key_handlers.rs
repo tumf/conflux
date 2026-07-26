@@ -657,6 +657,20 @@ pub(crate) fn handle_bulk_toggle_key(app: &mut AppState) -> Vec<TuiCommand> {
     app.toggle_all_marks()
 }
 
+/// Handle the selected-proposal log filter toggle (`f`) in the Changes view.
+///
+/// This is presentation-only: it changes which buffered entries the Logs panel
+/// renders and never touches execution marks, queue state, or any other
+/// workflow-control input. Other views ignore the key.
+pub(crate) fn handle_selected_proposal_log_filter_key(app: &mut AppState) {
+    use crate::tui::types::ViewMode;
+    if app.view_mode != ViewMode::Changes {
+        return;
+    }
+
+    app.toggle_selected_proposal_log_filter();
+}
+
 /// Handle main key events
 ///
 /// Returns Some(TuiCommand) if the key event should trigger the configured start control
@@ -802,6 +816,9 @@ pub async fn handle_key_event(
                 ctx.app.toggle_logs_panel();
             }
         }
+        (KeyCode::Char('f'), _) => {
+            handle_selected_proposal_log_filter_key(ctx.app);
+        }
         (KeyCode::Char('K'), _) => {
             // Enter force-kill confirmation for active changes in Running mode
             use crate::tui::types::ViewMode;
@@ -890,6 +907,85 @@ mod tests {
         assert!(!app.logs_panel_enabled);
         app.toggle_logs_panel();
         assert!(app.logs_panel_enabled);
+    }
+
+    fn log_filter_app() -> AppState {
+        let mut app = AppState::new(vec![
+            create_test_change("alpha"),
+            create_test_change("beta"),
+        ]);
+        app.logs.clear();
+        app.add_log(LogEntry::info("alpha apply").with_change_id("alpha"));
+        app.add_log(LogEntry::info("beta apply").with_change_id("beta"));
+        app.add_log(LogEntry::info("global orchestration"));
+        app
+    }
+
+    #[test]
+    fn f_key_toggles_selected_proposal_log_filter_in_changes_view() {
+        let mut app = log_filter_app();
+        assert!(!app.selected_proposal_log_filter);
+
+        handle_selected_proposal_log_filter_key(&mut app);
+        assert!(app.selected_proposal_log_filter);
+        assert_eq!(app.selected_proposal_log_filter_target(), Some("alpha"));
+
+        handle_selected_proposal_log_filter_key(&mut app);
+        assert!(!app.selected_proposal_log_filter);
+    }
+
+    #[test]
+    fn f_key_does_not_change_execution_marks_cursor_or_log_panel_visibility() {
+        let mut app = log_filter_app();
+        app.changes[0].selected = true;
+        app.changes[1].selected = false;
+        let statuses_before: Vec<String> = app
+            .changes
+            .iter()
+            .map(|c| c.display_status_cache.clone())
+            .collect();
+
+        handle_selected_proposal_log_filter_key(&mut app);
+
+        assert!(app.changes[0].selected);
+        assert!(!app.changes[1].selected);
+        assert_eq!(app.cursor_index, 0);
+        assert!(app.logs_panel_enabled);
+        assert_eq!(app.logs.len(), 3);
+        let statuses_after: Vec<String> = app
+            .changes
+            .iter()
+            .map(|c| c.display_status_cache.clone())
+            .collect();
+        assert_eq!(statuses_before, statuses_after);
+    }
+
+    #[test]
+    fn f_key_is_ignored_in_worktrees_view() {
+        let mut app = log_filter_app();
+        app.view_mode = ViewMode::Worktrees;
+
+        handle_selected_proposal_log_filter_key(&mut app);
+
+        assert!(!app.selected_proposal_log_filter);
+    }
+
+    #[test]
+    fn f_key_leaves_existing_log_panel_and_scroll_keys_intact() {
+        let mut app = log_filter_app();
+
+        // `l` semantics are unchanged by the new filter key.
+        app.toggle_logs_panel();
+        assert!(!app.logs_panel_enabled);
+        handle_selected_proposal_log_filter_key(&mut app);
+        assert!(!app.logs_panel_enabled);
+
+        // Filtering returns to newest output; PageUp still scrolls back.
+        app.scroll_logs_up(5);
+        assert!(!app.log_auto_scroll);
+        handle_selected_proposal_log_filter_key(&mut app);
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
     }
 
     #[test]
