@@ -267,6 +267,10 @@ fn test_build_apply_prompt_with_canonical_acceptance_findings() {
     assert_eq!(result.matches("missing repository coverage").count(), 1);
     assert!(result.contains("add regression test"));
     assert!(result.contains("Do not delete or move the runtime-owned acceptance follow-up section"));
+    assert!(result.contains("exact `  evidence: <one-line evidence>` form"));
+    assert!(result.contains("Never add ordinary paragraphs, headings, fenced blocks"));
+    assert!(result.contains("unindented `Evidence:` labels"));
+    assert!(result.contains("put longer notes outside it in a non-checkbox notes section"));
 }
 
 #[test]

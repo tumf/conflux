@@ -2224,6 +2224,76 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
     assert_eq!(progress.total, 3);
 }
 
+/// Parallel and serial dispatch both route acceptance follow-up persistence
+/// and PASS cleanup through the shared task-parser recovery path. This asserts
+/// the two call sequences produce byte-identical files, so recovery, warning,
+/// and cleanup behavior cannot diverge between execution modes.
+#[test]
+fn parallel_and_serial_follow_up_recovery_produce_identical_files() {
+    const DRIFTED: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] done\n",
+        "\n",
+        "## Current Acceptance Follow-up\n",
+        "- attempt: 1\n",
+        "- [x] earlier finding\n",
+        "### Reviewer notes\n",
+        "Free-form evidence with - [ ] checkbox text.\n",
+    );
+    let change_id = "parity-change";
+    let findings = ["latest finding".to_string()];
+
+    let seed = |root: &Path| {
+        let change_dir = root.join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).or_fail("unexpected error");
+        std::fs::write(change_dir.join("tasks.md"), DRIFTED).or_fail("unexpected error");
+    };
+
+    let parallel_root = TempDir::new().or_fail("unexpected error");
+    let serial_root = TempDir::new().or_fail("unexpected error");
+    seed(parallel_root.path());
+    seed(serial_root.path());
+
+    let mut rendered = Vec::new();
+    for root in [parallel_root.path(), serial_root.path()] {
+        // FAIL persistence: identical resolver + shared recovery entry point.
+        let tasks_path =
+            crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, root)
+                .or_fail("follow-up path resolves");
+        let recovery = crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            &findings,
+        )
+        .or_fail("recovery succeeds instead of terminating");
+        assert_eq!(recovery.recovered_blocks, 1);
+        assert!(recovery.warning().is_some());
+
+        let after_fail = std::fs::read_to_string(&tasks_path).or_fail("unexpected error");
+        assert!(after_fail.contains("## Recovered Acceptance Notes"));
+        assert!(after_fail.contains("- [ ] latest finding"));
+        assert_eq!(
+            crate::task_parser::parse_content(&after_fail, None),
+            crate::task_parser::TaskProgress::with_counts(1, 2)
+        );
+
+        // PASS cleanup: recovered notes survive, runtime section does not.
+        let cleanup_path = crate::task_parser::resolve_acceptance_follow_up_tasks_path_for_cleanup(
+            change_id, root,
+        )
+        .or_fail("cleanup path resolves")
+        .or_fail("cleanup path exists");
+        crate::task_parser::clear_acceptance_follow_up(&cleanup_path).or_fail("cleanup succeeds");
+
+        let after_pass = std::fs::read_to_string(&cleanup_path).or_fail("unexpected error");
+        assert!(!after_pass.contains("Acceptance Follow-up"));
+        assert!(after_pass.contains("## Recovered Acceptance Notes"));
+        rendered.push(after_pass);
+    }
+
+    assert_eq!(rendered[0], rendered[1]);
+}
+
 #[tokio::test]
 async fn test_acceptance_history_records_end_revision_when_head_changes() {
     let repo_root = TempDir::new().or_fail("unexpected error");
