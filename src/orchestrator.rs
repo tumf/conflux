@@ -74,6 +74,9 @@ pub struct Orchestrator {
     /// "select" | "running" | "stopped" | "stopping" | "error"
     #[cfg(feature = "web-monitoring")]
     execution_mode: String,
+    /// Optional observability-only sink projecting execution events onto an
+    /// external lifecycle adapter. It never participates in workflow routing.
+    lifecycle_sink: Option<Arc<dyn crate::events::EventSink>>,
 }
 
 /// Control flow result indicating whether to continue or break the main loop
@@ -143,7 +146,26 @@ impl Orchestrator {
             web_state: None,
             #[cfg(feature = "web-monitoring")]
             execution_mode: "select".to_string(),
+            lifecycle_sink: None,
         })
+    }
+
+    /// Attach an external lifecycle handle.
+    ///
+    /// Observability-only: the resulting sink receives a read-only projection of
+    /// execution events and cannot influence scheduling, acceptance, archive,
+    /// merge, or resume decisions.
+    pub fn set_lifecycle_handle(
+        &mut self,
+        handle: crate::lifecycle_integration::LifecycleHandle,
+        workspace: Option<String>,
+    ) {
+        if !handle.is_enabled() {
+            return;
+        }
+        self.lifecycle_sink = Some(Arc::new(crate::events::LifecycleEventSink::new(
+            handle, workspace,
+        )));
     }
 
     /// Set web monitoring state for broadcasting updates to WebSocket clients.
@@ -218,6 +240,7 @@ impl Orchestrator {
             web_state: None,
             #[cfg(feature = "web-monitoring")]
             execution_mode: "select".to_string(),
+            lifecycle_sink: None,
         })
     }
 
@@ -356,7 +379,12 @@ impl Orchestrator {
 
     /// Update shared state with an execution event
     async fn update_shared_state(&self, event: ExecutionEvent) {
-        let sinks: Vec<std::sync::Arc<dyn crate::events::EventSink>> = cli_event_sinks();
+        let mut sinks: Vec<std::sync::Arc<dyn crate::events::EventSink>> = cli_event_sinks();
+        // The lifecycle sink is appended last so it can only observe events that
+        // the reducer and existing sinks have already processed.
+        if let Some(lifecycle_sink) = &self.lifecycle_sink {
+            sinks.push(lifecycle_sink.clone());
+        }
         dispatch_event(self.shared_state.as_ref(), &sinks, event).await;
     }
 

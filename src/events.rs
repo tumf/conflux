@@ -735,6 +735,93 @@ pub fn cli_event_sinks() -> Vec<std::sync::Arc<dyn EventSink>> {
     vec![std::sync::Arc::new(NoopEventSink)]
 }
 
+// ── External lifecycle bridge ──────────────────────────────────────────────
+
+/// Map an orchestration event to a semantic external-lifecycle event.
+///
+/// This is a one-way observability projection. It never changes `EventSink`
+/// frontend ownership and never participates in workflow-control decisions:
+/// events that carry no semantic lifecycle meaning simply map to `None`.
+pub fn lifecycle_event_for_execution_event(
+    event: &ExecutionEvent,
+    workspace: Option<&str>,
+) -> Option<crate::lifecycle_integration::LifecycleEvent> {
+    use crate::lifecycle_integration::{LifecycleContext, LifecycleEvent, LifecycleState};
+
+    let context = |change_id: Option<&str>| LifecycleContext {
+        workspace: workspace.map(str::to_owned),
+        change_id: change_id.map(str::to_owned),
+        ..Default::default()
+    };
+
+    let (state, change_id) = match event {
+        // Work is executing.
+        ExecutionEvent::ProcessingStarted(id) => (LifecycleState::Working, Some(id.as_str())),
+        ExecutionEvent::ApplyStarted { change_id, .. }
+        | ExecutionEvent::ArchiveStarted { change_id, .. }
+        | ExecutionEvent::AcceptanceStarted { change_id, .. }
+        | ExecutionEvent::ResolveStarted { change_id, .. } => {
+            (LifecycleState::Working, Some(change_id.as_str()))
+        }
+        ExecutionEvent::ConflictResolutionStarted => (LifecycleState::Working, None),
+        // Graceful stop is still active work until it completes.
+        ExecutionEvent::Stopping => (LifecycleState::Working, None),
+
+        // A human decision is required before work can continue.
+        ExecutionEvent::AcceptanceGated { change_id, .. }
+        | ExecutionEvent::ExecutionBlocked { change_id, .. }
+        | ExecutionEvent::DependencyBlocked { change_id, .. } => {
+            (LifecycleState::Blocked, Some(change_id.as_str()))
+        }
+        ExecutionEvent::ProcessingError { id, .. } => (LifecycleState::Blocked, Some(id.as_str())),
+        ExecutionEvent::Error { .. } => (LifecycleState::Blocked, None),
+
+        // Nothing is executing anymore.
+        ExecutionEvent::AllCompleted | ExecutionEvent::Stopped => (LifecycleState::Idle, None),
+
+        // Every other event is progress detail without semantic lifecycle meaning.
+        _ => return None,
+    };
+
+    Some(LifecycleEvent::StateChanged {
+        state,
+        context: context(change_id),
+    })
+}
+
+/// `EventSink` adapter that projects orchestration events onto an external
+/// lifecycle adapter.
+///
+/// Publishing is non-blocking and failure-isolated, so adding this sink cannot
+/// change orchestration timing or routing.
+pub struct LifecycleEventSink {
+    handle: crate::lifecycle_integration::LifecycleHandle,
+    workspace: Option<String>,
+}
+
+impl LifecycleEventSink {
+    /// Create a sink that forwards mapped events to `handle`.
+    pub fn new(
+        handle: crate::lifecycle_integration::LifecycleHandle,
+        workspace: Option<String>,
+    ) -> Self {
+        Self { handle, workspace }
+    }
+}
+
+#[async_trait]
+impl EventSink for LifecycleEventSink {
+    async fn on_event(&self, event: &ExecutionEvent) {
+        if let Some(lifecycle_event) =
+            lifecycle_event_for_execution_event(event, self.workspace.as_deref())
+        {
+            self.handle.publish(lifecycle_event);
+        }
+    }
+
+    async fn on_state_changed(&self, _state: &OrchestratorState) {}
+}
+
 /// Sink used by tests to collect emitted events.
 #[derive(Default)]
 #[allow(dead_code)]
@@ -760,6 +847,256 @@ impl EventSink for MockEventSink {
     }
 
     async fn on_state_changed(&self, _state: &OrchestratorState) {}
+}
+
+#[cfg(test)]
+mod lifecycle_bridge_tests {
+    use super::*;
+    use crate::lifecycle_integration::{
+        LifecycleEvent, LifecycleHandle, LifecyclePublisher, LifecycleState,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// In-memory lifecycle dispatcher double.
+    ///
+    /// Keeps this suite unit-scoped: no adapter process, filesystem, or other
+    /// stateful external boundary is touched.
+    #[derive(Default)]
+    struct MockLifecycleDispatcher {
+        published: Mutex<Vec<LifecycleEvent>>,
+    }
+
+    impl MockLifecycleDispatcher {
+        fn published(&self) -> Vec<LifecycleEvent> {
+            self.published.lock().expect("mock lock").clone()
+        }
+
+        fn states(&self) -> Vec<LifecycleState> {
+            self.published()
+                .into_iter()
+                .filter_map(|event| match event {
+                    LifecycleEvent::StateChanged { state, .. } => Some(state),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl LifecyclePublisher for MockLifecycleDispatcher {
+        fn publish(&self, event: LifecycleEvent) {
+            self.published.lock().expect("mock lock").push(event);
+        }
+    }
+
+    fn mock_sink() -> (Arc<MockLifecycleDispatcher>, LifecycleEventSink) {
+        let dispatcher = Arc::new(MockLifecycleDispatcher::default());
+        let handle =
+            LifecycleHandle::from_publisher(dispatcher.clone() as Arc<dyn LifecyclePublisher>);
+        (
+            dispatcher,
+            LifecycleEventSink::new(handle, Some("/repo".to_string())),
+        )
+    }
+
+    fn state_of(event: &ExecutionEvent) -> Option<LifecycleState> {
+        match lifecycle_event_for_execution_event(event, Some("/repo")) {
+            Some(LifecycleEvent::StateChanged { state, .. }) => Some(state),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn active_execution_events_map_to_working() {
+        for event in [
+            ExecutionEvent::ProcessingStarted("change-a".to_string()),
+            ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            },
+            ExecutionEvent::ArchiveStarted {
+                change_id: "change-a".to_string(),
+                command: "archive".to_string(),
+            },
+            ExecutionEvent::AcceptanceStarted {
+                change_id: "change-a".to_string(),
+                command: "accept".to_string(),
+            },
+            ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "resolve".to_string(),
+            },
+            ExecutionEvent::Stopping,
+        ] {
+            assert_eq!(
+                state_of(&event),
+                Some(LifecycleState::Working),
+                "event should report working: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_decision_events_map_to_blocked() {
+        let blocker = StalledBlocker::acceptance_infrastructure("verification job still running");
+
+        for event in [
+            ExecutionEvent::AcceptanceGated {
+                change_id: "change-a".to_string(),
+                blocker: blocker.clone(),
+            },
+            ExecutionEvent::ExecutionBlocked {
+                change_id: "change-a".to_string(),
+                blocker,
+            },
+            ExecutionEvent::DependencyBlocked {
+                change_id: "change-a".to_string(),
+                dependency_ids: vec!["dep".to_string()],
+            },
+            ExecutionEvent::ProcessingError {
+                id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::Error {
+                message: "boom".to_string(),
+            },
+        ] {
+            assert_eq!(
+                state_of(&event),
+                Some(LifecycleState::Blocked),
+                "event should report blocked: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_events_map_to_idle() {
+        for event in [ExecutionEvent::AllCompleted, ExecutionEvent::Stopped] {
+            assert_eq!(
+                state_of(&event),
+                Some(LifecycleState::Idle),
+                "event should report idle: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn progress_detail_events_are_not_projected() {
+        for event in [
+            ExecutionEvent::Log(LogEntry::info("hello")),
+            ExecutionEvent::ApplyOutput {
+                change_id: "change-a".to_string(),
+                output: "chunk".to_string(),
+                iteration: Some(1),
+            },
+            ExecutionEvent::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 1,
+                total: 2,
+            },
+            ExecutionEvent::WorktreesRefreshed { worktrees: vec![] },
+        ] {
+            assert!(
+                lifecycle_event_for_execution_event(&event, Some("/repo")).is_none(),
+                "presentation-only event must not be projected: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projected_context_is_limited_to_workspace_and_change_id() {
+        let projected = lifecycle_event_for_execution_event(
+            &ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "secret-agent --token abcdef".to_string(),
+            },
+            Some("/repo"),
+        )
+        .expect("apply start should project");
+
+        match projected {
+            LifecycleEvent::StateChanged { context, .. } => {
+                assert_eq!(context.workspace.as_deref(), Some("/repo"));
+                assert_eq!(context.change_id.as_deref(), Some("change-a"));
+                assert_eq!(context.session_id, None);
+            }
+            other => panic!("unexpected projection: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sink_receives_orchestration_events_through_dispatch() {
+        let (dispatcher, lifecycle_sink) = mock_sink();
+        let state = tokio::sync::RwLock::new(crate::orchestration::state::OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        ));
+        let frontend_sink = std::sync::Arc::new(MockEventSink::new());
+        let sinks: Vec<std::sync::Arc<dyn EventSink>> =
+            vec![frontend_sink.clone(), std::sync::Arc::new(lifecycle_sink)];
+
+        for event in [
+            ExecutionEvent::ProcessingStarted("change-a".to_string()),
+            ExecutionEvent::Log(LogEntry::info("noise")),
+            ExecutionEvent::AllCompleted,
+        ] {
+            dispatch_event(&state, &sinks, event).await;
+        }
+
+        assert_eq!(
+            dispatcher.states(),
+            vec![LifecycleState::Working, LifecycleState::Idle],
+            "lifecycle sink must observe semantic transitions only"
+        );
+
+        assert_eq!(
+            frontend_sink.events().await.len(),
+            3,
+            "existing frontend sink ownership must be unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_sink_does_not_alter_reducer_state() {
+        let (_dispatcher, lifecycle_sink) = mock_sink();
+        let with_lifecycle = tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec!["change-a".to_string()], 10),
+        );
+        let without_lifecycle = tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec!["change-a".to_string()], 10),
+        );
+
+        let with_sinks: Vec<std::sync::Arc<dyn EventSink>> =
+            vec![std::sync::Arc::new(lifecycle_sink)];
+        let without_sinks: Vec<std::sync::Arc<dyn EventSink>> = cli_event_sinks();
+
+        dispatch_event(
+            &with_lifecycle,
+            &with_sinks,
+            ExecutionEvent::ProcessingStarted("change-a".to_string()),
+        )
+        .await;
+        dispatch_event(
+            &without_lifecycle,
+            &without_sinks,
+            ExecutionEvent::ProcessingStarted("change-a".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            with_lifecycle.read().await.all_display_statuses(),
+            without_lifecycle.read().await.all_display_statuses(),
+            "attaching a lifecycle sink must not change core state transitions"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_lifecycle_handle_drops_projected_events() {
+        let sink = LifecycleEventSink::new(LifecycleHandle::disabled(), Some("/repo".to_string()));
+
+        // Must not panic and must remain a no-op.
+        sink.on_event(&ExecutionEvent::ProcessingStarted("change-a".to_string()))
+            .await;
+    }
 }
 
 #[cfg(test)]

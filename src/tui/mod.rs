@@ -10,6 +10,7 @@ mod command_handlers;
 pub mod config;
 mod events;
 mod key_handlers;
+pub mod lifecycle;
 pub mod log_deduplicator;
 mod orchestrator;
 mod qr;

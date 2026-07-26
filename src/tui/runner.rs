@@ -4,6 +4,7 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::lifecycle_integration::LifecycleHandle;
 use crate::openspec::Change;
 use crate::parallel::PostArchiveAction;
 use crate::vcs::{GitWorkspaceManager, WorkspaceManager};
@@ -21,6 +22,7 @@ use tracing::{debug, info, warn};
 use super::command_handlers::{handle_tui_command, TuiCommandContext};
 use super::events::{LogEntry, OrchestratorEvent, TuiCommand};
 use super::key_handlers::{handle_key_event, KeyEventContext};
+use super::lifecycle::TuiLifecycleSnapshot;
 use super::log_deduplicator;
 // orchestrator functions now called from command_handlers
 use super::queue::DynamicQueue;
@@ -49,6 +51,7 @@ pub async fn run_tui(
         web_state,
         None,
         PostArchiveAction::MergeToBase,
+        LifecycleHandle::disabled(),
     )
     .await
 }
@@ -230,6 +233,7 @@ pub(crate) async fn shutdown_local_orchestrator_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tui_with_remote(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
@@ -237,6 +241,7 @@ pub async fn run_tui_with_remote(
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
     post_archive_action: PostArchiveAction,
+    lifecycle: LifecycleHandle,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
     let original_hook = std::panic::take_hook();
@@ -260,6 +265,7 @@ pub async fn run_tui_with_remote(
         web_state,
         remote_client,
         post_archive_action,
+        lifecycle,
     )
     .await;
 
@@ -270,6 +276,7 @@ pub async fn run_tui_with_remote(
 }
 
 /// Main TUI event loop
+#[allow(clippy::too_many_arguments)]
 async fn run_tui_loop(
     terminal: &mut DefaultTerminal,
     initial_changes: Vec<Change>,
@@ -278,6 +285,7 @@ async fn run_tui_loop(
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
     post_archive_action: PostArchiveAction,
+    lifecycle: LifecycleHandle,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()?;
 
@@ -845,6 +853,23 @@ async fn run_tui_loop(
     // Shared flag for graceful stop (signaling orchestrator to stop after current change)
     let graceful_stop_flag = Arc::new(AtomicBool::new(false));
 
+    // External lifecycle reporting is derived from typed TUI state, never from
+    // rendered screen contents. Unchanged states are deduplicated by the
+    // dispatcher, so publishing once per frame is cheap and non-blocking.
+    let lifecycle_workspace = repo_root.display().to_string();
+    let publish_lifecycle_state = |app: &AppState| {
+        if !lifecycle.is_enabled() {
+            return;
+        }
+        let snapshot = TuiLifecycleSnapshot::from_app(app);
+        lifecycle.publish_state(
+            snapshot.lifecycle_state(),
+            snapshot.lifecycle_context(&lifecycle_workspace),
+        );
+    };
+
+    publish_lifecycle_state(&app);
+
     loop {
         // Increment spinner frame for animation (updates every 100ms)
         app.spinner_frame = (app.spinner_frame + 1) % SPINNER_CHARS.len();
@@ -1002,6 +1027,8 @@ async fn run_tui_loop(
                 }
             }
         }
+
+        publish_lifecycle_state(&app);
 
         if app.should_quit {
             break;

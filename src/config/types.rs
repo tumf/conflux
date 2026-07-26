@@ -408,6 +408,122 @@ pub struct OrchestratorConfig {
     /// Proposal session configuration (ACP-based interactive proposal creation).
     #[serde(default)]
     pub proposal_session: Option<ProposalSessionConfig>,
+
+    /// Optional external lifecycle integration (observability-only adapter process).
+    ///
+    /// Absent by default: no adapter process is started and behavior is unchanged.
+    #[serde(default)]
+    pub lifecycle_integration: Option<LifecycleIntegrationConfig>,
+}
+
+// ── LifecycleIntegrationConfig ─────────────────────────────────────────────
+
+/// Configuration for one optional external lifecycle adapter.
+///
+/// The adapter is spawned once per cflx process as a child command with piped
+/// stdin and the inherited process environment. It receives newline-delimited
+/// JSON lifecycle messages. It is observability-only: it never influences
+/// workflow routing and all failures are reported as bounded diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LifecycleIntegrationConfig {
+    /// Explicitly enable/disable the configured adapter.
+    ///
+    /// When unset, a configured non-empty `command` is treated as enabled.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Adapter argv. The first element is the executable; remaining elements are arguments.
+    #[serde(default)]
+    pub command: Vec<String>,
+
+    /// Bounded queue capacity for pending lifecycle messages.
+    #[serde(default)]
+    pub queue_capacity: Option<usize>,
+
+    /// Bounded per-message write timeout in milliseconds.
+    #[serde(default)]
+    pub write_timeout_ms: Option<u64>,
+
+    /// Bounded shutdown deadline in milliseconds.
+    #[serde(default)]
+    pub shutdown_timeout_ms: Option<u64>,
+}
+
+impl LifecycleIntegrationConfig {
+    /// Return true when this integration should start an adapter process.
+    ///
+    /// An explicit `enabled: false` always wins. Otherwise the presence of a
+    /// non-empty `command` is the opt-in signal.
+    pub fn is_enabled(&self) -> bool {
+        match self.enabled {
+            Some(false) => false,
+            Some(true) => true,
+            None => !self.command.is_empty(),
+        }
+    }
+
+    /// Bounded queue capacity, falling back to the built-in default.
+    pub fn queue_capacity(&self) -> usize {
+        self.queue_capacity
+            .unwrap_or(DEFAULT_LIFECYCLE_QUEUE_CAPACITY)
+    }
+
+    /// Bounded per-message write timeout, falling back to the built-in default.
+    pub fn write_timeout_ms(&self) -> u64 {
+        self.write_timeout_ms
+            .unwrap_or(DEFAULT_LIFECYCLE_WRITE_TIMEOUT_MS)
+    }
+
+    /// Bounded shutdown deadline, falling back to the built-in default.
+    pub fn shutdown_timeout_ms(&self) -> u64 {
+        self.shutdown_timeout_ms
+            .unwrap_or(DEFAULT_LIFECYCLE_SHUTDOWN_TIMEOUT_MS)
+    }
+
+    /// Validate the adapter definition with actionable diagnostics.
+    ///
+    /// A disabled integration is always valid so that operators can keep a
+    /// commented-out adapter definition without breaking startup.
+    pub fn validate(&self) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+
+        if self.command.is_empty() {
+            return Err(OrchestratorError::ConfigLoad(
+                "Configuration error: `lifecycle_integration.command` must be a non-empty argv array, for example [\"cflx-herdr-adapter\"]".to_string(),
+            ));
+        }
+
+        if self.command[0].trim().is_empty() {
+            return Err(OrchestratorError::ConfigLoad(
+                "Configuration error: `lifecycle_integration.command[0]` must be a non-empty executable name".to_string(),
+            ));
+        }
+
+        if matches!(self.queue_capacity, Some(0)) {
+            return Err(OrchestratorError::ConfigLoad(
+                "Configuration error: `lifecycle_integration.queue_capacity` must be at least 1"
+                    .to_string(),
+            ));
+        }
+
+        if matches!(self.write_timeout_ms, Some(0)) {
+            return Err(OrchestratorError::ConfigLoad(
+                "Configuration error: `lifecycle_integration.write_timeout_ms` must be at least 1"
+                    .to_string(),
+            ));
+        }
+
+        if matches!(self.shutdown_timeout_ms, Some(0)) {
+            return Err(OrchestratorError::ConfigLoad(
+                "Configuration error: `lifecycle_integration.shutdown_timeout_ms` must be at least 1"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 // ── ProposalSessionConfig ──────────────────────────────────────────────────
@@ -749,6 +865,7 @@ impl OrchestratorConfig {
             stream_json_textify,
             command_strict_process_cleanup,
             proposal_session,
+            lifecycle_integration,
         } = other;
 
         // Plain Option fields use the standard config precedence rule:
@@ -854,6 +971,23 @@ impl OrchestratorConfig {
             command_strict_process_cleanup,
         );
         overwrite_if_some(&mut self.proposal_session, proposal_session);
+        overwrite_if_some(&mut self.lifecycle_integration, lifecycle_integration);
+    }
+
+    /// Get the configured external lifecycle integration, if any.
+    ///
+    /// Returns `None` when unconfigured so callers can keep the default
+    /// "no adapter process is started" behavior without extra branching.
+    pub fn get_lifecycle_integration(&self) -> Option<&LifecycleIntegrationConfig> {
+        self.lifecycle_integration.as_ref()
+    }
+
+    /// Validate the optional external lifecycle integration definition.
+    pub fn validate_lifecycle_integration(&self) -> Result<()> {
+        match self.lifecycle_integration.as_ref() {
+            Some(integration) => integration.validate(),
+            None => Ok(()),
+        }
     }
 
     /// Get the apply command (required, returns error if not set)
@@ -1194,6 +1328,7 @@ impl OrchestratorConfig {
     pub fn validate_required_commands(&self) -> Result<()> {
         self.get_stall_detection().validate()?;
         self.validate_operation_skills()?;
+        self.validate_lifecycle_integration()?;
 
         let mut missing = Vec::new();
 
@@ -1221,6 +1356,185 @@ impl OrchestratorConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_integration_config_tests {
+    use super::*;
+
+    fn enabled_config(command: Vec<&str>) -> LifecycleIntegrationConfig {
+        LifecycleIntegrationConfig {
+            command: command.into_iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lifecycle_integration_is_absent_by_default() {
+        let config = OrchestratorConfig::default();
+
+        assert!(config.get_lifecycle_integration().is_none());
+        assert!(config.validate_lifecycle_integration().is_ok());
+    }
+
+    #[test]
+    fn configured_argv_enables_adapter() {
+        let integration = enabled_config(vec!["my-adapter", "--flag"]);
+
+        assert!(integration.is_enabled());
+        assert!(integration.validate().is_ok());
+    }
+
+    #[test]
+    fn explicit_disable_wins_over_configured_argv() {
+        let integration = LifecycleIntegrationConfig {
+            enabled: Some(false),
+            ..enabled_config(vec!["my-adapter"])
+        };
+
+        assert!(!integration.is_enabled());
+        assert!(integration.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_argv_is_rejected_with_actionable_diagnostic() {
+        let integration = LifecycleIntegrationConfig {
+            enabled: Some(true),
+            ..Default::default()
+        };
+
+        let err = integration
+            .validate()
+            .expect_err("empty argv must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("lifecycle_integration.command"),
+            "diagnostic must name the offending key: {message}"
+        );
+        assert!(
+            message.contains("non-empty argv array"),
+            "diagnostic must explain the expected shape: {message}"
+        );
+    }
+
+    #[test]
+    fn blank_executable_is_rejected() {
+        let integration = enabled_config(vec!["   "]);
+
+        let err = integration
+            .validate()
+            .expect_err("blank executable must be rejected");
+        assert!(err.to_string().contains("lifecycle_integration.command[0]"));
+    }
+
+    #[test]
+    fn zero_bounds_are_rejected() {
+        for integration in [
+            LifecycleIntegrationConfig {
+                queue_capacity: Some(0),
+                ..enabled_config(vec!["my-adapter"])
+            },
+            LifecycleIntegrationConfig {
+                write_timeout_ms: Some(0),
+                ..enabled_config(vec!["my-adapter"])
+            },
+            LifecycleIntegrationConfig {
+                shutdown_timeout_ms: Some(0),
+                ..enabled_config(vec!["my-adapter"])
+            },
+        ] {
+            assert!(
+                integration.validate().is_err(),
+                "zero bound must be rejected: {integration:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_defaults_are_applied_when_unset() {
+        let integration = enabled_config(vec!["my-adapter"]);
+
+        assert_eq!(
+            integration.queue_capacity(),
+            DEFAULT_LIFECYCLE_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            integration.write_timeout_ms(),
+            DEFAULT_LIFECYCLE_WRITE_TIMEOUT_MS
+        );
+        assert_eq!(
+            integration.shutdown_timeout_ms(),
+            DEFAULT_LIFECYCLE_SHUTDOWN_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn required_command_validation_surfaces_lifecycle_errors() {
+        let config = OrchestratorConfig {
+            apply_command: Some("apply".to_string()),
+            archive_command: Some("archive".to_string()),
+            analyze_command: Some("analyze".to_string()),
+            acceptance_command: Some("accept".to_string()),
+            resolve_command: Some("resolve".to_string()),
+            lifecycle_integration: Some(LifecycleIntegrationConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = config
+            .validate_required_commands()
+            .expect_err("invalid lifecycle integration must fail required-command validation");
+        assert!(err.to_string().contains("lifecycle_integration.command"));
+    }
+
+    #[test]
+    fn merge_overwrites_lifecycle_integration_and_preserves_unset() {
+        let mut base = OrchestratorConfig {
+            lifecycle_integration: Some(enabled_config(vec!["base-adapter"])),
+            ..Default::default()
+        };
+
+        base.merge(OrchestratorConfig::default());
+        assert_eq!(
+            base.get_lifecycle_integration().map(|i| i.command.clone()),
+            Some(vec!["base-adapter".to_string()])
+        );
+
+        base.merge(OrchestratorConfig {
+            lifecycle_integration: Some(enabled_config(vec!["project-adapter"])),
+            ..Default::default()
+        });
+        assert_eq!(
+            base.get_lifecycle_integration().map(|i| i.command.clone()),
+            Some(vec!["project-adapter".to_string()])
+        );
+    }
+
+    #[test]
+    fn existing_configuration_without_lifecycle_key_still_parses() {
+        let parsed: OrchestratorConfig =
+            serde_json::from_str(r#"{"apply_command": "apply", "archive_command": "archive"}"#)
+                .expect("legacy configuration must remain parseable");
+
+        assert!(parsed.get_lifecycle_integration().is_none());
+    }
+
+    #[test]
+    fn lifecycle_integration_parses_from_configuration_document() {
+        let parsed: OrchestratorConfig = serde_json::from_str(
+            r#"{"lifecycle_integration": {"command": ["adapter", "--pane"], "shutdown_timeout_ms": 500}}"#,
+        )
+        .expect("lifecycle integration must parse");
+
+        let integration = parsed
+            .get_lifecycle_integration()
+            .expect("integration should be present");
+        assert!(integration.is_enabled());
+        assert_eq!(integration.command, vec!["adapter", "--pane"]);
+        assert_eq!(integration.shutdown_timeout_ms(), 500);
     }
 }
 

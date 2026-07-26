@@ -146,6 +146,7 @@ Command templates support these placeholders:
 | `stream_json_textify` | boolean | No | `true` | Converts Claude Code NDJSON to readable text |
 | `command_strict_process_cleanup` | boolean | No | `true` | Sweeps the full process group after completion |
 | `proposal_session` | object | No | see below | ACP transport for proposal sessions |
+| `lifecycle_integration` | object | No | unset | External lifecycle adapter (observability only) |
 | `server` | object | No | see below | Used by `cflx server` and `cflx service` |
 
 ## `hooks`
@@ -319,6 +320,110 @@ Legacy aliases are accepted:
 | `transport_args` | string[] | `["acp"]` | ACP subprocess args |
 | `transport_env` | object | `{}` | Extra environment variables |
 | `session_inactivity_timeout_secs` | integer | `1800` | ACP inactivity timeout |
+
+## `lifecycle_integration`
+
+This section lets an external tool observe the lifecycle of a normal `cflx` process without replacing, wrapping, or aliasing the `cflx` executable.
+
+When configured, `cflx` starts the adapter as a child process and writes newline-delimited JSON lifecycle messages to its stdin. It is **observability only**: adapter output and exit status are ignored and can never change workflow routing.
+
+```jsonc
+{
+  "lifecycle_integration": {
+    "command": ["cflx-herdr-adapter"],
+    "enabled": true,
+    "queue_capacity": 64,
+    "write_timeout_ms": 2000,
+    "shutdown_timeout_ms": 2000
+  }
+}
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `command` | string[] | `[]` | Adapter argv; first element is the executable |
+| `enabled` | boolean | unset | Unset means "enabled when `command` is non-empty"; `false` always wins |
+| `queue_capacity` | integer | `64` | Bounded pending-message queue; must be at least 1 |
+| `write_timeout_ms` | integer | `2000` | Bounded per-message write timeout; must be at least 1 |
+| `shutdown_timeout_ms` | integer | `2000` | Bounded shutdown deadline; must be at least 1 |
+
+An enabled integration with an empty `command` is rejected at startup with an actionable diagnostic naming `lifecycle_integration.command`.
+
+### Installation
+
+The adapter is any executable on `PATH` (or an absolute path) that reads stdin. No plugin format, dynamic library, or `cflx` wrapper is involved:
+
+1. Install the adapter executable.
+2. Add `lifecycle_integration.command` to `.cflx.jsonc` or `~/.config/cflx/config.jsonc`.
+3. Run `cflx`, `cflx tui`, or `cflx run` normally.
+
+### Protocol and versioning
+
+One compact JSON object per line, terminated by `\n`:
+
+```json
+{"protocol_version":1,"sequence":1,"kind":"process_started","mode":"tui","pid":4242,"context":{"workspace":"/repo"}}
+{"protocol_version":1,"sequence":2,"kind":"state_changed","mode":"tui","pid":4242,"state":"idle","context":{"workspace":"/repo"}}
+{"protocol_version":1,"sequence":3,"kind":"state_changed","mode":"tui","pid":4242,"state":"working","context":{"workspace":"/repo","change_id":"my-change"}}
+{"protocol_version":1,"sequence":4,"kind":"process_stopping","mode":"tui","pid":4242}
+```
+
+| Field | Notes |
+|---|---|
+| `protocol_version` | Currently `1`; adapters MUST ignore unknown major versions instead of guessing |
+| `sequence` | Monotonically increasing, gap-free per cflx process |
+| `kind` | `process_started`, `state_changed`, `session_identified`, `process_stopping` |
+| `mode` | `tui` for `cflx` / `cflx tui`, `run` for `cflx run` |
+| `pid` | Process id of the reporting `cflx` process |
+| `state` | `idle`, `working`, or `blocked`; present on `state_changed` |
+| `context` | Optional; only `workspace`, `change_id`, `session_id` may appear |
+
+Semantic states:
+
+- `idle` — ready/selection UI, or orchestration halted
+- `working` — orchestration is executing, including graceful stop
+- `blocked` — a confirmation, retry, or dependency decision is waiting on the user
+
+Unchanged states are deduplicated, so an adapter only sees real transitions.
+
+Stdin is closed after `process_stopping`. Treating end-of-stream as "the cflx process is gone" is the reliable teardown signal even if the process is killed.
+
+### Environment inheritance
+
+The adapter inherits the full `cflx` process environment. That is how a terminal-manager adapter discovers its context (for example `HERDR_ENV`, `HERDR_SOCKET_PATH`, `HERDR_PANE_ID`) without Conflux depending on any specific terminal manager. Adapter stdout and stderr are redirected to `/dev/null` so it can never corrupt the TUI display.
+
+### Failure behavior
+
+Every failure mode is non-fatal and never blocks startup, execution, or shutdown:
+
+| Situation | Behavior |
+|---|---|
+| Not configured, or `enabled: false` | No adapter process is started |
+| Adapter executable missing or unspawnable | One warning; lifecycle reporting disabled for the process |
+| Adapter crashes or exits early | One warning; lifecycle reporting disabled |
+| Adapter stops reading stdin | Write times out, one warning, lifecycle reporting disabled |
+| Adapter is slower than cflx | Queue fills and redundant messages are dropped; publishing never blocks |
+| Adapter still running at shutdown | Waited for up to `shutdown_timeout_ms`, then terminated |
+
+### Privacy boundary
+
+Only the fields in the table above are ever serialized. Lifecycle messages never contain environment variable values, credentials, configuration, agent command lines, prompts, agent output, error bodies, or terminal contents. Adding a field is a protocol change.
+
+### Herdr adapter path
+
+`tests/fixtures/herdr_lifecycle_adapter.py` is a tracked reference adapter. It exits as a no-op unless `HERDR_ENV=1`, then connects to `HERDR_SOCKET_PATH` and translates cflx lifecycle messages into Herdr agent reports keyed by `HERDR_PANE_ID`:
+
+```jsonc
+{
+  "lifecycle_integration": {
+    "command": ["python3", "/absolute/path/to/herdr_lifecycle_adapter.py"]
+  }
+}
+```
+
+Because the adapter no-ops outside Herdr, the same configuration is safe in every terminal.
+
+Herdr process detection is a **separate dependency** and is out of scope for Conflux: Herdr must recognize the foreground `cflx` process in order to create and remove the Agent entry. Until it does, the lifecycle stream reports state for an Agent entry that Herdr still has to own. The field names in the reference adapter are the integration *shape*, not a certified Herdr wire format — match them to the Herdr version you run.
 
 ## `server`
 
