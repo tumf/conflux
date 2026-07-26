@@ -422,6 +422,54 @@ FINDINGS:
         );
     }
 
+    /// Parser routing matrix: each canonical verdict keeps its own meaning and
+    /// only verdict-free output becomes the missing-verdict protocol failure.
+    /// The parser never sees command failure — a non-zero exit is classified by
+    /// the runtime before parsing — so nothing here can turn into a protocol
+    /// retry by accident.
+    #[test]
+    fn acceptance_parser_routing_matrix_is_stable() {
+        let cases: [(&str, AcceptanceResult); 10] = [
+            ("{\"acceptance\":\"pass\"}\n", AcceptanceResult::Pass),
+            ("ACCEPTANCE: PASS\n", AcceptanceResult::Pass),
+            (
+                "{\"acceptance\":\"fail\",\"findings\":[\"src/a.rs:1 issue\"]}\n",
+                AcceptanceResult::Fail {
+                    findings: vec!["src/a.rs:1 issue".to_string()],
+                },
+            ),
+            (
+                "ACCEPTANCE: FAIL\nFINDINGS:\n- src/a.rs:1 issue\n",
+                AcceptanceResult::Fail {
+                    findings: vec!["src/a.rs:1 issue".to_string()],
+                },
+            ),
+            (
+                "{\"acceptance\":\"continue\"}\n",
+                AcceptanceResult::Continue,
+            ),
+            ("ACCEPTANCE: CONTINUE\n", AcceptanceResult::Continue),
+            ("{\"acceptance\":\"gated\"}\n", AcceptanceResult::Gated),
+            ("ACCEPTANCE: BLOCKED\n", AcceptanceResult::Gated),
+            (
+                "Monitoring verification; waiting for the job to finish\n",
+                AcceptanceResult::MissingVerdict,
+            ),
+            (
+                "ACCEPTANCE: PASSAll criteria verified\n",
+                AcceptanceResult::MissingVerdict,
+            ),
+        ];
+
+        for (output, expected) in cases {
+            assert_eq!(
+                parse_acceptance_output(output),
+                expected,
+                "routing drifted for output: {output:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_explicit_continue_remains_distinct_from_missing_verdict() {
         // Canonical CONTINUE — via JSON and via legacy marker — must keep its

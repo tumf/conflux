@@ -2066,6 +2066,7 @@ async fn test_execute_acceptance_in_workspace_emits_gate_specific_failure_log_co
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -2180,6 +2181,7 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -2285,6 +2287,7 @@ async fn test_acceptance_history_records_end_revision_when_head_changes() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -2372,6 +2375,7 @@ async fn test_acceptance_diff_base_uses_last_acceptance_end_revision() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -2490,6 +2494,7 @@ async fn test_archive_guard_allows_archive_after_acceptance_head_change_pass() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -2889,6 +2894,69 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
     assert_eq!(
         classification.class_for("candidate-missing"),
         Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable)
+    );
+}
+
+/// Queue reconciliation must keep an actively retried missing-verdict change as
+/// in-progress acceptance work and only defer it as
+/// `terminal_error_retry_required` once the protocol budget is exhausted.
+#[tokio::test]
+async fn queue_reconciliation_defers_missing_verdict_only_after_retry_exhaustion() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+
+    let change_id = "missing-verdict-queue";
+    let queued = vec![make_test_change(change_id)];
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ApplyStarted {
+            change_id: change_id.to_string(),
+            command: "apply".to_string(),
+        });
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    // While protocol-retry budget remains, no terminal error is reported, so
+    // the change stays ordinary acceptance work.
+    let during_retry = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+    assert_ne!(
+        during_retry.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::TerminalErrorRetryRequired),
+        "an actively retried missing verdict must not be deferred as a terminal error"
+    );
+    assert!(during_retry.terminal_error_retry_required.is_empty());
+
+    // Exhaustion is the first point at which the runtime reports a terminal error.
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: change_id.to_string(),
+            error: crate::orchestration::acceptance::missing_verdict_exhausted_error(
+                3,
+                2,
+                &["Monitoring verification".to_string()],
+            ),
+        });
+    }
+
+    let after_exhaustion = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+    assert_eq!(
+        after_exhaustion.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::TerminalErrorRetryRequired),
+        "an exhausted missing verdict must reach the existing terminal-error deferral"
     );
 }
 
@@ -6986,6 +7054,433 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
     );
 }
 
+/// Observations collected from one dispatch driven by a stateful fake
+/// acceptance command that withholds a canonical verdict for the first
+/// `missing_attempts` invocations and then emits `ACCEPTANCE: PASS`.
+struct MissingVerdictDispatch {
+    result: WorkspaceResult,
+    workspace_path: std::path::PathBuf,
+    acceptance_invocations: u32,
+    apply_invocations: u32,
+    retry_progress_logs: Vec<String>,
+    acceptance_error_logs: Vec<String>,
+    saw_processing_error: bool,
+    /// Prompt text handed to each acceptance invocation, in order.
+    prompts: Vec<String>,
+}
+
+/// Dispatch one change whose acceptance command exits without a canonical
+/// verdict for its first `missing_attempts` invocations.
+///
+/// The command is the ordinary configured acceptance command on every
+/// invocation — the fixture never supplies a harness session, resume flag, or
+/// job identifier, so continuity can only come from Conflux-managed prompt
+/// context.
+async fn dispatch_with_missing_verdict_attempts(
+    change_id: &str,
+    missing_attempts: u32,
+) -> MissingVerdictDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create acceptance fixture state dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+    dispatch_missing_verdict_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        state_dir.path(),
+        change_id,
+        missing_attempts,
+    )
+    .await
+}
+
+/// Create the base repository fixture for a missing-verdict dispatch.
+///
+/// The change starts with an incomplete task so apply genuinely runs once; a
+/// protocol retry must then re-run acceptance only.
+async fn init_missing_verdict_repo(repo_root: &std::path::Path, change_id: &str) {
+    let change_dir = repo_root.join("openspec/changes").join(change_id);
+    std::fs::create_dir_all(&change_dir).or_fail("create active change dir");
+    std::fs::write(change_dir.join("proposal.md"), "# Missing verdict\n")
+        .or_fail("write active proposal");
+    std::fs::write(
+        change_dir.join("tasks.md"),
+        "## Implementation Tasks\n- [ ] done\n",
+    )
+    .or_fail("write active tasks");
+    init_git_repo(repo_root).await;
+}
+
+/// Run one dispatch against an existing repository fixture. Calling this twice
+/// with the same repository and workspace base — but a fresh executor, agent,
+/// and acceptance counter — models a process restart over the same unarchived
+/// workspace.
+async fn dispatch_missing_verdict_run(
+    repo_root: &std::path::Path,
+    workspace_base_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+    change_id: &str,
+    missing_attempts: u32,
+) -> MissingVerdictDispatch {
+    let repo_dir = repo_root;
+    let workspace_base = workspace_base_dir;
+    let base_revision = get_current_commit(repo_dir)
+        .await
+        .or_fail("get base revision");
+
+    let counter = state_dir.join("attempts");
+    let prompt_dir = state_dir.join("prompts");
+    std::fs::create_dir_all(&prompt_dir).or_fail("create prompt capture dir");
+    let counter_display = counter.display().to_string();
+    let prompt_dir_display = prompt_dir.display().to_string();
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.to_string_lossy().to_string()),
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+        )),
+        acceptance_command: Some(format!(
+            "sh -c 'n=$(cat \"{counter_display}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{counter_display}\"; \
+             printf \"%s\" \"$0\" > \"{prompt_dir_display}/attempt-$n.txt\"; \
+             if [ $n -gt {missing_attempts} ]; then echo \"ACCEPTANCE: PASS\"; \
+             else echo \"Monitoring verification, waiting for the owned job to finish\"; fi' \
+             {{prompt}}"
+        )),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch missing-verdict change");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let workspace_path = workspace_base.join(format!("cflx-{change_id}"));
+    let workspace_path = if workspace_path.exists() {
+        workspace_path
+    } else {
+        executor
+            .workspace_manager
+            .find_existing_workspace(change_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|workspace| workspace.path)
+            .unwrap_or_else(|| workspace_base.join(change_id))
+    };
+
+    let mut observed = MissingVerdictDispatch {
+        result,
+        workspace_path,
+        acceptance_invocations: 0,
+        apply_invocations: 0,
+        retry_progress_logs: Vec::new(),
+        acceptance_error_logs: Vec::new(),
+        saw_processing_error: false,
+        prompts: Vec::new(),
+    };
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                observed.acceptance_invocations += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                observed.apply_invocations += 1;
+            }
+            ExecutionEvent::ProcessingError { id, .. } if id == change_id => {
+                observed.saw_processing_error = true;
+            }
+            ExecutionEvent::Log(log) => {
+                if log.message.contains("protocol retry") {
+                    observed.retry_progress_logs.push(log.message.clone());
+                }
+                if matches!(log.level, crate::events::LogLevel::Error)
+                    && log.operation.as_deref() == Some("acceptance")
+                {
+                    observed.acceptance_error_logs.push(log.message.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut attempt = 1;
+    while let Ok(prompt) =
+        std::fs::read_to_string(prompt_dir.join(format!("attempt-{attempt}.txt")))
+    {
+        observed.prompts.push(prompt);
+        attempt += 1;
+    }
+
+    observed
+}
+
+/// A status-only acceptance exit must re-invoke the ordinary acceptance command
+/// with bounded continuation context instead of failing the workspace, and a
+/// later canonical PASS must archive normally.
+#[tokio::test]
+async fn parallel_missing_verdict_retries_then_passes_without_terminal_error() {
+    let change_id = "missing-verdict-retry-pass";
+    let observed = dispatch_with_missing_verdict_attempts(change_id, 2).await;
+
+    assert!(
+        observed.result.error.is_none(),
+        "acceptance must continue through the protocol retry instead of failing: {:?}",
+        observed.result.error
+    );
+    assert!(
+        observed.result.final_revision.is_some(),
+        "a canonical PASS after protocol retries must still hand off to archive"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "the initial attempt plus two protocol retries must run the acceptance command"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "a protocol retry re-runs acceptance only; the implementation did not fail"
+    );
+    assert!(
+        !observed.saw_processing_error,
+        "an in-budget protocol retry must not report the change as a terminal error, so queue \
+         reconciliation cannot classify it as terminal_error_retry_required"
+    );
+    assert!(
+        observed.acceptance_error_logs.is_empty(),
+        "no acceptance error event may be emitted before exhaustion: {:?}",
+        observed.acceptance_error_logs
+    );
+
+    // Non-terminal progress must be visible with attempt/maximum values.
+    assert_eq!(
+        observed.retry_progress_logs.len(),
+        2,
+        "each protocol retry must report progress: {:?}",
+        observed.retry_progress_logs
+    );
+    assert!(observed.retry_progress_logs[0].contains("protocol retry 1/2"));
+    assert!(observed.retry_progress_logs[1].contains("protocol retry 2/2"));
+
+    // Continuation comes only from Conflux-managed prompt context.
+    assert_eq!(observed.prompts.len(), 3);
+    assert!(
+        !observed.prompts[0].contains("<acceptance_protocol_retry>"),
+        "the initial attempt must not receive corrective retry context"
+    );
+    for prompt in &observed.prompts[1..] {
+        assert!(prompt.contains("<acceptance_protocol_retry>"));
+        assert!(prompt.contains("emit exactly one canonical verdict"));
+        assert!(
+            prompt.contains("Monitoring verification"),
+            "the retry must carry bounded prior acceptance output"
+        );
+        assert!(
+            prompt.contains("Missing acceptance verdict"),
+            "the retry must carry the recorded missing-verdict diagnostic"
+        );
+        let lower = prompt.to_ascii_lowercase();
+        for forbidden in ["session_id", "--resume", "job_id"] {
+            assert!(
+                !lower.contains(forbidden),
+                "continuation must stay harness neutral, found `{forbidden}`"
+            );
+        }
+    }
+
+    assert!(
+        !observed
+            .workspace_path
+            .join("ACCEPTANCE_REPORT.json")
+            .exists(),
+        "protocol retries must not create a workspace acceptance report"
+    );
+    assert!(
+        !observed
+            .workspace_path
+            .join(".cflx/acceptance-state.json")
+            .exists(),
+        "protocol retries must not create a durable acceptance checkpoint"
+    );
+}
+
+/// Three consecutive missing verdicts exhaust the dedicated budget and produce
+/// exactly one bounded terminal diagnostic.
+#[tokio::test]
+async fn parallel_missing_verdict_exhaustion_is_terminal_with_bounded_evidence() {
+    let change_id = "missing-verdict-exhausted";
+    let observed = dispatch_with_missing_verdict_attempts(change_id, u32::MAX).await;
+
+    let error = observed
+        .result
+        .error
+        .as_ref()
+        .or_fail("exhausted protocol retries must fail the workspace");
+    assert!(error.contains("missing-verdict protocol failure"));
+    assert!(error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"));
+    assert!(
+        error.contains("Monitoring verification"),
+        "terminal diagnostic must retain bounded evidence, got: {error}"
+    );
+
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "no fourth protocol retry may start"
+    );
+    assert_eq!(observed.apply_invocations, 1);
+    assert_eq!(
+        observed.retry_progress_logs.len(),
+        2,
+        "only the two in-budget retries report non-terminal progress"
+    );
+    assert_eq!(
+        observed.acceptance_error_logs.len(),
+        1,
+        "exhaustion must emit exactly one terminal acceptance error: {:?}",
+        observed.acceptance_error_logs
+    );
+    assert!(observed.acceptance_error_logs[0].contains("Missing acceptance verdict"));
+
+    assert!(
+        !observed
+            .workspace_path
+            .join("ACCEPTANCE_REPORT.json")
+            .exists(),
+        "an exhausted missing verdict must not create a workspace acceptance report"
+    );
+}
+
+/// Constitutional restart behavior: the protocol counter is active-run memory,
+/// so a run that starts on a still-unarchived workspace runs acceptance again
+/// from workspace state and cannot infer PASS from prior narrative output.
+#[tokio::test]
+async fn parallel_restart_reruns_acceptance_without_inferring_pass_from_prior_output() {
+    let change_id = "missing-verdict-restart";
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create acceptance state dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    // Model the post-restart world directly: an applied but unarchived
+    // workspace and no out-of-worktree runtime state at all. A previous run's
+    // protocol retries left nothing behind.
+    let workspace_path = workspace_base.path().join(change_id);
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            change_id,
+            workspace_path.to_string_lossy().as_ref(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("create applied-but-unarchived worktree");
+    std::fs::write(
+        workspace_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("tasks.md"),
+        "## Implementation Tasks\n- [x] done\n",
+    )
+    .or_fail("mark tasks applied in the resumed worktree");
+    for args in [
+        vec!["add", "-A"],
+        vec!["commit", "-m", &format!("Apply: {change_id}")],
+    ] {
+        Command::new("git")
+            .args(args)
+            .current_dir(&workspace_path)
+            .output()
+            .await
+            .or_fail("record the applied worktree commit");
+    }
+
+    let observed = dispatch_missing_verdict_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        state_dir.path(),
+        change_id,
+        u32::MAX,
+    )
+    .await;
+
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "the still-unarchived workspace must run acceptance again with a full, fresh protocol budget"
+    );
+    assert_eq!(
+        observed.retry_progress_logs.len(),
+        2,
+        "the restarted run must start a fresh protocol budget at retry 1/2, got {:?}",
+        observed.retry_progress_logs
+    );
+    assert!(observed.retry_progress_logs[0].contains("protocol retry 1/2"));
+    assert!(observed.retry_progress_logs[1].contains("protocol retry 2/2"));
+    assert!(
+        observed
+            .prompts
+            .first()
+            .is_some_and(|prompt| !prompt.contains("<acceptance_protocol_retry>")),
+        "the restarted run's first attempt must not resume a prior protocol retry"
+    );
+    assert!(
+        observed.result.final_revision.is_none(),
+        "an unarchived workspace must never be treated as accepted from prior narrative output"
+    );
+    assert!(
+        observed
+            .result
+            .error
+            .as_ref()
+            .is_some_and(|error| error.contains("missing-verdict protocol failure")),
+        "acceptance must reach a verdict again rather than inheriting a prior outcome: {:?}",
+        observed.result.error
+    );
+    assert!(
+        !workspace_path.join(".cflx/acceptance-state.json").exists(),
+        "restart routing must stay derivable from workspace file/git state"
+    );
+    assert!(
+        !workspace_path.join("ACCEPTANCE_REPORT.json").exists(),
+        "restart must not require a generated acceptance retry checkpoint"
+    );
+}
+
 #[tokio::test]
 async fn parallel_repeated_acceptance_failure_stalls_without_error_event() {
     assert_parallel_acceptance_failure_stalls_within_one_run(false).await;
@@ -9279,6 +9774,7 @@ async fn test_acceptance_finalizes_on_standalone_verdict_without_inactivity_retr
             &acceptance_tail_injected,
             &acceptance_history,
             Some("main"),
+            None,
         ),
     )
     .await
@@ -9384,6 +9880,7 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -9467,6 +9964,7 @@ async fn test_acceptance_cancels_while_waiting_for_silent_streaming_output() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("acceptance cancellation should return a result");
@@ -9621,6 +10119,7 @@ async fn test_acceptance_trailing_text_pass_is_not_canonical() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -9712,6 +10211,7 @@ async fn test_acceptance_status_only_exit_is_missing_verdict_not_continue() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -9827,6 +10327,7 @@ async fn test_acceptance_explicit_continue_verdict_retains_continue_routing() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");
@@ -9924,6 +10425,7 @@ async fn test_acceptance_json_verdict_pass_overrides_malformed_text() {
         &acceptance_tail_injected,
         &acceptance_history,
         Some("main"),
+        None,
     )
     .await
     .or_fail("unexpected error");

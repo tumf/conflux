@@ -24,6 +24,187 @@ pub const MISSING_VERDICT_DIAGNOSTIC: &str = "Missing acceptance verdict: accept
      exited without emitting a canonical verdict (protocol failure; status-only or waiting \
      output is not a verdict)";
 
+/// Maximum number of acceptance protocol retries permitted after the initial
+/// missing-verdict attempt. The initial invocation plus these retries gives
+/// three opportunities to satisfy the verdict protocol.
+///
+/// This budget is deliberately separate from the configured explicit-`CONTINUE`
+/// budget (`acceptance_max_continues`): a completed-but-verdictless command is a
+/// protocol failure, not an intentional continuation request.
+pub const MAX_MISSING_VERDICT_RETRIES: u32 = 2;
+
+/// Marks an acceptance invocation as a missing-verdict protocol retry so the
+/// prompt builder can inject the corrective continuation context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingVerdictRetry {
+    /// 1-based retry index (the first retry after the initial attempt is 1).
+    pub attempt: u32,
+    /// Maximum number of retries permitted after the initial attempt.
+    pub max: u32,
+}
+
+/// Routing decision for a completed acceptance command that emitted no
+/// canonical verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingVerdictRetryDecision {
+    /// Budget remains: re-invoke the normal configured acceptance command with
+    /// the continuation context described by [`MissingVerdictRetry`].
+    Retry(MissingVerdictRetry),
+    /// Budget exhausted: route to the terminal missing-verdict protocol failure.
+    Exhausted { attempts: u32, max: u32 },
+}
+
+/// Consecutive missing-verdict accounting for a single active orchestration run.
+///
+/// Per `openspec/CONSTITUTION.md` this is active-run memory only. It is never
+/// persisted outside the worktree, so a process restart simply re-runs
+/// acceptance for an applied-but-unarchived workspace instead of inferring a
+/// verdict from prior narrative output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MissingVerdictRetryState {
+    consecutive: u32,
+}
+
+impl MissingVerdictRetryState {
+    /// Number of consecutive missing verdicts observed so far.
+    pub fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
+
+    /// Record any canonical verdict (PASS/FAIL/CONTINUE/GATED/stalled-hold).
+    ///
+    /// Canonical routing is unchanged; only the protocol counter resets.
+    pub fn record_canonical_verdict(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// Record one completed acceptance command that emitted no canonical
+    /// verdict and return the resulting routing decision.
+    pub fn record_missing_verdict(&mut self) -> MissingVerdictRetryDecision {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive <= MAX_MISSING_VERDICT_RETRIES {
+            MissingVerdictRetryDecision::Retry(MissingVerdictRetry {
+                attempt: self.consecutive,
+                max: MAX_MISSING_VERDICT_RETRIES,
+            })
+        } else {
+            MissingVerdictRetryDecision::Exhausted {
+                attempts: self.consecutive,
+                max: MAX_MISSING_VERDICT_RETRIES,
+            }
+        }
+    }
+}
+
+fn bounded_missing_verdict_evidence(findings: &[String]) -> String {
+    let evidence = findings
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if evidence.is_empty() {
+        "no acceptance output captured".to_string()
+    } else {
+        evidence
+    }
+}
+
+/// Non-terminal progress message for a missing-verdict protocol retry.
+///
+/// Deliberately worded as progress, not error: the change is still acceptance
+/// work in progress while retry budget remains.
+pub fn missing_verdict_retry_progress(retry: MissingVerdictRetry, findings: &[String]) -> String {
+    format!(
+        "Acceptance completed without a canonical verdict; retrying acceptance \
+         (protocol retry {}/{}). Evidence: {}",
+        retry.attempt,
+        retry.max,
+        bounded_missing_verdict_evidence(findings)
+    )
+}
+
+/// Terminal diagnostic emitted once the missing-verdict retry budget is spent.
+pub fn missing_verdict_exhausted_error(attempts: u32, max: u32, findings: &[String]) -> String {
+    format!(
+        "Acceptance completed without a canonical verdict (missing-verdict protocol failure); \
+         status-only or waiting output is not a verdict. Exhausted {attempts} consecutive \
+         attempts after {max} protocol retries. Evidence: {}",
+        bounded_missing_verdict_evidence(findings)
+    )
+}
+
+/// Next step after an acceptance command completed without a canonical verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MissingVerdictRetryStep {
+    /// Budget remains: re-invoke the normal configured acceptance command with
+    /// `retry` as the continuation marker. `progress` is the non-terminal
+    /// operator-visible message.
+    Retry {
+        retry: MissingVerdictRetry,
+        progress: String,
+    },
+    /// Budget exhausted: route to the terminal missing-verdict protocol failure.
+    Exhausted { error: String },
+}
+
+/// Mode-independent driver for the missing-verdict protocol-retry sequence.
+///
+/// Serial and parallel orchestration share this driver so equivalent
+/// observations produce equivalent routing. Each acceptance invocation reads its
+/// continuation marker from [`Self::take_protocol_retry`] and reports the result
+/// back through [`Self::observe_missing_verdict`] or
+/// [`Self::observe_canonical_verdict`].
+///
+/// All state is active-run memory. Nothing is written outside the worktree, so a
+/// restarted process re-runs acceptance from workspace file/git state rather
+/// than resuming a protocol-retry sequence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissingVerdictRetryDriver {
+    state: MissingVerdictRetryState,
+    pending: Option<MissingVerdictRetry>,
+}
+
+impl MissingVerdictRetryDriver {
+    /// Consume the continuation marker for the acceptance invocation that is
+    /// about to start. `None` for an ordinary (non-retry) invocation.
+    pub fn take_protocol_retry(&mut self) -> Option<MissingVerdictRetry> {
+        self.pending.take()
+    }
+
+    /// Consecutive missing verdicts observed so far.
+    pub fn consecutive_missing_verdicts(&self) -> u32 {
+        self.state.consecutive()
+    }
+
+    /// Record any canonical verdict (PASS/FAIL/CONTINUE/GATED/stalled-hold).
+    /// Canonical routing is unchanged; only the protocol sequence resets.
+    pub fn observe_canonical_verdict(&mut self) {
+        self.state.record_canonical_verdict();
+        self.pending = None;
+    }
+
+    /// Record a completed acceptance command that emitted no canonical verdict
+    /// and return the resulting non-terminal or terminal step.
+    pub fn observe_missing_verdict(&mut self, findings: &[String]) -> MissingVerdictRetryStep {
+        match self.state.record_missing_verdict() {
+            MissingVerdictRetryDecision::Retry(retry) => {
+                self.pending = Some(retry);
+                MissingVerdictRetryStep::Retry {
+                    retry,
+                    progress: missing_verdict_retry_progress(retry, findings),
+                }
+            }
+            MissingVerdictRetryDecision::Exhausted { attempts, max } => {
+                self.pending = None;
+                MissingVerdictRetryStep::Exhausted {
+                    error: missing_verdict_exhausted_error(attempts, max, findings),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedFinding {
     pub identity: String,
@@ -310,6 +491,23 @@ impl AcceptanceResult {
     pub fn is_pass(&self) -> bool {
         matches!(self, AcceptanceResult::Pass)
     }
+
+    /// Returns true when the acceptance command emitted a canonical verdict
+    /// (PASS/FAIL/CONTINUE/GATED/stalled-hold).
+    ///
+    /// A missing verdict is a protocol failure, and command failure and
+    /// cancellation are not verdicts at all: none of them are canonical, so
+    /// none of them reset or consume the missing-verdict protocol budget.
+    pub fn is_canonical_verdict(&self) -> bool {
+        matches!(
+            self,
+            AcceptanceResult::Pass
+                | AcceptanceResult::Fail { .. }
+                | AcceptanceResult::Continue
+                | AcceptanceResult::Gated
+                | AcceptanceResult::PermissionStalled { .. }
+        )
+    }
 }
 
 /// Run acceptance test for a change with streaming output.
@@ -330,6 +528,10 @@ impl AcceptanceResult {
 /// * `Err(e)` - An error occurred
 ///
 /// The attempt_number is the number of the acceptance attempt that was just recorded.
+///
+/// `protocol_retry` is `Some` only when this invocation continues a previous
+/// attempt that exited without a canonical verdict.
+#[allow(clippy::too_many_arguments)]
 pub async fn acceptance_test_streaming<O, F>(
     change: &Change,
     agent: &mut AgentRunner,
@@ -337,6 +539,7 @@ pub async fn acceptance_test_streaming<O, F>(
     _config: &crate::config::OrchestratorConfig,
     output: &O,
     cancel_check: F,
+    protocol_retry: Option<MissingVerdictRetry>,
 ) -> Result<(AcceptanceResult, u32, String)>
 where
     O: OutputHandler,
@@ -360,7 +563,13 @@ where
 
     // Execute acceptance command with streaming via AiCommandRunner (real process handle)
     let (mut child, mut output_rx, start_time, command) = agent
-        .run_acceptance_streaming_with_runner(&change.id, ai_runner, None, base_branch.as_deref())
+        .run_acceptance_streaming_with_runner(
+            &change.id,
+            ai_runner,
+            None,
+            base_branch.as_deref(),
+            protocol_retry,
+        )
         .await?;
 
     // Log acceptance started with command
@@ -618,6 +827,349 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Table-driven contract for the dedicated missing-verdict budget: the
+    /// initial attempt plus two retries, then terminal exhaustion.
+    #[test]
+    fn missing_verdict_budget_allows_two_retries_then_exhausts() {
+        let mut state = MissingVerdictRetryState::default();
+        let expected = [
+            MissingVerdictRetryDecision::Retry(MissingVerdictRetry { attempt: 1, max: 2 }),
+            MissingVerdictRetryDecision::Retry(MissingVerdictRetry { attempt: 2, max: 2 }),
+            MissingVerdictRetryDecision::Exhausted {
+                attempts: 3,
+                max: 2,
+            },
+        ];
+
+        for (index, want) in expected.iter().enumerate() {
+            assert_eq!(
+                state.record_missing_verdict(),
+                *want,
+                "consecutive missing verdict #{} must route as {:?}",
+                index + 1,
+                want
+            );
+        }
+        assert_eq!(MAX_MISSING_VERDICT_RETRIES, 2);
+        assert_eq!(
+            state.consecutive(),
+            3,
+            "a fourth protocol retry must never be offered after exhaustion"
+        );
+        assert!(matches!(
+            state.record_missing_verdict(),
+            MissingVerdictRetryDecision::Exhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_verdict_canonical_verdict_resets_consecutive_sequence() {
+        let mut state = MissingVerdictRetryState::default();
+        assert!(matches!(
+            state.record_missing_verdict(),
+            MissingVerdictRetryDecision::Retry(MissingVerdictRetry { attempt: 1, .. })
+        ));
+        assert!(matches!(
+            state.record_missing_verdict(),
+            MissingVerdictRetryDecision::Retry(MissingVerdictRetry { attempt: 2, .. })
+        ));
+
+        // PASS/FAIL/CONTINUE/GATED/stalled-hold all reach this reset.
+        state.record_canonical_verdict();
+        assert_eq!(state.consecutive(), 0);
+
+        assert_eq!(
+            state.record_missing_verdict(),
+            MissingVerdictRetryDecision::Retry(MissingVerdictRetry { attempt: 1, max: 2 }),
+            "a later missing verdict must start a fresh protocol-retry sequence"
+        );
+    }
+
+    /// The protocol budget is fixed and independent from the configured
+    /// explicit-`CONTINUE` budget, whatever that budget is set to.
+    #[test]
+    fn missing_verdict_budget_is_independent_of_configured_continue_count() {
+        for configured_continues in [0u32, 1, 5, 50] {
+            let mut state = MissingVerdictRetryState::default();
+            let mut retries = 0u32;
+            loop {
+                match state.record_missing_verdict() {
+                    MissingVerdictRetryDecision::Retry(retry) => {
+                        assert_eq!(retry.max, MAX_MISSING_VERDICT_RETRIES);
+                        retries += 1;
+                    }
+                    MissingVerdictRetryDecision::Exhausted { attempts, max } => {
+                        assert_eq!(attempts, MAX_MISSING_VERDICT_RETRIES + 1);
+                        assert_eq!(max, MAX_MISSING_VERDICT_RETRIES);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(
+                retries, MAX_MISSING_VERDICT_RETRIES,
+                "configured acceptance_max_continues={configured_continues} must not change the \
+                 dedicated missing-verdict budget"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_verdict_diagnostics_are_bounded_and_distinguish_progress_from_terminal() {
+        let findings = (0..10)
+            .map(|index| format!("evidence line {index}"))
+            .collect::<Vec<_>>();
+
+        let progress =
+            missing_verdict_retry_progress(MissingVerdictRetry { attempt: 1, max: 2 }, &findings);
+        assert!(progress.contains("protocol retry 1/2"));
+        assert!(progress.contains("evidence line 4"));
+        assert!(
+            !progress.contains("evidence line 5"),
+            "evidence must stay bounded to the first five findings, got {progress}"
+        );
+        assert!(
+            !progress.to_ascii_lowercase().contains("protocol failure"),
+            "an available retry must not read as a terminal failure: {progress}"
+        );
+
+        let terminal = missing_verdict_exhausted_error(3, 2, &findings);
+        assert!(terminal.contains("missing-verdict protocol failure"));
+        assert!(terminal.contains("Exhausted 3 consecutive attempts after 2 protocol retries"));
+        assert!(terminal.contains("evidence line 4"));
+        assert!(!terminal.contains("evidence line 5"));
+
+        assert!(
+            missing_verdict_exhausted_error(3, 2, &[]).contains("no acceptance output captured"),
+            "empty evidence must still produce an actionable diagnostic"
+        );
+    }
+
+    /// Replay an acceptance verdict sequence through the shared driver exactly
+    /// as serial and parallel orchestration do, and report what each invocation
+    /// received plus how the sequence terminated.
+    fn replay_missing_verdict_sequence(
+        sequence: &[AcceptanceResult],
+    ) -> (
+        Vec<Option<MissingVerdictRetry>>,
+        Option<AcceptanceResult>,
+        Option<String>,
+    ) {
+        let mut protocol = MissingVerdictRetryDriver::default();
+        let mut received = Vec::new();
+        for result in sequence {
+            received.push(protocol.take_protocol_retry());
+            match result {
+                AcceptanceResult::MissingVerdict { findings } => {
+                    match protocol.observe_missing_verdict(findings) {
+                        MissingVerdictRetryStep::Retry { .. } => continue,
+                        MissingVerdictRetryStep::Exhausted { error } => {
+                            return (received, None, Some(error))
+                        }
+                    }
+                }
+                canonical => {
+                    protocol.observe_canonical_verdict();
+                    return (received, Some(canonical.clone()), None);
+                }
+            }
+        }
+        (received, None, None)
+    }
+
+    fn missing_verdict(evidence: &str) -> AcceptanceResult {
+        AcceptanceResult::MissingVerdict {
+            findings: vec![evidence.to_string()],
+        }
+    }
+
+    #[test]
+    fn missing_verdict_driver_retries_twice_then_accepts_canonical_pass() {
+        let (received, canonical, error) = replay_missing_verdict_sequence(&[
+            missing_verdict("waiting for verification"),
+            missing_verdict("still waiting"),
+            AcceptanceResult::Pass,
+        ]);
+
+        assert_eq!(received.len(), 3, "acceptance must be invoked three times");
+        assert_eq!(
+            received,
+            vec![
+                None,
+                Some(MissingVerdictRetry { attempt: 1, max: 2 }),
+                Some(MissingVerdictRetry { attempt: 2, max: 2 }),
+            ],
+            "only the retries may carry a continuation marker"
+        );
+        assert_eq!(canonical, Some(AcceptanceResult::Pass));
+        assert!(
+            error.is_none(),
+            "a canonical verdict within budget must not produce a terminal error"
+        );
+    }
+
+    #[test]
+    fn missing_verdict_driver_exhausts_after_three_consecutive_missing_verdicts() {
+        let (received, canonical, error) = replay_missing_verdict_sequence(&[
+            missing_verdict("waiting one"),
+            missing_verdict("waiting two"),
+            missing_verdict("waiting three"),
+            missing_verdict("never reached"),
+        ]);
+
+        assert_eq!(
+            received.len(),
+            3,
+            "no fourth protocol retry may start after exhaustion"
+        );
+        assert!(canonical.is_none());
+        let error = error.expect("third consecutive missing verdict must be terminal");
+        assert!(error.contains("missing-verdict protocol failure"));
+        assert!(error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"));
+        assert!(
+            error.contains("waiting three"),
+            "terminal diagnostic must carry bounded evidence, got {error}"
+        );
+    }
+
+    /// Every canonical outcome — not just PASS — resets the protocol sequence
+    /// and keeps its own routing untouched.
+    #[test]
+    fn missing_verdict_driver_treats_every_canonical_outcome_as_a_reset() {
+        for canonical in [
+            AcceptanceResult::Pass,
+            AcceptanceResult::Fail {
+                findings: vec!["src/lib.rs:1 fix".to_string()],
+            },
+            AcceptanceResult::Continue,
+            AcceptanceResult::Gated,
+            AcceptanceResult::PermissionStalled {
+                blocker: crate::events::StalledBlocker::acceptance_infrastructure("denied"),
+            },
+        ] {
+            let mut protocol = MissingVerdictRetryDriver::default();
+            assert!(matches!(
+                protocol.observe_missing_verdict(&["waiting".to_string()]),
+                MissingVerdictRetryStep::Retry { .. }
+            ));
+            assert!(protocol.take_protocol_retry().is_some());
+
+            protocol.observe_canonical_verdict();
+            assert_eq!(
+                protocol.consecutive_missing_verdicts(),
+                0,
+                "{canonical:?} must reset the consecutive protocol counter"
+            );
+            assert!(
+                protocol.take_protocol_retry().is_none(),
+                "{canonical:?} must clear any pending continuation marker"
+            );
+
+            // The next protocol failure starts a fresh full budget.
+            assert!(matches!(
+                protocol.observe_missing_verdict(&["waiting again".to_string()]),
+                MissingVerdictRetryStep::Retry {
+                    retry: MissingVerdictRetry { attempt: 1, .. },
+                    ..
+                }
+            ));
+        }
+    }
+
+    /// Routing matrix: only canonical verdicts reset the protocol sequence,
+    /// only a missing verdict may consume it, and command failure or
+    /// cancellation is never reclassified as a missing-verdict retry.
+    #[test]
+    fn acceptance_routing_matrix_keeps_missing_verdict_distinct() {
+        let cases: [(AcceptanceResult, bool, bool); 8] = [
+            (AcceptanceResult::Pass, true, false),
+            (
+                AcceptanceResult::Fail {
+                    findings: vec!["src/lib.rs:1 fix".to_string()],
+                },
+                true,
+                false,
+            ),
+            (AcceptanceResult::Continue, true, false),
+            (AcceptanceResult::Gated, true, false),
+            (
+                AcceptanceResult::PermissionStalled {
+                    blocker: crate::events::StalledBlocker::acceptance_infrastructure("denied"),
+                },
+                true,
+                false,
+            ),
+            (missing_verdict("waiting"), false, true),
+            (
+                AcceptanceResult::CommandFailed {
+                    error: "exit code 1".to_string(),
+                    findings: vec!["boom".to_string()],
+                },
+                false,
+                false,
+            ),
+            (AcceptanceResult::Cancelled, false, false),
+        ];
+
+        for (result, canonical, missing) in cases {
+            assert_eq!(
+                result.is_canonical_verdict(),
+                canonical,
+                "{result:?} canonical-verdict classification"
+            );
+            assert_eq!(
+                matches!(result, AcceptanceResult::MissingVerdict { .. }),
+                missing,
+                "{result:?} must not be confused with a missing verdict"
+            );
+            assert!(
+                !(canonical && missing),
+                "{result:?} cannot be both canonical and a protocol failure"
+            );
+        }
+
+        // Command failure keeps its own routing: it neither resets nor consumes
+        // the protocol budget, so a later missing verdict still gets a full one.
+        let mut protocol = MissingVerdictRetryDriver::default();
+        for result in [
+            AcceptanceResult::CommandFailed {
+                error: "exit code 1".to_string(),
+                findings: Vec::new(),
+            },
+            AcceptanceResult::Cancelled,
+        ] {
+            assert!(!result.is_canonical_verdict());
+            assert!(protocol.take_protocol_retry().is_none());
+            assert_eq!(protocol.consecutive_missing_verdicts(), 0);
+        }
+        assert!(matches!(
+            protocol.observe_missing_verdict(&["waiting".to_string()]),
+            MissingVerdictRetryStep::Retry {
+                retry: MissingVerdictRetry { attempt: 1, max: 2 },
+                ..
+            }
+        ));
+    }
+
+    /// Serial and parallel call the same driver; equivalent observations must
+    /// produce equivalent routing.
+    #[test]
+    fn missing_verdict_driver_has_serial_and_parallel_routing_parity() {
+        let sequence = [
+            missing_verdict("waiting"),
+            missing_verdict("waiting"),
+            AcceptanceResult::Fail {
+                findings: vec!["src/lib.rs:1 missing coverage".to_string()],
+            },
+        ];
+
+        let serial = replay_missing_verdict_sequence(&sequence);
+        let parallel = replay_missing_verdict_sequence(&sequence);
+        assert_eq!(serial, parallel);
+        assert_eq!(serial.0.len(), 3);
+        assert!(matches!(serial.1, Some(AcceptanceResult::Fail { .. })));
+        assert!(serial.2.is_none());
+    }
 
     #[test]
     fn semantic_fingerprint_excludes_runtime_bookkeeping() {
