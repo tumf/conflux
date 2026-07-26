@@ -164,6 +164,58 @@ fn ensure_runtime_acceptance_follow_up(
     Ok(())
 }
 
+/// Deterministic worktree-local task-format check run before acceptance dispatch.
+///
+/// Returns the validator diagnostics for the workspace-local `tasks.md`. An
+/// empty vector means the task-format contract holds. The result is derived
+/// purely from the workspace file, so a restart re-derives the same answer
+/// without any durable out-of-worktree workflow state.
+pub fn check_task_format(workspace_path: &Path, change_id: &str) -> Vec<String> {
+    let tasks_path = workspace_path
+        .join("openspec/changes")
+        .join(change_id)
+        .join("tasks.md");
+    let Ok(content) = fs::read_to_string(&tasks_path) else {
+        // A missing/unreadable tasks.md is already handled by check_task_progress;
+        // the format gate stays silent rather than inventing a second diagnostic.
+        return Vec::new();
+    };
+    crate::openspec_cmd::validation::validate_task_format(&content, change_id)
+}
+
+/// Task-format diagnostics that currently block the acceptance handoff.
+///
+/// Returns findings only when checkbox progress already reads complete, which is
+/// the state the pre-accept gate rejects. Both inputs (task progress and task
+/// format) come from workspace files, so any attempt — including one after a
+/// process restart — derives the same pending repair.
+pub fn pending_task_format_repair(workspace_path: &Path, change_id: &str) -> Vec<String> {
+    match check_task_progress(workspace_path, change_id) {
+        Ok(progress) if is_progress_complete(&progress) => {
+            check_task_format(workspace_path, change_id)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Whether completed task progress is still blocked from acceptance by an
+/// invalid task format.
+fn task_format_blocks_acceptance(workspace_path: &Path, change_id: &str) -> Vec<String> {
+    let diagnostics = check_task_format(workspace_path, change_id);
+    if !diagnostics.is_empty() {
+        warn!(
+            change_id = change_id,
+            workspace = %workspace_path.display(),
+            findings = diagnostics.len(),
+            "Task progress is complete but tasks.md task format is invalid; keeping change in apply instead of starting acceptance"
+        );
+        for diagnostic in &diagnostics {
+            warn!(change_id = change_id, "Task format finding: {}", diagnostic);
+        }
+    }
+    diagnostics
+}
+
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
     if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
         return Some(ApplyCompletionKind::BlockedHandoff);
@@ -492,6 +544,7 @@ pub async fn get_workspace_revision<W: WorkspaceManager + ?Sized>(
 /// * `change_id` - The change identifier
 /// * `history` - Optional apply history for context
 /// * `acceptance_tail` - Optional acceptance tail context (for first retry after acceptance failure)
+/// * `task_format_context` - Optional pre-accept task-format repair context
 ///
 /// # Returns
 ///
@@ -501,6 +554,7 @@ pub fn build_apply_prompt(
     change_id: &str,
     history: &str,
     acceptance_tail: &str,
+    task_format_context: &str,
 ) -> String {
     let user_prompt = config.get_apply_prompt();
     crate::agent::append_optional_prompt(
@@ -510,6 +564,7 @@ pub fn build_apply_prompt(
             user_prompt,
             history,
             acceptance_tail,
+            task_format_context,
         ),
         config.get_apply_append_prompt(),
     )
@@ -866,13 +921,23 @@ where
             break false;
         }
 
-        // Check if already complete
+        // Check if already complete. Completion only hands off to acceptance once
+        // the workspace-local task-format contract holds; otherwise the change
+        // stays in apply and the next attempt receives the diagnostics.
         if is_progress_complete(&progress) {
+            let task_format_findings = task_format_blocks_acceptance(workspace_path, change_id);
+            if task_format_findings.is_empty() {
+                info!(
+                    "Change {} is already complete ({}/{})",
+                    change_id, progress.completed, progress.total
+                );
+                break true;
+            }
             info!(
-                "Change {} is already complete ({}/{})",
-                change_id, progress.completed, progress.total
+                change_id = change_id,
+                findings = task_format_findings.len(),
+                "Running apply again to repair tasks.md task format before acceptance"
             );
-            break true;
         }
 
         let current_empty_wip_count = stall_detector.current_count(change_id, StallPhase::Apply);
@@ -1310,7 +1375,12 @@ where
                                 .await
                                 .unwrap_or(false)
                         };
-                        let reached_threshold = !is_progress_complete(&new_progress)
+                        // A checkbox-complete but format-invalid tasks.md is not an
+                        // acceptance-ready state, so it must stay subject to stall
+                        // detection instead of looping until max iterations.
+                        let acceptance_ready = is_progress_complete(&new_progress)
+                            && check_task_format(workspace_path, change_id).is_empty();
+                        let reached_threshold = !acceptance_ready
                             && stall_detector.register_commit(
                                 change_id,
                                 StallPhase::Apply,
@@ -1362,6 +1432,8 @@ where
                                         );
                                         if status.success()
                                             && is_progress_complete(&diagnosed_progress)
+                                            && check_task_format(workspace_path, change_id)
+                                                .is_empty()
                                         {
                                             new_progress = diagnosed_progress;
                                             stall_detector.clear_change(change_id);
@@ -1400,8 +1472,16 @@ where
             debug!("Skipping WIP snapshot for {} (non-Git backend)", change_id);
         }
 
-        // Check if complete
-        if is_progress_complete(&new_progress) {
+        // Check if complete. A completed checkbox set with an invalid active-section
+        // bullet must not proceed to acceptance: keep the change in apply so the
+        // next attempt repairs the format without consuming an acceptance cycle.
+        let post_apply_task_format_findings = if is_progress_complete(&new_progress) {
+            task_format_blocks_acceptance(workspace_path, change_id)
+        } else {
+            Vec::new()
+        };
+
+        if is_progress_complete(&new_progress) && post_apply_task_format_findings.is_empty() {
             // Run on_change_complete hook
             if let Some(hook_runner) = hooks {
                 let current_hook_ctx = hook_ctx.build_hook_context(
@@ -1513,7 +1593,7 @@ mod tests {
             ..Default::default()
         };
 
-        let prompt = build_apply_prompt(&config, "change-a", "history ctx", "acceptance ctx");
+        let prompt = build_apply_prompt(&config, "change-a", "history ctx", "acceptance ctx", "");
 
         assert!(prompt.contains("change_id: change-a"));
         assert!(prompt.ends_with("apply tail {change_id}"));
@@ -2524,6 +2604,286 @@ mod tests {
         assert_eq!(
             result.iterations, 1,
             "blocked-handoff grace-terminated run should exit in a single iteration"
+        );
+    }
+
+    // === Pre-accept task-format gate ===
+
+    /// All checkboxes complete, but an active section carries a top-level
+    /// evidence bullet the validator rejects.
+    const COMPLETED_BUT_MALFORMED_TASKS: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] Implement the gate\n",
+        "- evidence: cargo test passed\n",
+    );
+
+    const COMPLETED_AND_VALID_TASKS: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] Implement the gate\n",
+        "\n",
+        "## Notes\n",
+        "- evidence: cargo test passed\n",
+    );
+
+    fn write_tasks(workspace: &Path, change_id: &str, content: &str) {
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), content).unwrap();
+    }
+
+    /// Stand-in for the acceptance dispatch decision the callers make from
+    /// `ApplyLoopResult::completed`. Counts how many acceptance attempts the
+    /// apply outcome would consume.
+    fn count_acceptance_dispatch(result: &Result<ApplyLoopResult>) -> u32 {
+        match result {
+            Ok(loop_result) if loop_result.completed => 1,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn check_task_format_reports_active_section_evidence_bullet() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        write_tasks(workspace, "change-a", COMPLETED_BUT_MALFORMED_TASKS);
+
+        let diagnostics = check_task_format(workspace, "change-a");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].contains("tasks.md:3"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].contains("Possible task without checkbox"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn check_task_format_accepts_valid_completed_tasks() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        write_tasks(workspace, "change-a", COMPLETED_AND_VALID_TASKS);
+
+        assert!(check_task_format(workspace, "change-a").is_empty());
+    }
+
+    #[test]
+    fn pending_task_format_repair_is_silent_while_tasks_are_incomplete() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        write_tasks(
+            workspace,
+            "change-a",
+            "## Implementation Tasks\n- [ ] pending\n- evidence: partial\n",
+        );
+
+        assert!(
+            pending_task_format_repair(workspace, "change-a").is_empty(),
+            "the pre-accept gate only fires once checkbox progress reads complete"
+        );
+    }
+
+    #[test]
+    fn restart_derives_the_same_pending_task_format_repair() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        write_tasks(workspace, "change-a", COMPLETED_BUT_MALFORMED_TASKS);
+
+        let first = pending_task_format_repair(workspace, "change-a");
+        assert!(!first.is_empty());
+
+        // Simulate a restart: no runtime state survives, and any external logs
+        // are gone. The next action is re-derived from the workspace alone.
+        let restarted = pending_task_format_repair(workspace, "change-a");
+        assert_eq!(
+            first, restarted,
+            "restart must derive the identical pending repair from repository state"
+        );
+
+        let repair_prompt = crate::agent::build_task_format_repair_context(&restarted);
+        assert!(repair_prompt.contains("tasks.md:3"), "{repair_prompt}");
+        assert!(
+            repair_prompt.contains("Possible task without checkbox"),
+            "{repair_prompt}"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn malformed_completed_task_file_stays_in_apply() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "format-gate";
+        write_tasks(workspace, change_id, COMPLETED_BUT_MALFORMED_TASKS);
+
+        let config = OrchestratorConfig {
+            // Apply does nothing, so tasks.md stays malformed.
+            apply_command: Some("true".to_string()),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: false,
+                threshold: 3,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            Some(&workspace_manager),
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            0,
+            "a malformed completed task file must not consume an acceptance attempt"
+        );
+        assert!(
+            result.is_err(),
+            "apply must stay in apply rather than report completion"
+        );
+        // The diagnostic the next apply attempt receives stays derivable from the worktree.
+        let diagnostics = pending_task_format_repair(workspace, change_id);
+        assert!(!diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(diagnostics[0].contains("tasks.md:3"), "{diagnostics:?}");
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn corrected_task_file_proceeds_to_acceptance() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "format-repair";
+        write_tasks(workspace, change_id, COMPLETED_BUT_MALFORMED_TASKS);
+
+        let config = OrchestratorConfig {
+            // Apply repairs the malformed bullet while keeping the completed
+            // implementation evidence.
+            apply_command: Some(
+                "sh -c 'printf \"## Implementation Tasks\\n- [x] Implement the gate\\n\\n## Notes\\n- evidence: cargo test passed\\n\" > openspec/changes/{change_id}/tasks.md'"
+                    .to_string(),
+            ),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: false,
+                threshold: 3,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(3),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            Some(&workspace_manager),
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            1,
+            "the repaired task file must hand off to acceptance exactly once: {:?}",
+            result.as_ref().err().map(|e| e.to_string())
+        );
+        let loop_result = result.expect("repaired task format should complete apply");
+        assert!(loop_result.completed);
+        assert!(check_task_format(workspace, change_id).is_empty());
+        assert!(
+            check_task_progress(workspace, change_id)
+                .map(|progress| is_progress_complete(&progress))
+                .unwrap_or(false),
+            "completed implementation evidence must survive the repair"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn valid_completed_task_file_preserves_existing_handoff() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "format-valid";
+        write_tasks(workspace, change_id, COMPLETED_AND_VALID_TASKS);
+
+        let config = OrchestratorConfig {
+            // Any apply invocation would mean the gate cost an extra agent cycle.
+            apply_command: Some("false".to_string()),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = execute_apply_loop(
+            change_id,
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            Some(&workspace_manager),
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            |_line| async move {},
+        )
+        .await;
+
+        assert_eq!(
+            count_acceptance_dispatch(&result),
+            1,
+            "a valid completed task file keeps the existing acceptance handoff"
+        );
+        let loop_result = result.expect("valid completed task file should complete apply");
+        assert!(loop_result.completed);
+        assert_eq!(
+            loop_result.iterations, 1,
+            "the gate must not add an agent cycle for an already-valid task file"
         );
     }
 }

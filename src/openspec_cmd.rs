@@ -8,7 +8,7 @@ mod dependency_status;
 mod model;
 mod promotion;
 mod rendering;
-mod validation;
+pub(crate) mod validation;
 
 use crate::archive_layout;
 use archive::ArchiveEngine;
@@ -593,6 +593,161 @@ mod validation_tests {
             assert!(errors.is_empty(), "unexpected errors: {errors:?}");
             assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         }
+    }
+
+    /// Narrative metadata that apply guidance tells agents to write. None of it
+    /// may be reported as unchecked implementation work, and none of it may be
+    /// counted as task progress.
+    const NARRATIVE_SECTIONS_TASKS: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] Implement classifier (verification: unit - cargo test openspec_cmd --lib)\n",
+        "\n",
+        "## Final Validation\n",
+        "\n",
+        "Archive validation is the authoritative gate.\n",
+        "- expected command: `cflx openspec validate alpha --archive-gate`\n",
+        "\n",
+        "## Implementation Blocker #1\n",
+        "- category: external_non_mockable\n",
+        "- summary: vendor approval is unavailable\n",
+        "- evidence:\n",
+        "   - src/openspec_cmd/validation.rs:1\n",
+        "- owner: platform\n",
+        "\n",
+        "## Future Work\n",
+        "- Manual verification required\n",
+        "\n",
+        "## Out of Scope\n",
+        "- Rewriting arbitrary markdown bullets\n",
+        "\n",
+        "## Notes\n",
+        "- Background context only\n",
+        "\n",
+        "## Acceptance Notes\n",
+        "- Longer narrative evidence lives here\n",
+    );
+
+    #[test]
+    fn narrative_sections_permit_non_checkbox_bullets() {
+        for (strict, evidence_mode) in [(false, "off"), (true, "error")] {
+            let (errors, warnings) = validate_tasks_content(
+                NARRATIVE_SECTIONS_TASKS,
+                "alpha",
+                strict,
+                evidence_mode,
+                Some("implementation"),
+                None,
+            );
+            assert!(
+                errors.is_empty(),
+                "narrative bullets must not be reported as tasks (strict={strict}): {errors:?}"
+            );
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn narrative_sections_are_excluded_from_task_counting() {
+        let (completed, total) = count_tasks(NARRATIVE_SECTIONS_TASKS);
+        assert_eq!((completed, total), (1, 1));
+    }
+
+    #[test]
+    fn narrative_sections_reject_checkboxes() {
+        for heading in [
+            "## Final Validation",
+            "## Implementation Blocker #2",
+            "## Future Work",
+            "## Out of Scope",
+            "## Notes",
+            "## Acceptance Notes",
+        ] {
+            let content = format!("{heading}\n- [ ] Should not have checkbox\n");
+            let (errors, _) = validate_tasks_content(&content, "alpha", false, "off", None, None);
+            assert!(
+                errors.iter().any(|e| e.contains("excluded section")),
+                "{heading} must reject checkbox tasks: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_section_rejects_bare_evidence_bullet() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [x] Implement gate (verification: unit - cargo test execution::apply --lib)\n",
+            "- evidence: cargo test passed\n",
+        );
+        let (errors, _) = validate_tasks_content(content, "alpha", false, "off", None, None);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("tasks.md:3") && e.contains("Possible task without checkbox")),
+            "active-section evidence bullet must stay invalid: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn section_transition_restores_active_validation() {
+        let content = concat!(
+            "## Final Validation\n",
+            "- expected command: `cflx openspec validate alpha --archive-gate`\n",
+            "\n",
+            "## Implementation Tasks\n",
+            "- bare task in active section\n",
+        );
+        let (errors, _) = validate_tasks_content(content, "alpha", false, "off", None, None);
+        assert_eq!(
+            errors.len(),
+            1,
+            "only the active-section bare bullet is rejected: {errors:?}"
+        );
+        assert!(errors[0].contains("tasks.md:5"), "{errors:?}");
+        assert!(
+            errors[0].contains("Possible task without checkbox"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_follow_up_keeps_dedicated_classification() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [x] Implement gate (verification: unit - cargo test execution::apply --lib)\n",
+            "\n",
+            "## Current Acceptance Follow-up\n",
+            "attempt: 2\n",
+            "- [x] [ARCHIVE_GATE_TASK_FORMAT] tasks.md bullets are malformed\n",
+            "  evidence: converted evidence bullet to a narrative note\n",
+        );
+        let (errors, warnings) = validate_tasks_content(
+            content,
+            "alpha",
+            true,
+            "error",
+            Some("implementation"),
+            None,
+        );
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        // Runtime-owned findings remain checkbox tasks for progress accounting.
+        assert_eq!(count_tasks(content), (2, 2));
+    }
+
+    #[test]
+    fn validate_task_format_reports_only_format_findings() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [x] Implement gate\n",
+            "- evidence: cargo test passed\n",
+        );
+        let errors = crate::openspec_cmd::validation::validate_task_format(content, "alpha");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("Possible task without checkbox"),
+            "{errors:?}"
+        );
     }
 
     #[test]

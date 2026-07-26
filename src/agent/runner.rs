@@ -5,6 +5,7 @@ use super::output::OutputLine;
 use super::prompt::{
     build_acceptance_prompt_context_only_with_skill, build_acceptance_prompt_with_skill,
     build_apply_prompt_with_skill, build_archive_prompt_with_skill,
+    build_task_format_repair_context,
 };
 use crate::ai_command_runner::OutputLine as AiOutputLine;
 use crate::command_queue::{CommandQueue, CommandQueueConfig, StreamingOutputLine};
@@ -23,6 +24,19 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+/// Derive the pre-accept task-format repair context from workspace state.
+///
+/// `cwd` is the apply workspace (worktree in parallel mode, repository root in
+/// serial mode). The diagnostics are recomputed from the workspace-local
+/// `tasks.md` on every attempt, so a restart reproduces the same repair
+/// instruction without any durable runtime state.
+fn task_format_repair_context_for(cwd: Option<&Path>, change_id: &str) -> String {
+    let workspace_path = cwd.unwrap_or_else(|| Path::new("."));
+    let diagnostics =
+        crate::execution::apply::pending_task_format_repair(workspace_path, change_id);
+    build_task_format_repair_context(&diagnostics)
+}
 
 fn bridge_ai_output_channel(
     mut ai_rx: mpsc::Receiver<crate::ai_command_runner::OutputLine>,
@@ -174,6 +188,8 @@ impl AgentRunner {
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
 
+        let task_format_context = task_format_repair_context_for(cwd, change_id);
+
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
         let full_prompt = build_apply_prompt_with_skill(
             self.config.get_apply_skill(),
@@ -181,6 +197,7 @@ impl AgentRunner {
             user_prompt,
             &history_context,
             &acceptance_tail,
+            &task_format_context,
         );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
@@ -226,6 +243,7 @@ impl AgentRunner {
         // Then get immutable data
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
+        let task_format_context = task_format_repair_context_for(cwd, change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
         let full_prompt = build_apply_prompt_with_skill(
@@ -234,6 +252,7 @@ impl AgentRunner {
             user_prompt,
             &history_context,
             &acceptance_tail,
+            &task_format_context,
         );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
@@ -497,6 +516,7 @@ impl AgentRunner {
         let template = self.config.get_apply_command()?;
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
+        let task_format_context = task_format_repair_context_for(None, change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
         let full_prompt = build_apply_prompt_with_skill(
@@ -505,6 +525,7 @@ impl AgentRunner {
             user_prompt,
             &history_context,
             &acceptance_tail,
+            &task_format_context,
         );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);
@@ -549,6 +570,7 @@ impl AgentRunner {
         let template = self.config.get_apply_command()?;
         let user_prompt = self.config.get_apply_prompt();
         let history_context = self.apply_history.format_context(change_id);
+        let task_format_context = task_format_repair_context_for(None, change_id);
 
         // Build full prompt: user_prompt + system_prompt + acceptance_tail + history_context
         let full_prompt = build_apply_prompt_with_skill(
@@ -557,6 +579,7 @@ impl AgentRunner {
             user_prompt,
             &history_context,
             &acceptance_tail,
+            &task_format_context,
         );
 
         let command = expand_command_with_prompt(template, Some(change_id), &full_prompt);

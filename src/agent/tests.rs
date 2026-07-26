@@ -171,7 +171,13 @@ fn test_build_apply_prompt_with_all_parts() {
     let user_prompt = "Focus on implementation.";
     let history_context = "Previous attempt failed.";
     let acceptance_tail = "";
-    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt(
+        "my-change",
+        user_prompt,
+        history_context,
+        acceptance_tail,
+        "",
+    );
 
     assert!(result.contains("Focus on implementation."));
     assert!(result.contains("Previous attempt failed."));
@@ -182,7 +188,13 @@ fn test_build_apply_prompt_with_empty_user_prompt() {
     let user_prompt = "";
     let history_context = "Previous attempt failed.";
     let acceptance_tail = "";
-    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt(
+        "my-change",
+        user_prompt,
+        history_context,
+        acceptance_tail,
+        "",
+    );
 
     assert!(result.contains("Previous attempt failed."));
 }
@@ -192,7 +204,13 @@ fn test_build_apply_prompt_with_empty_history() {
     let user_prompt = "Focus on implementation.";
     let history_context = "";
     let acceptance_tail = "";
-    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt(
+        "my-change",
+        user_prompt,
+        history_context,
+        acceptance_tail,
+        "",
+    );
 
     assert!(result.contains("Focus on implementation."));
 }
@@ -202,7 +220,13 @@ fn test_build_apply_prompt_with_only_system_prompt() {
     let user_prompt = "";
     let history_context = "";
     let acceptance_tail = "";
-    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt(
+        "my-change",
+        user_prompt,
+        history_context,
+        acceptance_tail,
+        "",
+    );
 
     assert!(result.contains("$cflx-apply"));
     assert!(result.contains("load skills: cflx-apply"));
@@ -216,7 +240,7 @@ fn test_build_apply_prompt_with_only_system_prompt() {
 
 #[test]
 fn test_build_apply_prompt_keeps_fixed_guidance_out_of_variable_context() {
-    let result = build_apply_prompt("real-change", "", "", "");
+    let result = build_apply_prompt("real-change", "", "", "", "");
 
     assert!(!result.contains("Modify repository source, test, or config files"));
     assert!(!result.contains("git diff --stat shows real non-OpenSpec implementation"));
@@ -229,7 +253,13 @@ fn test_build_apply_prompt_with_acceptance_tail() {
     let history_context = "<last_apply attempt=\"1\">\nstatus: failed\n</last_apply>";
     let acceptance_tail =
         "<last_acceptance_output>\nTest failure detected\n</last_acceptance_output>";
-    let result = build_apply_prompt("my-change", user_prompt, history_context, acceptance_tail);
+    let result = build_apply_prompt(
+        "my-change",
+        user_prompt,
+        history_context,
+        acceptance_tail,
+        "",
+    );
 
     // Check all parts are present
     assert!(result.contains("Focus on implementation."));
@@ -261,7 +291,7 @@ fn test_build_apply_prompt_with_canonical_acceptance_findings() {
         "add regression test".to_string(),
         "missing repository coverage".to_string(),
     ]);
-    let result = build_apply_prompt("my-change", "", "", &context);
+    let result = build_apply_prompt("my-change", "", "", &context, "");
 
     assert!(result.contains("<acceptance_findings_json>"));
     assert_eq!(result.matches("missing repository coverage").count(), 1);
@@ -391,4 +421,115 @@ fn test_build_archive_prompt_both_empty() {
     assert!(result.contains("$cflx-archive"));
     assert!(result.contains("load skills: cflx-archive"));
     assert!(result.contains("change_id: my-change"));
+}
+
+// === Pre-accept task-format repair context ===
+
+#[test]
+fn task_format_repair_context_is_empty_without_diagnostics() {
+    assert!(build_task_format_repair_context(&[]).is_empty());
+    assert!(build_task_format_repair_context(&["   ".to_string()]).is_empty());
+}
+
+#[test]
+fn task_format_repair_context_identifies_failing_lines_and_rules() {
+    let diagnostics = vec![
+        "alpha: tasks.md:3: Possible task without checkbox: - evidence: cargo test passed"
+            .to_string(),
+        "alpha: tasks.md:9: Checkbox found in excluded section (should be removed)".to_string(),
+    ];
+    let context = build_task_format_repair_context(&diagnostics);
+
+    assert!(context.contains("<task_format_repair_required>"));
+    assert!(context.contains("</task_format_repair_required>"));
+    assert!(context.contains("tasks.md:3"), "{context}");
+    assert!(context.contains("tasks.md:9"), "{context}");
+    assert!(
+        context.contains("Possible task without checkbox"),
+        "{context}"
+    );
+    // The canonical repair rules must travel with the diagnostics.
+    assert!(
+        context.contains("`  evidence: <one-line evidence>`"),
+        "{context}"
+    );
+    assert!(
+        context.contains("Do not uncheck completed tasks"),
+        "{context}"
+    );
+}
+
+#[test]
+fn task_format_repair_context_bounds_large_diagnostic_lists() {
+    let diagnostics: Vec<String> = (1..=30)
+        .map(|line| format!("alpha: tasks.md:{line}: Possible task without checkbox: - note"))
+        .collect();
+    let context = build_task_format_repair_context(&diagnostics);
+
+    assert!(context.contains("tasks.md:20"), "{context}");
+    assert!(!context.contains("tasks.md:21:"), "{context}");
+    assert!(
+        context.contains("and 10 more task-format finding(s)"),
+        "{context}"
+    );
+}
+
+#[test]
+fn apply_prompt_carries_task_format_repair_before_history() {
+    let task_format_context = build_task_format_repair_context(&[
+        "alpha: tasks.md:3: Possible task without checkbox: - evidence: cargo test passed"
+            .to_string(),
+    ]);
+    let history_context = "<last_apply attempt=\"1\">\nstatus: ok\n</last_apply>";
+    let result = build_apply_prompt("alpha", "", history_context, "", &task_format_context);
+
+    assert!(result.contains("<task_format_repair_required>"));
+    assert!(result.contains("tasks.md:3"));
+
+    let repair_pos = result.find("<task_format_repair_required>").unwrap();
+    let history_pos = result.find("<last_apply attempt=\"1\">").unwrap();
+    assert!(
+        repair_pos < history_pos,
+        "the blocking repair instruction must precede historical context"
+    );
+}
+
+#[test]
+fn apply_prompt_omits_task_format_block_when_format_is_valid() {
+    let result = build_apply_prompt("alpha", "", "", "", "");
+    assert!(!result.contains("<task_format_repair_required>"));
+}
+
+#[test]
+fn task_format_repair_context_names_the_canonical_narrative_sections() {
+    use crate::openspec_cmd::validation::{classify_task_section, TaskSectionKind};
+
+    let context = build_task_format_repair_context(&[
+        "alpha: tasks.md:3: Possible task without checkbox: - evidence: cargo test passed"
+            .to_string(),
+    ]);
+
+    for heading in [
+        "Final Validation",
+        "Implementation Blocker",
+        "Future Work",
+        "Out of Scope",
+        "Notes",
+        "Acceptance Notes",
+    ] {
+        assert!(
+            context.contains(heading),
+            "repair guidance must name narrative section '{heading}': {context}"
+        );
+        assert_eq!(
+            classify_task_section(&format!("## {heading}")),
+            TaskSectionKind::Narrative,
+            "prompt guidance and native classifier must agree on '{heading}'"
+        );
+    }
+
+    assert!(
+        context.contains("never `- evidence:`"),
+        "repair guidance must forbid the top-level evidence bullet: {context}"
+    );
 }
