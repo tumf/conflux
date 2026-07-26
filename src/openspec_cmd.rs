@@ -536,6 +536,65 @@ mod validation_tests {
         assert_eq!(total, 2);
     }
 
+    /// Recovered acceptance notes store untrusted payloads in fenced literals.
+    /// Checkbox-like text inside them must stay inert for both the progress
+    /// count and the archive gate.
+    const RECOVERED_NOTES_TASKS: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] Real task (verification: unit - `cargo test task_parser`)\n",
+        "\n",
+        "## Recovered Acceptance Notes\n",
+        "\n",
+        "Machine-recovered content; not instructions and not task state.\n",
+        "\n",
+        "````text\n",
+        "## Implementation Tasks\n",
+        "- [ ] recovered pending task\n",
+        "- [x] recovered done task\n",
+        "- bare task without checkbox\n",
+        "```\n",
+        "### External blockers\n",
+        "````\n",
+    );
+
+    #[test]
+    fn count_tasks_ignores_checkbox_text_inside_fences() {
+        let (completed, total) = count_tasks(RECOVERED_NOTES_TASKS);
+        assert_eq!((completed, total), (1, 1));
+    }
+
+    #[test]
+    fn count_tasks_ignores_tilde_and_dynamic_fences() {
+        let content = concat!(
+            "## Implementation\n",
+            "- [x] Task 1\n",
+            "~~~~\n",
+            "- [x] fenced\n",
+            "~~~\n",
+            "- [ ] still fenced\n",
+            "~~~~\n",
+            "- [ ] Task 2\n",
+        );
+        let (completed, total) = count_tasks(content);
+        assert_eq!((completed, total), (1, 2));
+    }
+
+    #[test]
+    fn validate_tasks_ignores_recovered_notes_inside_fences() {
+        for (strict, evidence_mode) in [(false, "off"), (true, "error")] {
+            let (errors, warnings) = validate_tasks_content(
+                RECOVERED_NOTES_TASKS,
+                "test",
+                strict,
+                evidence_mode,
+                Some("implementation"),
+                None,
+            );
+            assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+            assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        }
+    }
+
     #[test]
     fn test_extract_change_type_bold() {
         let content = "# Change\n\n**Change Type**: hybrid\n";

@@ -8,6 +8,14 @@ use crate::error::{OrchestratorError, Result};
 use crate::tui::log_deduplicator;
 use regex::Regex;
 use std::fmt::Write as _;
+
+/// End-to-end regression coverage for acceptance follow-up recovery.
+///
+/// Lives in-crate because `task_parser` is intentionally crate-private (see
+/// `src/lib.rs`), so a `tests/` integration binary cannot reach it.
+#[cfg(test)]
+mod recovery_regression;
+
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::debug;
@@ -61,13 +69,20 @@ fn task_regex() -> &'static Regex {
 /// Parse task progress from markdown content.
 ///
 /// Parses each line looking for task checkboxes at the start of lines.
+/// Checkbox-like text inside fenced blocks is inert: recovered acceptance
+/// notes store untrusted payloads in fenced literals and must never change
+/// completion accounting.
 /// Returns the count of completed and total tasks.
 /// When change_id is provided, emits deduplicated debug logs.
 pub fn parse_content(content: &str, change_id: Option<&str>) -> TaskProgress {
     let regex = task_regex();
     let mut progress = TaskProgress::new();
+    let mut fences = FenceTracker::default();
 
     for line in content.lines() {
+        if fences.observe(line) {
+            continue;
+        }
         if let Some(captures) = regex.captures(line) {
             progress.total += 1;
             // Capture group 1 contains the checkbox status: ' ', 'x', or 'X'
@@ -108,10 +123,41 @@ fn read_tasks_file(path: &Path) -> Result<String> {
     })
 }
 
-fn write_tasks_file(path: &Path, content: String) -> Result<()> {
-    std::fs::write(path, content).map_err(|e| {
+/// Replace a tasks file in one atomic step.
+///
+/// The complete target content is written to a temporary file in the same
+/// directory and renamed over the destination. Any failure before the rename
+/// leaves the original file byte-for-byte unchanged.
+fn write_tasks_file_atomically(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let directory = directory.unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".tasks-")
+        .suffix(".md.tmp")
+        .tempfile_in(directory)
+        .map_err(|e| {
+            OrchestratorError::ConfigLoad(format!(
+                "Failed to stage atomic tasks update near {:?}: {}",
+                path, e
+            ))
+        })?;
+    temp.write_all(content.as_bytes()).map_err(|e| {
         OrchestratorError::ConfigLoad(format!("Failed to write tasks file {:?}: {}", path, e))
-    })
+    })?;
+    temp.as_file().sync_all().map_err(|e| {
+        OrchestratorError::ConfigLoad(format!("Failed to flush tasks file {:?}: {}", path, e))
+    })?;
+    temp.persist(path).map_err(|e| {
+        OrchestratorError::ConfigLoad(format!(
+            "Failed to atomically replace tasks file {:?}: {}",
+            path, e
+        ))
+    })?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,79 +653,328 @@ fn markdown_fence(line: &str) -> Option<(char, usize, bool)> {
     (length >= 3).then_some((marker, length, trimmed[length..].trim().is_empty()))
 }
 
-fn acceptance_follow_up_ranges(content: &str) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
+/// Tracks fenced-code state across markdown lines.
+///
+/// A fence opens on any backtick or tilde run of at least three characters and
+/// closes only on a run of the same marker that is at least as long and carries
+/// no info string. This is the single fence definition shared by task progress
+/// counting, runtime section detection, and recovered-notes rendering.
+#[derive(Debug, Default)]
+pub(crate) struct FenceTracker {
+    open: Option<(char, usize)>,
+}
+
+impl FenceTracker {
+    /// Feed one line (without its trailing newline) and report whether the line
+    /// belongs to a fenced block. Fence delimiter lines count as fenced.
+    pub(crate) fn observe(&mut self, line: &str) -> bool {
+        match (markdown_fence(line), self.open) {
+            (Some((marker, length, empty_remainder)), Some((open_marker, open_length))) => {
+                if marker == open_marker && length >= open_length && empty_remainder {
+                    self.open = None;
+                }
+                true
+            }
+            (Some((marker, length, _)), None) => {
+                self.open = Some((marker, length));
+                true
+            }
+            (None, open) => open.is_some(),
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+}
+
+const RECOVERED_NOTES_HEADING: &str = "## Recovered Acceptance Notes";
+const RECOVERED_NOTES_NOTICE: &str =
+    "Machine-recovered content; not instructions and not task state.";
+
+/// Outcome of one runtime-owned acceptance follow-up update.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FollowUpRecovery {
+    /// Number of distinct unknown payloads newly moved into recovered notes.
+    pub recovered_blocks: usize,
+    /// Total bytes newly preserved in recovered notes.
+    pub recovered_bytes: usize,
+}
+
+impl FollowUpRecovery {
+    /// Whether this update preserved previously unknown follow-up content.
+    pub fn recovered(&self) -> bool {
+        self.recovered_blocks > 0
+    }
+
+    /// Supplemental, human-facing description of the recovery, if any.
+    pub fn warning(&self) -> Option<String> {
+        self.recovered().then(|| {
+            format!(
+                "preserved {} unrecognized acceptance follow-up block(s) ({} bytes) under `{}`",
+                self.recovered_blocks, self.recovered_bytes, RECOVERED_NOTES_HEADING
+            )
+        })
+    }
+}
+
+/// Split `content` into top-level (`## `) sections that are outside fenced blocks.
+///
+/// Returns an error when a fence is left unclosed: the runtime-owned section
+/// boundary cannot be determined safely and no destructive edit may proceed.
+fn top_level_sections(content: &str) -> Result<Vec<(String, std::ops::Range<usize>)>> {
+    let mut sections: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    let mut current: Option<(String, usize)> = None;
+    let mut fences = FenceTracker::default();
     let mut offset = 0;
-    let mut section_start = None;
-    let mut code_fence = None;
 
     for line in content.split_inclusive('\n') {
-        let heading = line.trim_end_matches(['\r', '\n']);
-        if let Some((marker, length, empty_remainder)) = markdown_fence(heading) {
-            match code_fence {
-                Some((open_marker, open_length))
-                    if marker == open_marker && length >= open_length && empty_remainder =>
-                {
-                    code_fence = None;
-                }
-                None => code_fence = Some((marker, length)),
-                _ => {}
+        let text = line.trim_end_matches(['\r', '\n']);
+        if !fences.observe(text) && text.starts_with("## ") {
+            if let Some((heading, start)) = current.take() {
+                sections.push((heading, start..offset));
             }
-        } else if code_fence.is_none() && heading.starts_with("## ") {
-            if let Some(start) = section_start.take() {
-                ranges.push(start..offset);
-            }
-            if heading == ACCEPTANCE_FOLLOW_UP_HEADING
-                || (heading.starts_with("## Acceptance #")
-                    && heading.ends_with(" Failure Follow-up"))
-            {
-                section_start = Some(offset);
-            }
+            current = Some((text.to_string(), offset));
         }
         offset += line.len();
     }
 
-    if let Some(start) = section_start {
-        ranges.push(start..content.len());
+    if fences.is_open() {
+        return Err(OrchestratorError::ConfigLoad(
+            "Tasks file contains an unclosed code fence; refusing acceptance follow-up update \
+             because the runtime-owned section boundary cannot be determined safely"
+                .to_string(),
+        ));
     }
-    ranges
+
+    if let Some((heading, start)) = current {
+        sections.push((heading, start..content.len()));
+    }
+    Ok(sections)
 }
 
-fn remove_acceptance_follow_up_sections(content: &mut String) -> Result<()> {
-    let ranges = acceptance_follow_up_ranges(content);
-    for range in &ranges {
-        let section = &content[range.clone()];
-        let mut lines = section.lines();
-        let _ = lines.next();
-        // Runtime and apply agents have emitted several metadata spellings across
-        // versions (with/without leading dash); all are runtime-owned and safe to drop.
-        if lines.any(|line| {
-            let trimmed = line.trim();
-            !trimmed.is_empty()
-                && !trimmed.starts_with("- [ ] ")
-                && !trimmed.starts_with("- [x] ")
-                && !trimmed.starts_with("- [X] ")
-                && !trimmed.starts_with("- attempt: ")
-                && !trimmed.starts_with("attempt: ")
-                && trimmed != "### External blockers"
-                && !trimmed.starts_with("- identity: ")
-                && !trimmed.starts_with("evidence: ")
-                && !trimmed.starts_with("- evidence: ")
-                && !trimmed.starts_with("next action: ")
-        }) {
-            return Err(OrchestratorError::ConfigLoad(
-                "Acceptance follow-up contains non-runtime content; refusing destructive update"
-                    .to_string(),
-            ));
+fn is_acceptance_follow_up_heading(heading: &str) -> bool {
+    heading == ACCEPTANCE_FOLLOW_UP_HEADING
+        || (heading.starts_with("## Acceptance #") && heading.ends_with(" Failure Follow-up"))
+}
+
+fn acceptance_follow_up_ranges(content: &str) -> Result<Vec<std::ops::Range<usize>>> {
+    Ok(top_level_sections(content)?
+        .into_iter()
+        .filter(|(heading, _)| is_acceptance_follow_up_heading(heading))
+        .map(|(_, range)| range)
+        .collect())
+}
+
+/// Whether a follow-up body line is a runtime-owned record.
+///
+/// Runtime and apply agents have emitted several metadata spellings across
+/// versions (with/without leading dash, varying capitalization); all are
+/// runtime-owned and are regenerated rather than preserved.
+fn is_known_runtime_follow_up_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered == "### external blockers" {
+        return true;
+    }
+    const KNOWN_PREFIXES: [&str; 10] = [
+        "- [ ]",
+        "- [x]",
+        "- attempt:",
+        "attempt:",
+        "- identity:",
+        "identity:",
+        "- evidence:",
+        "evidence:",
+        "- next action:",
+        "next action:",
+    ];
+    KNOWN_PREFIXES
+        .iter()
+        .any(|prefix| lowered.starts_with(prefix))
+}
+
+/// Extract the unknown bytes of one runtime-owned follow-up section.
+///
+/// Recognized runtime records are dropped (runtime regenerates them); every
+/// other line is preserved with its original bytes. Only trailing newlines are
+/// dropped, because the fenced literal supplies its own terminator.
+fn unknown_follow_up_payload(section: &str) -> String {
+    let mut payload = String::new();
+    // Blank lines only belong to the payload when they separate unknown lines,
+    // so paragraph breaks inside recovered prose survive while runtime spacing
+    // is dropped.
+    let mut pending_blank = String::new();
+    // Runtime records only exist outside fences: checkbox or metadata text
+    // inside a pasted transcript is unknown payload, not a runtime record.
+    let mut fences = FenceTracker::default();
+    let mut lines = section.split_inclusive('\n');
+    let _heading = lines.next();
+
+    for line in lines {
+        let text = line.trim_end_matches(['\r', '\n']);
+        let fenced = fences.observe(text);
+        if !fenced && text.trim().is_empty() {
+            pending_blank.push_str(line);
+            continue;
+        }
+        if !fenced && is_known_runtime_follow_up_line(text) {
+            pending_blank.clear();
+            continue;
+        }
+        if !payload.is_empty() {
+            payload.push_str(&pending_blank);
+        }
+        pending_blank.clear();
+        payload.push_str(line);
+    }
+
+    while payload.ends_with('\n') || payload.ends_with('\r') {
+        payload.pop();
+    }
+    payload
+}
+
+/// Length of the backtick fence that safely encloses `payload`.
+///
+/// One character longer than the longest contiguous backtick run inside the
+/// payload, and never shorter than three, so embedded fences, headings, and
+/// checkbox syntax cannot escape into active Markdown.
+fn recovered_fence_length(payload: &str) -> usize {
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for character in payload.chars() {
+        if character == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
         }
     }
-    for range in ranges.into_iter().rev() {
-        content.replace_range(range, "");
+    longest.saturating_add(1).max(3)
+}
+
+/// Read back the payloads already stored in a recovered-notes section.
+///
+/// Payload bytes are the deduplication identity, so they are compared exactly
+/// as they were rendered.
+fn recovered_payloads(section: &str) -> Vec<String> {
+    let mut payloads = Vec::new();
+    let mut open: Option<(char, usize)> = None;
+    let mut current = String::new();
+
+    for line in section.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        match (markdown_fence(text), open) {
+            (Some((marker, length, empty_remainder)), Some((open_marker, open_length))) => {
+                if marker == open_marker && length >= open_length && empty_remainder {
+                    let mut payload = std::mem::take(&mut current);
+                    while payload.ends_with('\n') || payload.ends_with('\r') {
+                        payload.pop();
+                    }
+                    payloads.push(payload);
+                    open = None;
+                } else {
+                    current.push_str(line);
+                }
+            }
+            (Some((marker, length, _)), None) => open = Some((marker, length)),
+            (None, Some(_)) => current.push_str(line),
+            (None, None) => {}
+        }
     }
+    payloads
+}
+
+fn render_recovered_notes_section(payloads: &[String]) -> String {
+    let mut section = format!("{RECOVERED_NOTES_HEADING}\n\n{RECOVERED_NOTES_NOTICE}\n");
+    for payload in payloads {
+        let fence = "`".repeat(recovered_fence_length(payload));
+        let _ = write!(&mut section, "\n{fence}text\n{payload}\n{fence}\n");
+    }
+    section
+}
+
+fn ensure_blank_line_separator(content: &mut String) {
+    if content.is_empty() {
+        return;
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.ends_with("\n\n") {
+        content.push('\n');
+    }
+}
+
+fn trim_trailing_blank_lines(content: &mut String) {
     while content.ends_with("\n\n\n") {
         content.pop();
     }
-    Ok(())
+}
+
+/// Merge newly recovered payloads into `## Recovered Acceptance Notes`.
+///
+/// Identical payload bytes are never appended twice, so hydration, retry,
+/// restart, and repeated normalization converge on the same file.
+fn merge_recovered_notes(content: &mut String, payloads: Vec<String>) -> Result<FollowUpRecovery> {
+    let mut recovery = FollowUpRecovery::default();
+    if payloads.is_empty() {
+        return Ok(recovery);
+    }
+
+    let existing_range = top_level_sections(content)?
+        .into_iter()
+        .find(|(heading, _)| heading == RECOVERED_NOTES_HEADING)
+        .map(|(_, range)| range);
+    let mut known = existing_range
+        .as_ref()
+        .map(|range| recovered_payloads(&content[range.clone()]))
+        .unwrap_or_default();
+
+    for payload in payloads {
+        if known.contains(&payload) {
+            continue;
+        }
+        recovery.recovered_blocks += 1;
+        recovery.recovered_bytes += payload.len();
+        known.push(payload);
+    }
+    if !recovery.recovered() {
+        return Ok(recovery);
+    }
+
+    let rendered = render_recovered_notes_section(&known);
+    match existing_range {
+        Some(range) => {
+            let trailing = if range.end == content.len() { "" } else { "\n" };
+            content.replace_range(range, &format!("{rendered}{trailing}"));
+        }
+        None => {
+            ensure_blank_line_separator(content);
+            content.push_str(&rendered);
+        }
+    }
+    Ok(recovery)
+}
+
+/// Remove every runtime-owned follow-up section, preserving unknown content.
+fn strip_and_recover_follow_up_sections(content: &mut String) -> Result<FollowUpRecovery> {
+    let ranges = acceptance_follow_up_ranges(content)?;
+    let payloads = ranges
+        .iter()
+        .map(|range| unknown_follow_up_payload(&content[range.clone()]))
+        .filter(|payload| !payload.is_empty())
+        .collect::<Vec<_>>();
+
+    for range in ranges.into_iter().rev() {
+        content.replace_range(range, "");
+    }
+    trim_trailing_blank_lines(content);
+    merge_recovered_notes(content, payloads)
 }
 
 fn upsert_acceptance_follow_up_section(
@@ -688,14 +983,9 @@ fn upsert_acceptance_follow_up_section(
     findings: &[crate::orchestration::acceptance::NormalizedFinding],
     completed_identities: &[String],
     evidence_by_identity: &std::collections::HashMap<String, Vec<String>>,
-) -> Result<()> {
-    remove_acceptance_follow_up_sections(content)?;
-    if !content.ends_with('\n') {
-        content.push('\n');
-    }
-    if !content.ends_with("\n\n") {
-        content.push('\n');
-    }
+) -> Result<FollowUpRecovery> {
+    let recovery = strip_and_recover_follow_up_sections(content)?;
+    ensure_blank_line_separator(content);
     let _ = writeln!(content, "{ACCEPTANCE_FOLLOW_UP_HEADING}");
     content.push_str(&render_acceptance_follow_up_section(
         attempt,
@@ -703,7 +993,7 @@ fn upsert_acceptance_follow_up_section(
         completed_identities,
         evidence_by_identity,
     ));
-    Ok(())
+    Ok(recovery)
 }
 
 pub fn resolve_acceptance_follow_up_tasks_path(
@@ -758,32 +1048,36 @@ pub fn resolve_acceptance_follow_up_tasks_path_for_cleanup(
         .filter(|tasks_path| tasks_path.exists()))
 }
 
-pub fn replace_acceptance_follow_up_from_latest_fail(
-    tasks_path: &Path,
+/// Build the replacement `tasks.md` for a latest-FAIL follow-up rewrite.
+///
+/// Pure: no filesystem access, so recovery, preservation, deduplication, and
+/// hard-error boundaries are unit-testable in memory.
+fn plan_replace_acceptance_follow_up(
+    content: &str,
     attempt: u32,
     findings: &[String],
-) -> Result<()> {
-    let mut content = read_tasks_file(tasks_path)?;
+) -> Result<(String, FollowUpRecovery)> {
+    let mut content = content.to_string();
     let normalized_findings = normalize_acceptance_findings(findings);
-
-    upsert_acceptance_follow_up_section(
+    let recovery = upsert_acceptance_follow_up_section(
         &mut content,
         attempt,
         &normalized_findings,
         &[],
         &std::collections::HashMap::new(),
     )?;
-    write_tasks_file(tasks_path, content)
+    Ok((content, recovery))
 }
 
-pub fn merge_acceptance_follow_up_apply_progress(
-    tasks_path: &Path,
+/// Build the replacement `tasks.md` for apply-side follow-up reconciliation.
+fn plan_merge_acceptance_follow_up(
+    content: &str,
     attempt: u32,
     findings: &[String],
-) -> Result<()> {
-    let mut content = read_tasks_file(tasks_path)?;
+) -> Result<(String, FollowUpRecovery)> {
+    let mut content = content.to_string();
     let normalized_findings = normalize_acceptance_findings(findings);
-    let existing_section = acceptance_follow_up_ranges(&content)
+    let existing_section = acceptance_follow_up_ranges(&content)?
         .first()
         .map(|range| content[range.clone()].to_string())
         .unwrap_or_default();
@@ -791,19 +1085,48 @@ pub fn merge_acceptance_follow_up_apply_progress(
     let (merged_findings, completed_identities, evidence_by_identity) =
         reconcile_apply_progress(normalized_findings, &existing_findings);
 
-    upsert_acceptance_follow_up_section(
+    let recovery = upsert_acceptance_follow_up_section(
         &mut content,
         attempt,
         &merged_findings,
         &completed_identities,
         &evidence_by_identity,
     )?;
-    write_tasks_file(tasks_path, content)
+    Ok((content, recovery))
+}
+
+/// Build the replacement `tasks.md` for acceptance PASS cleanup.
+fn plan_clear_acceptance_follow_up(content: &str) -> Result<(String, FollowUpRecovery)> {
+    let mut content = content.to_string();
+    let recovery = strip_and_recover_follow_up_sections(&mut content)?;
+    Ok((content, recovery))
+}
+
+pub fn replace_acceptance_follow_up_from_latest_fail(
+    tasks_path: &Path,
+    attempt: u32,
+    findings: &[String],
+) -> Result<FollowUpRecovery> {
+    let original = read_tasks_file(tasks_path)?;
+    let (content, recovery) = plan_replace_acceptance_follow_up(&original, attempt, findings)?;
+    write_tasks_file_atomically(tasks_path, &content)?;
+    Ok(recovery)
+}
+
+pub fn merge_acceptance_follow_up_apply_progress(
+    tasks_path: &Path,
+    attempt: u32,
+    findings: &[String],
+) -> Result<FollowUpRecovery> {
+    let original = read_tasks_file(tasks_path)?;
+    let (content, recovery) = plan_merge_acceptance_follow_up(&original, attempt, findings)?;
+    write_tasks_file_atomically(tasks_path, &content)?;
+    Ok(recovery)
 }
 
 pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<String>)>> {
     let content = read_tasks_file(tasks_path)?;
-    let ranges = acceptance_follow_up_ranges(&content);
+    let ranges = acceptance_follow_up_ranges(&content)?;
     let Some(range) = ranges.last() else {
         return Ok(None);
     };
@@ -849,10 +1172,13 @@ pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<S
     Ok((!findings.is_empty()).then_some((attempt, findings)))
 }
 
-pub fn clear_acceptance_follow_up(tasks_path: &Path) -> Result<()> {
-    let mut content = read_tasks_file(tasks_path)?;
-    remove_acceptance_follow_up_sections(&mut content)?;
-    write_tasks_file(tasks_path, content)
+pub fn clear_acceptance_follow_up(tasks_path: &Path) -> Result<FollowUpRecovery> {
+    let original = read_tasks_file(tasks_path)?;
+    let (content, recovery) = plan_clear_acceptance_follow_up(&original)?;
+    if content != original {
+        write_tasks_file_atomically(tasks_path, &content)?;
+    }
+    Ok(recovery)
 }
 
 #[cfg(test)]
@@ -1320,16 +1646,19 @@ mod tests {
     }
 
     #[test]
-    fn clear_acceptance_follow_up_rejects_non_runtime_section_content() {
+    fn clear_acceptance_follow_up_recovers_non_runtime_section_content() {
         let dir = tempfile::tempdir().unwrap();
         let tasks_path = dir.path().join("tasks.md");
         let original = "## Current Acceptance Follow-up\n- [x] fixed\n```md\n## injected\n```\n";
         std::fs::write(&tasks_path, original).unwrap();
 
-        let error = clear_acceptance_follow_up(&tasks_path).unwrap_err();
+        let recovery = clear_acceptance_follow_up(&tasks_path).unwrap();
 
-        assert!(error.to_string().contains("non-runtime content"));
-        assert_eq!(std::fs::read_to_string(&tasks_path).unwrap(), original);
+        assert_eq!(recovery.recovered_blocks, 1);
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(!content.contains("## Current Acceptance Follow-up"));
+        assert!(content.contains(RECOVERED_NOTES_HEADING));
+        assert!(content.contains("````text\n```md\n## injected\n```\n````"));
     }
 
     #[test]
@@ -2373,5 +2702,295 @@ mod tests {
 
         // Restore directory
         env::set_current_dir(original_dir).unwrap();
+    }
+}
+
+/// Unit coverage for acceptance follow-up recovery.
+///
+/// These cases exercise the pure planning functions only: no filesystem, VCS,
+/// process, clock, or network boundary participates, so recovery, preservation,
+/// deduplication, and hard-error behavior are verified in isolation.
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    const DRIFTED_FOLLOW_UP: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] done\n",
+        "\n",
+        "## Current Acceptance Follow-up\n",
+        "- attempt: 1\n",
+        "- [x] [SAME_FINDING] fixed wording\n",
+        "  Evidence: ran `cargo test`\n",
+        "### Reviewer notes\n",
+        "First unknown paragraph.\n",
+        "\n",
+        "Second paragraph with ``inline`` runs and - [ ] checkbox text.\n",
+    );
+
+    const UNKNOWN_PAYLOAD: &str = concat!(
+        "### Reviewer notes\n",
+        "First unknown paragraph.\n",
+        "\n",
+        "Second paragraph with ``inline`` runs and - [ ] checkbox text."
+    );
+
+    fn replace(content: &str) -> (String, FollowUpRecovery) {
+        plan_replace_acceptance_follow_up(content, 2, &["[SAME_FINDING] still broken".into()])
+            .expect("replacement plan succeeds")
+    }
+
+    #[test]
+    fn unknown_follow_up_content_is_recovered_instead_of_terminating_the_workflow() {
+        let (content, recovery) = replace(DRIFTED_FOLLOW_UP);
+
+        assert_eq!(recovery.recovered_blocks, 1);
+        assert_eq!(recovery.recovered_bytes, UNKNOWN_PAYLOAD.len());
+        assert!(recovery.warning().is_some());
+        // Unknown bytes are preserved exactly, inside a fence longer than the
+        // longest backtick run in the payload.
+        assert!(content.contains(&format!(
+            "{RECOVERED_NOTES_HEADING}\n\n{RECOVERED_NOTES_NOTICE}\n\n```text\n{UNKNOWN_PAYLOAD}\n```\n"
+        )));
+        // Runtime content is regenerated, not recovered.
+        assert!(content.contains("## Current Acceptance Follow-up\n- attempt: 2\n"));
+        assert!(content.contains("- [ ] [SAME_FINDING] still broken"));
+        assert!(!content.contains("- attempt: 1"));
+        // Ordinary content is untouched and recovered notes precede the follow-up.
+        assert!(content.starts_with("## Implementation Tasks\n- [x] done\n"));
+        assert!(content.find(RECOVERED_NOTES_HEADING) < content.find(ACCEPTANCE_FOLLOW_UP_HEADING));
+    }
+
+    #[test]
+    fn runtime_metadata_capitalization_drift_stays_runtime_owned() {
+        let drifted = concat!(
+            "## Current Acceptance Follow-up\n",
+            "- Attempt: 1\n",
+            "- [X] fixed\n",
+            "  EVIDENCE: cargo test passed\n",
+            "### External Blockers\n",
+            "- Identity: `external|api`\n",
+            "  Next action: Resolve the external prerequisite.\n",
+        );
+
+        let (content, recovery) = replace(drifted);
+
+        assert_eq!(recovery, FollowUpRecovery::default());
+        assert!(!content.contains(RECOVERED_NOTES_HEADING));
+    }
+
+    #[test]
+    fn repeated_normalization_and_restart_do_not_duplicate_recovered_notes() {
+        let (first, first_recovery) = replace(DRIFTED_FOLLOW_UP);
+        assert_eq!(first_recovery.recovered_blocks, 1);
+
+        // Retry replacement, apply-side merge, and a restart that re-reads the
+        // file all converge on the same bytes.
+        let (second, second_recovery) = replace(&first);
+        assert_eq!(second_recovery, FollowUpRecovery::default());
+        assert_eq!(second.matches(RECOVERED_NOTES_HEADING).count(), 1);
+        assert_eq!(second.matches(UNKNOWN_PAYLOAD).count(), 1);
+
+        let (merged, merge_recovery) =
+            plan_merge_acceptance_follow_up(&second, 2, &["[SAME_FINDING] still broken".into()])
+                .unwrap();
+        assert_eq!(merge_recovery, FollowUpRecovery::default());
+        assert_eq!(merged.matches(UNKNOWN_PAYLOAD).count(), 1);
+
+        let (restarted, restart_recovery) = replace(&merged);
+        assert_eq!(restart_recovery, FollowUpRecovery::default());
+        assert_eq!(restarted, second);
+    }
+
+    #[test]
+    fn distinct_unknown_payloads_accumulate_as_separate_blocks() {
+        let (first, _) = replace(DRIFTED_FOLLOW_UP);
+        let with_new_drift = format!("{first}\nA brand new unknown note.\n");
+
+        let (second, recovery) = replace(&with_new_drift);
+
+        assert_eq!(recovery.recovered_blocks, 1);
+        assert_eq!(second.matches(RECOVERED_NOTES_HEADING).count(), 1);
+        assert!(second.contains(UNKNOWN_PAYLOAD));
+        assert!(second.contains("A brand new unknown note."));
+    }
+
+    #[test]
+    fn pass_cleanup_removes_runtime_section_and_retains_recovered_notes() {
+        let (with_notes, _) = replace(DRIFTED_FOLLOW_UP);
+
+        let (cleaned, recovery) = plan_clear_acceptance_follow_up(&with_notes).unwrap();
+
+        assert_eq!(recovery, FollowUpRecovery::default());
+        assert!(!cleaned.contains(ACCEPTANCE_FOLLOW_UP_HEADING));
+        assert!(cleaned.contains(RECOVERED_NOTES_HEADING));
+        assert!(cleaned.contains(UNKNOWN_PAYLOAD));
+        assert!(cleaned.starts_with("## Implementation Tasks\n- [x] done\n"));
+    }
+
+    #[test]
+    fn recovered_fence_is_longer_than_the_longest_backtick_run() {
+        let payload_source = concat!(
+            "## Current Acceptance Follow-up\n",
+            "- attempt: 1\n",
+            "`````\n",
+            "````\n",
+            "not a runtime record\n",
+            "````\n",
+            "`````\n",
+        );
+
+        let (content, recovery) = replace(payload_source);
+
+        assert_eq!(recovery.recovered_blocks, 1);
+        assert!(content.contains("``````text\n"));
+        assert!(content.contains("`````\n````\nnot a runtime record\n````\n`````\n``````\n"));
+        // The recovered literal round-trips: a second pass finds no new payload.
+        let (again, again_recovery) = replace(&content);
+        assert_eq!(again_recovery, FollowUpRecovery::default());
+        assert_eq!(again, content);
+    }
+
+    #[test]
+    fn recovered_checkbox_text_is_inert_for_task_progress() {
+        let (content, _) = replace(DRIFTED_FOLLOW_UP);
+
+        // `- [x] done` plus the regenerated runtime finding; the recovered
+        // `- [ ] checkbox text` line inside the fence must not count.
+        assert_eq!(
+            parse_content(&content, None),
+            TaskProgress::with_counts(1, 2)
+        );
+    }
+
+    #[test]
+    fn task_progress_ignores_dynamic_and_tilde_fences() {
+        let content = concat!(
+            "- [x] real task\n",
+            "~~~~\n",
+            "- [x] fenced\n",
+            "~~~\n",
+            "- [ ] still fenced\n",
+            "~~~~\n",
+            "````md\n",
+            "```\n",
+            "- [x] fenced\n",
+            "```\n",
+            "````\n",
+            "- [ ] second real task\n",
+        );
+
+        assert_eq!(
+            parse_content(content, None),
+            TaskProgress::with_counts(1, 2)
+        );
+    }
+
+    #[test]
+    fn unclosed_fence_is_a_hard_error_that_changes_nothing() {
+        let ambiguous = concat!(
+            "## Implementation Tasks\n",
+            "- [x] done\n",
+            "```md\n",
+            "## Current Acceptance Follow-up\n",
+            "- [ ] finding\n",
+        );
+
+        for error in [
+            plan_replace_acceptance_follow_up(ambiguous, 2, &["finding".into()]).unwrap_err(),
+            plan_merge_acceptance_follow_up(ambiguous, 2, &["finding".into()]).unwrap_err(),
+            plan_clear_acceptance_follow_up(ambiguous).unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("unclosed code fence"), "{message}");
+            assert!(
+                message.contains("boundary cannot be determined safely"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unclosed_fence_inside_the_follow_up_section_is_a_hard_error() {
+        let ambiguous = concat!(
+            "## Current Acceptance Follow-up\n",
+            "- attempt: 1\n",
+            "- [ ] finding\n",
+            "```text\n",
+            "unterminated reviewer dump\n",
+        );
+
+        let error = plan_clear_acceptance_follow_up(ambiguous).unwrap_err();
+        assert!(error.to_string().contains("unclosed code fence"));
+    }
+
+    #[test]
+    fn follow_up_headings_inside_fences_are_never_treated_as_runtime_sections() {
+        let documented = concat!(
+            "## Notes\n",
+            "```md\n",
+            "## Current Acceptance Follow-up\n",
+            "- [ ] example\n",
+            "```\n",
+        );
+
+        let (cleaned, recovery) = plan_clear_acceptance_follow_up(documented).unwrap();
+
+        assert_eq!(recovery, FollowUpRecovery::default());
+        assert_eq!(cleaned, documented);
+    }
+
+    #[test]
+    fn atomic_update_leaves_the_original_file_unchanged_when_staging_fails() {
+        // Filesystem-boundary check for the atomic writer: the temporary file
+        // cannot be created in a read-only directory, so no partial write or
+        // truncation can reach `tasks.md`.
+        let dir = tempfile::tempdir().unwrap();
+        let tasks_path = dir.path().join("tasks.md");
+        std::fs::write(&tasks_path, DRIFTED_FOLLOW_UP).unwrap();
+
+        let mut permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        let original_mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = permissions.mode();
+                permissions.set_mode(0o500);
+                mode
+            }
+            #[cfg(not(unix))]
+            {
+                permissions.set_readonly(true);
+                0
+            }
+        };
+        std::fs::set_permissions(dir.path(), permissions).unwrap();
+
+        let error = replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            &["still broken".to_string()],
+        )
+        .unwrap_err();
+
+        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            restore.set_mode(original_mode);
+        }
+        #[cfg(not(unix))]
+        {
+            restore.set_readonly(false);
+        }
+        std::fs::set_permissions(dir.path(), restore).unwrap();
+
+        assert!(error
+            .to_string()
+            .contains("Failed to stage atomic tasks update"));
+        assert_eq!(
+            std::fs::read_to_string(&tasks_path).unwrap(),
+            DRIFTED_FOLLOW_UP
+        );
     }
 }

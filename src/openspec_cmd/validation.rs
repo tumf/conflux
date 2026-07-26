@@ -333,8 +333,13 @@ pub(super) fn count_tasks(content: &str) -> (u32, u32) {
     let mut in_excluded = false;
     let mut completed = 0u32;
     let mut total = 0u32;
+    let mut fences = crate::task_parser::FenceTracker::default();
 
     for line in content.lines() {
+        // Fenced literals (e.g. recovered acceptance notes) are inert content.
+        if fences.observe(line) {
+            continue;
+        }
         if line.starts_with("##") {
             let section_name = line.trim_start_matches('#').trim().to_lowercase();
             in_excluded = excluded_sections.iter().any(|&s| section_name.contains(s));
@@ -697,9 +702,16 @@ pub(super) fn validate_tasks_content(
 
     let mut last_checkbox_line_num: Option<usize> = None;
     let mut pending_behavior_task_without_verification: Option<usize> = None;
+    let mut fences = crate::task_parser::FenceTracker::default();
 
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
+
+        // Fenced literals (e.g. recovered acceptance notes) are untrusted historical
+        // content, never headings, tasks, or verification declarations.
+        if fences.observe(line) {
+            continue;
+        }
 
         if line.starts_with("##") {
             // Runtime-owned follow-up subsections (e.g. `### External blockers`)

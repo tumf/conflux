@@ -720,14 +720,26 @@ impl SerialRunService {
                     workspace_path,
                 ) {
                     Ok(Some(tasks_path)) => {
-                        if let Err(err) = task_parser::clear_acceptance_follow_up(&tasks_path) {
-                            return ChangeProcessResult::AcceptanceCommandFailed {
-                                error: format!(
-                                    "Acceptance passed but follow-up cleanup failed at {}: {}",
-                                    tasks_path.display(),
-                                    err
-                                ),
-                            };
+                        match task_parser::clear_acceptance_follow_up(&tasks_path) {
+                            Ok(recovery) => {
+                                if let Some(warning) = recovery.warning() {
+                                    warn!(
+                                        "Acceptance follow-up recovery for {} at {}: {}",
+                                        change_id,
+                                        tasks_path.display(),
+                                        warning
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                return ChangeProcessResult::AcceptanceCommandFailed {
+                                    error: format!(
+                                        "Acceptance passed but follow-up cleanup failed at {}: {}",
+                                        tasks_path.display(),
+                                        err
+                                    ),
+                                };
+                            }
                         }
                     }
                     Ok(None) => debug!("No acceptance follow-up to clear for {}", change_id),
@@ -885,7 +897,7 @@ impl SerialRunService {
                         change_id,
                         workspace_path,
                     ) {
-                        if let Err(err) = task_parser::replace_acceptance_follow_up_from_latest_fail(
+                        match task_parser::replace_acceptance_follow_up_from_latest_fail(
                             &tasks_path,
                             agent
                                 .get_last_acceptance_attempt(change_id)
@@ -893,12 +905,24 @@ impl SerialRunService {
                                 .unwrap_or(1),
                             &findings,
                         ) {
-                            warn!(
+                            Ok(recovery) => {
+                                if let Some(warning) = recovery.warning() {
+                                    warn!(
+                                        "Acceptance follow-up recovery for {} at {}: {}",
+                                        change_id,
+                                        tasks_path.display(),
+                                        warning
+                                    );
+                                }
+                            }
+                            // Acceptance FAIL remains the primary diagnosis; persistence
+                            // degradation is supplemental context only.
+                            Err(err) => warn!(
                                 "Acceptance follow-up persistence degraded for {} at {}: {}",
                                 change_id,
                                 tasks_path.display(),
                                 err
-                            );
+                            ),
                         }
                     }
                 }
@@ -2011,6 +2035,137 @@ mod tests {
         let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
         assert!(!content.contains("Failure Follow-up"));
         assert!(content.contains("## Implementation Tasks\n- [x] done"));
+    }
+
+    /// `tasks.md` whose runtime-owned follow-up carries harmless unknown
+    /// reviewer prose that older runtime versions refused outright.
+    const DRIFTED_TASKS_MD: &str = concat!(
+        "## Implementation Tasks\n",
+        "- [x] done\n",
+        "\n",
+        "## Current Acceptance Follow-up\n",
+        "- attempt: 1\n",
+        "- [x] earlier finding\n",
+        "### Reviewer notes\n",
+        "Free-form evidence the runtime does not recognize.\n",
+    );
+
+    const DRIFTED_PAYLOAD: &str = concat!(
+        "### Reviewer notes\n",
+        "Free-form evidence the runtime does not recognize."
+    );
+
+    fn seed_serial_tasks(temp_dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join("test-change");
+        std::fs::create_dir_all(&change_dir).unwrap();
+        let tasks_path = change_dir.join("tasks.md");
+        std::fs::write(&tasks_path, content).unwrap();
+        tasks_path
+    }
+
+    #[test]
+    fn serial_acceptance_fail_recovers_unknown_follow_up_content_and_keeps_retrying() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let tasks_path = seed_serial_tasks(&temp_dir, DRIFTED_TASKS_MD);
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Fail {
+                findings: vec!["latest finding".to_string()],
+            },
+            || false,
+        );
+
+        // The workflow continues on the acceptance verdict instead of terminating.
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(content.contains("## Recovered Acceptance Notes"));
+        assert!(content.contains(DRIFTED_PAYLOAD));
+        assert!(content.contains("## Current Acceptance Follow-up\n- attempt: 1"));
+        assert!(content.contains("- [ ] latest finding"));
+        // Recovered checkbox-free prose leaves task accounting untouched.
+        assert_eq!(
+            crate::task_parser::parse_content(&content, None),
+            crate::task_parser::TaskProgress::with_counts(1, 2)
+        );
+    }
+
+    #[test]
+    fn serial_acceptance_pass_cleanup_retains_recovered_notes() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let tasks_path = seed_serial_tasks(&temp_dir, DRIFTED_TASKS_MD);
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Pass,
+            || false,
+        );
+
+        assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(!content.contains("Acceptance Follow-up"));
+        assert!(content.contains("## Recovered Acceptance Notes"));
+        assert!(content.contains(DRIFTED_PAYLOAD));
+    }
+
+    #[test]
+    fn serial_acceptance_pass_reports_hard_error_for_ambiguous_boundary() {
+        use crate::agent::AgentRunner;
+        use crate::orchestration::AcceptanceResult;
+
+        let ambiguous = concat!(
+            "## Implementation Tasks\n",
+            "- [x] done\n",
+            "\n",
+            "## Current Acceptance Follow-up\n",
+            "- [x] fixed\n",
+            "```text\n",
+            "unterminated reviewer dump\n",
+        );
+        let temp_dir = TempDir::new().unwrap();
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+        let tasks_path = seed_serial_tasks(&temp_dir, ambiguous);
+
+        let result = service.process_acceptance_result(
+            "test-change",
+            temp_dir.path(),
+            &agent,
+            AcceptanceResult::Pass,
+            || false,
+        );
+
+        match result {
+            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+                assert!(error.contains("unclosed code fence"), "{error}");
+            }
+            other => panic!("expected cleanup failure, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&tasks_path).unwrap(), ambiguous);
     }
 
     #[test]
