@@ -1839,19 +1839,30 @@ impl ParallelExecutor {
                             workspace.path.as_path(),
                         ) {
                             Ok(Some(tasks_path)) => {
-                                if let Err(err) = task_parser::clear_acceptance_follow_up(&tasks_path)
-                                {
-                                    return WorkspaceResult {
-                                        change_id,
-                                        workspace_name: workspace.name,
-                                        final_revision: None,
-                                        error: Some(format!(
-                                            "Acceptance passed but follow-up cleanup failed at {}: {}",
-                                            tasks_path.display(),
-                                            err
-                                        )),
-                                        rejected: None,
-                                    };
+                                match task_parser::clear_acceptance_follow_up(&tasks_path) {
+                                    Ok(recovery) => {
+                                        if let Some(warning) = recovery.warning() {
+                                            warn!(
+                                                "Acceptance follow-up recovery for {} at {}: {}",
+                                                change_id,
+                                                tasks_path.display(),
+                                                warning
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        return WorkspaceResult {
+                                            change_id,
+                                            workspace_name: workspace.name,
+                                            final_revision: None,
+                                            error: Some(format!(
+                                                "Acceptance passed but follow-up cleanup failed at {}: {}",
+                                                tasks_path.display(),
+                                                err
+                                            )),
+                                            rejected: None,
+                                        };
+                                    }
                                 }
                             }
                             Ok(None) => {
@@ -1993,8 +2004,15 @@ impl ParallelExecutor {
                         }
                         if !findings.is_empty() {
                             if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(&change_id, workspace.path.as_path()) {
-                                if let Err(err) = task_parser::replace_acceptance_follow_up_from_latest_fail(&tasks_path, acceptance_iteration, &findings) {
-                                    warn!("Acceptance follow-up persistence degraded for {} at {}: {}", change_id, tasks_path.display(), err);
+                                match task_parser::replace_acceptance_follow_up_from_latest_fail(&tasks_path, acceptance_iteration, &findings) {
+                                    Ok(recovery) => {
+                                        if let Some(warning) = recovery.warning() {
+                                            warn!("Acceptance follow-up recovery for {} at {}: {}", change_id, tasks_path.display(), warning);
+                                        }
+                                    }
+                                    // Acceptance FAIL remains the primary diagnosis; persistence
+                                    // degradation is supplemental context only.
+                                    Err(err) => warn!("Acceptance follow-up persistence degraded for {} at {}: {}", change_id, tasks_path.display(), err),
                                 }
                             }
                         }

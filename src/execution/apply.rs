@@ -148,7 +148,20 @@ fn ensure_runtime_acceptance_follow_up(
     };
     let tasks_path =
         crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace_path)?;
-    crate::task_parser::merge_acceptance_follow_up_apply_progress(&tasks_path, attempt, &findings)
+    let recovery = crate::task_parser::merge_acceptance_follow_up_apply_progress(
+        &tasks_path,
+        attempt,
+        &findings,
+    )?;
+    if let Some(warning) = recovery.warning() {
+        warn!(
+            "Acceptance follow-up recovery for {} at {}: {}",
+            change_id,
+            tasks_path.display(),
+            warning
+        );
+    }
+    Ok(())
 }
 
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
