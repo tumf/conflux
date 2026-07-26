@@ -142,12 +142,53 @@ impl AppState {
         self.add_log(LogEntry::warn(message).with_change_id(change_id));
     }
 
+    /// True when a change other than `change_id` is actually inside the resolve
+    /// lifecycle.
+    ///
+    /// `is_resolving` alone is not evidence of an active resolve: `resolve_merge()`
+    /// reserves that project-scoped slot optimistically when `M` is pressed, before
+    /// `ResolveStarted` arrives. Only the reducer-derived `resolving` display proves
+    /// a resolve actually started.
+    fn other_change_is_resolving(&self, change_id: &str) -> bool {
+        self.changes
+            .iter()
+            .any(|c| c.id != change_id && c.display_status_cache == "resolving")
+    }
+
+    /// Apply a manual (non auto-resumable) merge deferral.
+    ///
+    /// The shared reducer has already demoted the change to `MergeWait` and cleared
+    /// scheduler-owned `ResolveWait` membership, so any TUI-local resolve
+    /// reservation/queue entry for it is stale. Keeping it would recreate a
+    /// display-only `resolve pending` row that never drains, forcing a TUI restart
+    /// before the row could be retried.
+    fn apply_manual_merge_deferral(&mut self, change_id: &str, reason: &str) {
+        self.remove_from_resolve_queue(change_id);
+        if self.is_resolving && !self.other_change_is_resolving(change_id) {
+            self.is_resolving = false;
+        }
+        if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
+            change.set_display_status_cache("merge wait");
+        }
+        self.add_merge_deferred_warning_log(
+            change_id,
+            reason,
+            false,
+            format!("Merge deferred for {}: {}", change_id, reason),
+        );
+    }
+
     pub(crate) fn handle_merge_deferred(
         &mut self,
         change_id: String,
         reason: String,
         auto_resumable: bool,
     ) -> Option<TuiCommand> {
+        if !auto_resumable {
+            self.apply_manual_merge_deferral(&change_id, &reason);
+            return None;
+        }
+
         if self.is_resolving {
             let is_current_resolving = self
                 .changes
@@ -191,7 +232,7 @@ impl AppState {
                 }
             }
             None
-        } else if auto_resumable {
+        } else {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 change.set_display_status_cache("resolve pending");
             }
@@ -206,17 +247,6 @@ impl AppState {
                 ),
             );
             Some(TuiCommand::ResolveMerge(change_id))
-        } else {
-            if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
-                change.set_display_status_cache("merge wait");
-            }
-            self.add_merge_deferred_warning_log(
-                &change_id,
-                &reason,
-                auto_resumable,
-                format!("Merge deferred for {}: {}", change_id, reason),
-            );
-            None
         }
     }
 }
@@ -227,6 +257,7 @@ mod tests {
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::events::OrchestratorEvent;
     use crate::tui::types::AppMode;
+    use std::collections::HashMap;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -620,6 +651,206 @@ mod tests {
         );
 
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
+    }
+
+    /// Reducer-first production ordering: `M` reserves the local resolve slot, the
+    /// reducer demotes the row to MergeWait, the runner syncs that display, and only
+    /// then the TUI handles `MergeDeferred(auto_resumable=false)`. The stale
+    /// reservation must not be mistaken for an active resolve.
+    #[test]
+    fn manual_deferral_before_resolve_started_clears_optimistic_reservation() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.cursor_index = 0;
+        app.is_resolving = false;
+
+        let first_cmd = app.resolve_merge();
+        assert!(matches!(first_cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-a"));
+        assert!(app.is_resolving, "M must reserve the local resolve slot");
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+
+        app.apply_display_statuses_from_reducer(&HashMap::from([(
+            "change-a".to_string(),
+            "merge wait",
+        )]));
+        let deferred_cmd = app.handle_merge_deferred(
+            "change-a".to_string(),
+            "Base is dirty: Working tree has uncommitted changes".to_string(),
+            false,
+        );
+
+        assert!(
+            deferred_cmd.is_none(),
+            "manual deferral must not dispatch another resolve"
+        );
+        assert_eq!(
+            app.changes[0].display_status_cache, "merge wait",
+            "manual deferral must preserve the reducer-derived merge wait row"
+        );
+        assert!(
+            !app.is_resolving,
+            "stale optimistic reservation must be cleared"
+        );
+        assert!(!app.resolve_queue_set.contains("change-a"));
+        assert!(app.resolve_queue.is_empty());
+    }
+
+    /// Even if the deferred change was already queued locally (for example by an
+    /// earlier auto-resumable deferral), manual deferral must drain that entry while
+    /// leaving unrelated FIFO entries untouched.
+    #[test]
+    fn manual_deferral_removes_only_its_own_local_queue_entry() {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+            create_test_change("change-c", 0, 1),
+        ]);
+        app.is_resolving = true;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "resolve pending".to_string();
+        app.changes[2].display_status_cache = "resolve pending".to_string();
+        app.add_to_resolve_queue("change-b");
+        app.add_to_resolve_queue("change-c");
+
+        let cmd = app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Base is dirty: Working tree has uncommitted changes".to_string(),
+            false,
+        );
+
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[1].display_status_cache, "merge wait");
+        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert_eq!(
+            app.resolve_queue.iter().cloned().collect::<Vec<_>>(),
+            vec!["change-c".to_string()],
+            "unrelated queued resolves must keep FIFO membership"
+        );
+    }
+
+    /// A manual deferral for one change must not steal serialization from a different
+    /// change that actually entered the resolve lifecycle.
+    #[test]
+    fn manual_deferral_preserves_serialization_for_other_resolving_change() {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ]);
+        app.is_resolving = true;
+        app.changes[0].display_status_cache = "resolving".to_string();
+        app.changes[1].display_status_cache = "merge wait".to_string();
+
+        let cmd = app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Base is dirty: Working tree has uncommitted changes".to_string(),
+            false,
+        );
+
+        assert!(cmd.is_none());
+        assert_eq!(app.changes[1].display_status_cache, "merge wait");
+        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert!(
+            app.is_resolving,
+            "serialization must remain owned by the actually resolving change"
+        );
+        assert_eq!(app.changes[0].display_status_cache, "resolving");
+    }
+
+    /// Auto-resumable deferrals keep queueing behind a reservation-only slot owner,
+    /// so scheduler-owned retry work still shows as `resolve pending`.
+    #[test]
+    fn auto_resumable_merge_deferred_still_queues_behind_optimistic_reservation() {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ]);
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.changes[1].display_status_cache = "merge wait".to_string();
+        app.cursor_index = 0;
+        app.is_resolving = false;
+        assert!(app.resolve_merge().is_some());
+
+        let cmd = app.handle_merge_deferred(
+            "change-b".to_string(),
+            "Merge in progress (MERGE_HEAD exists)".to_string(),
+            true,
+        );
+
+        assert!(cmd.is_none(), "queued retry must wait for the active slot");
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        assert!(app.resolve_queue_set.contains("change-b"));
+        assert!(app.is_resolving);
+    }
+
+    /// Full local lifecycle: reservation, reducer demotion, TUI handling, then a
+    /// second `M` on the same `AppState` must produce fresh scheduler-consumable
+    /// retry intent without restarting the TUI.
+    #[test]
+    fn manual_deferral_keeps_second_m_actionable_without_restart() {
+        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
+        use std::sync::Arc;
+
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
+        }
+        app.set_shared_state(shared.clone());
+        app.mode = AppMode::Running;
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.cursor_index = 0;
+        app.is_resolving = false;
+
+        // 1st M press: reducer records retry intent, TUI reserves the local slot.
+        assert!(app.resolve_merge().is_some());
+        assert_eq!(
+            shared.blocking_read().resolve_wait_change_ids(),
+            vec!["change-a".to_string()]
+        );
+
+        // Scheduler retry evaluation finds a dirty base before ResolveStarted.
+        let display_map = {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "Base is dirty: Working tree has uncommitted changes".to_string(),
+                auto_resumable: false,
+            });
+            guard.all_display_statuses()
+        };
+        app.apply_display_statuses_from_reducer(&display_map);
+        let deferred_cmd = app.handle_merge_deferred(
+            "change-a".to_string(),
+            "Base is dirty: Working tree has uncommitted changes".to_string(),
+            false,
+        );
+
+        assert!(deferred_cmd.is_none());
+        assert_eq!(app.changes[0].display_status_cache, "merge wait");
+        assert!(!app.is_resolving);
+        assert!(app.resolve_queue.is_empty());
+        assert!(shared.blocking_read().resolve_wait_change_ids().is_empty());
+
+        // 2nd M press after the user cleaned the base: fresh retry, same AppState.
+        let second_cmd = app.resolve_merge();
+
+        assert!(
+            matches!(second_cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-a"),
+            "clean second M must dispatch a fresh retry without a TUI restart"
+        );
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+        assert_eq!(
+            shared.blocking_read().resolve_wait_change_ids(),
+            vec!["change-a".to_string()],
+            "second retry must be scheduler-consumable"
+        );
+        assert!(app.resolve_queue.is_empty());
     }
 
     #[test]

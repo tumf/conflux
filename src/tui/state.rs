@@ -875,6 +875,20 @@ impl AppState {
         }
     }
 
+    /// Remove one specific change from the resolve queue.
+    ///
+    /// Used when reducer-owned retry intent for that change is gone (for example a
+    /// manual `MergeDeferred(auto_resumable=false)`), so stale TUI-local queue
+    /// membership cannot outlive it. FIFO order of unrelated entries is preserved.
+    ///
+    /// Returns true if the change was queued and has been removed.
+    pub fn remove_from_resolve_queue(&mut self, change_id: &str) -> bool {
+        let removed_from_set = self.resolve_queue_set.remove(change_id);
+        let len_before = self.resolve_queue.len();
+        self.resolve_queue.retain(|queued| queued != change_id);
+        removed_from_set || self.resolve_queue.len() != len_before
+    }
+
     /// Pop the next change from the resolve queue.
     ///
     /// Returns the change ID if the queue is not empty, otherwise None.
@@ -3098,6 +3112,65 @@ mod tests {
         assert_eq!(app.pop_from_resolve_queue(), Some("change-b".to_string()));
         assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
         assert_eq!(app.pop_from_resolve_queue(), None);
+    }
+
+    #[test]
+    fn test_resolve_queue_remove_front_preserves_order() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+            create_test_change("change-c", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.add_to_resolve_queue("change-a");
+        app.add_to_resolve_queue("change-b");
+        app.add_to_resolve_queue("change-c");
+
+        assert!(app.remove_from_resolve_queue("change-a"));
+
+        assert!(!app.resolve_queue_set.contains("change-a"));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-b".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), None);
+    }
+
+    #[test]
+    fn test_resolve_queue_remove_middle_preserves_order() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+            create_test_change("change-c", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.add_to_resolve_queue("change-a");
+        app.add_to_resolve_queue("change-b");
+        app.add_to_resolve_queue("change-c");
+
+        assert!(app.remove_from_resolve_queue("change-b"));
+
+        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert!(app.resolve_queue_set.contains("change-a"));
+        assert!(app.resolve_queue_set.contains("change-c"));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
+        assert_eq!(app.pop_from_resolve_queue(), None);
+    }
+
+    #[test]
+    fn test_resolve_queue_remove_absent_change_is_noop() {
+        let changes = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.add_to_resolve_queue("change-a");
+
+        assert!(!app.remove_from_resolve_queue("change-b"));
+
+        assert!(app.resolve_queue_set.contains("change-a"));
+        assert_eq!(app.resolve_queue.len(), 1);
+        assert!(!app.remove_from_resolve_queue("change-b"));
+        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
     }
 
     #[test]
