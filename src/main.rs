@@ -19,6 +19,7 @@ mod events;
 mod execution;
 mod history;
 mod hooks;
+mod lifecycle_integration;
 mod log_viewer;
 mod openspec;
 mod openspec_cmd;
@@ -61,6 +62,9 @@ use cli::{
 use config::OrchestratorConfig;
 use error::Result;
 use install_skills::{run_install_skills, InstallSkillsOptions};
+use lifecycle_integration::{
+    LifecycleContext, LifecycleEvent, LifecycleExecutionMode, LifecycleIntegration, LifecycleState,
+};
 use orchestrator::Orchestrator;
 use parallel::PostArchiveAction;
 use std::path::Path;
@@ -98,6 +102,17 @@ async fn load_remote_changes(args: &TuiArgs) -> Result<Vec<openspec::Change>> {
     Ok(remote::group_changes_by_project(&projects))
 }
 
+/// Privacy-safe lifecycle context identifying this cflx process.
+///
+/// Only the workspace root is reported; no environment, configuration, or
+/// command content is ever included.
+fn lifecycle_process_context() -> LifecycleContext {
+    match std::env::current_dir() {
+        Ok(dir) => LifecycleContext::workspace(dir.display().to_string()),
+        Err(_) => LifecycleContext::default(),
+    }
+}
+
 async fn launch_tui(args: TuiArgs) -> Result<()> {
     let post_archive_action = tui_post_archive_action(&args)?;
 
@@ -107,6 +122,29 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
     let config = OrchestratorConfig::load(args.config.as_deref())?;
     tui::log_deduplicator::configure_logging(config.get_logging());
 
+    // Start the optional external lifecycle adapter before the interactive TUI
+    // is presented. Failures here are observability-only and never block startup.
+    let lifecycle = LifecycleIntegration::start(
+        config.get_lifecycle_integration(),
+        LifecycleExecutionMode::Tui,
+    );
+    lifecycle.handle().publish(LifecycleEvent::ProcessStarted {
+        context: lifecycle_process_context(),
+    });
+
+    let result = launch_tui_inner(args, config, post_archive_action, lifecycle.handle()).await;
+
+    lifecycle.shutdown().await;
+
+    result
+}
+
+async fn launch_tui_inner(
+    args: TuiArgs,
+    config: OrchestratorConfig,
+    post_archive_action: PostArchiveAction,
+    lifecycle: lifecycle_integration::LifecycleHandle,
+) -> Result<()> {
     let changes = if args.server.is_some() {
         info!(
             "Remote TUI mode: connecting to {}",
@@ -155,6 +193,7 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
         web_state_opt,
         remote_client,
         post_archive_action,
+        lifecycle,
     )
     .await
 }
@@ -628,6 +667,20 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Non-interactive run reports process and orchestration lifecycle
+            // through the same observability-only contract as the TUI. Started
+            // after startup validation so a rejected invocation never leaves an
+            // adapter process behind.
+            let lifecycle = LifecycleIntegration::start(
+                config.get_lifecycle_integration(),
+                LifecycleExecutionMode::Run,
+            );
+            let lifecycle_handle = lifecycle.handle();
+            let workspace_context = lifecycle_process_context().workspace;
+            lifecycle_handle.publish(LifecycleEvent::ProcessStarted {
+                context: lifecycle_process_context(),
+            });
+
             // Run mode control state for web control integration
             // Run mode now supports retry and resume via outer loop.
             use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -792,6 +845,8 @@ async fn main() -> Result<()> {
                 }
 
                 info!("Starting orchestrator");
+                lifecycle_handle
+                    .publish_state(LifecycleState::Working, lifecycle_process_context());
                 let mut orchestrator = Orchestrator::new(
                     change_ids.clone(),
                     config_path.clone(),
@@ -803,6 +858,9 @@ async fn main() -> Result<()> {
                     no_resume,
                     post_archive_action.clone(),
                 )?;
+
+                orchestrator
+                    .set_lifecycle_handle(lifecycle_handle.clone(), workspace_context.clone());
 
                 #[cfg(feature = "web-monitoring")]
                 if let Some(ref web_state) = web_state_arc {
@@ -849,6 +907,9 @@ async fn main() -> Result<()> {
                 match result {
                     Err(e) => {
                         error!("Orchestrator error: {}", e);
+                        // An error state waits for an operator retry decision.
+                        lifecycle_handle
+                            .publish_state(LifecycleState::Blocked, lifecycle_process_context());
 
                         // Wait for retry request in error state
                         // Keep checking restart_requested flag until user requests retry or signals stop
@@ -864,6 +925,7 @@ async fn main() -> Result<()> {
                                 || signal_stop.load(Ordering::SeqCst)
                             {
                                 info!("Stop requested in error state, exiting");
+                                lifecycle.shutdown().await;
                                 return Err(e);
                             }
 
@@ -899,6 +961,8 @@ async fn main() -> Result<()> {
             if let Some(handle) = web_bridge_handle {
                 handle.abort();
             }
+
+            lifecycle.shutdown().await;
         }
 
         // Logs subcommand: read-only persistent log viewer. Intentionally runs before

@@ -170,6 +170,20 @@ pub const DEFAULT_PROPOSAL_TRANSPORT_ARGS: &[&str] = &["acp"];
 /// Default inactivity timeout for proposal sessions (seconds)
 pub const DEFAULT_PROPOSAL_SESSION_INACTIVITY_TIMEOUT_SECS: u64 = 1800;
 
+// ── External lifecycle integration defaults ────────────────────────────────
+
+/// Default bounded queue capacity for the external lifecycle dispatcher.
+///
+/// The queue is intentionally small: lifecycle messages are observability-only,
+/// so dropping redundant state refreshes is preferred over growing memory.
+pub const DEFAULT_LIFECYCLE_QUEUE_CAPACITY: usize = 64;
+
+/// Default bounded per-message write timeout for the lifecycle adapter (milliseconds).
+pub const DEFAULT_LIFECYCLE_WRITE_TIMEOUT_MS: u64 = 2_000;
+
+/// Default bounded shutdown deadline for the lifecycle adapter (milliseconds).
+pub const DEFAULT_LIFECYCLE_SHUTDOWN_TIMEOUT_MS: u64 = 2_000;
+
 // ── Server defaults ───────────────────────────────────────────────────────
 
 /// Default server bind address

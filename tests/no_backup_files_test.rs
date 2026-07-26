@@ -43,7 +43,14 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
         );
     }
 
-    let function_gated: [(&str, &[&str]); 6] = [
+    let function_gated: [(&str, &[&str]); 7] = [
+        (
+            "tests/lifecycle_integration.rs",
+            &[
+                "run_entrypoint_streams_ordered_lifecycle_to_a_configured_adapter",
+                "tui_entrypoints_start_the_adapter_before_presenting_the_tui",
+            ],
+        ),
         (
             "src/parallel/tests/executor.rs",
             &[
