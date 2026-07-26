@@ -45,10 +45,10 @@ impl AppState {
             return;
         }
 
-        self.add_log(LogEntry::info(format!(
-            "Change '{}' blocked by dependencies",
-            change_id
-        )));
+        self.add_log(
+            LogEntry::info(format!("Change '{}' blocked by dependencies", change_id))
+                .with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_dependency_resolved(&mut self, change_id: String) {
@@ -74,10 +74,10 @@ impl AppState {
         }
 
         self.reset_analysis_log_dedupe();
-        self.add_log(LogEntry::info(format!(
-            "Change '{}' dependencies resolved",
-            change_id
-        )));
+        self.add_log(
+            LogEntry::info(format!("Change '{}' dependencies resolved", change_id))
+                .with_change_id(&change_id),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -248,6 +248,12 @@ pub struct AppState {
     pub resolve_queue_set: HashSet<String>,
     /// Whether the log panel is visible in Changes view
     pub logs_panel_enabled: bool,
+    /// Whether the Logs panel is limited to the proposal under the Changes cursor.
+    ///
+    /// Presentation-only, non-persistent TUI state. It never mutates
+    /// `AppState::logs` and must not be used as scheduler dispatch, resume
+    /// routing, acceptance, or archive input.
+    pub selected_proposal_log_filter: bool,
     /// Client-local TUI preferences such as keybindings.
     ///
     /// This is presentation/input mapping state only and must not be used for
@@ -427,6 +433,7 @@ impl AppState {
             resolve_queue: VecDeque::new(),
             resolve_queue_set: HashSet::new(),
             logs_panel_enabled: true, // Default: logs panel visible
+            selected_proposal_log_filter: false, // Default: show logs for every proposal
             tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
             diagnostic_dedup: DiagnosticDeduplicationStore::new(),
@@ -497,12 +504,14 @@ impl AppState {
         if self.changes.is_empty() {
             return;
         }
+        let previous_filter_target = self.captured_selected_proposal_log_filter_target();
         self.cursor_index = if self.cursor_index == 0 {
             self.changes.len() - 1
         } else {
             self.cursor_index - 1
         };
         self.list_state.select(Some(self.cursor_index));
+        self.sync_selected_proposal_log_filter_after_cursor_move(previous_filter_target.as_deref());
     }
 
     /// Move cursor down
@@ -510,8 +519,10 @@ impl AppState {
         if self.changes.is_empty() {
             return;
         }
+        let previous_filter_target = self.captured_selected_proposal_log_filter_target();
         self.cursor_index = (self.cursor_index + 1) % self.changes.len();
         self.list_state.select(Some(self.cursor_index));
+        self.sync_selected_proposal_log_filter_after_cursor_move(previous_filter_target.as_deref());
     }
 
     /// Move worktree cursor up
@@ -1184,6 +1195,61 @@ impl AppState {
     pub fn toggle_logs_panel(&mut self) {
         self.logs_panel_enabled = log_logic::toggle_logs_panel(self.logs_panel_enabled);
     }
+
+    /// Proposal ID the selected-proposal log filter currently targets.
+    ///
+    /// Derived from the Changes cursor so no second copy of the target can drift
+    /// out of sync. Returns `None` when the list is empty or the cursor is out of
+    /// range.
+    pub fn selected_proposal_log_filter_target(&self) -> Option<&str> {
+        self.changes
+            .get(self.cursor_index)
+            .map(|change| change.id.as_str())
+    }
+
+    /// Toggle the presentation-only selected-proposal log filter.
+    ///
+    /// Filtering changes which entries are visible, so the entry-based scroll
+    /// offset is no longer meaningful; return to the newest visible output with
+    /// auto-scroll enabled. `AppState::logs` is never modified.
+    pub fn toggle_selected_proposal_log_filter(&mut self) {
+        self.selected_proposal_log_filter =
+            log_logic::toggle_selected_proposal_log_filter(self.selected_proposal_log_filter);
+        self.scroll_logs_to_bottom();
+    }
+
+    /// Whether a buffered entry is visible under the current filter state.
+    pub fn log_entry_visible_for_selected_proposal_filter(&self, entry: &LogEntry) -> bool {
+        log_logic::log_entry_matches_selected_proposal(
+            self.selected_proposal_log_filter,
+            entry.change_id.as_deref(),
+            self.selected_proposal_log_filter_target(),
+        )
+    }
+
+    /// Snapshot the filter target before a cursor move, only when it can matter.
+    fn captured_selected_proposal_log_filter_target(&self) -> Option<String> {
+        if self.selected_proposal_log_filter {
+            self.selected_proposal_log_filter_target()
+                .map(str::to_string)
+        } else {
+            None
+        }
+    }
+
+    /// Reset the Logs panel position when a cursor move retargets an active filter.
+    fn sync_selected_proposal_log_filter_after_cursor_move(
+        &mut self,
+        previous_target: Option<&str>,
+    ) {
+        if log_logic::should_reset_log_position_for_target_change(
+            self.selected_proposal_log_filter,
+            previous_target,
+            self.selected_proposal_log_filter_target(),
+        ) {
+            self.scroll_logs_to_bottom();
+        }
+    }
 }
 
 // ============================================================================
@@ -1570,6 +1636,150 @@ mod tests {
             dependencies: Vec::new(),
             metadata: crate::openspec::ProposalMetadata::default(),
         }
+    }
+
+    fn visible_filtered_messages(app: &AppState) -> Vec<String> {
+        app.logs
+            .iter()
+            .filter(|entry| app.log_entry_visible_for_selected_proposal_filter(entry))
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
+
+    fn app_with_mixed_proposal_logs() -> AppState {
+        let mut app = AppState::new(vec![
+            create_test_change("alpha", 0, 1),
+            create_test_change("beta", 0, 1),
+        ]);
+        app.logs.clear();
+        app.add_log(LogEntry::info("alpha apply").with_change_id("alpha"));
+        app.add_log(LogEntry::info("beta apply").with_change_id("beta"));
+        app.add_log(LogEntry::info("global orchestration"));
+        app
+    }
+
+    #[test]
+    fn selected_proposal_log_filter_defaults_off_and_shows_every_entry() {
+        let app = app_with_mixed_proposal_logs();
+
+        assert!(!app.selected_proposal_log_filter);
+        assert_eq!(
+            visible_filtered_messages(&app),
+            vec!["alpha apply", "beta apply", "global orchestration"]
+        );
+    }
+
+    #[test]
+    fn selected_proposal_log_filter_shows_only_cursor_proposal_entries() {
+        let mut app = app_with_mixed_proposal_logs();
+
+        app.toggle_selected_proposal_log_filter();
+
+        assert!(app.selected_proposal_log_filter);
+        assert_eq!(app.selected_proposal_log_filter_target(), Some("alpha"));
+        assert_eq!(visible_filtered_messages(&app), vec!["alpha apply"]);
+    }
+
+    #[test]
+    fn selected_proposal_log_filter_follows_cursor_and_resets_to_newest() {
+        let mut app = app_with_mixed_proposal_logs();
+        app.toggle_selected_proposal_log_filter();
+        app.log_scroll_offset = 2;
+        app.log_auto_scroll = false;
+
+        app.cursor_down();
+
+        assert_eq!(app.selected_proposal_log_filter_target(), Some("beta"));
+        assert_eq!(visible_filtered_messages(&app), vec!["beta apply"]);
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+    }
+
+    #[test]
+    fn cursor_move_keeps_log_position_when_filter_is_off() {
+        let mut app = app_with_mixed_proposal_logs();
+        app.log_scroll_offset = 2;
+        app.log_auto_scroll = false;
+
+        app.cursor_down();
+
+        assert_eq!(app.log_scroll_offset, 2);
+        assert!(!app.log_auto_scroll);
+    }
+
+    #[test]
+    fn toggling_selected_proposal_log_filter_never_mutates_the_log_buffer() {
+        let mut app = app_with_mixed_proposal_logs();
+        let before: Vec<String> = app.logs.iter().map(|e| e.message.clone()).collect();
+
+        app.toggle_selected_proposal_log_filter();
+        app.toggle_selected_proposal_log_filter();
+
+        let after: Vec<String> = app.logs.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(before, after);
+        assert!(!app.selected_proposal_log_filter);
+        assert_eq!(
+            visible_filtered_messages(&app),
+            vec!["alpha apply", "beta apply", "global orchestration"]
+        );
+    }
+
+    #[test]
+    fn toggling_selected_proposal_log_filter_returns_to_newest_output() {
+        let mut app = app_with_mixed_proposal_logs();
+        app.log_scroll_offset = 2;
+        app.log_auto_scroll = false;
+
+        app.toggle_selected_proposal_log_filter();
+
+        assert_eq!(app.log_scroll_offset, 0);
+        assert!(app.log_auto_scroll);
+    }
+
+    #[test]
+    fn selected_proposal_log_filter_hides_everything_without_a_cursor_proposal() {
+        let mut app = AppState::new(vec![]);
+        app.logs.clear();
+        app.add_log(LogEntry::info("alpha apply").with_change_id("alpha"));
+        app.add_log(LogEntry::info("global orchestration"));
+
+        app.toggle_selected_proposal_log_filter();
+
+        assert_eq!(app.selected_proposal_log_filter_target(), None);
+        assert!(visible_filtered_messages(&app).is_empty());
+        assert_eq!(app.logs.len(), 2);
+    }
+
+    #[test]
+    fn selected_proposal_log_filter_uses_handler_attached_metadata_not_message_text() {
+        let mut app = AppState::new(vec![
+            create_test_change("alpha", 0, 1),
+            create_test_change("beta", 0, 1),
+        ]);
+        app.logs.clear();
+
+        app.handle_processing_started("alpha".to_string());
+        app.handle_processing_error("beta".to_string(), "boom".to_string());
+        app.handle_analysis_started(1, "attempt-a".to_string());
+
+        app.toggle_selected_proposal_log_filter();
+
+        // The beta error message contains the substring "beta", but only the
+        // structured metadata decides visibility.
+        assert_eq!(visible_filtered_messages(&app), vec!["Processing: alpha"]);
+        assert_eq!(app.logs.len(), 3);
+    }
+
+    #[test]
+    fn selected_proposal_log_filter_excludes_remote_project_only_entries() {
+        let mut app = AppState::new(vec![create_test_change("proj-1::demo/alpha", 0, 1)]);
+        app.logs.clear();
+        app.add_log(LogEntry::info("project scoped output").with_change_id("proj-1"));
+        app.add_log(LogEntry::info("proposal output").with_change_id("proj-1::demo/alpha"));
+
+        app.toggle_selected_proposal_log_filter();
+
+        assert_eq!(visible_filtered_messages(&app), vec!["proposal output"]);
     }
 
     fn create_test_worktree(path: &str, branch: &str, is_main: bool) -> WorktreeInfo {

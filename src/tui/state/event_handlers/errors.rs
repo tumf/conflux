@@ -13,7 +13,7 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)));
+        self.add_log(LogEntry::error(format!("Error in {}: {}", id, error)).with_change_id(&id));
         self.error_change_id = Some(id.clone());
         self.current_change = None;
     }
@@ -27,10 +27,10 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        self.add_log(LogEntry::error(format!(
-            "Apply failed for {}: {}",
-            change_id, error
-        )));
+        self.add_log(
+            LogEntry::error(format!("Apply failed for {}: {}", change_id, error))
+                .with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_archive_failed(&mut self, change_id: String, error: String) {
@@ -42,10 +42,10 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        self.add_log(LogEntry::error(format!(
-            "Archive failed for {}: {}",
-            change_id, error
-        )));
+        self.add_log(
+            LogEntry::error(format!("Archive failed for {}: {}", change_id, error))
+                .with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_resolve_failed(&mut self, change_id: String, error: String) {
@@ -53,10 +53,13 @@ impl AppState {
         self.is_resolving = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.display_status_cache == "merged" {
-                self.add_log(LogEntry::info(format!(
-                    "Ignoring ResolveFailed for '{}': already Merged",
-                    change_id
-                )));
+                self.add_log(
+                    LogEntry::info(format!(
+                        "Ignoring ResolveFailed for '{}': already Merged",
+                        change_id
+                    ))
+                    .with_change_id(&change_id),
+                );
                 return;
             }
             change.set_display_status_cache("merge wait");
@@ -66,16 +69,16 @@ impl AppState {
         }
         let message = format!("Failed to resolve merge for '{}': {}", change_id, error);
         self.show_warning_popup("Merge resolve failed", message.clone());
-        self.add_log(LogEntry::error(message));
+        self.add_log(LogEntry::error(message).with_change_id(&change_id));
 
         self.try_transition_to_select();
     }
 
     pub(crate) fn handle_change_stop_failed(&mut self, change_id: String, error: String) {
-        self.add_log(LogEntry::error(format!(
-            "Failed to stop {}: {}",
-            change_id, error
-        )));
+        self.add_log(
+            LogEntry::error(format!("Failed to stop {}: {}", change_id, error))
+                .with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_hook_failed(
@@ -100,13 +103,16 @@ impl AppState {
                 change_id, error
             );
             self.show_warning_popup("on_merged hook failed", message.clone());
-            self.add_log(LogEntry::error(message));
+            self.add_log(LogEntry::error(message).with_change_id(&change_id));
             self.try_transition_to_select();
         } else {
-            self.add_log(LogEntry::error(format!(
-                "Hook '{}' failed for {}: {}",
-                hook_type, change_id, error
-            )));
+            self.add_log(
+                LogEntry::error(format!(
+                    "Hook '{}' failed for {}: {}",
+                    hook_type, change_id, error
+                ))
+                .with_change_id(&change_id),
+            );
         }
     }
 
@@ -133,7 +139,7 @@ impl AppState {
             return;
         }
 
-        self.add_log(LogEntry::warn(message));
+        self.add_log(LogEntry::warn(message).with_change_id(change_id));
     }
 
     pub(crate) fn handle_merge_deferred(
@@ -231,6 +237,66 @@ mod tests {
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
         }
+    }
+
+    fn change_ids_for_message(app: &AppState, needle: &str) -> Vec<Option<String>> {
+        app.logs
+            .iter()
+            .filter(|entry| entry.message.contains(needle))
+            .map(|entry| entry.change_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn proposal_error_logs_carry_structured_change_id() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_processing_error("change-a".to_string(), "boom".to_string());
+        app.handle_apply_failed("change-a".to_string(), "boom".to_string());
+        app.handle_archive_failed("change-a".to_string(), "boom".to_string());
+        app.handle_resolve_failed("change-a".to_string(), "boom".to_string());
+        app.handle_change_stop_failed("change-a".to_string(), "boom".to_string());
+        app.handle_hook_failed(
+            "change-a".to_string(),
+            "on_applied".to_string(),
+            "boom".to_string(),
+        );
+
+        for needle in [
+            "Error in change-a: boom",
+            "Apply failed for change-a: boom",
+            "Archive failed for change-a: boom",
+            "Failed to resolve merge for 'change-a': boom",
+            "Failed to stop change-a: boom",
+            "Hook 'on_applied' failed for change-a: boom",
+        ] {
+            assert_eq!(
+                change_ids_for_message(&app, needle),
+                vec![Some("change-a".to_string())],
+                "expected structured change_id on {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_merged_hook_failure_and_merge_deferred_logs_carry_structured_change_id() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_hook_failed(
+            "change-a".to_string(),
+            "on_merged".to_string(),
+            "boom".to_string(),
+        );
+        let _ = app.handle_merge_deferred("change-a".to_string(), "conflict".to_string(), false);
+
+        assert_eq!(
+            change_ids_for_message(&app, "on_merged hook failed for 'change-a'"),
+            vec![Some("change-a".to_string())]
+        );
+        assert_eq!(
+            change_ids_for_message(&app, "Merge deferred for change-a: conflict"),
+            vec![Some("change-a".to_string())]
+        );
     }
 
     #[test]

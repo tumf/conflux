@@ -33,6 +33,45 @@ pub(super) fn toggle_logs_panel(current: bool) -> bool {
     !current
 }
 
+/// Flip the presentation-only selected-proposal log filter.
+pub(super) fn toggle_selected_proposal_log_filter(current: bool) -> bool {
+    !current
+}
+
+/// Decide whether a cursor move must return the Logs panel to its newest
+/// matching position.
+///
+/// Only an enabled filter whose target actually changed invalidates the current
+/// entry-based scroll offset; cursor movement with the filter off leaves the
+/// unfiltered scroll position alone.
+pub(super) fn should_reset_log_position_for_target_change(
+    filter_enabled: bool,
+    previous_target: Option<&str>,
+    next_target: Option<&str>,
+) -> bool {
+    filter_enabled && previous_target != next_target
+}
+
+/// Exact structured association between a log entry and the filter target.
+///
+/// Proposal identity comes only from `LogEntry::change_id`; entries without one
+/// (global orchestration output) and entries carrying a different ID (including
+/// remote project-only IDs) are excluded while the filter is enabled.
+pub(super) fn log_entry_matches_selected_proposal(
+    filter_enabled: bool,
+    entry_change_id: Option<&str>,
+    target_change_id: Option<&str>,
+) -> bool {
+    if !filter_enabled {
+        return true;
+    }
+
+    match (entry_change_id, target_change_id) {
+        (Some(entry_id), Some(target_id)) => entry_id == target_id,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +115,87 @@ mod tests {
     fn toggle_logs_panel_flips_visibility_flag() {
         assert!(toggle_logs_panel(false));
         assert!(!toggle_logs_panel(true));
+    }
+
+    #[test]
+    fn toggle_selected_proposal_log_filter_flips_flag() {
+        assert!(toggle_selected_proposal_log_filter(false));
+        assert!(!toggle_selected_proposal_log_filter(true));
+    }
+
+    #[test]
+    fn cursor_move_resets_log_position_only_when_active_target_changes() {
+        assert!(should_reset_log_position_for_target_change(
+            true,
+            Some("alpha"),
+            Some("beta")
+        ));
+        assert!(!should_reset_log_position_for_target_change(
+            true,
+            Some("alpha"),
+            Some("alpha")
+        ));
+        assert!(!should_reset_log_position_for_target_change(
+            false,
+            Some("alpha"),
+            Some("beta")
+        ));
+    }
+
+    #[test]
+    fn cursor_move_resets_log_position_when_target_becomes_unavailable() {
+        assert!(should_reset_log_position_for_target_change(
+            true,
+            Some("alpha"),
+            None
+        ));
+        assert!(!should_reset_log_position_for_target_change(
+            true, None, None
+        ));
+    }
+
+    #[test]
+    fn disabled_filter_keeps_every_entry_eligible() {
+        assert!(log_entry_matches_selected_proposal(
+            false,
+            Some("beta"),
+            Some("alpha")
+        ));
+        assert!(log_entry_matches_selected_proposal(false, None, None));
+    }
+
+    #[test]
+    fn enabled_filter_matches_only_exact_structured_change_id() {
+        assert!(log_entry_matches_selected_proposal(
+            true,
+            Some("alpha"),
+            Some("alpha")
+        ));
+        assert!(!log_entry_matches_selected_proposal(
+            true,
+            Some("beta"),
+            Some("alpha")
+        ));
+        // Remote project-only identity must not be promoted to proposal identity.
+        assert!(!log_entry_matches_selected_proposal(
+            true,
+            Some("project-1"),
+            Some("project-1::demo/alpha")
+        ));
+    }
+
+    #[test]
+    fn enabled_filter_excludes_unscoped_and_targetless_entries() {
+        assert!(!log_entry_matches_selected_proposal(
+            true,
+            None,
+            Some("alpha")
+        ));
+        assert!(!log_entry_matches_selected_proposal(
+            true,
+            Some("alpha"),
+            None
+        ));
+        assert!(!log_entry_matches_selected_proposal(true, None, None));
     }
 }
