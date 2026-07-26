@@ -380,7 +380,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "cflx"
-version = "0.6.186"
+version = "0.6.187"
 dependencies = [
  "agent-skills-rs",
  "anyhow",
