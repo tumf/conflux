@@ -8,7 +8,7 @@
 - [x] Map existing orchestration events into the same semantic lifecycle stream without changing `EventSink` frontend ownership or workflow-control decisions. (verification: unit - extend `src/events.rs` tests with a mock lifecycle dispatcher and run `cargo test events::`)
 - [x] Add a Herdr-compatible example adapter or tracked fixture that no-ops outside `HERDR_ENV=1` and translates messages using inherited socket/pane context without wrapping `cflx`. (verification: integration - `tests/lifecycle_integration.rs` starts a fake Herdr socket and runs the tracked adapter fixture via `cargo test --test lifecycle_integration`)
 - [x] Document lifecycle integration configuration, JSONL protocol/versioning, failure behavior, privacy boundary, and the separate Herdr process-detection dependency in `docs/guides/CONFIG.md`. (verification: manual - reviewer follows the setup in `docs/guides/CONFIG.md` and runs the documented fixture command; manual coverage is intentional for operator-facing setup clarity). Manual run performed: documented recording-adapter config produced the documented JSONL shape from `cflx run --all`, and the documented `tests/fixtures/herdr_lifecycle_adapter.py` command no-opped outside Herdr and emitted `agent_attach`/`agent_status`/`agent_detach` to a fake `HERDR_SOCKET_PATH` pane.
-- [x] Run repository quality gates and keep default tests under the one-second policy, marking only impractical process-level cases as `heavy`. (verification: integration - run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets`). All three gates pass. Only the two tests that spawn the real `cflx` binary are `heavy-tests`-gated, and they are registered in the `tests/no_backup_files_test.rs` gating guard; the slowest default-suite lifecycle test is 0.41s. `cargo test --features heavy-tests --test lifecycle_integration` passed 13/13 on 12 consecutive runs after replacing the tight fixture shutdown deadline and per-test tokio runtimes that made process-spawn timing flaky.
+- [x] Run repository quality gates and keep default tests under the one-second policy, marking only impractical process-level cases as `heavy`. (verification: integration - run `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets`). All three gates pass. Only the two tests that spawn the real `cflx` binary are `heavy-tests`-gated, and they are registered in the `tests/no_backup_files_test.rs` gating guard; the slowest default-suite lifecycle test measures under 0.5s. `cargo test --features heavy-tests --test lifecycle_integration` passed 13/13 on 12 consecutive runs after replacing the tight fixture shutdown deadline and per-test tokio runtimes that made process-spawn timing flaky.
 
 ## Future Work
 
@@ -19,3 +19,7 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate add-external-lifecycle-integrations --archive-gate`
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [ ] repository|tests/lifecycle_integration.rs|verification

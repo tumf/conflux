@@ -127,10 +127,11 @@ fn config_for(command: Vec<String>) -> LifecycleIntegrationConfig {
     LifecycleIntegrationConfig {
         command,
         // A small queue and write timeout keep failure paths fast and
-        // deterministic. The shutdown deadline stays generous on purpose: tests
-        // that assert bounded shutdown assert against their own, tighter bound,
-        // so a loaded machine that is slow to `fork`/`exec` a fixture cannot turn
-        // a correctness assertion into a timing flake.
+        // deterministic. The shutdown deadline stays generous on purpose, so a
+        // loaded machine that is slow to `fork`/`exec` a fixture cannot turn a
+        // correctness assertion into a timing flake. Tests that assert bounded
+        // shutdown override it with `TIGHT_SHUTDOWN_MS` and assert against that
+        // pinned deadline instead.
         queue_capacity: Some(16),
         write_timeout_ms: Some(150),
         shutdown_timeout_ms: Some(5_000),
@@ -356,10 +357,15 @@ async fn crashing_adapter_does_not_block_execution_or_shutdown_impl() {
     let dir = tempfile::tempdir().expect("tempdir");
     let adapter = crashing_adapter(dir.path());
 
-    let integration = LifecycleIntegration::start(
-        Some(&config_for(vec![adapter.display().to_string()])),
-        LifecycleExecutionMode::Run,
-    );
+    // The bound asserted below must be derived from the configured deadline, not
+    // from an independent guess: the contract only promises shutdown within
+    // `shutdown_timeout_ms`, so the generous default from `config_for` would let
+    // a load-delayed child fork/exec/exit legally outlive a tighter assertion.
+    let config = LifecycleIntegrationConfig {
+        shutdown_timeout_ms: Some(TIGHT_SHUTDOWN_MS),
+        ..config_for(vec![adapter.display().to_string()])
+    };
+    let integration = LifecycleIntegration::start(Some(&config), LifecycleExecutionMode::Run);
 
     let handle = integration.handle();
     for index in 0..200 {
@@ -371,9 +377,10 @@ async fn crashing_adapter_does_not_block_execution_or_shutdown_impl() {
 
     let started = Instant::now();
     integration.shutdown().await;
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "an early adapter exit must not stall shutdown"
+        elapsed < Duration::from_millis(1_500),
+        "an early adapter exit must not stall shutdown past the pinned {TIGHT_SHUTDOWN_MS}ms deadline, took {elapsed:?}"
     );
 }
 
