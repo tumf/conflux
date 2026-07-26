@@ -531,7 +531,9 @@ mod tests {
             for required in [
                 "immutable identity metadata",
                 "do not rewrite, split, or refine",
-                "separate indented `evidence:` lines",
+                "exact `  evidence: <one-line evidence>` form",
+                "unindented `Evidence:` labels",
+                "non-checkbox notes section",
                 "immediately mark",
             ] {
                 assert!(
