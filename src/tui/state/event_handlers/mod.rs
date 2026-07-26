@@ -183,7 +183,7 @@ impl AppState {
                     change.update_iteration_monotonic(iteration_number);
                 }
                 if let Some(line) = status_log {
-                    self.add_log(LogEntry::info(line));
+                    self.add_log(LogEntry::info(line).with_change_id(&id));
                 }
             }
             _ => {}

@@ -16,7 +16,7 @@ impl AppState {
                 change.total_tasks = progress.total;
             }
         }
-        self.add_log(LogEntry::success(format!("Completed: {}", id)));
+        self.add_log(LogEntry::success(format!("Completed: {}", id)).with_change_id(&id));
     }
 
     pub(crate) fn handle_all_completed(&mut self) {
@@ -60,7 +60,7 @@ impl AppState {
                 }
             }
         }
-        self.add_log(LogEntry::info(format!("Archived: {}", id)));
+        self.add_log(LogEntry::info(format!("Archived: {}", id)).with_change_id(&id));
     }
 
     pub(crate) fn handle_resolve_completed(
@@ -90,10 +90,10 @@ impl AppState {
             self.apply_worktree_status(&ids);
         }
         if !already_merged {
-            self.add_log(LogEntry::success(format!(
-                "Merge resolved for '{}'",
-                change_id
-            )));
+            self.add_log(
+                LogEntry::success(format!("Merge resolved for '{}'", change_id))
+                    .with_change_id(&change_id),
+            );
         }
 
         self.complete_resolve_lifecycle()
@@ -116,10 +116,10 @@ impl AppState {
                 }
             }
         }
-        self.add_log(LogEntry::success(format!(
-            "Merge completed for '{}'",
-            change_id
-        )));
+        self.add_log(
+            LogEntry::success(format!("Merge completed for '{}'", change_id))
+                .with_change_id(&change_id),
+        );
 
         if self.is_resolving || !self.resolve_queue.is_empty() {
             self.complete_resolve_lifecycle()
@@ -132,10 +132,13 @@ impl AppState {
         self.is_resolving = false;
 
         if let Some(next_change_id) = self.pop_from_resolve_queue() {
-            self.add_log(LogEntry::info(format!(
-                "Queueing scheduler retry intent for '{}' from resolve queue",
-                next_change_id
-            )));
+            self.add_log(
+                LogEntry::info(format!(
+                    "Queueing scheduler retry intent for '{}' from resolve queue",
+                    next_change_id
+                ))
+                .with_change_id(&next_change_id),
+            );
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {
                 change.set_display_status_cache("resolve pending");
             }
@@ -172,10 +175,10 @@ impl AppState {
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("archiving");
         }
-        self.add_log(LogEntry::info(format!(
-            "Acceptance completed: {}",
-            change_id
-        )));
+        self.add_log(
+            LogEntry::info(format!("Acceptance completed: {}", change_id))
+                .with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_change_skipped(&mut self, change_id: String, reason: String) {
@@ -187,7 +190,9 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        self.add_log(LogEntry::warn(format!("Skipped {}: {}", change_id, reason)));
+        self.add_log(
+            LogEntry::warn(format!("Skipped {}: {}", change_id, reason)).with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_branch_merge_failed(&mut self, branch_name: String, error: String) {
@@ -213,7 +218,7 @@ impl AppState {
                 change.elapsed_time = Some(started.elapsed());
             }
         }
-        self.add_log(LogEntry::info(format!("Stopped: {}", change_id)));
+        self.add_log(LogEntry::info(format!("Stopped: {}", change_id)).with_change_id(&change_id));
     }
 }
 
@@ -232,6 +237,91 @@ mod tests {
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
         }
+    }
+
+    fn change_ids_for_message(app: &AppState, needle: &str) -> Vec<Option<String>> {
+        app.logs
+            .iter()
+            .filter(|entry| entry.message.contains(needle))
+            .map(|entry| entry.change_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn proposal_completion_skip_and_stop_logs_carry_structured_change_id() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_processing_completed("change-a".to_string());
+        app.handle_change_archived("change-a".to_string());
+        app.handle_acceptance_completed("change-a".to_string());
+        let _ = app.handle_merge_completed("change-a".to_string());
+        app.handle_change_skipped("change-a".to_string(), "dependency".to_string());
+        app.handle_change_stopped("change-a".to_string());
+
+        for needle in [
+            "Completed: change-a",
+            "Archived: change-a",
+            "Acceptance completed: change-a",
+            "Merge completed for 'change-a'",
+            "Skipped change-a: dependency",
+            "Stopped: change-a",
+        ] {
+            assert_eq!(
+                change_ids_for_message(&app, needle),
+                vec![Some("change-a".to_string())],
+                "expected structured change_id on {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_completion_and_queue_retry_logs_carry_structured_change_id() {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ]);
+        app.add_to_resolve_queue("change-b");
+
+        let _ = app.handle_resolve_completed("change-a".to_string(), None);
+
+        assert_eq!(
+            change_ids_for_message(&app, "Merge resolved for 'change-a'"),
+            vec![Some("change-a".to_string())]
+        );
+        assert_eq!(
+            change_ids_for_message(&app, "Queueing scheduler retry intent for 'change-b'"),
+            vec![Some("change-b".to_string())]
+        );
+    }
+
+    #[test]
+    fn global_completion_log_remains_unscoped() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+
+        app.handle_all_completed();
+
+        assert_eq!(
+            change_ids_for_message(&app, "All changes processed successfully"),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn branch_scoped_merge_logs_stay_unscoped_without_a_proposal_id() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_branch_merge_started("feature/change-a".to_string());
+        app.handle_branch_merge_completed("feature/change-a".to_string());
+
+        assert_eq!(
+            change_ids_for_message(&app, "merging branch 'feature/change-a'"),
+            vec![None]
+        );
+        assert_eq!(
+            change_ids_for_message(&app, "merged branch 'feature/change-a' successfully"),
+            vec![None]
+        );
     }
 
     #[test]

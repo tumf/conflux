@@ -113,10 +113,10 @@ impl AppState {
             change.selected = false;
         }
 
-        self.add_log(LogEntry::warn(format!(
-            "Change rejected: {} ({})",
-            change_id, reason
-        )));
+        self.add_log(
+            LogEntry::warn(format!("Change rejected: {} ({})", change_id, reason))
+                .with_change_id(&change_id),
+        );
     }
 
     pub(crate) fn handle_parallel_start_rejected(
@@ -215,6 +215,27 @@ mod tests {
         });
 
         assert_eq!(app.changes[0].completed_tasks, 4);
+    }
+
+    #[test]
+    fn remote_status_transition_log_carries_structured_change_id() {
+        let mut app = AppState::new(vec![create_test_change("MyProj/feat", 1, 5)]);
+        app.logs.clear();
+
+        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
+            id: "MyProj/feat".to_string(),
+            completed_tasks: 2,
+            total_tasks: 5,
+            status: Some("applying".to_string()),
+            iteration_number: None,
+        });
+
+        let entry = app
+            .logs
+            .iter()
+            .find(|entry| entry.message.starts_with("Remote status:"))
+            .expect("remote status transition log");
+        assert_eq!(entry.change_id.as_deref(), Some("MyProj/feat"));
     }
 
     #[test]

@@ -16,7 +16,7 @@ impl AppState {
             change.started_at = Some(Instant::now());
             change.elapsed_time = None;
         }
-        self.add_log(LogEntry::info(format!("Processing: {}", id)));
+        self.add_log(LogEntry::info(format!("Processing: {}", id)).with_change_id(&id));
     }
 
     pub(crate) fn handle_apply_started(&mut self, change_id: String, command: String) {
@@ -296,6 +296,62 @@ mod tests {
         app.handle_analysis_started(1, "attempt-b".to_string());
 
         assert_eq!(count_analysis_logs(&app, 1), 2);
+    }
+
+    fn change_ids_for_message(app: &AppState, needle: &str) -> Vec<Option<String>> {
+        app.logs
+            .iter()
+            .filter(|entry| entry.message.contains(needle))
+            .map(|entry| entry.change_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn proposal_lifecycle_start_logs_carry_structured_change_id() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        app.handle_processing_started("change-a".to_string());
+        app.handle_apply_started("change-a".to_string(), "run".to_string());
+        app.handle_archive_started("change-a".to_string(), "run".to_string());
+        app.handle_resolve_started("change-a".to_string(), "run".to_string());
+        app.handle_acceptance_started("change-a".to_string(), "run".to_string());
+
+        for needle in [
+            "Processing: change-a",
+            "Apply started: change-a",
+            "Archiving: change-a",
+            "Resolving merge for 'change-a'",
+            "Acceptance started: change-a",
+        ] {
+            assert_eq!(
+                change_ids_for_message(&app, needle),
+                vec![Some("change-a".to_string())],
+                "expected structured change_id on {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn global_orchestration_logs_remain_unscoped() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+
+        app.handle_analysis_started(1, "attempt-a".to_string());
+        app.try_transition_to_select();
+        app.handle_stopped();
+
+        assert_eq!(
+            change_ids_for_message(&app, "Re-analyzing queued changes for dispatch"),
+            vec![None]
+        );
+        assert_eq!(
+            change_ids_for_message(&app, "All changes processed successfully"),
+            vec![None]
+        );
+        assert_eq!(
+            change_ids_for_message(&app, "Processing stopped"),
+            vec![None]
+        );
     }
 
     #[test]
