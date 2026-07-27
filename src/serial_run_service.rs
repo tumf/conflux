@@ -94,6 +94,14 @@ pub struct SerialRunService {
     /// records the verdict, so a restart finds this set empty and re-runs
     /// acceptance for complete unarchived work instead of inferring PASS.
     accepted_change_ids: HashSet<String>,
+    /// Changes held by a repair stop (`acceptance_remediation_mismatch` or
+    /// `repeated_acceptance_finding`) during *this* run.
+    ///
+    /// The hold is in-memory only — no worktree marker and no durable record —
+    /// and its single job is to suppress ordinary dispatch until an explicit
+    /// operator retry releases the automatic repair budget. Parallel reaches the
+    /// same suppression through its failed-change tracker.
+    acceptance_repair_holds: HashSet<String>,
 }
 
 impl SerialRunService {
@@ -114,6 +122,7 @@ impl SerialRunService {
             acceptance_stall_state_root: None,
             acceptance_resume: HashSet::new(),
             accepted_change_ids: HashSet::new(),
+            acceptance_repair_holds: HashSet::new(),
         }
     }
 
@@ -244,6 +253,11 @@ impl SerialRunService {
     /// silently discarded, and a refusal keeps the change stalled with its
     /// blocker evidence intact.
     pub async fn consume_explicit_acceptance_retry(&mut self, change_id: &str) -> Result<bool> {
+        // An explicit operator retry is the only thing that grants a new
+        // automatic repair opportunity, so it runs before the durable-hold
+        // lookup: a repair stop is deliberately in-memory and has no record to
+        // load. Occurrence evidence and the latest findings are preserved.
+        let released_repair_hold = self.release_repair_budget_for_explicit_retry(change_id);
         let store = self.acceptance_stall_store()?;
         let base_branch = self.current_branch_for_facts().await;
         // A legacy acceptance-origin marker must become runtime state before
@@ -260,10 +274,10 @@ impl SerialRunService {
         )
         .await?
         else {
-            return Ok(false);
+            return Ok(released_repair_hold);
         };
         if !record.resumable {
-            return Ok(false);
+            return Ok(released_repair_hold);
         }
         let consumed = store.consume(&record.repository_id, &record.change_id)?;
         if consumed {
@@ -278,7 +292,47 @@ impl SerialRunService {
                 change_id, record.apply_revision
             );
         }
-        Ok(consumed)
+        Ok(consumed || released_repair_hold)
+    }
+
+    /// Release an in-run repair hold so an explicit retry may start one more
+    /// automatic repair attempt.
+    ///
+    /// Both automatic-repair budgets are released: the per-ID ledger and the
+    /// identity/fingerprint baseline the broader semantic comparison stalls on.
+    /// Occurrence counts, the latest findings, the cycle count, and the FAIL
+    /// revision are kept, because they are the operator's evidence trail and
+    /// only Acceptance may close a finding. The ten-cycle global ceiling is
+    /// untouched. Returns whether a repair hold was actually released.
+    fn release_repair_budget_for_explicit_retry(&mut self, change_id: &str) -> bool {
+        if !self.acceptance_repair_holds.remove(change_id) {
+            return false;
+        }
+        if let Some(context) = self.acceptance_retry.get_mut(change_id) {
+            context.repair_ledger.reset_for_explicit_retry();
+            context.finding_identities.clear();
+            context.semantic_fingerprint = None;
+        }
+        self.stalled_change_ids.remove(change_id);
+        info!(
+            "Explicit retry for {}: released the automatic per-finding repair budget; occurrence \
+             evidence and open findings are retained",
+            change_id
+        );
+        true
+    }
+
+    /// Hold a change on an evidenced repair stop for the rest of this run.
+    ///
+    /// Nothing durable and nothing inside the worktree is written: the hold only
+    /// suppresses ordinary dispatch (`select_next_change`) until an explicit
+    /// operator retry releases it, which is parallel's `mark_failed` behavior
+    /// expressed in serial terms. It never proves completion, closure, or PASS.
+    fn hold_repair_stop(&mut self, change_id: &str, error: String) -> ChangeProcessResult {
+        error!("{error}");
+        self.acceptance_repair_holds.insert(change_id.to_string());
+        self.mark_stalled(change_id, &error);
+        ChangeProcessResult::Stalled { error }
     }
 
     /// Branch used as the base reference when gathering reconciliation facts.
@@ -648,14 +702,6 @@ impl SerialRunService {
                     change_id
                 );
                 Self::update_operation_tracker(&operation_tracker, "acceptance");
-                // Validate the repair delta before spending another acceptance
-                // invocation. Passing only authorizes the next review; it never
-                // claims the finding is resolved.
-                let repo_root = self.repo_root.clone();
-                if let Some(error) = self.check_repair_coverage(change_id, &repo_root).await {
-                    error!("{error}");
-                    return Ok(ChangeProcessResult::AcceptanceCommandFailed { error });
-                }
                 self.seed_active_run_acceptance_history(change_id, agent);
                 return self
                     .run_acceptance_loop(
@@ -973,6 +1019,9 @@ impl SerialRunService {
     /// context while the shared missing-verdict budget remains. That budget is
     /// active-run memory only and never touches the configured explicit-CONTINUE
     /// budget.
+    ///
+    /// Every entry runs the remediation-coverage gate first, so no serial path
+    /// can reach Acceptance with an unvalidated repair delta.
     async fn run_acceptance_loop<O: OutputHandler, F, G>(
         &mut self,
         change: &Change,
@@ -986,6 +1035,16 @@ impl SerialRunService {
         F: Fn() -> bool + Clone + Send + 'static,
         G: Fn() -> bool + Clone,
     {
+        // Validate the repair delta before spending an acceptance invocation.
+        // This gate belongs to every entry into acceptance — post-apply repair,
+        // restart rerun, and explicit retry — so it runs here rather than at one
+        // call site. Passing only authorizes the next review; it never claims the
+        // finding is resolved.
+        let repo_root = self.repo_root.clone();
+        if let Some(error) = self.check_repair_coverage(&change.id, &repo_root).await {
+            return Ok(self.hold_repair_stop(&change.id, error));
+        }
+
         let mut protocol = AcceptanceProtocolDriver::default();
         loop {
             match acceptance_test_streaming(
@@ -1014,14 +1073,16 @@ impl SerialRunService {
                 }
                 Ok((
                     result @ (AcceptanceResult::BareBlocker { .. }
+                    | AcceptanceResult::MalformedFinding { .. }
                     | AcceptanceResult::Stalled { .. }),
                     _attempt_number,
                     _command,
                 )) => {
                     // Same shared decision API as parallel dispatch: bare or
-                    // invalid compatibility input gets bounded acceptance-only
-                    // retry; only a validated blocker becomes a durable
-                    // revision-bound stall.
+                    // invalid compatibility input — including a FAIL whose
+                    // structured payload did not validate — gets bounded
+                    // acceptance-only retry; only a validated blocker becomes a
+                    // durable revision-bound stall.
                     match decide_acceptance_blocker(&mut protocol, &result) {
                         Some(AcceptanceBlockerDecision::ProtocolRetry { progress, .. }) => {
                             warn!("{} for {}", progress, change.id);
@@ -1209,9 +1270,11 @@ impl SerialRunService {
                 }
             }
             AcceptanceResult::MalformedFinding { rejection } => {
-                // Bounded protocol error owned by the acceptance loop: reaching
-                // this arm means the budget is spent. No repair work is
-                // dispatched and no path-only follow-up is written.
+                // The acceptance loop owns the bounded protocol budget for this
+                // result and routes it through `decide_acceptance_blocker`, so
+                // this arm is only reached by a caller that bypassed that loop.
+                // It reports the exhausted diagnostic without dispatching repair
+                // work or writing a path-only follow-up.
                 let error = crate::orchestration::acceptance::protocol_exhausted_error(
                     crate::orchestration::acceptance::AcceptanceProtocolError::MalformedFinding,
                     MAX_MISSING_VERDICT_RETRIES.saturating_add(1),
@@ -1333,9 +1396,10 @@ impl SerialRunService {
                         &changed_files,
                         &remediation_evidence,
                     );
-                    let error = stop.summary();
-                    error!("{error}");
-                    return ChangeProcessResult::AcceptanceCommandFailed { error };
+                    // The stop holds the change for the rest of this run so no
+                    // second automatic repair Apply is dispatched; only an
+                    // explicit operator retry releases the budget.
+                    return self.hold_repair_stop(change_id, stop.summary());
                 }
                 // The repair opportunity for these identities is consumed now,
                 // so the next FAIL that still reports one of them stops.
@@ -1356,7 +1420,9 @@ impl SerialRunService {
                     // judgements, not reviewer-validated external blockers. They
                     // carry no explicit category, so they must not fabricate one
                     // or create a durable hold; they stop and require explicit
-                    // retry. Parallel dispatch makes the identical decision.
+                    // retry. Parallel dispatch makes the identical decision, and
+                    // the in-run hold is what keeps "explicit retry is required"
+                    // true instead of falling back into another automatic apply.
                     let error = format!(
                         "Acceptance stopped retrying {change_id} ({reason}). External blocker \
                          context: {}. Explicit retry is required.",
@@ -1366,8 +1432,7 @@ impl SerialRunService {
                             external_blockers.join(" | ")
                         }
                     );
-                    error!("{error}");
-                    return ChangeProcessResult::AcceptanceCommandFailed { error };
+                    return self.hold_repair_stop(change_id, error);
                 }
                 let blocking_gate_context = findings
                     .first()
@@ -1793,15 +1858,27 @@ mod tests {
             .unwrap();
 
         // Repeated findings without progress stop the retry loop and require an
-        // explicit retry. No category is invented, and nothing is written into
-        // the change directory or a generated checkpoint.
+        // explicit retry. The change is held for the rest of the run so no
+        // second automatic repair apply is dispatched. No category is invented,
+        // and nothing is written into the change directory or a generated
+        // checkpoint.
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+            ChangeProcessResult::Stalled { error } => {
                 assert!(error.contains("repeated_acceptance_finding"), "{error}");
                 assert!(error.contains("retry explicitly"), "{error}");
             }
             other => panic!("expected a retry-exhaustion stop, got {other:?}"),
         }
+        assert!(
+            service.is_stalled(change_id),
+            "a repeated-finding stop must suppress ordinary dispatch"
+        );
+        assert!(
+            service
+                .select_next_change(&[create_test_change(change_id, 0, 1)])
+                .is_none(),
+            "the held change must not be reselected without an explicit retry"
+        );
         assert!(crate::parallel::acceptance_state::parse_blocked_marker(
             temp_dir.path(),
             change_id
@@ -2403,7 +2480,7 @@ mod tests {
             .await;
 
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+            ChangeProcessResult::Stalled { error } => {
                 assert!(error.contains("repeated_acceptance_finding"), "{error}");
             }
             other => panic!("expected a retry-exhaustion stop, got {other:?}"),
@@ -2441,7 +2518,7 @@ mod tests {
         // reviewer supplied no explicit category, evidence contract, or next
         // action. The loop stops without fabricating a durable stalled hold.
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+            ChangeProcessResult::Stalled { error } => {
                 assert!(error.contains("external_acceptance_blocker"), "{error}");
                 assert!(
                     error.contains("external non-mockable prerequisite unavailable"),
@@ -2566,7 +2643,7 @@ mod tests {
         // Cycle exhaustion is a runtime safety ceiling with no reviewer evidence,
         // so it must not synthesize a blocker category or a durable hold.
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+            ChangeProcessResult::Stalled { error } => {
                 assert!(
                     error.contains("acceptance_cycle_limit_exhausted"),
                     "{error}"
@@ -3893,7 +3970,7 @@ mod tests {
             )
             .await;
 
-        let ChangeProcessResult::AcceptanceCommandFailed { error } = &second else {
+        let ChangeProcessResult::Stalled { error } = &second else {
             panic!("expected a repeated-finding stop, got {second:?}");
         };
         assert!(error.contains("repeated_acceptance_finding"), "{error}");
@@ -3983,7 +4060,7 @@ mod tests {
             )
             .await;
 
-        let ChangeProcessResult::AcceptanceCommandFailed { error } = &mixed else {
+        let ChangeProcessResult::Stalled { error } = &mixed else {
             panic!("a mixed payload with a repeated ID must stop, got {mixed:?}");
         };
         assert!(error.contains("repeated_acceptance_finding"), "{error}");
@@ -4044,6 +4121,500 @@ mod tests {
             .check_repair_coverage("test-change", temp_dir.path())
             .await
             .is_none());
+    }
+
+    // --- Repair loop through the real serial cycle ---
+    //
+    // These drive `process_change` end to end with scripted apply and
+    // acceptance commands, so the gate placement, the run-scoped hold, and the
+    // bounded protocol budget are observed where production actually calls
+    // them instead of by invoking the shared decision APIs directly.
+
+    /// Fake acceptance command that emits the recorded verdict for invocation
+    /// `n` (falling back to the last recorded verdict) and counts invocations.
+    ///
+    /// Verdicts are read from files so JSON quoting survives the shell round
+    /// trip intact. `apply_extra` is an additional shell fragment the apply
+    /// command runs after completing every open task, which is how a scripted
+    /// repair chooses whether it touches the declared files or not.
+    fn serial_scripted_cycle_config(
+        change_id: &str,
+        state_dir: &std::path::Path,
+        verdicts: &[String],
+        apply_extra: &str,
+    ) -> OrchestratorConfig {
+        let verdict_dir = state_dir.join("verdicts");
+        std::fs::create_dir_all(&verdict_dir).unwrap();
+        for (index, verdict) in verdicts.iter().enumerate() {
+            std::fs::write(
+                verdict_dir.join(format!("verdict-{}.json", index + 1)),
+                verdict,
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            verdict_dir.join("verdict-last.json"),
+            verdicts.last().expect("at least one verdict"),
+        )
+        .unwrap();
+
+        let acceptance_counter = state_dir.join("acceptance-attempts").display().to_string();
+        let apply_counter = state_dir.join("apply-attempts").display().to_string();
+        let verdict_dir = verdict_dir.display().to_string();
+
+        OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'n=$(cat \"{apply_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"{apply_counter}\"; \
+                 sed \"s/- \\[ \\]/- [x]/g\" openspec/changes/{change_id}/tasks.md \
+                 > openspec/changes/{change_id}/tasks.next \
+                 && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
+                 {apply_extra}'"
+            )),
+            acceptance_command: Some(format!(
+                "sh -c 'n=$(cat \"{acceptance_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"{acceptance_counter}\"; \
+                 verdict=\"{verdict_dir}/verdict-$n.json\"; \
+                 [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; \
+                 cat \"$verdict\"'"
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn serial_invocations(state_dir: &std::path::Path, counter: &str) -> u32 {
+        std::fs::read_to_string(state_dir.join(counter))
+            .map(|text| text.trim().parse().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// One structured FAIL verdict as the acceptance command would print it.
+    fn structured_fail_verdict(id: &str, implementation: &str, verification: &str) -> String {
+        serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": id,
+                "severity": "major",
+                "summary": "Issued values are never asserted by value",
+                "evidence": [format!("{implementation} records counts only")],
+                "required_changes": [{
+                    "file": implementation,
+                    "description": "Expose issued challenge and presented proof values",
+                }],
+                "verification": [{
+                    "file": verification,
+                    "description": "Assert recorded values are absent from audit output",
+                }],
+            }],
+        })
+        .to_string()
+    }
+
+    async fn run_serial_cycle(
+        service: &mut SerialRunService,
+        agent: &mut AgentRunner,
+        ai_runner: &AiCommandRunner,
+        repo_root: &std::path::Path,
+        change_id: &str,
+    ) -> ChangeProcessResult {
+        service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                agent,
+                ai_runner,
+                &HookRunner::new(HooksConfig::default(), repo_root),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn serial_post_apply_rerun_gates_a_calibration_only_repair_before_acceptance() {
+        // The reported regression: the post-apply acceptance rerun in
+        // `apply_change_internal` reached acceptance without validating the
+        // repair delta, so a calibration-only repair bought another review.
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-mismatch";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[structured_fail_verdict(
+                "acceptance-secret-value-scan",
+                "src/relay.rs",
+                "tests/relay_test.rs",
+            )],
+            // The repair only nudges an unrelated calibration constant.
+            "mkdir -p calibration && echo tweak >> calibration/thresholds.txt",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let first = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(
+            matches!(first, ChangeProcessResult::AcceptanceFailed { .. }),
+            "the first structured FAIL must return to apply, got {first:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            1
+        );
+
+        let second = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::Stalled { error } = &second else {
+            panic!("a calibration-only repair must hold, got {second:?}");
+        };
+        assert!(error.contains("acceptance_remediation_mismatch"), "{error}");
+        assert!(error.contains("src/relay.rs"), "{error}");
+        assert!(error.contains("tests/relay_test.rs"), "{error}");
+        assert!(error.contains("\"coverage_complete\":false"), "{error}");
+        assert!(
+            error.contains("calibration/thresholds.txt"),
+            "the unrelated repair must be reported as a diagnostic: {error}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            1,
+            "the hold must stop before spending a second acceptance invocation"
+        );
+        assert!(
+            serial_invocations(state_dir.path(), "apply-attempts") >= 2,
+            "the repair apply itself must have run before the gate"
+        );
+        assert!(service.is_stalled(change_id));
+        assert!(!temp_dir.path().join(".cflx/acceptance-state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn serial_repeated_finding_holds_dispatch_until_an_explicit_retry() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-repeated";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[structured_fail_verdict(
+                "acceptance-secret-value-scan",
+                "src/relay.rs",
+                "tests/relay_test.rs",
+            )],
+            // The repair covers every declared path, so only the repeated ID —
+            // not missing coverage — can stop the loop.
+            "mkdir -p src tests && echo repair >> src/relay.rs \
+             && echo proof >> tests/relay_test.rs",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let first = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(matches!(
+            first,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+
+        let second = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        let ChangeProcessResult::Stalled { error } = &second else {
+            panic!("the repeated ID must stop automatic repair, got {second:?}");
+        };
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(error.contains("acceptance-secret-value-scan"), "{error}");
+
+        let apply_after_stop = serial_invocations(state_dir.path(), "apply-attempts");
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            2
+        );
+        assert!(
+            service
+                .select_next_change(&[create_test_change(change_id, 0, 1)])
+                .is_none(),
+            "no second automatic repair apply may be dispatched for a repeated ID"
+        );
+
+        // Explicit operator retry releases the automatic budget while keeping
+        // the occurrence evidence and the open findings.
+        assert!(service
+            .consume_explicit_acceptance_retry(change_id)
+            .await
+            .unwrap());
+        let context = service.acceptance_retry_context(change_id).unwrap();
+        assert_eq!(
+            context
+                .repair_ledger
+                .occurrences("repository|id|acceptance-secret-value-scan"),
+            2,
+            "occurrence evidence survives an explicit retry"
+        );
+        assert!(
+            !context
+                .repair_ledger
+                .has_consumed_repair("repository|id|acceptance-secret-value-scan"),
+            "the explicit retry must release the automatic repair budget"
+        );
+        assert_eq!(context.latest_findings().len(), 1);
+        assert!(!service.is_stalled(change_id));
+        assert!(service
+            .select_next_change(&[create_test_change(change_id, 0, 1)])
+            .is_some());
+
+        let third = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(
+            serial_invocations(state_dir.path(), "apply-attempts") >= apply_after_stop,
+            "the retried cycle may not lose apply work already recorded"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "only the operator-authorized retry reaches acceptance again"
+        );
+        assert!(
+            matches!(third, ChangeProcessResult::AcceptanceFailed { .. }),
+            "the retry grants exactly one more automatic repair opportunity, got {third:?}"
+        );
+
+        // That one authorized opportunity is all it grants: the still-open ID
+        // stops the loop again without another operator retry.
+        let fourth = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        let ChangeProcessResult::Stalled { error } = &fourth else {
+            panic!("the retried budget must be spent after one repair, got {fourth:?}");
+        };
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(service.is_stalled(change_id));
+    }
+
+    #[tokio::test]
+    async fn serial_new_finding_id_gets_a_repair_apply_through_the_real_cycle() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-new-id";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[
+                structured_fail_verdict(
+                    "acceptance-secret-value-scan",
+                    "src/relay.rs",
+                    "tests/relay_test.rs",
+                ),
+                structured_fail_verdict(
+                    "acceptance-audit-gap",
+                    "src/audit.rs",
+                    "tests/audit_test.rs",
+                ),
+                "{\"acceptance\":\"pass\"}".to_string(),
+            ],
+            "mkdir -p src tests && for f in src/relay.rs tests/relay_test.rs src/audit.rs \
+             tests/audit_test.rs; do echo repair >> $f; done",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        for expected in ["fail", "fail"] {
+            let result = run_serial_cycle(
+                &mut service,
+                &mut agent,
+                &ai_runner,
+                temp_dir.path(),
+                change_id,
+            )
+            .await;
+            assert!(
+                matches!(result, ChangeProcessResult::AcceptanceFailed { .. }),
+                "a genuinely new ID keeps its own repair opportunity ({expected}), got {result:?}"
+            );
+        }
+
+        let passed = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(
+            matches!(passed, ChangeProcessResult::AcceptancePassed),
+            "acceptance owns closure and may still pass after two repaired IDs, got {passed:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3
+        );
+    }
+
+    /// A malformed structured payload is a bounded protocol error in serial too:
+    /// acceptance is re-invoked for a corrected verdict instead of failing
+    /// immediately with a fabricated "budget spent" diagnostic.
+    #[tokio::test]
+    async fn serial_malformed_structured_finding_retries_then_accepts_a_corrected_verdict() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-malformed";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        // `verification` is missing, so the payload cannot become a path-only
+        // repair instruction.
+        let malformed = serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": "acceptance-secret-value-scan",
+                "severity": "major",
+                "summary": "Issued values are never asserted by value",
+                "evidence": ["relay records counts only"],
+                "required_changes": [{"file": "src/relay.rs", "description": "expose values"}],
+            }],
+        })
+        .to_string();
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[
+                malformed.clone(),
+                malformed.clone(),
+                "{\"acceptance\":\"pass\"}".to_string(),
+            ],
+            "true",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        assert!(
+            matches!(result, ChangeProcessResult::AcceptancePassed),
+            "the bounded protocol retry must reach the corrected verdict, got {result:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "serial must spend the same two protocol retries parallel does"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "apply-attempts"),
+            1,
+            "a malformed payload must never dispatch repair work"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_malformed_structured_finding_exhaustion_is_terminal() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-malformed-exhausted";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let malformed = serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": "acceptance-secret-value-scan",
+                "severity": "major",
+                "summary": "Issued values are never asserted by value",
+                "evidence": ["relay records counts only"],
+                "required_changes": [{"file": "src/relay.rs", "description": "expose values"}],
+            }],
+        })
+        .to_string();
+
+        let config =
+            serial_scripted_cycle_config(change_id, state_dir.path(), &[malformed], "true");
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::AcceptanceCommandFailed { error } = &result else {
+            panic!("exhausted protocol retries must be terminal, got {result:?}");
+        };
+        assert!(
+            error.contains("malformed-finding protocol failure"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"),
+            "{error}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "no fourth protocol retry may start"
+        );
+        assert_eq!(serial_invocations(state_dir.path(), "apply-attempts"), 1);
+        assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
     }
 
     #[tokio::test]

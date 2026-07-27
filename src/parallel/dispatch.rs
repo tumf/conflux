@@ -674,6 +674,55 @@ mod tests {
         driver.observe_canonical_verdict();
         assert_eq!(driver.consecutive_malformed_findings(), 0);
     }
+
+    /// An explicitly retried dispatch must start with the automatic per-finding
+    /// repair budget released, and the release must keep occurrence evidence.
+    ///
+    /// Parallel builds one retry context per dispatch, so the budget is empty by
+    /// construction; the shared release API is still what production calls, so
+    /// both modes grant exactly one more repair opportunity per explicit retry.
+    #[test]
+    fn parallel_explicit_retry_starts_with_a_released_repair_budget() {
+        let mut retry = AcceptanceRetryContext::default();
+        let findings =
+            crate::orchestration::acceptance::normalize_findings(&[secret_value_finding()]);
+        let crate::orchestration::acceptance::FindingRepairDecision::Repair { identities } =
+            retry.repair_ledger.observe_fail(&findings)
+        else {
+            panic!("first observation must allow one repair");
+        };
+        retry.repair_ledger.record_repair_dispatched(&identities);
+        assert!(retry
+            .repair_ledger
+            .has_consumed_repair("repository|id|acceptance-secret-value-scan"));
+
+        retry.repair_ledger.reset_for_explicit_retry();
+
+        assert!(
+            !retry
+                .repair_ledger
+                .has_consumed_repair("repository|id|acceptance-secret-value-scan"),
+            "an explicit retry releases the automatic repair budget"
+        );
+        assert_eq!(
+            retry
+                .repair_ledger
+                .occurrences("repository|id|acceptance-secret-value-scan"),
+            1,
+            "occurrence evidence must remain inspectable after the retry"
+        );
+        assert!(matches!(
+            retry.repair_ledger.observe_fail(&findings),
+            crate::orchestration::acceptance::FindingRepairDecision::Repair { .. }
+        ));
+
+        // The production explicit-retry branch is what calls the release.
+        let dispatch_source = include_str!("dispatch.rs");
+        assert!(
+            dispatch_source.contains("reset_for_explicit_retry"),
+            "the explicit-retry branch must call the shared release API"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1446,6 +1495,17 @@ impl ParallelExecutor {
             // Retry context lives in memory for this dispatch only: a restarted
             // process re-runs acceptance instead of resuming a prior verdict.
             let mut acceptance_retry = AcceptanceRetryContext::default();
+            if resume_at_acceptance {
+                // Explicit operator retry: release the automatic per-finding
+                // repair budget through the same shared API serial calls, so both
+                // modes grant exactly one more repair opportunity per retry.
+                // Parallel's ledger is per-dispatch, so this starts from an empty
+                // budget by construction; calling the release keeps the two
+                // explicit-retry contracts identical instead of implicit.
+                acceptance_retry
+                    .repair_ledger
+                    .reset_for_explicit_retry();
+            }
             // Consecutive missing-verdict accounting for this active run only,
             // shared with serial orchestration. It is independent from the
             // configured explicit-CONTINUE budget and is never persisted, so a

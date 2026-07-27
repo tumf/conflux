@@ -386,6 +386,13 @@ mod tests {
             !CFLX_ACCEPT_SKILL_MD.contains("replay all prior acceptance attempts"),
             "acceptance guidance must not ask for full-history replay"
         );
+        for phrase in ACCEPTANCE_PORTABILITY_FORBIDDEN_PHRASES {
+            assert!(
+                !CFLX_ACCEPT_SKILL_MD.contains(phrase),
+                "cflx-accept SKILL.md must not contain provider-coupled phrase '{}'",
+                phrase
+            );
+        }
     }
 
     #[test]
@@ -407,10 +414,12 @@ mod tests {
                 "cflx-apply SKILL.md must define the repair contract: {required}"
             );
         }
+        // The repair contract travels with Apply, so the apply skill carries the
+        // same portability requirement the acceptance skill does.
         for phrase in ACCEPTANCE_PORTABILITY_FORBIDDEN_PHRASES {
             assert!(
-                !CFLX_ACCEPT_SKILL_MD.contains(phrase),
-                "cflx-accept SKILL.md must not contain provider-coupled phrase '{}'",
+                !CFLX_APPLY_SKILL_MD.contains(phrase),
+                "cflx-apply SKILL.md must not contain provider-coupled phrase '{}'",
                 phrase
             );
         }
