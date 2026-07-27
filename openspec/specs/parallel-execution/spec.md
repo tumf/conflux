@@ -2678,30 +2678,34 @@ When archive is retried, resumed, or fails terminally, the runtime SHALL expose 
 
 ### Requirement: Acceptance blocker input compatibility is distinct from lifecycle display taxonomy
 
-When acceptance detects an implementation blocker, the system SHALL NOT expose that observation as `gated` in user-facing lifecycle or display taxonomy. The runtime SHALL treat the condition as a non-terminal stalled/review hold while preserving reason metadata such as `acceptance-gated` when the cause must be distinguished from dependency `blocked`.
+The canonical parser MAY continue to accept `gated` and legacy `blocked` verdict input for compatibility, but runtime MUST distinguish bare compatibility input from a validated structured external blocker. Bare input without explicit supported category, concrete non-empty evidence, next action, and resumability MUST be treated as an Acceptance protocol error and MUST NOT create `stalled`, dependency `blocked`, or an inferred blocker category.
 
-The canonical machine-readable acceptance verdict parser MAY continue to accept `gated` input for compatibility. During migration, runtimes MAY continue to accept legacy `blocked` acceptance verdict input for backward compatibility. Newly authored lifecycle/status surfaces, operator-facing docs, and UI tests MUST NOT require `gated` as a display status.
+A validated external blocker SHALL enter the non-terminal user-facing `stalled` lifecycle. Newly authored lifecycle/status surfaces MUST NOT expose `gated` as a status. Dependency wait remains the only `blocked` display meaning.
 
-If acceptance follow-up later routes the change into a resumable hold, that hold SHALL use `stalled` terminology rather than dependency `blocked` or display `gated`.
+#### Scenario: bare gated input receives bounded protocol retry
 
-#### Scenario: canonical acceptance blocker displays as stalled
-- **GIVEN** acceptance detects an implementation blocker for change `change-a`
-- **WHEN** the runtime exposes the lifecycle/display status
+- **GIVEN** Acceptance emits `{"acceptance":"gated"}` or `ACCEPTANCE: GATED` without a structured blocker payload
+- **WHEN** runtime parses and routes the result
+- **THEN** it classifies the result as an Acceptance protocol error
+- **AND** it retries Acceptance only within the shared fixed protocol budget
+- **AND** it emits no stalled lifecycle transition or blocker category
+- **AND** it creates no change artifact or durable stalled record
+
+#### Scenario: legacy bare blocked input is compatibility-only
+
+- **GIVEN** an older integration emits a bare `blocked` Acceptance verdict
+- **WHEN** a compatibility-aware runtime parses it
+- **THEN** it follows the same bounded protocol-error path as bare `gated`
+- **AND** it is not displayed as dependency `blocked` or execution `stalled`
+
+#### Scenario: validated blocker displays as stalled
+
+- **GIVEN** Acceptance emits a blocker with an explicit supported category, concrete evidence, next action, and resumability
+- **AND** runtime verifies that repository-only Apply work cannot resolve the prerequisite
+- **WHEN** runtime exposes lifecycle state
 - **THEN** the displayed status is `stalled`
+- **AND** the explicit category is preserved without prose-based inference
 - **AND** new prompts and tests do not require `gated` as a lifecycle/display term
-- **AND** dependency wait remains the only `blocked` display meaning
-
-#### Scenario: gated verdict input remains parser-compatible during migration
-- **GIVEN** an acceptance integration emits `gated`
-- **WHEN** a compatibility-aware runtime parses that verdict
-- **THEN** the runtime interprets it as an acceptance blocker observation
-- **AND** the user-facing lifecycle taxonomy describes the paused condition as `stalled`, not `gated`
-
-#### Scenario: legacy blocked acceptance verdict remains backward compatible during migration
-- **GIVEN** an older acceptance integration still emits `blocked`
-- **WHEN** a compatibility-aware runtime parses that verdict
-- **THEN** the runtime still interprets it as an acceptance blocker observation
-- **AND** canonical user-facing taxonomy describes the paused condition as `stalled`
 
 ### Requirement: archived dependency references have explicit scheduler and validation semantics
 
@@ -3183,42 +3187,52 @@ The scheduler SHALL maintain a single `DependencyContext` implementation that en
 
 ### Requirement: Acceptance stalled retry evidence is workspace-local
 
-Acceptance retry control during an active serial or parallel run MUST use in-memory previous finding identities, semantic baseline, and cycle count. Runtime MUST NOT persist this ordinary retry context in `.cflx/acceptance-state.json` or another replacement hidden checkpoint.
+Ordinary Acceptance retry bookkeeping during an active serial or parallel run MUST remain in memory and MUST NOT use `.cflx/acceptance-state.json` or a worktree checkpoint. Acceptance MUST NOT create an Acceptance-origin `APPLY_BLOCKED/marker.md` or another change-directory artifact.
 
-An acceptance-generated stalled hold MUST use the existing tracked apply-blocked marker contract. Ordinary dispatch MUST honor the marker after restart. Explicit retry MAY consume a resumable acceptance-generated marker, but MUST NOT clear unrelated, unknown-origin, or non-resumable blockers.
+A validated Acceptance stalled hold MUST be stored in versioned, atomic Conflux runtime state outside the worktree. The record MUST bind repository identity, change ID, managed worktree identity/path, branch when available, Apply revision, stalled phase, retry count, explicit blocker category and evidence, resumability, next action, and timestamps. Runtime MUST reconcile that binding with current repository/Git/worktree facts before the record controls dispatch or retry.
 
-If restart occurs before a stalled marker exists, Conflux MAY begin a fresh acceptance retry sequence, but MUST run acceptance again and MUST NOT treat the unarchived revision as accepted.
+Runtime state MAY control ordinary dispatch suppression, stalled presentation, explicit retry eligibility, and Acceptance resume phase. It MUST NOT prove implementation completion, Acceptance PASS, archive readiness, merge eligibility, or base integration. If state is absent or invalid while repository evidence shows a complete unarchived Apply revision, Conflux MUST run Acceptance again and MUST NOT infer PASS.
 
-#### Scenario: restart before stalled marker reruns acceptance with fresh in-memory context
+#### Scenario: validated stall survives restart without dirtying worktree
 
-- **GIVEN** acceptance previously failed but no stalled blocker marker was persisted
-- **AND** the orchestration process restarts
-- **WHEN** serial or parallel execution resumes the complete unarchived workspace
-- **THEN** acceptance runs again
-- **AND** prior in-memory retry count and semantic baseline are not reconstructed from a generated checkpoint
-- **AND** archive does not start from an inferred prior PASS
+- **GIVEN** Acceptance records a validated resumable external blocker for a complete Apply revision
+- **AND** the managed worktree is clean
+- **WHEN** Conflux restarts and reconciles a matching runtime record
+- **THEN** it restores execution `stalled` and the recorded next action
+- **AND** ordinary dispatch starts neither Apply, Acceptance, nor archive
+- **AND** the worktree remains clean and the Apply commit remains unchanged
 
-#### Scenario: restart reconstructs acceptance stalled state
+#### Scenario: missing runtime state reruns Acceptance
 
-- **GIVEN** a workspace contains an acceptance-generated resumable blocker marker
-- **AND** out-of-worktree Conflux state is absent
-- **WHEN** Conflux detects the workspace after restart
-- **THEN** it reconstructs the stalled hold and next action from the marker
-- **AND** serial and parallel ordinary dispatch do not start apply, acceptance, or archive
+- **GIVEN** a complete unarchived Apply revision exists
+- **AND** no valid Acceptance stall record exists after restart
+- **WHEN** Conflux derives the next action
+- **THEN** it runs Acceptance again
+- **AND** it does not infer prior PASS, enter archive, or rerun Apply solely from missing runtime metadata
 
-#### Scenario: explicit retry clears only acceptance-generated marker
+#### Scenario: stale state cannot override repository evidence
 
-- **GIVEN** an operator explicitly retries a stalled acceptance change
-- **WHEN** runtime prepares the workspace for retry
-- **THEN** it consumes the resumable acceptance-generated marker before dispatch
-- **AND** an apply-generated, unknown-origin, or non-resumable marker is not silently cleared
+- **GIVEN** a stored stall has a mismatched repository, worktree identity, path reuse guard, Apply revision, ancestry, or active-change state
+- **WHEN** restart or retry reconciliation evaluates it
+- **THEN** the record is invalidated or quarantined with a diagnostic
+- **AND** routing is recomputed from repository/Git/worktree evidence
+- **AND** the stale record cannot suppress cleanup or authorize archive or merge
 
-#### Scenario: marker consume failure blocks dispatch
+#### Scenario: explicit retry resumes Acceptance transactionally
 
-- **GIVEN** a resumable acceptance marker cannot be safely consumed
-- **WHEN** explicit retry preparation runs
-- **THEN** runtime reports the failure
-- **AND** it does not dispatch apply or acceptance with ambiguous workspace evidence
+- **GIVEN** a valid resumable Acceptance stall matches the current Apply revision
+- **WHEN** an operator explicitly retries it
+- **THEN** runtime prepares and starts Acceptance without rerunning Apply
+- **AND** the prior hold is consumed only across a successful dispatch-preparation boundary
+- **AND** preparation failure retains the blocker evidence and does not dispatch ambiguous work
+
+#### Scenario: legacy Acceptance marker migrates conservatively
+
+- **GIVEN** a legacy marker is proven Acceptance-origin, resumable, structurally valid, and bindable to the current repository, worktree, and Apply revision
+- **WHEN** Conflux performs one-time migration
+- **THEN** it writes the runtime record before removing generated marker residue
+- **AND** successful migration is idempotent and leaves the worktree clean
+- **AND** Apply-origin, unknown-origin, non-resumable, malformed, or ambiguous markers are not silently migrated or deleted
 
 ### Requirement: Runtime acceptance follow-up preserves completed repair work
 
@@ -3241,40 +3255,62 @@ During apply hydration, runtime MUST preserve the checked state of an existing a
 
 ### Requirement: Acceptance retry safeguards are mode-independent
 
-Serial and parallel execution MUST use equivalent finding normalization, semantic progress, retry, mixed-blocker, and stalled classification. The existing apply+acceptance ceiling of ten cycles MUST remain a safety ceiling, but exhaustion MUST produce a resumable `acceptance_cycle_limit_exhausted` stalled hold with workspace-local evidence instead of terminal Error.
+Serial and parallel execution MUST use equivalent blocker validation, protocol retry, finding normalization, semantic progress, retry, mixed-blocker, stalled persistence, reconciliation, migration, and explicit-retry decisions.
 
-#### Scenario: cycle ceiling preserves resumability
+Bare `gated` or legacy `blocked` input MUST share the fixed two-retry protocol bound used for missing verdict while retaining a distinct consecutive counter and corrective context. It MUST NOT consume Apply or explicit-CONTINUE budget, rerun Apply, or persist stalled state. Exhaustion MUST produce a terminal Acceptance protocol error requiring explicit retry.
 
-- **GIVEN** a change reaches the tenth apply+acceptance cycle without acceptance PASS
-- **WHEN** runtime enforces the safety ceiling
-- **THEN** it enters `acceptance_cycle_limit_exhausted` stalled
-- **AND** it preserves the worktree and retry evidence
-- **AND** it does not classify the ceiling as terminal implementation failure
+The existing apply+Acceptance ceiling of ten cycles remains a safety ceiling. A validated repository-external blocker or cycle-exhaustion hold MAY become resumable runtime `stalled` only with explicit evidence; evidence-free exhaustion MUST NOT create a synthetic category or worktree marker.
 
-#### Scenario: serial and parallel classify equivalent observations equally
+#### Scenario: bare GATED budget is equivalent across modes
 
-- **GIVEN** serial and parallel observe equivalent prior findings, current findings, and workspace progress
-- **WHEN** each computes its retry decision
-- **THEN** both choose the same apply-retry or stalled outcome and reason
+- **GIVEN** serial and parallel Acceptance each emit the same sequence of bare GATED results
+- **WHEN** each applies protocol retry policy
+- **THEN** both run at most two Acceptance-only retries after the initial result
+- **AND** both return the same terminal protocol error on the third consecutive result
+- **AND** neither writes stalled state or a worktree marker
+
+#### Scenario: canonical verdict resets bare GATED sequence
+
+- **GIVEN** a bare GATED result was retried
+- **WHEN** the next Acceptance invocation returns a canonical PASS, FAIL, CONTINUE, or validated stalled blocker
+- **THEN** the consecutive bare-GATED retry counter resets
+- **AND** the canonical result follows its normal routing
+
+#### Scenario: equivalent validated blockers produce equivalent state
+
+- **GIVEN** serial and parallel observe equivalent validated structured external blockers for equivalent Apply revisions
+- **WHEN** each computes and persists its decision
+- **THEN** both preserve the same explicit category, evidence, resumability, next action, and revision binding
+- **AND** both enter user-facing `stalled` without dirtying the worktree
 
 ### Requirement: Acceptance findings retain repository and external scopes
 
-Runtime MUST classify findings individually as repository-fixable or external/non-mockable. Repository-fixable findings MUST remain actionable repair input. External blockers MUST be retained and MUST NOT disappear when repository findings are present. If repository findings are resolved and only an unresolved external blocker remains, runtime MUST preserve it through the stalled path.
+Runtime MUST classify findings individually as repository-fixable or external/non-mockable. Repository-fixable findings MUST remain actionable Apply repair input. External blockers MUST be retained when repository findings are present, but they MAY enter durable runtime `stalled` only after repository-fixable findings are resolved and the external blocker satisfies the structured validation contract.
+
+Runtime MUST preserve an explicitly supplied supported category and MUST NOT infer credential, infrastructure, or other categories from narrative text. Missing or invalid blocker structure follows bounded protocol error rather than stalled persistence.
 
 #### Scenario: mixed findings preserve both responsibilities
 
-- **GIVEN** acceptance identifies a repository defect and an external prerequisite
-- **WHEN** runtime evaluates the FAIL
-- **THEN** the repository defect remains apply-repairable
-- **AND** the external prerequisite remains blocker evidence
-- **AND** apply is not instructed to satisfy the external prerequisite by repository edits
+- **GIVEN** Acceptance identifies a repository defect and a concrete external prerequisite
+- **WHEN** runtime evaluates the findings
+- **THEN** the repository defect remains Apply-repairable
+- **AND** the external prerequisite remains non-checkbox blocker metadata
+- **AND** runtime does not stall before repository-fixable findings are resolved
 
-#### Scenario: external blocker remains after repository repair
+#### Scenario: validated external blocker remains after repository repair
 
-- **GIVEN** apply resolves all repository-fixable findings
-- **AND** an external non-mockable blocker remains
-- **WHEN** acceptance runs again
-- **THEN** the blocker is preserved in a resumable stalled hold
+- **GIVEN** Apply resolves all repository-fixable findings
+- **AND** Acceptance returns a valid structured external blocker
+- **WHEN** runtime evaluates the result
+- **THEN** it preserves the explicit blocker in revision-bound runtime stalled state
+- **AND** it does not create a change-directory marker
+
+#### Scenario: unsupported credential inference is prohibited
+
+- **GIVEN** a bare or incomplete blocker narrative contains words such as credential, token, or auth
+- **WHEN** runtime validates the result
+- **THEN** it does not assign category `credential` from those words
+- **AND** it follows bounded protocol-error handling until a valid structured category and evidence are supplied
 
 ### Requirement: Acceptance follow-up rendering uses normalized finding scopes
 
@@ -3334,21 +3370,30 @@ A completed runtime-owned finding MUST remain completed during apply hydration a
 
 ### Requirement: Acceptance execution creates no JSON checkpoint
 
-Serial and parallel acceptance execution MUST NOT create, read, update, or delete `.cflx/acceptance-state.json`. Acceptance PASS for an active run MAY be held in memory only until archive handoff. After restart, incomplete archive work MUST be accepted again unless repository evidence already proves archive or base integration.
+Serial and parallel Acceptance execution MUST NOT create, read, update, or delete `.cflx/acceptance-state.json`. Acceptance PASS for an active run MAY be held in memory only until archive handoff. After restart, incomplete archive work MUST be accepted again unless repository evidence already proves archive or base integration.
+
+A versioned out-of-worktree Acceptance stall record is not a PASS checkpoint. It MAY represent only a validated temporary external hold bound to current repository/worktree/Apply evidence and MUST be ignored or invalidated when reconciliation fails.
 
 #### Scenario: uninterrupted pass reaches archive without checkpoint
 
-- **GIVEN** apply completed and acceptance runs in the same orchestration process
-- **WHEN** acceptance returns PASS
+- **GIVEN** Apply completed and Acceptance runs in the same orchestration process
+- **WHEN** Acceptance returns PASS
 - **THEN** archive handoff proceeds for that accepted revision
-- **AND** `.cflx/acceptance-state.json` never exists
+- **AND** neither `.cflx/acceptance-state.json` nor a persisted PASS record exists
 
-#### Scenario: checkpoint cleanup cannot dirty post-archive worktree
+#### Scenario: runtime stall cannot substitute for PASS
 
-- **GIVEN** acceptance passes and archive artifacts are committed
+- **GIVEN** a valid or stale Acceptance stall record exists
+- **WHEN** Conflux evaluates archive readiness
+- **THEN** the record cannot prove PASS or authorize archive
+- **AND** Acceptance must pass for the current revision through the normal execution path
+
+#### Scenario: runtime metadata cannot dirty post-archive worktree
+
+- **GIVEN** Acceptance passes and archive artifacts are committed
 - **WHEN** post-archive merge verification runs
-- **THEN** no acceptance checkpoint cleanup is performed
-- **AND** no manual `MergeWait` is produced solely by generated acceptance state
+- **THEN** no Acceptance runtime-state cleanup mutates the managed worktree
+- **AND** no manual `MergeWait` is produced solely by runtime stall metadata
 
 #### Scenario: genuine dirty evidence remains a blocker
 
@@ -3356,7 +3401,7 @@ Serial and parallel acceptance execution MUST NOT create, read, update, or delet
 - **AND** an unrelated user file remains modified
 - **WHEN** post-archive merge verification runs
 - **THEN** the unrelated dirty worktree remains concrete manual blocker evidence
-- **AND** removing acceptance checkpoints does not suppress the deferral
+- **AND** externalizing Acceptance stall state does not suppress the deferral
 
 ### Requirement: Apply completion MUST validate task format before acceptance
 

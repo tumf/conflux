@@ -21,18 +21,3 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate replace-acceptance-marker-stalls --archive-gate`
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] repository|migrate_legacy_acceptance_marker/remove_generated_marker|verification
-  evidence: `marker_is_tracked` preserves git-tracked markers and `verify_marker_removal_left_worktree_clean` fails on residue (src/parallel/acceptance_state.rs:640,706,731); new tracked fixture `acceptance_marker_migration_preserves_tracked_markers` (src/execution/state.rs:1109) passes with `cargo test --lib acceptance_marker_migration` (3 passed)
-- [x] repository|src/embedded_skills.rs|implementation
-  evidence: vacuous negated disjunction replaced by positive per-mirror assertions requiring the "Never create `APPLY_BLOCKED`" sentence plus explicit forbidden-phrase checks (src/embedded_skills.rs:273); `skills/cflx-accept-with-speca/SKILL.md:268` now carries the same prohibition; `cargo test --lib embedded_skills` 29 passed
-- [x] repository|src/parallel/dispatch.rs|verification
-  evidence: migration is no longer parallel-only — `SerialRunService::migrate_legacy_acceptance_marker` runs in both the serial preflight and explicit retry (src/serial_run_service.rs:387,447,236), covered by `serial_migrates_a_legacy_acceptance_marker_into_runtime_state` asserting migration, clean `git status --porcelain`, and a now-retryable hold
-- [x] repository|src/serial_run_service.rs|implementation
-  evidence: explicit retry sets `acceptance_resume` so `process_change` routes to `run_acceptance_loop` instead of archive (src/serial_run_service.rs:262,547), and `record_acceptance_stall` returns `AcceptanceCommandFailed` on revision lookup failure instead of persisting an empty `apply_revision` (src/serial_run_service.rs:302)
-- [x] repository|src/serial_run_service.rs|specification
-  evidence: serial now matches parallel mode-independence — `preflight_acceptance_stall` reconstructs runtime stalls on restart, complete-but-unaccepted changes rerun Acceptance rather than archive on an inferred PASS, and `AcceptanceStalled` carries the structured blocker to `ExecutionEvent::AcceptanceGated` (src/serial_run_service.rs:443,551,1400; src/orchestrator.rs:409; src/tui/orchestrator.rs:860)
-- [x] repository|src/serial_run_service.rs|verification
-  evidence: added `serial_restart_restores_runtime_acceptance_stall_before_archive`, `explicit_serial_retry_resumes_at_acceptance_without_rerunning_apply`, `serial_complete_change_reruns_acceptance_before_archive_after_restart`, `serial_stall_refuses_to_persist_without_an_apply_revision`, and `serial_acceptance_stall_displays_as_stalled_with_structured_metadata`; `cargo test --lib serial_` 46 passed and full `cargo fmt --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo test` (2344 passed, 0 failed) are green
