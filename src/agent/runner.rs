@@ -881,7 +881,10 @@ impl AgentRunner {
         let Some(retry) = protocol_retry else {
             return String::new();
         };
-        let previous_findings = self.acceptance_history.last_findings(change_id);
+        let previous_findings = self
+            .acceptance_history
+            .last_findings(change_id)
+            .map(|findings| crate::acceptance::finding_texts(&findings));
         super::prompt::build_missing_verdict_continuation_context(
             retry,
             stdout_tail,
@@ -944,6 +947,8 @@ impl AgentRunner {
             return Ok(String::new());
         }
 
+        let previous_findings =
+            previous_findings.map(|findings| crate::acceptance::finding_texts(&findings));
         let findings_slice = previous_findings.as_deref();
         Ok(build_acceptance_diff_context(
             &changed_files,
@@ -992,7 +997,10 @@ impl AgentRunner {
 
     /// Get the last findings from the most recent acceptance attempt.
     /// Returns None if there are no previous attempts or the last attempt has no findings.
-    pub fn get_last_acceptance_findings(&self, change_id: &str) -> Option<Vec<String>> {
+    pub fn get_last_acceptance_findings(
+        &self,
+        change_id: &str,
+    ) -> Option<Vec<crate::acceptance::AcceptanceFinding>> {
         self.acceptance_history
             .last_findings(change_id)
             .or_else(|| {
@@ -1000,6 +1008,16 @@ impl AgentRunner {
                     .last_follow_up_findings(change_id)
                     .map(|(_, findings)| findings)
             })
+    }
+
+    /// Complete texts of the latest acceptance findings.
+    ///
+    /// Used by acceptance-side diagnostics that consume plain prose; the
+    /// structured payload stays available through
+    /// [`Self::get_last_acceptance_findings`].
+    pub fn get_last_acceptance_finding_texts(&self, change_id: &str) -> Option<Vec<String>> {
+        self.get_last_acceptance_findings(change_id)
+            .map(|findings| crate::acceptance::finding_texts(&findings))
     }
 
     #[allow(dead_code)] // Exposes restart-restored baseline for serial acceptance regression coverage.
@@ -1016,14 +1034,17 @@ impl AgentRunner {
         &mut self,
         change_id: &str,
         attempt: u32,
-        findings: Vec<String>,
+        findings: Vec<crate::acceptance::AcceptanceFinding>,
     ) {
         self.acceptance_history
             .set_follow_up_findings(change_id, attempt, findings);
         self.reset_acceptance_tail_injection(change_id);
     }
 
-    pub fn get_acceptance_follow_up(&self, change_id: &str) -> Option<(u32, Vec<String>)> {
+    pub fn get_acceptance_follow_up(
+        &self,
+        change_id: &str,
+    ) -> Option<(u32, Vec<crate::acceptance::AcceptanceFinding>)> {
         self.acceptance_history.last_follow_up_findings(change_id)
     }
 

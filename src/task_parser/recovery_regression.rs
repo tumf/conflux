@@ -80,7 +80,9 @@ fn acceptance_follow_up_recovery_survives_retry_restart_and_pass_cleanup() {
     let recovery = task_parser::replace_acceptance_follow_up_from_latest_fail(
         &resolved,
         2,
-        &["[OPEN_FINDING] regression coverage is missing".to_string()],
+        &["[OPEN_FINDING] regression coverage is missing"
+            .to_string()
+            .into()],
     )
     .expect("FAIL persistence recovers instead of erroring");
     assert_eq!(recovery.recovered_blocks, 1);

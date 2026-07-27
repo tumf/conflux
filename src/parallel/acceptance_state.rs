@@ -42,11 +42,26 @@ pub const ACCEPTANCE_STALL_SCHEMA: &str = "acceptance-stall-v1";
 /// This is never serialized to a generated checkpoint file. It is discarded on
 /// process restart, which forces a fresh acceptance sequence instead of an
 /// inferred prior verdict.
+///
+/// Retry comparison state and the complete latest payload live in separate
+/// fields.
+///
+/// `finding_identities` and `semantic_fingerprint` are comparison data only.
+/// `findings` is the complete actionable payload the next Apply needs. Updating
+/// the comparison fields can never replace the payload, which is what the
+/// previous single-slot design allowed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AcceptanceRetryContext {
     pub finding_identities: Vec<String>,
     pub semantic_fingerprint: Option<String>,
     pub cycle_count: u32,
+    /// Complete latest findings reported by the most recent canonical FAIL.
+    pub findings: Vec<crate::acceptance::AcceptanceFinding>,
+    /// Per-finding automatic repair accounting for this active run.
+    pub repair_ledger: crate::orchestration::acceptance::FindingRepairLedger,
+    /// Revision observed when the latest FAIL was recorded, used as the base of
+    /// the remediation coverage delta.
+    pub fail_revision: Option<String>,
 }
 
 impl AcceptanceRetryContext {
@@ -56,6 +71,11 @@ impl AcceptanceRetryContext {
 
     pub fn previous_fingerprint(&self) -> Option<&str> {
         self.semantic_fingerprint.as_deref()
+    }
+
+    /// Complete latest actionable findings.
+    pub fn latest_findings(&self) -> &[crate::acceptance::AcceptanceFinding] {
+        &self.findings
     }
 }
 
@@ -782,6 +802,7 @@ mod tests {
             finding_identities: identities.iter().map(|value| value.to_string()).collect(),
             semantic_fingerprint: fingerprint.map(str::to_string),
             cycle_count,
+            ..AcceptanceRetryContext::default()
         }
     }
 

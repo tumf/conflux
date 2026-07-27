@@ -27,7 +27,8 @@ If `openspec/CONSTITUTION.md` exists, read it before acceptance review and treat
 machine-readable payload, on its own line:
 
 - PASS:     `{"acceptance":"pass"}`
-- FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
+- FAIL:     `{"acceptance":"fail","findings":[<finding>, ...]}` — each `<finding>`
+  is either a **structured repository finding** (preferred) or a legacy string.
 - CONTINUE: `{"acceptance":"continue"}`
 - STALLED HOLD (compatibility token) — **requires a structured blocker payload**:
 
@@ -37,6 +38,45 @@ machine-readable payload, on its own line:
 
 A bare `{"acceptance":"gated"}` is a **protocol error**, not a stalled hold. See
 "Structured stalled blocker contract" below.
+
+### Structured repository finding contract
+
+A structured finding tells Apply exactly what to change and exactly how it will
+be proved. Emit one whenever repository work can resolve the defect:
+
+```json
+{"acceptance":"fail","findings":[{
+  "id":"acceptance-secret-value-scan",
+  "severity":"minor",
+  "summary":"Challenge and proof leakage is not tested by value",
+  "evidence":["tests/support/relay.ts exposes counts but not issued values"],
+  "required_changes":[{"file":"tests/support/relay.ts","description":"Expose issued challenge and presented proof values to tests"}],
+  "verification":[{"file":"runtime/recovery.integration.test.ts","description":"Assert recorded values are absent from serialized audit and operator output"}]
+}]}
+```
+
+Rules:
+
+- Every field is required and every array must be non-empty.
+- `id` is the **stable retry identity**. Reuse the same `id` whenever you report
+  the same underlying defect, no matter how the summary, evidence, line numbers,
+  or cited paths changed. Never derive it from that mutable prose, and never emit
+  the same `id` twice in one verdict.
+- `severity` is `major` or `minor`. **Both block PASS**; the distinction is only
+  operator triage.
+- `required_changes[].file` and `verification[].file` are repository-relative
+  paths that must not escape the workspace. Runtime checks that every one of them
+  actually appears in the repair diff before it will run acceptance again, so
+  declare the files you genuinely expect to change — no more, no less.
+- A structured finding that is missing a field, has an empty array, or names an
+  invalid path is a **protocol error**. Runtime will not reduce it to a path-only
+  repair instruction; it asks you for a corrected verdict instead.
+- Legacy string findings remain accepted. They carry no declared path set, so
+  they get compatibility behavior rather than strict diff coverage.
+
+Each stable `id` gets **one** automatic repair Apply. If your next FAIL reports
+the same `id` as still open, runtime stops automatic repair and waits for an
+operator. Unrelated repository progress does not grant another attempt.
 
 The JSON verdict is the canonical machine-readable contract. The Conflux runtime parser resolves it with priority over the legacy plain-text marker, including when the JSON verdict is wrapped inside a supported agent event payload and the runtime can unwrap the text. Do not rely on a specific agent runtime for this behavior.
 
@@ -118,9 +158,10 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 
 - Re-validate every prior finding against the current worktree. Classify it as fixed or still-open from current repository evidence; a prior report alone is never evidence that it remains open.
 - Emit one atomic defect per finding. Keep implementation defects and missing test or verification evidence in separate findings when independently actionable.
-- Give each repository-fixable finding a stable leading code such as `[RETRY_TEST_MISSING]` when possible. Reuse that code only for the same defect across attempts.
+- Prefer a structured finding with a stable `id`, concrete `evidence`, and declared `required_changes`/`verification` files. For legacy string findings, keep the stable leading code such as `[RETRY_TEST_MISSING]`; reuse either identity only for the same defect across attempts.
 - Do not emit a broad cross-cutting or aggregate finding that duplicates defects or test work already owned by specific findings.
 - Acceptance remains read-only: return findings to runtime and never edit runtime-owned finding tasks or their checkbox state.
+- A checked runtime-owned follow-up box is an Apply **remediation claim**, never closure. Only your next canonical verdict closes a finding: omit its `id` from the next FAIL, or return PASS.
 
 ### Accept Rules
 

@@ -160,6 +160,482 @@ pub fn validate_acceptance_blocker(
     })
 }
 
+/// Severity of a structured repository finding.
+///
+/// Both severities block PASS. The distinction exists only so operators can
+/// triage; it never changes routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingSeverity {
+    /// Reviewer-declared major defect.
+    Major,
+    /// Reviewer-declared minor defect. Still blocks PASS.
+    Minor,
+}
+
+impl FindingSeverity {
+    /// Canonical lowercase token used in the verdict schema.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindingSeverity::Major => "major",
+            FindingSeverity::Minor => "minor",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "major" => Some(FindingSeverity::Major),
+            "minor" => Some(FindingSeverity::Minor),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FindingSeverity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One declared repository expectation: a file plus what must become true there.
+///
+/// Used for both `required_changes` (implementation) and `verification`
+/// (proof). `file` is always a normalized repository-relative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingFileExpectation {
+    /// Normalized repository-relative path.
+    pub file: String,
+    /// Expected behavior or proof at that path.
+    pub description: String,
+}
+
+/// A structured, actionable repository finding.
+///
+/// `id` is the authoritative retry identity. It is stable for the same defect
+/// across attempts and is never derived from the mutable `summary`, evidence
+/// prose, or line numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryFinding {
+    /// Stable reviewer-authored identity for this defect.
+    pub id: String,
+    /// `major` or `minor`; both block PASS.
+    pub severity: FindingSeverity,
+    /// One-line human-facing summary.
+    pub summary: String,
+    /// Concrete observed evidence.
+    pub evidence: Vec<String>,
+    /// Implementation files that must change, with expected behavior.
+    pub required_changes: Vec<FindingFileExpectation>,
+    /// Verification files that must change, with expected proof.
+    pub verification: Vec<FindingFileExpectation>,
+}
+
+impl RepositoryFinding {
+    /// Declared implementation paths.
+    pub fn required_files(&self) -> Vec<String> {
+        self.required_changes
+            .iter()
+            .map(|change| change.file.clone())
+            .collect()
+    }
+
+    /// Declared verification paths.
+    pub fn verification_files(&self) -> Vec<String> {
+        self.verification
+            .iter()
+            .map(|change| change.file.clone())
+            .collect()
+    }
+
+    /// Machine-readable payload handed to Apply, verbatim and complete.
+    pub fn to_json(&self) -> serde_json::Value {
+        let expectations = |items: &[FindingFileExpectation]| {
+            items
+                .iter()
+                .map(|item| serde_json::json!({"file": item.file, "description": item.description}))
+                .collect::<Vec<_>>()
+        };
+        serde_json::json!({
+            "id": self.id,
+            "severity": self.severity.as_str(),
+            "summary": self.summary,
+            "evidence": self.evidence,
+            "required_changes": expectations(&self.required_changes),
+            "verification": expectations(&self.verification),
+        })
+    }
+
+    /// Single-line rendering that keeps every actionable field.
+    ///
+    /// Runtime-owned follow-up records are line-oriented, so the complete
+    /// payload has to survive as one line without losing evidence, required
+    /// changes, or verification expectations.
+    pub fn to_single_line(&self) -> String {
+        let render = |items: &[FindingFileExpectation]| {
+            items
+                .iter()
+                .map(|item| format!("{} — {}", item.file, item.description))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        format!(
+            "[{}] ({}) {} | evidence: {} | required_changes: {} | verification: {}",
+            self.id,
+            self.severity,
+            self.summary,
+            self.evidence.join("; "),
+            render(&self.required_changes),
+            render(&self.verification),
+        )
+    }
+}
+
+/// Why an object entry in `findings` failed to qualify as a structured
+/// repository finding. Every variant routes to bounded protocol handling: none
+/// of them may degrade into a normalized path-only repair instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindingRejection {
+    /// The entry was neither a legacy string nor a JSON object.
+    NotStringOrObject,
+    /// `id` was absent or blank.
+    MissingId,
+    /// Two findings in the same verdict claimed the same `id`.
+    DuplicateId(String),
+    /// `severity` was absent or not `major`/`minor`.
+    UnsupportedSeverity(String),
+    /// `summary` was absent or blank.
+    MissingSummary,
+    /// `evidence` was absent, not an array, or had no concrete entry.
+    EmptyEvidence,
+    /// `required_changes` was absent or contained no valid entry.
+    EmptyRequiredChanges,
+    /// `verification` was absent or contained no valid entry.
+    EmptyVerification,
+    /// A declared path was absolute, escaped the workspace, or was blank.
+    InvalidPath { field: &'static str, path: String },
+    /// A declared entry had a path but no description.
+    MissingDescription { field: &'static str, path: String },
+}
+
+impl FindingRejection {
+    /// Short operator-facing reason, used in protocol-retry diagnostics.
+    pub fn reason(&self) -> String {
+        match self {
+            FindingRejection::NotStringOrObject => {
+                "finding entry is neither a legacy string nor a structured object".to_string()
+            }
+            FindingRejection::MissingId => {
+                "structured finding has no stable non-empty id".to_string()
+            }
+            FindingRejection::DuplicateId(id) => {
+                format!("structured finding id '{id}' appears more than once in one verdict")
+            }
+            FindingRejection::UnsupportedSeverity(severity) => {
+                format!("structured finding severity '{severity}' is not 'major' or 'minor'")
+            }
+            FindingRejection::MissingSummary => {
+                "structured finding has no non-empty summary".to_string()
+            }
+            FindingRejection::EmptyEvidence => {
+                "structured finding has no concrete evidence entries".to_string()
+            }
+            FindingRejection::EmptyRequiredChanges => {
+                "structured finding declares no required_changes entry".to_string()
+            }
+            FindingRejection::EmptyVerification => {
+                "structured finding declares no verification entry".to_string()
+            }
+            FindingRejection::InvalidPath { field, path } => format!(
+                "structured finding {field} path '{path}' is not a repository-relative path inside \
+                 the workspace"
+            ),
+            FindingRejection::MissingDescription { field, path } => format!(
+                "structured finding {field} entry for '{path}' has no description of the expected \
+                 behavior or proof"
+            ),
+        }
+    }
+}
+
+/// Normalize a declared path to a repository-relative form.
+///
+/// Returns `None` for absolute paths, Windows drive prefixes, blank input, and
+/// anything containing a `..` component: a finding may never point outside the
+/// workspace.
+pub fn normalize_repository_path(raw: &str) -> Option<String> {
+    let candidate = raw.trim().replace('\\', "/");
+    if candidate.is_empty() || candidate.starts_with('/') || candidate.starts_with('~') {
+        return None;
+    }
+    // Reject `C:/...` style absolute paths without rejecting `src/a.rs:10`.
+    if candidate.len() >= 2 && candidate.as_bytes()[1] == b':' {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in candidate.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => return None,
+            other => components.push(other),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+fn parse_expectations(
+    value: Option<&serde_json::Value>,
+    field: &'static str,
+) -> std::result::Result<Vec<FindingFileExpectation>, FindingRejection> {
+    let entries = value
+        .and_then(|value| value.as_array())
+        .ok_or(match field {
+            "required_changes" => FindingRejection::EmptyRequiredChanges,
+            _ => FindingRejection::EmptyVerification,
+        })?;
+    let mut expectations = Vec::new();
+    for entry in entries {
+        let object = entry.as_object().ok_or(FindingRejection::InvalidPath {
+            field,
+            path: entry.to_string(),
+        })?;
+        let raw_path = object
+            .get("file")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let file =
+            normalize_repository_path(raw_path).ok_or_else(|| FindingRejection::InvalidPath {
+                field,
+                path: raw_path.to_string(),
+            })?;
+        let description = object
+            .get("description")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| FindingRejection::MissingDescription {
+                field,
+                path: file.clone(),
+            })?;
+        expectations.push(FindingFileExpectation {
+            file,
+            description: description.to_string(),
+        });
+    }
+    if expectations.is_empty() {
+        return Err(match field {
+            "required_changes" => FindingRejection::EmptyRequiredChanges,
+            _ => FindingRejection::EmptyVerification,
+        });
+    }
+    Ok(expectations)
+}
+
+/// Validate one object entry of a FAIL `findings` array.
+///
+/// Validation is purely structural. Nothing is inferred from prose, and a
+/// failure never degrades into a lossy path-only instruction.
+pub fn validate_repository_finding(
+    value: &serde_json::Value,
+) -> std::result::Result<RepositoryFinding, FindingRejection> {
+    let object = value
+        .as_object()
+        .ok_or(FindingRejection::NotStringOrObject)?;
+
+    let id = object
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(FindingRejection::MissingId)?;
+
+    let raw_severity = object
+        .get("severity")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    let severity = FindingSeverity::parse(raw_severity)
+        .ok_or_else(|| FindingRejection::UnsupportedSeverity(raw_severity.to_string()))?;
+
+    let summary = object
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(FindingRejection::MissingSummary)?;
+
+    let evidence = string_list(object.get("evidence"));
+    if evidence.is_empty() {
+        return Err(FindingRejection::EmptyEvidence);
+    }
+
+    Ok(RepositoryFinding {
+        id: id.to_string(),
+        severity,
+        summary: summary.to_string(),
+        evidence,
+        required_changes: parse_expectations(object.get("required_changes"), "required_changes")?,
+        verification: parse_expectations(object.get("verification"), "verification")?,
+    })
+}
+
+/// One acceptance finding as it travels through history, follow-up state,
+/// prompts, and retry accounting.
+///
+/// This is the single shared representation. A structured finding keeps its
+/// complete payload; a legacy string finding keeps its complete original text.
+/// Neither is ever replaced by its normalized comparison identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceFinding {
+    text: String,
+    structured: Option<RepositoryFinding>,
+}
+
+impl AcceptanceFinding {
+    /// Wrap a legacy string finding, preserving its complete original text.
+    pub fn legacy(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            structured: None,
+        }
+    }
+
+    /// Wrap a validated structured finding.
+    pub fn structured(finding: RepositoryFinding) -> Self {
+        Self {
+            text: finding.to_single_line(),
+            structured: Some(finding),
+        }
+    }
+
+    /// Complete actionable text. Never a normalized identity.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Structured payload, when the reviewer supplied one.
+    pub fn structured_payload(&self) -> Option<&RepositoryFinding> {
+        self.structured.as_ref()
+    }
+
+    /// Stable reviewer-authored ID, when the finding is structured.
+    pub fn id(&self) -> Option<&str> {
+        self.structured.as_ref().map(|finding| finding.id.as_str())
+    }
+
+    /// Whether this finding declares required implementation/verification paths
+    /// that strict diff coverage can enforce.
+    pub fn declares_paths(&self) -> bool {
+        self.structured.is_some()
+    }
+
+    /// Machine-readable payload for the Apply repair prompt.
+    pub fn to_json(&self) -> serde_json::Value {
+        match &self.structured {
+            Some(finding) => finding.to_json(),
+            None => serde_json::json!({"finding": self.text}),
+        }
+    }
+}
+
+impl From<String> for AcceptanceFinding {
+    fn from(value: String) -> Self {
+        Self::legacy(value)
+    }
+}
+
+impl From<&str> for AcceptanceFinding {
+    fn from(value: &str) -> Self {
+        Self::legacy(value)
+    }
+}
+
+impl std::ops::Deref for AcceptanceFinding {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.text
+    }
+}
+
+impl AsRef<str> for AcceptanceFinding {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for AcceptanceFinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.text)
+    }
+}
+
+// Text-equality conveniences. Comparing against a plain string checks the
+// complete finding text; it never compares a normalized identity.
+impl PartialEq<str> for AcceptanceFinding {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for AcceptanceFinding {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for AcceptanceFinding {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
+/// Complete texts of a finding list, in order.
+pub fn finding_texts(findings: &[AcceptanceFinding]) -> Vec<String> {
+    findings
+        .iter()
+        .map(|finding| finding.text().to_string())
+        .collect()
+}
+
+/// Wrap legacy string findings without changing their text.
+pub fn legacy_findings<I, S>(findings: I) -> Vec<AcceptanceFinding>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    findings
+        .into_iter()
+        .map(|finding| AcceptanceFinding::legacy(finding))
+        .collect()
+}
+
+/// Parse one `findings` array into shared findings.
+///
+/// Strings stay legacy. Objects must validate; a malformed object is a protocol
+/// error rather than a lossy degradation. Duplicate structured IDs in one
+/// verdict are rejected because retry accounting keys on the ID.
+pub fn parse_finding_entries(
+    entries: &[serde_json::Value],
+) -> std::result::Result<Vec<AcceptanceFinding>, FindingRejection> {
+    let mut findings = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for entry in entries {
+        if let Some(text) = entry.as_str() {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            findings.push(AcceptanceFinding::legacy(trimmed));
+            continue;
+        }
+        let structured = validate_repository_finding(entry)?;
+        if !seen_ids.insert(structured.id.clone()) {
+            return Err(FindingRejection::DuplicateId(structured.id));
+        }
+        findings.push(AcceptanceFinding::structured(structured));
+    }
+    Ok(findings)
+}
+
 /// Collect the non-blank string entries of a JSON array field.
 fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
     value
@@ -182,9 +658,16 @@ pub enum AcceptanceResult {
     /// Acceptance passed
     Pass,
     /// Acceptance failed with findings
-    Fail { findings: Vec<String> },
+    Fail { findings: Vec<AcceptanceFinding> },
     /// Acceptance requires more investigation - continue later
     Continue,
+    /// A FAIL verdict carried a `findings` entry that claimed to be structured
+    /// but did not validate.
+    ///
+    /// Like [`AcceptanceResult::BareBlocker`] this is a bounded protocol error:
+    /// the runtime asks for a corrected verdict instead of dispatching ambiguous
+    /// path-only repair work.
+    MalformedFinding { rejection: FindingRejection },
     /// A `gated` (or legacy `blocked`) compatibility verdict arrived without a
     /// payload that qualifies as a validated external blocker.
     ///
@@ -225,8 +708,10 @@ pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
 pub(crate) struct JsonVerdict {
     /// Canonical verdict kind: `pass`/`fail`/`continue`/`gated`.
     pub kind: &'static str,
-    /// `findings` array entries, when present.
-    pub findings: Vec<String>,
+    /// Raw `findings` array entries, when present. Validation happens in
+    /// [`acceptance_result_from_json`] so a malformed structured entry can be
+    /// reported as a protocol error instead of being silently dropped.
+    pub findings: Vec<serde_json::Value>,
     /// Raw `blocker` payload, when present. Validated separately so the parser
     /// can report *why* a compatibility verdict failed to qualify as a stall.
     pub blocker: Option<serde_json::Value>,
@@ -267,11 +752,7 @@ pub(crate) fn parse_json_verdict(text: &str) -> Option<JsonVerdict> {
     let findings = obj
         .get("findings")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
+        .cloned()
         .unwrap_or_default();
     Some(JsonVerdict {
         kind,
@@ -447,7 +928,7 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
             rejection: BlockerRejection::Missing,
         },
         Some("fail") => AcceptanceResult::Fail {
-            findings: fallback_findings,
+            findings: legacy_findings(fallback_findings),
         },
         // No canonical verdict anywhere in the output: explicit protocol
         // failure, never an implicit CONTINUE.
@@ -458,8 +939,11 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
 fn acceptance_result_from_json(verdict: JsonVerdict) -> AcceptanceResult {
     match verdict.kind {
         "pass" => AcceptanceResult::Pass,
-        "fail" => AcceptanceResult::Fail {
-            findings: verdict.findings,
+        // A structured finding that fails validation is a protocol error. It is
+        // never converted into a normalized path-only repair instruction.
+        "fail" => match parse_finding_entries(&verdict.findings) {
+            Ok(findings) => AcceptanceResult::Fail { findings },
+            Err(rejection) => AcceptanceResult::MalformedFinding { rejection },
         },
         "continue" => AcceptanceResult::Continue,
         // Compatibility verdict: only a validated structured payload becomes a
@@ -636,13 +1120,13 @@ FINDINGS:
             (
                 "{\"acceptance\":\"fail\",\"findings\":[\"src/a.rs:1 issue\"]}\n",
                 AcceptanceResult::Fail {
-                    findings: vec!["src/a.rs:1 issue".to_string()],
+                    findings: vec!["src/a.rs:1 issue".to_string().into()],
                 },
             ),
             (
                 "ACCEPTANCE: FAIL\nFINDINGS:\n- src/a.rs:1 issue\n",
                 AcceptanceResult::Fail {
-                    findings: vec!["src/a.rs:1 issue".to_string()],
+                    findings: vec!["src/a.rs:1 issue".to_string().into()],
                 },
             ),
             (
@@ -858,7 +1342,7 @@ ACCEPTANCE: PASS
         assert_eq!(
             parse_acceptance_output(output),
             AcceptanceResult::Fail {
-                findings: vec!["real failure".to_string()]
+                findings: vec!["real failure".to_string().into()]
             }
         );
     }
@@ -1236,6 +1720,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 AcceptanceResult::Continue => "continue",
                 AcceptanceResult::BareBlocker { .. } => "gated",
                 AcceptanceResult::Stalled { .. } => "stalled",
+                AcceptanceResult::MalformedFinding { .. } => "malformed-finding",
                 AcceptanceResult::MissingVerdict => "missing-verdict",
             };
             assert_eq!(
@@ -1394,7 +1879,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         assert_eq!(
             parse_acceptance_output(&event),
             AcceptanceResult::Fail {
-                findings: vec!["real".to_string()]
+                findings: vec!["real".to_string().into()]
             }
         );
     }
@@ -1406,7 +1891,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         assert_eq!(
             parse_acceptance_output(output),
             AcceptanceResult::Fail {
-                findings: vec!["canonical".to_string()]
+                findings: vec!["canonical".to_string().into()]
             }
         );
     }
@@ -1696,5 +2181,306 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     fn test_regression_malformed_text_then_json_pass() {
         let output = "ACCEPTANCE: PASS# Acceptance Review Summary\n{\"acceptance\":\"pass\"}\n";
         assert_eq!(parse_acceptance_output(output), AcceptanceResult::Pass);
+    }
+    // --- Structured repository finding contract ---
+
+    fn secret_value_finding_json() -> String {
+        serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": "acceptance-secret-value-scan",
+                "severity": "minor",
+                "summary": "Challenge and proof leakage is not tested by value",
+                "evidence": ["tests/support/relay.ts exposes counts but not issued values"],
+                "required_changes": [{
+                    "file": "tests/support/relay.ts",
+                    "description": "Expose issued challenge and presented proof values to tests"
+                }],
+                "verification": [{
+                    "file": "runtime/recovery.integration.test.ts",
+                    "description": "Assert recorded values are absent from serialized audit output"
+                }]
+            }]
+        })
+        .to_string()
+    }
+
+    fn fail_findings(output: &str) -> Vec<AcceptanceFinding> {
+        match parse_acceptance_output(output) {
+            AcceptanceResult::Fail { findings } => findings,
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    fn rejection(output: &str) -> FindingRejection {
+        match parse_acceptance_output(output) {
+            AcceptanceResult::MalformedFinding { rejection } => rejection,
+            other => panic!("expected MalformedFinding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acceptance_structured_finding_reaches_callers_without_lossy_conversion() {
+        let findings = fail_findings(&secret_value_finding_json());
+        assert_eq!(findings.len(), 1);
+        let structured = findings[0]
+            .structured_payload()
+            .expect("structured payload must survive parsing");
+
+        assert_eq!(structured.id, "acceptance-secret-value-scan");
+        assert_eq!(structured.severity, FindingSeverity::Minor);
+        assert_eq!(
+            structured.summary,
+            "Challenge and proof leakage is not tested by value"
+        );
+        assert_eq!(
+            structured.evidence,
+            ["tests/support/relay.ts exposes counts but not issued values"]
+        );
+        assert_eq!(structured.required_files(), ["tests/support/relay.ts"]);
+        assert_eq!(
+            structured.verification_files(),
+            ["runtime/recovery.integration.test.ts"]
+        );
+
+        // The single-line rendering keeps every actionable field, so no surface
+        // that only carries text can silently reduce this to a path hint.
+        let text = findings[0].text();
+        assert!(text.contains("acceptance-secret-value-scan"), "{text}");
+        assert!(
+            text.contains("exposes counts but not issued values"),
+            "{text}"
+        );
+        assert!(text.contains("tests/support/relay.ts"), "{text}");
+        assert!(
+            text.contains("runtime/recovery.integration.test.ts"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn acceptance_structured_finding_accepts_both_severities_and_both_block_pass() {
+        for severity in ["major", "minor"] {
+            let output = serde_json::json!({
+                "acceptance": "fail",
+                "findings": [{
+                    "id": format!("id-{severity}"),
+                    "severity": severity,
+                    "summary": "s",
+                    "evidence": ["e"],
+                    "required_changes": [{"file": "src/a.rs", "description": "d"}],
+                    "verification": [{"file": "tests/a.rs", "description": "d"}]
+                }]
+            })
+            .to_string();
+            let result = parse_acceptance_output(&output);
+            assert!(
+                matches!(result, AcceptanceResult::Fail { .. }),
+                "{severity} must block PASS, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn acceptance_structured_finding_rejection_matrix_is_bounded_protocol_handling() {
+        let base = serde_json::json!({
+            "id": "stable-id",
+            "severity": "major",
+            "summary": "s",
+            "evidence": ["e"],
+            "required_changes": [{"file": "src/a.rs", "description": "d"}],
+            "verification": [{"file": "tests/a.rs", "description": "d"}]
+        });
+        let mutate = |key: &str, value: serde_json::Value| {
+            let mut object = base.as_object().unwrap().clone();
+            if value.is_null() {
+                object.remove(key);
+            } else {
+                object.insert(key.to_string(), value);
+            }
+            serde_json::json!({"acceptance": "fail", "findings": [object]}).to_string()
+        };
+
+        let cases: Vec<(String, FindingRejection)> = vec![
+            (
+                mutate("id", serde_json::Value::Null),
+                FindingRejection::MissingId,
+            ),
+            (
+                mutate("id", serde_json::json!("   ")),
+                FindingRejection::MissingId,
+            ),
+            (
+                mutate("severity", serde_json::json!("blocker")),
+                FindingRejection::UnsupportedSeverity("blocker".to_string()),
+            ),
+            (
+                mutate("summary", serde_json::Value::Null),
+                FindingRejection::MissingSummary,
+            ),
+            (
+                mutate("evidence", serde_json::json!([])),
+                FindingRejection::EmptyEvidence,
+            ),
+            (
+                mutate("required_changes", serde_json::Value::Null),
+                FindingRejection::EmptyRequiredChanges,
+            ),
+            (
+                mutate("verification", serde_json::json!([])),
+                FindingRejection::EmptyVerification,
+            ),
+            (
+                mutate(
+                    "required_changes",
+                    serde_json::json!([{"file": "../../etc/passwd", "description": "d"}]),
+                ),
+                FindingRejection::InvalidPath {
+                    field: "required_changes",
+                    path: "../../etc/passwd".to_string(),
+                },
+            ),
+            (
+                mutate(
+                    "verification",
+                    serde_json::json!([{"file": "/abs/path.rs", "description": "d"}]),
+                ),
+                FindingRejection::InvalidPath {
+                    field: "verification",
+                    path: "/abs/path.rs".to_string(),
+                },
+            ),
+            (
+                mutate(
+                    "verification",
+                    serde_json::json!([{"file": "tests/a.rs", "description": "  "}]),
+                ),
+                FindingRejection::MissingDescription {
+                    field: "verification",
+                    path: "tests/a.rs".to_string(),
+                },
+            ),
+        ];
+
+        for (output, expected) in cases {
+            assert_eq!(rejection(&output), expected, "routing drifted for {output}");
+        }
+    }
+
+    #[test]
+    fn acceptance_duplicate_structured_ids_are_a_protocol_error() {
+        let finding = serde_json::json!({
+            "id": "same-id",
+            "severity": "major",
+            "summary": "s",
+            "evidence": ["e"],
+            "required_changes": [{"file": "src/a.rs", "description": "d"}],
+            "verification": [{"file": "tests/a.rs", "description": "d"}]
+        });
+        let output =
+            serde_json::json!({"acceptance": "fail", "findings": [finding.clone(), finding]})
+                .to_string();
+        assert_eq!(
+            rejection(&output),
+            FindingRejection::DuplicateId("same-id".to_string())
+        );
+    }
+
+    #[test]
+    fn acceptance_non_object_non_string_finding_entry_is_a_protocol_error() {
+        let output = r#"{"acceptance":"fail","findings":[42]}"#;
+        assert_eq!(rejection(output), FindingRejection::NotStringOrObject);
+    }
+
+    #[test]
+    fn acceptance_malformed_structured_finding_never_becomes_path_only_work() {
+        // Regression shape: an object naming a file but omitting verification
+        // must not degrade into "fix src/a.rs" style repair instructions.
+        let output = serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": "partial",
+                "severity": "major",
+                "summary": "s",
+                "evidence": ["e"],
+                "required_changes": [{"file": "src/a.rs", "description": "d"}]
+            }]
+        })
+        .to_string();
+        let result = parse_acceptance_output(&output);
+        assert!(
+            matches!(result, AcceptanceResult::MalformedFinding { .. }),
+            "got {result:?}"
+        );
+        if let AcceptanceResult::Fail { findings } = result {
+            panic!("malformed structured finding degraded into {findings:?}");
+        }
+    }
+
+    #[test]
+    fn acceptance_mixed_legacy_and_structured_findings_both_survive() {
+        let output = serde_json::json!({
+            "acceptance": "fail",
+            "findings": [
+                "src/legacy.rs:10 missing regression coverage",
+                {
+                    "id": "structured-id",
+                    "severity": "major",
+                    "summary": "s",
+                    "evidence": ["e"],
+                    "required_changes": [{"file": "src/a.rs", "description": "d"}],
+                    "verification": [{"file": "tests/a.rs", "description": "d"}]
+                }
+            ]
+        })
+        .to_string();
+
+        let findings = fail_findings(&output);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].id(), None);
+        assert_eq!(
+            findings[0].text(),
+            "src/legacy.rs:10 missing regression coverage"
+        );
+        assert_eq!(findings[1].id(), Some("structured-id"));
+    }
+
+    #[test]
+    fn acceptance_legacy_verdict_syntax_is_unchanged() {
+        // Both legacy shapes keep their complete original text and gain no
+        // structured payload.
+        for output in [
+            "ACCEPTANCE: FAIL\nFINDINGS:\n- src/a.rs:1 issue\n",
+            r#"{"acceptance":"fail","findings":["src/a.rs:1 issue"]}"#,
+        ] {
+            let findings = fail_findings(output);
+            assert_eq!(findings.len(), 1, "{output}");
+            assert_eq!(findings[0].text(), "src/a.rs:1 issue", "{output}");
+            assert!(findings[0].structured_payload().is_none(), "{output}");
+            assert!(!findings[0].declares_paths(), "{output}");
+        }
+    }
+
+    #[test]
+    fn acceptance_repository_path_normalization_rejects_escapes() {
+        assert_eq!(
+            normalize_repository_path("./src//a.rs"),
+            Some("src/a.rs".to_string())
+        );
+        assert_eq!(
+            normalize_repository_path("src\\a.rs"),
+            Some("src/a.rs".to_string())
+        );
+        for escape in [
+            "",
+            "  ",
+            "/etc/passwd",
+            "~/secrets",
+            "C:/x",
+            "../up",
+            "a/../../b",
+        ] {
+            assert_eq!(normalize_repository_path(escape), None, "{escape}");
+        }
     }
 }

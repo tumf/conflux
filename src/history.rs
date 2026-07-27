@@ -361,8 +361,12 @@ pub struct AcceptanceAttempt {
     pub passed: bool,
     /// Duration of the attempt
     pub duration: Duration,
-    /// Findings if failed (None if passed)
-    pub findings: Option<Vec<String>>,
+    /// Findings if failed (None if passed).
+    ///
+    /// Always the complete actionable payload. Retry identities and semantic
+    /// fingerprints live in separate fields of [`AcceptanceHistory`] and can
+    /// never be written here.
+    pub findings: Option<Vec<crate::acceptance::AcceptanceFinding>>,
     /// Exit code if available
     pub exit_code: Option<i32>,
     /// Last N lines of stdout (tail summary)
@@ -373,13 +377,25 @@ pub struct AcceptanceAttempt {
     pub commit_hash: Option<String>,
 }
 
-/// Tracks acceptance attempts per change
+/// Tracks acceptance attempts per change.
+///
+/// Three concepts are stored in three distinct fields and are never merged:
+///
+/// - `follow_up_findings`: the complete latest actionable payload for Apply;
+/// - `retry_identities`: compact comparison identities for retry accounting;
+/// - `semantic_fingerprints`: the broad workspace progress baseline.
+///
+/// Updating an identity or fingerprint can therefore never overwrite the
+/// actionable payload — that lossy overwrite was the regression this separation
+/// exists to prevent.
 #[derive(Clone)]
 pub struct AcceptanceHistory {
     /// Map of change_id to list of attempts
     attempts: HashMap<String, Vec<AcceptanceAttempt>>,
-    /// Canonical FAIL findings pending the next apply retry.
-    follow_up_findings: HashMap<String, (u32, Vec<String>)>,
+    /// Canonical FAIL findings pending the next apply retry. Complete payload only.
+    follow_up_findings: HashMap<String, (u32, Vec<crate::acceptance::AcceptanceFinding>)>,
+    /// Compact comparison identities for retry accounting. Never rendered to Apply.
+    retry_identities: HashMap<String, Vec<String>>,
     /// Workspace checkpoint semantic baseline for restart-safe acceptance retries.
     semantic_fingerprints: HashMap<String, String>,
 }
@@ -390,6 +406,7 @@ impl AcceptanceHistory {
         Self {
             attempts: HashMap::new(),
             follow_up_findings: HashMap::new(),
+            retry_identities: HashMap::new(),
             semantic_fingerprints: HashMap::new(),
         }
     }
@@ -427,31 +444,67 @@ impl AcceptanceHistory {
     pub fn clear(&mut self, change_id: &str) {
         self.attempts.remove(change_id);
         self.follow_up_findings.remove(change_id);
+        self.retry_identities.remove(change_id);
         self.semantic_fingerprints.remove(change_id);
     }
 
-    pub fn set_follow_up_findings(&mut self, change_id: &str, attempt: u32, findings: Vec<String>) {
+    /// Store the complete latest actionable payload for the next Apply.
+    ///
+    /// This is the only writer of the payload slot. Callers must pass real
+    /// findings; passing normalized identities here would reintroduce the lossy
+    /// overwrite this API separation prevents.
+    pub fn set_follow_up_findings(
+        &mut self,
+        change_id: &str,
+        attempt: u32,
+        findings: Vec<crate::acceptance::AcceptanceFinding>,
+    ) {
         self.follow_up_findings
             .insert(change_id.to_string(), (attempt, findings));
     }
 
     pub fn clear_follow_up_findings(&mut self, change_id: &str) {
         self.follow_up_findings.remove(change_id);
+        self.retry_identities.remove(change_id);
         self.semantic_fingerprints.remove(change_id);
     }
 
-    pub fn set_checkpoint(
+    /// Record retry comparison state only.
+    ///
+    /// Deliberately has no access to the payload slot: identities and semantic
+    /// baselines are comparison data, and a checkpoint update must never be able
+    /// to replace evidence, required changes, or verification expectations.
+    pub fn set_retry_checkpoint(
         &mut self,
         change_id: &str,
         attempt: u32,
-        findings: Vec<String>,
+        identities: Vec<String>,
         semantic_fingerprint: Option<String>,
     ) {
-        self.set_follow_up_findings(change_id, attempt, findings);
+        self.retry_identities
+            .insert(change_id.to_string(), identities);
         if let Some(fingerprint) = semantic_fingerprint {
             self.semantic_fingerprints
                 .insert(change_id.to_string(), fingerprint);
         }
+        // The attempt counter is shared bookkeeping, so keep it current without
+        // disturbing any payload already stored for this change.
+        match self.follow_up_findings.get_mut(change_id) {
+            Some((recorded, _)) => *recorded = (*recorded).max(attempt),
+            None => {
+                self.follow_up_findings
+                    .insert(change_id.to_string(), (attempt, Vec::new()));
+            }
+        }
+    }
+
+    /// Comparison identities recorded by the latest retry checkpoint.
+    ///
+    /// Deliberately separate from the payload accessor; consumed by the
+    /// payload/identity separation regression coverage.
+    #[allow(dead_code)]
+    pub fn retry_identities(&self, change_id: &str) -> Option<Vec<String>> {
+        self.retry_identities.get(change_id).cloned()
     }
 
     #[allow(dead_code)] // Consumed by restart diagnostics and serial checkpoint regression coverage.
@@ -459,8 +512,15 @@ impl AcceptanceHistory {
         self.semantic_fingerprints.get(change_id).cloned()
     }
 
-    pub fn last_follow_up_findings(&self, change_id: &str) -> Option<(u32, Vec<String>)> {
-        self.follow_up_findings.get(change_id).cloned()
+    /// Complete latest actionable payload pending the next Apply.
+    pub fn last_follow_up_findings(
+        &self,
+        change_id: &str,
+    ) -> Option<(u32, Vec<crate::acceptance::AcceptanceFinding>)> {
+        self.follow_up_findings
+            .get(change_id)
+            .filter(|(_, findings)| !findings.is_empty())
+            .cloned()
     }
 
     /// Count consecutive CONTINUE attempts from the end of the history.
@@ -494,7 +554,10 @@ impl AcceptanceHistory {
 
     /// Get the last findings from the most recent acceptance attempt.
     /// Returns None if there are no previous attempts or the last attempt has no findings.
-    pub fn last_findings(&self, change_id: &str) -> Option<Vec<String>> {
+    pub fn last_findings(
+        &self,
+        change_id: &str,
+    ) -> Option<Vec<crate::acceptance::AcceptanceFinding>> {
         self.attempts
             .get(change_id)
             .and_then(|v| v.last())
@@ -533,7 +596,12 @@ impl AcceptanceHistory {
             .attempts
             .get(change_id)
             .and_then(|attempts| attempts.last());
-        let mut findings = attempt
+        // The complete payload is rendered here, never a comparison identity:
+        // whitespace is normalized for readability and duplicates are collapsed
+        // on the stable finding ID (or on the full legacy text), but no
+        // actionable field is dropped.
+        let mut seen = std::collections::HashSet::new();
+        let findings = attempt
             .and_then(|attempt| attempt.findings.clone())
             .or_else(|| {
                 self.follow_up_findings
@@ -542,18 +610,25 @@ impl AcceptanceHistory {
             })
             .unwrap_or_default()
             .into_iter()
-            .map(|finding| finding.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|finding| !finding.is_empty())
+            .filter(|finding| !finding.text().trim().is_empty())
+            .filter(|finding| {
+                let key = finding
+                    .id()
+                    .map(|id| format!("id:{id}"))
+                    .unwrap_or_else(|| format!("text:{}", finding.text()));
+                seen.insert(key)
+            })
+            .map(|finding| finding.to_json())
             .collect::<Vec<_>>();
-        findings.sort_unstable();
-        findings.dedup();
         if findings.is_empty() && attempt.is_none() {
             return String::new();
         }
         let diagnostic_fallback = findings.is_empty()
-            || findings
-                .iter()
-                .any(|finding| finding.contains("Investigation incomplete - continue later"))
+            || findings.iter().any(|finding| {
+                finding
+                    .to_string()
+                    .contains("Investigation incomplete - continue later")
+            })
             || attempt.is_some_and(|attempt| attempt.exit_code.is_some_and(|code| code != 0));
         let truncate = |value: &str| value.chars().take(MAX_DIAGNOSTIC_CHARS).collect::<String>();
         let payload = serde_json::json!({
@@ -1217,10 +1292,15 @@ mod tests {
     #[test]
     fn acceptance_checkpoint_has_explicit_context_contract() {
         let mut history = AcceptanceHistory::new();
-        history.set_checkpoint(
+        history.set_follow_up_findings(
             "change-a",
             2,
-            vec!["finding-a".to_string()],
+            crate::acceptance::legacy_findings(["finding-a"]),
+        );
+        history.set_retry_checkpoint(
+            "change-a",
+            2,
+            vec!["repository|finding-a|implementation".to_string()],
             Some("fingerprint-a".to_string()),
         );
 
@@ -1228,7 +1308,10 @@ mod tests {
 
         assert!(context.contains("<current_acceptance_context>"));
         assert!(context.contains("\"attempt\":2"));
-        assert!(context.contains("\"latest_findings\":[\"finding-a\"]"));
+        // The complete payload is rendered, never the comparison identity the
+        // retry checkpoint stored alongside it.
+        assert!(context.contains("\"latest_findings\":[{\"finding\":\"finding-a\"}]"));
+        assert!(!context.contains("repository|finding-a|implementation"));
         assert!(!context.contains("fingerprint-a"));
         assert!(!context.contains("acceptance_checkpoint"));
     }
@@ -1247,7 +1330,7 @@ mod tests {
                     attempt,
                     passed: false,
                     duration: Duration::from_secs(attempt.into()),
-                    findings: Some(vec![finding.to_string()]),
+                    findings: Some(vec![finding.to_string().into()]),
                     exit_code: Some(0),
                     stdout_tail: Some(output.to_string()),
                     stderr_tail: None,
@@ -1274,7 +1357,9 @@ mod tests {
                 attempt: 4,
                 passed: false,
                 duration: Duration::from_secs(1),
-                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                findings: Some(vec!["Investigation incomplete - continue later"
+                    .to_string()
+                    .into()]),
                 exit_code: Some(0),
                 stdout_tail: Some("x".repeat(9_000)),
                 stderr_tail: None,
@@ -1326,7 +1411,7 @@ mod tests {
                 attempt: 1,
                 passed: false,
                 duration: Duration::from_secs(30),
-                findings: Some(vec!["Issue 1".to_string()]),
+                findings: Some(vec!["Issue 1".to_string().into()]),
                 exit_code: Some(1),
                 stdout_tail: None,
                 stderr_tail: None,
@@ -1373,7 +1458,7 @@ mod tests {
                 attempt: 1,
                 passed: false,
                 duration: Duration::from_secs(30),
-                findings: Some(vec!["Issue 1".to_string()]),
+                findings: Some(vec!["Issue 1".to_string().into()]),
                 exit_code: Some(1),
                 stdout_tail: None,
                 stderr_tail: None,
@@ -1393,7 +1478,7 @@ mod tests {
         assert!(history.last_findings("change-a").is_none());
 
         // Add attempt with findings
-        let findings1 = vec!["Issue 1".to_string(), "Issue 2".to_string()];
+        let findings1 = crate::acceptance::legacy_findings(["Issue 1", "Issue 2"]);
         history.record(
             "change-a",
             AcceptanceAttempt {
@@ -1412,7 +1497,7 @@ mod tests {
         assert_eq!(history.last_findings("change-a"), Some(findings1));
 
         // Add another attempt with different findings
-        let findings2 = vec!["Fixed issue 1".to_string()];
+        let findings2 = crate::acceptance::legacy_findings(["Fixed issue 1"]);
         history.record(
             "change-a",
             AcceptanceAttempt {
@@ -1447,5 +1532,136 @@ mod tests {
 
         // Should return None (last attempt has no findings)
         assert!(history.last_findings("change-a").is_none());
+    }
+    /// Regression fixture for the lossy-overwrite defect: a detailed finding and
+    /// the compact `repository|path|verification` identity derived from it.
+    fn secret_value_finding() -> crate::acceptance::AcceptanceFinding {
+        crate::acceptance::AcceptanceFinding::structured(crate::acceptance::RepositoryFinding {
+            id: "acceptance-secret-value-scan".to_string(),
+            severity: crate::acceptance::FindingSeverity::Minor,
+            summary: "Challenge and proof leakage is not tested by value".to_string(),
+            evidence: vec![
+                "tests/support/relay.ts exposes counts but not issued values".to_string(),
+            ],
+            required_changes: vec![crate::acceptance::FindingFileExpectation {
+                file: "tests/support/relay.ts".to_string(),
+                description: "Expose issued challenge and presented proof values".to_string(),
+            }],
+            verification: vec![crate::acceptance::FindingFileExpectation {
+                file: "runtime/recovery.integration.test.ts".to_string(),
+                description: "Assert recorded values are absent from audit output".to_string(),
+            }],
+        })
+    }
+
+    #[test]
+    fn retry_checkpoint_cannot_overwrite_the_actionable_payload() {
+        let mut history = AcceptanceHistory::new();
+        let finding = secret_value_finding();
+        history.set_follow_up_findings("change-a", 1, vec![finding.clone()]);
+
+        // Repeatedly updating comparison state — exactly the sequence that used
+        // to replace the payload with `repository|path|verification`.
+        for cycle in 1..=3 {
+            history.set_retry_checkpoint(
+                "change-a",
+                cycle,
+                vec!["repository|tests/support/relay.ts|verification".to_string()],
+                Some(format!("fingerprint-{cycle}")),
+            );
+        }
+
+        let (attempt, stored) = history
+            .last_follow_up_findings("change-a")
+            .expect("payload survives every checkpoint update");
+        assert_eq!(attempt, 3, "attempt bookkeeping still advances");
+        assert_eq!(stored, vec![finding], "payload is byte-identical");
+
+        let structured = stored[0]
+            .structured_payload()
+            .expect("structured payload survives");
+        assert_eq!(
+            structured.evidence,
+            ["tests/support/relay.ts exposes counts but not issued values"]
+        );
+        assert_eq!(structured.required_files(), ["tests/support/relay.ts"]);
+        assert_eq!(
+            structured.verification_files(),
+            ["runtime/recovery.integration.test.ts"]
+        );
+
+        // Identity and fingerprint remain reachable, but through their own
+        // typed accessors rather than the payload slot.
+        assert_eq!(
+            history.retry_identities("change-a"),
+            Some(vec![
+                "repository|tests/support/relay.ts|verification".to_string()
+            ])
+        );
+        assert_eq!(
+            history.semantic_fingerprint("change-a"),
+            Some("fingerprint-3".to_string())
+        );
+    }
+
+    #[test]
+    fn retry_checkpoint_without_a_payload_never_fabricates_findings() {
+        let mut history = AcceptanceHistory::new();
+        history.set_retry_checkpoint(
+            "change-a",
+            2,
+            vec!["repository|src/a.rs|implementation".to_string()],
+            Some("fingerprint".to_string()),
+        );
+
+        // An identity-only checkpoint yields no repair target: the next Apply
+        // gets nothing rather than a path-only instruction.
+        assert!(history.last_follow_up_findings("change-a").is_none());
+        assert_eq!(
+            history.retry_identities("change-a"),
+            Some(vec!["repository|src/a.rs|implementation".to_string()])
+        );
+        assert!(history.format_context("change-a").is_empty());
+    }
+
+    #[test]
+    fn acceptance_context_renders_complete_payload_not_identity() {
+        let mut history = AcceptanceHistory::new();
+        history.set_follow_up_findings("change-a", 1, vec![secret_value_finding()]);
+        history.set_retry_checkpoint(
+            "change-a",
+            1,
+            vec!["repository|tests/support/relay.ts|verification".to_string()],
+            Some("fingerprint".to_string()),
+        );
+
+        let context = history.format_context("change-a");
+        assert!(
+            context.contains("acceptance-secret-value-scan"),
+            "{context}"
+        );
+        assert!(context.contains("required_changes"), "{context}");
+        assert!(context.contains("verification"), "{context}");
+        assert!(
+            context.contains("exposes counts but not issued values"),
+            "{context}"
+        );
+        assert!(
+            !context.contains("repository|tests/support/relay.ts|verification"),
+            "compact identity must never reach the prompt: {context}"
+        );
+    }
+
+    #[test]
+    fn clearing_follow_up_drops_payload_identity_and_fingerprint_together() {
+        let mut history = AcceptanceHistory::new();
+        history.set_follow_up_findings("change-a", 1, vec![secret_value_finding()]);
+        history.set_retry_checkpoint("change-a", 1, vec!["id".to_string()], Some("f".to_string()));
+
+        history.clear_follow_up_findings("change-a");
+
+        assert!(history.last_follow_up_findings("change-a").is_none());
+        assert!(history.retry_identities("change-a").is_none());
+        assert!(history.semantic_fingerprint("change-a").is_none());
     }
 }

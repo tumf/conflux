@@ -1184,11 +1184,13 @@ pub async fn execute_archive_in_workspace(
 }
 
 /// Execute acceptance test in a workspace with streaming output
-fn format_acceptance_failure_log_message(findings: &[String]) -> String {
+fn format_acceptance_failure_log_message(
+    findings: &[crate::acceptance::AcceptanceFinding],
+) -> String {
     let finding_count = findings.len();
     let blocking_gate_context = findings
         .first()
-        .cloned()
+        .map(|finding| finding.text().to_string())
         .unwrap_or_else(|| "no acceptance findings captured".to_string());
 
     format!(
@@ -1305,7 +1307,9 @@ pub async fn execute_acceptance_in_workspace(
                     let previous_findings = {
                         let acc_history = acceptance_history.lock().await;
                         if acc_history.count(change_id) > 0 {
-                            acc_history.last_findings(change_id)
+                            acc_history
+                                .last_findings(change_id)
+                                .map(|findings| crate::acceptance::finding_texts(&findings))
                         } else {
                             None
                         }
@@ -1338,7 +1342,7 @@ pub async fn execute_acceptance_in_workspace(
     let stdout_tail = agent.get_last_acceptance_stdout_tail(change_id);
     let stderr_tail = agent.get_last_acceptance_stderr_tail(change_id);
     let previous_findings_text = agent
-        .get_last_acceptance_findings(change_id)
+        .get_last_acceptance_finding_texts(change_id)
         .map(|findings| findings.join("\n"));
     let previous_acceptance_denial = crate::permission::classify_permission_denial(&[
         stdout_tail.as_deref(),
@@ -1356,7 +1360,9 @@ pub async fn execute_acceptance_in_workspace(
             retry,
             stdout_tail.as_deref(),
             stderr_tail.as_deref(),
-            agent.get_last_acceptance_findings(change_id).as_deref(),
+            agent
+                .get_last_acceptance_finding_texts(change_id)
+                .as_deref(),
         )
     });
 
@@ -1639,7 +1645,7 @@ pub async fn execute_acceptance_in_workspace(
                     attempt: attempt_number,
                     passed: false,
                     duration: start_time.elapsed(),
-                    findings: Some(tail_findings.clone()),
+                    findings: Some(crate::acceptance::legacy_findings(tail_findings.clone())),
                     exit_code: status.code(),
                     stdout_tail: stdout_tail.clone(),
                     stderr_tail: stderr_tail.clone(),
@@ -1680,7 +1686,7 @@ pub async fn execute_acceptance_in_workspace(
             attempt: attempt_number,
             passed: false,
             duration: start_time.elapsed(),
-            findings: Some(tail_findings.clone()),
+            findings: Some(crate::acceptance::legacy_findings(tail_findings.clone())),
             exit_code: status.code(),
             stdout_tail: stdout_tail.clone(),
             stderr_tail: stderr_tail.clone(),
@@ -1762,7 +1768,9 @@ pub async fn execute_acceptance_in_workspace(
                 attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                findings: Some(crate::acceptance::legacy_findings([
+                    "Investigation incomplete - continue later",
+                ])),
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
@@ -1815,7 +1823,7 @@ pub async fn execute_acceptance_in_workspace(
                 attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(evidence.clone()),
+                findings: Some(crate::acceptance::legacy_findings(evidence.clone())),
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
@@ -1871,7 +1879,7 @@ pub async fn execute_acceptance_in_workspace(
                 attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(findings),
+                findings: Some(crate::acceptance::legacy_findings(findings)),
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
@@ -1922,10 +1930,10 @@ pub async fn execute_acceptance_in_workspace(
                 attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(vec![
+                findings: Some(crate::acceptance::legacy_findings([
                     crate::orchestration::acceptance::BARE_BLOCKER_DIAGNOSTIC.to_string(),
                     rejection.reason(),
-                ]),
+                ])),
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
@@ -1961,13 +1969,69 @@ pub async fn execute_acceptance_in_workspace(
                 attempt_number,
             ))
         }
+        ParseResult::MalformedFinding { rejection } => {
+            // A structured finding that does not validate is a protocol error.
+            // The caller owns the bounded retry budget, so this arm dispatches no
+            // repair work and records no follow-up: reducing the finding to a
+            // path-only instruction is exactly what must not happen.
+            warn!(
+                "Acceptance emitted a malformed structured finding for {}: {}",
+                change_id,
+                rejection.reason()
+            );
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: attempt_number,
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(crate::acceptance::legacy_findings([
+                    crate::orchestration::acceptance::MALFORMED_FINDING_DIAGNOSTIC.to_string(),
+                    rejection.reason(),
+                ])),
+                exit_code: status.code(),
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
+            };
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
+            acceptance_tail_injected.lock().await.remove(change_id);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::warn(format!(
+                            "Acceptance emitted a FAIL verdict whose structured finding did not \
+                             validate ({}); runtime will not convert it into a path-only repair \
+                             instruction.",
+                            rejection.reason()
+                        ))
+                        .with_change_id(change_id)
+                        .with_operation("acceptance")
+                        .with_iteration(attempt_number),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
+            }
+
+            Ok((
+                crate::orchestration::AcceptanceResult::MalformedFinding { rejection },
+                attempt_number,
+            ))
+        }
         ParseResult::Fail { findings } => {
             let findings_for_tasks = if findings.is_empty() {
-                vec!["Investigate acceptance failure and apply the required fix".to_string()]
+                crate::acceptance::legacy_findings([
+                    "Investigate acceptance failure and apply the required fix",
+                ])
             } else {
                 findings
             };
-            let findings_text = findings_for_tasks.join("\n");
+            let findings_text = crate::acceptance::finding_texts(&findings_for_tasks).join("\n");
             let current_denial = crate::permission::classify_permission_denial(&[
                 stdout_tail.as_deref(),
                 stderr_tail.as_deref(),
@@ -2017,7 +2081,7 @@ pub async fn execute_acceptance_in_workspace(
             }
             let blocking_gate_context = findings_for_tasks
                 .first()
-                .cloned()
+                .map(|finding| finding.text().to_string())
                 .unwrap_or_else(|| "no acceptance findings captured".to_string());
             info!(
                 "Acceptance failed for: {} ({} findings), blocking gate context: {}",
@@ -2116,14 +2180,18 @@ mod tests {
                 attempt: 3,
                 passed: false,
                 duration: Duration::from_secs(1),
-                findings: Some(vec!["fix canonical finding".to_string()]),
+                findings: Some(vec!["fix canonical finding".to_string().into()]),
                 exit_code: Some(0),
                 stdout_tail: Some("unstructured noise".to_string()),
                 stderr_tail: None,
                 commit_hash: None,
             },
         );
-        history.set_follow_up_findings("change-a", 3, vec!["fix canonical finding".to_string()]);
+        history.set_follow_up_findings(
+            "change-a",
+            3,
+            vec!["fix canonical finding".to_string().into()],
+        );
         let history = Arc::new(Mutex::new(history));
         let injected = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut first_agent = AgentRunner::new(OrchestratorConfig::default());
@@ -2217,8 +2285,9 @@ mod tests {
     fn test_format_acceptance_failure_log_message_includes_blocking_gate_context() {
         let message = format_acceptance_failure_log_message(&[
             "archive-readiness gate failed: cargo clippy -- -D warnings (src/lib.rs:42)"
-                .to_string(),
-            "second finding".to_string(),
+                .to_string()
+                .into(),
+            "second finding".to_string().into(),
         ]);
 
         assert!(

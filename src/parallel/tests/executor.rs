@@ -2211,8 +2211,8 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
         &tasks_dir.join("tasks.md"),
         iteration,
         &[
-            "missing regression test".to_string(),
-            "add repo coverage".to_string(),
+            "missing regression test".to_string().into(),
+            "add repo coverage".to_string().into(),
         ],
     )
     .or_fail("unexpected error");
@@ -2269,7 +2269,7 @@ fn parallel_and_serial_follow_up_recovery_produce_identical_files() {
         let recovery = crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &findings,
+            &crate::acceptance::legacy_findings(findings.clone()),
         )
         .or_fail("recovery succeeds instead of terminating");
         assert_eq!(recovery.recovered_blocks, 1);
@@ -7009,10 +7009,11 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         // A checkpoint left behind by an older Conflux version claims an almost
         // exhausted retry budget for this exact change. Dispatch must ignore it.
         let finding_identity =
-            crate::orchestration::acceptance::normalize_findings(&["repeated finding".to_string()])
-                [0]
-            .identity
-            .clone();
+            crate::orchestration::acceptance::normalize_findings(&["repeated finding"
+                .to_string()
+                .into()])[0]
+                .identity
+                .clone();
         std::fs::create_dir_all(checkpoint_path.parent().or_fail("checkpoint parent"))
             .or_fail("create stale checkpoint dir");
         std::fs::write(
@@ -7080,11 +7081,11 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         .as_deref()
         .or_fail("repeated findings must stop the retry loop with a diagnostic");
     assert!(
-        error.contains("repeated_acceptance_findings"),
+        error.contains("repeated_acceptance_finding"),
         "diagnostic must name the retry judgement: {error}"
     );
     assert!(
-        error.contains("Explicit retry is required"),
+        error.contains("retry explicitly"),
         "diagnostic must state the operator action: {error}"
     );
     assert!(
@@ -11406,5 +11407,460 @@ async fn test_archived_dirty_finalization_resume_does_not_rerun_archive_command(
     assert!(
         saw_resume_event,
         "resume path should emit dedicated ArchiveResumed event"
+    );
+}
+
+// --- Repair loop through the real parallel dispatch cycle ---
+//
+// These drive `dispatch_change_to_workspace` end to end with scripted apply and
+// acceptance commands so the diff-coverage gate, the per-ID repair budget, and
+// the resulting stop diagnostics are observed on the production path rather
+// than by calling the shared decision APIs directly.
+
+/// Observations from one scripted repair-cycle dispatch.
+struct ScriptedRepairDispatch {
+    result: WorkspaceResult,
+    workspace_path: PathBuf,
+    acceptance_invocations: u32,
+    apply_invocations: u32,
+    acceptance_error_logs: Vec<String>,
+}
+
+/// One structured FAIL verdict as the acceptance command would print it.
+fn scripted_structured_fail(id: &str, implementation: &str, verification: &str) -> String {
+    serde_json::json!({
+        "acceptance": "fail",
+        "findings": [{
+            "id": id,
+            "severity": "major",
+            "summary": "Issued values are never asserted by value",
+            "evidence": [format!("{implementation} records counts only")],
+            "required_changes": [{
+                "file": implementation,
+                "description": "Expose issued challenge and presented proof values",
+            }],
+            "verification": [{
+                "file": verification,
+                "description": "Assert recorded values are absent from audit output",
+            }],
+        }],
+    })
+    .to_string()
+}
+
+/// Dispatch one change whose acceptance command emits the recorded verdict for
+/// invocation `n`, falling back to the last recorded verdict. `apply_extra` is
+/// the shell fragment the apply command runs after completing every open task,
+/// which is how a scripted repair chooses whether it covers the declared files.
+async fn dispatch_scripted_repair_cycle(
+    change_id: &str,
+    verdicts: &[String],
+    apply_extra: &str,
+) -> ScriptedRepairDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create scripted verdict state dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let verdict_dir = state_dir.path().join("verdicts");
+    std::fs::create_dir_all(&verdict_dir).or_fail("create verdict dir");
+    for (index, verdict) in verdicts.iter().enumerate() {
+        std::fs::write(
+            verdict_dir.join(format!("verdict-{}.json", index + 1)),
+            verdict,
+        )
+        .or_fail("write scripted verdict");
+    }
+    std::fs::write(
+        verdict_dir.join("verdict-last.json"),
+        verdicts.last().or_fail("at least one verdict"),
+    )
+    .or_fail("write trailing verdict");
+
+    let counter = state_dir.path().join("attempts").display().to_string();
+    let verdict_dir = verdict_dir.display().to_string();
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
+             {apply_extra}\""
+        )),
+        acceptance_command: Some(format!(
+            "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{counter}\"; verdict=\"{verdict_dir}/verdict-$n.json\"; \
+             [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; cat \"$verdict\"'"
+        )),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch scripted repair cycle");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let workspace_path = workspace_base.path().join(format!("cflx-{change_id}"));
+    let mut observed = ScriptedRepairDispatch {
+        result,
+        workspace_path,
+        acceptance_invocations: 0,
+        apply_invocations: 0,
+        acceptance_error_logs: Vec::new(),
+    };
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                observed.acceptance_invocations += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                observed.apply_invocations += 1;
+            }
+            ExecutionEvent::Log(log) => {
+                if matches!(log.level, crate::events::LogLevel::Error)
+                    && log.operation.as_deref() == Some("acceptance")
+                {
+                    observed.acceptance_error_logs.push(log.message.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    observed
+}
+
+/// A repair that only nudges an unrelated calibration constant must not buy
+/// another acceptance invocation.
+#[tokio::test]
+async fn parallel_calibration_only_repair_holds_before_a_second_acceptance_invocation() {
+    let change_id = "parallel-mismatch";
+    let observed = dispatch_scripted_repair_cycle(
+        change_id,
+        &[scripted_structured_fail(
+            "acceptance-secret-value-scan",
+            "src/relay.rs",
+            "tests/relay_test.rs",
+        )],
+        "mkdir -p calibration && echo tweak >> calibration/thresholds.txt",
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_ref()
+        .or_fail("a missing-coverage repair must stop the workspace");
+    assert!(error.contains("acceptance_remediation_mismatch"), "{error}");
+    assert!(error.contains("src/relay.rs"), "{error}");
+    assert!(error.contains("tests/relay_test.rs"), "{error}");
+    assert!(error.contains("\"coverage_complete\":false"), "{error}");
+    assert!(
+        error.contains("calibration/thresholds.txt"),
+        "the unrelated repair must be reported as a diagnostic: {error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 1,
+        "the gate must stop before spending a second acceptance invocation"
+    );
+    assert_eq!(
+        observed.apply_invocations, 2,
+        "the repair apply itself runs before the gate evaluates its delta"
+    );
+    assert!(
+        observed.result.final_revision.is_none(),
+        "a held repair cycle must never hand off to archive"
+    );
+    assert!(
+        !observed
+            .workspace_path
+            .join(".cflx/acceptance-state.json")
+            .exists(),
+        "a repair hold must not create a durable acceptance checkpoint"
+    );
+}
+
+/// The same stable finding ID on the next FAIL stops before a second automatic
+/// repair apply, even though the repair covered every declared path.
+#[tokio::test]
+async fn parallel_repeated_finding_id_stops_the_dispatch_cycle_before_a_second_repair_apply() {
+    let change_id = "parallel-repeated";
+    let observed = dispatch_scripted_repair_cycle(
+        change_id,
+        &[scripted_structured_fail(
+            "acceptance-secret-value-scan",
+            "src/relay.rs",
+            "tests/relay_test.rs",
+        )],
+        "mkdir -p src tests && echo repair >> src/relay.rs && echo proof >> tests/relay_test.rs",
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_ref()
+        .or_fail("a repeated finding ID must stop the workspace");
+    assert!(error.contains("repeated_acceptance_finding"), "{error}");
+    assert!(error.contains("acceptance-secret-value-scan"), "{error}");
+    assert!(error.contains("\"resumable\":true"), "{error}");
+    assert!(
+        error.contains("\"proves_acceptance_pass\":false"),
+        "{error}"
+    );
+    assert_eq!(
+        observed.apply_invocations, 2,
+        "the first repair is automatic; the second one is not"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 2,
+        "the stop happens on the FAIL that repeats the ID, not later"
+    );
+    assert_eq!(
+        observed.acceptance_error_logs.len(),
+        1,
+        "exactly one operator-facing stop diagnostic: {:?}",
+        observed.acceptance_error_logs
+    );
+    assert!(observed.result.final_revision.is_none());
+}
+
+/// A genuinely new ID gets its own automatic repair apply — the prior ID's spent
+/// budget does not carry over — and that opportunity is likewise spent once.
+///
+/// The serial counterpart covers the canonical PASS that follows two repaired
+/// IDs. Three real apply/acceptance cycles through managed worktrees put this
+/// one just over one second, so it belongs to the heavy tier.
+#[cfg_attr(not(feature = "heavy-tests"), ignore)]
+#[tokio::test]
+async fn parallel_new_finding_id_receives_its_own_repair_apply_in_the_dispatch_cycle() {
+    let change_id = "parallel-new-id";
+    let observed = dispatch_scripted_repair_cycle(
+        change_id,
+        &[
+            scripted_structured_fail(
+                "acceptance-secret-value-scan",
+                "src/relay.rs",
+                "tests/relay_test.rs",
+            ),
+            scripted_structured_fail(
+                "acceptance-audit-gap",
+                "src/audit.rs",
+                "tests/audit_test.rs",
+            ),
+        ],
+        "mkdir -p src tests && echo repair >> src/relay.rs && echo proof >> tests/relay_test.rs \
+         && echo repair >> src/audit.rs && echo proof >> tests/audit_test.rs",
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_ref()
+        .or_fail("the new ID's own budget is spent by its second occurrence");
+    assert!(error.contains("repeated_acceptance_finding"), "{error}");
+    assert!(
+        error.contains("acceptance-audit-gap"),
+        "the new ID is the stop reason, not the Acceptance-closed prior ID: {error}"
+    );
+    assert!(
+        !error.contains("acceptance-secret-value-scan"),
+        "the prior ID was closed by Acceptance and must not reappear: {error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "the new ID's repair is re-reviewed instead of stopping at its first FAIL"
+    );
+    assert_eq!(
+        observed.apply_invocations, 3,
+        "the new ID received its own automatic repair apply"
+    );
+    assert!(observed.result.final_revision.is_none());
+}
+
+/// Drive the same scripted repeated-ID scenario through the real serial cycle
+/// and return the stop diagnostic serial produced.
+async fn run_serial_repeated_cycle(change_id: &str, verdict: &str, apply_extra: &str) -> String {
+    use crate::hooks::{HookRunner, HooksConfig};
+    use crate::orchestration::output::NullOutputHandler;
+    use crate::serial_run_service::{ChangeProcessResult, SerialRunService};
+
+    let repo_dir = TempDir::new().or_fail("create temp serial repo");
+    let state_dir = TempDir::new().or_fail("create serial verdict state dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let verdict_path = state_dir.path().join("verdict.json");
+    std::fs::write(&verdict_path, verdict).or_fail("write serial verdict");
+    let verdict_path = verdict_path.display().to_string();
+
+    let config = create_test_config_with(OrchestratorConfig {
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
+             {apply_extra}\""
+        )),
+        acceptance_command: Some(format!("sh -c 'cat \"{verdict_path}\"'")),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let queue_config = CommandQueueConfig {
+        stagger_delay_ms: 0,
+        max_retries: 0,
+        retry_delay_ms: 0,
+        retry_error_patterns: default_retry_patterns(),
+        retry_if_duration_under_secs: 0,
+        inactivity_timeout_secs: 0,
+        inactivity_kill_grace_secs: 10,
+        inactivity_timeout_max_retries: 0,
+        strict_process_cleanup: true,
+    };
+    let ai_runner = AiCommandRunner::new(queue_config, Arc::new(Mutex::new(None)));
+    let mut agent = AgentRunner::new(config.clone());
+    let mut service = SerialRunService::new(repo_dir.path().to_path_buf(), config.clone());
+    let change = crate::openspec::list_changes_native_from(repo_dir.path())
+        .or_fail("list serial changes")
+        .into_iter()
+        .find(|change| change.id == change_id)
+        .or_fail("the scripted change exists");
+
+    let mut last = None;
+    for _ in 0..2 {
+        last = Some(
+            service
+                .process_change(
+                    &change,
+                    &mut agent,
+                    &ai_runner,
+                    &HookRunner::new(HooksConfig::default(), repo_dir.path()),
+                    &NullOutputHandler::new(),
+                    1,
+                    1,
+                    || false,
+                    || false,
+                    None,
+                )
+                .await
+                .or_fail("serial cycle should not error"),
+        );
+    }
+
+    match last.or_fail("two serial cycles ran") {
+        ChangeProcessResult::Stalled { error } => error,
+        other => panic!("expected a serial repeated-finding stop, got {other:?}"),
+    }
+}
+
+/// Parse the machine-readable diagnostics out of a repair stop summary.
+fn repair_stop_diagnostics(summary: &str) -> serde_json::Value {
+    let (_, json) = summary
+        .split_once("Diagnostics: ")
+        .or_fail("a repair stop summary carries machine-readable diagnostics");
+    serde_json::from_str(json).or_fail("repair stop diagnostics are valid JSON")
+}
+
+/// Equivalent observations in the two execution modes must produce equivalent
+/// operator evidence. Both sides here come from a real cycle — serial through
+/// `process_change`, parallel through `dispatch_change_to_workspace` — so this
+/// compares two independent runs rather than one function against itself.
+#[tokio::test]
+async fn serial_and_parallel_repeated_finding_stops_report_equivalent_diagnostics() {
+    let change_id = "parity-repeated";
+    let verdict = scripted_structured_fail(
+        "acceptance-secret-value-scan",
+        "src/relay.rs",
+        "tests/relay_test.rs",
+    );
+    let apply_extra =
+        "mkdir -p src tests && echo repair >> src/relay.rs && echo proof >> tests/relay_test.rs";
+
+    // The two runs are independent (separate repositories, workspaces, and
+    // scripted counters), so they run concurrently to keep this test inside the
+    // repository's one-second default-suite budget.
+    let (parallel, serial_error) = tokio::join!(
+        dispatch_scripted_repair_cycle(change_id, std::slice::from_ref(&verdict), apply_extra),
+        run_serial_repeated_cycle(change_id, &verdict, apply_extra),
+    );
+    let parallel_error = parallel
+        .result
+        .error
+        .as_ref()
+        .or_fail("parallel must stop on the repeated ID");
+
+    let parallel_json = repair_stop_diagnostics(parallel_error);
+    let serial_json = repair_stop_diagnostics(&serial_error);
+
+    // Revision identifiers and the raw delta are legitimately mode-specific:
+    // parallel commits apply inside its worktree, serial does not. Everything
+    // that explains *why* automation stopped must match exactly.
+    for field in [
+        "change_id",
+        "stop_reason",
+        "findings",
+        "finding_occurrences",
+        "repeated_identities",
+        "required_files",
+        "verification_files",
+        "uncovered_files",
+        "coverage_complete",
+        "legacy_findings_without_declared_paths",
+        "remediation_evidence",
+        "resumable",
+        "next_action",
+        "proves_completion",
+        "proves_acceptance_pass",
+        "proves_archive_readiness",
+    ] {
+        assert_eq!(
+            serial_json.get(field),
+            parallel_json.get(field),
+            "field `{field}` diverges between execution modes:\nserial={serial_json}\nparallel={parallel_json}"
+        );
+    }
+    assert_eq!(
+        serial_json
+            .get("stop_reason")
+            .and_then(|value| value.as_str()),
+        Some(crate::orchestration::acceptance::REPEATED_FINDING_REASON)
     );
 }

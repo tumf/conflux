@@ -529,43 +529,71 @@ pub fn parse_progress_with_fallback(
 
 const ACCEPTANCE_FOLLOW_UP_HEADING: &str = "## Current Acceptance Follow-up";
 
+/// Runtime-owned metadata line carrying the immutable structured finding
+/// payload for one follow-up item.
+///
+/// Persisting the payload (not just its checkbox text) is what lets an
+/// interrupted FAIL-to-Apply handoff recover the actionable repair target from
+/// workspace-local evidence instead of inferring one.
+const FINDING_PAYLOAD_PREFIX: &str = "  finding: ";
+
 fn normalize_acceptance_findings(
-    findings: &[String],
+    findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Vec<crate::orchestration::acceptance::NormalizedFinding> {
     let mut normalized = crate::orchestration::acceptance::normalize_findings(findings);
     if normalized.is_empty() {
-        normalized = crate::orchestration::acceptance::normalize_findings(&[String::from(
-            "Investigate acceptance failure and apply the required fix",
-        )]);
+        normalized = crate::orchestration::acceptance::normalize_findings(&[
+            crate::acceptance::AcceptanceFinding::legacy(
+                "Investigate acceptance failure and apply the required fix",
+            ),
+        ]);
     }
     normalized
 }
 
+/// One follow-up item already recorded in the workspace.
+///
+/// `remediation_claimed` is what a checked box means: Apply recorded a repair
+/// claim. It is never closure — only a later canonical Acceptance result closes
+/// or reopens an item.
 #[derive(Debug, PartialEq, Eq)]
 struct ExistingAcceptanceFinding {
     finding: crate::orchestration::acceptance::NormalizedFinding,
-    completed: bool,
+    remediation_claimed: bool,
     evidence: Vec<String>,
 }
 
 fn existing_acceptance_findings(section: &str) -> Vec<ExistingAcceptanceFinding> {
-    let mut findings = Vec::new();
+    let mut findings: Vec<ExistingAcceptanceFinding> = Vec::new();
     for line in section.lines() {
-        if let Some((completed, text)) = ["- [ ] ", "- [x] ", "- [X] "]
+        if let Some((remediation_claimed, text)) = ["- [ ] ", "- [x] ", "- [X] "]
             .iter()
             .enumerate()
             .find_map(|(index, prefix)| line.strip_prefix(prefix).map(|text| (index > 0, text)))
         {
-            if let Some(finding) =
-                crate::orchestration::acceptance::normalize_findings(&[text.to_string()])
-                    .into_iter()
-                    .next()
+            if let Some(finding) = crate::orchestration::acceptance::normalize_findings(&[
+                crate::acceptance::AcceptanceFinding::legacy(text),
+            ])
+            .into_iter()
+            .next()
             {
                 findings.push(ExistingAcceptanceFinding {
                     finding,
-                    completed,
+                    remediation_claimed,
                     evidence: Vec::new(),
                 });
+            }
+        } else if let Some(payload) = line.strip_prefix(FINDING_PAYLOAD_PREFIX) {
+            // Runtime-owned payload: restores the immutable structured finding,
+            // including its stable ID, over the checkbox text Apply can see.
+            if let Some(existing) = findings.last_mut() {
+                if let Some(finding) = parse_finding_payload(payload) {
+                    existing.finding =
+                        crate::orchestration::acceptance::normalize_findings(&[finding])
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| existing.finding.clone());
+                }
             }
         } else if let Some(evidence) = line.trim().strip_prefix("evidence: ") {
             if let Some(finding) = findings.last_mut() {
@@ -576,6 +604,17 @@ fn existing_acceptance_findings(section: &str) -> Vec<ExistingAcceptanceFinding>
     findings
 }
 
+/// Parse one persisted `  finding: {...}` payload back into a shared finding.
+///
+/// Invalid metadata is ignored rather than trusted: a corrupted payload must not
+/// be able to fabricate a finding ID or a repair target.
+fn parse_finding_payload(payload: &str) -> Option<crate::acceptance::AcceptanceFinding> {
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).ok()?;
+    crate::acceptance::validate_repository_finding(&value)
+        .ok()
+        .map(crate::acceptance::AcceptanceFinding::structured)
+}
+
 fn reconcile_apply_progress(
     mut runtime_findings: Vec<crate::orchestration::acceptance::NormalizedFinding>,
     existing_findings: &[ExistingAcceptanceFinding],
@@ -584,39 +623,53 @@ fn reconcile_apply_progress(
     Vec<String>,
     std::collections::HashMap<String, Vec<String>>,
 ) {
-    let mut completed_identities = Vec::new();
+    let mut claimed_identities = Vec::new();
     let mut evidence_by_identity = std::collections::HashMap::new();
     for candidate in &mut runtime_findings {
         if let Some(existing) = existing_findings
             .iter()
             .find(|existing| existing.finding.identity == candidate.identity)
         {
-            candidate.text.clone_from(&existing.finding.text);
-            if existing.completed {
-                completed_identities.push(candidate.identity.clone());
+            // Runtime owns the actionable detail for structured findings: the
+            // reviewer's payload wins over whatever text is on the checkbox line
+            // so Apply cannot rewrite a finding into something easier.
+            if candidate.finding.structured_payload().is_none() {
+                candidate.text.clone_from(&existing.finding.text);
+                candidate.finding =
+                    crate::acceptance::AcceptanceFinding::legacy(existing.finding.text.clone());
+            }
+            if existing.remediation_claimed {
+                claimed_identities.push(candidate.identity.clone());
             }
             if !existing.evidence.is_empty() {
                 evidence_by_identity.insert(candidate.identity.clone(), existing.evidence.clone());
             }
         }
     }
-    (runtime_findings, completed_identities, evidence_by_identity)
+    (runtime_findings, claimed_identities, evidence_by_identity)
 }
 
 fn render_acceptance_follow_up_section(
     attempt: u32,
     findings: &[crate::orchestration::acceptance::NormalizedFinding],
-    completed_identities: &[String],
+    claimed_identities: &[String],
     evidence_by_identity: &std::collections::HashMap<String, Vec<String>>,
 ) -> String {
     let mut section = format!("- attempt: {attempt}\n");
     for finding in findings.iter().filter(|finding| !finding.external) {
-        let checked = if completed_identities.contains(&finding.identity) {
+        let checked = if claimed_identities.contains(&finding.identity) {
             "x"
         } else {
             " "
         };
         let _ = writeln!(&mut section, "- [{checked}] {}", finding.text);
+        if let Some(structured) = finding.finding.structured_payload() {
+            let _ = writeln!(
+                &mut section,
+                "{FINDING_PAYLOAD_PREFIX}{}",
+                structured.to_json()
+            );
+        }
         if let Some(evidence) = evidence_by_identity.get(&finding.identity) {
             for item in evidence {
                 let _ = writeln!(&mut section, "  evidence: {item}");
@@ -780,7 +833,7 @@ fn is_known_runtime_follow_up_line(line: &str) -> bool {
     if lowered == "### external blockers" {
         return true;
     }
-    const KNOWN_PREFIXES: [&str; 10] = [
+    const KNOWN_PREFIXES: [&str; 12] = [
         "- [ ]",
         "- [x]",
         "- attempt:",
@@ -791,6 +844,8 @@ fn is_known_runtime_follow_up_line(line: &str) -> bool {
         "evidence:",
         "- next action:",
         "next action:",
+        "- finding:",
+        "finding:",
     ];
     KNOWN_PREFIXES
         .iter()
@@ -1055,7 +1110,7 @@ pub fn resolve_acceptance_follow_up_tasks_path_for_cleanup(
 fn plan_replace_acceptance_follow_up(
     content: &str,
     attempt: u32,
-    findings: &[String],
+    findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Result<(String, FollowUpRecovery)> {
     let mut content = content.to_string();
     let normalized_findings = normalize_acceptance_findings(findings);
@@ -1073,7 +1128,7 @@ fn plan_replace_acceptance_follow_up(
 fn plan_merge_acceptance_follow_up(
     content: &str,
     attempt: u32,
-    findings: &[String],
+    findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Result<(String, FollowUpRecovery)> {
     let mut content = content.to_string();
     let normalized_findings = normalize_acceptance_findings(findings);
@@ -1082,14 +1137,14 @@ fn plan_merge_acceptance_follow_up(
         .map(|range| content[range.clone()].to_string())
         .unwrap_or_default();
     let existing_findings = existing_acceptance_findings(&existing_section);
-    let (merged_findings, completed_identities, evidence_by_identity) =
+    let (merged_findings, claimed_identities, evidence_by_identity) =
         reconcile_apply_progress(normalized_findings, &existing_findings);
 
     let recovery = upsert_acceptance_follow_up_section(
         &mut content,
         attempt,
         &merged_findings,
-        &completed_identities,
+        &claimed_identities,
         &evidence_by_identity,
     )?;
     Ok((content, recovery))
@@ -1105,7 +1160,7 @@ fn plan_clear_acceptance_follow_up(content: &str) -> Result<(String, FollowUpRec
 pub fn replace_acceptance_follow_up_from_latest_fail(
     tasks_path: &Path,
     attempt: u32,
-    findings: &[String],
+    findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Result<FollowUpRecovery> {
     let original = read_tasks_file(tasks_path)?;
     let (content, recovery) = plan_replace_acceptance_follow_up(&original, attempt, findings)?;
@@ -1116,7 +1171,7 @@ pub fn replace_acceptance_follow_up_from_latest_fail(
 pub fn merge_acceptance_follow_up_apply_progress(
     tasks_path: &Path,
     attempt: u32,
-    findings: &[String],
+    findings: &[crate::acceptance::AcceptanceFinding],
 ) -> Result<FollowUpRecovery> {
     let original = read_tasks_file(tasks_path)?;
     let (content, recovery) = plan_merge_acceptance_follow_up(&original, attempt, findings)?;
@@ -1124,7 +1179,15 @@ pub fn merge_acceptance_follow_up_apply_progress(
     Ok(recovery)
 }
 
-pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<String>)>> {
+/// Read the runtime-owned current follow-up as actionable findings.
+///
+/// Structured findings are restored from their runtime-owned payload line, so an
+/// interrupted FAIL-to-Apply handoff recovers stable IDs, evidence, required
+/// changes, and verification expectations rather than checkbox text alone. A
+/// checked box is a remediation claim only; nothing here implies closure or PASS.
+pub fn read_acceptance_follow_up(
+    tasks_path: &Path,
+) -> Result<Option<(u32, Vec<crate::acceptance::AcceptanceFinding>)>> {
     let content = read_tasks_file(tasks_path)?;
     let ranges = acceptance_follow_up_ranges(&content)?;
     let Some(range) = ranges.last() else {
@@ -1150,7 +1213,7 @@ pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<S
             tasks_path.display()
         ))
     })?;
-    let mut findings = Vec::new();
+    let mut findings: Vec<crate::acceptance::AcceptanceFinding> = Vec::new();
     let mut in_external_blockers = false;
     for line in lines {
         let trimmed = line.trim();
@@ -1162,14 +1225,40 @@ pub fn read_acceptance_follow_up(tasks_path: &Path) -> Result<Option<(u32, Vec<S
             .iter()
             .find_map(|prefix| line.strip_prefix(prefix))
         {
-            findings.push(finding.to_string());
+            findings.push(crate::acceptance::AcceptanceFinding::legacy(finding));
+        } else if let Some(payload) = line.strip_prefix(FINDING_PAYLOAD_PREFIX) {
+            // The runtime-owned payload is authoritative for the preceding item.
+            if let (Some(last), Some(structured)) = (
+                findings.len().checked_sub(1),
+                parse_finding_payload(payload),
+            ) {
+                findings[last] = structured;
+            }
         } else if in_external_blockers {
             if let Some(evidence) = trimmed.strip_prefix("evidence: ") {
-                findings.push(evidence.to_string());
+                findings.push(crate::acceptance::AcceptanceFinding::legacy(evidence));
             }
         }
     }
     Ok((!findings.is_empty()).then_some((attempt, findings)))
+}
+
+/// Read the Apply-authored remediation evidence lines from the current
+/// follow-up.
+///
+/// Evidence is a remediation *claim*: it never closes a finding and never
+/// implies Acceptance PASS.
+pub fn read_acceptance_follow_up_evidence(tasks_path: &Path) -> Result<Vec<String>> {
+    let content = read_tasks_file(tasks_path)?;
+    let ranges = acceptance_follow_up_ranges(&content)?;
+    let Some(range) = ranges.last() else {
+        return Ok(Vec::new());
+    };
+    Ok(content[range.clone()]
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("evidence: "))
+        .map(str::to_string)
+        .collect())
 }
 
 pub fn clear_acceptance_follow_up(tasks_path: &Path) -> Result<FollowUpRecovery> {
@@ -1308,8 +1397,8 @@ mod tests {
             &tasks_path,
             2,
             &[
-                "missing repository coverage".to_string(),
-                "add notification links".to_string(),
+                "missing repository coverage".to_string().into(),
+                "add notification links".to_string().into(),
             ],
         )
         .unwrap();
@@ -1337,7 +1426,7 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             1,
-            &["fresh finding".to_string()],
+            &["fresh finding".to_string().into()],
         )
         .unwrap();
 
@@ -1361,7 +1450,7 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &["latest finding".to_string()],
+            &["latest finding".to_string().into()],
         )
         .unwrap();
 
@@ -1384,8 +1473,8 @@ mod tests {
             &tasks_path,
             2,
             &[
-                "latest finding".to_string(),
-                "add regression test".to_string(),
+                "latest finding".to_string().into(),
+                "add regression test".to_string().into(),
             ],
         )
         .unwrap();
@@ -1410,8 +1499,8 @@ mod tests {
             &tasks_path,
             2,
             &[
-                "latest finding".to_string(),
-                "add regression test".to_string(),
+                "latest finding".to_string().into(),
+                "add regression test".to_string().into(),
             ],
         )
         .unwrap();
@@ -1437,8 +1526,12 @@ mod tests {
             &tasks_path,
             2,
             &[
-                "Regression test absent in src/example.rs:99 with changed detail".to_string(),
-                "Incorrect implementation at src/other.rs:40 with new evidence".to_string(),
+                "Regression test absent in src/example.rs:99 with changed detail"
+                    .to_string()
+                    .into(),
+                "Incorrect implementation at src/other.rs:40 with new evidence"
+                    .to_string()
+                    .into(),
             ],
         )
         .unwrap();
@@ -1467,7 +1560,9 @@ mod tests {
         merge_acceptance_follow_up_apply_progress(
             &tasks_path,
             2,
-            &["[SERIAL_STALLED_MARKER_MISSING] detailed original finding".to_string()],
+            &["[SERIAL_STALLED_MARKER_MISSING] detailed original finding"
+                .to_string()
+                .into()],
         )
         .unwrap();
 
@@ -1492,7 +1587,11 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &["[SERIAL_STALLED_MARKER_MISSING] still missing at src/run.rs:42".to_string()],
+            &[
+                "[SERIAL_STALLED_MARKER_MISSING] still missing at src/run.rs:42"
+                    .to_string()
+                    .into(),
+            ],
         )
         .unwrap();
 
@@ -1512,8 +1611,12 @@ mod tests {
             &tasks_path,
             3,
             &[
-                "fix repository regression at src/run.rs:4".to_string(),
-                "external non-mockable prerequisite: vendor approval".to_string(),
+                "fix repository regression at src/run.rs:4"
+                    .to_string()
+                    .into(),
+                "external non-mockable prerequisite: vendor approval"
+                    .to_string()
+                    .into(),
             ],
         )
         .unwrap();
@@ -1546,10 +1649,10 @@ mod tests {
             follow_up,
             Some((
                 3,
-                vec![
-                    "fix repository regression at src/run.rs:4".to_string(),
-                    "external non-mockable prerequisite: vendor approval".to_string(),
-                ],
+                crate::acceptance::legacy_findings([
+                    "fix repository regression at src/run.rs:4",
+                    "external non-mockable prerequisite: vendor approval",
+                ]),
             ))
         );
     }
@@ -1563,7 +1666,9 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &["finding\n## injected heading\n- [ ] injected task".to_string()],
+            &["finding\n## injected heading\n- [ ] injected task"
+                .to_string()
+                .into()],
         )
         .unwrap();
 
@@ -1635,7 +1740,7 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &["latest finding".to_string()],
+            &["latest finding".to_string().into()],
         )
         .unwrap();
 
@@ -1688,7 +1793,7 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             3,
-            &[" ".to_string(), "\t".to_string()],
+            &[" ".to_string().into(), "\t".to_string().into()],
         )
         .unwrap();
 
@@ -1706,7 +1811,7 @@ mod tests {
         replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             4,
-            &["fresh finding".to_string()],
+            &["fresh finding".to_string().into()],
         )
         .unwrap();
 
@@ -2703,6 +2808,236 @@ mod tests {
         // Restore directory
         env::set_current_dir(original_dir).unwrap();
     }
+
+    // --- Runtime-owned follow-up: immutable identity + Apply remediation claims ---
+
+    fn structured_finding(id: &str) -> crate::acceptance::AcceptanceFinding {
+        crate::acceptance::AcceptanceFinding::structured(crate::acceptance::RepositoryFinding {
+            id: id.to_string(),
+            severity: crate::acceptance::FindingSeverity::Minor,
+            summary: "Challenge and proof leakage is not tested by value".to_string(),
+            evidence: vec!["tests/support/relay.ts exposes counts but not values".to_string()],
+            required_changes: vec![crate::acceptance::FindingFileExpectation {
+                file: "tests/support/relay.ts".to_string(),
+                description: "Expose issued challenge and presented proof values".to_string(),
+            }],
+            verification: vec![crate::acceptance::FindingFileExpectation {
+                file: "runtime/recovery.integration.test.ts".to_string(),
+                description: "Assert recorded values are absent from audit output".to_string(),
+            }],
+        })
+    }
+
+    #[test]
+    fn follow_up_persists_structured_payload_for_interruption_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
+
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            &[structured_finding("acceptance-secret-value-scan")],
+        )
+        .unwrap();
+
+        // Restart path: everything Apply needs comes back from workspace-local
+        // evidence, not from lost in-memory state.
+        let (attempt, recovered) = read_acceptance_follow_up(&tasks_path).unwrap().unwrap();
+        assert_eq!(attempt, 2);
+        assert_eq!(recovered.len(), 1);
+        let structured = recovered[0]
+            .structured_payload()
+            .expect("structured payload recovered from workspace evidence");
+        assert_eq!(structured.id, "acceptance-secret-value-scan");
+        assert_eq!(structured.required_files(), ["tests/support/relay.ts"]);
+        assert_eq!(
+            structured.verification_files(),
+            ["runtime/recovery.integration.test.ts"]
+        );
+        assert_eq!(
+            structured.evidence,
+            ["tests/support/relay.ts exposes counts but not values"]
+        );
+    }
+
+    #[test]
+    fn apply_checkbox_is_a_remediation_claim_and_cannot_close_a_finding() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
+        let finding = structured_finding("acceptance-secret-value-scan");
+
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            1,
+            std::slice::from_ref(&finding),
+        )
+        .unwrap();
+
+        // Apply marks the box and adds evidence.
+        let claimed = std::fs::read_to_string(&tasks_path).unwrap().replace(
+            "- [ ] [acceptance-secret-value-scan]",
+            "- [x] [acceptance-secret-value-scan]",
+        );
+        std::fs::write(
+            &tasks_path,
+            format!("{claimed}  evidence: exposed issued values\n"),
+        )
+        .unwrap();
+
+        // A later FAIL reporting the same ID reopens it: the claim never closed
+        // it, and the reviewer's payload is restored verbatim.
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            std::slice::from_ref(&finding),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(
+            content.contains("- [ ] [acceptance-secret-value-scan]"),
+            "{content}"
+        );
+        let (_, recovered) = read_acceptance_follow_up(&tasks_path).unwrap().unwrap();
+        assert_eq!(recovered, vec![finding]);
+    }
+
+    #[test]
+    fn apply_hydration_preserves_the_claim_but_not_the_authority_to_rewrite_a_finding() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
+        let finding = structured_finding("acceptance-secret-value-scan");
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            1,
+            std::slice::from_ref(&finding),
+        )
+        .unwrap();
+
+        // Apply rewrites the checkbox text to something easier and claims it.
+        let tampered = std::fs::read_to_string(&tasks_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                if line.starts_with("- [ ] [acceptance-secret-value-scan]") {
+                    "- [x] tidied up a comment".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&tasks_path, format!("{tampered}\n  evidence: reworded\n")).unwrap();
+
+        merge_acceptance_follow_up_apply_progress(&tasks_path, 1, std::slice::from_ref(&finding))
+            .unwrap();
+
+        let (_, recovered) = read_acceptance_follow_up(&tasks_path).unwrap().unwrap();
+        assert_eq!(
+            recovered,
+            vec![finding],
+            "runtime restores the reviewer payload over Apply-authored text"
+        );
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(!content.contains("tidied up a comment"), "{content}");
+    }
+
+    #[test]
+    fn absent_finding_id_is_removed_only_by_a_new_canonical_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            1,
+            &[structured_finding("first-id")],
+        )
+        .unwrap();
+
+        // The next canonical FAIL no longer reports `first-id`: acceptance
+        // closed it, so runtime drops it and grants the new ID its own item.
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            2,
+            &[structured_finding("second-id")],
+        )
+        .unwrap();
+
+        let (_, recovered) = read_acceptance_follow_up(&tasks_path).unwrap().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id(), Some("second-id"));
+    }
+
+    #[test]
+    fn invalid_finding_metadata_is_ignored_rather_than_trusted() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(
+            &tasks_path,
+            "## Implementation Tasks\n- [x] Task 1\n\n\
+             ## Current Acceptance Follow-up\n- attempt: 1\n\
+             - [ ] legacy style finding at src/a.rs:10\n\
+             \x20 finding: {\"id\":\"forged\"}\n",
+        );
+
+        let (_, recovered) = read_acceptance_follow_up(&tasks_path).unwrap().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].id(),
+            None,
+            "a corrupted payload must not fabricate a finding ID"
+        );
+        assert_eq!(recovered[0].text(), "legacy style finding at src/a.rs:10");
+    }
+
+    #[test]
+    fn legacy_string_findings_keep_their_existing_follow_up_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            1,
+            &crate::acceptance::legacy_findings(["src/a.rs:10 missing regression coverage"]),
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        assert!(
+            content.contains("- [ ] src/a.rs:10 missing regression coverage"),
+            "{content}"
+        );
+        assert!(
+            !content.contains(FINDING_PAYLOAD_PREFIX.trim()),
+            "legacy findings declare no structured payload: {content}"
+        );
+    }
+
+    #[test]
+    fn remediation_evidence_is_readable_for_stop_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let tasks_path = temp.path().join("tasks.md");
+        write_tasks(&tasks_path, "## Implementation Tasks\n- [x] Task 1\n");
+        replace_acceptance_follow_up_from_latest_fail(
+            &tasks_path,
+            1,
+            &[structured_finding("acceptance-secret-value-scan")],
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&tasks_path).unwrap();
+        std::fs::write(
+            &tasks_path,
+            format!("{content}  evidence: exposed issued values in relay.ts\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_acceptance_follow_up_evidence(&tasks_path).unwrap(),
+            ["exposed issued values in relay.ts"]
+        );
+    }
 }
 
 /// Unit coverage for acceptance follow-up recovery.
@@ -2969,7 +3304,7 @@ mod recovery_tests {
         let error = replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &["still broken".to_string()],
+            &["still broken".to_string().into()],
         )
         .unwrap_err();
 

@@ -94,6 +94,14 @@ pub struct SerialRunService {
     /// records the verdict, so a restart finds this set empty and re-runs
     /// acceptance for complete unarchived work instead of inferring PASS.
     accepted_change_ids: HashSet<String>,
+    /// Changes held by a repair stop (`acceptance_remediation_mismatch` or
+    /// `repeated_acceptance_finding`) during *this* run.
+    ///
+    /// The hold is in-memory only — no worktree marker and no durable record —
+    /// and its single job is to suppress ordinary dispatch until an explicit
+    /// operator retry releases the automatic repair budget. Parallel reaches the
+    /// same suppression through its failed-change tracker.
+    acceptance_repair_holds: HashSet<String>,
 }
 
 impl SerialRunService {
@@ -114,6 +122,7 @@ impl SerialRunService {
             acceptance_stall_state_root: None,
             acceptance_resume: HashSet::new(),
             accepted_change_ids: HashSet::new(),
+            acceptance_repair_holds: HashSet::new(),
         }
     }
 
@@ -244,6 +253,11 @@ impl SerialRunService {
     /// silently discarded, and a refusal keeps the change stalled with its
     /// blocker evidence intact.
     pub async fn consume_explicit_acceptance_retry(&mut self, change_id: &str) -> Result<bool> {
+        // An explicit operator retry is the only thing that grants a new
+        // automatic repair opportunity, so it runs before the durable-hold
+        // lookup: a repair stop is deliberately in-memory and has no record to
+        // load. Occurrence evidence and the latest findings are preserved.
+        let released_repair_hold = self.release_repair_budget_for_explicit_retry(change_id);
         let store = self.acceptance_stall_store()?;
         let base_branch = self.current_branch_for_facts().await;
         // A legacy acceptance-origin marker must become runtime state before
@@ -260,10 +274,10 @@ impl SerialRunService {
         )
         .await?
         else {
-            return Ok(false);
+            return Ok(released_repair_hold);
         };
         if !record.resumable {
-            return Ok(false);
+            return Ok(released_repair_hold);
         }
         let consumed = store.consume(&record.repository_id, &record.change_id)?;
         if consumed {
@@ -278,7 +292,47 @@ impl SerialRunService {
                 change_id, record.apply_revision
             );
         }
-        Ok(consumed)
+        Ok(consumed || released_repair_hold)
+    }
+
+    /// Release an in-run repair hold so an explicit retry may start one more
+    /// automatic repair attempt.
+    ///
+    /// Both automatic-repair budgets are released: the per-ID ledger and the
+    /// identity/fingerprint baseline the broader semantic comparison stalls on.
+    /// Occurrence counts, the latest findings, the cycle count, and the FAIL
+    /// revision are kept, because they are the operator's evidence trail and
+    /// only Acceptance may close a finding. The ten-cycle global ceiling is
+    /// untouched. Returns whether a repair hold was actually released.
+    fn release_repair_budget_for_explicit_retry(&mut self, change_id: &str) -> bool {
+        if !self.acceptance_repair_holds.remove(change_id) {
+            return false;
+        }
+        if let Some(context) = self.acceptance_retry.get_mut(change_id) {
+            context.repair_ledger.reset_for_explicit_retry();
+            context.finding_identities.clear();
+            context.semantic_fingerprint = None;
+        }
+        self.stalled_change_ids.remove(change_id);
+        info!(
+            "Explicit retry for {}: released the automatic per-finding repair budget; occurrence \
+             evidence and open findings are retained",
+            change_id
+        );
+        true
+    }
+
+    /// Hold a change on an evidenced repair stop for the rest of this run.
+    ///
+    /// Nothing durable and nothing inside the worktree is written: the hold only
+    /// suppresses ordinary dispatch (`select_next_change`) until an explicit
+    /// operator retry releases it, which is parallel's `mark_failed` behavior
+    /// expressed in serial terms. It never proves completion, closure, or PASS.
+    fn hold_repair_stop(&mut self, change_id: &str, error: String) -> ChangeProcessResult {
+        error!("{error}");
+        self.acceptance_repair_holds.insert(change_id.to_string());
+        self.mark_stalled(change_id, &error);
+        ChangeProcessResult::Stalled { error }
     }
 
     /// Branch used as the base reference when gathering reconciliation facts.
@@ -386,6 +440,43 @@ impl SerialRunService {
         self.acceptance_retry.insert(change_id.to_string(), context);
     }
 
+    /// Validate the post-FAIL repair delta against every declared finding path.
+    ///
+    /// Returns the operator-facing hold diagnostic when declared coverage is
+    /// missing. Serial and parallel call the same shared decision so equivalent
+    /// observations stop for the same reason with equivalent evidence.
+    async fn check_repair_coverage(
+        &self,
+        change_id: &str,
+        workspace: &std::path::Path,
+    ) -> Option<String> {
+        let context = self.acceptance_retry.get(change_id)?;
+        if context.latest_findings().is_empty() {
+            return None;
+        }
+        let (changed_files, apply_revision, remediation_evidence) =
+            crate::orchestration::acceptance::collect_repair_gate_inputs(
+                workspace,
+                change_id,
+                context.fail_revision.as_deref(),
+            )
+            .await;
+        match crate::orchestration::acceptance::decide_repair_gate(
+            change_id,
+            context.latest_findings(),
+            &context.repair_ledger,
+            context.fail_revision.as_deref(),
+            apply_revision.as_deref(),
+            &changed_files,
+            &remediation_evidence,
+        ) {
+            crate::orchestration::acceptance::RepairGateDecision::Proceed => None,
+            crate::orchestration::acceptance::RepairGateDecision::Stop(stop) => {
+                Some(stop.summary())
+            }
+        }
+    }
+
     /// Seed the agent with acceptance retry context gathered earlier in this run.
     ///
     /// Nothing is restored after a restart: the in-memory map is empty, so the
@@ -399,12 +490,23 @@ impl SerialRunService {
         }
 
         let mut history = crate::history::AcceptanceHistory::new();
-        history.set_checkpoint(
+        // Comparison identities and the semantic baseline go to the retry
+        // checkpoint; the complete payload goes to the payload slot. Seeding
+        // identities into the payload slot is what previously reduced a detailed
+        // finding to `repository|path|verification` before the next Apply.
+        history.set_retry_checkpoint(
             change_id,
             context.cycle_count,
             context.finding_identities.clone(),
             context.semantic_fingerprint.clone(),
         );
+        if !context.findings.is_empty() {
+            history.set_follow_up_findings(
+                change_id,
+                context.cycle_count,
+                context.findings.clone(),
+            );
+        }
         agent.seed_acceptance_history(history);
     }
 
@@ -917,6 +1019,9 @@ impl SerialRunService {
     /// context while the shared missing-verdict budget remains. That budget is
     /// active-run memory only and never touches the configured explicit-CONTINUE
     /// budget.
+    ///
+    /// Every entry runs the remediation-coverage gate first, so no serial path
+    /// can reach Acceptance with an unvalidated repair delta.
     async fn run_acceptance_loop<O: OutputHandler, F, G>(
         &mut self,
         change: &Change,
@@ -930,6 +1035,16 @@ impl SerialRunService {
         F: Fn() -> bool + Clone + Send + 'static,
         G: Fn() -> bool + Clone,
     {
+        // Validate the repair delta before spending an acceptance invocation.
+        // This gate belongs to every entry into acceptance — post-apply repair,
+        // restart rerun, and explicit retry — so it runs here rather than at one
+        // call site. Passing only authorizes the next review; it never claims the
+        // finding is resolved.
+        let repo_root = self.repo_root.clone();
+        if let Some(error) = self.check_repair_coverage(&change.id, &repo_root).await {
+            return Ok(self.hold_repair_stop(&change.id, error));
+        }
+
         let mut protocol = AcceptanceProtocolDriver::default();
         loop {
             match acceptance_test_streaming(
@@ -958,14 +1073,16 @@ impl SerialRunService {
                 }
                 Ok((
                     result @ (AcceptanceResult::BareBlocker { .. }
+                    | AcceptanceResult::MalformedFinding { .. }
                     | AcceptanceResult::Stalled { .. }),
                     _attempt_number,
                     _command,
                 )) => {
                     // Same shared decision API as parallel dispatch: bare or
-                    // invalid compatibility input gets bounded acceptance-only
-                    // retry; only a validated blocker becomes a durable
-                    // revision-bound stall.
+                    // invalid compatibility input — including a FAIL whose
+                    // structured payload did not validate — gets bounded
+                    // acceptance-only retry; only a validated blocker becomes a
+                    // durable revision-bound stall.
                     match decide_acceptance_blocker(&mut protocol, &result) {
                         Some(AcceptanceBlockerDecision::ProtocolRetry { progress, .. }) => {
                             warn!("{} for {}", progress, change.id);
@@ -1006,13 +1123,15 @@ impl SerialRunService {
                 Ok((result, _attempt_number, _command)) => {
                     protocol.observe_canonical_verdict();
                     let repo_root = self.repo_root.clone();
-                    break Ok(self.process_acceptance_result(
-                        &change.id,
-                        &repo_root,
-                        agent,
-                        result,
-                        is_single_change_stopped,
-                    ));
+                    break Ok(self
+                        .process_acceptance_result(
+                            &change.id,
+                            &repo_root,
+                            agent,
+                            result,
+                            is_single_change_stopped,
+                        )
+                        .await);
                 }
                 Err(e) => {
                     error!("Acceptance error for {}: {}", change.id, e);
@@ -1064,7 +1183,7 @@ impl SerialRunService {
     ///
     /// Handles Pass, Continue, Fail, CommandFailed, and Cancelled results,
     /// applying max_continues logic for Continue results.
-    fn process_acceptance_result<F>(
+    async fn process_acceptance_result<F>(
         &mut self,
         change_id: &str,
         workspace_path: &std::path::Path,
@@ -1134,6 +1253,7 @@ impl SerialRunService {
                             finding_identities: Vec::new(),
                             semantic_fingerprint,
                             cycle_count: continue_count,
+                            ..AcceptanceRetryContext::default()
                         },
                     );
                     warn!(
@@ -1148,6 +1268,21 @@ impl SerialRunService {
                     );
                     ChangeProcessResult::AcceptanceContinue
                 }
+            }
+            AcceptanceResult::MalformedFinding { rejection } => {
+                // The acceptance loop owns the bounded protocol budget for this
+                // result and routes it through `decide_acceptance_blocker`, so
+                // this arm is only reached by a caller that bypassed that loop.
+                // It reports the exhausted diagnostic without dispatching repair
+                // work or writing a path-only follow-up.
+                let error = crate::orchestration::acceptance::protocol_exhausted_error(
+                    crate::orchestration::acceptance::AcceptanceProtocolError::MalformedFinding,
+                    MAX_MISSING_VERDICT_RETRIES.saturating_add(1),
+                    MAX_MISSING_VERDICT_RETRIES,
+                    &[rejection.reason()],
+                );
+                error!("{} for {}", error, change_id);
+                ChangeProcessResult::AcceptanceCommandFailed { error }
             }
             AcceptanceResult::BareBlocker { rejection } => {
                 // The acceptance loop owns the bounded protocol budget for this
@@ -1215,12 +1350,67 @@ impl SerialRunService {
                     &fingerprint,
                     retry_count,
                 );
+                // Per-finding accounting decides before the broad semantic
+                // comparison: a repeated ID stops automatic repair even when
+                // unrelated files changed.
+                let mut repair_ledger = previous
+                    .as_ref()
+                    .map(|context| context.repair_ledger.clone())
+                    .unwrap_or_default();
+                let repair = repair_ledger.observe_fail(&normalized);
+                let fail_revision = crate::vcs::git::commands::get_current_commit(workspace_path)
+                    .await
+                    .ok();
                 let retry = AcceptanceRetryContext {
                     finding_identities: identities.clone(),
                     semantic_fingerprint: Some(fingerprint),
                     cycle_count: retry_count,
+                    findings: findings.clone(),
+                    repair_ledger: repair_ledger.clone(),
+                    fail_revision: fail_revision.clone(),
                 };
                 self.set_acceptance_retry_context(change_id, retry.clone());
+                if let crate::orchestration::acceptance::FindingRepairDecision::Stop {
+                    repeated_identities,
+                    ..
+                } = repair
+                {
+                    let (changed_files, apply_revision, remediation_evidence) =
+                        crate::orchestration::acceptance::collect_repair_gate_inputs(
+                            workspace_path,
+                            change_id,
+                            previous
+                                .as_ref()
+                                .and_then(|context| context.fail_revision.as_deref()),
+                        )
+                        .await;
+                    let stop = crate::orchestration::acceptance::repeated_finding_stop(
+                        change_id,
+                        &findings,
+                        &repair_ledger,
+                        repeated_identities,
+                        previous
+                            .as_ref()
+                            .and_then(|context| context.fail_revision.as_deref()),
+                        apply_revision.as_deref(),
+                        &changed_files,
+                        &remediation_evidence,
+                    );
+                    // The stop holds the change for the rest of this run so no
+                    // second automatic repair Apply is dispatched; only an
+                    // explicit operator retry releases the budget.
+                    return self.hold_repair_stop(change_id, stop.summary());
+                }
+                // The repair opportunity for these identities is consumed now,
+                // so the next FAIL that still reports one of them stops.
+                repair_ledger.record_repair_dispatched(&identities);
+                self.set_acceptance_retry_context(
+                    change_id,
+                    AcceptanceRetryContext {
+                        repair_ledger,
+                        ..retry.clone()
+                    },
+                );
                 if let AcceptanceRetryDecision::Stall {
                     reason,
                     external_blockers,
@@ -1230,7 +1420,9 @@ impl SerialRunService {
                     // judgements, not reviewer-validated external blockers. They
                     // carry no explicit category, so they must not fabricate one
                     // or create a durable hold; they stop and require explicit
-                    // retry. Parallel dispatch makes the identical decision.
+                    // retry. Parallel dispatch makes the identical decision, and
+                    // the in-run hold is what keeps "explicit retry is required"
+                    // true instead of falling back into another automatic apply.
                     let error = format!(
                         "Acceptance stopped retrying {change_id} ({reason}). External blocker \
                          context: {}. Explicit retry is required.",
@@ -1240,12 +1432,11 @@ impl SerialRunService {
                             external_blockers.join(" | ")
                         }
                     );
-                    error!("{error}");
-                    return ChangeProcessResult::AcceptanceCommandFailed { error };
+                    return self.hold_repair_stop(change_id, error);
                 }
                 let blocking_gate_context = findings
                     .first()
-                    .cloned()
+                    .map(|finding| finding.text().to_string())
                     .unwrap_or_else(|| "no acceptance findings captured".to_string());
                 warn!(
                     "Acceptance failed for {} ({} findings), blocking gate context: {}; will retry apply",
@@ -1383,7 +1574,9 @@ pub enum ChangeProcessResult {
     /// Acceptance test passed
     AcceptancePassed,
     /// Acceptance test failed
-    AcceptanceFailed { findings: Vec<String> },
+    AcceptanceFailed {
+        findings: Vec<crate::acceptance::AcceptanceFinding>,
+    },
     /// Acceptance test command failed
     AcceptanceCommandFailed { error: String },
     /// Acceptance test requires continuation
@@ -1665,15 +1858,27 @@ mod tests {
             .unwrap();
 
         // Repeated findings without progress stop the retry loop and require an
-        // explicit retry. No category is invented, and nothing is written into
-        // the change directory or a generated checkpoint.
+        // explicit retry. The change is held for the rest of the run so no
+        // second automatic repair apply is dispatched. No category is invented,
+        // and nothing is written into the change directory or a generated
+        // checkpoint.
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
-                assert!(error.contains("repeated_acceptance_findings"), "{error}");
-                assert!(error.contains("Explicit retry is required"), "{error}");
+            ChangeProcessResult::Stalled { error } => {
+                assert!(error.contains("repeated_acceptance_finding"), "{error}");
+                assert!(error.contains("retry explicitly"), "{error}");
             }
             other => panic!("expected a retry-exhaustion stop, got {other:?}"),
         }
+        assert!(
+            service.is_stalled(change_id),
+            "a repeated-finding stop must suppress ordinary dispatch"
+        );
+        assert!(
+            service
+                .select_next_change(&[create_test_change(change_id, 0, 1)])
+                .is_none(),
+            "the held change must not be reselected without an explicit retry"
+        );
         assert!(crate::parallel::acceptance_state::parse_blocked_marker(
             temp_dir.path(),
             change_id
@@ -2209,8 +2414,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn serial_acceptance_pass_hands_off_in_memory_without_writing_a_checkpoint() {
+    #[tokio::test]
+    async fn serial_acceptance_pass_hands_off_in_memory_without_writing_a_checkpoint() {
         let temp_dir = TempDir::new().unwrap();
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
@@ -2221,31 +2426,35 @@ mod tests {
                 finding_identities: vec!["repository|old finding|implementation".to_string()],
                 semantic_fingerprint: Some("baseline".to_string()),
                 cycle_count: 1,
+                ..AcceptanceRetryContext::default()
             },
         );
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Pass,
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Pass,
+                || false,
+            )
+            .await;
 
         assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
         assert!(service.acceptance_retry_context("test-change").is_none());
         assert!(!temp_dir.path().join(".cflx/acceptance-state.json").exists());
     }
 
-    #[test]
-    fn serial_repeated_findings_without_progress_stop_before_another_apply() {
+    #[tokio::test]
+    async fn serial_repeated_findings_without_progress_stop_before_another_apply() {
         use crate::orchestration::acceptance::normalize_findings;
 
         let temp_dir = TempDir::new().unwrap();
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
-        let findings = vec!["src/lib.rs:10 missing regression coverage".to_string()];
+        let findings =
+            crate::acceptance::legacy_findings(["src/lib.rs:10 missing regression coverage"]);
         let fingerprint = semantic_progress_fingerprint(temp_dir.path()).unwrap();
         service.set_acceptance_retry_context(
             "test-change",
@@ -2256,20 +2465,23 @@ mod tests {
                     .collect(),
                 semantic_fingerprint: Some(fingerprint),
                 cycle_count: 1,
+                ..AcceptanceRetryContext::default()
             },
         );
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail { findings },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail { findings },
+                || false,
+            )
+            .await;
 
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
-                assert!(error.contains("repeated_acceptance_findings"), "{error}");
+            ChangeProcessResult::Stalled { error } => {
+                assert!(error.contains("repeated_acceptance_finding"), "{error}");
             }
             other => panic!("expected a retry-exhaustion stop, got {other:?}"),
         }
@@ -2281,28 +2493,32 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn serial_external_only_failure_stops_without_a_durable_hold() {
+    #[tokio::test]
+    async fn serial_external_only_failure_stops_without_a_durable_hold() {
         let temp_dir = TempDir::new().unwrap();
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: vec!["external non-mockable prerequisite unavailable".to_string()],
-            },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec!["external non-mockable prerequisite unavailable"
+                        .to_string()
+                        .into()],
+                },
+                || false,
+            )
+            .await;
 
         // External-only FAIL findings are not a validated structured blocker: the
         // reviewer supplied no explicit category, evidence contract, or next
         // action. The loop stops without fabricating a durable stalled hold.
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+            ChangeProcessResult::Stalled { error } => {
                 assert!(error.contains("external_acceptance_blocker"), "{error}");
                 assert!(
                     error.contains("external non-mockable prerequisite unavailable"),
@@ -2319,8 +2535,8 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn serial_missing_verdict_routes_as_protocol_failure_not_continue() {
+    #[tokio::test]
+    async fn serial_missing_verdict_routes_as_protocol_failure_not_continue() {
         // A completed acceptance command without a canonical verdict must be
         // surfaced as an explicit protocol/command failure with actionable
         // evidence — never as the intentional-CONTINUE retry path.
@@ -2329,15 +2545,20 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::MissingVerdict {
-                findings: vec!["Monitoring verification, will report when complete".to_string()],
-            },
-            || false,
-        );
+        let result =
+            service
+                .process_acceptance_result(
+                    "test-change",
+                    temp_dir.path(),
+                    &agent,
+                    AcceptanceResult::MissingVerdict {
+                        findings: vec![
+                            "Monitoring verification, will report when complete".to_string()
+                        ],
+                    },
+                    || false,
+                )
+                .await;
 
         match result {
             ChangeProcessResult::AcceptanceCommandFailed { error } => {
@@ -2361,8 +2582,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn serial_explicit_continue_still_uses_continue_retry_path() {
+    #[tokio::test]
+    async fn serial_explicit_continue_still_uses_continue_retry_path() {
         // Control: an explicit canonical CONTINUE keeps its intentional
         // continuation routing and configured retry policy.
         let temp_dir = TempDir::new().unwrap();
@@ -2370,13 +2591,15 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Continue,
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Continue,
+                || false,
+            )
+            .await;
 
         assert!(
             matches!(result, ChangeProcessResult::AcceptanceContinue),
@@ -2385,39 +2608,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn serial_cycle_limit_stops_without_a_workspace_marker() {
+    #[tokio::test]
+    async fn serial_cycle_limit_stops_without_a_workspace_marker() {
         use crate::orchestration::acceptance::{normalize_findings, MAX_ACCEPTANCE_RETRY_CYCLES};
 
         let temp_dir = TempDir::new().unwrap();
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
-        let findings = vec!["new finding at ceiling".to_string()];
+        let findings = crate::acceptance::legacy_findings(["new finding at ceiling"]);
         service.set_acceptance_retry_context(
             "test-change",
             AcceptanceRetryContext {
-                finding_identities: normalize_findings(&["older finding".to_string()])
+                finding_identities: normalize_findings(&["older finding".to_string().into()])
                     .into_iter()
                     .map(|finding| finding.identity)
                     .collect(),
                 semantic_fingerprint: Some("previous-progress".to_string()),
                 cycle_count: MAX_ACCEPTANCE_RETRY_CYCLES - 1,
+                ..AcceptanceRetryContext::default()
             },
         );
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail { findings },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail { findings },
+                || false,
+            )
+            .await;
 
         // Cycle exhaustion is a runtime safety ceiling with no reviewer evidence,
         // so it must not synthesize a blocker category or a durable hold.
         match &result {
-            ChangeProcessResult::AcceptanceCommandFailed { error } => {
+            ChangeProcessResult::Stalled { error } => {
                 assert!(
                     error.contains("acceptance_cycle_limit_exhausted"),
                     "{error}"
@@ -2434,8 +2660,8 @@ mod tests {
         .is_none());
     }
 
-    #[test]
-    fn test_process_acceptance_result_archive_readiness_fail_blocks_archive_progression() {
+    #[tokio::test]
+    async fn test_process_acceptance_result_archive_readiness_fail_blocks_archive_progression() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2444,10 +2670,10 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
 
         let agent = AgentRunner::new(OrchestratorConfig::default());
-        let findings = vec![
-            "blocking gate: cargo clippy -- -D warnings".to_string(),
-            "src/orchestration/archive.rs:459".to_string(),
-        ];
+        let findings = crate::acceptance::legacy_findings([
+            "blocking gate: cargo clippy -- -D warnings",
+            "src/orchestration/archive.rs:459",
+        ]);
         let change_dir = temp_dir
             .path()
             .join("openspec")
@@ -2460,15 +2686,17 @@ mod tests {
         )
         .unwrap();
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: findings.clone(),
-            },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: findings.clone(),
+                },
+                || false,
+            )
+            .await;
 
         assert!(matches!(
             result,
@@ -2477,8 +2705,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn serial_latest_fail_reconciles_completed_findings_with_parallel_parity() {
+    #[tokio::test]
+    async fn serial_latest_fail_reconciles_completed_findings_with_parallel_parity() {
         let temp_dir = TempDir::new().unwrap();
         let change_id = "test-change";
         let change_dir = temp_dir
@@ -2496,20 +2724,22 @@ mod tests {
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
-        let findings = vec![
-            "[SAME_FINDING] defect still present with new evidence".to_string(),
-            "[NEW_FINDING] distinct newly reported defect".to_string(),
-        ];
+        let findings = crate::acceptance::legacy_findings([
+            "[SAME_FINDING] defect still present with new evidence",
+            "[NEW_FINDING] distinct newly reported defect",
+        ]);
 
-        let result = service.process_acceptance_result(
-            change_id,
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: findings.clone(),
-            },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                change_id,
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: findings.clone(),
+                },
+                || false,
+            )
+            .await;
 
         assert!(matches!(
             result,
@@ -2527,8 +2757,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn acceptance_fail_uses_recorded_attempt_number_for_follow_up() {
+    #[tokio::test]
+    async fn acceptance_fail_uses_recorded_attempt_number_for_follow_up() {
         use crate::agent::AgentRunner;
         use crate::history::AcceptanceAttempt;
         use crate::orchestration::AcceptanceResult;
@@ -2544,7 +2774,7 @@ mod tests {
                 attempt: 1,
                 passed: false,
                 duration: Duration::from_secs(1),
-                findings: Some(vec!["first".to_string()]),
+                findings: Some(vec!["first".to_string().into()]),
                 exit_code: Some(0),
                 stdout_tail: None,
                 stderr_tail: None,
@@ -2557,7 +2787,7 @@ mod tests {
                 attempt: 2,
                 passed: false,
                 duration: Duration::from_secs(1),
-                findings: Some(vec!["second".to_string()]),
+                findings: Some(vec!["second".to_string().into()]),
                 exit_code: Some(0),
                 stdout_tail: None,
                 stderr_tail: None,
@@ -2572,15 +2802,17 @@ mod tests {
         std::fs::create_dir_all(&change_dir).unwrap();
         std::fs::write(change_dir.join("tasks.md"), "- [x] done\n").unwrap();
 
-        service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: vec!["canonical second".to_string()],
-            },
-            || false,
-        );
+        service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec!["canonical second".to_string().into()],
+                },
+                || false,
+            )
+            .await;
 
         let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
         assert!(content.contains("## Current Acceptance Follow-up"));
@@ -2591,8 +2823,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_process_acceptance_result_fail_uses_archive_tasks_fallback_when_active_missing() {
+    #[tokio::test]
+    async fn test_process_acceptance_result_fail_uses_archive_tasks_fallback_when_active_missing() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2614,16 +2846,18 @@ mod tests {
         )
         .unwrap();
 
-        let findings = vec!["archive fallback finding".to_string()];
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: findings.clone(),
-            },
-            || false,
-        );
+        let findings = crate::acceptance::legacy_findings(["archive fallback finding"]);
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: findings.clone(),
+                },
+                || false,
+            )
+            .await;
 
         assert!(matches!(
             result,
@@ -2637,8 +2871,8 @@ mod tests {
         assert!(content.contains("- [ ] archive fallback finding"));
     }
 
-    #[test]
-    fn test_process_acceptance_result_fail_degrades_when_no_tasks_path_available() {
+    #[tokio::test]
+    async fn test_process_acceptance_result_fail_degrades_when_no_tasks_path_available() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2646,17 +2880,19 @@ mod tests {
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
-        let findings = vec!["missing tasks path finding".to_string()];
+        let findings = crate::acceptance::legacy_findings(["missing tasks path finding"]);
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: findings.clone(),
-            },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: findings.clone(),
+                },
+                || false,
+            )
+            .await;
 
         assert!(matches!(
             result,
@@ -2665,8 +2901,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn acceptance_pass_clears_runtime_follow_up() {
+    #[tokio::test]
+    async fn acceptance_pass_clears_runtime_follow_up() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2686,13 +2922,15 @@ mod tests {
         )
         .unwrap();
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Pass,
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Pass,
+                || false,
+            )
+            .await;
 
         assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
         let content = std::fs::read_to_string(change_dir.join("tasks.md")).unwrap();
@@ -2730,8 +2968,8 @@ mod tests {
         tasks_path
     }
 
-    #[test]
-    fn serial_acceptance_fail_recovers_unknown_follow_up_content_and_keeps_retrying() {
+    #[tokio::test]
+    async fn serial_acceptance_fail_recovers_unknown_follow_up_content_and_keeps_retrying() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2741,15 +2979,17 @@ mod tests {
         let agent = AgentRunner::new(OrchestratorConfig::default());
         let tasks_path = seed_serial_tasks(&temp_dir, DRIFTED_TASKS_MD);
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Fail {
-                findings: vec!["latest finding".to_string()],
-            },
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec!["latest finding".to_string().into()],
+                },
+                || false,
+            )
+            .await;
 
         // The workflow continues on the acceptance verdict instead of terminating.
         assert!(matches!(
@@ -2768,8 +3008,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn serial_acceptance_pass_cleanup_retains_recovered_notes() {
+    #[tokio::test]
+    async fn serial_acceptance_pass_cleanup_retains_recovered_notes() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2779,13 +3019,15 @@ mod tests {
         let agent = AgentRunner::new(OrchestratorConfig::default());
         let tasks_path = seed_serial_tasks(&temp_dir, DRIFTED_TASKS_MD);
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Pass,
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Pass,
+                || false,
+            )
+            .await;
 
         assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
         let content = std::fs::read_to_string(&tasks_path).unwrap();
@@ -2794,8 +3036,8 @@ mod tests {
         assert!(content.contains(DRIFTED_PAYLOAD));
     }
 
-    #[test]
-    fn serial_acceptance_pass_reports_hard_error_for_ambiguous_boundary() {
+    #[tokio::test]
+    async fn serial_acceptance_pass_reports_hard_error_for_ambiguous_boundary() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2814,13 +3056,15 @@ mod tests {
         let agent = AgentRunner::new(OrchestratorConfig::default());
         let tasks_path = seed_serial_tasks(&temp_dir, ambiguous);
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Pass,
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Pass,
+                || false,
+            )
+            .await;
 
         match result {
             ChangeProcessResult::AcceptanceCommandFailed { error } => {
@@ -2831,8 +3075,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&tasks_path).unwrap(), ambiguous);
     }
 
-    #[test]
-    fn test_process_acceptance_result_archive_readiness_pass_allows_archive_progression() {
+    #[tokio::test]
+    async fn test_process_acceptance_result_archive_readiness_pass_allows_archive_progression() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2842,21 +3086,23 @@ mod tests {
 
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let result = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Pass,
-            || false,
-        );
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Pass,
+                || false,
+            )
+            .await;
 
         assert!(matches!(result, ChangeProcessResult::AcceptancePassed));
     }
 
     /// Bare and validated blocker results must never touch the change directory
     /// in serial mode, and a bare token must not be reported as a stalled hold.
-    #[test]
-    fn serial_blocker_results_create_no_change_directory_artifact() {
+    #[tokio::test]
+    async fn serial_blocker_results_create_no_change_directory_artifact() {
         use crate::agent::AgentRunner;
         use crate::orchestration::AcceptanceResult;
 
@@ -2865,15 +3111,17 @@ mod tests {
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
         let agent = AgentRunner::new(OrchestratorConfig::default());
 
-        let bare = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::BareBlocker {
-                rejection: crate::acceptance::BlockerRejection::Missing,
-            },
-            || false,
-        );
+        let bare = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::BareBlocker {
+                    rejection: crate::acceptance::BlockerRejection::Missing,
+                },
+                || false,
+            )
+            .await;
         match &bare {
             ChangeProcessResult::AcceptanceCommandFailed { error } => {
                 assert!(error.contains("bare-blocker protocol failure"), "{error}");
@@ -2886,22 +3134,24 @@ mod tests {
             "bare blocker input must never present as a stalled hold"
         );
 
-        let stalled = service.process_acceptance_result(
-            "test-change",
-            temp_dir.path(),
-            &agent,
-            AcceptanceResult::Stalled {
-                blocker: crate::acceptance::AcceptanceBlocker {
-                    category: "external_service".to_string(),
-                    evidence: vec!["registry returned 503".to_string()],
-                    next_action: "wait for the registry then retry acceptance".to_string(),
-                    resumable: true,
-                    prerequisite_owner: None,
-                    evidence_ids: Vec::new(),
+        let stalled = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Stalled {
+                    blocker: crate::acceptance::AcceptanceBlocker {
+                        category: "external_service".to_string(),
+                        evidence: vec!["registry returned 503".to_string()],
+                        next_action: "wait for the registry then retry acceptance".to_string(),
+                        resumable: true,
+                        prerequisite_owner: None,
+                        evidence_ids: Vec::new(),
+                    },
                 },
-            },
-            || false,
-        );
+                || false,
+            )
+            .await;
         match &stalled {
             ChangeProcessResult::Stalled { error } => {
                 assert!(error.starts_with("external_service:"), "{error}");
@@ -3298,6 +3548,7 @@ mod tests {
                 finding_identities: vec!["external|job 42|verification".to_string()],
                 semantic_fingerprint: Some("baseline".to_string()),
                 cycle_count: 2,
+                ..AcceptanceRetryContext::default()
             },
             "no_semantic_progress",
             &["verification job 42".to_string()],
@@ -3560,5 +3811,856 @@ mod tests {
         // Verify 'b' is marked as stalled
         assert!(service.is_stalled("b"));
         assert!(!service.is_stalled("a"));
+    }
+    // --- Actionable finding contract: serial wiring ---
+
+    fn structured_finding(
+        id: &str,
+        implementation: &str,
+        verification: &str,
+    ) -> crate::acceptance::AcceptanceFinding {
+        crate::acceptance::AcceptanceFinding::structured(crate::acceptance::RepositoryFinding {
+            id: id.to_string(),
+            severity: crate::acceptance::FindingSeverity::Minor,
+            summary: "Challenge and proof leakage is not tested by value".to_string(),
+            evidence: vec!["relay exposes counts but not issued values".to_string()],
+            required_changes: vec![crate::acceptance::FindingFileExpectation {
+                file: implementation.to_string(),
+                description: "Expose issued challenge and presented proof values".to_string(),
+            }],
+            verification: vec![crate::acceptance::FindingFileExpectation {
+                file: verification.to_string(),
+                description: "Assert recorded values are absent from audit output".to_string(),
+            }],
+        })
+    }
+
+    fn secret_value_finding() -> crate::acceptance::AcceptanceFinding {
+        structured_finding(
+            "acceptance-secret-value-scan",
+            "tests/support/relay.ts",
+            "runtime/recovery.integration.test.ts",
+        )
+    }
+
+    fn change_with_tasks(temp_dir: &TempDir, change_id: &str) {
+        let change_dir = temp_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [x] Task 1\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn serial_detailed_finding_survives_the_checkpoint_into_the_apply_prompt() {
+        // Regression shape: a detailed secret-value verification finding must not
+        // be reduced to a `repository|path|verification` prompt.
+        let temp_dir = TempDir::new().unwrap();
+        change_with_tasks(&temp_dir, "test-change");
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let mut agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let result = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec![secret_value_finding()],
+                },
+                || false,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+
+        // Seeding the next apply goes through the same path production uses.
+        service.seed_active_run_acceptance_history("test-change", &mut agent);
+        let prompt_context = agent.get_acceptance_tail_context_for_apply("test-change");
+
+        assert!(
+            prompt_context.contains("Expose issued challenge and presented proof values"),
+            "{prompt_context}"
+        );
+        assert!(
+            prompt_context.contains("runtime/recovery.integration.test.ts"),
+            "{prompt_context}"
+        );
+        assert!(
+            prompt_context.contains("relay exposes counts but not issued values"),
+            "{prompt_context}"
+        );
+        assert!(
+            !prompt_context.contains("repository|id|acceptance-secret-value-scan"),
+            "the compact identity must never replace repair detail: {prompt_context}"
+        );
+
+        // Identity and fingerprint are still tracked, in their own fields.
+        let context = service.acceptance_retry_context("test-change").unwrap();
+        assert_eq!(
+            context.finding_identities,
+            ["repository|id|acceptance-secret-value-scan"]
+        );
+        assert_eq!(context.latest_findings(), [secret_value_finding()]);
+    }
+
+    #[tokio::test]
+    async fn serial_repeated_structured_id_stops_before_a_second_repair_apply() {
+        let temp_dir = TempDir::new().unwrap();
+        change_with_tasks(&temp_dir, "test-change");
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        let first = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec![secret_value_finding()],
+                },
+                || false,
+            )
+            .await;
+        assert!(matches!(
+            first,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+
+        // Unrelated repository progress happened, and the finding was restated
+        // with different prose, evidence, and a different cited path.
+        std::fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+        std::fs::write(temp_dir.path().join("src/unrelated.rs"), "// new comment\n").unwrap();
+        let restated = crate::acceptance::AcceptanceFinding::structured(
+            crate::acceptance::RepositoryFinding {
+                id: "acceptance-secret-value-scan".to_string(),
+                severity: crate::acceptance::FindingSeverity::Major,
+                summary: "Rewritten summary".to_string(),
+                evidence: vec!["different evidence at src/other.rs:99".to_string()],
+                required_changes: vec![crate::acceptance::FindingFileExpectation {
+                    file: "src/other.rs".to_string(),
+                    description: "different change".to_string(),
+                }],
+                verification: vec![crate::acceptance::FindingFileExpectation {
+                    file: "tests/other.rs".to_string(),
+                    description: "different proof".to_string(),
+                }],
+            },
+        );
+
+        let second = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec![restated],
+                },
+                || false,
+            )
+            .await;
+
+        let ChangeProcessResult::Stalled { error } = &second else {
+            panic!("expected a repeated-finding stop, got {second:?}");
+        };
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(
+            error.contains("acceptance-secret-value-scan"),
+            "the repeated ID is the stop reason: {error}"
+        );
+        assert!(error.contains("\"resumable\":true"), "{error}");
+        assert!(
+            error.contains("\"proves_acceptance_pass\":false"),
+            "{error}"
+        );
+        // No durable hold, no worktree marker.
+        assert!(crate::parallel::acceptance_state::parse_blocked_marker(
+            temp_dir.path(),
+            "test-change"
+        )
+        .unwrap()
+        .is_none());
+        assert!(!temp_dir.path().join(".cflx/acceptance-state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn serial_new_finding_id_receives_its_own_repair_opportunity() {
+        let temp_dir = TempDir::new().unwrap();
+        change_with_tasks(&temp_dir, "test-change");
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        for findings in [
+            vec![secret_value_finding()],
+            vec![structured_finding(
+                "acceptance-new-defect",
+                "src/new.rs",
+                "tests/new.rs",
+            )],
+        ] {
+            let result = service
+                .process_acceptance_result(
+                    "test-change",
+                    temp_dir.path(),
+                    &agent,
+                    AcceptanceResult::Fail { findings },
+                    || false,
+                )
+                .await;
+            assert!(
+                matches!(result, ChangeProcessResult::AcceptanceFailed { .. }),
+                "a genuinely new ID keeps its own repair opportunity, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_mixed_repeated_and_new_ids_stop_atomically_with_all_findings_retained() {
+        let temp_dir = TempDir::new().unwrap();
+        change_with_tasks(&temp_dir, "test-change");
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        let agent = AgentRunner::new(OrchestratorConfig::default());
+
+        service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec![secret_value_finding()],
+                },
+                || false,
+            )
+            .await;
+
+        let mixed = service
+            .process_acceptance_result(
+                "test-change",
+                temp_dir.path(),
+                &agent,
+                AcceptanceResult::Fail {
+                    findings: vec![
+                        secret_value_finding(),
+                        structured_finding("acceptance-new-defect", "src/new.rs", "tests/new.rs"),
+                    ],
+                },
+                || false,
+            )
+            .await;
+
+        let ChangeProcessResult::Stalled { error } = &mixed else {
+            panic!("a mixed payload with a repeated ID must stop, got {mixed:?}");
+        };
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(
+            error.contains("acceptance-new-defect"),
+            "every finding is retained: {error}"
+        );
+        assert!(error.contains("acceptance-secret-value-scan"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn serial_calibration_only_repair_stops_before_invoking_acceptance() {
+        let temp_dir = TempDir::new().unwrap();
+        change_with_tasks(&temp_dir, "test-change");
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        service.set_acceptance_retry_context(
+            "test-change",
+            AcceptanceRetryContext {
+                findings: vec![secret_value_finding()],
+                fail_revision: None,
+                ..AcceptanceRetryContext::default()
+            },
+        );
+
+        // No declared file was touched, so coverage cannot authorize another
+        // acceptance invocation.
+        let error = service
+            .check_repair_coverage("test-change", temp_dir.path())
+            .await
+            .expect("missing declared coverage must hold");
+
+        assert!(error.contains("acceptance_remediation_mismatch"), "{error}");
+        assert!(error.contains("tests/support/relay.ts"), "{error}");
+        assert!(
+            error.contains("runtime/recovery.integration.test.ts"),
+            "{error}"
+        );
+        assert!(error.contains("\"coverage_complete\":false"), "{error}");
+        assert!(error.contains("\"resumable\":true"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn serial_legacy_findings_have_no_declared_paths_and_pass_the_coverage_gate() {
+        let temp_dir = TempDir::new().unwrap();
+        change_with_tasks(&temp_dir, "test-change");
+        let mut service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
+        service.set_acceptance_retry_context(
+            "test-change",
+            AcceptanceRetryContext {
+                findings: crate::acceptance::legacy_findings(["src/a.rs:10 missing coverage"]),
+                ..AcceptanceRetryContext::default()
+            },
+        );
+
+        assert!(service
+            .check_repair_coverage("test-change", temp_dir.path())
+            .await
+            .is_none());
+    }
+
+    // --- Repair loop through the real serial cycle ---
+    //
+    // These drive `process_change` end to end with scripted apply and
+    // acceptance commands, so the gate placement, the run-scoped hold, and the
+    // bounded protocol budget are observed where production actually calls
+    // them instead of by invoking the shared decision APIs directly.
+
+    /// Fake acceptance command that emits the recorded verdict for invocation
+    /// `n` (falling back to the last recorded verdict) and counts invocations.
+    ///
+    /// Verdicts are read from files so JSON quoting survives the shell round
+    /// trip intact. `apply_extra` is an additional shell fragment the apply
+    /// command runs after completing every open task, which is how a scripted
+    /// repair chooses whether it touches the declared files or not.
+    fn serial_scripted_cycle_config(
+        change_id: &str,
+        state_dir: &std::path::Path,
+        verdicts: &[String],
+        apply_extra: &str,
+    ) -> OrchestratorConfig {
+        let verdict_dir = state_dir.join("verdicts");
+        std::fs::create_dir_all(&verdict_dir).unwrap();
+        for (index, verdict) in verdicts.iter().enumerate() {
+            std::fs::write(
+                verdict_dir.join(format!("verdict-{}.json", index + 1)),
+                verdict,
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            verdict_dir.join("verdict-last.json"),
+            verdicts.last().expect("at least one verdict"),
+        )
+        .unwrap();
+
+        let acceptance_counter = state_dir.join("acceptance-attempts").display().to_string();
+        let apply_counter = state_dir.join("apply-attempts").display().to_string();
+        let verdict_dir = verdict_dir.display().to_string();
+
+        OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'n=$(cat \"{apply_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"{apply_counter}\"; \
+                 sed \"s/- \\[ \\]/- [x]/g\" openspec/changes/{change_id}/tasks.md \
+                 > openspec/changes/{change_id}/tasks.next \
+                 && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md; \
+                 {apply_extra}'"
+            )),
+            acceptance_command: Some(format!(
+                "sh -c 'n=$(cat \"{acceptance_counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+                 echo $n > \"{acceptance_counter}\"; \
+                 verdict=\"{verdict_dir}/verdict-$n.json\"; \
+                 [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; \
+                 cat \"$verdict\"'"
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn serial_invocations(state_dir: &std::path::Path, counter: &str) -> u32 {
+        std::fs::read_to_string(state_dir.join(counter))
+            .map(|text| text.trim().parse().unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    /// One structured FAIL verdict as the acceptance command would print it.
+    fn structured_fail_verdict(id: &str, implementation: &str, verification: &str) -> String {
+        serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": id,
+                "severity": "major",
+                "summary": "Issued values are never asserted by value",
+                "evidence": [format!("{implementation} records counts only")],
+                "required_changes": [{
+                    "file": implementation,
+                    "description": "Expose issued challenge and presented proof values",
+                }],
+                "verification": [{
+                    "file": verification,
+                    "description": "Assert recorded values are absent from audit output",
+                }],
+            }],
+        })
+        .to_string()
+    }
+
+    async fn run_serial_cycle(
+        service: &mut SerialRunService,
+        agent: &mut AgentRunner,
+        ai_runner: &AiCommandRunner,
+        repo_root: &std::path::Path,
+        change_id: &str,
+    ) -> ChangeProcessResult {
+        service
+            .process_change(
+                &create_test_change(change_id, 0, 1),
+                agent,
+                ai_runner,
+                &HookRunner::new(HooksConfig::default(), repo_root),
+                &NullOutputHandler::new(),
+                1,
+                1,
+                || false,
+                || false,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn serial_post_apply_rerun_gates_a_calibration_only_repair_before_acceptance() {
+        // The reported regression: the post-apply acceptance rerun in
+        // `apply_change_internal` reached acceptance without validating the
+        // repair delta, so a calibration-only repair bought another review.
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-mismatch";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[structured_fail_verdict(
+                "acceptance-secret-value-scan",
+                "src/relay.rs",
+                "tests/relay_test.rs",
+            )],
+            // The repair only nudges an unrelated calibration constant.
+            "mkdir -p calibration && echo tweak >> calibration/thresholds.txt",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let first = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(
+            matches!(first, ChangeProcessResult::AcceptanceFailed { .. }),
+            "the first structured FAIL must return to apply, got {first:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            1
+        );
+
+        let second = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::Stalled { error } = &second else {
+            panic!("a calibration-only repair must hold, got {second:?}");
+        };
+        assert!(error.contains("acceptance_remediation_mismatch"), "{error}");
+        assert!(error.contains("src/relay.rs"), "{error}");
+        assert!(error.contains("tests/relay_test.rs"), "{error}");
+        assert!(error.contains("\"coverage_complete\":false"), "{error}");
+        assert!(
+            error.contains("calibration/thresholds.txt"),
+            "the unrelated repair must be reported as a diagnostic: {error}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            1,
+            "the hold must stop before spending a second acceptance invocation"
+        );
+        assert!(
+            serial_invocations(state_dir.path(), "apply-attempts") >= 2,
+            "the repair apply itself must have run before the gate"
+        );
+        assert!(service.is_stalled(change_id));
+        assert!(!temp_dir.path().join(".cflx/acceptance-state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn serial_repeated_finding_holds_dispatch_until_an_explicit_retry() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-repeated";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[structured_fail_verdict(
+                "acceptance-secret-value-scan",
+                "src/relay.rs",
+                "tests/relay_test.rs",
+            )],
+            // The repair covers every declared path, so only the repeated ID —
+            // not missing coverage — can stop the loop.
+            "mkdir -p src tests && echo repair >> src/relay.rs \
+             && echo proof >> tests/relay_test.rs",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let first = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(matches!(
+            first,
+            ChangeProcessResult::AcceptanceFailed { .. }
+        ));
+
+        let second = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        let ChangeProcessResult::Stalled { error } = &second else {
+            panic!("the repeated ID must stop automatic repair, got {second:?}");
+        };
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(error.contains("acceptance-secret-value-scan"), "{error}");
+
+        let apply_after_stop = serial_invocations(state_dir.path(), "apply-attempts");
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            2
+        );
+        assert!(
+            service
+                .select_next_change(&[create_test_change(change_id, 0, 1)])
+                .is_none(),
+            "no second automatic repair apply may be dispatched for a repeated ID"
+        );
+
+        // Explicit operator retry releases the automatic budget while keeping
+        // the occurrence evidence and the open findings.
+        assert!(service
+            .consume_explicit_acceptance_retry(change_id)
+            .await
+            .unwrap());
+        let context = service.acceptance_retry_context(change_id).unwrap();
+        assert_eq!(
+            context
+                .repair_ledger
+                .occurrences("repository|id|acceptance-secret-value-scan"),
+            2,
+            "occurrence evidence survives an explicit retry"
+        );
+        assert!(
+            !context
+                .repair_ledger
+                .has_consumed_repair("repository|id|acceptance-secret-value-scan"),
+            "the explicit retry must release the automatic repair budget"
+        );
+        assert_eq!(context.latest_findings().len(), 1);
+        assert!(!service.is_stalled(change_id));
+        assert!(service
+            .select_next_change(&[create_test_change(change_id, 0, 1)])
+            .is_some());
+
+        let third = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(
+            serial_invocations(state_dir.path(), "apply-attempts") >= apply_after_stop,
+            "the retried cycle may not lose apply work already recorded"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "only the operator-authorized retry reaches acceptance again"
+        );
+        assert!(
+            matches!(third, ChangeProcessResult::AcceptanceFailed { .. }),
+            "the retry grants exactly one more automatic repair opportunity, got {third:?}"
+        );
+
+        // That one authorized opportunity is all it grants: the still-open ID
+        // stops the loop again without another operator retry.
+        let fourth = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        let ChangeProcessResult::Stalled { error } = &fourth else {
+            panic!("the retried budget must be spent after one repair, got {fourth:?}");
+        };
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(service.is_stalled(change_id));
+    }
+
+    #[tokio::test]
+    async fn serial_new_finding_id_gets_a_repair_apply_through_the_real_cycle() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-new-id";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[
+                structured_fail_verdict(
+                    "acceptance-secret-value-scan",
+                    "src/relay.rs",
+                    "tests/relay_test.rs",
+                ),
+                structured_fail_verdict(
+                    "acceptance-audit-gap",
+                    "src/audit.rs",
+                    "tests/audit_test.rs",
+                ),
+                "{\"acceptance\":\"pass\"}".to_string(),
+            ],
+            "mkdir -p src tests && for f in src/relay.rs tests/relay_test.rs src/audit.rs \
+             tests/audit_test.rs; do echo repair >> $f; done",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        for expected in ["fail", "fail"] {
+            let result = run_serial_cycle(
+                &mut service,
+                &mut agent,
+                &ai_runner,
+                temp_dir.path(),
+                change_id,
+            )
+            .await;
+            assert!(
+                matches!(result, ChangeProcessResult::AcceptanceFailed { .. }),
+                "a genuinely new ID keeps its own repair opportunity ({expected}), got {result:?}"
+            );
+        }
+
+        let passed = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+        assert!(
+            matches!(passed, ChangeProcessResult::AcceptancePassed),
+            "acceptance owns closure and may still pass after two repaired IDs, got {passed:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3
+        );
+    }
+
+    /// A malformed structured payload is a bounded protocol error in serial too:
+    /// acceptance is re-invoked for a corrected verdict instead of failing
+    /// immediately with a fabricated "budget spent" diagnostic.
+    #[tokio::test]
+    async fn serial_malformed_structured_finding_retries_then_accepts_a_corrected_verdict() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-malformed";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        // `verification` is missing, so the payload cannot become a path-only
+        // repair instruction.
+        let malformed = serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": "acceptance-secret-value-scan",
+                "severity": "major",
+                "summary": "Issued values are never asserted by value",
+                "evidence": ["relay records counts only"],
+                "required_changes": [{"file": "src/relay.rs", "description": "expose values"}],
+            }],
+        })
+        .to_string();
+
+        let config = serial_scripted_cycle_config(
+            change_id,
+            state_dir.path(),
+            &[
+                malformed.clone(),
+                malformed.clone(),
+                "{\"acceptance\":\"pass\"}".to_string(),
+            ],
+            "true",
+        );
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        assert!(
+            matches!(result, ChangeProcessResult::AcceptancePassed),
+            "the bounded protocol retry must reach the corrected verdict, got {result:?}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "serial must spend the same two protocol retries parallel does"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "apply-attempts"),
+            1,
+            "a malformed payload must never dispatch repair work"
+        );
+    }
+
+    #[tokio::test]
+    async fn serial_malformed_structured_finding_exhaustion_is_terminal() {
+        let temp_dir = TempDir::new().unwrap();
+        let state_dir = TempDir::new().unwrap();
+        let change_id = "serial-malformed-exhausted";
+        init_serial_repo(temp_dir.path(), change_id);
+
+        let malformed = serde_json::json!({
+            "acceptance": "fail",
+            "findings": [{
+                "id": "acceptance-secret-value-scan",
+                "severity": "major",
+                "summary": "Issued values are never asserted by value",
+                "evidence": ["relay records counts only"],
+                "required_changes": [{"file": "src/relay.rs", "description": "expose values"}],
+            }],
+        })
+        .to_string();
+
+        let config =
+            serial_scripted_cycle_config(change_id, state_dir.path(), &[malformed], "true");
+        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = serial_test_ai_runner();
+
+        let result = run_serial_cycle(
+            &mut service,
+            &mut agent,
+            &ai_runner,
+            temp_dir.path(),
+            change_id,
+        )
+        .await;
+
+        let ChangeProcessResult::AcceptanceCommandFailed { error } = &result else {
+            panic!("exhausted protocol retries must be terminal, got {result:?}");
+        };
+        assert!(
+            error.contains("malformed-finding protocol failure"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"),
+            "{error}"
+        );
+        assert_eq!(
+            serial_invocations(state_dir.path(), "acceptance-attempts"),
+            3,
+            "no fourth protocol retry may start"
+        );
+        assert_eq!(serial_invocations(state_dir.path(), "apply-attempts"), 1);
+        assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
+    }
+
+    #[tokio::test]
+    async fn serial_and_parallel_repair_stops_are_equivalent() {
+        // Both modes call the same shared decision API with the same inputs, so
+        // equivalent observations must produce identical stop reasons,
+        // resumability, and diagnostic fields.
+        let findings = [secret_value_finding()];
+        let mut ledger = crate::orchestration::acceptance::FindingRepairLedger::default();
+        let normalized = normalize_findings(&findings);
+        let crate::orchestration::acceptance::FindingRepairDecision::Repair { identities } =
+            ledger.observe_fail(&normalized)
+        else {
+            panic!("first observation must allow one repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+        let crate::orchestration::acceptance::FindingRepairDecision::Stop {
+            repeated_identities,
+            ..
+        } = ledger.observe_fail(&normalized)
+        else {
+            panic!("the repeated ID must stop automatic repair");
+        };
+
+        let build = || {
+            crate::orchestration::acceptance::repeated_finding_stop(
+                "test-change",
+                &findings,
+                &ledger,
+                repeated_identities.clone(),
+                Some("fail-rev"),
+                Some("apply-rev"),
+                &["tests/support/relay.ts".to_string()],
+                &["claimed".to_string()],
+            )
+        };
+        let serial_stop = build();
+        let parallel_stop = build();
+
+        assert_eq!(serial_stop, parallel_stop);
+        assert_eq!(serial_stop.summary(), parallel_stop.summary());
+        assert_eq!(serial_stop.to_json(), parallel_stop.to_json());
+        assert_eq!(
+            serial_stop.reason,
+            crate::orchestration::acceptance::REPEATED_FINDING_REASON
+        );
+        assert!(serial_stop.resumable);
     }
 }
