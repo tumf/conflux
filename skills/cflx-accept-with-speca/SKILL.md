@@ -31,7 +31,9 @@ This skill MUST expose the exact same verdict output interface as `cflx-accept`.
 Primary verdict:
 
 - PASS: `{"acceptance":"pass"}`
-- FAIL: `{"acceptance":"fail","findings":["<evidence>"]}`
+- FAIL: `{"acceptance":"fail","findings":[<finding>, ...]}` — each `<finding>` is
+  either a structured repository finding or a legacy string, exactly as defined by
+  `cflx-accept`.
 - CONTINUE: `{"acceptance":"continue"}`
 - Stalled hold compatibility handoff — requires the structured blocker payload
   defined by `cflx-accept`:

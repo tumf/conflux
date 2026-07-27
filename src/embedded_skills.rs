@@ -345,7 +345,7 @@ mod tests {
             "agent-runtime independent",
             "Runtime-specific entrypoints are adapters",
             "{\"acceptance\":\"pass\"}",
-            "{\"acceptance\":\"fail\",\"findings\":[\"<evidence>\"]}",
+            "{\"acceptance\":\"fail\",\"findings\":[<finding>, ...]}",
             "{\"acceptance\":\"continue\"}",
             "\"acceptance\":\"gated\"",
             "ACCEPTANCE: PASS",
@@ -362,6 +362,51 @@ mod tests {
             !CFLX_ACCEPT_SKILL_MD.contains(".opencode/commands/cflx-accept.md"),
             "cflx-accept SKILL.md must not require runtime-specific command files for its interface"
         );
+
+        // The structured repository-finding contract is portable guidance, not a
+        // runtime implementation detail: reviewers on any agent runtime must be
+        // told how to author a stable ID, declared paths, and both severities.
+        for required in &[
+            "Structured repository finding contract",
+            "\"required_changes\"",
+            "\"verification\"",
+            "stable retry identity",
+            "Reuse the same `id`",
+            "Both block PASS",
+            "automatic repair Apply",
+            "Legacy string findings remain accepted",
+            "remediation claim",
+        ] {
+            assert!(
+                CFLX_ACCEPT_SKILL_MD.contains(required),
+                "cflx-accept SKILL.md must define the structured finding contract: {required}"
+            );
+        }
+        assert!(
+            !CFLX_ACCEPT_SKILL_MD.contains("replay all prior acceptance attempts"),
+            "acceptance guidance must not ask for full-history replay"
+        );
+    }
+
+    #[test]
+    fn test_cflx_apply_skill_defines_the_repair_contract() {
+        for required in &[
+            "ACCEPTANCE REPAIR MODE IS THE PRIMARY SCOPE",
+            "<acceptance_findings_json>",
+            "Completed proposal tasks are constraints, not new work candidates",
+            "SATISFY EVERY DECLARED FILE",
+            "acceptance_remediation_mismatch",
+            "RELATE EVERY EXTRA FILE",
+            "REMEDIATION IS A CLAIM, NOT CLOSURE",
+            "Only a later acceptance review can close a finding",
+            "repeated_acceptance_finding",
+            "`finding:` LINES ARE RUNTIME-OWNED",
+        ] {
+            assert!(
+                CFLX_APPLY_SKILL_MD.contains(required),
+                "cflx-apply SKILL.md must define the repair contract: {required}"
+            );
+        }
         for phrase in ACCEPTANCE_PORTABILITY_FORBIDDEN_PHRASES {
             assert!(
                 !CFLX_ACCEPT_SKILL_MD.contains(phrase),
@@ -386,7 +431,7 @@ mod tests {
             "agent-runtime independent",
             "Runtime-specific entrypoints are adapters",
             "{\"acceptance\":\"pass\"}",
-            "{\"acceptance\":\"fail\",\"findings\":[\"<evidence>\"]}",
+            "{\"acceptance\":\"fail\",\"findings\":[<finding>, ...]}",
             "{\"acceptance\":\"continue\"}",
             "\"acceptance\":\"gated\"",
             "ACCEPTANCE: PASS",

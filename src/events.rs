@@ -1311,4 +1311,137 @@ mod tests {
         assert!(debug_str.contains("test-change"));
         assert!(debug_str.contains("resolve"));
     }
+    /// Operator-facing repair-stop diagnostics must be machine-readable so
+    /// CLI/TUI/event consumers can explain the stop without parsing narrative
+    /// logs — and must never read as completion, PASS, or archive readiness.
+    #[test]
+    fn acceptance_repair_stop_diagnostics_are_structured_and_non_authoritative() {
+        use crate::orchestration::acceptance::{
+            decide_repair_gate, FindingRepairLedger, RepairGateDecision,
+        };
+
+        let finding = crate::acceptance::AcceptanceFinding::structured(
+            crate::acceptance::RepositoryFinding {
+                id: "acceptance-secret-value-scan".to_string(),
+                severity: crate::acceptance::FindingSeverity::Minor,
+                summary: "Challenge and proof leakage is not tested by value".to_string(),
+                evidence: vec!["relay exposes counts but not issued values".to_string()],
+                required_changes: vec![crate::acceptance::FindingFileExpectation {
+                    file: "tests/support/relay.ts".to_string(),
+                    description: "Expose issued challenge and presented proof values".to_string(),
+                }],
+                verification: vec![crate::acceptance::FindingFileExpectation {
+                    file: "runtime/recovery.integration.test.ts".to_string(),
+                    description: "Assert recorded values are absent from audit output".to_string(),
+                }],
+            },
+        );
+
+        let RepairGateDecision::Stop(stop) = decide_repair_gate(
+            "change-a",
+            &[finding],
+            &FindingRepairLedger::default(),
+            Some("fail-rev"),
+            Some("apply-rev"),
+            &["tests/calibration.test.ts".to_string()],
+            &["adjusted calibration threshold".to_string()],
+        ) else {
+            panic!("missing declared coverage must hold");
+        };
+
+        let json = stop.to_json();
+        // Every operator diagnostic the contract requires.
+        assert_eq!(json["change_id"], "change-a");
+        assert_eq!(json["stop_reason"], "acceptance_remediation_mismatch");
+        assert_eq!(json["findings"][0]["id"], "acceptance-secret-value-scan");
+        assert_eq!(json["findings"][0]["severity"], "minor");
+        assert!(json["findings"][0]["evidence"].is_array());
+        assert!(json["findings"][0]["required_changes"].is_array());
+        assert!(json["findings"][0]["verification"].is_array());
+        assert!(json["finding_occurrences"].is_array());
+        assert_eq!(json["fail_revision"], "fail-rev");
+        assert_eq!(json["apply_revision"], "apply-rev");
+        assert_eq!(json["required_files"][0], "tests/support/relay.ts");
+        assert_eq!(
+            json["verification_files"][0],
+            "runtime/recovery.integration.test.ts"
+        );
+        assert_eq!(json["changed_files"][0], "tests/calibration.test.ts");
+        assert_eq!(json["unrelated_files"][0], "tests/calibration.test.ts");
+        assert_eq!(json["coverage_complete"], false);
+        assert!(json["uncovered_files"].as_array().unwrap().len() == 2);
+        assert_eq!(
+            json["remediation_evidence"][0],
+            "adjusted calibration threshold"
+        );
+        assert_eq!(json["resumable"], true);
+        assert!(json["next_action"].as_str().unwrap().contains("retry"));
+
+        // Explicitly not authority for anything the constitution reserves.
+        assert_eq!(json["proves_completion"], false);
+        assert_eq!(json["proves_acceptance_pass"], false);
+        assert_eq!(json["proves_archive_readiness"], false);
+
+        // The one-line summary an operator sees carries the same evidence.
+        let summary = stop.summary();
+        assert!(
+            summary.contains("acceptance_remediation_mismatch"),
+            "{summary}"
+        );
+        assert!(summary.contains("tests/support/relay.ts"), "{summary}");
+    }
+
+    /// A repeated-finding stop keeps occurrence counts so operators can see the
+    /// automatic repair budget was already spent.
+    #[test]
+    fn repeated_finding_diagnostics_report_occurrence_counts() {
+        use crate::orchestration::acceptance::{
+            normalize_findings, repeated_finding_stop, FindingRepairDecision, FindingRepairLedger,
+        };
+
+        let findings = crate::acceptance::legacy_findings(["Missing retry test at src/run.rs:10"]);
+        let normalized = normalize_findings(&findings);
+        let mut ledger = FindingRepairLedger::default();
+        let FindingRepairDecision::Repair { identities } = ledger.observe_fail(&normalized) else {
+            panic!("first observation must allow one repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+        let FindingRepairDecision::Stop {
+            repeated_identities,
+            ..
+        } = ledger.observe_fail(&normalized)
+        else {
+            panic!("the repeated identity must stop automatic repair");
+        };
+
+        let json = repeated_finding_stop(
+            "change-a",
+            &findings,
+            &ledger,
+            repeated_identities,
+            Some("fail-rev"),
+            Some("apply-rev"),
+            &["src/run.rs".to_string()],
+            &[],
+        )
+        .to_json();
+
+        assert_eq!(json["stop_reason"], "repeated_acceptance_finding");
+        assert_eq!(
+            json["finding_occurrences"][0]["identity"],
+            "repository|src/run.rs|verification"
+        );
+        assert_eq!(json["finding_occurrences"][0]["occurrences"], 2);
+        assert_eq!(
+            json["repeated_identities"][0],
+            "repository|src/run.rs|verification"
+        );
+        assert_eq!(json["resumable"], true);
+        // A legacy finding declares no path set, so it is reported as such rather
+        // than being held to strict coverage.
+        assert_eq!(
+            json["legacy_findings_without_declared_paths"][0],
+            "Missing retry test at src/run.rs:10"
+        );
+    }
 }

@@ -143,7 +143,9 @@ mod tests {
                 fresh.previous_identities(),
                 fresh.previous_fingerprint(),
                 &crate::orchestration::acceptance::normalize_findings(&[
-                    "src/lib.rs:1 missing regression coverage".to_string(),
+                    "src/lib.rs:1 missing regression coverage"
+                        .to_string()
+                        .into(),
                 ]),
                 "fingerprint",
                 1,
@@ -157,7 +159,9 @@ mod tests {
     #[test]
     fn acceptance_retry_context_stalls_only_on_repeated_in_run_findings() {
         let findings = crate::orchestration::acceptance::normalize_findings(&[
-            "src/lib.rs:1 missing regression coverage".to_string(),
+            "src/lib.rs:1 missing regression coverage"
+                .to_string()
+                .into(),
         ]);
         let previous = AcceptanceRetryContext {
             finding_identities: findings
@@ -166,6 +170,7 @@ mod tests {
                 .collect(),
             semantic_fingerprint: Some("fingerprint".to_string()),
             cycle_count: 1,
+            ..AcceptanceRetryContext::default()
         };
 
         assert!(matches!(
@@ -360,8 +365,12 @@ mod tests {
             &tasks_path,
             2,
             &[
-                "[SAME_FINDING] defect still present with new evidence".to_string(),
-                "[NEW_FINDING] distinct newly reported defect".to_string(),
+                "[SAME_FINDING] defect still present with new evidence"
+                    .to_string()
+                    .into(),
+                "[NEW_FINDING] distinct newly reported defect"
+                    .to_string()
+                    .into(),
             ],
         )
         .unwrap();
@@ -443,6 +452,227 @@ mod tests {
         assert_eq!(candidate.completed_tasks, 1);
         assert_eq!(candidate.total_tasks, 1);
         assert!(candidate.metadata.change_type.as_deref() == Some("implementation"));
+    }
+
+    // --- Actionable finding contract: parallel wiring ---
+
+    fn structured_finding(
+        id: &str,
+        implementation: &str,
+        verification: &str,
+    ) -> crate::acceptance::AcceptanceFinding {
+        crate::acceptance::AcceptanceFinding::structured(crate::acceptance::RepositoryFinding {
+            id: id.to_string(),
+            severity: crate::acceptance::FindingSeverity::Minor,
+            summary: "Challenge and proof leakage is not tested by value".to_string(),
+            evidence: vec!["relay exposes counts but not issued values".to_string()],
+            required_changes: vec![crate::acceptance::FindingFileExpectation {
+                file: implementation.to_string(),
+                description: "Expose issued challenge and presented proof values".to_string(),
+            }],
+            verification: vec![crate::acceptance::FindingFileExpectation {
+                file: verification.to_string(),
+                description: "Assert recorded values are absent from audit output".to_string(),
+            }],
+        })
+    }
+
+    fn secret_value_finding() -> crate::acceptance::AcceptanceFinding {
+        structured_finding(
+            "acceptance-secret-value-scan",
+            "tests/support/relay.ts",
+            "runtime/recovery.integration.test.ts",
+        )
+    }
+
+    #[test]
+    fn parallel_retry_checkpoint_preserves_the_payload_for_the_next_apply() {
+        // Mirrors the ordering dispatch uses: the executor records the complete
+        // payload, then dispatch records comparison state. The payload must
+        // survive, so the next apply prompt still carries the required change.
+        let mut shared_history = crate::history::AcceptanceHistory::new();
+        shared_history.set_follow_up_findings("change-a", 1, vec![secret_value_finding()]);
+
+        let retry = AcceptanceRetryContext {
+            finding_identities: vec!["repository|id|acceptance-secret-value-scan".to_string()],
+            semantic_fingerprint: Some("fingerprint".to_string()),
+            cycle_count: 1,
+            findings: vec![secret_value_finding()],
+            ..AcceptanceRetryContext::default()
+        };
+        shared_history.set_retry_checkpoint(
+            "change-a",
+            retry.cycle_count,
+            retry.finding_identities.clone(),
+            retry.semantic_fingerprint.clone(),
+        );
+
+        let mut agent =
+            crate::agent::AgentRunner::new(crate::config::OrchestratorConfig::default());
+        agent.seed_acceptance_history(shared_history);
+        let prompt_context = agent.get_acceptance_tail_context_for_apply("change-a");
+
+        assert!(
+            prompt_context.contains("Expose issued challenge and presented proof values"),
+            "{prompt_context}"
+        );
+        assert!(
+            prompt_context.contains("runtime/recovery.integration.test.ts"),
+            "{prompt_context}"
+        );
+        assert!(
+            !prompt_context.contains("repository|id|acceptance-secret-value-scan"),
+            "{prompt_context}"
+        );
+    }
+
+    #[test]
+    fn parallel_repeated_structured_id_stops_before_a_second_repair_apply() {
+        let mut retry = AcceptanceRetryContext::default();
+        let findings = [secret_value_finding()];
+        let normalized = crate::orchestration::acceptance::normalize_findings(&findings);
+
+        let crate::orchestration::acceptance::FindingRepairDecision::Repair { identities } =
+            retry.repair_ledger.observe_fail(&normalized)
+        else {
+            panic!("first observation must allow one repair");
+        };
+        retry.repair_ledger.record_repair_dispatched(&identities);
+
+        // Unrelated semantic progress plus rewritten prose for the same defect.
+        let restated = crate::acceptance::AcceptanceFinding::structured(
+            crate::acceptance::RepositoryFinding {
+                id: "acceptance-secret-value-scan".to_string(),
+                severity: crate::acceptance::FindingSeverity::Major,
+                summary: "Rewritten summary".to_string(),
+                evidence: vec!["different evidence at src/other.rs:99".to_string()],
+                required_changes: vec![crate::acceptance::FindingFileExpectation {
+                    file: "src/other.rs".to_string(),
+                    description: "different change".to_string(),
+                }],
+                verification: vec![crate::acceptance::FindingFileExpectation {
+                    file: "tests/other.rs".to_string(),
+                    description: "different proof".to_string(),
+                }],
+            },
+        );
+        let crate::orchestration::acceptance::FindingRepairDecision::Stop {
+            reason,
+            repeated_identities,
+        } = retry.repair_ledger.observe_fail(
+            &crate::orchestration::acceptance::normalize_findings(std::slice::from_ref(&restated)),
+        )
+        else {
+            panic!("a repeated ID must stop automatic repair in parallel too");
+        };
+
+        assert_eq!(
+            reason,
+            crate::orchestration::acceptance::REPEATED_FINDING_REASON
+        );
+        let stop = crate::orchestration::acceptance::repeated_finding_stop(
+            "change-a",
+            std::slice::from_ref(&restated),
+            &retry.repair_ledger,
+            repeated_identities,
+            Some("fail-rev"),
+            Some("apply-rev"),
+            &["src/other.rs".to_string(), "tests/other.rs".to_string()],
+            &[],
+        );
+        let error = stop.summary();
+        assert!(error.contains("repeated_acceptance_finding"), "{error}");
+        assert!(error.contains("acceptance-secret-value-scan"), "{error}");
+        assert!(error.contains("\"resumable\":true"), "{error}");
+    }
+
+    #[test]
+    fn parallel_calibration_only_repair_holds_before_acceptance() {
+        let retry = AcceptanceRetryContext {
+            findings: vec![secret_value_finding()],
+            fail_revision: Some("fail-rev".to_string()),
+            ..AcceptanceRetryContext::default()
+        };
+
+        let crate::orchestration::acceptance::RepairGateDecision::Stop(stop) =
+            crate::orchestration::acceptance::decide_repair_gate(
+                "change-a",
+                &retry.findings,
+                &retry.repair_ledger,
+                retry.fail_revision.as_deref(),
+                Some("apply-rev"),
+                &["tests/calibration.test.ts".to_string()],
+                &["adjusted calibration threshold".to_string()],
+            )
+        else {
+            panic!("calibration-only repair must hold before acceptance");
+        };
+
+        assert_eq!(
+            stop.reason,
+            crate::orchestration::acceptance::REMEDIATION_MISMATCH_REASON
+        );
+        assert_eq!(stop.coverage.unrelated_files, ["tests/calibration.test.ts"]);
+        assert_eq!(
+            stop.coverage.uncovered(),
+            [
+                "acceptance-secret-value-scan: required_changes tests/support/relay.ts",
+                "acceptance-secret-value-scan: verification runtime/recovery.integration.test.ts",
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_new_finding_id_receives_its_own_repair_opportunity() {
+        let mut retry = AcceptanceRetryContext::default();
+        let first = crate::orchestration::acceptance::normalize_findings(&[secret_value_finding()]);
+        let crate::orchestration::acceptance::FindingRepairDecision::Repair { identities } =
+            retry.repair_ledger.observe_fail(&first)
+        else {
+            panic!("first observation must allow one repair");
+        };
+        retry.repair_ledger.record_repair_dispatched(&identities);
+
+        let second = crate::orchestration::acceptance::normalize_findings(&[structured_finding(
+            "acceptance-new-defect",
+            "src/new.rs",
+            "tests/new.rs",
+        )]);
+        assert!(matches!(
+            retry.repair_ledger.observe_fail(&second),
+            crate::orchestration::acceptance::FindingRepairDecision::Repair { .. }
+        ));
+    }
+
+    #[test]
+    fn parallel_malformed_structured_finding_is_a_bounded_protocol_retry() {
+        // The malformed-finding contract must not consume the missing-verdict or
+        // bare-blocker budgets, and must never dispatch repair work.
+        let mut driver = crate::orchestration::acceptance::AcceptanceProtocolDriver::default();
+        let rejection = crate::acceptance::FindingRejection::MissingId;
+
+        for attempt in 1..=crate::orchestration::acceptance::MAX_ACCEPTANCE_PROTOCOL_RETRIES {
+            let step = driver.observe_malformed_finding(&rejection);
+            let crate::orchestration::acceptance::MissingVerdictRetryStep::Retry { retry, .. } =
+                step
+            else {
+                panic!("retry budget must remain at attempt {attempt}");
+            };
+            assert_eq!(
+                retry.kind,
+                crate::orchestration::acceptance::AcceptanceProtocolError::MalformedFinding
+            );
+        }
+        assert!(matches!(
+            driver.observe_malformed_finding(&rejection),
+            crate::orchestration::acceptance::MissingVerdictRetryStep::Exhausted { .. }
+        ));
+        assert_eq!(driver.consecutive_missing_verdicts(), 0);
+        assert_eq!(driver.consecutive_bare_blockers(), 0);
+
+        // Any canonical verdict resets the malformed-finding sequence too.
+        driver.observe_canonical_verdict();
+        assert_eq!(driver.consecutive_malformed_findings(), 0);
     }
 }
 
@@ -1977,6 +2207,48 @@ impl ParallelExecutor {
                     }
                     Ok((crate::orchestration::AcceptanceResult::Pass, 0))
                 } else {
+                    // Validate the repair delta before spending another
+                    // acceptance invocation. Passing authorizes only the next
+                    // review; it never claims the finding is resolved.
+                    if !acceptance_retry.latest_findings().is_empty() {
+                        let (changed_files, apply_revision, remediation_evidence) =
+                            crate::orchestration::acceptance::collect_repair_gate_inputs(
+                                &workspace.path,
+                                &change_id,
+                                acceptance_retry.fail_revision.as_deref(),
+                            )
+                            .await;
+                        if let crate::orchestration::acceptance::RepairGateDecision::Stop(stop) =
+                            crate::orchestration::acceptance::decide_repair_gate(
+                                &change_id,
+                                acceptance_retry.latest_findings(),
+                                &acceptance_retry.repair_ledger,
+                                acceptance_retry.fail_revision.as_deref(),
+                                apply_revision.as_deref(),
+                                &changed_files,
+                                &remediation_evidence,
+                            )
+                        {
+                            let error = stop.summary();
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::error(error.clone())
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance"),
+                                    ))
+                                    .await;
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult {
+                                change_id,
+                                workspace_name: workspace.name,
+                                final_revision: None,
+                                error: Some(error),
+                                rejected: None,
+                            };
+                        }
+                    }
                     agent.seed_acceptance_history(acceptance_history.lock().await.clone());
                     execute_acceptance_in_workspace(
                         &change_id,
@@ -2129,7 +2401,7 @@ impl ParallelExecutor {
                     )) => {
                         let blocking_gate_context = findings
                             .first()
-                            .cloned()
+                            .map(|finding| finding.text().to_string())
                             .unwrap_or_else(|| "no acceptance findings captured".to_string());
                         warn!(
                             "Acceptance failed for {} ({} findings) (cycle {}), blocking gate context: {}; returning to apply loop",
@@ -2153,14 +2425,69 @@ impl ParallelExecutor {
                             previous.previous_fingerprint(),
                             &normalized, &fingerprint, cycle_count,
                         );
+                        // Per-finding accounting runs before the broad semantic
+                        // comparison so a repeated ID stops automatic repair even
+                        // when unrelated files changed. Serial makes the same call.
+                        let mut repair_ledger = acceptance_retry.repair_ledger.clone();
+                        let repair = repair_ledger.observe_fail(&normalized);
+                        let previous_fail_revision = acceptance_retry.fail_revision.clone();
+                        let fail_revision =
+                            crate::vcs::git::commands::get_current_commit(&workspace.path)
+                                .await
+                                .ok();
+                        if let crate::orchestration::acceptance::FindingRepairDecision::Stop {
+                            repeated_identities,
+                            ..
+                        } = repair
+                        {
+                            let (changed_files, apply_revision, remediation_evidence) =
+                                crate::orchestration::acceptance::collect_repair_gate_inputs(
+                                    &workspace.path,
+                                    &change_id,
+                                    previous_fail_revision.as_deref(),
+                                )
+                                .await;
+                            let stop = crate::orchestration::acceptance::repeated_finding_stop(
+                                &change_id,
+                                &findings,
+                                &repair_ledger,
+                                repeated_identities,
+                                previous_fail_revision.as_deref(),
+                                apply_revision.as_deref(),
+                                &changed_files,
+                                &remediation_evidence,
+                            );
+                            let error = stop.summary();
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::error(error.clone())
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                    ))
+                                    .await;
+                            }
+                            cancel_monitor.abort();
+                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(error), rejected: None };
+                        }
+                        // The repair opportunity for these identities is consumed
+                        // now, so the next FAIL reporting one of them stops.
+                        repair_ledger.record_repair_dispatched(&identities);
                         acceptance_retry = AcceptanceRetryContext {
                             finding_identities: identities.clone(),
                             semantic_fingerprint: Some(fingerprint),
                             cycle_count,
+                            findings: findings.clone(),
+                            repair_ledger,
+                            fail_revision,
                         };
                         {
                             let mut shared_history = acceptance_history.lock().await;
-                            shared_history.set_checkpoint(
+                            // Identities and the semantic baseline are comparison
+                            // state; the complete payload is written separately so
+                            // the checkpoint can never overwrite actionable detail.
+                            shared_history.set_retry_checkpoint(
                                 &change_id,
                                 acceptance_retry.cycle_count,
                                 acceptance_retry.finding_identities.clone(),
@@ -2225,6 +2552,54 @@ impl ParallelExecutor {
                                 .await;
                         }
                         continue;
+                    }
+                    Ok((
+                        crate::orchestration::AcceptanceResult::MalformedFinding { rejection },
+                        acceptance_iteration,
+                    )) => {
+                        // Bounded protocol error: acceptance is re-invoked for a
+                        // corrected verdict. No repair work is dispatched and no
+                        // path-only follow-up is written.
+                        match protocol.observe_malformed_finding(&rejection) {
+                            crate::orchestration::acceptance::MissingVerdictRetryStep::Retry {
+                                progress,
+                                ..
+                            } => {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::info(progress)
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance")
+                                                .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                continue;
+                            }
+                            crate::orchestration::acceptance::MissingVerdictRetryStep::Exhausted {
+                                error,
+                            } => {
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::error(error.clone())
+                                                .with_change_id(&change_id)
+                                                .with_operation("acceptance")
+                                                .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(error),
+                                    rejected: None,
+                                };
+                            }
+                        }
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::PermissionStalled { blocker },

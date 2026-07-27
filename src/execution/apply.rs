@@ -1841,7 +1841,9 @@ mod tests {
                 attempt: 2,
                 passed: false,
                 duration: Duration::from_secs(1),
-                findings: Some(vec!["Investigation incomplete - continue later".to_string()]),
+                findings: Some(vec!["Investigation incomplete - continue later"
+                    .to_string()
+                    .into()]),
                 exit_code: Some(0),
                 stdout_tail: None,
                 stderr_tail: None,
@@ -1878,14 +1880,18 @@ mod tests {
                 attempt: 2,
                 passed: false,
                 duration: Duration::from_secs(1),
-                findings: Some(vec!["fix missing coverage".to_string()]),
+                findings: Some(vec!["fix missing coverage".to_string().into()]),
                 exit_code: Some(0),
                 stdout_tail: None,
                 stderr_tail: None,
                 commit_hash: None,
             },
         );
-        history.set_follow_up_findings("change-a", 2, vec!["fix missing coverage".to_string()]);
+        history.set_follow_up_findings(
+            "change-a",
+            2,
+            vec!["fix missing coverage".to_string().into()],
+        );
         let mut agent = AgentRunner::new(OrchestratorConfig::default());
         agent.seed_acceptance_history(history);
 
@@ -2505,7 +2511,9 @@ mod tests {
         history.set_follow_up_findings(
             change_id,
             2,
-            vec!["missing regression coverage at src/example.rs:10".to_string()],
+            vec!["missing regression coverage at src/example.rs:10"
+                .to_string()
+                .into()],
         );
         let mut agent = AgentRunner::new(config.clone());
         agent.seed_acceptance_history(history);

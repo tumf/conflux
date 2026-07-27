@@ -121,6 +121,35 @@ pub async fn get_changed_files<P: AsRef<Path>>(
         .collect())
 }
 
+/// Files touched since `revision`, including uncommitted and untracked work.
+///
+/// Acceptance remediation coverage has to see the whole repair delta: a repair
+/// Apply may commit, may leave the edit in the working tree, or may add a brand
+/// new test file. `git diff --name-only <revision>` covers committed and
+/// uncommitted tracked edits; untracked files are collected separately.
+pub async fn get_changed_files_since<P: AsRef<Path>>(
+    cwd: P,
+    revision: &str,
+) -> VcsResult<Vec<String>> {
+    let cwd = cwd.as_ref();
+    let mut files = run_git(&["diff", "--name-only", revision], cwd)
+        .await?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(String::from)
+        .collect::<Vec<_>>();
+    files.extend(
+        run_git(&["ls-files", "--others", "--exclude-standard"], cwd)
+            .await?
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(String::from),
+    );
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 /// Check whether the current HEAD commit has no file changes.
 pub async fn is_head_empty_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     let output = run_git(

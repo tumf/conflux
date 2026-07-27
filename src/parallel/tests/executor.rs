@@ -2211,8 +2211,8 @@ async fn test_acceptance_fail_records_follow_up_tasks() {
         &tasks_dir.join("tasks.md"),
         iteration,
         &[
-            "missing regression test".to_string(),
-            "add repo coverage".to_string(),
+            "missing regression test".to_string().into(),
+            "add repo coverage".to_string().into(),
         ],
     )
     .or_fail("unexpected error");
@@ -2269,7 +2269,7 @@ fn parallel_and_serial_follow_up_recovery_produce_identical_files() {
         let recovery = crate::task_parser::replace_acceptance_follow_up_from_latest_fail(
             &tasks_path,
             2,
-            &findings,
+            &crate::acceptance::legacy_findings(findings.clone()),
         )
         .or_fail("recovery succeeds instead of terminating");
         assert_eq!(recovery.recovered_blocks, 1);
@@ -7009,10 +7009,11 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         // A checkpoint left behind by an older Conflux version claims an almost
         // exhausted retry budget for this exact change. Dispatch must ignore it.
         let finding_identity =
-            crate::orchestration::acceptance::normalize_findings(&["repeated finding".to_string()])
-                [0]
-            .identity
-            .clone();
+            crate::orchestration::acceptance::normalize_findings(&["repeated finding"
+                .to_string()
+                .into()])[0]
+                .identity
+                .clone();
         std::fs::create_dir_all(checkpoint_path.parent().or_fail("checkpoint parent"))
             .or_fail("create stale checkpoint dir");
         std::fs::write(
@@ -7080,11 +7081,11 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         .as_deref()
         .or_fail("repeated findings must stop the retry loop with a diagnostic");
     assert!(
-        error.contains("repeated_acceptance_findings"),
+        error.contains("repeated_acceptance_finding"),
         "diagnostic must name the retry judgement: {error}"
     );
     assert!(
-        error.contains("Explicit retry is required"),
+        error.contains("retry explicitly"),
         "diagnostic must state the operator action: {error}"
     );
     assert!(

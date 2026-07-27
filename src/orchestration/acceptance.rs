@@ -56,6 +56,9 @@ pub enum AcceptanceProtocolError {
     /// The command emitted `gated`/legacy `blocked` without a validated
     /// structured blocker payload.
     BareBlocker,
+    /// The command emitted a FAIL verdict whose structured finding payload did
+    /// not validate.
+    MalformedFinding,
 }
 
 impl AcceptanceProtocolError {
@@ -64,9 +67,18 @@ impl AcceptanceProtocolError {
         match self {
             AcceptanceProtocolError::MissingVerdict => "missing-verdict",
             AcceptanceProtocolError::BareBlocker => "bare-blocker",
+            AcceptanceProtocolError::MalformedFinding => "malformed-finding",
         }
     }
 }
+
+/// First history/finding line recorded when acceptance emits a FAIL whose
+/// structured finding payload does not validate.
+pub const MALFORMED_FINDING_DIAGNOSTIC: &str =
+    "Malformed acceptance finding: acceptance emitted a \
+     FAIL verdict with a structured finding that is missing a stable id, severity, summary, \
+     evidence, required_changes, or verification (protocol failure; runtime will not reduce it to \
+     a path-only repair instruction)";
 
 /// Marks an acceptance invocation as a protocol retry so the prompt builder can
 /// inject the corrective continuation context for the specific contract that
@@ -163,6 +175,9 @@ pub fn missing_verdict_retry_progress(
     let cause = match retry.kind {
         AcceptanceProtocolError::MissingVerdict => "without a canonical verdict",
         AcceptanceProtocolError::BareBlocker => "with a gated token but no validated blocker",
+        AcceptanceProtocolError::MalformedFinding => {
+            "with a FAIL verdict whose structured finding did not validate"
+        }
     };
     format!(
         "Acceptance completed {cause}; retrying acceptance \
@@ -199,6 +214,12 @@ pub fn protocol_exhausted_error(
             "Acceptance emitted a gated compatibility token without a validated structured blocker \
              (bare-blocker protocol failure); a stalled hold requires an explicit supported \
              category, concrete evidence, next action, and resumability."
+        }
+        AcceptanceProtocolError::MalformedFinding => {
+            "Acceptance emitted a FAIL verdict whose structured finding did not validate \
+             (malformed-finding protocol failure); a structured finding requires a stable id, a \
+             major/minor severity, a summary, concrete evidence, and repository-relative \
+             required_changes and verification entries."
         }
     };
     format!(
@@ -242,6 +263,7 @@ pub enum MissingVerdictRetryStep {
 pub struct AcceptanceProtocolDriver {
     missing_verdict: ProtocolRetryCounter,
     bare_blocker: ProtocolRetryCounter,
+    malformed_finding: ProtocolRetryCounter,
     pending: Option<AcceptanceProtocolRetry>,
 }
 
@@ -268,7 +290,28 @@ impl AcceptanceProtocolDriver {
     pub fn observe_canonical_verdict(&mut self) {
         self.missing_verdict.reset();
         self.bare_blocker.reset();
+        self.malformed_finding.reset();
         self.pending = None;
+    }
+
+    /// Consecutive malformed structured findings observed so far.
+    pub fn consecutive_malformed_findings(&self) -> u32 {
+        self.malformed_finding.consecutive()
+    }
+
+    /// Record a FAIL verdict whose structured finding payload did not validate.
+    ///
+    /// No repair work is dispatched: the runtime asks for a corrected verdict
+    /// rather than guessing what the reviewer meant.
+    pub fn observe_malformed_finding(
+        &mut self,
+        rejection: &crate::acceptance::FindingRejection,
+    ) -> MissingVerdictRetryStep {
+        let evidence = vec![MALFORMED_FINDING_DIAGNOSTIC.to_string(), rejection.reason()];
+        let decision = self
+            .malformed_finding
+            .record(AcceptanceProtocolError::MalformedFinding);
+        self.step_from(decision, &evidence)
     }
 
     /// Record a completed acceptance command that emitted no canonical verdict
@@ -367,9 +410,19 @@ pub fn decide_acceptance_blocker(
                 }
             })
         }
+        AcceptanceResult::MalformedFinding { rejection } => {
+            Some(match driver.observe_malformed_finding(rejection) {
+                MissingVerdictRetryStep::Retry { retry, progress } => {
+                    AcceptanceBlockerDecision::ProtocolRetry { retry, progress }
+                }
+                MissingVerdictRetryStep::Exhausted { error } => {
+                    AcceptanceBlockerDecision::ProtocolExhausted { error }
+                }
+            })
+        }
         AcceptanceResult::Stalled { blocker } => {
-            // A validated stall is a canonical verdict: it resets both protocol
-            // sequences and follows the durable stalled-hold path.
+            // A validated stall is a canonical verdict: it resets every protocol
+            // sequence and follows the durable stalled-hold path.
             driver.observe_canonical_verdict();
             Some(AcceptanceBlockerDecision::Stall {
                 blocker: blocker.clone(),
@@ -379,14 +432,62 @@ pub fn decide_acceptance_blocker(
     }
 }
 
+/// A finding paired with its compact comparison identity.
+///
+/// `identity` exists purely for retry accounting and reconciliation. `finding`
+/// keeps the complete actionable payload, so nothing downstream has to
+/// reconstruct evidence, required changes, or verification from the identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedFinding {
     pub identity: String,
     pub text: String,
     pub external: bool,
+    pub finding: crate::acceptance::AcceptanceFinding,
 }
 
-pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
+/// Derive comparison identities for a finding list.
+///
+/// A structured finding's identity is its reviewer-authored `id`, so changed
+/// prose, line numbers, evidence, or cited paths cannot manufacture a new
+/// identity. Legacy string findings keep the historical deterministic fallback.
+pub fn normalize_findings(
+    findings: &[crate::acceptance::AcceptanceFinding],
+) -> Vec<NormalizedFinding> {
+    let mut normalized = findings
+        .iter()
+        .filter_map(|finding| {
+            let structured = finding.structured_payload()?;
+            Some(NormalizedFinding {
+                identity: format!("repository|id|{}", structured.id),
+                text: finding.text().to_string(),
+                external: false,
+                finding: finding.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    normalized.extend(normalize_legacy_findings(
+        findings
+            .iter()
+            .filter(|finding| finding.structured_payload().is_none()),
+    ));
+    normalized.sort_by(|left, right| left.identity.cmp(&right.identity));
+    normalized.dedup_by(|left, right| left.identity == right.identity);
+    normalized
+}
+
+fn normalize_legacy_findings<'a, I>(findings: I) -> Vec<NormalizedFinding>
+where
+    I: IntoIterator<Item = &'a crate::acceptance::AcceptanceFinding>,
+{
+    let texts = findings
+        .into_iter()
+        .map(|finding| finding.text().to_string())
+        .collect::<Vec<_>>();
+    normalize_legacy_texts(&texts)
+}
+
+/// Legacy fallback identity derivation, retained verbatim for string findings.
+pub fn normalize_legacy_texts(findings: &[String]) -> Vec<NormalizedFinding> {
     fn rule_kind(text: &str) -> &'static str {
         if ["test", "coverage", "verification", "evidence"]
             .iter()
@@ -460,6 +561,7 @@ pub fn normalize_findings(findings: &[String]) -> Vec<NormalizedFinding> {
                         },
                         |code| format!("{scope}|code|{code}"),
                     ),
+                    finding: crate::acceptance::AcceptanceFinding::legacy(normalized.clone()),
                     text: normalized,
                     external,
                 }
@@ -482,13 +584,20 @@ pub enum AcceptanceRetryDecision {
     },
 }
 
-pub fn repository_findings(findings: &[String]) -> Vec<String> {
+/// Findings that repository work can resolve.
+///
+/// Structured findings are always repository-scoped: they declare repository
+/// paths. Only legacy strings can be classified as external prerequisites.
+pub fn repository_findings(
+    findings: &[crate::acceptance::AcceptanceFinding],
+) -> Vec<crate::acceptance::AcceptanceFinding> {
     findings
         .iter()
         .filter(|finding| {
-            normalize_findings(std::slice::from_ref(*finding))
-                .first()
-                .is_some_and(|normalized| !normalized.external)
+            finding.structured_payload().is_some()
+                || normalize_legacy_texts(&[finding.text().to_string()])
+                    .first()
+                    .is_some_and(|normalized| !normalized.external)
         })
         .cloned()
         .collect()
@@ -557,6 +666,452 @@ pub fn semantic_progress_fingerprint(workspace: &std::path::Path) -> std::io::Re
             (hash ^ byte as u64).wrapping_mul(0x100000001b3)
         });
     Ok(format!("{hash:016x}"))
+}
+
+/// Stop reason for a repair hold that precedes the next Acceptance invocation.
+///
+/// Both reasons are temporary, evidenced, resumable holds. Neither proves
+/// implementation completion, finding closure, PASS, archive readiness, or
+/// merge eligibility, and neither writes anything into the managed worktree.
+pub const REMEDIATION_MISMATCH_REASON: &str = "acceptance_remediation_mismatch";
+/// Stop reason used when the same finding ID survives its one repair Apply.
+pub const REPEATED_FINDING_REASON: &str = "repeated_acceptance_finding";
+
+/// Result of comparing declared finding work against the actual repair delta.
+///
+/// This is a coverage gate, not semantic acceptance: passing it only authorizes
+/// the next Acceptance invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemediationCoverage {
+    /// Files observed in the repair delta, sorted and deduplicated.
+    pub changed_files: Vec<String>,
+    /// Declared `required_changes` paths absent from the delta, per finding ID.
+    pub missing_required: Vec<(String, String)>,
+    /// Declared `verification` paths absent from the delta, per finding ID.
+    pub missing_verification: Vec<(String, String)>,
+    /// Changed files not declared by any finding.
+    pub unrelated_files: Vec<String>,
+    /// Findings that declare no path set and therefore keep legacy behavior.
+    pub legacy_finding_texts: Vec<String>,
+}
+
+impl RemediationCoverage {
+    /// Whether every declared implementation and verification path was covered.
+    pub fn is_complete(&self) -> bool {
+        self.missing_required.is_empty() && self.missing_verification.is_empty()
+    }
+
+    /// Uncovered declared paths, formatted for operator diagnostics.
+    pub fn uncovered(&self) -> Vec<String> {
+        self.missing_required
+            .iter()
+            .map(|(id, file)| format!("{id}: required_changes {file}"))
+            .chain(
+                self.missing_verification
+                    .iter()
+                    .map(|(id, file)| format!("{id}: verification {file}")),
+            )
+            .collect()
+    }
+}
+
+/// Normalize one raw changed-path entry from a VCS status/diff listing.
+fn normalize_changed_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `git diff --name-status` renames arrive as `old -> new`; both sides count
+    // as touched so a finding satisfied by moving a file is still covered.
+    crate::acceptance::normalize_repository_path(trimmed)
+}
+
+/// Collect the distinct repository-relative files in a repair delta.
+pub fn normalize_changed_files<I, S>(paths: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut files = paths
+        .into_iter()
+        .flat_map(|path| {
+            path.as_ref()
+                .split(" -> ")
+                .filter_map(normalize_changed_path)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Validate that a repair delta covers every declared finding expectation.
+///
+/// Pure over the changed-file list so the decision is unit-testable without a
+/// real repository. Coverage never claims the finding is semantically resolved.
+pub fn evaluate_remediation_coverage(
+    findings: &[crate::acceptance::AcceptanceFinding],
+    changed_files: &[String],
+) -> RemediationCoverage {
+    let changed = normalize_changed_files(changed_files);
+    let mut coverage = RemediationCoverage {
+        changed_files: changed.clone(),
+        ..RemediationCoverage::default()
+    };
+    let mut declared = std::collections::BTreeSet::new();
+
+    for finding in findings {
+        // A finding that declares no path set keeps legacy compatibility
+        // behavior: strict coverage has nothing to enforce against.
+        if !finding.declares_paths() {
+            coverage
+                .legacy_finding_texts
+                .push(finding.text().to_string());
+            continue;
+        }
+        let Some(structured) = finding.structured_payload() else {
+            continue;
+        };
+        for file in structured.required_files() {
+            declared.insert(file.clone());
+            if !changed.contains(&file) {
+                coverage
+                    .missing_required
+                    .push((structured.id.clone(), file));
+            }
+        }
+        for file in structured.verification_files() {
+            declared.insert(file.clone());
+            if !changed.contains(&file) {
+                coverage
+                    .missing_verification
+                    .push((structured.id.clone(), file));
+            }
+        }
+    }
+
+    coverage.unrelated_files = changed
+        .into_iter()
+        .filter(|file| !declared.contains(file))
+        .collect();
+    coverage
+}
+
+/// Per-finding automatic repair accounting for one active orchestration run.
+///
+/// Each stable ID gets exactly one automatic repair Apply after its first FAIL
+/// observation. Unrelated semantic progress never resets that budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FindingRepairLedger {
+    /// Identities that have already consumed their one automatic repair Apply.
+    repaired: std::collections::BTreeSet<String>,
+    /// How many canonical FAIL results reported each identity.
+    occurrences: std::collections::BTreeMap<String, u32>,
+}
+
+/// What runtime should do after ingesting a canonical FAIL result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FindingRepairDecision {
+    /// Every open finding still has its automatic repair opportunity.
+    Repair {
+        /// Identities granted (or continuing to hold) a repair opportunity.
+        identities: Vec<String>,
+    },
+    /// At least one identity already consumed its repair opportunity.
+    ///
+    /// Runtime stops atomically: no partial Apply is dispatched even when other
+    /// identities in the same verdict are new.
+    Stop {
+        reason: &'static str,
+        repeated_identities: Vec<String>,
+    },
+}
+
+impl FindingRepairLedger {
+    /// Occurrence count for one identity across this run.
+    pub fn occurrences(&self, identity: &str) -> u32 {
+        self.occurrences.get(identity).copied().unwrap_or(0)
+    }
+
+    /// Every observed identity with its occurrence count, for diagnostics.
+    pub fn occurrence_report(&self) -> Vec<(String, u32)> {
+        self.occurrences
+            .iter()
+            .map(|(identity, count)| (identity.clone(), *count))
+            .collect()
+    }
+
+    /// Whether an identity already consumed its automatic repair opportunity.
+    pub fn has_consumed_repair(&self, identity: &str) -> bool {
+        self.repaired.contains(identity)
+    }
+
+    /// Ingest a canonical FAIL result and decide whether repair may proceed.
+    ///
+    /// Identities absent from `findings` were closed by Acceptance, so their
+    /// accounting is dropped: only Acceptance closes a finding.
+    pub fn observe_fail(&mut self, findings: &[NormalizedFinding]) -> FindingRepairDecision {
+        let identities = findings
+            .iter()
+            .filter(|finding| !finding.external)
+            .map(|finding| finding.identity.clone())
+            .collect::<Vec<_>>();
+        let open = identities
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        self.occurrences
+            .retain(|identity, _| open.contains(identity));
+        self.repaired.retain(|identity| open.contains(identity));
+        for identity in &identities {
+            *self.occurrences.entry(identity.clone()).or_insert(0) += 1;
+        }
+
+        let repeated = identities
+            .iter()
+            .filter(|identity| self.repaired.contains(*identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !repeated.is_empty() {
+            return FindingRepairDecision::Stop {
+                reason: REPEATED_FINDING_REASON,
+                repeated_identities: repeated,
+            };
+        }
+        FindingRepairDecision::Repair { identities }
+    }
+
+    /// Record that the automatic repair Apply for `identities` was dispatched.
+    pub fn record_repair_dispatched(&mut self, identities: &[String]) {
+        for identity in identities {
+            self.repaired.insert(identity.clone());
+        }
+    }
+
+    /// Drop all accounting, used when an operator authorizes a new attempt.
+    ///
+    /// Occurrence diagnostics are the caller's to preserve; this only releases
+    /// the automatic budget so an explicit retry can proceed.
+    pub fn reset_for_explicit_retry(&mut self) {
+        self.repaired.clear();
+    }
+}
+
+/// Structured, mode-independent diagnostics for a repair stop.
+///
+/// Serial and parallel build this from the same inputs so equivalent
+/// observations produce equivalent operator evidence. Per constitutional law 1a
+/// this record controls only stalled presentation, dispatch suppression, and
+/// explicit-retry eligibility: it never proves implementation completion,
+/// finding closure, Acceptance PASS, archive readiness, or merge eligibility,
+/// and it is never written into a managed worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceRepairStop {
+    pub change_id: String,
+    pub reason: &'static str,
+    /// Every open finding, complete and unmodified.
+    pub findings: Vec<crate::acceptance::AcceptanceFinding>,
+    /// Comparison identity plus how many canonical FAILs reported it.
+    pub occurrences: Vec<(String, u32)>,
+    /// Identities that already consumed their one automatic repair.
+    pub repeated_identities: Vec<String>,
+    /// Revision recorded when the FAIL was observed.
+    pub fail_revision: Option<String>,
+    /// Revision produced by the repair Apply.
+    pub apply_revision: Option<String>,
+    /// Declared implementation and verification paths.
+    pub required_files: Vec<String>,
+    pub verification_files: Vec<String>,
+    /// Coverage result over the actual repair delta.
+    pub coverage: RemediationCoverage,
+    /// Apply-authored remediation evidence recovered from workspace follow-up.
+    pub remediation_evidence: Vec<String>,
+    pub resumable: bool,
+    pub next_action: String,
+}
+
+impl AcceptanceRepairStop {
+    /// Machine-readable diagnostics for CLI/TUI/event consumers.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "change_id": self.change_id,
+            "stop_reason": self.reason,
+            "findings": self.findings.iter().map(|finding| finding.to_json()).collect::<Vec<_>>(),
+            "finding_occurrences": self
+                .occurrences
+                .iter()
+                .map(|(identity, count)| serde_json::json!({"identity": identity, "occurrences": count}))
+                .collect::<Vec<_>>(),
+            "repeated_identities": self.repeated_identities,
+            "fail_revision": self.fail_revision,
+            "apply_revision": self.apply_revision,
+            "required_files": self.required_files,
+            "verification_files": self.verification_files,
+            "changed_files": self.coverage.changed_files,
+            "uncovered_files": self.coverage.uncovered(),
+            "coverage_complete": self.coverage.is_complete(),
+            "unrelated_files": self.coverage.unrelated_files,
+            "legacy_findings_without_declared_paths": self.coverage.legacy_finding_texts,
+            "remediation_evidence": self.remediation_evidence,
+            "resumable": self.resumable,
+            "next_action": self.next_action,
+            "proves_completion": false,
+            "proves_acceptance_pass": false,
+            "proves_archive_readiness": false,
+        })
+    }
+
+    /// Identities present in the occurrence report, in stable order.
+    pub fn occurrence_identities(&self) -> Vec<String> {
+        self.occurrences
+            .iter()
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
+    /// One-line operator-facing summary used as the process-result error text.
+    pub fn summary(&self) -> String {
+        format!(
+            "Acceptance stopped automatic repair for {} ({}). {} Diagnostics: {}",
+            self.change_id,
+            self.reason,
+            self.next_action,
+            self.to_json()
+        )
+    }
+}
+
+/// What runtime should do before invoking Acceptance again after a repair Apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairGateDecision {
+    /// Declared coverage is satisfied (or nothing was declared): Acceptance may
+    /// run. This authorizes only the next review, never semantic resolution.
+    Proceed,
+    /// Coverage is incomplete: hold with evidence and do not spend an Acceptance
+    /// invocation.
+    Stop(Box<AcceptanceRepairStop>),
+}
+
+/// Validate a repair delta against every open structured finding.
+///
+/// Pure over `changed_files` and `remediation_evidence` so serial and parallel
+/// share one decision and it stays unit-testable without a real repository.
+pub fn decide_repair_gate(
+    change_id: &str,
+    findings: &[crate::acceptance::AcceptanceFinding],
+    ledger: &FindingRepairLedger,
+    fail_revision: Option<&str>,
+    apply_revision: Option<&str>,
+    changed_files: &[String],
+    remediation_evidence: &[String],
+) -> RepairGateDecision {
+    let coverage = evaluate_remediation_coverage(findings, changed_files);
+    if coverage.is_complete() {
+        return RepairGateDecision::Proceed;
+    }
+    let uncovered = coverage.uncovered().join(", ");
+    RepairGateDecision::Stop(Box::new(AcceptanceRepairStop {
+        change_id: change_id.to_string(),
+        reason: REMEDIATION_MISMATCH_REASON,
+        findings: findings.to_vec(),
+        occurrences: ledger.occurrence_report(),
+        repeated_identities: Vec::new(),
+        fail_revision: fail_revision.map(str::to_string),
+        apply_revision: apply_revision.map(str::to_string),
+        required_files: declared_files(findings, true),
+        verification_files: declared_files(findings, false),
+        coverage,
+        remediation_evidence: remediation_evidence.to_vec(),
+        resumable: true,
+        next_action: format!(
+            "Change the declared files still missing from the repair delta ({uncovered}), then \
+             retry explicitly. Unrelated or comment-only changes cannot satisfy the finding \
+             contract, and coverage alone never proves the finding is resolved."
+        ),
+    }))
+}
+
+/// Build the repeated-finding stop record for an ingested canonical FAIL.
+#[allow(clippy::too_many_arguments)]
+pub fn repeated_finding_stop(
+    change_id: &str,
+    findings: &[crate::acceptance::AcceptanceFinding],
+    ledger: &FindingRepairLedger,
+    repeated_identities: Vec<String>,
+    fail_revision: Option<&str>,
+    apply_revision: Option<&str>,
+    changed_files: &[String],
+    remediation_evidence: &[String],
+) -> AcceptanceRepairStop {
+    AcceptanceRepairStop {
+        change_id: change_id.to_string(),
+        reason: REPEATED_FINDING_REASON,
+        findings: findings.to_vec(),
+        occurrences: ledger.occurrence_report(),
+        next_action: format!(
+            "Finding {} is still open after its one automatic repair. Review the finding and the \
+             recorded remediation evidence, then retry explicitly; unrelated changed files do not \
+             grant another automatic repair.",
+            repeated_identities.join(", ")
+        ),
+        repeated_identities,
+        fail_revision: fail_revision.map(str::to_string),
+        apply_revision: apply_revision.map(str::to_string),
+        required_files: declared_files(findings, true),
+        verification_files: declared_files(findings, false),
+        coverage: evaluate_remediation_coverage(findings, changed_files),
+        remediation_evidence: remediation_evidence.to_vec(),
+        resumable: true,
+    }
+}
+
+fn declared_files(
+    findings: &[crate::acceptance::AcceptanceFinding],
+    required: bool,
+) -> Vec<String> {
+    let mut files = findings
+        .iter()
+        .filter_map(|finding| finding.structured_payload())
+        .flat_map(|finding| {
+            if required {
+                finding.required_files()
+            } else {
+                finding.verification_files()
+            }
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Collect the repair delta and Apply-authored remediation evidence for a
+/// change, so both execution modes feed [`decide_repair_gate`] identically.
+///
+/// Missing git or follow-up state degrades to empty inputs rather than an
+/// inferred pass: an empty delta simply fails coverage for a declared finding.
+pub async fn collect_repair_gate_inputs(
+    workspace: &std::path::Path,
+    change_id: &str,
+    fail_revision: Option<&str>,
+) -> (Vec<String>, Option<String>, Vec<String>) {
+    let changed_files = match fail_revision {
+        Some(revision) => crate::vcs::git::commands::get_changed_files_since(workspace, revision)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let apply_revision = crate::vcs::git::commands::get_current_commit(workspace)
+        .await
+        .ok();
+    let remediation_evidence =
+        crate::task_parser::resolve_acceptance_follow_up_tasks_path(change_id, workspace)
+            .ok()
+            .and_then(|path| crate::task_parser::read_acceptance_follow_up_evidence(&path).ok())
+            .unwrap_or_default();
+    (changed_files, apply_revision, remediation_evidence)
 }
 
 pub fn decide_acceptance_retry(
@@ -636,9 +1191,17 @@ pub enum AcceptanceResult {
     /// Acceptance passed - can proceed to archive.
     Pass,
     /// Acceptance failed - must return to apply loop.
-    Fail { findings: Vec<String> },
+    Fail {
+        findings: Vec<crate::acceptance::AcceptanceFinding>,
+    },
     /// Acceptance requires more investigation - retry acceptance.
     Continue,
+    /// A FAIL verdict carried a structured `findings` entry that did not
+    /// validate. Bounded protocol error: acceptance is re-invoked for a
+    /// corrected verdict and no ambiguous repair work is dispatched.
+    MalformedFinding {
+        rejection: crate::acceptance::FindingRejection,
+    },
     /// A `gated`/legacy `blocked` compatibility token arrived without a
     /// validated structured blocker. This is a bounded protocol error: it never
     /// creates a stalled lifecycle transition, blocker category, or durable
@@ -905,7 +1468,7 @@ where
             attempt: attempt_number,
             passed: false,
             duration: start_time.elapsed(),
-            findings: Some(tail_findings.clone()),
+            findings: Some(crate::acceptance::legacy_findings(tail_findings.clone())),
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
@@ -938,7 +1501,9 @@ where
             info!("Acceptance test failed for: {}", change.id);
             output.on_warn("Acceptance test: FAIL");
             let findings = if parsed_findings.is_empty() {
-                vec!["Investigate acceptance failure and apply the required fix".to_string()]
+                crate::acceptance::legacy_findings([
+                    "Investigate acceptance failure and apply the required fix",
+                ])
             } else {
                 parsed_findings
             };
@@ -959,6 +1524,18 @@ where
                 blocker.category, blocker.next_action
             ));
             (AcceptanceResult::Stalled { blocker }, false)
+        }
+        crate::acceptance::AcceptanceResult::MalformedFinding { rejection } => {
+            warn!(
+                "Acceptance emitted a malformed structured finding for: {} ({})",
+                change.id,
+                rejection.reason()
+            );
+            output.on_error(&format!(
+                "Acceptance test: MALFORMED FINDING (protocol failure — {})",
+                rejection.reason()
+            ));
+            (AcceptanceResult::MalformedFinding { rejection }, false)
         }
         crate::acceptance::AcceptanceResult::BareBlocker { rejection } => {
             warn!(
@@ -989,30 +1566,38 @@ where
 
     let history_findings = match &result {
         AcceptanceResult::Fail { findings } => Some(findings.clone()),
-        AcceptanceResult::Continue => {
-            Some(vec!["Investigation incomplete - continue later".to_string()])
-        }
+        AcceptanceResult::Continue => Some(crate::acceptance::legacy_findings([
+            "Investigation incomplete - continue later",
+        ])),
         AcceptanceResult::Stalled { blocker } => {
             let mut evidence = vec![format!(
                 "Validated external blocker (category {}): {}",
                 blocker.category, blocker.next_action
             )];
             evidence.extend(blocker.evidence.iter().cloned());
-            Some(evidence)
+            Some(crate::acceptance::legacy_findings(evidence))
         }
-        AcceptanceResult::BareBlocker { rejection } => Some(vec![
+        AcceptanceResult::BareBlocker { rejection } => Some(crate::acceptance::legacy_findings([
             BARE_BLOCKER_DIAGNOSTIC.to_string(),
             rejection.reason(),
-        ]),
+        ])),
+        AcceptanceResult::MalformedFinding { rejection } => {
+            Some(crate::acceptance::legacy_findings([
+                MALFORMED_FINDING_DIAGNOSTIC.to_string(),
+                rejection.reason(),
+            ]))
+        }
         AcceptanceResult::Pass => None,
         AcceptanceResult::MissingVerdict { findings } => {
             let mut evidence = vec![MISSING_VERDICT_DIAGNOSTIC.to_string()];
             evidence.extend(findings.iter().cloned());
-            Some(evidence)
+            Some(crate::acceptance::legacy_findings(evidence))
         }
         AcceptanceResult::CommandFailed { .. }
         | AcceptanceResult::PermissionStalled { .. }
-        | AcceptanceResult::Cancelled => Some(tail_findings.clone()),
+        | AcceptanceResult::Cancelled => {
+            Some(crate::acceptance::legacy_findings(tail_findings.clone()))
+        }
     };
     let attempt_number = agent.next_acceptance_attempt_number(&change.id);
     let attempt = AcceptanceAttempt {
@@ -1299,7 +1884,7 @@ mod tests {
         for canonical in [
             AcceptanceResult::Pass,
             AcceptanceResult::Fail {
-                findings: vec!["src/lib.rs:1 fix".to_string()],
+                findings: vec!["src/lib.rs:1 fix".to_string().into()],
             },
             AcceptanceResult::Continue,
             AcceptanceResult::Stalled {
@@ -1403,7 +1988,7 @@ mod tests {
         for canonical in [
             AcceptanceResult::Pass,
             AcceptanceResult::Fail {
-                findings: vec!["src/lib.rs:1 fix".to_string()],
+                findings: vec!["src/lib.rs:1 fix".to_string().into()],
             },
             AcceptanceResult::Continue,
             AcceptanceResult::Stalled {
@@ -1610,7 +2195,7 @@ mod tests {
             (AcceptanceResult::Pass, true, false),
             (
                 AcceptanceResult::Fail {
-                    findings: vec!["src/lib.rs:1 fix".to_string()],
+                    findings: vec!["src/lib.rs:1 fix".to_string().into()],
                 },
                 true,
                 false,
@@ -1697,7 +2282,7 @@ mod tests {
             missing_verdict("waiting"),
             missing_verdict("waiting"),
             AcceptanceResult::Fail {
-                findings: vec!["src/lib.rs:1 missing coverage".to_string()],
+                findings: vec!["src/lib.rs:1 missing coverage".to_string().into()],
             },
         ];
 
@@ -1756,8 +2341,8 @@ mod tests {
     #[test]
     fn retry_decision_normalizes_order_whitespace_duplicates_and_stalls_repeats() {
         let findings = normalize_findings(&[
-            " src/lib.rs:10   missing  test ".to_string(),
-            "src/lib.rs:11 missing test".to_string(),
+            " src/lib.rs:10   missing  test ".to_string().into(),
+            "src/lib.rs:11 missing test".to_string().into(),
         ]);
         assert_eq!(findings.len(), 1);
         let decision = decide_acceptance_retry(
@@ -1778,7 +2363,7 @@ mod tests {
 
     #[test]
     fn retry_decision_stalls_external_only_and_allows_progress_changed() {
-        let findings = normalize_findings(&["external service outage".to_string()]);
+        let findings = normalize_findings(&["external service outage".to_string().into()]);
         assert!(findings[0].external);
         assert!(matches!(
             decide_acceptance_retry(&[], None, &findings, "one", 1),
@@ -1815,11 +2400,15 @@ mod tests {
     #[test]
     fn generic_credential_and_unavailable_errors_remain_repository_fixable() {
         let findings = normalize_findings(&[
-            "missing API key in test fixture".to_string(),
-            "src/client.rs: rate limit retry missing".to_string(),
-            "network unreachable: fix retry handling".to_string(),
-            "dns resolution failed while repairing src/client.rs".to_string(),
-            "missing non-mockable external credential".to_string(),
+            "missing API key in test fixture".to_string().into(),
+            "src/client.rs: rate limit retry missing".to_string().into(),
+            "network unreachable: fix retry handling".to_string().into(),
+            "dns resolution failed while repairing src/client.rs"
+                .to_string()
+                .into(),
+            "missing non-mockable external credential"
+                .to_string()
+                .into(),
         ]);
         assert_eq!(
             findings.iter().filter(|finding| finding.external).count(),
@@ -1828,11 +2417,15 @@ mod tests {
         assert!(findings[0].identity.starts_with("external|"));
         assert_eq!(
             repository_findings(&[
-                "missing API key in test fixture".to_string(),
-                "src/client.rs: rate limit retry missing".to_string(),
-                "network unreachable: fix retry handling".to_string(),
-                "dns resolution failed while repairing src/client.rs".to_string(),
-                "missing non-mockable external credential".to_string(),
+                "missing API key in test fixture".to_string().into(),
+                "src/client.rs: rate limit retry missing".to_string().into(),
+                "network unreachable: fix retry handling".to_string().into(),
+                "dns resolution failed while repairing src/client.rs"
+                    .to_string()
+                    .into(),
+                "missing non-mockable external credential"
+                    .to_string()
+                    .into(),
             ])
             .len(),
             4
@@ -1941,7 +2534,7 @@ mod tests {
     fn test_acceptance_result_is_pass() {
         assert!(AcceptanceResult::Pass.is_pass());
         assert!(!AcceptanceResult::Fail {
-            findings: vec!["error".to_string()]
+            findings: vec!["error".to_string().into()]
         }
         .is_pass());
         assert!(!AcceptanceResult::CommandFailed {
@@ -2041,5 +2634,448 @@ mod tests {
             }
             _ => panic!("Expected Fail"),
         }
+    }
+    // --- Remediation-to-diff coverage ---
+
+    use crate::acceptance::AcceptanceFinding;
+
+    fn finding(id: &str, implementation: &str, verification: &str) -> AcceptanceFinding {
+        AcceptanceFinding::structured(crate::acceptance::RepositoryFinding {
+            id: id.to_string(),
+            severity: crate::acceptance::FindingSeverity::Minor,
+            summary: "Challenge and proof leakage is not tested by value".to_string(),
+            evidence: vec!["relay exposes counts but not issued values".to_string()],
+            required_changes: vec![crate::acceptance::FindingFileExpectation {
+                file: implementation.to_string(),
+                description: "Expose issued challenge and presented proof values".to_string(),
+            }],
+            verification: vec![crate::acceptance::FindingFileExpectation {
+                file: verification.to_string(),
+                description: "Assert recorded values are absent from audit output".to_string(),
+            }],
+        })
+    }
+
+    fn secret_value_finding() -> AcceptanceFinding {
+        finding(
+            "acceptance-secret-value-scan",
+            "tests/support/relay.ts",
+            "runtime/recovery.integration.test.ts",
+        )
+    }
+
+    fn changed(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    #[test]
+    fn complete_coverage_permits_semantic_review_without_claiming_resolution() {
+        let findings = [secret_value_finding()];
+        let coverage = evaluate_remediation_coverage(
+            &findings,
+            &changed(&[
+                "tests/support/relay.ts",
+                "runtime/recovery.integration.test.ts",
+            ]),
+        );
+
+        assert!(coverage.is_complete());
+        assert!(coverage.uncovered().is_empty());
+        assert!(coverage.unrelated_files.is_empty());
+        assert_eq!(
+            decide_repair_gate(
+                "change-a",
+                &findings,
+                &FindingRepairLedger::default(),
+                Some("fail-rev"),
+                Some("apply-rev"),
+                &changed(&[
+                    "tests/support/relay.ts",
+                    "runtime/recovery.integration.test.ts",
+                ]),
+                &[],
+            ),
+            RepairGateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn missing_implementation_or_verification_path_fails_coverage() {
+        let findings = [secret_value_finding()];
+
+        let missing_implementation = evaluate_remediation_coverage(
+            &findings,
+            &changed(&["runtime/recovery.integration.test.ts"]),
+        );
+        assert!(!missing_implementation.is_complete());
+        assert_eq!(
+            missing_implementation.missing_required,
+            [(
+                "acceptance-secret-value-scan".to_string(),
+                "tests/support/relay.ts".to_string()
+            )]
+        );
+        assert!(missing_implementation.missing_verification.is_empty());
+
+        let missing_verification =
+            evaluate_remediation_coverage(&findings, &changed(&["tests/support/relay.ts"]));
+        assert!(!missing_verification.is_complete());
+        assert_eq!(
+            missing_verification.missing_verification,
+            [(
+                "acceptance-secret-value-scan".to_string(),
+                "runtime/recovery.integration.test.ts".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn calibration_only_change_stops_before_acceptance_with_evidence() {
+        // Regression shape: Apply touched only a calibration test and a comment.
+        let findings = [secret_value_finding()];
+        let delta = changed(&["tests/calibration.test.ts", "src/unrelated.rs"]);
+
+        let RepairGateDecision::Stop(stop) = decide_repair_gate(
+            "change-a",
+            &findings,
+            &FindingRepairLedger::default(),
+            Some("fail-rev"),
+            Some("apply-rev"),
+            &delta,
+            &["adjusted calibration threshold".to_string()],
+        ) else {
+            panic!("calibration-only repair must not authorize another acceptance run");
+        };
+
+        assert_eq!(stop.reason, REMEDIATION_MISMATCH_REASON);
+        assert!(stop.resumable);
+        assert_eq!(stop.fail_revision.as_deref(), Some("fail-rev"));
+        assert_eq!(stop.apply_revision.as_deref(), Some("apply-rev"));
+        assert_eq!(stop.required_files, ["tests/support/relay.ts"]);
+        assert_eq!(
+            stop.verification_files,
+            ["runtime/recovery.integration.test.ts"]
+        );
+        assert_eq!(
+            stop.coverage.unrelated_files,
+            ["src/unrelated.rs", "tests/calibration.test.ts"],
+            "every changed file is retained as a diagnostic, sorted"
+        );
+        assert_eq!(stop.coverage.changed_files.len(), delta.len());
+        assert_eq!(
+            stop.remediation_evidence,
+            ["adjusted calibration threshold"]
+        );
+        // The complete finding is retained for the operator.
+        assert_eq!(stop.findings, findings);
+
+        let json = stop.to_json();
+        assert_eq!(json["coverage_complete"], false);
+        assert_eq!(json["proves_acceptance_pass"], false);
+        assert_eq!(json["proves_archive_readiness"], false);
+        assert_eq!(json["proves_completion"], false);
+    }
+
+    #[test]
+    fn coverage_normalizes_renames_and_untracked_paths() {
+        let findings = [secret_value_finding()];
+        // A rename entry from `--name-status` counts both sides as touched, and
+        // `./`-prefixed untracked entries normalize to the same repository path.
+        let coverage = evaluate_remediation_coverage(
+            &findings,
+            &changed(&[
+                "tests/support/old-relay.ts -> tests/support/relay.ts",
+                "./runtime/recovery.integration.test.ts",
+            ]),
+        );
+
+        assert!(coverage.is_complete(), "{coverage:?}");
+        assert_eq!(
+            coverage.unrelated_files,
+            ["tests/support/old-relay.ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_findings_without_declared_paths_keep_compatibility_behavior() {
+        let findings = crate::acceptance::legacy_findings(["src/a.rs:10 missing coverage"]);
+        let coverage = evaluate_remediation_coverage(&findings, &changed(&["docs/readme.md"]));
+
+        assert!(
+            coverage.is_complete(),
+            "a legacy finding declares no path set, so strict coverage cannot apply"
+        );
+        assert_eq!(
+            coverage.legacy_finding_texts,
+            ["src/a.rs:10 missing coverage"]
+        );
+        assert_eq!(
+            decide_repair_gate(
+                "change-a",
+                &findings,
+                &FindingRepairLedger::default(),
+                None,
+                None,
+                &changed(&["docs/readme.md"]),
+                &[],
+            ),
+            RepairGateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn empty_repair_delta_cannot_satisfy_a_declared_finding() {
+        let findings = [secret_value_finding()];
+        assert!(matches!(
+            decide_repair_gate(
+                "change-a",
+                &findings,
+                &FindingRepairLedger::default(),
+                Some("fail-rev"),
+                Some("fail-rev"),
+                &[],
+                &[],
+            ),
+            RepairGateDecision::Stop(_)
+        ));
+    }
+
+    // --- Per-finding automatic repair budget ---
+
+    fn observe(
+        ledger: &mut FindingRepairLedger,
+        findings: &[AcceptanceFinding],
+    ) -> FindingRepairDecision {
+        ledger.observe_fail(&normalize_findings(findings))
+    }
+
+    #[test]
+    fn first_observation_grants_one_repair_opportunity() {
+        let mut ledger = FindingRepairLedger::default();
+        let findings = [secret_value_finding()];
+
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &findings) else {
+            panic!("first observation must allow one repair");
+        };
+        assert_eq!(identities, ["repository|id|acceptance-secret-value-scan"]);
+        assert_eq!(
+            ledger.occurrences("repository|id|acceptance-secret-value-scan"),
+            1
+        );
+        assert!(!ledger.has_consumed_repair("repository|id|acceptance-secret-value-scan"));
+
+        ledger.record_repair_dispatched(&identities);
+        assert!(ledger.has_consumed_repair("repository|id|acceptance-secret-value-scan"));
+    }
+
+    #[test]
+    fn repeated_id_stops_before_a_second_repair_regardless_of_progress() {
+        let mut ledger = FindingRepairLedger::default();
+        let findings = [secret_value_finding()];
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &findings) else {
+            panic!("first observation must allow one repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+
+        // The same defect, reported with changed prose, changed evidence, a
+        // changed line number, and a different cited path.
+        let restated = AcceptanceFinding::structured(crate::acceptance::RepositoryFinding {
+            id: "acceptance-secret-value-scan".to_string(),
+            severity: crate::acceptance::FindingSeverity::Major,
+            summary: "Rewritten summary at a new line".to_string(),
+            evidence: vec!["different evidence at src/other.rs:99".to_string()],
+            required_changes: vec![crate::acceptance::FindingFileExpectation {
+                file: "src/other.rs".to_string(),
+                description: "different described change".to_string(),
+            }],
+            verification: vec![crate::acceptance::FindingFileExpectation {
+                file: "tests/other.rs".to_string(),
+                description: "different described proof".to_string(),
+            }],
+        });
+
+        let FindingRepairDecision::Stop {
+            reason,
+            repeated_identities,
+        } = observe(&mut ledger, std::slice::from_ref(&restated))
+        else {
+            panic!("a repeated ID must stop automatic repair");
+        };
+        assert_eq!(reason, REPEATED_FINDING_REASON);
+        assert_eq!(
+            repeated_identities,
+            ["repository|id|acceptance-secret-value-scan"]
+        );
+        assert_eq!(
+            ledger.occurrences("repository|id|acceptance-secret-value-scan"),
+            2
+        );
+
+        // Unrelated semantic progress does not change the decision, and the stop
+        // record retains the complete finding.
+        let stop = repeated_finding_stop(
+            "change-a",
+            &[restated],
+            &ledger,
+            repeated_identities,
+            Some("fail-rev"),
+            Some("apply-rev"),
+            &changed(&["src/other.rs", "tests/other.rs", "docs/notes.md"]),
+            &["claimed a repair".to_string()],
+        );
+        assert_eq!(stop.reason, REPEATED_FINDING_REASON);
+        assert!(
+            stop.coverage.is_complete(),
+            "coverage passing is irrelevant"
+        );
+        assert_eq!(
+            stop.occurrences,
+            [("repository|id|acceptance-secret-value-scan".to_string(), 2)]
+        );
+        assert!(stop.resumable);
+        assert_eq!(stop.remediation_evidence, ["claimed a repair"]);
+    }
+
+    #[test]
+    fn a_new_finding_id_receives_its_own_repair_opportunity() {
+        let mut ledger = FindingRepairLedger::default();
+        let first = [secret_value_finding()];
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &first) else {
+            panic!("first observation must allow one repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+
+        // Acceptance closed the prior ID and reported a genuinely new one.
+        let second = [finding(
+            "acceptance-new-defect",
+            "src/new.rs",
+            "tests/new.rs",
+        )];
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &second) else {
+            panic!("a new ID gets its own opportunity");
+        };
+        assert_eq!(identities, ["repository|id|acceptance-new-defect"]);
+        assert_eq!(
+            ledger.occurrences("repository|id|acceptance-secret-value-scan"),
+            0,
+            "an ID acceptance stopped reporting is closed, not carried forward"
+        );
+    }
+
+    #[test]
+    fn mixed_repeated_and_new_ids_stop_atomically_with_every_finding_retained() {
+        let mut ledger = FindingRepairLedger::default();
+        let repeated = secret_value_finding();
+        let FindingRepairDecision::Repair { identities } =
+            observe(&mut ledger, std::slice::from_ref(&repeated))
+        else {
+            panic!("first observation must allow one repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+
+        let fresh = finding("acceptance-new-defect", "src/new.rs", "tests/new.rs");
+        let mixed = [repeated, fresh];
+        let FindingRepairDecision::Stop {
+            reason,
+            repeated_identities,
+        } = observe(&mut ledger, &mixed)
+        else {
+            panic!("a mixed payload containing a repeated ID must stop atomically");
+        };
+        assert_eq!(reason, REPEATED_FINDING_REASON);
+        assert_eq!(
+            repeated_identities,
+            ["repository|id|acceptance-secret-value-scan"],
+            "only the repeated ID is the stop reason"
+        );
+
+        let stop = repeated_finding_stop(
+            "change-a",
+            &mixed,
+            &ledger,
+            repeated_identities,
+            None,
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(stop.findings.len(), 2, "diagnostics retain every finding");
+        assert_eq!(
+            stop.occurrence_identities(),
+            [
+                "repository|id|acceptance-new-defect".to_string(),
+                "repository|id|acceptance-secret-value-scan".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_retry_reset_releases_the_automatic_budget_only() {
+        let mut ledger = FindingRepairLedger::default();
+        let findings = [secret_value_finding()];
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &findings) else {
+            panic!("first observation must allow one repair");
+        };
+        ledger.record_repair_dispatched(&identities);
+
+        ledger.reset_for_explicit_retry();
+
+        assert!(!ledger.has_consumed_repair("repository|id|acceptance-secret-value-scan"));
+        assert_eq!(
+            ledger.occurrences("repository|id|acceptance-secret-value-scan"),
+            1,
+            "prior occurrence evidence is preserved for review"
+        );
+        assert!(matches!(
+            observe(&mut ledger, &findings),
+            FindingRepairDecision::Repair { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_findings_use_the_fallback_identity_for_the_repair_budget() {
+        let mut ledger = FindingRepairLedger::default();
+        let findings = crate::acceptance::legacy_findings(["Missing retry test at src/run.rs:10"]);
+        let FindingRepairDecision::Repair { identities } = observe(&mut ledger, &findings) else {
+            panic!("first observation must allow one repair");
+        };
+        assert_eq!(identities, ["repository|src/run.rs|verification"]);
+        ledger.record_repair_dispatched(&identities);
+
+        // Same defect, different prose and line number: the fallback identity is
+        // stable, so the repeated-finding stop still fires.
+        let restated =
+            crate::acceptance::legacy_findings(["Regression coverage absent in src/run.rs:99"]);
+        assert!(matches!(
+            observe(&mut ledger, &restated),
+            FindingRepairDecision::Stop { .. }
+        ));
+    }
+
+    #[test]
+    fn structured_finding_identity_is_the_reviewer_id_not_its_prose() {
+        let first = normalize_findings(&[secret_value_finding()]);
+        let restated = normalize_findings(&[AcceptanceFinding::structured(
+            crate::acceptance::RepositoryFinding {
+                id: "acceptance-secret-value-scan".to_string(),
+                severity: crate::acceptance::FindingSeverity::Major,
+                summary: "totally different words".to_string(),
+                evidence: vec!["totally different evidence".to_string()],
+                required_changes: vec![crate::acceptance::FindingFileExpectation {
+                    file: "src/elsewhere.rs".to_string(),
+                    description: "d".to_string(),
+                }],
+                verification: vec![crate::acceptance::FindingFileExpectation {
+                    file: "tests/elsewhere.rs".to_string(),
+                    description: "d".to_string(),
+                }],
+            },
+        )]);
+
+        assert_eq!(first[0].identity, restated[0].identity);
+        assert_ne!(
+            first[0].text, restated[0].text,
+            "identity is stable while the payload stays free to change"
+        );
     }
 }

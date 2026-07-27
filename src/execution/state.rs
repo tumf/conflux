@@ -1041,6 +1041,7 @@ mod tests {
                 finding_identities: vec!["external|job 42|verification".to_string()],
                 semantic_fingerprint: Some("baseline".to_string()),
                 cycle_count: 3,
+                ..AcceptanceRetryContext::default()
             },
             "no_semantic_progress",
             &["verification job 42".to_string()],
@@ -1124,6 +1125,7 @@ mod tests {
                 finding_identities: vec!["external|job 42|verification".to_string()],
                 semantic_fingerprint: Some("baseline".to_string()),
                 cycle_count: 3,
+                ..AcceptanceRetryContext::default()
             },
             "no_semantic_progress",
             &["verification job 42".to_string()],
