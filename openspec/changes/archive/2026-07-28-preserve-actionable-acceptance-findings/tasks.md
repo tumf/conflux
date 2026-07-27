@@ -19,12 +19,3 @@
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate preserve-actionable-acceptance-findings --archive-gate`
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] repository|remediation-mismatch/repeated-id/new-id/mixed-id|verification
-  evidence: real-cycle tests added — serial `process_change` (mismatch/repeated/new-id/malformed/explicit-retry) and parallel `dispatch_change_to_workspace` (mismatch/repeated/new-id), plus a parity test comparing two independent real runs
-- [x] repository|src/orchestration/acceptance.rs|verification
-  evidence: `FindingRepairLedger::reset_for_explicit_retry` now has production callers in both modes (serial `consume_explicit_acceptance_retry`, parallel explicit-retry dispatch branch) with budget-release and evidence-preservation tests
-- [x] repository|src/serial_run_service.rs|verification
-  evidence: coverage gate moved into `run_acceptance_loop` so every serial entry gates, repair stops now hold dispatch via `hold_repair_stop`, and `MalformedFinding` routes through `decide_acceptance_blocker` for the same 2 bounded retries parallel gets
