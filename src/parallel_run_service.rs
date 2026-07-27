@@ -630,8 +630,9 @@ impl ParallelRunService {
             in_flight_ids: in_flight.clone(),
             error: normalized_error.clone(),
         };
-        // The shared marker keeps producer wording and consumer classification in sync:
-        // consumers (TUI) rely on it to route this diagnostic as non-fatal.
+        // The shared marker keeps operator-facing wording stable across producer and
+        // tests. It is observability text only: non-fatality is carried by emitting
+        // this diagnostic as a warning log event, not by its message content.
         let message = format!(
             "{}: error={}, queued={:?}, in_flight={:?}",
             crate::events::RECOVERABLE_ANALYSIS_FALLBACK_MARKER,

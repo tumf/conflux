@@ -26,8 +26,9 @@ use utoipa::ToSchema;
 ///
 /// Producers emit this prefix when an LLM analysis response is rejected but
 /// metadata-dependency-only analysis safely takes over, so scheduler execution
-/// continues. Consumers use it to keep the diagnostic non-fatal: degraded but
-/// live execution must never be presented as a stopped or failed run.
+/// continues. It is operator-facing wording only: consumers MUST NOT classify
+/// fatality from it. Non-fatality is carried by the warning-log event type the
+/// producer uses, never by message content.
 pub const RECOVERABLE_ANALYSIS_FALLBACK_MARKER: &str =
     "Dependency analysis degraded: falling back to metadata-dependency-only analysis";
 
