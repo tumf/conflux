@@ -582,7 +582,6 @@ impl ParallelRunService {
                     // Rejecting an LLM analysis response is recoverable: metadata-dependency-only
                     // fallback below preserves declared dependencies, so this stays warning-visible
                     // instead of being emitted as a terminal workflow error.
-                    Self::log_recoverable_analysis_fallback(&e);
                     self.emit_recoverable_analysis_fallback_diagnostic_once(
                         changes,
                         in_flight_ids,
@@ -643,7 +642,16 @@ impl ParallelRunService {
         (key, message)
     }
 
-    /// Emit the recoverable fallback diagnostic as a deduplicated warning log event.
+    /// Emit the recoverable fallback diagnostic as a deduplicated warning.
+    ///
+    /// The tracing record and the runtime event are two representations of the same
+    /// operator-facing diagnostic, so both live behind a single
+    /// `DiagnosticDeduplicationKey::AnalysisFailure` decision. Emitting the tracing
+    /// record ahead of the gate would leave persistent logs accumulating repetitions
+    /// that the event stream already suppresses.
+    ///
+    /// The gate is evaluated even without an event sender so tracing-only callers get
+    /// the same bounded diagnostics.
     ///
     /// Successful metadata fallback is degraded execution, not a terminal failure, so
     /// this path never emits `ParallelEvent::Error`; terminal error events remain
@@ -655,19 +663,20 @@ impl ParallelRunService {
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         error: &str,
     ) {
-        let Some(tx) = event_tx else {
-            return;
-        };
         let (key, message) =
             Self::recoverable_analysis_fallback_diagnostic(changes, in_flight_ids, error);
+        let error = error.trim().to_string();
         let mut dedup = self.diagnostic_dedup.lock().await;
         dedup
             .emit_or_suppress(
                 key,
-                || async move {
-                    let _ = tx
-                        .send(ParallelEvent::Log(crate::events::LogEntry::warn(&message)))
-                        .await;
+                move || async move {
+                    Self::log_recoverable_analysis_fallback(&error);
+                    if let Some(tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(crate::events::LogEntry::warn(&message)))
+                            .await;
+                    }
                 },
                 || {
                     debug!("Suppressing repeated analysis fallback diagnostic");
@@ -832,6 +841,76 @@ mod tests {
             resolve_command: Some("echo resolve".to_string()),
             ..Default::default()
         }
+    }
+
+    /// Collects tracing records so tests can assert on the tracing observability
+    /// surface alongside the runtime event stream.
+    #[derive(Clone, Default)]
+    struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl CaptureLayer {
+        fn records(&self) -> Vec<(tracing::Level, String)> {
+            self.0.lock().expect("capture layer mutex").clone()
+        }
+
+        fn warnings_containing(&self, needle: &str) -> usize {
+            self.records()
+                .iter()
+                .filter(|(level, fields)| *level == tracing::Level::WARN && fields.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor {
+                fields: String,
+            }
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.fields
+                        .push_str(&format!("{}={:?};", field.name(), value));
+                }
+            }
+
+            let mut visitor = Visitor {
+                fields: String::new(),
+            };
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .expect("capture layer mutex")
+                .push((*event.metadata().level(), visitor.fields));
+        }
+    }
+
+    fn capture_tracing() -> (CaptureLayer, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        let capture = CaptureLayer::default();
+        // WARN and above is everything these assertions inspect. Keeping the filter
+        // tight also keeps tracing's process-wide max-level hint from opening up to
+        // TRACE while the guard is held, which would slow unrelated concurrent tests.
+        let subscriber =
+            tracing_subscriber::registry().with(capture.clone().with_filter(LevelFilter::WARN));
+        // `set_default` (not `with_default`) keeps the subscriber installed across
+        // `.await` points inside single-threaded `#[tokio::test]` runtimes.
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, guard)
     }
 
     #[test]
@@ -1330,6 +1409,7 @@ mod tests {
             create_test_change("gateway", vec![]),
         ];
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+        let (capture, _tracing_guard) = capture_tracing();
 
         for _ in 0..2 {
             service
@@ -1398,60 +1478,74 @@ mod tests {
             1,
             "a different queued set must remain visible: {warnings:?}"
         );
+
+        // The tracing surface must follow the same deduplication decision as the
+        // runtime event stream: one record per distinct signature, never more.
+        let records = capture.records();
+        assert!(
+            records
+                .iter()
+                .all(|(level, _)| *level != tracing::Level::ERROR),
+            "recoverable fallback must not emit ERROR-level tracing records: {records:?}"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(level, _)| *level == tracing::Level::WARN)
+                .count(),
+            3,
+            "tracing records must collapse equivalent signatures exactly like runtime events: {records:?}"
+        );
+        assert_eq!(
+            capture.warnings_containing("Missing change IDs in response"),
+            2,
+            "two repeats of one signature plus one changed queued context: {records:?}"
+        );
+        assert_eq!(
+            capture.warnings_containing("Duplicate change ID in order: route"),
+            1,
+            "a different rejection reason must emit its own tracing record: {records:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recoverable_analysis_fallback_dedupes_tracing_without_event_sender() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+        let changes = vec![create_test_change("route", vec!["policy"])];
+        let (capture, _tracing_guard) = capture_tracing();
+
+        for _ in 0..3 {
+            service
+                .emit_recoverable_analysis_fallback_diagnostic_once(
+                    &changes,
+                    &[],
+                    None,
+                    "Missing change IDs in response: [\"gateway\"]",
+                )
+                .await;
+        }
+
+        let records = capture.records();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(level, _)| *level == tracing::Level::WARN)
+                .count(),
+            1,
+            "tracing-only callers must still get exactly one record per signature: {records:?}"
+        );
     }
 
     #[test]
     fn test_recoverable_fallback_log_uses_warn_level_only() {
         use tracing::Level;
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::Layer;
 
-        #[derive(Clone, Default)]
-        struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(Level, String)>>>);
+        let (capture, guard) = capture_tracing();
+        ParallelRunService::log_recoverable_analysis_fallback(&"invalid dependency graph");
+        drop(guard);
 
-        impl<S> Layer<S> for CaptureLayer
-        where
-            S: tracing::Subscriber,
-        {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Visitor {
-                    fields: String,
-                }
-
-                impl tracing::field::Visit for Visitor {
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        self.fields
-                            .push_str(&format!("{}={:?};", field.name(), value));
-                    }
-                }
-
-                let mut visitor = Visitor {
-                    fields: String::new(),
-                };
-                event.record(&mut visitor);
-                self.0
-                    .lock()
-                    .expect("capture layer mutex")
-                    .push((*event.metadata().level(), visitor.fields));
-            }
-        }
-
-        let capture = CaptureLayer::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-
-        tracing::subscriber::with_default(subscriber, || {
-            ParallelRunService::log_recoverable_analysis_fallback(&"invalid dependency graph");
-        });
-
-        let events = capture.0.lock().expect("capture layer mutex");
+        let events = capture.records();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, Level::WARN);
         assert!(
