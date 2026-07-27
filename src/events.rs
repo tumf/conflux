@@ -22,6 +22,15 @@ use crate::orchestration::state::OrchestratorState;
 #[cfg(feature = "web-monitoring")]
 use utoipa::ToSchema;
 
+/// Message marker identifying a recoverable dependency-analysis fallback diagnostic.
+///
+/// Producers emit this prefix when an LLM analysis response is rejected but
+/// metadata-dependency-only analysis safely takes over, so scheduler execution
+/// continues. Consumers use it to keep the diagnostic non-fatal: degraded but
+/// live execution must never be presented as a stopped or failed run.
+pub const RECOVERABLE_ANALYSIS_FALLBACK_MARKER: &str =
+    "Dependency analysis degraded: falling back to metadata-dependency-only analysis";
+
 /// Log level for TUI logs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "web-monitoring", derive(ToSchema))]

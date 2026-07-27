@@ -3864,6 +3864,65 @@ mod tests {
     }
 
     // =========================================================================
+    // Tests for keep-TUI-running-after-recoverable-analysis-fallback
+    // =========================================================================
+
+    #[test]
+    fn analysis_fallback_running_status_header_keeps_running_controls() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.current_change = Some("change-a".to_string());
+        app.changes[0].display_status_cache = "applying".to_string();
+        app.orchestration_started_at = Some(std::time::Instant::now());
+        app.add_log(LogEntry::info("log"));
+        let fallback = format!(
+            "{}: error=Missing change IDs in response, queued=[\"change-a\"], in_flight=[]",
+            crate::events::RECOVERABLE_ANALYSIS_FALLBACK_MARKER
+        );
+
+        app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Error {
+            message: fallback,
+        });
+
+        let content = buffer_to_string(&render_buffer(&mut app, 100, 24));
+        assert!(
+            content.contains("Esc: stop"),
+            "status header must retain running controls after fallback:\n{content}"
+        );
+        assert!(
+            !content.contains(": retry, Ctrl+C: quit"),
+            "status header must not offer error-mode retry controls after fallback:\n{content}"
+        );
+        assert!(
+            content.contains("Elapsed"),
+            "status header must retain elapsed orchestration display:\n{content}"
+        );
+    }
+
+    #[test]
+    fn fatal_global_error_status_header_still_shows_retry_controls() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.current_change = Some("change-a".to_string());
+        app.orchestration_started_at = Some(std::time::Instant::now());
+        app.add_log(LogEntry::info("log"));
+
+        app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Error {
+            message: "Parallel execution failed: base worktree is unusable".to_string(),
+        });
+
+        let content = buffer_to_string(&render_buffer(&mut app, 100, 24));
+        assert!(
+            content.contains(": retry, Ctrl+C: quit"),
+            "fatal errors must still expose retry controls:\n{content}"
+        );
+        assert!(
+            !content.contains("Esc: stop"),
+            "fatal errors must not keep running controls:\n{content}"
+        );
+    }
+
+    // =========================================================================
     // Tests for split_remote_change_id
     // =========================================================================
 

@@ -612,7 +612,10 @@ impl ParallelRunService {
     /// The `AnalysisFailure` key identity is intentionally unchanged so repeated
     /// equivalent fallbacks keep collapsing into a single diagnostic while a
     /// different error or queued/in-flight set stays independently visible.
-    fn recoverable_analysis_fallback_diagnostic(
+    ///
+    /// Crate-visible so consumer-side tests can assert against the real producer
+    /// message instead of a hand-written copy that could silently drift.
+    pub(crate) fn recoverable_analysis_fallback_diagnostic(
         changes: &[Change],
         in_flight_ids: &[String],
         error: &str,
@@ -627,9 +630,14 @@ impl ParallelRunService {
             in_flight_ids: in_flight.clone(),
             error: normalized_error.clone(),
         };
+        // The shared marker keeps producer wording and consumer classification in sync:
+        // consumers (TUI) rely on it to route this diagnostic as non-fatal.
         let message = format!(
-            "Dependency analysis degraded: falling back to metadata-dependency-only analysis: error={}, queued={:?}, in_flight={:?}",
-            normalized_error, queued_ids, in_flight
+            "{}: error={}, queued={:?}, in_flight={:?}",
+            crate::events::RECOVERABLE_ANALYSIS_FALLBACK_MARKER,
+            normalized_error,
+            queued_ids,
+            in_flight
         );
         (key, message)
     }
