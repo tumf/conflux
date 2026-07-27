@@ -29,7 +29,14 @@ machine-readable payload, on its own line:
 - PASS:     `{"acceptance":"pass"}`
 - FAIL:     `{"acceptance":"fail","findings":["<evidence>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- STALLED HOLD (compatibility token): `{"acceptance":"gated"}`
+- STALLED HOLD (compatibility token) — **requires a structured blocker payload**:
+
+```json
+{"acceptance":"gated","blocker":{"category":"credential","evidence":["STAGING_API_KEY is unset in the verification environment"],"next_action":"provision STAGING_API_KEY, then retry acceptance","resumable":true}}
+```
+
+A bare `{"acceptance":"gated"}` is a **protocol error**, not a stalled hold. See
+"Structured stalled blocker contract" below.
 
 The JSON verdict is the canonical machine-readable contract. The Conflux runtime parser resolves it with priority over the legacy plain-text marker, including when the JSON verdict is wrapped inside a supported agent event payload and the runtime can unwrap the text. Do not rely on a specific agent runtime for this behavior.
 
@@ -39,8 +46,10 @@ standalone plain-text markers on their own line:
 - `ACCEPTANCE: PASS`
 - `ACCEPTANCE: FAIL`
 - `ACCEPTANCE: CONTINUE`
-- `ACCEPTANCE: GATED` (legacy fallback for a stalled implementation blocker hold)
-- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
+- `ACCEPTANCE: GATED` (parsed for compatibility only; it carries no structured
+  blocker, so on its own it is always a protocol error)
+- Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED` (same
+  compatibility-only meaning)
 
 These markers are kept as a fallback so existing runs do not break. New
 acceptance runs SHOULD emit the JSON verdict; when both appear, JSON wins.
@@ -124,12 +133,44 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Final OpenSpec validation, archive-gate validation, and archive readiness are not implementation tasks; if they need to be documented, require a non-checkbox `## Final Validation` or notes section.
 - A valid `Implementation Blocker #<n>` with concrete evidence and unblock actions creates a stalled acceptance hold for operators and lifecycle/status displays.
 - Recoverable infrastructure blockers are non-terminal stalled holds, not rejection evidence. Examples include Docker daemon/image pull failures, DNS/network timeouts, package registry outages, missing non-mockable credentials, port conflicts, and pending managed verification jobs.
-- For the current runtime compatibility period, emit `{"acceptance":"gated"}` and the legacy fallback marker `ACCEPTANCE: GATED` only as protocol handoff tokens for that stalled hold.
-- Legacy `blocked` acceptance verdict is input compatibility; `gated` is also compatibility/protocol terminology and MUST NOT be treated as operator-facing lifecycle taxonomy.
+- Legacy `blocked` acceptance verdict is input compatibility; `gated` is also compatibility/protocol terminology and MUST NOT be treated as operator-facing lifecycle taxonomy. The operator-facing lifecycle term is `stalled`.
 - Do not require or create terminal `REJECTED.md` evidence for recoverable infrastructure blockers unless independent evidence proves the change intent is invalid, obsolete, contradictory, or constitution-violating.
 - Repository-fixable vs stalled-hold rubric:
   - `FAIL`: repository-only autonomous work (code/tests/spec/tasks/docs in this repo) can resolve the issue.
-  - Stalled hold via compatibility token `{"acceptance":"gated"}`: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, missing upstream constraint resolution, or recoverable infrastructure/credential/pending verification blocker).
+  - Stalled hold via a structured `gated` payload: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, missing upstream constraint resolution, or recoverable infrastructure/credential/pending verification blocker).
+
+## Structured stalled blocker contract
+
+A stalled hold pauses the whole workflow, so it must be earned with evidence.
+The runtime accepts one only when the `gated` verdict carries a `blocker` object
+with **all four** required fields:
+
+| Field | Requirement |
+| --- | --- |
+| `category` | Exactly one of: `credential`, `external_approval`, `policy`, `external_service`, `pending_verification`, `infrastructure`, `schema_incompatibility`, `human_decision` |
+| `evidence` | Non-empty array of concrete observed evidence strings |
+| `next_action` | Non-empty string describing what unblocks the hold |
+| `resumable` | Boolean — whether acceptance can resume once the prerequisite is met |
+
+Optional: `prerequisite_owner` (owning team/role) and `evidence_ids` (stable
+identifiers).
+
+State explicitly why repository-only apply work cannot resolve the prerequisite.
+
+**You choose the category from what you actually observed.** The runtime never
+infers one from your prose: writing "credential", "token", or "auth" in a
+narrative does not produce category `credential`, and it never will.
+
+Anything short of the full payload — a bare `{"acceptance":"gated"}`, a plain
+`ACCEPTANCE: GATED` line, an unsupported category, an empty `evidence` array, a
+missing `next_action`, or a missing `resumable` — is an **acceptance protocol
+error**. The runtime does not stall on it. It re-runs acceptance within a fixed
+retry budget and then reports a terminal protocol error. If you cannot supply
+all four fields from real evidence, emit `FAIL` or `CONTINUE` instead.
+
+Never create `APPLY_BLOCKED`, a marker file, or any other runtime artifact under
+the change directory. The runtime records stalled holds outside the worktree and
+keeps the worktree clean.
 - For behavior-changing work, missing/ambiguous verification planning is FAIL (not CONTINUE)
 
 ## Portable Interface Constraint

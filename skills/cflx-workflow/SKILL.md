@@ -65,14 +65,23 @@ Use these outcomes:
 - `pass`: all requirements and active task claims have repository evidence.
 - `fail`: repository-only work can resolve the finding.
 - `continue`: review is incomplete and another acceptance attempt is required.
-- `gated`: compatibility token for a valid non-terminal stalled hold that repository-only apply work cannot resolve.
+- `gated`: compatibility token for a valid non-terminal stalled hold that repository-only apply work cannot resolve. It is only a stalled hold when accompanied by a structured `blocker` payload; a bare token is a protocol error.
 
 The canonical verdict is strict JSON on its own line:
 
 - `{"acceptance":"pass"}`
 - `{"acceptance":"fail","findings":["<evidence>"]}`
 - `{"acceptance":"continue"}`
-- `{"acceptance":"gated"}`
+- `{"acceptance":"gated","blocker":{"category":"<supported>","evidence":["<concrete>"],"next_action":"<unblock>","resumable":true}}`
+
+Supported blocker categories: `credential`, `external_approval`, `policy`,
+`external_service`, `pending_verification`, `infrastructure`,
+`schema_incompatibility`, `human_decision`. Choose one from observed evidence —
+the runtime never infers a category from prose. A bare `{"acceptance":"gated"}`
+or plain `ACCEPTANCE: GATED`, an unsupported category, empty evidence, or a
+missing `next_action`/`resumable` is an acceptance protocol error: the runtime
+retries acceptance within a fixed budget and then reports a terminal protocol
+error. Emit `FAIL` or `CONTINUE` instead when you cannot supply all four fields.
 
 During compatibility rollout, emit the matching legacy marker as the next and final line:
 
@@ -83,7 +92,7 @@ During compatibility rollout, emit the matching legacy marker as the next and fi
 
 `ACCEPTANCE: BLOCKED` is accepted only as legacy input compatibility. Do not wrap verdicts in headings, blockquotes, bullets, emphasis, or code fences, and do not append text to verdict lines.
 
-A valid `Implementation Blocker` produces a stalled hold only when repository-only work cannot resolve it. Recoverable infrastructure failures remain non-terminal stalled holds. Missing or ambiguous verification planning, false unit-test claims, dirty worktrees, and missing repository implementation are FAIL findings.
+A valid `Implementation Blocker` produces a stalled hold only when repository-only work cannot resolve it and the structured blocker payload is supplied. Recoverable infrastructure failures remain non-terminal stalled holds. Never create `APPLY_BLOCKED` or any other runtime marker under the change directory; the runtime records stalled holds outside the worktree. Missing or ambiguous verification planning, false unit-test claims, dirty worktrees, and missing repository implementation are FAIL findings.
 
 ## Archive
 

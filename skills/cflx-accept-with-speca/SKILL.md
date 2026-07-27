@@ -33,7 +33,10 @@ Primary verdict:
 - PASS: `{"acceptance":"pass"}`
 - FAIL: `{"acceptance":"fail","findings":["<evidence>"]}`
 - CONTINUE: `{"acceptance":"continue"}`
-- Stalled hold compatibility handoff: `{"acceptance":"gated"}`
+- Stalled hold compatibility handoff — requires the structured blocker payload
+  defined by `cflx-accept`:
+  `{"acceptance":"gated","blocker":{"category":"<supported>","evidence":["<concrete>"],"next_action":"<unblock>","resumable":true}}`.
+  A bare `{"acceptance":"gated"}` is a protocol error, not a stalled hold.
 
 Backward-compatible fallback markers:
 
@@ -43,7 +46,7 @@ Backward-compatible fallback markers:
 - `ACCEPTANCE: GATED`
 - Legacy fallback accepted during migration: `ACCEPTANCE: BLOCKED`
 
-Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the portable Conflux acceptance interface. Valid Implementation Blockers still create stalled acceptance holds and use the shared `{"acceptance":"gated"}` compatibility handoff until parser support for a `stalled` verdict exists. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
+Use the standard Conflux acceptance outcomes only: `pass`, `fail`, `continue`, or the current stalled-hold compatibility token `gated`. For blocking SPECA/property failures that are repository-fixable, return the standard JSON `fail` verdict with actionable `findings` under the portable Conflux acceptance interface. Valid Implementation Blockers still create stalled acceptance holds and use the shared `gated` compatibility handoff until parser support for a `stalled` verdict exists, but only with the full structured blocker payload (explicit supported `category`, non-empty `evidence`, `next_action`, and `resumable`). Choose the category from observed evidence; the runtime never infers one from prose, and it never accepts a bare token as a stalled hold. Do not emit any SPECA-specific terminal marker, alternate verdict line, alternate schema, or extra machine-readable verdict object. During JSON rollout, follow `cflx-accept` transition behavior by emitting JSON first and the matching legacy marker second as the final two lines when compatibility with older runtimes is required.
 
 ## Verification Completion Ownership
 
@@ -262,7 +265,11 @@ For each high-value property:
 - **Blocking**: Concrete property failure with repository evidence. Map to standard acceptance `fail` with a `findings` item naming the property, evidence path/function/line when available, and required autonomous fix.
 - **Advisory**: Non-blocking risk or improvement. Mention in reasoning if useful, but do not force failure by itself.
 - **Incomplete**: Repository-only work/checks are still needed. Treat as `fail` when the agent can resolve it by editing code/tests/spec/tasks/docs.
-- **Stalled hold**: Use only when the standard acceptance blocker rubric allows it and repository-only work cannot resolve the issue. During the compatibility period, emit the shared `{"acceptance":"gated"}` verdict for this hold; do not introduce `{"acceptance":"stalled"}` or any SPECA-specific outcome.
+- **Stalled hold**: Use only when the standard acceptance blocker rubric allows it and repository-only work cannot resolve the issue. During the compatibility period, emit the shared `gated` verdict *with* its structured blocker payload for this hold; do not introduce `{"acceptance":"stalled"}` or any SPECA-specific outcome.
+
+Never create `APPLY_BLOCKED`, a marker file, or any other runtime artifact under
+the change directory. The runtime records stalled holds outside the worktree and
+keeps the worktree clean.
 
 ### 5. Emit one Conflux verdict
 

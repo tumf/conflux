@@ -2958,28 +2958,40 @@ mod tests {
         );
     }
 
+    /// The explicit category reaches reducer state verbatim, and prose never
+    /// overrides it — the same narrative under a different category must produce
+    /// a different stalled classification.
     #[test]
-    fn test_representative_infrastructure_blockers_map_to_stalled_categories() {
+    fn test_explicit_blocker_categories_reach_stalled_metadata_without_prose_inference() {
+        // Every message below contains words the old classifier keyed on
+        // (docker, daemon, timeout, credential, still running). None of them may
+        // change the category.
         let cases = [
             (
+                "credential",
                 "docker image pull failed: lookup registry-1.docker.io i/o timeout",
-                "infrastructure",
             ),
-            ("Cannot connect to the Docker daemon", "infrastructure"),
-            ("missing non-mockable external credential", "credential"),
-            ("package registry timeout fetching crate", "infrastructure"),
+            ("infrastructure", "missing non-mockable external credential"),
             (
+                "human_decision",
                 "agent-exec managed verification job still running",
-                "pending_verification",
+            ),
+            ("external_approval", "Cannot connect to the Docker daemon"),
+            (
+                "schema_incompatibility",
+                "package registry timeout fetching crate",
             ),
         ];
 
-        for (idx, (message, expected_category)) in cases.iter().enumerate() {
+        for (idx, (explicit_category, message)) in cases.iter().enumerate() {
             let change_id = format!("c-{idx}");
             let mut state = OrchestratorState::new(vec![change_id.clone()], 0);
             state.apply_execution_event(&crate::events::ExecutionEvent::AcceptanceGated {
                 change_id: change_id.clone(),
-                blocker: crate::events::StalledBlocker::acceptance_infrastructure(*message),
+                blocker: crate::events::StalledBlocker::acceptance_external(
+                    *explicit_category,
+                    *message,
+                ),
             });
 
             let runtime = state
@@ -2989,7 +3001,8 @@ mod tests {
             assert!(matches!(runtime.terminal, TerminalState::None));
             assert_eq!(
                 runtime.blocked_metadata.blocker_reason.as_deref(),
-                Some(format!("acceptance-gated:{expected_category}").as_str())
+                Some(format!("acceptance-gated:{explicit_category}").as_str()),
+                "the explicit category must survive verbatim for {message}"
             );
             assert!(
                 runtime
@@ -3049,7 +3062,8 @@ mod tests {
 
         state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
             change_id: "c".to_string(),
-            blocker: StalledBlocker::acceptance_infrastructure(
+            blocker: StalledBlocker::acceptance_external(
+                "pending_verification",
                 "docker image pull failed: lookup registry-1.docker.io i/o timeout",
             ),
         });
@@ -3063,7 +3077,7 @@ mod tests {
         assert!(matches!(runtime.terminal, TerminalState::None));
         assert_eq!(
             runtime.blocked_metadata.blocker_reason.as_deref(),
-            Some("acceptance-gated:infrastructure")
+            Some("acceptance-gated:pending_verification")
         );
         let unblock = runtime
             .blocked_metadata

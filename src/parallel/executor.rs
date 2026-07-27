@@ -1254,7 +1254,7 @@ pub async fn execute_acceptance_in_workspace(
     acceptance_tail_injected: &Arc<Mutex<std::collections::HashMap<String, bool>>>,
     acceptance_history: &Arc<Mutex<crate::history::AcceptanceHistory>>,
     base_branch: Option<&str>,
-    protocol_retry: Option<crate::orchestration::acceptance::MissingVerdictRetry>,
+    protocol_retry: Option<crate::orchestration::acceptance::AcceptanceProtocolRetry>,
 ) -> Result<(crate::orchestration::AcceptanceResult, u32)> {
     use crate::acceptance::{parse_acceptance_output, AcceptanceResult as ParseResult};
 
@@ -1856,14 +1856,22 @@ pub async fn execute_acceptance_in_workspace(
                 attempt_number,
             ))
         }
-        ParseResult::Gated => {
-            info!("Acceptance gated for: {}", change_id);
+        ParseResult::Stalled { blocker } => {
+            info!(
+                "Acceptance reported a validated external blocker for: {} (category {})",
+                change_id, blocker.category
+            );
             let attempt_number = agent.next_acceptance_attempt_number(change_id);
+            let mut findings = vec![format!(
+                "Validated external blocker (category {}): {}",
+                blocker.category, blocker.next_action
+            )];
+            findings.extend(blocker.evidence.iter().cloned());
             let attempt = crate::history::AcceptanceAttempt {
                 attempt: attempt_number,
                 passed: false,
                 duration: start_time.elapsed(),
-                findings: Some(vec!["Implementation blocker detected".to_string()]),
+                findings: Some(findings),
                 exit_code: status.code(),
                 stdout_tail: stdout_tail.clone(),
                 stderr_tail: stderr_tail.clone(),
@@ -1879,9 +1887,10 @@ pub async fn execute_acceptance_in_workspace(
             if let Some(ref tx) = event_tx {
                 let _ = tx
                     .send(ParallelEvent::Log(
-                        crate::events::LogEntry::warn(
-                            "Acceptance gated - implementation blocker detected",
-                        )
+                        crate::events::LogEntry::warn(format!(
+                            "Acceptance stalled ({}) on a validated external blocker: {}",
+                            blocker.category, blocker.next_action
+                        ))
                         .with_change_id(change_id)
                         .with_operation("acceptance")
                         .with_iteration(attempt_number),
@@ -1895,7 +1904,60 @@ pub async fn execute_acceptance_in_workspace(
             }
 
             Ok((
-                crate::orchestration::AcceptanceResult::Gated,
+                crate::orchestration::AcceptanceResult::Stalled { blocker },
+                attempt_number,
+            ))
+        }
+        ParseResult::BareBlocker { rejection } => {
+            // A gated compatibility token with no validated blocker payload is a
+            // protocol error. The caller owns the bounded retry budget, so this
+            // arm emits no stalled lifecycle transition and no blocker category.
+            warn!(
+                "Acceptance emitted a bare blocker compatibility token for {}: {}",
+                change_id,
+                rejection.reason()
+            );
+            let attempt_number = agent.next_acceptance_attempt_number(change_id);
+            let attempt = crate::history::AcceptanceAttempt {
+                attempt: attempt_number,
+                passed: false,
+                duration: start_time.elapsed(),
+                findings: Some(vec![
+                    crate::orchestration::acceptance::BARE_BLOCKER_DIAGNOSTIC.to_string(),
+                    rejection.reason(),
+                ]),
+                exit_code: status.code(),
+                stdout_tail: stdout_tail.clone(),
+                stderr_tail: stderr_tail.clone(),
+                commit_hash: revision_to_history_commit_hash(&end_revision),
+            };
+            agent.record_acceptance_attempt(change_id, attempt.clone());
+            acceptance_history.lock().await.record(change_id, attempt);
+            acceptance_tail_injected.lock().await.remove(change_id);
+
+            if let Some(ref tx) = event_tx {
+                let _ = tx
+                    .send(ParallelEvent::Log(
+                        crate::events::LogEntry::warn(format!(
+                            "Acceptance emitted a gated compatibility token without a validated \
+                             structured blocker ({}); a stalled hold requires an explicit supported \
+                             category, concrete evidence, next action, and resumability.",
+                            rejection.reason()
+                        ))
+                        .with_change_id(change_id)
+                        .with_operation("acceptance")
+                        .with_iteration(attempt_number),
+                    ))
+                    .await;
+                let _ = tx
+                    .send(ParallelEvent::AcceptanceCompleted {
+                        change_id: change_id.to_string(),
+                    })
+                    .await;
+            }
+
+            Ok((
+                crate::orchestration::AcceptanceResult::BareBlocker { rejection },
                 attempt_number,
             ))
         }

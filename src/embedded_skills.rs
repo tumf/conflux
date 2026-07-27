@@ -246,6 +246,98 @@ mod tests {
         }
     }
 
+    /// Both acceptance skills must teach the structured blocker contract that
+    /// the parser actually enforces, and must not ask the reviewer to create a
+    /// change-directory marker.
+    #[test]
+    fn acceptance_skills_require_the_structured_stalled_blocker_contract() {
+        for (label, content) in [
+            ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
+            ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
+        ] {
+            // The four required fields the runtime validates.
+            for field in ["category", "evidence", "next_action", "resumable"] {
+                assert!(
+                    content.contains(field),
+                    "{label} must document the required blocker field `{field}`"
+                );
+            }
+            assert!(
+                content.contains("protocol error"),
+                "{label} must state that a bare gated token is a protocol error"
+            );
+            assert!(
+                content.contains("structured blocker"),
+                "{label} must name the structured blocker payload"
+            );
+            // Positive contract: every mirrored acceptance skill must carry the
+            // explicit prohibition. A negated disjunction here would be vacuous —
+            // a mirror that *instructs* marker creation but simply omits the
+            // sentence would satisfy it.
+            assert!(
+                content.contains("Never create `APPLY_BLOCKED`"),
+                "{label} must forbid change-directory markers outright"
+            );
+            assert!(
+                content.contains(
+                    "The runtime records stalled holds outside the worktree and\nkeeps the \
+                     worktree clean."
+                ),
+                "{label} must state that stalled holds live outside the worktree"
+            );
+            for forbidden in [
+                "create a marker under the change directory",
+                "write `APPLY_BLOCKED`",
+                "create `APPLY_BLOCKED`\n",
+            ] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{label} must not instruct the reviewer to create a marker ({forbidden:?})"
+                );
+            }
+        }
+
+        // The primary skill carries the full contract table and category list.
+        for category in crate::acceptance::SUPPORTED_BLOCKER_CATEGORIES {
+            assert!(
+                CFLX_ACCEPT_SKILL_MD.contains(category),
+                "cflx-accept must list supported category `{category}`"
+            );
+        }
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("Never create `APPLY_BLOCKED`"),
+            "cflx-accept must forbid change-directory markers outright"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("The runtime never\ninfers one from your prose"),
+            "cflx-accept must state that the runtime does not infer categories"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("emit `FAIL` or `CONTINUE` instead"),
+            "cflx-accept must route incomplete evidence back to FAIL/CONTINUE"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("The operator-facing lifecycle term is `stalled`"),
+            "cflx-accept must keep `stalled` as the lifecycle term"
+        );
+    }
+
+    /// The embedded copies and the on-disk sources must not drift: the skill
+    /// files shipped in the binary are what the reviewer actually reads.
+    #[test]
+    fn acceptance_skill_mirrors_match_the_repository_sources() {
+        assert_eq!(
+            CFLX_ACCEPT_SKILL_MD,
+            include_str!("../skills/cflx-accept/SKILL.md"),
+            "embedded cflx-accept must match skills/cflx-accept/SKILL.md"
+        );
+        assert_eq!(
+            CFLX_ACCEPT_WITH_SPECA_SKILL_MD,
+            include_str!("../skills/cflx-accept-with-speca/SKILL.md"),
+            "embedded SPECA acceptance skill must match its repository source"
+        );
+    }
+
     #[test]
     fn test_cflx_accept_skill_defines_portable_contract() {
         for required in &[
@@ -255,7 +347,7 @@ mod tests {
             "{\"acceptance\":\"pass\"}",
             "{\"acceptance\":\"fail\",\"findings\":[\"<evidence>\"]}",
             "{\"acceptance\":\"continue\"}",
-            "{\"acceptance\":\"gated\"}",
+            "\"acceptance\":\"gated\"",
             "ACCEPTANCE: PASS",
             "ACCEPTANCE: FAIL",
             "ACCEPTANCE: CONTINUE",
@@ -296,7 +388,7 @@ mod tests {
             "{\"acceptance\":\"pass\"}",
             "{\"acceptance\":\"fail\",\"findings\":[\"<evidence>\"]}",
             "{\"acceptance\":\"continue\"}",
-            "{\"acceptance\":\"gated\"}",
+            "\"acceptance\":\"gated\"",
             "ACCEPTANCE: PASS",
             "ACCEPTANCE: FAIL",
             "ACCEPTANCE: CONTINUE",
@@ -719,7 +811,7 @@ mod tests {
                 "{label} must describe valid Implementation Blockers as stalled holds"
             );
             assert!(
-                content.contains("compatibility") && content.contains("{\"acceptance\":\"gated\"}"),
+                content.contains("compatibility") && content.contains("\"acceptance\":\"gated\""),
                 "{label} must keep gated as a parser-compatible handoff token"
             );
             assert!(

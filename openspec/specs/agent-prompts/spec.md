@@ -282,45 +282,43 @@ Implementation Blocker の記録は以下を満たさなければならない（
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-acceptance プロンプトと配布 acceptance 関連 skill は Implementation Blocker を stalled acceptance hold として説明しなければならない（MUST）。妥当な blocker については、互換期間中の protocol handoff として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力してもよい（MAY）。ただし、この verdict は user-facing lifecycle/status としての `gated` を意味してはならず、runtime は paused state を `stalled` として扱わなければならない（MUST）。parser が別 change で対応するまで、配布 guidance は final machine-readable verdict として `{"acceptance":"stalled"}` を出力するよう指示してはならない（MUST NOT）。
+Acceptance prompts and distributed Acceptance skills MUST distinguish repository-fixable findings, validated stalled blockers, and protocol-invalid bare blocker verdicts.
 
-acceptance は以下を満たさなければならない（MUST）。
-- `Implementation Blocker` の内容が不十分または誤りの場合は `ACCEPTANCE: FAIL` を出力し、follow-up タスクを tasks.md に追加する
-- acceptance blocker verdict の場合は blocker の概要を簡潔に出力する
-- repo 内編集・テスト更新・spec/tasks/proposal 修正など、AI がこの repository 内の変更だけで自律的に解決できる問題は `FAIL` として返さなければならない（MUST）。
-- 人判断待ち、repo 外の設定変更、外部依存の解消待ち、追加情報待ち、または apply を再実行しても repository 変更だけでは解決不能な blocker は acceptance blocker verdict として返さなければならない（MUST）。
-- blocker verdict を返さず `FAIL` を返した場合、その finding は apply へ戻って repository 作業を行うことで解消可能であることを意味しなければならない（MUST）。
-- apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を stalled hold のまま保留するか」を区別できなければならない
-- 互換期間中に旧 `blocked` acceptance verdict や `gated` verdict を runtime が受理できても、新規 lifecycle/status contract は `stalled` を operator-facing term として使わなければならない（MUST）
-- 配布 skill と command mirror は `gated` を primary rubric label や lifecycle/status 名として説明してはならず、stalled hold の互換 protocol token としてのみ説明しなければならない（MUST）
+A stalled handoff MUST include an explicit supported category, concrete non-empty evidence, next action, and resumability, and MUST state why repository-only Apply work cannot resolve the prerequisite. During compatibility migration, the machine-readable verdict MAY use the parser-supported `gated` token only when the structured blocker payload accompanies it. Bare `{"acceptance":"gated"}`, `ACCEPTANCE: GATED`, or legacy `blocked` input is a protocol error subject to bounded Acceptance retry and MUST NOT be presented as sufficient stalled evidence.
 
-#### Scenario: acceptance emits blocker verdict for a valid implementation blocker
+Guidance MUST use `stalled` for user-facing lifecycle taxonomy, MUST NOT instruct Acceptance to create `APPLY_BLOCKED` or another runtime marker under the change directory, and MUST NOT infer credential, infrastructure, or other categories from narrative prose. Repository-fixable code, tests, specs, tasks, documentation, or mockable dependencies remain FAIL findings returned to Apply.
 
-- **GIVEN** acceptance が妥当な Implementation Blocker を確認した
-- **AND** その blocker は repository 内編集だけでは解決できない
-- **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は stalled acceptance hold の compatibility handoff として解釈される
-- **AND** 互換 token は現在の parser が受理する `{"acceptance":"gated"}` / `ACCEPTANCE: GATED` である
-- **AND** runtime/user-facing status は `stalled` として扱われる
-- **AND** blocker の概要が添えられる
-- **AND** reviewer は parser support が入るまで `{"acceptance":"stalled"}` を出力しない
+#### Scenario: Acceptance emits structured blocker handoff
 
-#### Scenario: acceptance uses fail for repository-fixable issues
+- **GIVEN** Acceptance verifies a prerequisite that repository-only work cannot resolve
+- **WHEN** the reviewer emits a stalled compatibility handoff
+- **THEN** it supplies an explicit supported category, concrete evidence, next action, and resumability with the machine-readable verdict
+- **AND** runtime/user-facing status is `stalled`
+- **AND** the reviewer does not create a marker in the change directory
 
-- **GIVEN** acceptance が code / tests / tasks / spec の repository 内修正で解決できる問題を見つけた
-- **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は `fail` を使う
-- **AND** finding は apply が実行可能な repository-local follow-up として記録される
+#### Scenario: bare GATED is corrected by retry
 
-#### Scenario: acceptance uses stalled hold for infrastructure verification blocker
+- **GIVEN** an Acceptance response emits bare `gated` or legacy `blocked` without the required blocker fields
+- **WHEN** runtime invokes the bounded corrective retry
+- **THEN** prompt guidance identifies the prior output as protocol-incomplete
+- **AND** it asks for one canonical repository-fixable verdict or one fully structured stalled blocker
+- **AND** it does not suggest a category or fabricate evidence for the reviewer
 
-- **GIVEN** acceptance が必須 verification gate を実行した
-- **AND** gate failed because of external/local infrastructure unavailability such as Docker image pull DNS timeout, Docker daemon unavailable, registry timeout, third-party outage, or missing non-mockable external credential
-- **AND** repository-local code, tests, specs, or tasks cannot resolve that blocker
-- **WHEN** reviewer emits a machine-readable verdict
-- **THEN** verdict is the stalled-hold compatibility handoff `{"acceptance":"gated"}` / `ACCEPTANCE: GATED`
-- **AND** guidance states this must be runtime/user-facing `stalled`, not terminal `rejected`
-- **AND** guidance includes next action to restore the missing infrastructure or credential and rerun the gate
+#### Scenario: Acceptance uses FAIL for repository-fixable issues
+
+- **GIVEN** Acceptance finds code, tests, tasks, specs, documentation, or a mockable dependency that repository work can resolve
+- **WHEN** the reviewer emits a machine-readable verdict
+- **THEN** it uses FAIL with concrete current-worktree findings
+- **AND** no stalled state or change-directory blocker marker is requested
+
+#### Scenario: non-mockable credential blocker retains explicit evidence
+
+- **GIVEN** a required credential is non-mockable for the declared verification phase
+- **AND** Acceptance identifies the credential name or owning prerequisite and the exact rerun action
+- **WHEN** it emits a structured blocker
+- **THEN** it explicitly selects category `credential`
+- **AND** it includes the concrete evidence and next action
+- **AND** runtime does not derive the category merely because narrative text contains credential, token, or auth
 
 ### Requirement: Prompts MUST apply a mock-first external dependency policy
 
@@ -753,45 +751,43 @@ The skill MUST NOT require changing `acceptance_command` merely to opt into SPEC
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-acceptance プロンプトと配布 acceptance 関連 skill は Implementation Blocker を stalled acceptance hold として説明しなければならない（MUST）。妥当な blocker については、互換期間中の protocol handoff として `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` を出力してもよい（MAY）。ただし、この verdict は user-facing lifecycle/status としての `gated` を意味してはならず、runtime は paused state を `stalled` として扱わなければならない（MUST）。parser が別 change で対応するまで、配布 guidance は final machine-readable verdict として `{"acceptance":"stalled"}` を出力するよう指示してはならない（MUST NOT）。
+Acceptance prompts and distributed Acceptance skills MUST distinguish repository-fixable findings, validated stalled blockers, and protocol-invalid bare blocker verdicts.
 
-acceptance は以下を満たさなければならない（MUST）。
-- `Implementation Blocker` の内容が不十分または誤りの場合は `ACCEPTANCE: FAIL` を出力し、follow-up タスクを tasks.md に追加する
-- acceptance blocker verdict の場合は blocker の概要を簡潔に出力する
-- repo 内編集・テスト更新・spec/tasks/proposal 修正など、AI がこの repository 内の変更だけで自律的に解決できる問題は `FAIL` として返さなければならない（MUST）。
-- 人判断待ち、repo 外の設定変更、外部依存の解消待ち、追加情報待ち、または apply を再実行しても repository 変更だけでは解決不能な blocker は acceptance blocker verdict として返さなければならない（MUST）。
-- blocker verdict を返さず `FAIL` を返した場合、その finding は apply へ戻って repository 作業を行うことで解消可能であることを意味しなければならない（MUST）。
-- apply-generated recoverable blocker を審査するレビュー経路では、「change を reject するか」と「change を stalled hold のまま保留するか」を区別できなければならない
-- 互換期間中に旧 `blocked` acceptance verdict や `gated` verdict を runtime が受理できても、新規 lifecycle/status contract は `stalled` を operator-facing term として使わなければならない（MUST）
-- 配布 skill と command mirror は `gated` を primary rubric label や lifecycle/status 名として説明してはならず、stalled hold の互換 protocol token としてのみ説明しなければならない（MUST）
+A stalled handoff MUST include an explicit supported category, concrete non-empty evidence, next action, and resumability, and MUST state why repository-only Apply work cannot resolve the prerequisite. During compatibility migration, the machine-readable verdict MAY use the parser-supported `gated` token only when the structured blocker payload accompanies it. Bare `{"acceptance":"gated"}`, `ACCEPTANCE: GATED`, or legacy `blocked` input is a protocol error subject to bounded Acceptance retry and MUST NOT be presented as sufficient stalled evidence.
 
-#### Scenario: acceptance emits blocker verdict for a valid implementation blocker
+Guidance MUST use `stalled` for user-facing lifecycle taxonomy, MUST NOT instruct Acceptance to create `APPLY_BLOCKED` or another runtime marker under the change directory, and MUST NOT infer credential, infrastructure, or other categories from narrative prose. Repository-fixable code, tests, specs, tasks, documentation, or mockable dependencies remain FAIL findings returned to Apply.
 
-- **GIVEN** acceptance が妥当な Implementation Blocker を確認した
-- **AND** その blocker は repository 内編集だけでは解決できない
-- **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は stalled acceptance hold の compatibility handoff として解釈される
-- **AND** 互換 token は現在の parser が受理する `{"acceptance":"gated"}` / `ACCEPTANCE: GATED` である
-- **AND** runtime/user-facing status は `stalled` として扱われる
-- **AND** blocker の概要が添えられる
-- **AND** reviewer は parser support が入るまで `{"acceptance":"stalled"}` を出力しない
+#### Scenario: Acceptance emits structured blocker handoff
 
-#### Scenario: acceptance uses fail for repository-fixable issues
+- **GIVEN** Acceptance verifies a prerequisite that repository-only work cannot resolve
+- **WHEN** the reviewer emits a stalled compatibility handoff
+- **THEN** it supplies an explicit supported category, concrete evidence, next action, and resumability with the machine-readable verdict
+- **AND** runtime/user-facing status is `stalled`
+- **AND** the reviewer does not create a marker in the change directory
 
-- **GIVEN** acceptance が code / tests / tasks / spec の repository 内修正で解決できる問題を見つけた
-- **WHEN** reviewer が machine-readable verdict を返す
-- **THEN** verdict は `fail` を使う
-- **AND** finding は apply が実行可能な repository-local follow-up として記録される
+#### Scenario: bare GATED is corrected by retry
 
-#### Scenario: acceptance uses stalled hold for infrastructure verification blocker
+- **GIVEN** an Acceptance response emits bare `gated` or legacy `blocked` without the required blocker fields
+- **WHEN** runtime invokes the bounded corrective retry
+- **THEN** prompt guidance identifies the prior output as protocol-incomplete
+- **AND** it asks for one canonical repository-fixable verdict or one fully structured stalled blocker
+- **AND** it does not suggest a category or fabricate evidence for the reviewer
 
-- **GIVEN** acceptance が必須 verification gate を実行した
-- **AND** gate failed because of external/local infrastructure unavailability such as Docker image pull DNS timeout, Docker daemon unavailable, registry timeout, third-party outage, or missing non-mockable external credential
-- **AND** repository-local code, tests, specs, or tasks cannot resolve that blocker
-- **WHEN** reviewer emits a machine-readable verdict
-- **THEN** verdict is the stalled-hold compatibility handoff `{"acceptance":"gated"}` / `ACCEPTANCE: GATED`
-- **AND** guidance states this must be runtime/user-facing `stalled`, not terminal `rejected`
-- **AND** guidance includes next action to restore the missing infrastructure or credential and rerun the gate
+#### Scenario: Acceptance uses FAIL for repository-fixable issues
+
+- **GIVEN** Acceptance finds code, tests, tasks, specs, documentation, or a mockable dependency that repository work can resolve
+- **WHEN** the reviewer emits a machine-readable verdict
+- **THEN** it uses FAIL with concrete current-worktree findings
+- **AND** no stalled state or change-directory blocker marker is requested
+
+#### Scenario: non-mockable credential blocker retains explicit evidence
+
+- **GIVEN** a required credential is non-mockable for the declared verification phase
+- **AND** Acceptance identifies the credential name or owning prerequisite and the exact rerun action
+- **WHEN** it emits a structured blocker
+- **THEN** it explicitly selects category `credential`
+- **AND** it includes the concrete evidence and next action
+- **AND** runtime does not derive the category merely because narrative text contains credential, token, or auth
 
 ### Requirement: Acceptance skills MUST define a JSON-primary verdict contract
 

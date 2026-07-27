@@ -14,7 +14,7 @@ use crate::error::{OrchestratorError, Result};
 use crate::history::{
     AcceptanceAttempt, AcceptanceHistory, ApplyHistory, ArchiveHistory, OutputCollector,
 };
-use crate::orchestration::acceptance::MissingVerdictRetry;
+use crate::orchestration::acceptance::AcceptanceProtocolRetry;
 use crate::process_manager::{ManagedChild, StreamingChildHandle};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -701,7 +701,7 @@ impl AgentRunner {
         change_id: &str,
         cwd: Option<&Path>,
         base_branch: Option<&str>,
-        protocol_retry: Option<MissingVerdictRetry>,
+        protocol_retry: Option<AcceptanceProtocolRetry>,
     ) -> Result<(ManagedChild, mpsc::Receiver<OutputLine>, Instant, String)> {
         let start = Instant::now();
         let template = self.config.get_acceptance_command()?;
@@ -793,7 +793,7 @@ impl AgentRunner {
         ai_runner: &crate::ai_command_runner::AiCommandRunner,
         cwd: Option<&Path>,
         base_branch: Option<&str>,
-        protocol_retry: Option<MissingVerdictRetry>,
+        protocol_retry: Option<AcceptanceProtocolRetry>,
     ) -> Result<(
         StreamingChildHandle,
         mpsc::Receiver<OutputLine>,
@@ -874,7 +874,7 @@ impl AgentRunner {
     fn build_missing_verdict_continuation_context(
         &self,
         change_id: &str,
-        protocol_retry: Option<MissingVerdictRetry>,
+        protocol_retry: Option<AcceptanceProtocolRetry>,
         stdout_tail: Option<&str>,
         stderr_tail: Option<&str>,
     ) -> String {

@@ -135,7 +135,9 @@ pub async fn run_orchestrator(
     let mut serial_service = SerialRunService::new(repo_root, config);
     if explicit_retry {
         for change_id in &change_ids {
-            serial_service.consume_explicit_acceptance_retry(change_id)?;
+            serial_service
+                .consume_explicit_acceptance_retry(change_id)
+                .await?;
         }
     }
 
@@ -854,6 +856,29 @@ pub async fn run_orchestrator(
                     )
                     .await;
                 }
+            }
+            // A validated acceptance stall carries structured blocker evidence,
+            // so it is published as the same `AcceptanceGated` lifecycle event
+            // parallel mode emits and displays as `stalled` rather than as an
+            // opaque processing error.
+            Ok(ref stalled @ ChangeProcessResult::AcceptanceStalled { ref error, .. }) => {
+                for event in stalled.stalled_lifecycle_events(&change_id) {
+                    dispatch_event(
+                        &tx,
+                        &shared_state,
+                        #[cfg(feature = "web-monitoring")]
+                        web_state.as_ref(),
+                        event,
+                    )
+                    .await;
+                }
+                tracing::warn!(
+                    change_id = %change_id,
+                    "Acceptance stalled on a validated external blocker: {error}"
+                );
+
+                // Remove stalled change from pending
+                shared_state.write().await.remove_from_pending(&change_id);
             }
             Ok(ChangeProcessResult::Stalled { error }) => {
                 let processing_error_event = OrchestratorEvent::ProcessingError {

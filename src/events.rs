@@ -242,41 +242,6 @@ pub struct StalledBlocker {
     pub worktree_preserved: bool,
 }
 
-fn classify_stalled_blocker_category(error_summary: &str) -> &'static str {
-    let lower = error_summary.to_ascii_lowercase();
-    if lower.contains("credential")
-        || lower.contains(" api key")
-        || lower.contains("token")
-        || lower.contains("auth")
-    {
-        "credential"
-    } else if lower.contains("still running")
-        || lower.contains("pending")
-        || lower.contains("agent-exec")
-        || lower.contains("managed verification job")
-    {
-        "pending_verification"
-    } else if lower.contains("docker")
-        || lower.contains("daemon")
-        || lower.contains("dns")
-        || lower.contains("network")
-        || lower.contains("port conflict")
-        || lower.contains("address already in use")
-        || lower.contains("image")
-        || lower.contains("timeout")
-    {
-        "infrastructure"
-    } else if lower.contains("external service")
-        || lower.contains("rate limit")
-        || lower.contains("429")
-        || lower.contains("service outage")
-    {
-        "external_service"
-    } else {
-        "infrastructure"
-    }
-}
-
 impl StalledBlocker {
     pub fn permission_denial(
         phase: impl Into<String>,
@@ -299,10 +264,23 @@ impl StalledBlocker {
         }
     }
 
-    pub fn acceptance_infrastructure(error_summary: impl Into<String>) -> Self {
+    /// Build an acceptance stalled blocker from an **explicitly supplied**
+    /// category.
+    ///
+    /// There is deliberately no prose-classifying constructor. Scanning an error
+    /// summary for words like `credential`, `token`, or `auth` produced
+    /// confident-looking categories that nothing had verified, so the category
+    /// must now come from a validated reviewer payload or from a runtime
+    /// classifier that owns the decision (for example permission-denial
+    /// classification).
+    #[cfg(test)]
+    pub fn acceptance_external(
+        category: impl Into<String>,
+        error_summary: impl Into<String>,
+    ) -> Self {
         let error_summary = error_summary.into();
         Self {
-            category: classify_stalled_blocker_category(&error_summary).to_string(),
+            category: category.into(),
             phase: "acceptance".to_string(),
             gate: "acceptance".to_string(),
             evidence: vec![error_summary.clone()],
@@ -937,7 +915,10 @@ mod lifecycle_bridge_tests {
 
     #[test]
     fn user_decision_events_map_to_blocked() {
-        let blocker = StalledBlocker::acceptance_infrastructure("verification job still running");
+        let blocker = StalledBlocker::acceptance_external(
+            "pending_verification",
+            "verification job still running",
+        );
 
         for event in [
             ExecutionEvent::AcceptanceGated {

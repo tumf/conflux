@@ -406,6 +406,37 @@ impl Orchestrator {
         LoopControl::Continue
     }
 
+    /// Handle a validated acceptance stall.
+    ///
+    /// Unlike a generic stall this carries structured blocker evidence, so it is
+    /// published as the same `AcceptanceGated` lifecycle event parallel mode
+    /// emits. Serial must not degrade it into an opaque processing error, and
+    /// must not clear the hold it just recorded.
+    async fn handle_acceptance_stalled(
+        &mut self,
+        next: &Change,
+        events: Vec<ExecutionEvent>,
+        error: &str,
+    ) -> LoopControl {
+        warn!(
+            "Acceptance stalled for {} on a validated external blocker: {}",
+            next.id, error
+        );
+        {
+            let mut state = self.shared_state.write().await;
+            state.add_dynamic_change(next.id.clone());
+            state.mark_stalled(next.id.clone());
+            for event in events {
+                state.apply_execution_event(&event);
+            }
+        }
+        self.stall_detector.clear_change(&next.id);
+        if let Some(progress) = &mut self.progress {
+            progress.error(error);
+        }
+        LoopControl::Continue
+    }
+
     /// Handle Failed result
     async fn handle_failed(&mut self, next: &Change, error: &str) -> Result<()> {
         error!("Change failed: {} - {}", next.id, error);
@@ -667,6 +698,11 @@ impl Orchestrator {
                 Ok(LoopControl::Continue)
             }
             ChangeProcessResult::Stalled { error } => Ok(self.handle_stalled(next, &error).await),
+            ChangeProcessResult::AcceptanceStalled { ref error, .. } => {
+                let error = error.clone();
+                let events = result.stalled_lifecycle_events(&next.id);
+                Ok(self.handle_acceptance_stalled(next, events, &error).await)
+            }
             ChangeProcessResult::Failed { error } => {
                 self.handle_failed(next, &error).await?;
                 Ok(LoopControl::Continue)
