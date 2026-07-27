@@ -579,8 +579,11 @@ impl ParallelRunService {
                     return result;
                 }
                 Err(e) => {
+                    // Rejecting an LLM analysis response is recoverable: metadata-dependency-only
+                    // fallback below preserves declared dependencies, so this stays warning-visible
+                    // instead of being emitted as a terminal workflow error.
                     Self::log_recoverable_analysis_fallback(&e);
-                    self.emit_analysis_failure_diagnostic_once(
+                    self.emit_recoverable_analysis_fallback_diagnostic_once(
                         changes,
                         in_flight_ids,
                         event_tx,
@@ -603,16 +606,17 @@ impl ParallelRunService {
         );
     }
 
-    async fn emit_analysis_failure_diagnostic_once(
-        &self,
+    /// Build the deduplication key and operator-facing message for a recoverable
+    /// analysis fallback.
+    ///
+    /// The `AnalysisFailure` key identity is intentionally unchanged so repeated
+    /// equivalent fallbacks keep collapsing into a single diagnostic while a
+    /// different error or queued/in-flight set stays independently visible.
+    fn recoverable_analysis_fallback_diagnostic(
         changes: &[Change],
         in_flight_ids: &[String],
-        event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         error: &str,
-    ) {
-        let Some(tx) = event_tx else {
-            return;
-        };
+    ) -> (DiagnosticDeduplicationKey, String) {
         let mut queued_ids: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
         queued_ids.sort();
         let mut in_flight = in_flight_ids.to_vec();
@@ -623,22 +627,41 @@ impl ParallelRunService {
             in_flight_ids: in_flight.clone(),
             error: normalized_error.clone(),
         };
+        let message = format!(
+            "Dependency analysis degraded: falling back to metadata-dependency-only analysis: error={}, queued={:?}, in_flight={:?}",
+            normalized_error, queued_ids, in_flight
+        );
+        (key, message)
+    }
+
+    /// Emit the recoverable fallback diagnostic as a deduplicated warning log event.
+    ///
+    /// Successful metadata fallback is degraded execution, not a terminal failure, so
+    /// this path never emits `ParallelEvent::Error`; terminal error events remain
+    /// reserved for operations that actually fail without a safe fallback.
+    async fn emit_recoverable_analysis_fallback_diagnostic_once(
+        &self,
+        changes: &[Change],
+        in_flight_ids: &[String],
+        event_tx: Option<&mpsc::Sender<ParallelEvent>>,
+        error: &str,
+    ) {
+        let Some(tx) = event_tx else {
+            return;
+        };
+        let (key, message) =
+            Self::recoverable_analysis_fallback_diagnostic(changes, in_flight_ids, error);
         let mut dedup = self.diagnostic_dedup.lock().await;
         dedup
             .emit_or_suppress(
                 key,
                 || async move {
-                    let message = format!(
-                        "Dependency analysis failed: error={}, queued={:?}, in_flight={:?}",
-                        normalized_error, queued_ids, in_flight
-                    );
                     let _ = tx
                         .send(ParallelEvent::Log(crate::events::LogEntry::warn(&message)))
                         .await;
-                    let _ = tx.send(ParallelEvent::Error { message }).await;
                 },
                 || {
-                    debug!("Suppressing repeated analysis failure diagnostic");
+                    debug!("Suppressing repeated analysis fallback diagnostic");
                 },
             )
             .await;
@@ -1175,6 +1198,196 @@ mod tests {
         assert!(
             !result.dependencies.is_empty(),
             "recoverable fallback must not degrade to dependency-free analysis"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recoverable_analysis_fallback_emits_warning_without_terminal_error() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let mut config = create_test_config();
+        config.use_llm_analysis = Some(true);
+        // Reproduce the production case: the LLM omits a queued change ID, so the
+        // response is rejected and metadata fallback takes over.
+        config.analyze_command =
+            Some("echo '{\"order\":[\"route\",\"policy\"],\"dependencies\":{}}'".to_string());
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), config);
+        let changes = vec![
+            create_test_change("route", vec!["policy"]),
+            create_test_change("policy", vec![]),
+            create_test_change("gateway", vec![]),
+        ];
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        let result = service
+            .analyze_order_with_sender(&changes, &[], Some(&event_tx), 1)
+            .await;
+
+        assert_eq!(
+            result.order,
+            vec![
+                "route".to_string(),
+                "policy".to_string(),
+                "gateway".to_string()
+            ],
+            "fallback must represent every queued change exactly once"
+        );
+        assert_eq!(
+            result.dependencies.get("route"),
+            Some(&vec!["policy".to_string()]),
+            "declared metadata dependencies must survive fallback"
+        );
+
+        drop(event_tx);
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ParallelEvent::Log(entry) if entry.level == crate::events::LogLevel::Warn => {
+                    warnings.push(entry.message)
+                }
+                ParallelEvent::Error { message } => errors.push(message),
+                _ => {}
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "successful metadata fallback must not emit a terminal error event: {errors:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "successful metadata fallback should emit exactly one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("metadata-dependency-only"),
+            "warning must name the fallback mode: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("Missing change IDs in response"),
+            "warning must preserve the original analysis rejection reason: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_recoverable_analysis_fallback_diagnostic_message_names_fallback_mode() {
+        let changes = vec![
+            create_test_change("route", vec!["policy"]),
+            create_test_change("policy", vec![]),
+        ];
+
+        let (key, message) = ParallelRunService::recoverable_analysis_fallback_diagnostic(
+            &changes,
+            &["beta".to_string(), "alpha".to_string()],
+            "  Missing change IDs in response: [\"gateway\"]  ",
+        );
+
+        assert!(
+            matches!(
+                key,
+                DiagnosticDeduplicationKey::AnalysisFailure {
+                    ref queued_ids,
+                    ref in_flight_ids,
+                    ref error,
+                } if queued_ids == &["policy".to_string(), "route".to_string()]
+                    && in_flight_ids == &["alpha".to_string(), "beta".to_string()]
+                    && error == "Missing change IDs in response: [\"gateway\"]"
+            ),
+            "dedup identity must stay stable and order-independent: {key:?}"
+        );
+        assert!(
+            message.contains("metadata-dependency-only"),
+            "message must name the fallback mode: {message}"
+        );
+        assert!(
+            message.contains("Missing change IDs in response"),
+            "message must preserve the original reason: {message}"
+        );
+        assert!(
+            !message.contains("Dependency analysis failed"),
+            "recoverable fallback must not be phrased as a terminal failure: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recoverable_analysis_fallback_diagnostic_dedupes_by_signature() {
+        let temp_dir = TempDir::new().expect("tempdir");
+        let service = ParallelRunService::new(temp_dir.path().to_path_buf(), create_test_config());
+        let changes = vec![create_test_change("route", vec!["policy"])];
+        let other_changes = vec![
+            create_test_change("route", vec!["policy"]),
+            create_test_change("gateway", vec![]),
+        ];
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
+
+        for _ in 0..2 {
+            service
+                .emit_recoverable_analysis_fallback_diagnostic_once(
+                    &changes,
+                    &[],
+                    Some(&event_tx),
+                    "Missing change IDs in response: [\"gateway\"]",
+                )
+                .await;
+        }
+        // A materially different error must remain independently visible.
+        service
+            .emit_recoverable_analysis_fallback_diagnostic_once(
+                &changes,
+                &[],
+                Some(&event_tx),
+                "Duplicate change ID in order: route",
+            )
+            .await;
+        // So must a changed queued/in-flight context for the same error.
+        service
+            .emit_recoverable_analysis_fallback_diagnostic_once(
+                &other_changes,
+                &["alpha".to_string()],
+                Some(&event_tx),
+                "Missing change IDs in response: [\"gateway\"]",
+            )
+            .await;
+
+        drop(event_tx);
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ParallelEvent::Log(entry) if entry.level == crate::events::LogLevel::Warn => {
+                    warnings.push(entry.message)
+                }
+                ParallelEvent::Error { message } => errors.push(message),
+                _ => {}
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "fallback diagnostics must never emit terminal error events: {errors:?}"
+        );
+        assert_eq!(
+            warnings.len(),
+            3,
+            "equivalent diagnostics collapse to one while distinct contexts stay visible: {warnings:?}"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|message| message.contains("Duplicate change ID in order: route"))
+                .count(),
+            1,
+            "a different error must remain visible: {warnings:?}"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|message| message.contains("\"gateway\", \"route\""))
+                .count(),
+            1,
+            "a different queued set must remain visible: {warnings:?}"
         );
     }
 
