@@ -1007,6 +1007,368 @@ mod validation_tests {
         );
     }
 
+    fn role_declaration(
+        id: &str,
+        phase: &str,
+        execution_class: &str,
+        completion_role: &str,
+    ) -> crate::openspec::VerificationDeclaration {
+        crate::openspec::VerificationDeclaration {
+            id: Some(id.to_string()),
+            phase: Some(phase.to_string()),
+            execution_class: Some(execution_class.to_string()),
+            completion_role: Some(completion_role.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_release_gate_target_facts_report_only_non_local_change_blockers() {
+        let declarations = vec![
+            role_declaration(
+                "local-tests",
+                "pre-integration",
+                "repository-local",
+                "change-blocking",
+            ),
+            role_declaration(
+                "deployed-smoke",
+                "post-integration",
+                "deployed-service",
+                "change-blocking",
+            ),
+            role_declaration(
+                "release-smoke",
+                "post-integration",
+                "deployed-service",
+                "operational-observation",
+            ),
+        ];
+
+        let facts = validation::release_gate_target_facts(&declarations);
+
+        assert!(!facts.metadata_unreadable);
+        assert_eq!(
+            facts.non_local_blockers,
+            vec![(
+                "deployed-smoke".to_string(),
+                "execution class 'deployed-service'".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_classify_release_gate_edge_rejects_local_dependent_on_non_local_blocker() {
+        let target = validation::release_gate_target_facts(&[role_declaration(
+            "device-acceptance",
+            "pre-integration",
+            "physical-device",
+            "change-blocking",
+        )]);
+
+        let (errors, warnings) =
+            validation::classify_release_gate_edge("follow-on", false, false, "gate", &target);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("follow-on: proposal dependency 'gate'"));
+        assert!(errors[0].contains("'device-acceptance'"));
+        assert!(errors[0].contains("Remedy: split 'gate'"));
+    }
+
+    #[test]
+    fn test_classify_release_gate_edge_spares_observational_dependents_and_in_flight_work() {
+        let target = validation::release_gate_target_facts(&[role_declaration(
+            "deployed-smoke",
+            "post-integration",
+            "deployed-service",
+            "change-blocking",
+        )]);
+
+        let (observational_errors, observational_warnings) =
+            validation::classify_release_gate_edge("stage-two", true, false, "stage-one", &target);
+        assert!(observational_errors.is_empty(), "{observational_errors:?}");
+        assert!(observational_warnings.is_empty());
+
+        let (in_flight_errors, in_flight_warnings) =
+            validation::classify_release_gate_edge("running", false, true, "gate", &target);
+        assert!(
+            in_flight_errors.is_empty(),
+            "in-flight work must not be aborted: {in_flight_errors:?}"
+        );
+        assert!(in_flight_warnings[0].contains("in-flight operation is not interrupted"));
+    }
+
+    #[test]
+    fn test_classify_release_gate_edge_defers_to_target_for_unreadable_metadata() {
+        let target = validation::ReleaseGateTarget {
+            metadata_unreadable: true,
+            non_local_blockers: Vec::new(),
+        };
+
+        let (errors, warnings) =
+            validation::classify_release_gate_edge("dependent", false, false, "target", &target);
+
+        assert!(
+            errors.is_empty(),
+            "target owns the parse failure, not the dependent: {errors:?}"
+        );
+        assert!(warnings[0].contains("reported on 'target'"));
+    }
+
+    #[test]
+    fn test_is_observational_release_change_requires_declared_roles_without_blockers() {
+        assert!(validation::is_observational_release_change(&[
+            role_declaration(
+                "release-smoke",
+                "post-integration",
+                "deployed-service",
+                "operational-observation"
+            ),
+        ]));
+        assert!(!validation::is_observational_release_change(&[
+            role_declaration(
+                "local-tests",
+                "pre-integration",
+                "repository-local",
+                "change-blocking"
+            ),
+            role_declaration(
+                "release-smoke",
+                "post-integration",
+                "deployed-service",
+                "operational-observation"
+            ),
+        ]));
+        // Legacy declarations never make a change observational by omission.
+        assert!(!validation::is_observational_release_change(&[
+            crate::openspec::VerificationDeclaration {
+                id: Some("legacy".to_string()),
+                phase: Some("post-integration".to_string()),
+                ..Default::default()
+            },
+        ]));
+        assert!(!validation::is_observational_release_change(&[]));
+    }
+
+    #[test]
+    fn test_reverse_impact_warnings_separate_queued_from_in_flight_dependents() {
+        let warnings = validation::reverse_impact_warnings(
+            "gate",
+            &["deployed-smoke".to_string()],
+            &["queued-one".to_string(), "queued-two".to_string()],
+            &["running-one".to_string()],
+        );
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0].contains("affect queued dependents: queued-one, queued-two"));
+        assert!(warnings[0].contains("next dispatch eligibility decision"));
+        assert!(warnings[1].contains("in-flight dependents are not interrupted"));
+        assert!(
+            validation::reverse_impact_warnings("gate", &[], &["queued-one".to_string()], &[])
+                .is_empty()
+        );
+    }
+
+    /// Bundled proposal guidance is the authoring half of the release-gate
+    /// contract; validation alone cannot teach authors the split pattern.
+    #[test]
+    fn test_cflx_proposal_skill_documents_release_gate_dependency_rules() {
+        let skill = include_str!("../skills/cflx-proposal/SKILL.md");
+
+        for required in [
+            // Dependency eligibility is defined by consumed repository output.
+            "### 3. Decide Dependency Eligibility",
+            "required to implement the dependent change or to run its `pre-integration` verification",
+            "Release sequence alone is never an acceptable justification",
+            // Forbidden release-sequencing uses.
+            "Roadmap or backlog ordering",
+            "MVP, milestone, or release phase boundaries",
+            "Deployed-service checks or environment smoke tests",
+            "Physical-device acceptance",
+            "Human or external approval",
+            "Credentialed access to an external system",
+            // Reverse-impact review.
+            "Review reverse-dependency impact before adding an edge",
+            "list the direct and transitive downstream changes that would become blocked",
+            // Implementation / release-observation split.
+            "Split repository-local implementation from release observation",
+            "The release-observation change may depend on the implementation change",
+            "must depend only on the repository outputs they consume",
+            // Structured verification fields rather than a parallel gate block.
+            "Do not invent a parallel completion-gate block",
+            "`completion_role: change-blocking` requires `phase: pre-integration` **and** `execution_class: repository-local`",
+            "MUST be `completion_role: operational-observation`",
+            "Legacy declarations without the two fields stay valid during migration",
+            "verification-id: <id>",
+        ] {
+            assert!(
+                skill.contains(required),
+                "cflx-proposal skill must document: {required}"
+            );
+        }
+    }
+
+    /// Proposal frontmatter that has migrated to the structured role model.
+    const MIGRATED_PROPOSAL: &str = concat!(
+        "---\nverifications:\n",
+        "  - id: local-tests\n    phase: pre-integration\n    execution_class: repository-local\n    completion_role: change-blocking\n    prerequisites: []\n",
+        "  - id: deployed-smoke\n    phase: post-integration\n    execution_class: deployed-service\n    completion_role: operational-observation\n    prerequisites: []\n",
+        "---\n# Migrated\n\n**Change Type**: implementation\n",
+    );
+
+    const LEGACY_PROPOSAL: &str = concat!(
+        "---\nverifications:\n",
+        "  - id: local-tests\n    phase: pre-integration\n    prerequisites: []\n",
+        "---\n# Legacy\n\n**Change Type**: implementation\n",
+    );
+
+    #[test]
+    fn test_active_checkbox_requires_change_blocking_verification_reference() {
+        let content = "## Implementation Tasks\n- [ ] Wire the validator (verification: unit - cargo test openspec_cmd --lib)\n";
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "must reference a change-blocking verification via 'verification-id: <id>'"
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_active_checkbox_accepts_declared_change_blocking_reference() {
+        let content = "## Implementation Tasks\n- [ ] Wire the validator (verification: unit - cargo test openspec_cmd --lib; verification-id: local-tests)\n";
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_active_checkbox_rejects_operational_observation_reference() {
+        let content = "## Implementation Tasks\n- [ ] Confirm the device boots (verification: manual - operator checklist in docs/release.md; verification-id: deployed-smoke)\n";
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "verification-id 'deployed-smoke' is not a change-blocking verification"
+            ) && error.contains("release-observation change")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_active_checkbox_rejects_unknown_verification_reference() {
+        let content = "## Implementation Tasks\n- [ ] Wire the validator (verification: unit - cargo test openspec_cmd --lib; verification-id: does-not-exist)\n";
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(
+            errors.iter().any(|error| error.contains(
+                "verification-id 'does-not-exist' is not declared in proposal.md verifications"
+            )),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_verification_reference_accepted_from_continuation_line() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Wire the validator\n",
+            "  verification: unit - cargo test openspec_cmd --lib; verification-id: local-tests\n",
+        );
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_verification_linkage_skips_narrative_and_future_work_sections() {
+        let content = concat!(
+            "## Implementation Tasks\n",
+            "- [ ] Wire the validator (verification: unit - cargo test openspec_cmd --lib; verification-id: local-tests)\n",
+            "\n## Future Work\n",
+            "- Physical device acceptance after release\n",
+            "\n## Notes\n",
+            "- Release observation is tracked separately\n",
+        );
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_verification_linkage_stays_inactive_for_legacy_proposals() {
+        let content = "## Implementation Tasks\n- [ ] Wire the validator (verification: unit - cargo test openspec_cmd --lib)\n";
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("implementation"),
+            Some(LEGACY_PROPOSAL),
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn test_verification_linkage_stays_inactive_for_spec_only_changes() {
+        let content = "## Specification Tasks\n- [ ] Promote the delta to canonical spec\n";
+        let (errors, _) = validate_tasks_content(
+            content,
+            "test",
+            true,
+            "error",
+            Some("spec-only"),
+            Some(MIGRATED_PROPOSAL),
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
     #[test]
     fn test_validate_tasks_with_weak_verification() {
         let content = "- [ ] Add a new feature (verification: manual review)\n";
@@ -2201,6 +2563,452 @@ mod openspec_list_show_tests {
             OpenSpecManager::new()
                 .validate_change(Some("spec-only-contract"), true, "off")
                 .0
+        );
+    }
+
+    /// Valid repository-local completion gate.
+    const LOCAL_BLOCKER: &str = "  - id: local-tests\n    requirement: repository behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test\n    rerun: cargo test\n    prerequisites: []\n    execution_class: repository-local\n    completion_role: change-blocking\n";
+    /// Deployed-service outcome incorrectly declared as a completion gate.
+    const DEPLOYED_BLOCKER: &str = "  - id: deployed-smoke\n    requirement: deployed behavior\n    phase: post-integration\n    owner: repository-automation\n    trigger: default-branch-integration\n    automation: Cargo.toml\n    evidence: workflow artifact\n    rerun: workflow_dispatch\n    prerequisites: []\n    execution_class: deployed-service\n    completion_role: change-blocking\n";
+    /// Physical-device acceptance incorrectly declared as a completion gate.
+    const DEVICE_BLOCKER: &str = "  - id: device-acceptance\n    requirement: device behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: operator log\n    rerun: rerun device check\n    prerequisites: []\n    execution_class: physical-device\n    completion_role: change-blocking\n";
+    /// Credentialed repository automation, correctly modeled as observation.
+    const CREDENTIALED_OBSERVATION: &str = "  - id: credentialed-publish\n    requirement: published artifact behavior\n    phase: post-integration\n    owner: repository-automation\n    trigger: default-branch-integration\n    automation: Cargo.toml\n    evidence: workflow artifact\n    rerun: workflow_dispatch\n    prerequisites: []\n    execution_class: credentialed-external\n    completion_role: operational-observation\n";
+    /// Post-integration observation used by release-observation changes.
+    const RELEASE_OBSERVATION: &str = "  - id: release-smoke\n    requirement: release behavior observed after integration\n    phase: post-integration\n    owner: repository-automation\n    trigger: default-branch-integration\n    automation: Cargo.toml\n    evidence: workflow artifact\n    rerun: workflow_dispatch\n    prerequisites: []\n    execution_class: deployed-service\n    completion_role: operational-observation\n";
+    /// Legacy declaration with none of the new role fields.
+    const LEGACY_DECLARATION: &str = "  - id: legacy-local\n    requirement: repository behavior\n    phase: pre-integration\n    owner: conflux-acceptance\n    trigger: pull request\n    automation: Cargo.toml\n    evidence: cargo test\n    rerun: cargo test\n    prerequisites: []\n";
+
+    const LINKED_TASKS: &str = "## Implementation Tasks\n- [ ] 1. implement behavior (verification: unit - cargo test openspec_cmd --lib; verification-id: local-tests)\n";
+    const OBSERVATION_TASKS: &str =
+        "## Future Work\n- Operational release observation after integration\n";
+
+    /// Prepare a repository root shared by release-gate dependency fixtures.
+    fn setup_release_gate_repo(root: &Path) {
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        track_file(root, "Cargo.toml");
+    }
+
+    fn create_release_gate_change(
+        root: &Path,
+        change_id: &str,
+        change_type: &str,
+        dependencies: &[&str],
+        verifications: &str,
+        tasks: &str,
+    ) {
+        let dir = root.join("openspec/changes").join(change_id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let dependencies_yaml = if dependencies.is_empty() {
+            "dependencies: []\n".to_string()
+        } else {
+            let mut yaml = "dependencies:\n".to_string();
+            for dependency in dependencies {
+                yaml.push_str(&format!("  - {}\n", dependency));
+            }
+            yaml
+        };
+        fs::write(
+            dir.join("proposal.md"),
+            format!(
+                "---\nchange_type: {change_type}\n{dependencies_yaml}verifications:\n{verifications}---\n# {change_id}\n\n**Change Type**: {change_type}\n\n## Problem\nrelease gate fixture\n"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("tasks.md"), tasks).unwrap();
+
+        let spec_dir = dir.join("specs").join("release-gate");
+        fs::create_dir_all(&spec_dir).unwrap();
+        fs::write(
+            spec_dir.join("spec.md"),
+            format!("## ADDED Requirements\n\n### Requirement: {change_id} behavior\n\n#### Scenario: Fixture scenario\n- WHEN validation runs\n- THEN the fixture is evaluated\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_release_gate_rejects_non_local_change_blocking_declaration_on_owner() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "deployed-gate",
+            "implementation",
+            &[],
+            &format!("{LOCAL_BLOCKER}{DEPLOYED_BLOCKER}"),
+            LINKED_TASKS,
+        );
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("deployed-gate"), true, "off");
+
+        assert!(!valid);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("verification 'deployed-smoke'"))
+                .count(),
+            2,
+            "phase and execution-class violations are both owned by the target: {errors:?}"
+        );
+        assert!(errors.iter().any(|error| error
+            .contains("completion_role: change-blocking requires phase: pre-integration")));
+        assert!(errors.iter().any(|error| error.contains(
+            "completion_role: change-blocking requires execution_class: repository-local"
+        )));
+    }
+
+    #[test]
+    fn test_release_gate_rejects_physical_device_change_blocker() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "device-gate",
+            "implementation",
+            &[],
+            &format!("{LOCAL_BLOCKER}{DEVICE_BLOCKER}"),
+            LINKED_TASKS,
+        );
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("device-gate"), true, "off");
+
+        assert!(!valid);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("verification 'device-acceptance'")
+                    && error.contains("found 'physical-device'")
+                    && error.contains("operational-observation")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_release_gate_accepts_credentialed_repository_automation_observation() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "credentialed-observation",
+            "implementation",
+            &[],
+            &format!("{LOCAL_BLOCKER}{CREDENTIALED_OBSERVATION}"),
+            LINKED_TASKS,
+        );
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("credentialed-observation"), true, "off");
+
+        assert!(valid, "{errors:?}");
+    }
+
+    #[test]
+    fn test_release_gate_accepts_ordinary_local_dependency_edge() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "feature-a",
+            "implementation",
+            &[],
+            LOCAL_BLOCKER,
+            LINKED_TASKS,
+        );
+        create_release_gate_change(
+            temp.path(),
+            "feature-b",
+            "implementation",
+            &["feature-a"],
+            LOCAL_BLOCKER,
+            LINKED_TASKS,
+        );
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("feature-b"), true, "off");
+
+        assert!(valid, "{errors:?}");
+    }
+
+    #[test]
+    fn test_release_gate_rejects_dependency_on_non_local_change_blocker() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "release-target",
+            "implementation",
+            &[],
+            &format!("{LOCAL_BLOCKER}{DEPLOYED_BLOCKER}"),
+            LINKED_TASKS,
+        );
+        create_release_gate_change(
+            temp.path(),
+            "follow-on",
+            "implementation",
+            &["release-target"],
+            LOCAL_BLOCKER,
+            LINKED_TASKS,
+        );
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("follow-on"), true, "off");
+
+        assert!(!valid);
+        let diagnostic = errors
+            .iter()
+            .find(|error| error.contains("declares non-local change-blocking verification"))
+            .unwrap_or_else(|| panic!("expected release-gate dependency diagnostic: {errors:?}"));
+        assert!(diagnostic.starts_with("follow-on:"), "{diagnostic}");
+        assert!(diagnostic.contains("'release-target'"), "{diagnostic}");
+        assert!(diagnostic.contains("'deployed-smoke'"), "{diagnostic}");
+        assert!(diagnostic.contains("Remedy: split"), "{diagnostic}");
+    }
+
+    #[test]
+    fn test_release_gate_allows_observational_release_chain() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "release-stage-one",
+            "spec-only",
+            &[],
+            RELEASE_OBSERVATION,
+            OBSERVATION_TASKS,
+        );
+        create_release_gate_change(
+            temp.path(),
+            "release-stage-two",
+            "spec-only",
+            &["release-stage-one"],
+            RELEASE_OBSERVATION,
+            OBSERVATION_TASKS,
+        );
+
+        let (valid, errors, _) =
+            OpenSpecManager::new().validate_change(Some("release-stage-two"), true, "off");
+
+        assert!(valid, "{errors:?}");
+    }
+
+    #[test]
+    fn test_release_gate_keeps_legacy_declarations_valid_with_migration_warning() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "legacy-target",
+            "implementation",
+            &[],
+            LEGACY_DECLARATION,
+            "## Implementation Tasks\n- [ ] 1. implement behavior (verification: unit - cargo test openspec_cmd --lib)\n",
+        );
+        create_release_gate_change(
+            temp.path(),
+            "legacy-dependent",
+            "implementation",
+            &["legacy-target"],
+            LEGACY_DECLARATION,
+            "## Implementation Tasks\n- [ ] 1. implement behavior (verification: unit - cargo test openspec_cmd --lib)\n",
+        );
+
+        let (valid, errors, warnings) =
+            OpenSpecManager::new().validate_change(Some("legacy-dependent"), true, "off");
+
+        assert!(valid, "{errors:?}");
+        assert!(
+            warnings.iter().any(|warning| warning
+                .contains("legacy declaration without execution_class/completion_role")
+                && warning.contains("add execution_class: repository-local")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_release_gate_attributes_malformed_target_metadata_to_target() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "malformed-target",
+            "implementation",
+            &[],
+            LOCAL_BLOCKER,
+            LINKED_TASKS,
+        );
+        let malformed = fs::read_to_string(
+            temp.path()
+                .join("openspec/changes/malformed-target/proposal.md"),
+        )
+        .unwrap()
+        .replace("    prerequisites: []\n", "    surprise_key: value\n");
+        fs::write(
+            temp.path()
+                .join("openspec/changes/malformed-target/proposal.md"),
+            malformed,
+        )
+        .unwrap();
+        create_release_gate_change(
+            temp.path(),
+            "malformed-dependent",
+            "implementation",
+            &["malformed-target"],
+            LOCAL_BLOCKER,
+            LINKED_TASKS,
+        );
+
+        let mgr = OpenSpecManager::new();
+        let (target_valid, target_errors, _) =
+            mgr.validate_change(Some("malformed-target"), true, "off");
+        let (dependent_valid, dependent_errors, dependent_warnings) =
+            mgr.validate_change(Some("malformed-dependent"), true, "off");
+
+        assert!(!target_valid);
+        assert!(
+            target_errors.iter().any(|error| error
+                .contains("malformed-target: proposal.md verification metadata")
+                && error.contains("surprise_key")),
+            "{target_errors:?}"
+        );
+        assert!(
+            dependent_valid,
+            "dependent must not duplicate the target parse failure: {dependent_errors:?}"
+        );
+        assert!(
+            dependent_warnings.iter().any(|warning| warning
+                .contains("unreadable verification metadata")
+                && warning.contains("reported on 'malformed-target'")),
+            "{dependent_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_release_gate_reports_reverse_impact_and_spares_in_flight_dependents() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "release-target",
+            "implementation",
+            &[],
+            &format!("{LOCAL_BLOCKER}{DEPLOYED_BLOCKER}"),
+            LINKED_TASKS,
+        );
+        for dependent in ["queued-one", "queued-two", "running-one"] {
+            create_release_gate_change(
+                temp.path(),
+                dependent,
+                "implementation",
+                &["release-target"],
+                LOCAL_BLOCKER,
+                LINKED_TASKS,
+            );
+        }
+        fs::write(temp.path().join(".conflux-inflight"), "running-one\n").unwrap();
+
+        let mgr = OpenSpecManager::new();
+        let (_, _, target_warnings) = mgr.validate_change(Some("release-target"), true, "off");
+        let (queued_valid, queued_errors, _) = mgr.validate_change(Some("queued-one"), true, "off");
+        let (running_valid, running_errors, running_warnings) =
+            mgr.validate_change(Some("running-one"), true, "off");
+
+        assert!(
+            target_warnings.iter().any(|warning| warning
+                .contains("affect queued dependents: queued-one, queued-two")
+                && warning.contains("next dispatch eligibility decision")),
+            "{target_warnings:?}"
+        );
+        assert!(
+            target_warnings.iter().any(|warning| warning
+                .contains("in-flight dependents are not interrupted")
+                && warning.contains("running-one")),
+            "{target_warnings:?}"
+        );
+        assert!(!queued_valid);
+        assert!(queued_errors
+            .iter()
+            .any(|error| error.contains("declares non-local change-blocking verification")));
+        assert!(
+            running_valid,
+            "in-flight dependent must not be aborted by target metadata edits: {running_errors:?}"
+        );
+        assert!(
+            running_warnings
+                .iter()
+                .any(|warning| warning.contains("in-flight operation is not interrupted")),
+            "{running_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_release_gate_blocks_original_fifteen_dependent_fan_out() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+        setup_release_gate_repo(temp.path());
+        create_release_gate_change(
+            temp.path(),
+            "release-bottleneck",
+            "implementation",
+            &[],
+            &format!("{LOCAL_BLOCKER}{DEPLOYED_BLOCKER}"),
+            LINKED_TASKS,
+        );
+        let dependents: Vec<String> = (1..=15)
+            .map(|index| format!("dependent-{index:02}"))
+            .collect();
+        for dependent in &dependents {
+            create_release_gate_change(
+                temp.path(),
+                dependent,
+                "implementation",
+                &["release-bottleneck"],
+                LOCAL_BLOCKER,
+                LINKED_TASKS,
+            );
+        }
+
+        let (valid, errors, warnings) = OpenSpecManager::new().validate_change(None, true, "off");
+
+        assert!(!valid);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(
+                    |error| error.starts_with("release-bottleneck: verification 'deployed-smoke'")
+                )
+                .count(),
+            2,
+            "the owning proposal reports its own field violations once each: {errors:?}"
+        );
+        for dependent in &dependents {
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.starts_with(&format!("{dependent}:"))
+                        && error.contains("'release-bottleneck'")
+                        && error.contains("'deployed-smoke'")
+                        && error.contains("Remedy: split")),
+                "missing reference diagnostic for {dependent}: {errors:?}"
+            );
+        }
+        assert!(
+            warnings.iter().any(|warning| warning
+                .starts_with("release-bottleneck: non-local change-blocking verification(s)")
+                && warning.contains("dependent-01")
+                && warning.contains("dependent-15")),
+            "{warnings:?}"
         );
     }
 

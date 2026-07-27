@@ -19,6 +19,8 @@ verifications:
     evidence: cargo test openspec_cmd --lib output plus repository tests covering dependency gate diagnostics, migration safety, and skill guidance assertions
     rerun: cargo test openspec_cmd --lib
     prerequisites: []
+    execution_class: repository-local
+    completion_role: change-blocking
 ---
 # Prevent Release Gates from Blocking Implementation Dependency Graphs
 

@@ -308,6 +308,63 @@ mod tests {
         std::fs::write(change_dir.join("proposal.md"), "# Change\n").unwrap();
     }
 
+    fn write_change_with_verifications(root: &std::path::Path, id: &str, verifications: &str) {
+        let change_dir = root.join("openspec/changes").join(id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("proposal.md"),
+            format!("---\nverifications:\n{verifications}---\n# Change\n"),
+        )
+        .unwrap();
+    }
+
+    /// Verification role metadata is a validation-time contract only. Dispatch
+    /// eligibility must keep using archive/in-flight/queued evidence exactly as
+    /// before, including for archived targets already merged into the base.
+    #[tokio::test]
+    async fn verification_role_metadata_does_not_change_scheduler_classification() {
+        let temp_dir = TempDir::new().unwrap();
+        write_change_with_verifications(
+            temp_dir.path(),
+            "queued-gate",
+            "  - id: deployed-smoke\n    phase: post-integration\n    execution_class: deployed-service\n    completion_role: change-blocking\n",
+        );
+        write_change_with_verifications(
+            temp_dir.path(),
+            "active-observation",
+            "  - id: release-smoke\n    phase: post-integration\n    execution_class: deployed-service\n    completion_role: operational-observation\n",
+        );
+        let archive_dir = temp_dir
+            .path()
+            .join("openspec/changes/archive/2026-07-21-archived-gate");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::write(
+            archive_dir.join("proposal.md"),
+            "---\nverifications:\n  - id: deployed-smoke\n    phase: post-integration\n    execution_class: physical-device\n    completion_role: change-blocking\n---\n# Archived\n",
+        )
+        .unwrap();
+
+        let context = DependencyContext::from_parts(
+            temp_dir.path().to_path_buf(),
+            ["queued-gate"],
+            &HashSet::new(),
+            None,
+        );
+
+        assert_eq!(
+            context.classify("queued-gate"),
+            DependencyTargetClass::Queued
+        );
+        assert_eq!(
+            context.classify("active-observation"),
+            DependencyTargetClass::ActiveButNotQueued
+        );
+        assert_eq!(
+            context.classify("archived-gate"),
+            DependencyTargetClass::Archived
+        );
+    }
+
     #[tokio::test]
     async fn context_blocks_dependencies_when_lifecycle_evidence_lock_is_unavailable() {
         let temp_dir = TempDir::new().unwrap();

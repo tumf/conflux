@@ -183,6 +183,8 @@ verifications:
     evidence: local test result or repository evidence location
     rerun: concrete local rerun command
     prerequisites: []
+    execution_class: repository-local
+    completion_role: change-blocking
   - id: deployed-smoke
     requirement: Operational outcome verified after integration
     phase: post-integration
@@ -192,12 +194,33 @@ verifications:
     evidence: expected published evidence location
     rerun: concrete recovery or rerun action
     prerequisites: []
+    execution_class: deployed-service
+    completion_role: operational-observation
 ---
 ```
 
 Every implementation or hybrid proposal MUST declare at least one complete `pre-integration` verification. Every claimed post-integration outcome MUST use a complete `post-integration` declaration. `id`, `requirement`, `phase`, `owner`, `trigger`, `automation`, `evidence`, `rerun`, and `prerequisites` are required. `pre-integration` requires `owner: conflux-acceptance`; `post-integration` requires `owner: repository-automation`. `automation` must be a safe repository-relative tracked regular file.
 
 Classify outcomes structurally. Do not put deployment URLs, external HTTP/API checks, or results available only after default-branch integration into pre-integration checkbox acceptance conditions. Record those as post-integration automation with evidence publication and rerun ownership.
+
+**Verification execution class and completion role**
+
+The `verifications` block is the only structured truth source for completion gating. Do not invent a parallel completion-gate block.
+
+- `execution_class` is one of `repository-local`, `repository-automation`, `deployed-service`, `physical-device`, `external-approval`, `credentialed-external`.
+- `completion_role` is one of `change-blocking`, `operational-observation`.
+- `completion_role: change-blocking` requires `phase: pre-integration` **and** `execution_class: repository-local`. Nothing else may block Conflux acceptance, archive, or merge.
+- Every `post-integration` declaration, and every non-local execution class, MUST be `completion_role: operational-observation`.
+- Declare `execution_class` and `completion_role` together; declaring only one fails validation.
+- Legacy declarations without the two fields stay valid during migration and receive migration warnings.
+
+Every checkbox in an active implementation task section MUST reference a declared `change-blocking` verification with `verification-id: <id>`:
+
+```markdown
+- [ ] Implement the parser (verification: unit - cargo test parser; verification-id: local-tests)
+```
+
+Referencing an undeclared ID, or an `operational-observation` ID, fails validation. If an outcome cannot be produced locally before integration, it does not belong to an active checkbox: move it to `## Future Work` or to a separate release-observation change. Prose alone never turns a manual or external gate into a legitimate completion condition.
 
 Keep the human-readable line near the top as well for backward-compatible readability:
 
@@ -217,6 +240,34 @@ Before writing anything, evaluate whether the request should be split into multi
 - The acceptance criteria cannot be verified independently.
 
 When keeping a single proposal despite multiple scopes, explicitly record the rationale in `proposal.md` or `design.md`.
+
+### 3. Decide Dependency Eligibility
+
+`dependencies` are hard implementation-order gates: a dependent change stays blocked until every dependency is archived and integrated into the base. Use them only for repository output the dependent change actually consumes.
+
+**A hard dependency is eligible only when** the dependency's base-integrated repository output — concrete code, contract, schema, migration, configuration, or test surface — is required to implement the dependent change or to run its `pre-integration` verification. Record that consumed surface as the justification.
+
+**Never use a hard dependency for**:
+
+- Roadmap or backlog ordering
+- MVP, milestone, or release phase boundaries
+- Deployed-service checks or environment smoke tests
+- Physical-device acceptance
+- Human or external approval
+- Credentialed access to an external system
+
+Release sequence alone is never an acceptable justification. Those outcomes are `operational-observation` verifications, not implementation dependencies; making them block a hard dependency edge converts one operational release gate into a graph-wide development stop.
+
+**Review reverse-dependency impact before adding an edge.** Before adding a dependency, or before adding a non-local verification to a change that already has dependents, list the direct and transitive downstream changes that would become blocked. If any of them only need repository-local contracts or implementation, the edge is wrong — remove it or split the target.
+
+**Split repository-local implementation from release observation.** When one scope contains both locally completable implementation and independently executable non-local acceptance (physical device, deployed service, external approval, credentials), create two changes:
+
+1. An implementation change that is completable from repository-local `change-blocking` evidence.
+2. A release-observation change whose verifications are all `operational-observation`, with no active implementation checkboxes.
+
+The release-observation change may depend on the implementation change, and release-observation changes may form ordered chains among themselves, because observations never block Conflux completion. Unrelated follow-on implementation changes must depend only on the repository outputs they consume — never on the release-observation change.
+
+Strict validation rejects a repository-local implementation change that depends on a target declaring a non-local `change-blocking` verification, and names the dependent, target, verification ID, and remedy.
 
 ### 3. Generate Change ID
 
@@ -595,6 +646,9 @@ Active task sections are the mirror image: every top-level `- ` or `* ` line mus
 - Identify what's truly non-mockable
 - Plan integration points
 - Document assumptions
+- Confirm each hard dependency names the repository output the dependent change consumes
+- Move release sequencing, deployment checks, device acceptance, and approvals into `operational-observation` verifications instead of dependency edges
+- Re-check direct and transitive dependents before adding an edge or a non-local verification
 
 ### Large Scope
 

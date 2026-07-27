@@ -43,6 +43,209 @@ pub struct VerificationDeclaration {
     pub evidence: Option<String>,
     pub rerun: Option<String>,
     pub prerequisites: Option<Vec<String>>,
+    /// Where the verification actually executes. Optional during migration.
+    pub execution_class: Option<String>,
+    /// Whether the verification may block Conflux completion. Optional during migration.
+    pub completion_role: Option<String>,
+}
+
+/// Execution environment for a structured verification declaration.
+///
+/// Only `RepositoryLocal` evidence can be produced offline from the repository
+/// before integration, so only that class may hold a change-blocking role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationExecutionClass {
+    RepositoryLocal,
+    RepositoryAutomation,
+    DeployedService,
+    PhysicalDevice,
+    ExternalApproval,
+    CredentialedExternal,
+}
+
+impl VerificationExecutionClass {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "repository-local" => Some(Self::RepositoryLocal),
+            "repository-automation" => Some(Self::RepositoryAutomation),
+            "deployed-service" => Some(Self::DeployedService),
+            "physical-device" => Some(Self::PhysicalDevice),
+            "external-approval" => Some(Self::ExternalApproval),
+            "credentialed-external" => Some(Self::CredentialedExternal),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryLocal => "repository-local",
+            Self::RepositoryAutomation => "repository-automation",
+            Self::DeployedService => "deployed-service",
+            Self::PhysicalDevice => "physical-device",
+            Self::ExternalApproval => "external-approval",
+            Self::CredentialedExternal => "credentialed-external",
+        }
+    }
+
+    /// Whether evidence for this class is produced from the repository itself.
+    pub fn is_repository_local(self) -> bool {
+        matches!(self, Self::RepositoryLocal)
+    }
+}
+
+/// Whether a structured verification may keep a Conflux change incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationCompletionRole {
+    ChangeBlocking,
+    OperationalObservation,
+}
+
+impl VerificationCompletionRole {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "change-blocking" => Some(Self::ChangeBlocking),
+            "operational-observation" => Some(Self::OperationalObservation),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChangeBlocking => "change-blocking",
+            Self::OperationalObservation => "operational-observation",
+        }
+    }
+}
+
+/// Structural problem found in a single verification declaration's role metadata.
+///
+/// Message rendering belongs to the validator so the owning change ID stays with
+/// the caller; this enum only carries the deterministic classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerificationRoleIssue {
+    UnknownExecutionClass(String),
+    UnknownCompletionRole(String),
+    /// Exactly one of the two role fields is present.
+    IncompleteRoleMetadata,
+    /// `change-blocking` declared on a non-`pre-integration` phase.
+    PostIntegrationChangeBlocking(String),
+    /// `change-blocking` declared on a non-`repository-local` execution class.
+    NonLocalChangeBlocking(VerificationExecutionClass),
+    /// Neither role field is declared yet (migration warning, not an error).
+    LegacyRoleMetadataMissing,
+}
+
+impl VerificationRoleIssue {
+    /// Migration gaps are advisory; every other issue is a hard failure.
+    pub fn is_warning(&self) -> bool {
+        matches!(self, Self::LegacyRoleMetadataMissing)
+    }
+}
+
+impl VerificationDeclaration {
+    pub fn execution_class(&self) -> Option<VerificationExecutionClass> {
+        self.execution_class
+            .as_deref()
+            .and_then(VerificationExecutionClass::parse)
+    }
+
+    pub fn completion_role(&self) -> Option<VerificationCompletionRole> {
+        self.completion_role
+            .as_deref()
+            .and_then(VerificationCompletionRole::parse)
+    }
+
+    /// Whether this declaration participates in the new role model at all.
+    pub fn declares_role_metadata(&self) -> bool {
+        non_empty(self.execution_class.as_deref()).is_some()
+            || non_empty(self.completion_role.as_deref()).is_some()
+    }
+
+    /// Whether this declaration is a valid repository-local completion gate.
+    pub fn is_change_blocking(&self) -> bool {
+        self.completion_role() == Some(VerificationCompletionRole::ChangeBlocking)
+    }
+
+    /// Whether a change-blocking role is declared on non-local evidence.
+    ///
+    /// This is the hazardous composition that turns operational release
+    /// acceptance into a graph-wide implementation stop.
+    pub fn is_non_local_change_blocker(&self) -> bool {
+        self.is_change_blocking()
+            && (self.phase.as_deref() != Some("pre-integration")
+                || !self
+                    .execution_class()
+                    .is_some_and(VerificationExecutionClass::is_repository_local))
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Evaluate role metadata for one declaration without touching the filesystem.
+pub fn evaluate_verification_role(
+    declaration: &VerificationDeclaration,
+) -> Vec<VerificationRoleIssue> {
+    let mut issues = Vec::new();
+    let execution_class = non_empty(declaration.execution_class.as_deref());
+    let completion_role = non_empty(declaration.completion_role.as_deref());
+
+    match (execution_class, completion_role) {
+        (None, None) => return vec![VerificationRoleIssue::LegacyRoleMetadataMissing],
+        (Some(_), None) | (None, Some(_)) => {
+            issues.push(VerificationRoleIssue::IncompleteRoleMetadata)
+        }
+        (Some(_), Some(_)) => {}
+    }
+
+    let parsed_class =
+        execution_class.map(|value| (value, VerificationExecutionClass::parse(value)));
+    if let Some((raw, None)) = parsed_class {
+        issues.push(VerificationRoleIssue::UnknownExecutionClass(
+            raw.to_string(),
+        ));
+    }
+    let parsed_role =
+        completion_role.map(|value| (value, VerificationCompletionRole::parse(value)));
+    if let Some((raw, None)) = parsed_role {
+        issues.push(VerificationRoleIssue::UnknownCompletionRole(
+            raw.to_string(),
+        ));
+    }
+
+    if matches!(
+        parsed_role,
+        Some((_, Some(VerificationCompletionRole::ChangeBlocking)))
+    ) {
+        match declaration.phase.as_deref() {
+            Some("pre-integration") => {}
+            Some(phase) => issues.push(VerificationRoleIssue::PostIntegrationChangeBlocking(
+                phase.to_string(),
+            )),
+            None => issues.push(VerificationRoleIssue::PostIntegrationChangeBlocking(
+                "<missing phase>".to_string(),
+            )),
+        }
+        if let Some((_, Some(class))) = parsed_class {
+            if !class.is_repository_local() {
+                issues.push(VerificationRoleIssue::NonLocalChangeBlocking(class));
+            }
+        }
+    }
+
+    issues
+}
+
+/// Collect declaration IDs that are valid repository-local completion gates.
+pub fn change_blocking_verification_ids(declarations: &[VerificationDeclaration]) -> Vec<String> {
+    declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.is_change_blocking() && !declaration.is_non_local_change_blocker()
+        })
+        .filter_map(|declaration| non_empty(declaration.id.as_deref()).map(str::to_string))
+        .collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -275,6 +478,8 @@ pub fn parse_frontmatter_metadata_strict(
                 "evidence",
                 "rerun",
                 "prerequisites",
+                "execution_class",
+                "completion_role",
             ]
             .into_iter()
             .collect();
@@ -1157,6 +1362,130 @@ verifications:
         assert_eq!(declarations[0].phase.as_deref(), Some("invalid"));
         assert_eq!(declarations[0].prerequisites, Some(Vec::new()));
         assert_eq!(declarations[1].id.as_deref(), Some("duplicate"));
+    }
+
+    fn declaration(
+        phase: &str,
+        execution_class: &str,
+        completion_role: &str,
+    ) -> VerificationDeclaration {
+        VerificationDeclaration {
+            id: Some("check".to_string()),
+            phase: (!phase.is_empty()).then(|| phase.to_string()),
+            execution_class: (!execution_class.is_empty()).then(|| execution_class.to_string()),
+            completion_role: (!completion_role.is_empty()).then(|| completion_role.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_parse_verification_role_fields_from_frontmatter() {
+        let parsed = parse_proposal_frontmatter_strict(
+            "---\nverifications:\n  - id: local\n    phase: pre-integration\n    execution_class: repository-local\n    completion_role: change-blocking\n    prerequisites: []\n---\n# Change",
+            Path::new("proposal.md"),
+        );
+
+        assert!(parsed.diagnostics.is_empty());
+        let declarations = parsed.metadata.unwrap().verifications;
+        assert_eq!(
+            declarations[0].execution_class(),
+            Some(VerificationExecutionClass::RepositoryLocal)
+        );
+        assert_eq!(
+            declarations[0].completion_role(),
+            Some(VerificationCompletionRole::ChangeBlocking)
+        );
+        assert!(declarations[0].is_change_blocking());
+        assert!(!declarations[0].is_non_local_change_blocker());
+        assert_eq!(
+            change_blocking_verification_ids(&declarations),
+            vec!["local".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_legacy_verification_declaration_reports_migration_issue_only() {
+        let legacy = declaration("pre-integration", "", "");
+
+        assert!(!legacy.declares_role_metadata());
+        let issues = evaluate_verification_role(&legacy);
+        assert_eq!(
+            issues,
+            vec![VerificationRoleIssue::LegacyRoleMetadataMissing]
+        );
+        assert!(issues.iter().all(VerificationRoleIssue::is_warning));
+        assert!(change_blocking_verification_ids(&[legacy]).is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_verification_role_rejects_inconsistent_combinations() {
+        assert_eq!(
+            evaluate_verification_role(&declaration(
+                "post-integration",
+                "repository-automation",
+                "change-blocking"
+            )),
+            vec![
+                VerificationRoleIssue::PostIntegrationChangeBlocking(
+                    "post-integration".to_string()
+                ),
+                VerificationRoleIssue::NonLocalChangeBlocking(
+                    VerificationExecutionClass::RepositoryAutomation
+                )
+            ]
+        );
+        assert_eq!(
+            evaluate_verification_role(&declaration(
+                "pre-integration",
+                "physical-device",
+                "change-blocking"
+            )),
+            vec![VerificationRoleIssue::NonLocalChangeBlocking(
+                VerificationExecutionClass::PhysicalDevice
+            )]
+        );
+        assert_eq!(
+            evaluate_verification_role(&declaration("pre-integration", "repository-local", "")),
+            vec![VerificationRoleIssue::IncompleteRoleMetadata]
+        );
+        assert_eq!(
+            evaluate_verification_role(&declaration("pre-integration", "on-my-laptop", "blocking")),
+            vec![
+                VerificationRoleIssue::UnknownExecutionClass("on-my-laptop".to_string()),
+                VerificationRoleIssue::UnknownCompletionRole("blocking".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_operational_observation_declarations_are_never_change_blocking() {
+        for class in [
+            "repository-automation",
+            "deployed-service",
+            "physical-device",
+            "external-approval",
+            "credentialed-external",
+        ] {
+            let observation = declaration("post-integration", class, "operational-observation");
+            assert!(
+                evaluate_verification_role(&observation).is_empty(),
+                "{class}"
+            );
+            assert!(!observation.is_change_blocking());
+            assert!(!observation.is_non_local_change_blocker());
+        }
+    }
+
+    #[test]
+    fn test_non_local_change_blocker_detection_covers_missing_phase_and_class() {
+        assert!(
+            declaration("", "repository-local", "change-blocking").is_non_local_change_blocker()
+        );
+        assert!(declaration("pre-integration", "", "change-blocking").is_non_local_change_blocker());
+        assert!(
+            declaration("pre-integration", "deployed-service", "change-blocking")
+                .is_non_local_change_blocker()
+        );
     }
 
     #[test]
