@@ -1003,6 +1003,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
+        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1146,6 +1147,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
+        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1305,6 +1307,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
+        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1519,6 +1522,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
+        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1725,6 +1729,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
+        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1937,6 +1942,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
+        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -7065,20 +7071,27 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         .await
         .or_fail("workspace task should exist")
         .or_fail("workspace task join should succeed");
+    // Repeated findings without semantic progress are a runtime retry judgement,
+    // not a reviewer-validated external blocker. The loop stops and requires an
+    // explicit retry, without inventing a blocker category or writing anything
+    // into the change directory.
+    let error = result
+        .error
+        .as_deref()
+        .or_fail("repeated findings must stop the retry loop with a diagnostic");
     assert!(
-        result.error.is_none(),
-        "stalled acceptance is not an error: {:?}",
-        result.error
+        error.contains("repeated_acceptance_findings"),
+        "diagnostic must name the retry judgement: {error}"
     );
-
-    let marker =
+    assert!(
+        error.contains("Explicit retry is required"),
+        "diagnostic must state the operator action: {error}"
+    );
+    assert!(
         crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
-            .or_fail("load stalled marker")
-            .or_fail("acceptance failure must persist a stalled marker");
-    assert_eq!(marker.reason, "repeated_acceptance_findings");
-    assert_eq!(
-        marker.retry_count, 2,
-        "retry count must come from this run only, not from generated state"
+            .or_fail("read change directory")
+            .is_none(),
+        "acceptance must not create a blocked marker under the change directory"
     );
 
     if stale_checkpoint {
@@ -7095,7 +7108,7 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
 
     let mut acceptance_count = 0;
     let mut apply_count = 0;
-    let mut saw_error = false;
+    let mut saw_stalled = false;
     while let Ok(event) = rx.try_recv() {
         match event {
             ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
@@ -7104,27 +7117,603 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
             ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
                 apply_count += 1;
             }
-            ExecutionEvent::ProcessingError { id, .. } if id == change_id => {
-                saw_error = true;
+            ExecutionEvent::AcceptanceGated { change_id: id, .. } if id == change_id => {
+                saw_stalled = true;
             }
             _ => {}
         }
     }
     assert_eq!(
         acceptance_count, 2,
-        "the first failure must retry apply and only the repeated failure may stall"
+        "the first failure must retry apply and only the repeated failure may stop"
     );
     assert_eq!(
         apply_count, 1,
-        "exactly one apply retry precedes the repeated-finding stall"
+        "exactly one apply retry precedes the repeated-finding stop"
     );
     assert!(
-        !saw_error,
-        "stalled acceptance must not emit ProcessingError"
+        !saw_stalled,
+        "evidence-free retry exhaustion must not emit a stalled lifecycle transition"
     );
 }
 
+/// Observations from one dispatch whose acceptance command emits bare
+/// `ACCEPTANCE: GATED` for its first `bare_attempts` invocations and then the
+/// supplied final verdict payload.
+struct GatedDispatch {
+    result: WorkspaceResult,
+    workspace_path: std::path::PathBuf,
+    acceptance_invocations: u32,
+    apply_invocations: u32,
+    stalled_events: Vec<crate::events::StalledBlocker>,
+    prompts: Vec<String>,
+}
+
+/// Dispatch one change against a gated-then-final acceptance fixture.
+///
+/// `stall_state_root` isolates runtime stall state per test, so nothing reaches
+/// a developer's real XDG state directory and concurrent tests cannot observe
+/// each other's holds.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_gated_run(
+    repo_root: &std::path::Path,
+    workspace_base_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+    stall_state_root: &std::path::Path,
+    change_id: &str,
+    bare_attempts: u32,
+    final_verdict: &str,
+    explicit_retry: bool,
+) -> GatedDispatch {
+    let base_revision = get_current_commit(repo_root)
+        .await
+        .or_fail("get base revision");
+
+    let counter = state_dir.join("attempts");
+    let prompt_dir = state_dir.join("prompts");
+    std::fs::create_dir_all(&prompt_dir).or_fail("create prompt capture dir");
+    // The final verdict is read from a file so JSON quoting survives the shell
+    // round trip intact.
+    let verdict_file = state_dir.join("final-verdict.txt");
+    std::fs::write(&verdict_file, final_verdict).or_fail("write final verdict fixture");
+    let counter_display = counter.display().to_string();
+    let prompt_dir_display = prompt_dir.display().to_string();
+    let verdict_display = verdict_file.display().to_string();
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base_dir.to_string_lossy().to_string()),
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+        )),
+        acceptance_command: Some(format!(
+            "sh -c 'n=$(cat \"{counter_display}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{counter_display}\"; \
+             printf \"%s\" \"$0\" > \"{prompt_dir_display}/attempt-$n.txt\"; \
+             if [ $n -gt {bare_attempts} ]; then cat \"{verdict_display}\"; \
+             else echo \"ACCEPTANCE: GATED\"; fi' {{prompt}}"
+        )),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
+    executor.set_acceptance_stall_state_root(stall_state_root.to_path_buf());
+    executor.set_explicit_retry(explicit_retry);
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_root.to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch gated change");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let workspace_path = workspace_base_dir.join(format!("cflx-{change_id}"));
+    let workspace_path = if workspace_path.exists() {
+        workspace_path
+    } else {
+        executor
+            .workspace_manager
+            .find_existing_workspace(change_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|workspace| workspace.path)
+            .unwrap_or_else(|| workspace_base_dir.join(change_id))
+    };
+
+    let mut observed = GatedDispatch {
+        result,
+        workspace_path,
+        acceptance_invocations: 0,
+        apply_invocations: 0,
+        stalled_events: Vec::new(),
+        prompts: Vec::new(),
+    };
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                observed.acceptance_invocations += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                observed.apply_invocations += 1;
+            }
+            ExecutionEvent::AcceptanceGated {
+                change_id: id,
+                blocker,
+            } if id == change_id => observed.stalled_events.push(blocker),
+            _ => {}
+        }
+    }
+
+    let mut attempt = 1;
+    while let Ok(prompt) =
+        std::fs::read_to_string(prompt_dir.join(format!("attempt-{attempt}.txt")))
+    {
+        observed.prompts.push(prompt);
+        attempt += 1;
+    }
+
+    observed
+}
+
+fn workspace_porcelain_status(workspace_path: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(workspace_path)
+        .output()
+        .or_fail("read workspace git status");
+    String::from_utf8(output.stdout).or_fail("decode git status")
+}
+
+fn workspace_head(workspace_path: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(workspace_path)
+        .output()
+        .or_fail("read workspace HEAD");
+    String::from_utf8(output.stdout)
+        .or_fail("decode HEAD")
+        .trim()
+        .to_string()
+}
+
+const VALIDATED_BLOCKER_VERDICT: &str = concat!(
+    r#"{"acceptance":"gated","blocker":{"category":"credential","#,
+    r#""evidence":["STAGING_API_KEY is unset in the verification environment"],"#,
+    r#""next_action":"provision STAGING_API_KEY then retry acceptance","resumable":true}}"#,
+    "\n"
+);
+
+/// gated → gated → PASS: exactly two acceptance-only retries, one apply, no
+/// stalled transition, and a clean worktree with the apply commit intact.
+#[tokio::test]
+async fn parallel_bare_gated_retries_then_passes_without_stalling() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create fixture state dir");
+    let stall_state = TempDir::new().or_fail("create stall state root");
+    let change_id = "parallel-bare-gated-pass";
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let observed = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        state_dir.path(),
+        stall_state.path(),
+        change_id,
+        2,
+        "ACCEPTANCE: PASS\n",
+        false,
+    )
+    .await;
+
+    assert!(
+        observed.result.error.is_none(),
+        "bare gated within budget must not fail the workspace: {:?}",
+        observed.result.error
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "the initial attempt plus exactly two protocol retries must run"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "a bare gated protocol retry must never rerun apply"
+    );
+    assert!(
+        observed.stalled_events.is_empty(),
+        "bare gated input must emit no stalled lifecycle transition"
+    );
+
+    assert!(!observed.prompts[0].contains("<acceptance_protocol_retry>"));
+    for attempt in [1usize, 2] {
+        let prompt = &observed.prompts[attempt];
+        assert!(prompt.contains("<acceptance_protocol_retry>"));
+        assert!(prompt.contains("without a validated structured blocker"));
+        assert!(prompt.contains("Supported categories:"));
+    }
+
+    assert!(
+        !observed
+            .workspace_path
+            .join("openspec/changes")
+            .join(change_id)
+            .join("APPLY_BLOCKED")
+            .exists(),
+        "acceptance must not create a marker under the change directory"
+    );
+}
+
+/// Three consecutive bare gated results exhaust the shared budget, produce a
+/// terminal protocol error, and still leave a clean worktree with no hold.
+#[tokio::test]
+async fn parallel_bare_gated_exhaustion_is_terminal_and_creates_no_hold() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create fixture state dir");
+    let stall_state = TempDir::new().or_fail("create stall state root");
+    let change_id = "parallel-bare-gated-exhausted";
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let observed = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        state_dir.path(),
+        stall_state.path(),
+        change_id,
+        5,
+        "ACCEPTANCE: PASS\n",
+        false,
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("exhausted bare gated retries must be terminal");
+    assert!(error.contains("bare-blocker protocol failure"), "{error}");
+    assert!(
+        error.contains("Exhausted 3 consecutive attempts after 2 protocol retries"),
+        "{error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "no fourth protocol retry may start after exhaustion"
+    );
+    assert_eq!(observed.apply_invocations, 1);
+    assert!(observed.stalled_events.is_empty());
+
+    // No durable hold anywhere, and the worktree is untouched by acceptance.
+    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
+    assert!(store
+        .load(
+            &crate::parallel::acceptance_state::repository_identity(repo_dir.path()),
+            change_id
+        )
+        .or_fail("read stall store")
+        .is_none());
+    assert_eq!(workspace_porcelain_status(&observed.workspace_path), "");
+}
+
+/// A validated structured blocker stalls immediately, records a revision-bound
+/// hold outside the worktree, and preserves the clean worktree and apply commit.
+/// A restart then restores `stalled` without re-running anything, and an
+/// explicit retry resumes acceptance only.
+/// Heavy: three full dispatch rounds against real git worktrees put this over
+/// the one-second default-suite budget. The individual behaviours it chains are
+/// also covered by faster default tests (stall persistence and restart
+/// reconciliation in `execution::state`, dispatch suppression in
+/// `runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid`); this
+/// test exists to prove they compose end to end.
+#[cfg(feature = "heavy-tests")]
+#[tokio::test]
+async fn parallel_validated_blocker_stalls_survives_restart_and_retries_acceptance_only() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let stall_state = TempDir::new().or_fail("create stall state root");
+    let change_id = "parallel-validated-stall";
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    // --- 1. Enter the stall -------------------------------------------------
+    let first = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        TempDir::new().or_fail("state dir").path(),
+        stall_state.path(),
+        change_id,
+        0,
+        VALIDATED_BLOCKER_VERDICT,
+        false,
+    )
+    .await;
+
+    assert!(
+        first.result.error.is_none(),
+        "a validated stall is not an error: {:?}",
+        first.result.error
+    );
+    assert_eq!(
+        first.acceptance_invocations, 1,
+        "a validated blocker must not consume protocol retry budget"
+    );
+    assert_eq!(first.stalled_events.len(), 1);
+    assert_eq!(first.stalled_events[0].category, "credential");
+    assert!(first.stalled_events[0].resumable);
+
+    let apply_revision = workspace_head(&first.workspace_path);
+    assert_eq!(
+        workspace_porcelain_status(&first.workspace_path),
+        "",
+        "entering a stall must leave the managed worktree clean"
+    );
+    assert!(!first
+        .workspace_path
+        .join("openspec/changes")
+        .join(change_id)
+        .join("APPLY_BLOCKED")
+        .exists());
+
+    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
+    let repository_id = crate::parallel::acceptance_state::repository_identity(repo_dir.path());
+    let record = store
+        .load(&repository_id, change_id)
+        .or_fail("read stall store")
+        .or_fail("a validated blocker must persist a runtime hold");
+    assert_eq!(record.category, "credential");
+    assert_eq!(record.apply_revision, apply_revision);
+    assert_eq!(record.phase, "acceptance");
+    assert!(record.resumable);
+
+    // --- 2. Restart: the hold suppresses dispatch entirely ------------------
+    let restart_state = TempDir::new().or_fail("restart state dir");
+    let restarted = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        restart_state.path(),
+        stall_state.path(),
+        change_id,
+        0,
+        VALIDATED_BLOCKER_VERDICT,
+        false,
+    )
+    .await;
+
+    assert!(restarted.result.error.is_none());
+    assert_eq!(
+        restarted.acceptance_invocations, 0,
+        "a reconciled hold must start neither apply nor acceptance"
+    );
+    assert_eq!(restarted.apply_invocations, 0);
+    assert_eq!(restarted.stalled_events.len(), 1);
+    assert_eq!(restarted.stalled_events[0].category, "credential");
+    assert_eq!(
+        restarted.stalled_events[0].next_action,
+        "provision STAGING_API_KEY then retry acceptance"
+    );
+    assert_eq!(workspace_porcelain_status(&first.workspace_path), "");
+    assert_eq!(
+        workspace_head(&first.workspace_path),
+        apply_revision,
+        "the apply commit must survive a stalled restart"
+    );
+
+    // --- 3. Explicit retry resumes acceptance only --------------------------
+    let retry_state = TempDir::new().or_fail("retry state dir");
+    let retried = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        retry_state.path(),
+        stall_state.path(),
+        change_id,
+        0,
+        "ACCEPTANCE: PASS\n",
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        retried.acceptance_invocations, 1,
+        "explicit retry must re-run acceptance"
+    );
+    assert_eq!(
+        retried.apply_invocations, 0,
+        "explicit retry must resume at acceptance without rerunning apply"
+    );
+    assert!(
+        store
+            .load(&repository_id, change_id)
+            .or_fail("read stall store")
+            .is_none(),
+        "a successful explicit retry consumes the hold"
+    );
+}
+
+/// Ordinary queue reconciliation must not re-submit a runtime-stalled change,
+/// and a hold that has lost its binding must release the change again.
+#[tokio::test]
+async fn runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let stall_state = TempDir::new().or_fail("create stall state root");
+    let change_id = "parallel-queue-stalled";
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let observed = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        TempDir::new().or_fail("state dir").path(),
+        stall_state.path(),
+        change_id,
+        0,
+        VALIDATED_BLOCKER_VERDICT,
+        false,
+    )
+    .await;
+    assert_eq!(observed.stalled_events.len(), 1);
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
+    executor.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
+
+    let queued = vec![make_test_change(change_id)];
+    let classification = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+
+    assert_eq!(
+        classification.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
+        "a runtime-stalled change must not be classified as dispatchable"
+    );
+    assert!(
+        !classification.has_dispatchable_apply(),
+        "ordinary reconciliation must not re-submit a stalled change (Blocked -> Blocked)"
+    );
+    assert!(classification.has_blocked_or_waiting_work());
+
+    // Once the hold loses its binding it is quarantined and the change is free
+    // to be dispatched again — a stale record can never block work forever.
+    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
+    let repository_id = crate::parallel::acceptance_state::repository_identity(repo_dir.path());
+    let mut record = store
+        .load(&repository_id, change_id)
+        .or_fail("read stall store")
+        .or_fail("hold must exist");
+    record.apply_revision = "0".repeat(40);
+    std::fs::write(
+        store.record_path(&repository_id, change_id),
+        serde_json::to_vec_pretty(&record).or_fail("encode record"),
+    )
+    .or_fail("plant stale record");
+
+    let classification = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+    assert_ne!(
+        classification.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
+        "a hold that lost its binding must release the change"
+    );
+}
+
+/// Explicit retry is a preparation transaction. When it refuses to proceed —
+/// here because the hold is not resumable — the blocker evidence must survive
+/// untouched and no ambiguous work may be dispatched.
+#[tokio::test]
+async fn refused_explicit_retry_retains_the_acceptance_hold() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let stall_state = TempDir::new().or_fail("create stall state root");
+    let change_id = "parallel-retry-refused";
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    // Enter a stall, then rewrite the hold as non-resumable.
+    let observed = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        TempDir::new().or_fail("state dir").path(),
+        stall_state.path(),
+        change_id,
+        0,
+        VALIDATED_BLOCKER_VERDICT,
+        false,
+    )
+    .await;
+    assert_eq!(observed.stalled_events.len(), 1);
+
+    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
+    let repository_id = crate::parallel::acceptance_state::repository_identity(repo_dir.path());
+    let mut record = store
+        .load(&repository_id, change_id)
+        .or_fail("read stall store")
+        .or_fail("hold must exist");
+    record.resumable = false;
+    let before = store.save(&record).or_fail("store non-resumable hold");
+
+    // Explicit retry must refuse and change nothing.
+    let retried = dispatch_gated_run(
+        repo_dir.path(),
+        workspace_base.path(),
+        TempDir::new().or_fail("retry state dir").path(),
+        stall_state.path(),
+        change_id,
+        0,
+        "ACCEPTANCE: PASS\n",
+        true,
+    )
+    .await;
+
+    assert_eq!(
+        retried.acceptance_invocations, 0,
+        "a refused retry must not dispatch acceptance"
+    );
+    assert_eq!(
+        retried.apply_invocations, 0,
+        "a refused retry must not dispatch apply"
+    );
+
+    let after = store
+        .load(&repository_id, change_id)
+        .or_fail("read stall store")
+        .or_fail("a refused retry must retain the blocker evidence");
+    assert_eq!(after, before);
+    assert_eq!(workspace_porcelain_status(&observed.workspace_path), "");
+}
+
+/// Cleanup, archive, and merge decisions must stay entirely repository-derived.
+/// Runtime stall state is not an input to any of them, so none of those modules
+/// may reach for the store at all.
+#[test]
+fn cleanup_archive_and_merge_do_not_consult_acceptance_stall_state() {
+    for (label, source) in [
+        ("cleanup", include_str!("../cleanup.rs")),
+        ("merge", include_str!("../merge.rs")),
+        ("archive", include_str!("../../execution/archive.rs")),
+    ] {
+        for forbidden in ["AcceptanceStallStore", "load_valid_acceptance_stall"] {
+            assert!(
+                !source.contains(forbidden),
+                "{label} must not consult acceptance stall state ({forbidden})"
+            );
+        }
+    }
+}
+
 /// Observations collected from one dispatch driven by a stateful fake
+/// acceptance command that withholds a canonical verdict for the first
+/// `missing_attempts` invocations and then emits `ACCEPTANCE: PASS`./// Observations collected from one dispatch driven by a stateful fake
 /// acceptance command that withholds a canonical verdict for the first
 /// `missing_attempts` invocations and then emits `ACCEPTANCE: PASS`.
 struct MissingVerdictDispatch {
@@ -7552,7 +8141,7 @@ async fn parallel_restart_reruns_acceptance_without_inferring_pass_from_prior_ou
 }
 
 #[tokio::test]
-async fn parallel_repeated_acceptance_failure_stalls_without_error_event() {
+async fn parallel_repeated_acceptance_failure_stops_without_a_change_directory_marker() {
     assert_parallel_acceptance_failure_stalls_within_one_run(false).await;
 }
 
@@ -7757,15 +8346,16 @@ async fn test_resumed_workspace_marker_stops_parallel_dispatch_before_apply_acce
         .output()
         .await
         .or_fail("create resumed worktree");
-    crate::parallel::acceptance_state::write_acceptance_blocked_marker(
-        &workspace_path,
-        change_id,
-        "acceptance stalled",
-        &[],
-        true,
-        "explicit retry",
-    )
-    .or_fail("write acceptance marker");
+    // Apply-origin markers keep their existing conservative blocked routing;
+    // they are never migrated or consumed by acceptance.
+    let marker_path = workspace_path
+        .join("openspec/changes")
+        .join(change_id)
+        .join("APPLY_BLOCKED/marker.md");
+    std::fs::create_dir_all(marker_path.parent().or_fail("marker parent"))
+        .or_fail("create marker dir");
+    std::fs::write(&marker_path, "origin: apply\nreason: apply blocked\n")
+        .or_fail("write apply marker");
 
     let config = create_test_config_with(OrchestratorConfig {
         workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),

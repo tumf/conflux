@@ -135,7 +135,9 @@ pub async fn run_orchestrator(
     let mut serial_service = SerialRunService::new(repo_root, config);
     if explicit_retry {
         for change_id in &change_ids {
-            serial_service.consume_explicit_acceptance_retry(change_id)?;
+            serial_service
+                .consume_explicit_acceptance_retry(change_id)
+                .await?;
         }
     }
 

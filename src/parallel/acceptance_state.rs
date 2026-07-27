@@ -1,4 +1,4 @@
-//! Acceptance retry state.
+//! Acceptance retry and stall state.
 //!
 //! Ordinary acceptance retry bookkeeping (cycle count, previous finding
 //! identities, semantic baseline) lives in memory for the duration of one
@@ -6,10 +6,18 @@
 //! checkpoint: after a restart, complete but unarchived work is accepted again
 //! rather than trusting an inferred prior PASS.
 //!
-//! The only durable acceptance artifact is the tracked
-//! `APPLY_BLOCKED/marker.md` stalled hold, which has an independent
-//! repository-visible purpose and is written only after retry safeguards decide
-//! that further automatic work must stop.
+//! A *validated* external blocker is different. It is a temporary hold that must
+//! survive restart without mutating the managed worktree, so it is stored in the
+//! versioned, revision-bound [`AcceptanceStallStore`] under Conflux's XDG state
+//! area. Per constitutional law 1a that record may control only dispatch
+//! suppression, `stalled` presentation, and acceptance-only explicit retry: it
+//! can never prove implementation completion, acceptance PASS, archive
+//! readiness, or merge eligibility.
+//!
+//! Acceptance no longer writes `APPLY_BLOCKED/marker.md`. Apply-origin and
+//! unknown-origin markers keep their existing conservative handling, and legacy
+//! acceptance-origin markers are migrated once (see
+//! [`migrate_legacy_acceptance_marker`]).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,6 +30,12 @@ use crate::error::{OrchestratorError, Result};
 
 const BLOCKED_MARKER_FILE: &str = "APPLY_BLOCKED/marker.md";
 const MARKER_VERSION: &str = "acceptance-stalled-v1";
+
+/// Schema version for the out-of-worktree acceptance stall record.
+///
+/// Reading a record with any other schema is a hard refusal: the record is
+/// quarantined and cannot control routing.
+pub const ACCEPTANCE_STALL_SCHEMA: &str = "acceptance-stall-v1";
 
 /// In-memory acceptance retry context for one active orchestration run.
 ///
@@ -105,30 +119,14 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     })
 }
 
-#[allow(dead_code)]
-pub fn write_acceptance_blocked_marker(
-    workspace_path: &Path,
-    change_id: &str,
-    reason: &str,
-    evidence: &[String],
-    resumable: bool,
-    next_action: &str,
-) -> Result<()> {
-    write_acceptance_blocked_marker_with_context(
-        workspace_path,
-        change_id,
-        reason,
-        evidence,
-        &AcceptanceRetryContext::default(),
-        "unknown",
-        &[],
-        resumable,
-        next_action,
-    )
-}
-
+/// Test-only helper that fabricates a legacy acceptance-origin marker.
+///
+/// Production acceptance never writes a marker any more; this exists so
+/// migration and conservative-preservation regressions can build realistic
+/// legacy fixtures.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn write_acceptance_blocked_marker_with_context(
+pub fn write_legacy_acceptance_marker(
     workspace_path: &Path,
     change_id: &str,
     reason: &str,
@@ -209,20 +207,500 @@ pub fn parse_blocked_marker(
     }))
 }
 
-pub fn consume_resumable_acceptance_marker(workspace_path: &Path, change_id: &str) -> Result<bool> {
-    let path = marker_path(workspace_path, change_id);
-    if !matches!(
-        parse_blocked_marker(workspace_path, change_id)?,
-        Some(BlockedMarker {
-            origin: BlockedMarkerOrigin::Acceptance,
-            resumable: true,
-            ..
-        })
-    ) {
-        return Ok(false);
+/// Versioned, revision-bound acceptance stall record.
+///
+/// Stored outside every managed worktree. Its authority is deliberately narrow
+/// (constitutional law 1a): dispatch suppression, `stalled` presentation, and
+/// acceptance-only explicit retry. Nothing here is completion evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceStallRecord {
+    /// Schema version; must equal [`ACCEPTANCE_STALL_SCHEMA`].
+    pub schema: String,
+    /// Identity of the repository that owns the change.
+    pub repository_id: String,
+    pub change_id: String,
+    /// Stable identity of the managed worktree (see [`worktree_identity`]).
+    pub worktree_id: String,
+    /// Canonical worktree path at the time the hold was recorded.
+    pub worktree_path: String,
+    /// Branch checked out in the worktree, when resolvable.
+    pub branch: Option<String>,
+    /// Apply revision the hold is bound to.
+    pub apply_revision: String,
+    /// Phase that stalled. Always `acceptance` for records written here.
+    pub phase: String,
+    /// Acceptance retry count observed when the hold was recorded.
+    pub retry_count: u32,
+    /// Explicit blocker category supplied by the reviewer.
+    pub category: String,
+    /// Concrete blocker evidence.
+    pub evidence: Vec<String>,
+    /// Whether acceptance can resume once the prerequisite is satisfied.
+    pub resumable: bool,
+    /// Operator-facing unblock action.
+    pub next_action: String,
+    /// Optional owning team/role for the prerequisite.
+    pub prerequisite_owner: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl AcceptanceStallRecord {
+    /// Build a record from a validated blocker and the current repository facts.
+    pub fn new(
+        facts: &WorkspaceFacts,
+        blocker: &crate::acceptance::AcceptanceBlocker,
+        apply_revision: &str,
+        retry_count: u32,
+    ) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            schema: ACCEPTANCE_STALL_SCHEMA.to_string(),
+            repository_id: facts.repository_id.clone(),
+            change_id: facts.change_id.clone(),
+            worktree_id: facts.worktree_id.clone(),
+            worktree_path: facts.worktree_path.clone(),
+            branch: facts.branch.clone(),
+            apply_revision: apply_revision.to_string(),
+            phase: "acceptance".to_string(),
+            retry_count,
+            category: blocker.category.clone(),
+            evidence: blocker.evidence.clone(),
+            resumable: blocker.resumable,
+            next_action: blocker.next_action.clone(),
+            prerequisite_owner: blocker.prerequisite_owner.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
     }
-    fs::remove_file(path)?;
-    Ok(true)
+
+    /// Operator-facing blocker view for lifecycle events and status displays.
+    ///
+    /// The category is copied verbatim; it is never re-derived from prose.
+    pub fn to_stalled_blocker(&self) -> crate::events::StalledBlocker {
+        crate::events::StalledBlocker {
+            category: self.category.clone(),
+            phase: self.phase.clone(),
+            gate: "acceptance".to_string(),
+            error_summary: format!(
+                "validated external acceptance blocker ({}): {}",
+                self.category,
+                self.evidence.join(" | ")
+            ),
+            evidence: self.evidence.clone(),
+            next_action: self.next_action.clone(),
+            resumable: self.resumable,
+            worktree_preserved: true,
+        }
+    }
+}
+
+/// Current repository/worktree facts a stall record is reconciled against.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkspaceFacts {
+    pub repository_id: String,
+    pub change_id: String,
+    pub worktree_id: String,
+    pub worktree_path: String,
+    pub branch: Option<String>,
+    /// Whether the stored apply revision still exists in the worktree history.
+    pub apply_revision_exists: bool,
+    /// Whether current HEAD equals or descends from the stored apply revision.
+    pub head_descends_from_apply_revision: bool,
+    /// Whether the change is still active (not archived, not merged).
+    pub change_active: bool,
+}
+
+/// Outcome of reconciling a stored stall record against current facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StallReconciliation {
+    /// The record still binds to reality and may control routing.
+    Valid,
+    /// The record lost its binding. It must be invalidated or quarantined and
+    /// routing recomputed from repository evidence.
+    Invalid { reason: String },
+}
+
+impl StallReconciliation {
+    #[cfg(test)]
+    pub fn is_valid(&self) -> bool {
+        matches!(self, StallReconciliation::Valid)
+    }
+}
+
+/// Reconcile a stored stall record against current repository/worktree facts.
+///
+/// Pure decision logic: every input is a fact gathered by the caller, so this is
+/// unit-testable without touching git, the filesystem, or a real worktree.
+///
+/// Checks run in the order the design specifies, so the reported reason names
+/// the first binding that actually broke.
+pub fn reconcile_acceptance_stall(
+    record: &AcceptanceStallRecord,
+    facts: &WorkspaceFacts,
+) -> StallReconciliation {
+    let invalid = |reason: String| StallReconciliation::Invalid { reason };
+
+    if record.schema != ACCEPTANCE_STALL_SCHEMA {
+        return invalid(format!(
+            "unsupported acceptance stall schema '{}'",
+            record.schema
+        ));
+    }
+    if record.repository_id != facts.repository_id {
+        return invalid("stall record belongs to a different repository".to_string());
+    }
+    if record.change_id != facts.change_id {
+        return invalid("stall record belongs to a different change".to_string());
+    }
+    if !facts.change_active {
+        return invalid("change is archived or merged; stall record is obsolete".to_string());
+    }
+    if record.worktree_id != facts.worktree_id {
+        return invalid(
+            "managed worktree identity changed; the recorded worktree was deleted, recreated, \
+             or its path reused"
+                .to_string(),
+        );
+    }
+    if record.worktree_path != facts.worktree_path {
+        return invalid("managed worktree path changed since the hold was recorded".to_string());
+    }
+    if !facts.apply_revision_exists {
+        return invalid(format!(
+            "recorded apply revision {} no longer exists",
+            record.apply_revision
+        ));
+    }
+    if !facts.head_descends_from_apply_revision {
+        return invalid(format!(
+            "current HEAD no longer descends from the recorded apply revision {}",
+            record.apply_revision
+        ));
+    }
+    StallReconciliation::Valid
+}
+
+/// Stable identity for a repository, used as the storage key and as the first
+/// reconciliation guard.
+pub fn repository_identity(repo_root: &Path) -> String {
+    fs::canonicalize(repo_root)
+        .unwrap_or_else(|_| repo_root.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Stable identity for a managed worktree.
+///
+/// For a linked git worktree this is the `gitdir:` pointer written into
+/// `<worktree>/.git`, which changes when the worktree is recreated under a
+/// different name. Combined with the apply-revision ancestry check in
+/// [`reconcile_acceptance_stall`], a worktree that is deleted and rebuilt at the
+/// same path fails reconciliation because the fresh checkout no longer carries
+/// the recorded apply commit.
+pub fn worktree_identity(worktree_path: &Path) -> String {
+    let git_pointer = worktree_path.join(".git");
+    match fs::read_to_string(&git_pointer) {
+        Ok(contents) => contents.trim().to_string(),
+        // A non-linked worktree (plain clone) has `.git` as a directory.
+        Err(_) => format!("gitdir: {}", git_pointer.to_string_lossy()),
+    }
+}
+
+/// Versioned, atomic store for acceptance stall records.
+///
+/// The store lives outside every managed worktree, so creating, reading,
+/// reconciling, consuming, and quarantining records never dirties a worktree.
+/// The root is injectable so tests run against an isolated temporary directory
+/// with no real credentials, services, or shared state.
+#[derive(Debug, Clone)]
+pub struct AcceptanceStallStore {
+    root: PathBuf,
+}
+
+impl AcceptanceStallStore {
+    /// Build a store rooted at an explicit directory (used by tests).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Build a store rooted at Conflux's XDG state area.
+    pub fn discover() -> Result<Self> {
+        let base = match std::env::var_os("XDG_STATE_HOME") {
+            Some(value) if !value.is_empty() => PathBuf::from(value),
+            _ => dirs::home_dir()
+                .ok_or_else(|| {
+                    OrchestratorError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "cannot determine home directory for acceptance stall state",
+                    ))
+                })?
+                .join(".local/state"),
+        };
+        Ok(Self::new(base.join("cflx/acceptance-stalls")))
+    }
+
+    /// Storage path for one repository + change hold.
+    ///
+    /// Crate-visible so reconciliation tests can plant a record whose *content*
+    /// disagrees with the key it is stored under.
+    pub(crate) fn record_path(&self, repository_id: &str, change_id: &str) -> PathBuf {
+        self.root
+            .join(stable_key(repository_id))
+            .join(format!("{}.json", stable_key(change_id)))
+    }
+
+    /// Atomically create or update the hold for `record`'s repository + change,
+    /// returning exactly what was stored.
+    ///
+    /// An existing record's `created_at` is preserved so retry counts and hold
+    /// age stay meaningful across repeated observations of the same blocker.
+    pub fn save(&self, record: &AcceptanceStallRecord) -> Result<AcceptanceStallRecord> {
+        let path = self.record_path(&record.repository_id, &record.change_id);
+        let mut record = record.clone();
+        if let Ok(Some(existing)) = self.read_raw(&path) {
+            record.created_at = existing.created_at;
+        }
+        record.updated_at = chrono::Utc::now().to_rfc3339();
+        atomic_write(&path, &serde_json::to_vec_pretty(&record)?)?;
+        Ok(record)
+    }
+
+    /// Load the hold for a repository + change.
+    ///
+    /// Corrupt or unsupported-schema records are quarantined and reported as
+    /// absent: a record the runtime cannot understand must never control
+    /// dispatch.
+    pub fn load(
+        &self,
+        repository_id: &str,
+        change_id: &str,
+    ) -> Result<Option<AcceptanceStallRecord>> {
+        let path = self.record_path(repository_id, change_id);
+        match self.read_raw(&path) {
+            Ok(record) => Ok(record),
+            Err(error) => {
+                self.quarantine_path(&path, &error.to_string())?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn read_raw(&self, path: &Path) -> Result<Option<AcceptanceStallRecord>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(path)?;
+        let record: AcceptanceStallRecord = serde_json::from_str(&contents).map_err(|error| {
+            OrchestratorError::AgentCommand(format!(
+                "corrupt acceptance stall record at {}: {error}",
+                path.display()
+            ))
+        })?;
+        if record.schema != ACCEPTANCE_STALL_SCHEMA {
+            return Err(OrchestratorError::AgentCommand(format!(
+                "acceptance stall record at {} has unsupported schema '{}'",
+                path.display(),
+                record.schema
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    /// Remove the hold. Idempotent: consuming an absent record returns `false`
+    /// rather than failing, so a retry that races a restart stays safe.
+    pub fn consume(&self, repository_id: &str, change_id: &str) -> Result<bool> {
+        let path = self.record_path(repository_id, change_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&path)?;
+        Ok(true)
+    }
+
+    /// Move an unusable record aside with a diagnostic so an operator can still
+    /// inspect it, while guaranteeing it no longer controls routing.
+    pub fn quarantine(&self, repository_id: &str, change_id: &str, reason: &str) -> Result<()> {
+        let path = self.record_path(repository_id, change_id);
+        self.quarantine_path(&path, reason)
+    }
+
+    fn quarantine_path(&self, path: &Path, reason: &str) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let quarantine_dir = self.root.join("quarantine");
+        fs::create_dir_all(&quarantine_dir)?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "record.json".to_string());
+        let target = quarantine_dir.join(format!(
+            "{}-{}-{}",
+            std::process::id(),
+            WRITE_NONCE.fetch_add(1, Ordering::Relaxed),
+            name
+        ));
+        fs::rename(path, &target)?;
+        fs::write(target.with_extension("reason.txt"), reason)?;
+        Ok(())
+    }
+}
+
+/// Map an arbitrary identity string to a filesystem-safe, stable key.
+fn stable_key(value: &str) -> String {
+    let hash = value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
+        });
+    let readable = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let readable = readable.trim_matches('-');
+    let tail = readable
+        .char_indices()
+        .rev()
+        .nth(39)
+        .map(|(index, _)| &readable[index..])
+        .unwrap_or(readable);
+    format!("{tail}-{hash:016x}")
+}
+
+/// Outcome of the one-time legacy acceptance marker migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerMigration {
+    /// No marker was present, or nothing needed to change.
+    NotApplicable,
+    /// A marker was preserved unchanged because it could not be proven to be a
+    /// resumable, structurally valid, acceptance-owned hold.
+    Preserved { reason: String },
+    /// The marker was converted into a runtime stall record and removed.
+    Migrated { category: String },
+}
+
+/// Migrate one legacy acceptance-origin `APPLY_BLOCKED/marker.md` into runtime
+/// stall state.
+///
+/// Deliberately conservative. Migration happens only when the marker proves it
+/// is acceptance-owned, resumable, and carries a usable blocker payload, and
+/// only when the caller can bind it to the current repository, worktree, and
+/// apply revision. Apply-origin, unknown-origin, non-resumable, and malformed
+/// markers are preserved untouched — this function never deletes evidence it
+/// cannot prove is acceptance-generated.
+///
+/// The runtime record is written *before* the marker is removed, so an
+/// interruption can only leave a duplicate hold (idempotently re-migrated),
+/// never a lost one.
+pub fn migrate_legacy_acceptance_marker(
+    store: &AcceptanceStallStore,
+    workspace_path: &Path,
+    facts: &WorkspaceFacts,
+    apply_revision: &str,
+) -> Result<MarkerMigration> {
+    let path = marker_path(workspace_path, &facts.change_id);
+    if !path.exists() {
+        return Ok(MarkerMigration::NotApplicable);
+    }
+
+    // A marker we cannot parse is malformed: preserve it for human inspection.
+    let marker = match parse_blocked_marker(workspace_path, &facts.change_id) {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return Ok(MarkerMigration::NotApplicable),
+        Err(error) => {
+            return Ok(MarkerMigration::Preserved {
+                reason: format!("marker is malformed and was left untouched: {error}"),
+            })
+        }
+    };
+
+    if !matches!(marker.origin, BlockedMarkerOrigin::Acceptance) {
+        return Ok(MarkerMigration::Preserved {
+            reason: format!(
+                "marker origin {:?} is not acceptance-owned; conservative blocked handling retained",
+                marker.origin
+            ),
+        });
+    }
+    if !marker.resumable {
+        return Ok(MarkerMigration::Preserved {
+            reason: "acceptance marker is not resumable; conservative blocked handling retained"
+                .to_string(),
+        });
+    }
+
+    let evidence = marker
+        .evidence
+        .iter()
+        .chain(marker.external_blockers.iter())
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    if evidence.is_empty() {
+        return Ok(MarkerMigration::Preserved {
+            reason: "acceptance marker carries no concrete blocker evidence to migrate".to_string(),
+        });
+    }
+    let next_action = marker.next_action.trim();
+    if next_action.is_empty() {
+        return Ok(MarkerMigration::Preserved {
+            reason: "acceptance marker carries no next action to migrate".to_string(),
+        });
+    }
+
+    // Legacy markers predate explicit categories. Rather than infer one from
+    // prose, migrate under the neutral `pending_verification` category and keep
+    // the original reason as the leading evidence line.
+    let mut migrated_evidence = vec![format!(
+        "legacy acceptance marker reason: {}",
+        marker.reason
+    )];
+    migrated_evidence.extend(evidence);
+    let blocker = crate::acceptance::AcceptanceBlocker {
+        category: "pending_verification".to_string(),
+        evidence: migrated_evidence,
+        next_action: next_action.to_string(),
+        resumable: true,
+        prerequisite_owner: None,
+        evidence_ids: Vec::new(),
+    };
+
+    let record = store.save(&AcceptanceStallRecord::new(
+        facts,
+        &blocker,
+        apply_revision,
+        marker.retry_count,
+    ))?;
+
+    // Only now remove the generated marker, and only its own directory.
+    remove_generated_marker(workspace_path, &facts.change_id)?;
+    Ok(MarkerMigration::Migrated {
+        category: record.category,
+    })
+}
+
+/// Remove a generated `APPLY_BLOCKED` marker and the directory Conflux created
+/// for it, leaving no residue behind. Any unexpected sibling file keeps the
+/// directory, so nothing a human placed there is destroyed.
+fn remove_generated_marker(workspace_path: &Path, change_id: &str) -> Result<()> {
+    let path = marker_path(workspace_path, change_id);
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    if let Some(parent) = path.parent() {
+        if parent.exists() && fs::read_dir(parent)?.next().is_none() {
+            fs::remove_dir(parent)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -242,52 +720,308 @@ mod tests {
         }
     }
 
-    #[test]
-    fn module_persists_no_acceptance_checkpoint_file() {
-        let temp = TempDir::new().unwrap();
-        write_acceptance_blocked_marker_with_context(
-            temp.path(),
-            "change",
-            "acceptance_gated",
-            &[],
-            &retry_context(&["repository|evidence|verification"], Some("baseline"), 2),
-            "no_semantic_progress",
-            &[],
-            true,
-            "explicit retry",
-        )
-        .unwrap();
+    fn blocker() -> crate::acceptance::AcceptanceBlocker {
+        crate::acceptance::AcceptanceBlocker {
+            category: "credential".to_string(),
+            evidence: vec!["STAGING_API_KEY is unset".to_string()],
+            next_action: "provision STAGING_API_KEY then retry acceptance".to_string(),
+            resumable: true,
+            prerequisite_owner: Some("platform".to_string()),
+            evidence_ids: vec!["cred-1".to_string()],
+        }
+    }
 
-        assert!(!temp.path().join(".cflx/acceptance-state.json").exists());
+    fn facts() -> WorkspaceFacts {
+        WorkspaceFacts {
+            repository_id: "/repo".to_string(),
+            change_id: "change".to_string(),
+            worktree_id: "gitdir: /repo/.git/worktrees/ws-change".to_string(),
+            worktree_path: "/repo/../worktrees/ws-change".to_string(),
+            branch: Some("ws-change".to_string()),
+            apply_revision_exists: true,
+            head_descends_from_apply_revision: true,
+            change_active: true,
+        }
+    }
+
+    fn record() -> AcceptanceStallRecord {
+        AcceptanceStallRecord::new(&facts(), &blocker(), "revision-1", 2)
+    }
+
+    #[test]
+    fn acceptance_state_store_round_trips_every_bound_field() {
+        let temp = TempDir::new().unwrap();
+        let store = AcceptanceStallStore::new(temp.path());
+        let original = record();
+        store.save(&original).unwrap();
+
+        let loaded = store.load("/repo", "change").unwrap().unwrap();
+        assert_eq!(loaded.schema, ACCEPTANCE_STALL_SCHEMA);
+        assert_eq!(loaded.repository_id, "/repo");
+        assert_eq!(loaded.change_id, "change");
+        assert_eq!(loaded.worktree_id, original.worktree_id);
+        assert_eq!(loaded.worktree_path, original.worktree_path);
+        assert_eq!(loaded.branch.as_deref(), Some("ws-change"));
+        assert_eq!(loaded.apply_revision, "revision-1");
+        assert_eq!(loaded.phase, "acceptance");
+        assert_eq!(loaded.retry_count, 2);
+        assert_eq!(loaded.category, "credential");
+        assert_eq!(loaded.evidence, ["STAGING_API_KEY is unset"]);
+        assert!(loaded.resumable);
+        assert_eq!(
+            loaded.next_action,
+            "provision STAGING_API_KEY then retry acceptance"
+        );
+        assert_eq!(loaded.prerequisite_owner.as_deref(), Some("platform"));
+        assert!(!loaded.created_at.is_empty());
+        assert!(!loaded.updated_at.is_empty());
+
+        // Nothing is written into any worktree-shaped location.
+        assert!(!temp.path().join("openspec").exists());
         assert!(!temp.path().join(".cflx").exists());
     }
 
     #[test]
-    fn marker_write_failure_leaves_no_partial_marker() {
+    fn acceptance_state_store_isolates_repositories_and_changes() {
         let temp = TempDir::new().unwrap();
-        let change_dir = temp.path().join("openspec/changes/change");
-        fs::create_dir_all(&change_dir).unwrap();
-        fs::write(change_dir.join("APPLY_BLOCKED"), "not a directory").unwrap();
+        let store = AcceptanceStallStore::new(temp.path());
+        store.save(&record()).unwrap();
+        store
+            .save(&AcceptanceStallRecord {
+                repository_id: "/other-repo".to_string(),
+                ..record()
+            })
+            .unwrap();
+        store
+            .save(&AcceptanceStallRecord {
+                change_id: "other-change".to_string(),
+                ..record()
+            })
+            .unwrap();
 
-        assert!(write_acceptance_blocked_marker_with_context(
-            temp.path(),
-            "change",
-            "acceptance_gated",
-            &[],
-            &AcceptanceRetryContext::default(),
-            "no_semantic_progress",
-            &[],
-            true,
-            "explicit retry",
-        )
-        .is_err());
-        assert!(!marker_path(temp.path(), "change").exists());
+        assert!(store.consume("/repo", "change").unwrap());
+        assert!(store.load("/repo", "change").unwrap().is_none());
+        assert!(store.load("/other-repo", "change").unwrap().is_some());
+        assert!(store.load("/repo", "other-change").unwrap().is_some());
+    }
+
+    /// Re-observing the same blocker updates the hold in place and preserves the
+    /// original creation time, so hold age stays meaningful.
+    #[test]
+    fn acceptance_state_save_is_idempotent_and_preserves_creation_time() {
+        let temp = TempDir::new().unwrap();
+        let store = AcceptanceStallStore::new(temp.path());
+        let first = record();
+        store.save(&first).unwrap();
+        let stored_first = store.load("/repo", "change").unwrap().unwrap();
+
+        let mut second = record();
+        second.created_at = "1999-01-01T00:00:00Z".to_string();
+        second.retry_count = 5;
+        store.save(&second).unwrap();
+
+        let stored_second = store.load("/repo", "change").unwrap().unwrap();
+        assert_eq!(stored_second.created_at, stored_first.created_at);
+        assert_eq!(stored_second.retry_count, 5);
+    }
+
+    /// Corrupt and unsupported-schema records are quarantined, never obeyed.
+    #[test]
+    fn acceptance_state_quarantines_corrupt_and_unsupported_records() {
+        for (label, contents) in [
+            ("corrupt", "{ not json".to_string()),
+            (
+                "unsupported schema",
+                serde_json::to_string(&AcceptanceStallRecord {
+                    schema: "acceptance-stall-v99".to_string(),
+                    ..record()
+                })
+                .unwrap(),
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let store = AcceptanceStallStore::new(temp.path());
+            store.save(&record()).unwrap();
+            let path = store.record_path("/repo", "change");
+            fs::write(&path, &contents).unwrap();
+
+            assert!(
+                store.load("/repo", "change").unwrap().is_none(),
+                "{label} record must not control routing"
+            );
+            assert!(!path.exists(), "{label} record must be moved aside");
+            let quarantined = fs::read_dir(temp.path().join("quarantine"))
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .count();
+            assert!(quarantined >= 2, "{label} record and its reason are kept");
+        }
     }
 
     #[test]
-    fn marker_round_trip_preserves_in_memory_retry_context_and_foreign_markers() {
+    fn acceptance_state_consume_is_idempotent_and_quarantine_tolerates_absence() {
         let temp = TempDir::new().unwrap();
-        write_acceptance_blocked_marker_with_context(
+        let store = AcceptanceStallStore::new(temp.path());
+        store.save(&record()).unwrap();
+
+        assert!(store.consume("/repo", "change").unwrap());
+        assert!(!store.consume("/repo", "change").unwrap());
+        store.quarantine("/repo", "change", "already gone").unwrap();
+    }
+
+    /// A write failure must not leave a half-written hold behind.
+    #[test]
+    fn acceptance_state_write_failure_leaves_no_partial_record() {
+        let temp = TempDir::new().unwrap();
+        let store = AcceptanceStallStore::new(temp.path());
+        let path = store.record_path("/repo", "change");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A directory where the record file belongs makes the rename fail.
+        fs::create_dir_all(&path).unwrap();
+
+        assert!(store.save(&record()).is_err());
+        assert!(path.is_dir(), "the obstruction is left untouched");
+        assert!(
+            fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")),
+            "no temporary file may survive a failed write"
+        );
+    }
+
+    /// Reconciliation matrix: exactly one broken binding per case, and each must
+    /// invalidate the record with a reason naming what actually broke.
+    #[test]
+    fn acceptance_state_reconciliation_rejects_every_broken_binding() {
+        assert_eq!(
+            reconcile_acceptance_stall(&record(), &facts()),
+            StallReconciliation::Valid
+        );
+        assert!(reconcile_acceptance_stall(&record(), &facts()).is_valid());
+
+        let cases: Vec<(&str, AcceptanceStallRecord, WorkspaceFacts)> = vec![
+            (
+                "schema",
+                AcceptanceStallRecord {
+                    schema: "acceptance-stall-v0".to_string(),
+                    ..record()
+                },
+                facts(),
+            ),
+            (
+                "different repository",
+                record(),
+                WorkspaceFacts {
+                    repository_id: "/elsewhere".to_string(),
+                    ..facts()
+                },
+            ),
+            (
+                "different change",
+                record(),
+                WorkspaceFacts {
+                    change_id: "other-change".to_string(),
+                    ..facts()
+                },
+            ),
+            (
+                "archived or merged",
+                record(),
+                WorkspaceFacts {
+                    change_active: false,
+                    ..facts()
+                },
+            ),
+            (
+                "worktree identity",
+                record(),
+                WorkspaceFacts {
+                    worktree_id: "gitdir: /repo/.git/worktrees/ws-recreated".to_string(),
+                    ..facts()
+                },
+            ),
+            (
+                "worktree path",
+                record(),
+                WorkspaceFacts {
+                    worktree_path: "/repo/../worktrees/reused".to_string(),
+                    ..facts()
+                },
+            ),
+            (
+                "apply revision",
+                record(),
+                WorkspaceFacts {
+                    apply_revision_exists: false,
+                    ..facts()
+                },
+            ),
+            (
+                "ancestry",
+                record(),
+                WorkspaceFacts {
+                    head_descends_from_apply_revision: false,
+                    ..facts()
+                },
+            ),
+        ];
+
+        for (label, stored, current) in cases {
+            match reconcile_acceptance_stall(&stored, &current) {
+                StallReconciliation::Invalid { reason } => assert!(
+                    !reason.is_empty(),
+                    "{label} mismatch must report a diagnostic"
+                ),
+                StallReconciliation::Valid => {
+                    panic!("{label} mismatch must invalidate the record")
+                }
+            }
+        }
+    }
+
+    /// The storage key must stay stable, filesystem-safe, and collision-free
+    /// across identities that only differ deep inside a long path.
+    #[test]
+    fn acceptance_state_keys_are_stable_and_safe() {
+        let long_a = "/Users/dev/very/long/path/to/repository/alpha";
+        let long_b = "/Users/dev/very/long/path/to/repository/beta";
+        assert_eq!(stable_key(long_a), stable_key(long_a));
+        assert_ne!(stable_key(long_a), stable_key(long_b));
+        for key in [stable_key(long_a), stable_key("weird/id with spaces")] {
+            assert!(!key.contains('/'), "{key} must be a single path segment");
+            assert!(!key.contains(' '), "{key} must not contain spaces");
+            assert!(!key.is_empty());
+        }
+    }
+
+    #[test]
+    fn acceptance_state_record_exposes_the_explicit_category_verbatim() {
+        let blocker = crate::acceptance::AcceptanceBlocker {
+            category: "human_decision".to_string(),
+            // Prose full of credential words must not change the category.
+            evidence: vec!["needs a credential token auth decision from the owner".to_string()],
+            next_action: "owner decides".to_string(),
+            resumable: false,
+            prerequisite_owner: None,
+            evidence_ids: Vec::new(),
+        };
+        let record = AcceptanceStallRecord::new(&facts(), &blocker, "revision-1", 0);
+        let displayed = record.to_stalled_blocker();
+
+        assert_eq!(record.category, "human_decision");
+        assert_eq!(displayed.category, "human_decision");
+        assert_eq!(displayed.phase, "acceptance");
+        assert_eq!(displayed.gate, "acceptance");
+        assert!(!displayed.resumable);
+        assert!(displayed.worktree_preserved);
+        assert!(displayed.error_summary.contains("human_decision"));
+    }
+
+    #[test]
+    fn legacy_marker_round_trip_preserves_context_and_foreign_markers() {
+        let temp = TempDir::new().unwrap();
+        write_legacy_acceptance_marker(
             temp.path(),
             "change",
             "blocked: details\nnext line",
@@ -303,6 +1037,7 @@ mod tests {
             "explicit retry",
         )
         .unwrap();
+
         let marker = parse_blocked_marker(temp.path(), "change")
             .unwrap()
             .unwrap();
@@ -312,21 +1047,15 @@ mod tests {
             ["repository|evidence|verification"]
         );
         assert_eq!(marker.retry_count, 2);
-        assert_eq!(
-            marker.semantic_fingerprint.as_deref(),
-            Some("semantic baseline")
-        );
         assert_eq!(marker.evidence, ["external: detail\n- nested"]);
-        assert_eq!(marker.semantic_progress, "no_semantic_progress");
         assert_eq!(
             marker.external_blockers,
             ["recoverable verification blocker"]
         );
         assert!(marker.worktree_preserved);
-        assert!(consume_resumable_acceptance_marker(temp.path(), "change").unwrap());
 
+        // Foreign markers keep their conservative classification.
         let path = marker_path(temp.path(), "change");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "origin: apply\nreason: blocked\n").unwrap();
         assert_eq!(
             parse_blocked_marker(temp.path(), "change")
@@ -335,33 +1064,27 @@ mod tests {
                 .origin,
             BlockedMarkerOrigin::Apply
         );
-        assert!(!consume_resumable_acceptance_marker(temp.path(), "change").unwrap());
-        assert!(path.exists());
 
         fs::write(&path, "{not json").unwrap();
         assert!(parse_blocked_marker(temp.path(), "change").is_err());
-        assert!(path.exists());
+        assert!(path.exists(), "a malformed marker must never be consumed");
     }
 
+    /// The removed writer must stay removed: acceptance has no production path
+    /// that can create a marker under a change directory.
     #[test]
-    fn default_marker_write_has_no_retry_context() {
-        let temp = TempDir::new().unwrap();
-        write_acceptance_blocked_marker(
-            temp.path(),
-            "change",
-            "permission_stalled",
-            &["external blocker".to_string()],
-            true,
-            "explicit retry",
-        )
-        .unwrap();
-
-        let marker = parse_blocked_marker(temp.path(), "change")
-            .unwrap()
-            .unwrap();
-        assert!(marker.finding_identities.is_empty());
-        assert_eq!(marker.retry_count, 0);
-        assert_eq!(marker.semantic_fingerprint, None);
-        assert_eq!(marker.evidence, ["external blocker"]);
+    fn acceptance_state_module_has_no_production_marker_writer() {
+        let source = include_str!("acceptance_state.rs");
+        // Split so this assertion's own literal cannot satisfy the search.
+        let removed_writer = concat!("pub fn ", "write_acceptance_blocked_marker");
+        assert_eq!(
+            source.matches(removed_writer).count(),
+            0,
+            "acceptance must not expose a blocked-marker writer"
+        );
+        assert!(
+            source.contains("#[cfg(test)]\n#[allow(clippy::too_many_arguments)]\npub fn write_legacy_acceptance_marker"),
+            "the only marker writer left must be the test-only legacy fixture helper"
+        );
     }
 }

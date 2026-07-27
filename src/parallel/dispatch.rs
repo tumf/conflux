@@ -20,9 +20,9 @@ use crate::error::{OrchestratorError, Result};
 use crate::events::LogEntry;
 use crate::execution::state::{detect_workspace_state, is_merged_to_base, WorkspaceState};
 use crate::orchestration::acceptance::{
-    decide_acceptance_retry, normalize_findings, semantic_progress_fingerprint,
-    AcceptanceRetryDecision, MissingVerdictRetryDriver, MissingVerdictRetryStep,
-    MAX_ACCEPTANCE_RETRY_CYCLES,
+    decide_acceptance_blocker, decide_acceptance_retry, normalize_findings,
+    semantic_progress_fingerprint, AcceptanceBlockerDecision, AcceptanceProtocolDriver,
+    AcceptanceRetryDecision, MissingVerdictRetryStep, MAX_ACCEPTANCE_RETRY_CYCLES,
 };
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
@@ -32,9 +32,8 @@ use crate::task_parser;
 use crate::vcs::WorkspaceStatus;
 
 use super::acceptance_state::{
-    consume_resumable_acceptance_marker, parse_blocked_marker,
-    write_acceptance_blocked_marker_with_context, AcceptanceRetryContext, BlockedMarker,
-    BlockedMarkerOrigin,
+    migrate_legacy_acceptance_marker, parse_blocked_marker, AcceptanceRetryContext, BlockedMarker,
+    BlockedMarkerOrigin, MarkerMigration,
 };
 use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
@@ -184,40 +183,60 @@ mod tests {
         ));
     }
 
+    /// Explicit retry consumes only the hold belonging to the retried
+    /// repository + change. A hold recorded for a different repository is
+    /// untouched, so retrying one change cannot silently clear another's
+    /// blocker evidence.
     #[test]
-    fn explicit_retry_consumes_only_the_resolved_workspace_marker() {
-        let base = TempDir::new().unwrap();
-        let workspace = TempDir::new().unwrap();
-        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
-            base.path(),
-            "change",
-            "base marker",
-            &[],
-            true,
-            "explicit retry",
-        )
-        .unwrap();
-        crate::parallel::acceptance_state::write_acceptance_blocked_marker(
-            workspace.path(),
-            "change",
-            "workspace marker",
-            &[],
-            true,
-            "explicit retry",
-        )
-        .unwrap();
+    fn explicit_retry_consumes_only_the_resolved_repository_hold() {
+        use crate::parallel::acceptance_state::{
+            AcceptanceStallRecord, AcceptanceStallStore, WorkspaceFacts,
+        };
 
+        let state_root = TempDir::new().unwrap();
+        let store = AcceptanceStallStore::new(state_root.path());
+
+        let blocker = crate::acceptance::AcceptanceBlocker {
+            category: "external_service".to_string(),
+            evidence: vec!["registry returned 503".to_string()],
+            next_action: "wait for the registry then retry acceptance".to_string(),
+            resumable: true,
+            prerequisite_owner: None,
+            evidence_ids: Vec::new(),
+        };
+        let facts = |repository_id: &str| WorkspaceFacts {
+            repository_id: repository_id.to_string(),
+            change_id: "change".to_string(),
+            worktree_id: format!("gitdir: {repository_id}/.git"),
+            worktree_path: repository_id.to_string(),
+            branch: Some("main".to_string()),
+            apply_revision_exists: true,
+            head_descends_from_apply_revision: true,
+            change_active: true,
+        };
+
+        store
+            .save(&AcceptanceStallRecord::new(
+                &facts("/repo/a"),
+                &blocker,
+                "revision-a",
+                0,
+            ))
+            .unwrap();
+        store
+            .save(&AcceptanceStallRecord::new(
+                &facts("/repo/b"),
+                &blocker,
+                "revision-b",
+                0,
+            ))
+            .unwrap();
+
+        assert!(store.consume("/repo/a", "change").unwrap());
+        assert!(store.load("/repo/a", "change").unwrap().is_none());
         assert!(
-            crate::parallel::acceptance_state::consume_resumable_acceptance_marker(
-                workspace.path(),
-                "change",
-            )
-            .unwrap()
-        );
-        assert!(
-            crate::parallel::acceptance_state::parse_blocked_marker(base.path(), "change")
-                .unwrap()
-                .is_some()
+            store.load("/repo/b", "change").unwrap().is_some(),
+            "another repository's hold must survive an unrelated explicit retry"
         );
     }
 
@@ -795,8 +814,117 @@ impl ParallelExecutor {
         )
         .await?;
 
+        let base_branch = self
+            .workspace_manager
+            .ensure_original_branch_initialized()
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?;
+
+        // --- Acceptance stall reconciliation (constitutional law 1a) ---
+        //
+        // The runtime record lives outside every worktree. It may suppress
+        // ordinary dispatch, restore `stalled`, and select acceptance as the
+        // explicit-retry phase — nothing more. Everything below reads git and
+        // the filesystem directly; the record never proves its own binding.
+        let stall_store = self.acceptance_stall_store()?;
+
+        // One-time migration of a legacy acceptance-origin marker. A stalled
+        // acceptance hold never commits, so current HEAD is the apply revision
+        // the marker was written against.
+        if let Ok(head) = crate::vcs::git::commands::get_current_commit(&workspace_val.path).await {
+            match crate::execution::state::gather_workspace_facts(
+                &self.repo_root,
+                &workspace_val.path,
+                &change_id,
+                &head,
+                &base_branch,
+            )
+            .await
+            {
+                Ok(facts) => {
+                    match migrate_legacy_acceptance_marker(
+                        &stall_store,
+                        &workspace_val.path,
+                        &facts,
+                        &head,
+                    ) {
+                        Ok(MarkerMigration::Migrated { category }) => {
+                            send_event(
+                                &self.event_tx,
+                                ParallelEvent::Log(
+                                    LogEntry::info(format!(
+                                        "Migrated legacy acceptance blocker marker for {change_id} \
+                                         into runtime stall state (category {category})"
+                                    ))
+                                    .with_change_id(&change_id),
+                                ),
+                            )
+                            .await;
+                        }
+                        Ok(MarkerMigration::Preserved { reason }) => {
+                            debug!(
+                                change_id = %change_id,
+                                reason = %reason,
+                                "Preserved non-acceptance blocked marker unchanged"
+                            );
+                        }
+                        Ok(MarkerMigration::NotApplicable) => {}
+                        Err(error) => warn!(
+                            "Legacy acceptance marker migration degraded for {change_id}: {error}"
+                        ),
+                    }
+                }
+                Err(error) => warn!(
+                    "Could not gather workspace facts for {change_id} stall reconciliation: {error}"
+                ),
+            }
+        }
+
+        let mut stall_record = crate::execution::state::load_valid_acceptance_stall(
+            &stall_store,
+            &self.repo_root,
+            &workspace_val.path,
+            &change_id,
+            &base_branch,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            warn!("Could not load acceptance stall state for {change_id}: {error}");
+            None
+        });
+
+        // Explicit retry is a preparation transaction: the workspace is already
+        // prepared at this point, so consuming the hold here means a failure
+        // *before* this line retains the blocker evidence untouched.
+        let mut resume_at_acceptance = false;
         if self.explicit_retry {
-            consume_resumable_acceptance_marker(&workspace_val.path, &change_id)?;
+            match stall_record.take() {
+                Some(record) if record.resumable => {
+                    stall_store.consume(&record.repository_id, &record.change_id)?;
+                    resume_at_acceptance = true;
+                    send_event(
+                        &self.event_tx,
+                        ParallelEvent::Log(
+                            LogEntry::info(format!(
+                                "Explicit retry for {change_id}: resuming at acceptance against \
+                                 apply revision {} without rerunning apply",
+                                record.apply_revision
+                            ))
+                            .with_change_id(&change_id),
+                        ),
+                    )
+                    .await;
+                }
+                Some(record) => {
+                    // A non-resumable hold is preserved: retry must not silently
+                    // discard evidence the operator still needs.
+                    warn!(
+                        "Explicit retry refused for {change_id}: acceptance stall is not resumable"
+                    );
+                    stall_record = Some(record);
+                }
+                None => {}
+            }
         }
 
         // Track workspace for cleanup
@@ -822,11 +950,6 @@ impl ParallelExecutor {
         let acceptance_tail_injected = self.acceptance_tail_injected.clone();
         let cancel_token = self.cancel_token.clone();
         let shared_stagger_state = self.shared_stagger_state.clone();
-        let base_branch = self
-            .workspace_manager
-            .ensure_original_branch_initialized()
-            .await
-            .map_err(OrchestratorError::from_vcs_error)?;
         let dynamic_queue = self.dynamic_queue.clone();
         let workspace = workspace_val;
 
@@ -869,7 +992,50 @@ impl ParallelExecutor {
                 WorkspaceState::Created
             };
 
-            let resume_action = if was_resumed {
+            // A reconciled runtime stall record suppresses ordinary dispatch and
+            // restores the operator-facing `stalled` hold. It never advances the
+            // workflow: apply, acceptance, and archive all stay unstarted, and
+            // the worktree is not touched at all.
+            if let Some(record) = &stall_record {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(ParallelEvent::AcceptanceGated {
+                            change_id: change_id.clone(),
+                            blocker: record.to_stalled_blocker(),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                            change_id: change_id.clone(),
+                            workspace_name: workspace.name.clone(),
+                            status: WorkspaceStatus::Blocked,
+                        })
+                        .await;
+                    let _ = tx
+                        .send(ParallelEvent::Log(
+                            LogEntry::warn(format!(
+                                "Acceptance stalled ({}) on a validated external blocker: {}",
+                                record.category, record.next_action
+                            ))
+                            .with_change_id(&change_id)
+                            .with_operation("acceptance"),
+                        ))
+                        .await;
+                }
+                return WorkspaceResult {
+                    change_id,
+                    workspace_name: workspace.name,
+                    final_revision: None,
+                    error: None,
+                    rejected: None,
+                };
+            }
+
+            let resume_action = if resume_at_acceptance {
+                // The consumed hold proved a complete apply revision, so an
+                // explicit retry resumes acceptance rather than repeating apply.
+                ResumeAction::Acceptance
+            } else if was_resumed {
                 decide_resume_action(&change_id, &workspace.path, &effective_state)
             } else {
                 ResumeAction::Apply
@@ -1055,7 +1221,7 @@ impl ParallelExecutor {
             // configured explicit-CONTINUE budget and is never persisted, so a
             // restart re-runs acceptance from workspace state instead of
             // resuming a protocol-retry sequence.
-            let mut protocol = MissingVerdictRetryDriver::default();
+            let mut protocol = AcceptanceProtocolDriver::default();
             let mut cycle_count = 0u32;
             let mut cumulative_iteration = 0u32; // Track total apply iterations across all cycles
 
@@ -1333,16 +1499,26 @@ impl ParallelExecutor {
             let _apply_revision = loop {
                 cycle_count += 1;
                 if cycle_count > MAX_ACCEPTANCE_RETRY_CYCLES {
-                    let evidence = vec![format!("acceptance cycle limit {} reached", MAX_ACCEPTANCE_RETRY_CYCLES)];
-                    if let Err(error) = write_acceptance_blocked_marker_with_context(
-                        &workspace.path, &change_id, "acceptance_cycle_limit_exhausted", &evidence,
-                        &acceptance_retry, "no_semantic_progress", &[], true, "explicit retry",
-                    ) {
-                        cancel_monitor.abort();
-                        return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(format!("Failed to persist acceptance stalled evidence: {error}")), rejected: None };
+                    // Cycle exhaustion is a runtime safety ceiling, not a
+                    // reviewer-validated external blocker. It carries no
+                    // explicit category or evidence, so it must not fabricate
+                    // one or create a durable stalled hold; it stops and waits
+                    // for an explicit operator retry.
+                    let error = format!(
+                        "Acceptance retry ceiling reached for {change_id}: {MAX_ACCEPTANCE_RETRY_CYCLES} \
+                         apply+acceptance cycles produced no resolution. Explicit retry is required."
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx
+                            .send(ParallelEvent::Log(
+                                LogEntry::error(error.clone())
+                                    .with_change_id(&change_id)
+                                    .with_operation("acceptance"),
+                            ))
+                            .await;
                     }
                     cancel_monitor.abort();
-                    return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: None, rejected: None };
+                    return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(error), rejected: None };
                 }
 
                 // Skip apply only for the first cycle when resuming from an already-applied state.
@@ -1992,15 +2168,32 @@ impl ParallelExecutor {
                             );
                         }
                         if let AcceptanceRetryDecision::Stall { reason, external_blockers } = decision {
-                            if let Err(error) = write_acceptance_blocked_marker_with_context(
-                                &workspace.path, &change_id, reason, &identities, &acceptance_retry,
-                                "no_semantic_progress", &external_blockers, true, "explicit retry",
-                            ) {
-                                cancel_monitor.abort();
-                                return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(format!("Failed to persist acceptance stalled evidence: {error}")), rejected: None };
+                            // Repeated findings and cycle exhaustion are runtime
+                            // retry judgements, not reviewer-validated external
+                            // blockers: no category is invented and no durable
+                            // hold is written. Only an explicit structured
+                            // blocker reaches runtime stall state.
+                            let error = format!(
+                                "Acceptance stopped retrying {change_id} ({reason}). External blocker \
+                                 context: {}. Explicit retry is required.",
+                                if external_blockers.is_empty() {
+                                    "none reported".to_string()
+                                } else {
+                                    external_blockers.join(" | ")
+                                }
+                            );
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::Log(
+                                        LogEntry::error(error.clone())
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                    ))
+                                    .await;
                             }
                             cancel_monitor.abort();
-                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: None, rejected: None };
+                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(error), rejected: None };
                         }
                         if !findings.is_empty() {
                             if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(&change_id, workspace.path.as_path()) {
@@ -2037,18 +2230,30 @@ impl ParallelExecutor {
                         crate::orchestration::AcceptanceResult::PermissionStalled { blocker },
                         acceptance_iteration,
                     )) => {
-                        let evidence = vec![blocker.summary()];
-                        if let Err(error) = write_acceptance_blocked_marker_with_context(
+                        // A repeated unresolved permission/tool-policy denial is a
+                        // concrete repository-external prerequisite with an
+                        // explicit category supplied by the denial classifier —
+                        // never inferred from narrative prose.
+                        let stall_blocker = crate::acceptance::AcceptanceBlocker {
+                            category: "policy".to_string(),
+                            evidence: blocker.evidence.clone(),
+                            next_action: blocker.next_action.clone(),
+                            resumable: blocker.resumable,
+                            prerequisite_owner: None,
+                            evidence_ids: vec![blocker.category.clone()],
+                        };
+                        if let Err(error) = crate::execution::state::persist_acceptance_stall(
+                            &stall_store,
+                            &repo_root,
                             &workspace.path,
                             &change_id,
-                            "permission_stalled",
-                            &evidence,
-                            &acceptance_retry,
-                            "no_semantic_progress",
-                            &evidence,
-                            true,
-                            "explicit retry",
-                        ) {
+                            &base_branch,
+                            &revision,
+                            &stall_blocker,
+                            acceptance_retry.cycle_count,
+                        )
+                        .await
+                        {
                             cancel_monitor.abort();
                             return WorkspaceResult {
                                 change_id,
@@ -2190,81 +2395,137 @@ impl ParallelExecutor {
                         }
                     }
                     Ok((
-                        crate::orchestration::AcceptanceResult::Gated,
+                        result @ (crate::orchestration::AcceptanceResult::BareBlocker { .. }
+                            | crate::orchestration::AcceptanceResult::Stalled { .. }),
                         acceptance_iteration,
                     )) => {
-                        let blocker_summary = blocked_handoff
-                            .as_ref()
-                            .map(|handoff| {
-                                format!(
-                                    "acceptance emitted gated compatibility token; blocker evidence at {}",
-                                    handoff.blocker_path.display()
+                        // One shared decision API drives both modes: bare or
+                        // invalid compatibility input gets bounded acceptance-only
+                        // retry, and only a validated structured blocker becomes a
+                        // durable revision-bound stall.
+                        match decide_acceptance_blocker(&mut protocol, &result) {
+                            Some(AcceptanceBlockerDecision::ProtocolRetry { progress, .. }) => {
+                                warn!(
+                                    "Bare acceptance blocker for {} (cycle {}): {}",
+                                    change_id, cycle_count, progress
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::info(format!(
+                                                "{} (cycle {})",
+                                                progress, cycle_count
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                // Acceptance only: the implementation did not
+                                // fail, so apply is never repeated and no stalled
+                                // lifecycle transition is emitted.
+                                skip_apply_once = true;
+                                continue;
+                            }
+                            Some(AcceptanceBlockerDecision::ProtocolExhausted { error }) => {
+                                error!(
+                                    "Bare acceptance blocker for {} (cycle {}): {}",
+                                    change_id, cycle_count, error
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::error(format!(
+                                                "Bare acceptance blocker (cycle {}): {}",
+                                                cycle_count, error
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: Some(error),
+                                    rejected: None,
+                                };
+                            }
+                            Some(AcceptanceBlockerDecision::Stall { blocker }) => {
+                                let record = match crate::execution::state::persist_acceptance_stall(
+                                    &stall_store,
+                                    &repo_root,
+                                    &workspace.path,
+                                    &change_id,
+                                    &base_branch,
+                                    &revision,
+                                    &blocker,
+                                    acceptance_retry.cycle_count,
                                 )
-                            })
-                            .unwrap_or_else(|| {
-                                "acceptance emitted gated compatibility token without a dedicated blocker artifact".to_string()
-                            });
-                        let blocker = crate::events::StalledBlocker::acceptance_infrastructure(blocker_summary);
-                        let evidence = vec![blocker.summary()];
-                        if let Err(error) = write_acceptance_blocked_marker_with_context(
-                            &workspace.path,
-                            &change_id,
-                            "acceptance_gated",
-                            &evidence,
-                            &acceptance_retry,
-                            "no_semantic_progress",
-                            &evidence,
-                            true,
-                            "explicit retry",
-                        ) {
-                            return WorkspaceResult {
-                                change_id,
-                                workspace_name: workspace.name,
-                                final_revision: None,
-                                error: Some(format!(
-                                    "Failed to persist acceptance stalled evidence: {error}"
-                                )),
-                                rejected: None,
-                            };
+                                .await
+                                {
+                                    Ok(record) => record,
+                                    Err(error) => {
+                                        cancel_monitor.abort();
+                                        return WorkspaceResult {
+                                            change_id,
+                                            workspace_name: workspace.name,
+                                            final_revision: None,
+                                            error: Some(format!(
+                                                "Failed to persist acceptance stalled evidence: {error}"
+                                            )),
+                                            rejected: None,
+                                        };
+                                    }
+                                };
+                                warn!(
+                                    "Acceptance stalled for {} on a validated external blocker ({})",
+                                    change_id, record.category
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx
+                                        .send(ParallelEvent::AcceptanceGated {
+                                            change_id: change_id.clone(),
+                                            blocker: record.to_stalled_blocker(),
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::WorkspaceStatusUpdated {
+                                            change_id: change_id.clone(),
+                                            workspace_name: workspace.name.clone(),
+                                            status: WorkspaceStatus::Blocked,
+                                        })
+                                        .await;
+                                    let _ = tx
+                                        .send(ParallelEvent::Log(
+                                            LogEntry::warn(format!(
+                                                "Acceptance stalled ({}) on a validated external blocker; \
+                                                 worktree preserved and apply revision {} unchanged",
+                                                record.category, record.apply_revision
+                                            ))
+                                            .with_change_id(&change_id)
+                                            .with_operation("acceptance")
+                                            .with_iteration(acceptance_iteration),
+                                        ))
+                                        .await;
+                                }
+                                cancel_monitor.abort();
+                                return WorkspaceResult {
+                                    change_id,
+                                    workspace_name: workspace.name,
+                                    final_revision: None,
+                                    error: None,
+                                    rejected: None,
+                                };
+                            }
+                            None => unreachable!(
+                                "decide_acceptance_blocker owns every blocker-bearing result"
+                            ),
                         }
-                        warn!(
-                            "Acceptance gated for {} - recording non-terminal stalled hold",
-                            change_id
-                        );
-
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx
-                                .send(ParallelEvent::AcceptanceGated {
-                                    change_id: change_id.clone(),
-                                    blocker: blocker.clone(),
-                                })
-                                .await;
-                            let _ = tx
-                                .send(ParallelEvent::WorkspaceStatusUpdated {
-                                    change_id: change_id.clone(),
-                                    workspace_name: workspace.name.clone(),
-                                    status: WorkspaceStatus::Blocked,
-                                })
-                                .await;
-                            let _ = tx
-                                .send(ParallelEvent::Log(
-                                    LogEntry::warn(
-                                        "Acceptance gated compatibility token recorded as stalled hold; no terminal rejection flow executed",
-                                    )
-                                    .with_change_id(&change_id)
-                                    .with_operation("acceptance")
-                                    .with_iteration(acceptance_iteration),
-                                ))
-                                .await;
-                        }
-
-                        return WorkspaceResult {
-                            change_id,
-                            workspace_name: workspace.name,
-                            final_revision: None,
-                            error: None,
-                            rejected: None,
-                        };
                     }
                     Ok((
                         crate::orchestration::AcceptanceResult::Cancelled,

@@ -15,6 +15,167 @@
 //!   `ACCEPTANCE: PASS|FAIL|CONTINUE|GATED` remain supported for backward
 //!   compatibility, but JSON takes priority whenever both are present.
 
+/// Supported explicit blocker categories for a validated stalled hold.
+///
+/// The category is always supplied explicitly by the acceptance reviewer. The
+/// runtime never derives it by searching narrative prose for words such as
+/// `credential`, `token`, or `auth`: an unsupported or absent category is a
+/// protocol error, not an invitation to guess.
+pub const SUPPORTED_BLOCKER_CATEGORIES: &[&str] = &[
+    "credential",
+    "external_approval",
+    "policy",
+    "external_service",
+    "pending_verification",
+    "infrastructure",
+    "schema_incompatibility",
+    "human_decision",
+];
+
+/// Structured, validated external blocker payload accompanying a `gated`
+/// compatibility verdict.
+///
+/// Every field here is authored by the acceptance reviewer. A payload that
+/// satisfies [`validate_acceptance_blocker`] is the *only* input that may enter
+/// the durable `stalled` hold; anything weaker stays on the bounded
+/// protocol-error path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceBlocker {
+    /// Explicit category drawn from [`SUPPORTED_BLOCKER_CATEGORIES`].
+    pub category: String,
+    /// Concrete non-empty evidence for the external prerequisite.
+    pub evidence: Vec<String>,
+    /// Operator-facing action that can unblock the hold.
+    pub next_action: String,
+    /// Whether acceptance can resume once the prerequisite is satisfied.
+    pub resumable: bool,
+    /// Optional owning team/role for the prerequisite.
+    pub prerequisite_owner: Option<String>,
+    /// Optional stable identifiers for the evidence entries.
+    pub evidence_ids: Vec<String>,
+}
+
+/// Why a `gated`/legacy-`blocked` verdict failed to qualify as a validated
+/// stalled blocker. Every variant routes to the bounded protocol-error path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockerRejection {
+    /// No `blocker` payload accompanied the compatibility verdict at all
+    /// (bare `{"acceptance":"gated"}` or plain-text `ACCEPTANCE: GATED`).
+    Missing,
+    /// The `blocker` field was present but not a JSON object.
+    NotAnObject,
+    /// `category` was absent or not a string.
+    MissingCategory,
+    /// `category` was present but is not in [`SUPPORTED_BLOCKER_CATEGORIES`].
+    UnsupportedCategory(String),
+    /// `evidence` was absent, not an array, or contained no non-blank entry.
+    EmptyEvidence,
+    /// `next_action` was absent or blank.
+    MissingNextAction,
+    /// `resumable` was absent or not a boolean.
+    MissingResumable,
+}
+
+impl BlockerRejection {
+    /// Short operator-facing reason, used in protocol-retry diagnostics.
+    pub fn reason(&self) -> String {
+        match self {
+            BlockerRejection::Missing => {
+                "no structured blocker payload accompanied the gated verdict".to_string()
+            }
+            BlockerRejection::NotAnObject => "blocker payload is not a JSON object".to_string(),
+            BlockerRejection::MissingCategory => {
+                "blocker payload has no explicit category".to_string()
+            }
+            BlockerRejection::UnsupportedCategory(category) => format!(
+                "blocker category '{category}' is not one of: {}",
+                SUPPORTED_BLOCKER_CATEGORIES.join(", ")
+            ),
+            BlockerRejection::EmptyEvidence => {
+                "blocker payload has no concrete evidence entries".to_string()
+            }
+            BlockerRejection::MissingNextAction => "blocker payload has no next_action".to_string(),
+            BlockerRejection::MissingResumable => {
+                "blocker payload has no boolean resumable field".to_string()
+            }
+        }
+    }
+}
+
+/// Validate a raw `blocker` payload from a `gated` verdict object.
+///
+/// Validation is purely structural and explicit: the category must be one the
+/// runtime supports, evidence must be concrete, and the reviewer must state
+/// both a next action and resumability. Nothing is inferred from prose.
+pub fn validate_acceptance_blocker(
+    payload: Option<&serde_json::Value>,
+) -> std::result::Result<AcceptanceBlocker, BlockerRejection> {
+    let Some(payload) = payload else {
+        return Err(BlockerRejection::Missing);
+    };
+    if payload.is_null() {
+        return Err(BlockerRejection::Missing);
+    }
+    let object = payload.as_object().ok_or(BlockerRejection::NotAnObject)?;
+
+    let category = object
+        .get("category")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(BlockerRejection::MissingCategory)?;
+    if !SUPPORTED_BLOCKER_CATEGORIES.contains(&category) {
+        return Err(BlockerRejection::UnsupportedCategory(category.to_string()));
+    }
+
+    let evidence = string_list(object.get("evidence"));
+    if evidence.is_empty() {
+        return Err(BlockerRejection::EmptyEvidence);
+    }
+
+    let next_action = object
+        .get("next_action")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(BlockerRejection::MissingNextAction)?;
+
+    let resumable = object
+        .get("resumable")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(BlockerRejection::MissingResumable)?;
+
+    Ok(AcceptanceBlocker {
+        category: category.to_string(),
+        evidence,
+        next_action: next_action.to_string(),
+        resumable,
+        prerequisite_owner: object
+            .get("prerequisite_owner")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        evidence_ids: string_list(object.get("evidence_ids")),
+    })
+}
+
+/// Collect the non-blank string entries of a JSON array field.
+fn string_list(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|value| value.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Result of parsing acceptance output
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptanceResult {
@@ -24,8 +185,17 @@ pub enum AcceptanceResult {
     Fail { findings: Vec<String> },
     /// Acceptance requires more investigation - continue later
     Continue,
-    /// Acceptance gated due to implementation blocker
-    Gated,
+    /// A `gated` (or legacy `blocked`) compatibility verdict arrived without a
+    /// payload that qualifies as a validated external blocker.
+    ///
+    /// This is an acceptance protocol error, not a stalled hold: it creates no
+    /// lifecycle transition, no blocker category, and no durable record. The
+    /// runtime retries acceptance within a bounded budget and then reports a
+    /// terminal protocol error.
+    BareBlocker { rejection: BlockerRejection },
+    /// A `gated` compatibility verdict carrying a validated structured external
+    /// blocker. Only this variant may enter the durable `stalled` hold.
+    Stalled { blocker: AcceptanceBlocker },
     /// No canonical verdict was found in the output. The acceptance command
     /// completed without emitting the machine-readable verdict it owes
     /// (for example a status-only or waiting narrative), which is a protocol
@@ -50,9 +220,21 @@ pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
     ("ACCEPTANCE: BLOCKED", "gated"),
 ];
 
+/// A strict JSON acceptance verdict object parsed from one line/text payload.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JsonVerdict {
+    /// Canonical verdict kind: `pass`/`fail`/`continue`/`gated`.
+    pub kind: &'static str,
+    /// `findings` array entries, when present.
+    pub findings: Vec<String>,
+    /// Raw `blocker` payload, when present. Validated separately so the parser
+    /// can report *why* a compatibility verdict failed to qualify as a stall.
+    pub blocker: Option<serde_json::Value>,
+}
+
 /// Attempt to parse a single line/text payload as a strict JSON acceptance
-/// verdict object. Returns `Some((kind, findings))` when the trimmed content is
-/// a JSON object with an `acceptance` field equal to one of
+/// verdict object. Returns `Some(verdict)` when the trimmed content is a JSON
+/// object with an `acceptance` field equal to one of
 /// `pass`/`fail`/`continue`/`gated` (case-insensitive).
 /// Legacy `blocked` input is accepted as backward-compatible alias.
 ///
@@ -61,8 +243,12 @@ pub(crate) const CANONICAL_VERDICTS: &[(&str, &str)] = &[
 /// ```json
 /// {"acceptance":"pass"}
 /// {"acceptance":"fail","findings":["src/foo.rs:10 issue"]}
+/// {"acceptance":"gated","blocker":{"category":"credential",
+///   "evidence":["STAGING_API_KEY is unset in the verification environment"],
+///   "next_action":"provision STAGING_API_KEY then retry acceptance",
+///   "resumable":true}}
 /// ```
-pub(crate) fn parse_json_verdict(text: &str) -> Option<(&'static str, Vec<String>)> {
+pub(crate) fn parse_json_verdict(text: &str) -> Option<JsonVerdict> {
     let trimmed = text.trim();
     if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
         return None;
@@ -87,7 +273,11 @@ pub(crate) fn parse_json_verdict(text: &str) -> Option<(&'static str, Vec<String
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Some((kind, findings))
+    Some(JsonVerdict {
+        kind,
+        findings,
+        blocker: obj.get("blocker").cloned(),
+    })
 }
 
 /// Detect a canonical verdict kind in a single output line.
@@ -156,7 +346,7 @@ impl VerdictStreamDetector {
             return None;
         }
         parse_json_verdict(trimmed)
-            .map(|(kind, _)| kind)
+            .map(|verdict| verdict.kind)
             .or_else(|| canonical_verdict_kind(trimmed))
     }
 }
@@ -222,8 +412,8 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
                 continue;
             }
 
-            if let Some((kind, findings)) = parse_json_verdict(candidate) {
-                return acceptance_result_from_kind(kind, findings);
+            if let Some(verdict) = parse_json_verdict(candidate) {
+                return acceptance_result_from_json(verdict);
             }
 
             if fallback_kind.is_none() {
@@ -251,7 +441,11 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     match fallback_kind {
         Some("pass") => AcceptanceResult::Pass,
         Some("continue") => AcceptanceResult::Continue,
-        Some("gated") => AcceptanceResult::Gated,
+        // The plain-text fallback carries no structured payload, so a legacy
+        // `ACCEPTANCE: GATED`/`ACCEPTANCE: BLOCKED` line is always bare.
+        Some("gated") => AcceptanceResult::BareBlocker {
+            rejection: BlockerRejection::Missing,
+        },
         Some("fail") => AcceptanceResult::Fail {
             findings: fallback_findings,
         },
@@ -261,12 +455,19 @@ pub fn parse_acceptance_output(output: &str) -> AcceptanceResult {
     }
 }
 
-fn acceptance_result_from_kind(kind: &str, findings: Vec<String>) -> AcceptanceResult {
-    match kind {
+fn acceptance_result_from_json(verdict: JsonVerdict) -> AcceptanceResult {
+    match verdict.kind {
         "pass" => AcceptanceResult::Pass,
-        "fail" => AcceptanceResult::Fail { findings },
+        "fail" => AcceptanceResult::Fail {
+            findings: verdict.findings,
+        },
         "continue" => AcceptanceResult::Continue,
-        "gated" | "blocked" => AcceptanceResult::Gated,
+        // Compatibility verdict: only a validated structured payload becomes a
+        // stall. Everything else is a bounded protocol error.
+        "gated" => match validate_acceptance_blocker(verdict.blocker.as_ref()) {
+            Ok(blocker) => AcceptanceResult::Stalled { blocker },
+            Err(rejection) => AcceptanceResult::BareBlocker { rejection },
+        },
         _ => AcceptanceResult::MissingVerdict,
     }
 }
@@ -449,8 +650,18 @@ FINDINGS:
                 AcceptanceResult::Continue,
             ),
             ("ACCEPTANCE: CONTINUE\n", AcceptanceResult::Continue),
-            ("{\"acceptance\":\"gated\"}\n", AcceptanceResult::Gated),
-            ("ACCEPTANCE: BLOCKED\n", AcceptanceResult::Gated),
+            (
+                "{\"acceptance\":\"gated\"}\n",
+                AcceptanceResult::BareBlocker {
+                    rejection: BlockerRejection::Missing,
+                },
+            ),
+            (
+                "ACCEPTANCE: BLOCKED\n",
+                AcceptanceResult::BareBlocker {
+                    rejection: BlockerRejection::Missing,
+                },
+            ),
             (
                 "Monitoring verification; waiting for the job to finish\n",
                 AcceptanceResult::MissingVerdict,
@@ -795,19 +1006,34 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     #[test]
     fn test_parse_blocked() {
         let output = "ACCEPTANCE: BLOCKED\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::BareBlocker {
+                rejection: BlockerRejection::Missing
+            }
+        );
     }
 
     #[test]
     fn test_parse_blocked_with_extra_output() {
         let output = "Some debug output\nACCEPTANCE: BLOCKED\nMore output\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::BareBlocker {
+                rejection: BlockerRejection::Missing
+            }
+        );
     }
 
     #[test]
     fn test_parse_blocked_with_bold_decoration() {
         let output = "**ACCEPTANCE: BLOCKED**\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::BareBlocker {
+                rejection: BlockerRejection::Missing
+            }
+        );
     }
 
     // Characterization tests: document the exact contract that
@@ -906,7 +1132,12 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     #[test]
     fn test_parse_blocked_with_heading_prefix() {
         let output = "## ACCEPTANCE: BLOCKED\n";
-        assert_eq!(parse_acceptance_output(output), AcceptanceResult::Gated);
+        assert_eq!(
+            parse_acceptance_output(output),
+            AcceptanceResult::BareBlocker {
+                rejection: BlockerRejection::Missing
+            }
+        );
     }
 
     #[test]
@@ -1003,7 +1234,8 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 AcceptanceResult::Pass => "pass",
                 AcceptanceResult::Fail { .. } => "fail",
                 AcceptanceResult::Continue => "continue",
-                AcceptanceResult::Gated => "gated",
+                AcceptanceResult::BareBlocker { .. } => "gated",
+                AcceptanceResult::Stalled { .. } => "stalled",
                 AcceptanceResult::MissingVerdict => "missing-verdict",
             };
             assert_eq!(
@@ -1051,59 +1283,50 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
 
     // --- JSON-primary verdict contract tests ---
 
+    fn verdict_kind(line: &str) -> Option<&'static str> {
+        parse_json_verdict(line).map(|verdict| verdict.kind)
+    }
+
     #[test]
     fn test_parse_json_verdict_pass() {
-        let line = r#"{"acceptance":"pass"}"#;
-        assert_eq!(
-            parse_json_verdict(line),
-            Some(("pass", Vec::<String>::new()))
-        );
+        let verdict = parse_json_verdict(r#"{"acceptance":"pass"}"#).expect("strict JSON verdict");
+        assert_eq!(verdict.kind, "pass");
+        assert!(verdict.findings.is_empty());
+        assert_eq!(verdict.blocker, None);
     }
 
     #[test]
     fn test_parse_json_verdict_fail_with_findings() {
         let line = r#"{"acceptance":"fail","findings":["src/a.rs:1 bad","src/b.rs:2 worse"]}"#;
-        let (kind, findings) = parse_json_verdict(line).expect("strict JSON verdict");
-        assert_eq!(kind, "fail");
-        assert_eq!(findings, vec!["src/a.rs:1 bad", "src/b.rs:2 worse"]);
+        let verdict = parse_json_verdict(line).expect("strict JSON verdict");
+        assert_eq!(verdict.kind, "fail");
+        assert_eq!(verdict.findings, vec!["src/a.rs:1 bad", "src/b.rs:2 worse"]);
     }
 
     #[test]
     fn test_parse_json_verdict_continue_gated_and_legacy_blocked() {
         assert_eq!(
-            parse_json_verdict(r#"{"acceptance":"continue"}"#),
-            Some(("continue", Vec::<String>::new()))
+            verdict_kind(r#"{"acceptance":"continue"}"#),
+            Some("continue")
         );
-        assert_eq!(
-            parse_json_verdict(r#"{"acceptance":"gated"}"#),
-            Some(("gated", Vec::<String>::new()))
-        );
-        assert_eq!(
-            parse_json_verdict(r#"{"acceptance":"blocked"}"#),
-            Some(("gated", Vec::<String>::new()))
-        );
+        assert_eq!(verdict_kind(r#"{"acceptance":"gated"}"#), Some("gated"));
+        assert_eq!(verdict_kind(r#"{"acceptance":"blocked"}"#), Some("gated"));
     }
 
     #[test]
     fn test_parse_json_verdict_case_insensitive_value() {
-        assert_eq!(
-            parse_json_verdict(r#"{"acceptance":"PASS"}"#),
-            Some(("pass", Vec::<String>::new()))
-        );
-        assert_eq!(
-            parse_json_verdict(r#"{"acceptance":"Fail"}"#),
-            Some(("fail", Vec::<String>::new()))
-        );
+        assert_eq!(verdict_kind(r#"{"acceptance":"PASS"}"#), Some("pass"));
+        assert_eq!(verdict_kind(r#"{"acceptance":"Fail"}"#), Some("fail"));
     }
 
     #[test]
     fn test_parse_json_verdict_rejects_non_object_and_unknown_kind() {
-        assert_eq!(parse_json_verdict("pass"), None);
-        assert_eq!(parse_json_verdict(r#"["pass"]"#), None);
-        assert_eq!(parse_json_verdict(r#"{"acceptance":"maybe"}"#), None);
-        assert_eq!(parse_json_verdict(r#"{"other":"pass"}"#), None);
-        assert_eq!(parse_json_verdict("not json"), None);
-        assert_eq!(parse_json_verdict(""), None);
+        assert_eq!(verdict_kind("pass"), None);
+        assert_eq!(verdict_kind(r#"["pass"]"#), None);
+        assert_eq!(verdict_kind(r#"{"acceptance":"maybe"}"#), None);
+        assert_eq!(verdict_kind(r#"{"other":"pass"}"#), None);
+        assert_eq!(verdict_kind("not json"), None);
+        assert_eq!(verdict_kind(""), None);
     }
 
     #[test]
@@ -1259,6 +1482,209 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         );
         assert_eq!(detect_verdict_in_line("plain log line"), None);
         assert_eq!(detect_verdict_in_line(""), None);
+    }
+
+    // --- Structured stalled-blocker contract tests ---
+
+    fn structured_gated(blocker: &str) -> String {
+        format!("{{\"acceptance\":\"gated\",\"blocker\":{blocker}}}\n")
+    }
+
+    const VALID_BLOCKER: &str = r#"{"category":"credential","evidence":["STAGING_API_KEY unset in the verification environment"],"next_action":"provision STAGING_API_KEY then retry acceptance","resumable":true}"#;
+
+    #[test]
+    fn structured_blocker_becomes_validated_stall_with_explicit_category() {
+        match parse_acceptance_output(&structured_gated(VALID_BLOCKER)) {
+            AcceptanceResult::Stalled { blocker } => {
+                assert_eq!(blocker.category, "credential");
+                assert_eq!(
+                    blocker.evidence,
+                    ["STAGING_API_KEY unset in the verification environment"]
+                );
+                assert_eq!(
+                    blocker.next_action,
+                    "provision STAGING_API_KEY then retry acceptance"
+                );
+                assert!(blocker.resumable);
+                assert_eq!(blocker.prerequisite_owner, None);
+                assert!(blocker.evidence_ids.is_empty());
+            }
+            other => panic!("expected validated stall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_blocker_preserves_optional_owner_and_evidence_ids() {
+        let blocker = r#"{"category":"external_approval","evidence":["change board ticket CB-42 is awaiting sign-off"],"next_action":"await CB-42 approval then retry acceptance","resumable":true,"prerequisite_owner":"release-management","evidence_ids":["CB-42",""," "]}"#;
+        match parse_acceptance_output(&structured_gated(blocker)) {
+            AcceptanceResult::Stalled { blocker } => {
+                assert_eq!(blocker.category, "external_approval");
+                assert_eq!(
+                    blocker.prerequisite_owner.as_deref(),
+                    Some("release-management")
+                );
+                assert_eq!(blocker.evidence_ids, ["CB-42"]);
+            }
+            other => panic!("expected validated stall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_supported_category_is_accepted_verbatim() {
+        for category in SUPPORTED_BLOCKER_CATEGORIES {
+            let blocker = format!(
+                r#"{{"category":"{category}","evidence":["concrete evidence"],"next_action":"resolve then retry","resumable":false}}"#
+            );
+            match parse_acceptance_output(&structured_gated(&blocker)) {
+                AcceptanceResult::Stalled { blocker } => {
+                    assert_eq!(&blocker.category, category);
+                    assert!(!blocker.resumable);
+                }
+                other => panic!("category {category} must validate, got {other:?}"),
+            }
+        }
+    }
+
+    /// Table-driven rejection matrix: every incomplete or malformed blocker
+    /// payload falls back to the bounded protocol-error path, never a stall.
+    #[test]
+    fn invalid_blocker_payloads_fall_back_to_bare_protocol_error() {
+        let cases: &[(&str, BlockerRejection)] = &[
+            (r#"null"#, BlockerRejection::Missing),
+            (r#""credential""#, BlockerRejection::NotAnObject),
+            (r#"["credential"]"#, BlockerRejection::NotAnObject),
+            (
+                r#"{"evidence":["e"],"next_action":"a","resumable":true}"#,
+                BlockerRejection::MissingCategory,
+            ),
+            (
+                r#"{"category":"   ","evidence":["e"],"next_action":"a","resumable":true}"#,
+                BlockerRejection::MissingCategory,
+            ),
+            (
+                r#"{"category":"flaky_test","evidence":["e"],"next_action":"a","resumable":true}"#,
+                BlockerRejection::UnsupportedCategory("flaky_test".to_string()),
+            ),
+            (
+                r#"{"category":"credential","evidence":[],"next_action":"a","resumable":true}"#,
+                BlockerRejection::EmptyEvidence,
+            ),
+            (
+                r#"{"category":"credential","evidence":["  "],"next_action":"a","resumable":true}"#,
+                BlockerRejection::EmptyEvidence,
+            ),
+            (
+                r#"{"category":"credential","next_action":"a","resumable":true}"#,
+                BlockerRejection::EmptyEvidence,
+            ),
+            (
+                r#"{"category":"credential","evidence":["e"],"resumable":true}"#,
+                BlockerRejection::MissingNextAction,
+            ),
+            (
+                r#"{"category":"credential","evidence":["e"],"next_action":"  ","resumable":true}"#,
+                BlockerRejection::MissingNextAction,
+            ),
+            (
+                r#"{"category":"credential","evidence":["e"],"next_action":"a"}"#,
+                BlockerRejection::MissingResumable,
+            ),
+            (
+                r#"{"category":"credential","evidence":["e"],"next_action":"a","resumable":"yes"}"#,
+                BlockerRejection::MissingResumable,
+            ),
+        ];
+
+        for (payload, expected) in cases {
+            assert_eq!(
+                parse_acceptance_output(&structured_gated(payload)),
+                AcceptanceResult::BareBlocker {
+                    rejection: expected.clone()
+                },
+                "payload must not become a stall: {payload}"
+            );
+        }
+    }
+
+    /// Prose containing credential/token/auth words must never be promoted to a
+    /// category. Only an explicit supported `category` field can do that.
+    #[test]
+    fn credential_prose_never_infers_a_blocker_category() {
+        let outputs = [
+            "{\"acceptance\":\"gated\",\"findings\":[\"missing credential token for auth\"]}\n"
+                .to_string(),
+            structured_gated(
+                r#"{"evidence":["missing credential token for auth"],"next_action":"provision it","resumable":true}"#,
+            ),
+            "ACCEPTANCE: GATED\nThe deploy credential token could not be read (auth failure)\n"
+                .to_string(),
+        ];
+        for output in outputs {
+            match parse_acceptance_output(&output) {
+                AcceptanceResult::BareBlocker { .. } => {}
+                other => panic!("prose must not create a category, got {other:?}"),
+            }
+        }
+    }
+
+    /// Bare and legacy compatibility inputs share one protocol-error path.
+    #[test]
+    fn bare_and_legacy_blocker_inputs_share_the_protocol_error_path() {
+        let bare = AcceptanceResult::BareBlocker {
+            rejection: BlockerRejection::Missing,
+        };
+        for output in [
+            "{\"acceptance\":\"gated\"}\n",
+            "{\"acceptance\":\"blocked\"}\n",
+            "ACCEPTANCE: GATED\n",
+            "ACCEPTANCE: BLOCKED\n",
+            "**ACCEPTANCE: GATED**\n",
+        ] {
+            assert_eq!(
+                parse_acceptance_output(output),
+                bare,
+                "drifted for {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blocker_rejection_reasons_are_operator_readable() {
+        assert!(BlockerRejection::Missing
+            .reason()
+            .contains("no structured blocker"));
+        assert!(BlockerRejection::UnsupportedCategory("nope".to_string())
+            .reason()
+            .contains("credential"));
+        assert!(BlockerRejection::EmptyEvidence
+            .reason()
+            .contains("evidence"));
+        assert!(BlockerRejection::MissingNextAction
+            .reason()
+            .contains("next_action"));
+        assert!(BlockerRejection::MissingResumable
+            .reason()
+            .contains("resumable"));
+        assert!(BlockerRejection::NotAnObject
+            .reason()
+            .contains("JSON object"));
+        assert!(BlockerRejection::MissingCategory
+            .reason()
+            .contains("category"));
+    }
+
+    #[test]
+    fn structured_blocker_survives_agent_event_wrapping() {
+        let text = format!("{{\"acceptance\":\"gated\",\"blocker\":{VALID_BLOCKER}}}");
+        let event = serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        })
+        .to_string();
+        assert!(matches!(
+            parse_acceptance_output(&event),
+            AcceptanceResult::Stalled { .. }
+        ));
     }
 
     /// Regression for the malformed trailing-text real-log case

@@ -138,7 +138,7 @@ cflx openspec archive <id> --yes  # Archive change
 ### Implementation Blocker Stalled Hold
 
 - Apply can escalate `IMPLEMENTATION_BLOCKER` when implementation is truly impossible in current loop
-- Accept treats a valid Implementation Blocker as a stalled acceptance hold; during the compatibility period it returns `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` only as protocol handoff tokens with concrete blocker evidence (legacy `BLOCKED` is input compatibility only)
+- Accept treats a valid Implementation Blocker as a stalled acceptance hold; during the compatibility period it returns `gated` only as a protocol handoff token, and only with a structured `blocker` payload carrying an explicit supported category, concrete evidence, next action, and resumability. A bare `ACCEPTANCE: GATED` / `{"acceptance":"gated"}` is a protocol error, not a stalled hold (legacy `BLOCKED` is input compatibility only)
 
 ### Autonomous Execution (all operation-specific skills)
 

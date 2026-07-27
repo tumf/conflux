@@ -66,6 +66,7 @@ pub(super) enum QueuedWorkClass {
     TerminalErrorRetryRequired,
     DependencyBlocked,
     CandidateUnavailable,
+    AcceptanceStalled,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -76,6 +77,10 @@ pub(super) struct BlockedOnlyQueueClassification {
     pub terminal_error_retry_required: Vec<String>,
     pub dependency_blocked: Vec<String>,
     pub candidate_unavailable: Vec<String>,
+    /// Changes held by a reconciled runtime acceptance stall. They are waiting
+    /// work, never dispatchable, so ordinary reconciliation cannot re-submit
+    /// them and produce a `Blocked -> Blocked` loop.
+    pub acceptance_stalled: Vec<String>,
 }
 
 impl BlockedOnlyQueueClassification {
@@ -89,6 +94,7 @@ impl BlockedOnlyQueueClassification {
             || !self.terminal_error_retry_required.is_empty()
             || !self.dependency_blocked.is_empty()
             || !self.candidate_unavailable.is_empty()
+            || !self.acceptance_stalled.is_empty()
     }
 
     pub fn is_blocked_only(&self) -> bool {
@@ -115,6 +121,8 @@ impl BlockedOnlyQueueClassification {
             Some(QueuedWorkClass::TerminalErrorRetryRequired)
         } else if self.dependency_blocked.iter().any(|id| id == change_id) {
             Some(QueuedWorkClass::DependencyBlocked)
+        } else if self.acceptance_stalled.iter().any(|id| id == change_id) {
+            Some(QueuedWorkClass::AcceptanceStalled)
         } else if self.candidate_unavailable.iter().any(|id| id == change_id) {
             Some(QueuedWorkClass::CandidateUnavailable)
         } else {
@@ -2201,6 +2209,48 @@ impl ParallelExecutor {
         outcome
     }
 
+    /// Change IDs currently held by a valid runtime acceptance stall.
+    ///
+    /// Reconciliation failures are not errors here: a record that no longer
+    /// binds is quarantined by the loader and simply omitted, so repository
+    /// evidence resumes control.
+    async fn acceptance_stalled_change_ids(
+        &self,
+        queued: &[crate::openspec::Change],
+    ) -> HashSet<String> {
+        let mut stalled = HashSet::new();
+        if queued.is_empty() {
+            return stalled;
+        }
+        let Ok(store) = self.acceptance_stall_store() else {
+            return stalled;
+        };
+        let base_branch = self
+            .workspace_manager
+            .original_branch()
+            .unwrap_or_else(|| "main".to_string());
+
+        for change in queued {
+            let Ok(Some(workspace_path)) =
+                crate::vcs::git::get_worktree_path_for_change(&self.repo_root, &change.id).await
+            else {
+                continue;
+            };
+            if let Ok(Some(_record)) = crate::execution::state::load_valid_acceptance_stall(
+                &store,
+                &self.repo_root,
+                &workspace_path,
+                &change.id,
+                &base_branch,
+            )
+            .await
+            {
+                stalled.insert(change.id.clone());
+            }
+        }
+        stalled
+    }
+
     pub(super) async fn classify_queued_work(
         &self,
         queued: &[crate::openspec::Change],
@@ -2232,8 +2282,18 @@ impl ParallelExecutor {
         let resolve_wait_set: HashSet<String> = resolve_wait_ids.into_iter().collect();
         let reject_wait_set: HashSet<String> = reject_wait_ids.into_iter().collect();
 
+        // A reconciled acceptance stall keeps its change out of ordinary
+        // dispatch entirely. Reconciliation runs here rather than at dispatch
+        // time so a record that has lost its binding is quarantined and the
+        // change becomes dispatchable again on the very next cycle.
+        let acceptance_stalled = self.acceptance_stalled_change_ids(queued).await;
+
         for change in queued {
             seen_ids.insert(change.id.clone());
+            if acceptance_stalled.contains(&change.id) {
+                classification.acceptance_stalled.push(change.id.clone());
+                continue;
+            }
             if merge_wait_set.contains(&change.id) || self.merge_wait_changes.contains(&change.id) {
                 classification.manual_merge_wait.push(change.id.clone());
                 continue;
@@ -2556,6 +2616,7 @@ impl ParallelExecutor {
                 terminal_error_retry_required = classification.terminal_error_retry_required.len(),
                 dependency_blocked = classification.dependency_blocked.len(),
                 candidate_unavailable = classification.candidate_unavailable.len(),
+                acceptance_stalled = classification.acceptance_stalled.len(),
                 "Skipping dependency analysis because queued work is blocked-only"
             );
             self.emit_no_analysis_diagnostic(

@@ -1090,7 +1090,10 @@ mod tests {
     }
 
     fn stalled_blocker() -> StalledBlocker {
-        StalledBlocker::acceptance_infrastructure("managed verification job still running")
+        StalledBlocker::acceptance_external(
+            "pending_verification",
+            "managed verification job still running",
+        )
     }
 
     #[test]
