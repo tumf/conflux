@@ -1,17 +1,6 @@
-use crate::events::RECOVERABLE_ANALYSIS_FALLBACK_MARKER;
 use crate::tui::events::LogEntry;
 
 use super::AppState;
-
-/// Classify a global diagnostic as a recoverable dependency-analysis fallback.
-///
-/// Successful metadata-dependency-only fallback keeps the scheduler running, so the
-/// diagnostic is degraded-execution observability rather than a fatal run failure.
-/// The producer already emits it as a warning; this classifier keeps the TUI safe if
-/// any producer path ever routes the same diagnostic through the fatal error channel.
-pub(crate) fn is_recoverable_analysis_fallback(message: &str) -> bool {
-    message.contains(RECOVERABLE_ANALYSIS_FALLBACK_MARKER)
-}
 
 impl AppState {
     pub(crate) fn handle_apply_output(
@@ -167,16 +156,14 @@ impl AppState {
         )));
     }
 
+    /// Handle a global error event as fatal.
+    ///
+    /// Fatality is decided by event type alone. Diagnostic message content is never
+    /// inspected: a genuine fatal error can quote or wrap recoverable-fallback wording,
+    /// and downgrading on that text would keep `AppMode::Running` after orchestration
+    /// had already stopped. Recoverable dependency-analysis fallback stays non-fatal by
+    /// arriving on the producer's warning-log event path instead of this channel.
     pub(crate) fn handle_error(&mut self, message: String) {
-        if is_recoverable_analysis_fallback(&message) {
-            // Non-fatal path: orchestration keeps executing on metadata dependencies,
-            // so the running lifecycle presentation (mode, current change, active rows,
-            // queue marks, reducer-derived state) must survive untouched. Only the
-            // warning log is appended.
-            self.add_log(LogEntry::warn(message));
-            return;
-        }
-
         self.reset_analysis_log_dedupe();
         self.add_log(LogEntry::error(message.clone()));
         self.mode = crate::tui::types::AppMode::Error;
@@ -205,8 +192,8 @@ mod tests {
     }
 
     /// Build the exact operator-facing diagnostic the scheduler emits for a
-    /// recoverable analysis fallback, so consumer classification is tested against
-    /// real producer wording rather than a copy that can drift.
+    /// recoverable analysis fallback, so consumer handling is tested against real
+    /// producer wording rather than a copy that can drift.
     pub(crate) fn recoverable_analysis_fallback_message(queued: &[&str], error: &str) -> String {
         let changes: Vec<Change> = queued
             .iter()
@@ -273,21 +260,35 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_analysis_fallback_classifier_matches_producer_message_only() {
-        let fallback =
+    fn fatal_global_error_quoting_fallback_marker_still_enters_error_mode() {
+        let (mut app, _shared) = running_app_with_shared_state();
+        let quoted =
             recoverable_analysis_fallback_message(&["change-a"], "Missing change IDs in response");
+        let fatal = format!(
+            "Parallel execution failed: base worktree is unusable (last diagnostic: \"{quoted}\")"
+        );
 
-        assert!(
-            is_recoverable_analysis_fallback(&fallback),
-            "producer fallback wording must be recognized as recoverable: {fallback}"
+        app.handle_orchestrator_event(OrchestratorEvent::Error {
+            message: fatal.clone(),
+        });
+
+        assert_eq!(
+            app.mode,
+            AppMode::Error,
+            "message content must not downgrade a global error event"
         );
-        assert!(
-            !is_recoverable_analysis_fallback("Parallel execution failed: worktree base is dirty"),
-            "unrelated global failures must stay fatal"
-        );
-        assert!(
-            !is_recoverable_analysis_fallback("Dependency analysis failed: error=timeout"),
-            "a terminal analysis failure must not be reclassified as recoverable"
+        assert_eq!(app.current_change, None, "fatal error must clear context");
+        assert_eq!(app.error_change_id, None);
+        let entry = app
+            .logs
+            .iter()
+            .rev()
+            .find(|entry| entry.message.contains("base worktree is unusable"))
+            .expect("fatal diagnostic log entry");
+        assert_eq!(
+            entry.level,
+            LogLevel::Error,
+            "fatal diagnostic must stay error-level even when it quotes fallback wording"
         );
     }
 
@@ -306,11 +307,9 @@ mod tests {
             "Missing change IDs in response: [\"change-b\"]",
         );
 
-        // Defensive path: even if the diagnostic ever arrives through the fatal
-        // global error channel, the TUI must keep the running presentation.
-        app.handle_orchestrator_event(OrchestratorEvent::Error {
-            message: fallback.clone(),
-        });
+        // Production path: the scheduler emits the successful fallback as a warning
+        // log event, so the running presentation must survive untouched.
+        app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(&fallback)));
 
         assert_eq!(app.mode, AppMode::Running, "fallback must not stop the TUI");
         assert_eq!(app.current_change.as_deref(), Some("change-a"));
@@ -374,7 +373,7 @@ mod tests {
             "Missing change IDs in response: [\"change-b\"]",
         );
 
-        app.handle_orchestrator_event(OrchestratorEvent::Error { message: fallback });
+        app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(&fallback)));
 
         // No explicit retry is issued: later lifecycle events must flow normally.
         // Only handlers without filesystem access are exercised here so the test
@@ -426,7 +425,7 @@ mod tests {
             "Missing change IDs in response: [\"change-b\"]",
         );
 
-        app.handle_orchestrator_event(OrchestratorEvent::Error { message: fallback });
+        app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(&fallback)));
         app.handle_orchestrator_event(OrchestratorEvent::ChangeArchived("change-a".to_string()));
 
         assert_eq!(app.mode, AppMode::Running);

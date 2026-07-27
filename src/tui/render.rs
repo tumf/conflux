@@ -3880,9 +3880,10 @@ mod tests {
             crate::events::RECOVERABLE_ANALYSIS_FALLBACK_MARKER
         );
 
-        app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Error {
-            message: fallback,
-        });
+        // Production path: the producer emits the successful fallback as a warning.
+        app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Log(LogEntry::warn(
+            fallback,
+        )));
 
         let content = buffer_to_string(&render_buffer(&mut app, 100, 24));
         assert!(
@@ -3919,6 +3920,35 @@ mod tests {
         assert!(
             !content.contains("Esc: stop"),
             "fatal errors must not keep running controls:\n{content}"
+        );
+    }
+
+    #[test]
+    fn fatal_global_error_status_header_quoting_fallback_shows_retry_controls() {
+        let mut app = create_test_app(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        app.current_change = Some("change-a".to_string());
+        app.orchestration_started_at = Some(std::time::Instant::now());
+        app.add_log(LogEntry::info("log"));
+        // A fatal diagnostic that wraps the recoverable fallback wording must not be
+        // downgraded by message content.
+        let fatal = format!(
+            "Parallel execution failed: base worktree is unusable (last diagnostic: \"{}: error=Missing change IDs in response, queued=[\"change-a\"], in_flight=[]\")",
+            crate::events::RECOVERABLE_ANALYSIS_FALLBACK_MARKER
+        );
+
+        app.handle_orchestrator_event(crate::tui::events::OrchestratorEvent::Error {
+            message: fatal,
+        });
+
+        let content = buffer_to_string(&render_buffer(&mut app, 100, 24));
+        assert!(
+            content.contains(": retry, Ctrl+C: quit"),
+            "a fatal error quoting fallback text must still expose retry controls:\n{content}"
+        );
+        assert!(
+            !content.contains("Esc: stop"),
+            "a fatal error quoting fallback text must not keep running controls:\n{content}"
         );
     }
 
