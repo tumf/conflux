@@ -1105,6 +1105,93 @@ mod tests {
         );
     }
 
+    /// A git-tracked marker is committed repository content, not generated
+    /// residue. Removing it would dirty the managed worktree, so migration must
+    /// refuse and leave both the file and the worktree exactly as they were.
+    #[tokio::test]
+    async fn acceptance_marker_migration_preserves_tracked_markers() {
+        let repo = TempDir::new().unwrap();
+        let state_root = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        commit(repo.path(), "Apply: test-change");
+
+        write_legacy_acceptance_marker(
+            repo.path(),
+            "test-change",
+            "acceptance_gated",
+            &["managed verification job 42 is still running".to_string()],
+            &AcceptanceRetryContext {
+                finding_identities: vec!["external|job 42|verification".to_string()],
+                semantic_fingerprint: Some("baseline".to_string()),
+                cycle_count: 3,
+            },
+            "no_semantic_progress",
+            &["verification job 42".to_string()],
+            true,
+            "wait for job 42 then retry acceptance",
+        )
+        .unwrap();
+
+        // Commit the marker so git tracks it, exactly like a legacy run that
+        // captured the marker into the apply commit.
+        StdCommand::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["commit", "-m", "legacy tracked marker"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let apply_revision = head_revision(repo.path());
+        assert_eq!(
+            porcelain_status(repo.path()),
+            "",
+            "fixture must start from a clean tracked state"
+        );
+
+        let marker_path = repo
+            .path()
+            .join("openspec/changes/test-change/APPLY_BLOCKED/marker.md");
+        let before = std::fs::read(&marker_path).unwrap();
+
+        let store = AcceptanceStallStore::new(state_root.path());
+        let facts = gather_workspace_facts(
+            repo.path(),
+            repo.path(),
+            "test-change",
+            &apply_revision,
+            "main",
+        )
+        .await
+        .unwrap();
+
+        let migration =
+            migrate_legacy_acceptance_marker(&store, repo.path(), &facts, &apply_revision).unwrap();
+        match migration {
+            MarkerMigration::Preserved { reason } => {
+                assert!(
+                    reason.contains("tracked"),
+                    "tracked markers must be preserved for tracked-ness, got: {reason}"
+                );
+            }
+            other => panic!("tracked marker must be preserved, got {other:?}"),
+        }
+
+        // Neither the marker nor the worktree changed, and no hold was invented.
+        assert_eq!(std::fs::read(&marker_path).unwrap(), before);
+        assert_eq!(porcelain_status(repo.path()), "");
+        assert_eq!(head_revision(repo.path()), apply_revision);
+        assert_eq!(
+            load_valid_acceptance_stall(&store, repo.path(), repo.path(), "test-change", "main")
+                .await
+                .unwrap(),
+            None,
+            "a preserved marker must not create runtime stall state"
+        );
+    }
+
     /// Migration must never delete evidence it cannot prove is acceptance-owned.
     #[tokio::test]
     async fn acceptance_marker_migration_preserves_foreign_and_malformed_markers() {

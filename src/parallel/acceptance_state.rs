@@ -637,6 +637,17 @@ pub fn migrate_legacy_acceptance_marker(
         });
     }
 
+    // A tracked marker is committed repository content, not generated residue.
+    // Deleting it would dirty the managed worktree and rewrite change artifacts,
+    // so it is ambiguous by definition and stays untouched.
+    if marker_is_tracked(workspace_path, &facts.change_id) {
+        return Ok(MarkerMigration::Preserved {
+            reason: "acceptance marker is tracked by git; removing it would dirty the managed \
+                     worktree, so it is treated as ambiguous and preserved"
+                .to_string(),
+        });
+    }
+
     let evidence = marker
         .evidence
         .iter()
@@ -687,9 +698,34 @@ pub fn migrate_legacy_acceptance_marker(
     })
 }
 
+/// Whether git tracks the marker file at `workspace_path` for `change_id`.
+///
+/// A non-git directory, or a git invocation that cannot run at all, reports
+/// "not tracked" only because the caller has already established that the marker
+/// is untracked generated residue in that case; a *failed* lookup inside a real
+/// repository is conservatively reported as tracked so migration refuses.
+fn marker_is_tracked(workspace_path: &Path, change_id: &str) -> bool {
+    let path = marker_path(workspace_path, change_id);
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(&path)
+        .current_dir(workspace_path)
+        .output();
+    match output {
+        // Exit 0 means the path is in the index: tracked repository content.
+        Ok(output) => output.status.success(),
+        // git is unavailable: we cannot prove the marker is generated residue.
+        Err(_) => true,
+    }
+}
+
 /// Remove a generated `APPLY_BLOCKED` marker and the directory Conflux created
 /// for it, leaving no residue behind. Any unexpected sibling file keeps the
 /// directory, so nothing a human placed there is destroyed.
+///
+/// The removal is verified: `git status --porcelain` scoped to the marker
+/// directory must come back empty, so a migration can never silently hand back a
+/// dirty managed worktree.
 fn remove_generated_marker(workspace_path: &Path, change_id: &str) -> Result<()> {
     let path = marker_path(workspace_path, change_id);
     if path.exists() {
@@ -700,7 +736,36 @@ fn remove_generated_marker(workspace_path: &Path, change_id: &str) -> Result<()>
             fs::remove_dir(parent)?;
         }
     }
-    Ok(())
+    verify_marker_removal_left_worktree_clean(workspace_path, &path)
+}
+
+/// Fail loudly when removing the generated marker left git-visible residue.
+fn verify_marker_removal_left_worktree_clean(workspace_path: &Path, path: &Path) -> Result<()> {
+    let Some(marker_dir) = path.parent() else {
+        return Ok(());
+    };
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--"])
+        .arg(marker_dir)
+        .current_dir(workspace_path)
+        .output();
+    let Ok(output) = output else {
+        // No git available to check against; the filesystem removal above is the
+        // only guarantee we can offer.
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+    let residue = String::from_utf8_lossy(&output.stdout);
+    if residue.trim().is_empty() {
+        return Ok(());
+    }
+    Err(OrchestratorError::Io(std::io::Error::other(format!(
+        "removing the generated acceptance marker at {} left the worktree dirty: {}",
+        path.display(),
+        residue.trim()
+    ))))
 }
 
 #[cfg(test)]

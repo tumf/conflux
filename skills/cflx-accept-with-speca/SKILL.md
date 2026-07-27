@@ -265,7 +265,11 @@ For each high-value property:
 - **Blocking**: Concrete property failure with repository evidence. Map to standard acceptance `fail` with a `findings` item naming the property, evidence path/function/line when available, and required autonomous fix.
 - **Advisory**: Non-blocking risk or improvement. Mention in reasoning if useful, but do not force failure by itself.
 - **Incomplete**: Repository-only work/checks are still needed. Treat as `fail` when the agent can resolve it by editing code/tests/spec/tasks/docs.
-- **Stalled hold**: Use only when the standard acceptance blocker rubric allows it and repository-only work cannot resolve the issue. During the compatibility period, emit the shared `gated` verdict *with* its structured blocker payload for this hold; do not introduce `{"acceptance":"stalled"}` or any SPECA-specific outcome, and never create a marker under the change directory.
+- **Stalled hold**: Use only when the standard acceptance blocker rubric allows it and repository-only work cannot resolve the issue. During the compatibility period, emit the shared `gated` verdict *with* its structured blocker payload for this hold; do not introduce `{"acceptance":"stalled"}` or any SPECA-specific outcome.
+
+Never create `APPLY_BLOCKED`, a marker file, or any other runtime artifact under
+the change directory. The runtime records stalled holds outside the worktree and
+keeps the worktree clean.
 
 ### 5. Emit one Conflux verdict
 

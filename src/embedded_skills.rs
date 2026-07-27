@@ -270,11 +270,31 @@ mod tests {
                 content.contains("structured blocker"),
                 "{label} must name the structured blocker payload"
             );
+            // Positive contract: every mirrored acceptance skill must carry the
+            // explicit prohibition. A negated disjunction here would be vacuous —
+            // a mirror that *instructs* marker creation but simply omits the
+            // sentence would satisfy it.
             assert!(
-                !content.contains("Never create `APPLY_BLOCKED`")
-                    || !content.contains("create a marker"),
-                "{label} must not instruct the reviewer to create a marker"
+                content.contains("Never create `APPLY_BLOCKED`"),
+                "{label} must forbid change-directory markers outright"
             );
+            assert!(
+                content.contains(
+                    "The runtime records stalled holds outside the worktree and\nkeeps the \
+                     worktree clean."
+                ),
+                "{label} must state that stalled holds live outside the worktree"
+            );
+            for forbidden in [
+                "create a marker under the change directory",
+                "write `APPLY_BLOCKED`",
+                "create `APPLY_BLOCKED`\n",
+            ] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{label} must not instruct the reviewer to create a marker ({forbidden:?})"
+                );
+            }
         }
 
         // The primary skill carries the full contract table and category list.
