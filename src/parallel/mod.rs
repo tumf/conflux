@@ -12,6 +12,7 @@
 //! - `orchestration`: order-based re-analysis scheduler loop
 
 pub(crate) mod acceptance_state;
+pub(crate) mod analysis_signature;
 mod archive_state;
 mod builder;
 mod cleanup;
@@ -49,6 +50,7 @@ pub use merge::MergeAttempt;
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
+use crate::parallel::analysis_signature::{AnalysisInputProbe, CompletedAnalysisInput};
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::vcs::WorkspaceManager;
 use std::collections::{HashMap, HashSet};
@@ -218,6 +220,27 @@ pub struct ParallelExecutor {
     ///
     /// This state is intentionally in-memory and MUST NOT participate in scheduling decisions.
     diagnostic_dedup: DiagnosticDeduplicationStore<DiagnosticDeduplicationKey>,
+    /// Last dependency-analysis input that completed with a usable result.
+    ///
+    /// Ordinary timer-driven analysis is skipped while the current input still matches this
+    /// record, which is what stops an unchanged scheduler state from relaunching costly
+    /// analysis agents forever. It is deliberately process-local: it is never persisted, so a
+    /// restart always performs an initial analysis, and it never authorizes dispatch — the
+    /// previous `AnalysisResult` is not retained.
+    last_completed_analysis_input: Option<CompletedAnalysisInput>,
+    /// Earliest instant at which a suppressed input may probe repository-visible signature
+    /// material again.
+    ///
+    /// The scheduler wakes every 500 ms; without this bound each wake would re-read proposal
+    /// files and spawn a VCS revision subprocess just to confirm nothing changed.
+    next_analysis_signature_probe_at: Option<tokio::time::Instant>,
+    /// Override for dependency-analysis signature probing.
+    ///
+    /// `None` uses the real repository probe (VCS revision plus
+    /// `openspec/changes/<id>/proposal.md` content). Tests inject a deterministic double so
+    /// suppression coverage does not depend on real VCS subprocesses, and so probe counts and
+    /// probe failures can be observed directly.
+    analysis_input_probe: Option<Arc<dyn AnalysisInputProbe>>,
 }
 
 #[cfg(test)]

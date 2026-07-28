@@ -42,6 +42,71 @@ pub struct AnalysisResult {
     pub groups: Option<Vec<ParallelGroup>>,
 }
 
+/// How an [`AnalysisResult`] was produced, as runtime-only execution metadata.
+///
+/// The scheduler needs to tell a *completed* analysis apart from a *degraded* one: a
+/// healthy or intentionally metadata-only result describes the input faithfully and may
+/// suppress an unchanged ordinary timer input indefinitely, while a metadata fallback
+/// produced by a recoverable LLM failure must only suppress it for a bounded interval so
+/// a transient analyzer outage still recovers.
+///
+/// This provenance is process-local and is never serialized, persisted, or used as
+/// authoritative workflow state; it only decides whether duplicate analyzer work is
+/// avoided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisProvenance {
+    /// The configured LLM analysis command produced the result.
+    HealthyLlm,
+    /// LLM analysis is intentionally disabled, so metadata-dependency analysis is the
+    /// configured result rather than a fallback.
+    IntentionalMetadataOnly,
+    /// LLM analysis failed recoverably and the metadata-dependency fallback was used.
+    RecoverableFailureFallback,
+}
+
+impl AnalysisProvenance {
+    /// Whether this result is a recoverable-failure fallback rather than the analysis the
+    /// current configuration asks for.
+    pub fn is_degraded(self) -> bool {
+        matches!(self, AnalysisProvenance::RecoverableFailureFallback)
+    }
+}
+
+/// An [`AnalysisResult`] together with the runtime-only provenance of how it was produced.
+///
+/// The dependency semantics carried by `result` are unchanged; `provenance` is additional
+/// execution metadata for the scheduler.
+#[derive(Debug, Clone)]
+pub struct AnalysisOutcome {
+    pub result: AnalysisResult,
+    pub provenance: AnalysisProvenance,
+}
+
+impl AnalysisOutcome {
+    pub fn new(result: AnalysisResult, provenance: AnalysisProvenance) -> Self {
+        Self { result, provenance }
+    }
+
+    pub fn healthy(result: AnalysisResult) -> Self {
+        Self::new(result, AnalysisProvenance::HealthyLlm)
+    }
+
+    pub fn intentional_metadata_only(result: AnalysisResult) -> Self {
+        Self::new(result, AnalysisProvenance::IntentionalMetadataOnly)
+    }
+
+    pub fn recoverable_failure_fallback(result: AnalysisResult) -> Self {
+        Self::new(result, AnalysisProvenance::RecoverableFailureFallback)
+    }
+}
+
+/// Callers that do not model analyzer health treat their result as healthy output.
+impl From<AnalysisResult> for AnalysisOutcome {
+    fn from(result: AnalysisResult) -> Self {
+        Self::healthy(result)
+    }
+}
+
 /// Analyzer for determining parallel execution groups
 pub struct ParallelizationAnalyzer {
     ai_runner: crate::ai_command_runner::AiCommandRunner,

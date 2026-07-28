@@ -1042,6 +1042,9 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+        last_completed_analysis_input: None,
+        next_analysis_signature_probe_at: None,
+        analysis_input_probe: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -2801,8 +2804,9 @@ fn dependent_ready_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     Box::pin(async move {
         crate::analyzer::AnalysisResult {
@@ -2810,6 +2814,7 @@ fn dependent_ready_analysis_result<'a>(
             dependencies: HashMap::from([("dependent".to_string(), vec!["resolving".to_string()])]),
             groups: None,
         }
+        .into()
     })
 }
 
@@ -2817,8 +2822,9 @@ fn ready_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     Box::pin(async move {
         crate::analyzer::AnalysisResult {
@@ -2826,6 +2832,7 @@ fn ready_analysis_result<'a>(
             dependencies: HashMap::new(),
             groups: None,
         }
+        .into()
     })
 }
 
@@ -2833,8 +2840,9 @@ fn blocked_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     let dependencies = changes
         .iter()
@@ -2846,6 +2854,7 @@ fn blocked_analysis_result<'a>(
             dependencies,
             groups: None,
         }
+        .into()
     })
 }
 
@@ -2853,8 +2862,9 @@ fn declared_dependency_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     let dependencies = changes
         .iter()
@@ -2866,6 +2876,7 @@ fn declared_dependency_analysis_result<'a>(
             dependencies,
             groups: None,
         }
+        .into()
     })
 }
 
@@ -2873,8 +2884,9 @@ fn selective_dependency_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     let dependencies = changes
         .iter()
@@ -2892,6 +2904,7 @@ fn selective_dependency_analysis_result<'a>(
             dependencies,
             groups: None,
         }
+        .into()
     })
 }
 
@@ -3115,7 +3128,7 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
         _in_flight: &'a [String],
         _iteration: u32,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+        Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
     > {
         if let Some(calls) = BLOCKED_ONLY_ANALYZER_CALLS.get() {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -3127,6 +3140,7 @@ async fn test_blocked_only_reanalysis_skips_analyzer_for_merge_wait_and_terminal
                 dependencies: HashMap::new(),
                 groups: None,
             }
+            .into()
         })
     }
 
@@ -3366,8 +3380,9 @@ fn single_queued_route_depends_on_policy_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     Box::pin(async move {
         crate::analyzer::AnalysisResult {
@@ -3375,6 +3390,7 @@ fn single_queued_route_depends_on_policy_analysis_result<'a>(
             dependencies: HashMap::from([("route".to_string(), vec!["policy".to_string()])]),
             groups: None,
         }
+        .into()
     })
 }
 
@@ -3382,8 +3398,9 @@ fn beta_depends_on_alpha_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     Box::pin(async move {
         crate::analyzer::AnalysisResult {
@@ -3391,6 +3408,7 @@ fn beta_depends_on_alpha_analysis_result<'a>(
             dependencies: HashMap::from([("beta".to_string(), vec!["alpha".to_string()])]),
             groups: None,
         }
+        .into()
     })
 }
 
@@ -3398,8 +3416,9 @@ fn dependency_on_inflight_analysis_result<'a>(
     changes: &'a [crate::openspec::Change],
     in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     let dependency = in_flight
         .first()
@@ -3421,6 +3440,7 @@ fn dependency_on_inflight_analysis_result<'a>(
             dependencies,
             groups: None,
         }
+        .into()
     })
 }
 

@@ -11,4 +11,6 @@ mod manual_resolve;
 #[cfg(test)]
 mod reanalysis_trigger_lifetime;
 #[cfg(test)]
+mod unchanged_analysis_input;
+#[cfg(test)]
 mod workspace_resume;

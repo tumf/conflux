@@ -552,6 +552,12 @@ impl ParallelRunService {
     /// Otherwise, returns changes in listed order with proposal metadata dependencies preserved.
     /// When a sender is provided, AnalysisOutput events are sent for streaming output.
     ///
+    /// The returned [`crate::analyzer::AnalysisOutcome`] carries runtime-only provenance so the
+    /// scheduler can tell a healthy or intentionally metadata-only result apart from a
+    /// recoverable-failure fallback. Only the failure fallback uses bounded suppression, which
+    /// keeps a broken analyzer command from being relaunched on every timer wake while still
+    /// allowing recovery from a transient outage.
+    ///
     /// # Arguments
     /// * `changes` - Changes to analyze for execution order
     /// * `in_flight_ids` - Currently executing change IDs (not selectable, but available as dependencies)
@@ -563,7 +569,7 @@ impl ParallelRunService {
         in_flight_ids: &[String],
         event_tx: Option<&mpsc::Sender<ParallelEvent>>,
         iteration: u32,
-    ) -> crate::analyzer::AnalysisResult {
+    ) -> crate::analyzer::AnalysisOutcome {
         // Check if LLM analysis is enabled (default: true)
         if self.config.use_llm_analysis() {
             info!("Using LLM analysis for parallelization (analyze_command)");
@@ -576,7 +582,7 @@ impl ParallelRunService {
                         "LLM analysis successful: {} changes in order",
                         result.order.len()
                     );
-                    return result;
+                    return crate::analyzer::AnalysisOutcome::healthy(result);
                 }
                 Err(e) => {
                     // Rejecting an LLM analysis response is recoverable: metadata-dependency-only
@@ -589,13 +595,17 @@ impl ParallelRunService {
                         &e.to_string(),
                     )
                     .await;
+                    return crate::analyzer::AnalysisOutcome::recoverable_failure_fallback(
+                        Self::metadata_dependency_analysis_result(changes),
+                    );
                 }
             }
-        } else {
-            info!("LLM analysis disabled, using metadata-dependency-only analysis");
         }
 
-        Self::metadata_dependency_analysis_result(changes)
+        info!("LLM analysis disabled, using metadata-dependency-only analysis");
+        crate::analyzer::AnalysisOutcome::intentional_metadata_only(
+            Self::metadata_dependency_analysis_result(changes),
+        )
     }
 
     fn log_recoverable_analysis_fallback(error: &dyn std::fmt::Display) {
@@ -1245,17 +1255,26 @@ mod tests {
             create_test_change("policy", vec![]),
         ];
 
-        let result = service
+        let outcome = service
             .analyze_order_with_sender(&changes, &[], None, 1)
             .await;
 
         assert_eq!(
-            result.order,
+            outcome.result.order,
             vec!["route".to_string(), "policy".to_string()]
         );
         assert_eq!(
-            result.dependencies.get("route"),
+            outcome.result.dependencies.get("route"),
             Some(&vec!["policy".to_string()])
+        );
+        assert_eq!(
+            outcome.provenance,
+            crate::analyzer::AnalysisProvenance::IntentionalMetadataOnly,
+            "configured metadata-only analysis is the intended result, not a failure fallback"
+        );
+        assert!(
+            !outcome.provenance.is_degraded(),
+            "intentional metadata-only analysis must not be suppressed on a degraded interval"
         );
     }
 
@@ -1271,21 +1290,30 @@ mod tests {
             create_test_change("policy", vec![]),
         ];
 
-        let result = service
+        let outcome = service
             .analyze_order_with_sender(&changes, &[], None, 1)
             .await;
 
         assert_eq!(
-            result.order,
+            outcome.result.order,
             vec!["route".to_string(), "policy".to_string()]
         );
         assert_eq!(
-            result.dependencies.get("route"),
+            outcome.result.dependencies.get("route"),
             Some(&vec!["policy".to_string()])
         );
         assert!(
-            !result.dependencies.is_empty(),
+            !outcome.result.dependencies.is_empty(),
             "recoverable fallback must not degrade to dependency-free analysis"
+        );
+        assert_eq!(
+            outcome.provenance,
+            crate::analyzer::AnalysisProvenance::RecoverableFailureFallback,
+            "a failed LLM command must be distinguishable from a configured metadata-only result"
+        );
+        assert!(
+            outcome.provenance.is_degraded(),
+            "recoverable-failure fallback must use bounded suppression so one retry stays possible"
         );
     }
 
@@ -1306,12 +1334,12 @@ mod tests {
         ];
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ParallelEvent>(32);
 
-        let result = service
+        let outcome = service
             .analyze_order_with_sender(&changes, &[], Some(&event_tx), 1)
             .await;
 
         assert_eq!(
-            result.order,
+            outcome.result.order,
             vec![
                 "route".to_string(),
                 "policy".to_string(),
@@ -1320,9 +1348,14 @@ mod tests {
             "fallback must represent every queued change exactly once"
         );
         assert_eq!(
-            result.dependencies.get("route"),
+            outcome.result.dependencies.get("route"),
             Some(&vec!["policy".to_string()]),
             "declared metadata dependencies must survive fallback"
+        );
+        assert_eq!(
+            outcome.provenance,
+            crate::analyzer::AnalysisProvenance::RecoverableFailureFallback,
+            "a rejected LLM response is a recoverable failure, not healthy analyzer output"
         );
 
         drop(event_tx);
