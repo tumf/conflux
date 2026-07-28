@@ -5,6 +5,43 @@
 //! - Continues re-analysis even when apply commands are running
 //! - Tracks in-flight changes to calculate available slots
 //! - Responds to queue notifications, debounce timers, and task completions
+//!
+//! # Re-analysis trigger lifetime
+//!
+//! `ReanalysisReason::ResolveCompletion`, `SlotRecovery`, and `RepairCandidate` bypass
+//! queue debounce, so they are treated as one-shot state-transition edges: the loop
+//! consumes them back to the non-bypass `Initial` state once a queued re-analysis /
+//! dispatch evaluation has actually used them (see
+//! [`ParallelExecutor::evaluate_queued_reanalysis_and_dispatch`]). Keeping such a reason
+//! across iterations would let the plain 500 ms timer branch replay an already-handled
+//! edge and restart expensive dependency analysis on every scheduler tick.
+//!
+//! # Capacity-recovery audit
+//!
+//! Because the sticky reason is gone, every path that releases scheduler-accounted
+//! occupancy must reach queued work through a real wake edge, slot-recovery detection,
+//! or the bounded timer/debounce evaluation:
+//!
+//! - Workspace task completion: `join_set.join_next()` in [`Self::wait_for_scheduler_event`]
+//!   removes the change from `in_flight` via `handle_workspace_completion` and sets
+//!   `ResolveCompletion` (or `Completion` while a manual resolve is still active).
+//! - Manual resolve completion: the TUI decrements the shared manual-resolve counter and
+//!   calls `DynamicQueue::notify_scheduler`, which wakes the queue-notification branch.
+//! - Automatic conflict/merge resolution: `conflict::AutoResolveGuard` decrements
+//!   `auto_resolve_count` on success, failure, and early return, and the owning
+//!   background merge task always reports a `MergeResult` afterwards.
+//! - Background merge results (merged / deferred / failed): `handle_merge_result_with_tx`
+//!   decrements `pending_merge_count` for every outcome; merged additionally arms a
+//!   `ResolveCompletion` edge and promotes deferred base-lane waiters.
+//! - Deferred resolve/reject wait retries: `maybe_dispatch_resolve_wait_retry_with_tx`
+//!   spawns through the same merge-result channel, so its completion is a wake edge too.
+//! - Zero-to-positive slot transitions observed by `calculate_available_slots` /
+//!   `last_available_slots` are promoted to `SlotRecovery`.
+//!
+//! Coverage lives in `src/parallel/tests/reanalysis_trigger_lifetime.rs` (edge lifetime,
+//! merge-outcome capacity release), `src/parallel/tests/conflict.rs` (auto-resolve guard
+//! release on success / failure / early return), and
+//! `src/parallel/tests/auto_resolve.rs` (deferred retry convergence).
 
 use crate::error::Result;
 use crate::events::LogEntry;
@@ -253,9 +290,9 @@ impl ParallelExecutor {
                 );
                 break;
             }
-            if !queued.is_empty() {
-                let (should_break, new_iteration) = self
-                    .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            if let Some((should_break, new_iteration)) = self
+                .evaluate_queued_reanalysis_and_dispatch(
+                    ReanalysisDispatchContext {
                         queued: &mut queued,
                         in_flight: &mut in_flight,
                         max_parallelism,
@@ -265,9 +302,11 @@ impl ParallelExecutor {
                         semaphore: semaphore.clone(),
                         join_set: &mut join_set,
                         cleanup_guard: &mut cleanup_guard,
-                    })
-                    .await?;
-
+                    },
+                    &mut reanalysis_reason,
+                )
+                .await?
+            {
                 iteration = new_iteration;
 
                 if should_break {
@@ -322,6 +361,47 @@ impl ParallelExecutor {
             send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         }
         Ok(())
+    }
+
+    /// Run the scheduler loop's queued re-analysis/dispatch evaluation and apply the
+    /// loop-owned trigger lifetime.
+    ///
+    /// Returns `None` when there is no queued work: that loop iteration performs no
+    /// evaluation, so an edge-triggered reason stays armed for the next eligible
+    /// iteration instead of being silently discarded.
+    ///
+    /// Trigger lifetime is owned here rather than inside `perform_reanalysis_and_dispatch`
+    /// so the helper keeps its single-evaluation direct-call semantics.  Once a queued
+    /// evaluation has actually consumed an edge-triggered reason, it is reset to the
+    /// non-bypass `Initial` state so later timer-only wakes fall back to the ordinary
+    /// bounded queue-debounce policy instead of replaying the same edge.
+    pub(super) async fn evaluate_queued_reanalysis_and_dispatch<F>(
+        &mut self,
+        ctx: ReanalysisDispatchContext<'_, F>,
+        reanalysis_reason: &mut ReanalysisReason,
+    ) -> Result<Option<(bool, u32)>>
+    where
+        for<'a> F: Fn(
+                &'a [crate::openspec::Change],
+                &'a [String],
+                u32,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+            > + Send
+            + Sync,
+    {
+        if ctx.queued.is_empty() {
+            return Ok(None);
+        }
+
+        let evaluated_reason = ctx.reanalysis_reason;
+        let result = self.perform_reanalysis_and_dispatch(ctx).await?;
+
+        if *reanalysis_reason == evaluated_reason && evaluated_reason.is_one_shot_edge_trigger() {
+            *reanalysis_reason = ReanalysisReason::Initial;
+        }
+
+        Ok(Some(result))
     }
 
     async fn wait_for_scheduler_event(
