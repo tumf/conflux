@@ -69,6 +69,25 @@ pub enum ReanalysisReason {
     RepairCandidate,
 }
 
+impl ReanalysisReason {
+    /// Whether this reason represents a single scheduler state-transition edge whose
+    /// debounce bypass must be consumed after one evaluation.
+    ///
+    /// `ResolveCompletion`, `SlotRecovery`, and `RepairCandidate` are edge-triggered:
+    /// keeping them in the loop-owned reanalysis reason would let plain timer wakes
+    /// replay an already-consumed edge and restart expensive dependency analysis every
+    /// scheduler tick.  `QueueNotification` is excluded because the scheduler loop
+    /// already reconciles it against real candidate additions each iteration.
+    pub fn is_one_shot_edge_trigger(self) -> bool {
+        matches!(
+            self,
+            ReanalysisReason::ResolveCompletion
+                | ReanalysisReason::SlotRecovery
+                | ReanalysisReason::RepairCandidate
+        )
+    }
+}
+
 impl std::fmt::Display for ReanalysisReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

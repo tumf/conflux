@@ -7,12 +7,25 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// How the mock reports conflicts across successive `detect_conflicts` calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConflictProbe {
+    /// Always report the configured conflicts.
+    Static,
+    /// Report conflicts on the initial detection, then report them cleared.
+    ClearedAfterFirstCall,
+    /// Fail detection, exercising the early-return path of resolve.
+    AlwaysFails,
+}
+
 /// Mock WorkspaceManager for testing conflict detection.
 struct MockWorkspaceManager {
     conflicts: Vec<String>,
     status_output: String,
     log_output: String,
     repo_root: PathBuf,
+    probe: ConflictProbe,
+    detect_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockWorkspaceManager {
@@ -23,7 +36,19 @@ impl MockWorkspaceManager {
                 .to_string(),
             log_output: "commit abc123\nAuthor: Test\nDate: 2024-01-01\n\nTest commit".to_string(),
             repo_root: PathBuf::from("/tmp/test-repo"),
+            probe: ConflictProbe::Static,
+            detect_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    fn with_repo_root(mut self, repo_root: PathBuf) -> Self {
+        self.repo_root = repo_root;
+        self
+    }
+
+    fn with_probe(mut self, probe: ConflictProbe) -> Self {
+        self.probe = probe;
+        self
     }
 
     fn with_status(mut self, status: String) -> Self {
@@ -162,7 +187,18 @@ impl WorkspaceManager for MockWorkspaceManager {
     }
 
     async fn detect_conflicts(&self) -> VcsResult<Vec<String>> {
-        Ok(self.conflicts.clone())
+        let call = self
+            .detect_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.probe {
+            ConflictProbe::Static => Ok(self.conflicts.clone()),
+            ConflictProbe::ClearedAfterFirstCall if call == 0 => Ok(self.conflicts.clone()),
+            ConflictProbe::ClearedAfterFirstCall => Ok(Vec::new()),
+            ConflictProbe::AlwaysFails => Err(crate::vcs::VcsError::Conflict {
+                backend: VcsBackend::Git,
+                details: "conflict detection unavailable".to_string(),
+            }),
+        }
     }
 
     async fn get_status(&self) -> VcsResult<String> {
@@ -305,4 +341,83 @@ fn test_resolve_merges_prompt_contains_cleanup_instructions() {
     assert!(prompt_fragment.contains("git rm -rf openspec/changes/<change_id>"));
     assert!(prompt_fragment.contains("resurrected"));
     assert!(prompt_fragment.contains("Finally, run `git commit -m"));
+}
+
+/// Capacity-recovery audit coverage for automatic conflict resolution.
+///
+/// Automatic resolve occupancy is accounted through an RAII guard, so the scheduler's
+/// `calculate_available_slots` input must return to its pre-resolve value on every exit
+/// path. If any path leaked the counter, queued work would stay permanently capacity
+/// gated and would depend on a sticky re-analysis trigger to make progress.
+async fn run_auto_resolve_and_report_counter(
+    probe: ConflictProbe,
+) -> (bool, usize, tempfile::TempDir) {
+    let repo_dir = tempfile::TempDir::new().expect("create temp repo dir");
+    let manager = MockWorkspaceManager::new(vec!["conflict.txt".to_string()])
+        .with_repo_root(repo_dir.path().to_path_buf())
+        .with_probe(probe);
+
+    let config = crate::config::OrchestratorConfig {
+        resolve_command: Some("echo resolve".to_string()),
+        ..Default::default()
+    };
+    let auto_resolve_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let result = resolve_conflicts_with_retry(
+        &manager as &dyn WorkspaceManager,
+        &config,
+        &None,
+        &["rev1".to_string()],
+        &["change-a".to_string()],
+        "merge conflict",
+        1,
+        std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        auto_resolve_count.clone(),
+    )
+    .await;
+
+    let remaining = auto_resolve_count.load(std::sync::atomic::Ordering::SeqCst);
+    (result.is_ok(), remaining, repo_dir)
+}
+
+#[tokio::test]
+async fn auto_resolve_releases_capacity_on_success() {
+    let (succeeded, remaining, _repo_dir) =
+        run_auto_resolve_and_report_counter(ConflictProbe::ClearedAfterFirstCall).await;
+
+    assert!(succeeded, "cleared conflicts should complete resolution");
+    assert_eq!(
+        remaining, 0,
+        "successful automatic resolve must release its scheduler slot"
+    );
+}
+
+#[tokio::test]
+async fn auto_resolve_releases_capacity_on_failure() {
+    let (succeeded, remaining, _repo_dir) =
+        run_auto_resolve_and_report_counter(ConflictProbe::Static).await;
+
+    assert!(
+        !succeeded,
+        "unresolved conflicts should exhaust retries and fail"
+    );
+    assert_eq!(
+        remaining, 0,
+        "failed automatic resolve must release its scheduler slot"
+    );
+}
+
+#[tokio::test]
+async fn auto_resolve_releases_capacity_on_early_return() {
+    let (succeeded, remaining, _repo_dir) =
+        run_auto_resolve_and_report_counter(ConflictProbe::AlwaysFails).await;
+
+    assert!(
+        !succeeded,
+        "conflict detection failure should return early with an error"
+    );
+    assert_eq!(
+        remaining, 0,
+        "early-return automatic resolve must release its scheduler slot"
+    );
 }

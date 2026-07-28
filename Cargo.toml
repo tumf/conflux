@@ -96,5 +96,9 @@ nix = { version = "0.27", features = ["signal", "process"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_System_JobObjects", "Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
 
+[dev-dependencies]
+# `test-util` enables paused-clock tests for the scheduler loop's timer behavior.
+tokio = { version = "1", features = ["full", "process", "test-util"] }
+
 [build-dependencies]
 chrono = "0.4"
