@@ -270,8 +270,9 @@ fn analysis_result<'a>(
     changes: &'a [Change],
     _in_flight: &'a [String],
     _iteration: u32,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+> {
     let order = changes.iter().map(|change| change.id.clone()).collect();
     Box::pin(async move {
         crate::analyzer::AnalysisResult {
@@ -279,6 +280,7 @@ fn analysis_result<'a>(
             dependencies: HashMap::new(),
             groups: None,
         }
+        .into()
     })
 }
 

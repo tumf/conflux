@@ -146,6 +146,11 @@ impl ParallelExecutor {
             resolve_wait_retry_triggered: false,
             last_resolve_wait_base_dirty: None,
             diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+            // A fresh executor holds no prior analysis signature, so the first eligible
+            // evaluation always analyzes instead of trusting a previous process's state.
+            last_completed_analysis_input: None,
+            next_analysis_signature_probe_at: None,
+            analysis_input_probe: None,
         }
     }
 
@@ -176,6 +181,19 @@ impl ParallelExecutor {
 
     pub fn set_explicit_retry(&mut self, explicit_retry: bool) {
         self.explicit_retry = explicit_retry;
+    }
+
+    /// Override how dependency-analysis signature material is probed.
+    ///
+    /// Production leaves this unset and probes the real repository. Tests inject a double so
+    /// unchanged-input suppression can be exercised deterministically, including probe counts
+    /// and probe failures, without depending on VCS subprocesses.
+    #[cfg(test)]
+    pub(crate) fn set_analysis_input_probe(
+        &mut self,
+        probe: Arc<dyn crate::parallel::analysis_signature::AnalysisInputProbe>,
+    ) {
+        self.analysis_input_probe = Some(probe);
     }
 
     /// Point acceptance stall state at an isolated root (tests only).

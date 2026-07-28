@@ -32,6 +32,19 @@ pub(crate) enum DiagnosticDeduplicationKey {
         in_flight_ids: Vec<String>,
         error: String,
     },
+    /// Ordinary timer analysis skipped because the analysis input was already analyzed.
+    UnchangedAnalysisInput {
+        signature: String,
+        queued_len: usize,
+        in_flight_len: usize,
+        degraded: bool,
+    },
+    /// Analysis-input signature construction failed, so suppression was not applied.
+    AnalysisSignatureUnavailable {
+        queued_len: usize,
+        in_flight_len: usize,
+        error: String,
+    },
     DependencyBlocker {
         change_id: String,
         fingerprint: Vec<(String, String)>,

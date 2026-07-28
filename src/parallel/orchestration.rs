@@ -16,6 +16,26 @@
 //! across iterations would let the plain 500 ms timer branch replay an already-handled
 //! edge and restart expensive dependency analysis on every scheduler tick.
 //!
+//! # Unchanged ordinary-timer input
+//!
+//! Consuming edge triggers fixes replay of an *explicit* edge, but it does not stop the
+//! plain `Initial` timer branch from re-analyzing forever. The queue-coalescing debounce
+//! only measures how long ago the queue changed, so once ten seconds have elapsed every
+//! later 500 ms wake passes it — it is neither a cooldown nor an unchanged-input check.
+//!
+//! The second layer therefore compares the *input*: immediately before invoking the
+//! analyzer, an ordinary timer evaluation builds a deterministic
+//! [`crate::parallel::analysis_signature::AnalysisInputSignature`] over the queued analysis
+//! fields, the queued and in-flight proposal content the prompt references, in-flight
+//! membership, dispatch capacity, and the effective dependency-base revision. If that input
+//! already completed with a usable result in this process, the analyzer is skipped and a
+//! deduplicated `unchanged_analysis_input` reason is emitted. Cheap queue classification,
+//! reconciliation, and blocker checks still run first, so nothing repository-visible is
+//! cached — only duplicate expensive analysis is removed.
+//!
+//! Both layers are required: they solve different replay mechanisms, and neither subsumes
+//! the other. Coverage lives in `src/parallel/tests/unchanged_analysis_input.rs`.
+//!
 //! # Capacity-recovery audit
 //!
 //! Because the sticky reason is gone, every path that releases scheduler-accounted
@@ -37,6 +57,9 @@
 //!   spawns through the same merge-result channel, so its completion is a wake edge too.
 //! - Zero-to-positive slot transitions observed by `calculate_available_slots` /
 //!   `last_available_slots` are promoted to `SlotRecovery`.
+//! - Independently of any reason, changed capacity or in-flight membership changes the
+//!   analysis-input signature, so the bounded timer evaluation re-analyzes even when a
+//!   slot-recovery notification is lost.
 //!
 //! Coverage lives in `src/parallel/tests/reanalysis_trigger_lifetime.rs` (edge lifetime,
 //! merge-outcome capacity release), `src/parallel/tests/conflict.rs` (auto-resolve guard
@@ -122,7 +145,9 @@ impl ParallelExecutor {
     ///
     /// # Arguments
     /// * `changes` - Initial list of changes to execute
-    /// * `analyzer` - Async function that returns AnalysisResult (order + dependencies)
+    /// * `analyzer` - Async function that returns an `AnalysisOutcome` (order + dependencies
+    ///   plus runtime-only provenance describing whether the result came from a healthy
+    ///   analyzer run, intentional metadata-only analysis, or a recoverable-failure fallback)
     ///   - First parameter: queued changes to analyze
     ///   - Second parameter: in-flight change IDs (currently executing)
     ///   - Third parameter: iteration number
@@ -137,7 +162,7 @@ impl ParallelExecutor {
                 &'a [String],
                 u32,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
             > + Send
             + Sync,
     {
@@ -386,7 +411,7 @@ impl ParallelExecutor {
                 &'a [String],
                 u32,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
             > + Send
             + Sync,
     {

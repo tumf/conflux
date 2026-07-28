@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::{AnalysisOutcome, AnalysisResult};
 use crate::dependency_targets::DependencyTargetClass;
 use crate::error::{OrchestratorError, Result};
 use crate::events::{ExecutionEvent, LogEntry};
@@ -15,6 +15,10 @@ use crate::orchestration::state::WaitState;
 use crate::orchestration::{
     execute_rejection_flow, handle_blocked_from_rejecting, handle_resume_apply_from_rejecting,
     run_rejection_review, RejectionReviewVerdict,
+};
+use crate::parallel::analysis_signature::{
+    build_analysis_input_signature, proposal_digest_from_path, AnalysisInputMaterials,
+    AnalysisInputSignature, CompletedAnalysisInput, SUPPRESSED_PROBE_INTERVAL,
 };
 use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use tokio::sync::{mpsc, Semaphore};
@@ -191,8 +195,69 @@ struct ReanalysisExecutionDecision {
 }
 
 enum DependencyAnalysisAttempt {
-    Completed(AnalysisResult),
+    Completed(AnalysisOutcome),
     EmptyOrder(ReanalysisFlowDecision),
+}
+
+/// One pass through the pre-analysis pipeline.
+///
+/// `captured_signature` is the analysis-input snapshot taken immediately before the analyzer
+/// was invoked. Recording that pre-analysis value (rather than recomputing it afterwards) is
+/// what keeps a queue or repository change that happened *during* analysis visible to the
+/// next probe instead of being hidden by the newer state.
+struct DependencyAnalysisPass {
+    attempt: DependencyAnalysisAttempt,
+    captured_signature: Option<AnalysisInputSignature>,
+}
+
+impl DependencyAnalysisPass {
+    fn terminal(decision: ReanalysisFlowDecision) -> Self {
+        Self {
+            attempt: DependencyAnalysisAttempt::EmptyOrder(decision),
+            captured_signature: None,
+        }
+    }
+}
+
+/// Whether `reason` is an explicit scheduler edge that must analyze once per event.
+///
+/// These are exactly the reasons that already bypass the queue-coalescing debounce, so they
+/// keep a single authoritative meaning: a real state-transition event gets one immediate
+/// evaluation, matching signature or not.
+///
+/// `Completion` is deliberately absent. It is not consumed as a one-shot edge and does not
+/// bypass debounce today, so treating it as an unconditional bypass would let a retained
+/// reason replay analysis on every wake. It needs no bypass either: a task completion always
+/// changes in-flight membership or capacity, which changes the signature on its own.
+fn bypasses_unchanged_input_gate(reason: ReanalysisReason) -> bool {
+    matches!(
+        reason,
+        ReanalysisReason::QueueNotification
+            | ReanalysisReason::SlotRecovery
+            | ReanalysisReason::ResolveCompletion
+            | ReanalysisReason::RepairCandidate
+    )
+}
+
+/// Whether the ordinary-timer suppression gate allows this pass to invoke the analyzer.
+enum UnchangedInputGate {
+    /// Invoke the analyzer. `captured` is `None` when no signature could be built, in which
+    /// case the pass runs fail-open and records nothing.
+    Analyze {
+        captured: Option<AnalysisInputSignature>,
+    },
+    /// The current input equals an already completed input; skip the expensive analyzer.
+    Suppress,
+}
+
+/// Result of one dispatch-selection pass.
+///
+/// `selected` is needed by the suppression decision: a pass that selects nothing while
+/// capacity is positive and nothing is in flight must stay eligible for the next debounced
+/// timer evaluation.
+struct DispatchSelectionOutcome {
+    iteration: u32,
+    selected: usize,
 }
 
 struct DispatchSelectedCandidatesContext<'a> {
@@ -2691,6 +2756,263 @@ impl ParallelExecutor {
         ReanalysisExecutionDecision { effective_reason }
     }
 
+    /// Probe the repository-visible material a signature needs.
+    ///
+    /// Returns `Err` with an operator-visible reason on any read or revision failure so the
+    /// caller can fail open rather than suppress analysis on partial input.
+    async fn probe_analysis_signature_materials(
+        &self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+    ) -> std::result::Result<(String, std::collections::HashMap<String, String>), String> {
+        let referenced_ids: HashSet<&str> = queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .chain(in_flight.iter().map(String::as_str))
+            .collect();
+
+        match &self.analysis_input_probe {
+            Some(probe) => {
+                let base_revision = probe.base_revision().await?;
+                let mut digests = std::collections::HashMap::new();
+                for change_id in referenced_ids {
+                    digests.insert(change_id.to_string(), probe.proposal_digest(change_id)?);
+                }
+                Ok((base_revision, digests))
+            }
+            None => {
+                let base_revision = self
+                    .workspace_manager
+                    .get_current_revision()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut digests = std::collections::HashMap::new();
+                for change_id in referenced_ids {
+                    let path = self
+                        .repo_root
+                        .join("openspec/changes")
+                        .join(change_id)
+                        .join("proposal.md");
+                    digests.insert(change_id.to_string(), proposal_digest_from_path(&path)?);
+                }
+                Ok((base_revision, digests))
+            }
+        }
+    }
+
+    /// Build the current analysis-input signature, or `None` when it cannot be built.
+    ///
+    /// Signature construction is fail-open by design: a proposal read or revision resolution
+    /// error emits a deduplicated warning and yields no signature, which permits analysis and
+    /// records nothing. It must never terminate the scheduler loop.
+    async fn current_analysis_input_signature(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        available_slots: usize,
+    ) -> Option<AnalysisInputSignature> {
+        match self
+            .probe_analysis_signature_materials(queued, in_flight)
+            .await
+        {
+            Ok((base_revision, proposal_digests)) => {
+                let in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
+                Some(build_analysis_input_signature(&AnalysisInputMaterials {
+                    queued,
+                    in_flight_ids: &in_flight_ids,
+                    available_slots,
+                    max_parallelism,
+                    base_revision: &base_revision,
+                    proposal_digests: &proposal_digests,
+                }))
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    queued = queued.len(),
+                    in_flight = in_flight.len(),
+                    "Could not build dependency-analysis input signature; permitting analysis without suppression"
+                );
+                let key = DiagnosticDeduplicationKey::AnalysisSignatureUnavailable {
+                    queued_len: queued.len(),
+                    in_flight_len: in_flight.len(),
+                    error: error.clone(),
+                };
+                let log_entry = LogEntry::warn(format!(
+                    "Dependency-analysis input signature unavailable; analysis proceeds without unchanged-input suppression: error={}, queued={}, in_flight={}",
+                    error,
+                    queued.len(),
+                    in_flight.len()
+                ));
+                self.emit_log_diagnostic_once(
+                    key,
+                    log_entry,
+                    "Suppressing repeated analysis-signature-unavailable diagnostic",
+                )
+                .await;
+                None
+            }
+        }
+    }
+
+    /// Decide whether an ordinary timer evaluation may invoke the expensive analyzer.
+    ///
+    /// This runs *after* queue classification, reconciliation, and debounce eligibility, so
+    /// cheap repository-visible work is never cached — only duplicate analyzer invocation is
+    /// removed. Explicit scheduler edges never reach this gate.
+    async fn check_unchanged_analysis_input(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        effective_reason: ReanalysisReason,
+    ) -> UnchangedInputGate {
+        let available_slots = self.calculate_available_slots(max_parallelism, in_flight);
+
+        if bypasses_unchanged_input_gate(effective_reason) {
+            // An explicit edge gets one immediate evaluation per event even when its input
+            // signature matches. Its signature is still captured so that once the edge is
+            // consumed, later timer-only wakes fall back to unchanged-input suppression.
+            let captured = self
+                .current_analysis_input_signature(
+                    queued,
+                    in_flight,
+                    max_parallelism,
+                    available_slots,
+                )
+                .await;
+            self.next_analysis_signature_probe_at = None;
+            return UnchangedInputGate::Analyze { captured };
+        }
+
+        let now = tokio::time::Instant::now();
+
+        // While an input is suppressed, only re-probe at the bounded cadence. A 500 ms wake
+        // before the deadline must not read proposal files or spawn a VCS subprocess.
+        if let Some(probe_deadline) = self.next_analysis_signature_probe_at {
+            if now < probe_deadline {
+                debug!("Skipping dependency-analysis signature probe before its bounded deadline");
+                return UnchangedInputGate::Suppress;
+            }
+        }
+
+        let available_slots = self.calculate_available_slots(max_parallelism, in_flight);
+        let Some(signature) = self
+            .current_analysis_input_signature(queued, in_flight, max_parallelism, available_slots)
+            .await
+        else {
+            self.next_analysis_signature_probe_at = None;
+            return UnchangedInputGate::Analyze { captured: None };
+        };
+
+        let suppressing_record = self
+            .last_completed_analysis_input
+            .as_ref()
+            .filter(|record| record.suppresses(&signature, now));
+
+        match suppressing_record {
+            Some(record) => {
+                let degraded = record.is_degraded();
+                self.next_analysis_signature_probe_at = Some(now + SUPPRESSED_PROBE_INTERVAL);
+                self.emit_unchanged_analysis_input_diagnostic(
+                    queued,
+                    in_flight,
+                    max_parallelism,
+                    &signature,
+                    degraded,
+                )
+                .await;
+                UnchangedInputGate::Suppress
+            }
+            None => {
+                self.next_analysis_signature_probe_at = None;
+                UnchangedInputGate::Analyze {
+                    captured: Some(signature),
+                }
+            }
+        }
+    }
+
+    async fn emit_unchanged_analysis_input_diagnostic(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        signature: &AnalysisInputSignature,
+        degraded: bool,
+    ) {
+        info!(
+            queued = queued.len(),
+            in_flight = in_flight.len(),
+            degraded,
+            "Skipping dependency analysis because the analysis input is unchanged since the last completed analysis"
+        );
+        let key = DiagnosticDeduplicationKey::UnchangedAnalysisInput {
+            signature: signature.as_str().to_string(),
+            queued_len: queued.len(),
+            in_flight_len: in_flight.len(),
+            degraded,
+        };
+        let log_entry = LogEntry::info(format!(
+            "No analysis started: reason=unchanged_analysis_input, degraded={}, queued={}, in_flight={}, max_parallelism={}",
+            degraded,
+            queued.len(),
+            in_flight.len(),
+            max_parallelism
+        ));
+        self.emit_log_diagnostic_once(
+            key,
+            log_entry,
+            "Suppressing repeated unchanged-analysis-input diagnostic",
+        )
+        .await;
+        self.emit_no_analysis_diagnostic(
+            queued,
+            in_flight,
+            max_parallelism,
+            "unchanged_analysis_input",
+        )
+        .await;
+    }
+
+    /// Record a completed analysis input so unchanged ordinary timer wakes stay quiescent.
+    ///
+    /// `captured` is the pre-analysis snapshot. A recoverable-failure fallback is recorded as
+    /// degraded, so a broken analyzer command is not relaunched on every wake but still gets
+    /// one retry after the fixed degraded interval.
+    fn record_completed_analysis_input(
+        &mut self,
+        captured: Option<AnalysisInputSignature>,
+        provenance: crate::analyzer::AnalysisProvenance,
+    ) {
+        let Some(signature) = captured else {
+            return;
+        };
+
+        let now = tokio::time::Instant::now();
+        self.last_completed_analysis_input = Some(if provenance.is_degraded() {
+            CompletedAnalysisInput::degraded(signature, now)
+        } else {
+            CompletedAnalysisInput::healthy(signature)
+        });
+        self.next_analysis_signature_probe_at = None;
+        debug!(
+            degraded = provenance.is_degraded(),
+            "Recorded completed dependency-analysis input signature"
+        );
+    }
+
+    /// Drop any suppression for the current input.
+    ///
+    /// Used when an analysis pass produced no usable dispatch decision while the scheduler was
+    /// otherwise idle: an erroneous non-deterministic dependency result must not be able to
+    /// freeze an idle scheduler permanently.
+    fn forget_completed_analysis_input(&mut self) {
+        self.last_completed_analysis_input = None;
+        self.next_analysis_signature_probe_at = None;
+    }
+
     async fn should_run_analysis_now(
         &mut self,
         queued: &[crate::openspec::Change],
@@ -2699,13 +3021,7 @@ impl ParallelExecutor {
         iteration: u32,
         effective_reason: ReanalysisReason,
     ) -> ReanalysisFlowDecision {
-        let bypass_debounce = matches!(
-            effective_reason,
-            ReanalysisReason::QueueNotification
-                | ReanalysisReason::SlotRecovery
-                | ReanalysisReason::ResolveCompletion
-                | ReanalysisReason::RepairCandidate
-        );
+        let bypass_debounce = bypasses_unchanged_input_gate(effective_reason);
 
         let should_analyze = if iteration == 1 {
             info!("First iteration, skipping debounce check");
@@ -2772,7 +3088,7 @@ impl ParallelExecutor {
                 &'a [String],
                 u32,
             )
-                -> std::pin::Pin<Box<dyn std::future::Future<Output = AnalysisResult> + Send + 'a>>
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = AnalysisOutcome> + Send + 'a>>
             + Send
             + Sync,
     {
@@ -2794,9 +3110,11 @@ impl ParallelExecutor {
         .await;
 
         let in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
-        let analysis_result = analyzer(queued, &in_flight_ids, iteration).await;
+        let analysis_outcome = analyzer(queued, &in_flight_ids, iteration).await;
 
-        if analysis_result.order.is_empty() {
+        if analysis_outcome.result.order.is_empty() {
+            // A terminal path that produced no usable analysis decision must not establish a
+            // completed input, or an unusable result would suppress every later attempt.
             warn!("No order returned from analysis");
             return DependencyAnalysisAttempt::EmptyOrder(ReanalysisFlowDecision::done(
                 in_flight.is_empty(),
@@ -2804,7 +3122,7 @@ impl ParallelExecutor {
             ));
         }
 
-        DependencyAnalysisAttempt::Completed(analysis_result)
+        DependencyAnalysisAttempt::Completed(analysis_outcome)
     }
 
     async fn handle_post_analysis_capacity(
@@ -2859,7 +3177,7 @@ impl ParallelExecutor {
     async fn dispatch_selected_candidates(
         &mut self,
         ctx: DispatchSelectedCandidatesContext<'_>,
-    ) -> Result<u32> {
+    ) -> Result<DispatchSelectionOutcome> {
         let DispatchSelectedCandidatesContext {
             queued,
             in_flight,
@@ -2875,7 +3193,10 @@ impl ParallelExecutor {
             .await;
 
         if selected_changes.is_empty() {
-            return Ok(iteration);
+            return Ok(DispatchSelectionOutcome {
+                iteration,
+                selected: 0,
+            });
         }
 
         let base_revision = self
@@ -2929,7 +3250,10 @@ impl ParallelExecutor {
         let dispatched_set: HashSet<_> = selected_changes.iter().collect();
         queued.retain(|c| !dispatched_set.contains(&c.id));
 
-        Ok(iteration + 1)
+        Ok(DispatchSelectionOutcome {
+            iteration: iteration + 1,
+            selected: selected_changes.len(),
+        })
     }
 
     async fn before_dependency_analysis<F>(
@@ -2940,14 +3264,14 @@ impl ParallelExecutor {
         iteration: u32,
         reanalysis_reason: ReanalysisReason,
         analyzer: &F,
-    ) -> Result<DependencyAnalysisAttempt>
+    ) -> Result<DependencyAnalysisPass>
     where
         for<'a> F: Fn(
                 &'a [crate::openspec::Change],
                 &'a [String],
                 u32,
             )
-                -> std::pin::Pin<Box<dyn std::future::Future<Output = AnalysisResult> + Send + 'a>>
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = AnalysisOutcome> + Send + 'a>>
             + Send
             + Sync,
     {
@@ -2956,7 +3280,7 @@ impl ParallelExecutor {
             .await
             .into_result()
         {
-            return Ok(DependencyAnalysisAttempt::EmptyOrder(
+            return Ok(DependencyAnalysisPass::terminal(
                 ReanalysisFlowDecision::done(should_break, iteration),
             ));
         }
@@ -2978,7 +3302,7 @@ impl ParallelExecutor {
             .await
             .into_result()
         {
-            return Ok(DependencyAnalysisAttempt::EmptyOrder(
+            return Ok(DependencyAnalysisPass::terminal(
                 ReanalysisFlowDecision::done(should_break, iteration),
             ));
         }
@@ -2988,12 +3312,32 @@ impl ParallelExecutor {
             .await
             .into_result()
         {
-            return Ok(DependencyAnalysisAttempt::EmptyOrder(
+            return Ok(DependencyAnalysisPass::terminal(
                 ReanalysisFlowDecision::done(should_break, iteration),
             ));
         }
 
-        Ok(self
+        // Queue classification, reconciliation, dependency blocker checks, and debounce
+        // eligibility have all run against fresh repository state by now. Only the expensive
+        // analyzer invocation is subject to unchanged-input suppression.
+        let captured_signature = match self
+            .check_unchanged_analysis_input(
+                queued,
+                in_flight,
+                max_parallelism,
+                analysis_decision.effective_reason,
+            )
+            .await
+        {
+            UnchangedInputGate::Analyze { captured } => captured,
+            UnchangedInputGate::Suppress => {
+                return Ok(DependencyAnalysisPass::terminal(
+                    ReanalysisFlowDecision::done(false, iteration),
+                ));
+            }
+        };
+
+        let attempt = self
             .run_dependency_analysis_attempt(
                 queued,
                 in_flight,
@@ -3001,7 +3345,12 @@ impl ParallelExecutor {
                 analysis_decision.effective_reason,
                 analyzer,
             )
-            .await)
+            .await;
+
+        Ok(DependencyAnalysisPass {
+            attempt,
+            captured_signature,
+        })
     }
 
     pub(super) async fn perform_reanalysis_and_dispatch<F>(
@@ -3014,7 +3363,7 @@ impl ParallelExecutor {
                 &'a [String],
                 u32,
             ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisResult> + Send + 'a>,
+                Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
             > + Send
             + Sync,
     {
@@ -3037,7 +3386,7 @@ impl ParallelExecutor {
             return Ok((true, iteration));
         }
 
-        let analysis_result = match self
+        let pass = self
             .before_dependency_analysis(
                 queued,
                 in_flight,
@@ -3046,9 +3395,10 @@ impl ParallelExecutor {
                 reanalysis_reason,
                 analyzer,
             )
-            .await?
-        {
-            DependencyAnalysisAttempt::Completed(result) => result,
+            .await?;
+        let captured_signature = pass.captured_signature;
+        let analysis_outcome = match pass.attempt {
+            DependencyAnalysisAttempt::Completed(outcome) => outcome,
             DependencyAnalysisAttempt::EmptyOrder(decision) => {
                 if let Some(result) = decision.into_result() {
                     return Ok(result);
@@ -3056,7 +3406,10 @@ impl ParallelExecutor {
                 unreachable!("empty analysis order always produces a terminal flow decision")
             }
         };
+        let provenance = analysis_outcome.provenance;
+        let analysis_result = analysis_outcome.result;
 
+        let was_idle_before_dispatch = in_flight.is_empty();
         let available_slots = match self
             .handle_post_analysis_capacity(
                 queued,
@@ -3068,11 +3421,17 @@ impl ParallelExecutor {
             .await
         {
             Ok(Some(slots)) => slots,
-            Ok(None) => return Ok((false, iteration)),
+            Ok(None) => {
+                // Zero capacity with a usable analysis result is the state that produced the
+                // live no-progress loop: the input was genuinely analyzed, so record it and
+                // let capacity recovery change the signature later.
+                self.record_completed_analysis_input(captured_signature, provenance);
+                return Ok((false, iteration));
+            }
             Err(error) => return Err(error),
         };
 
-        let new_iteration = self
+        let dispatch = self
             .dispatch_selected_candidates(DispatchSelectedCandidatesContext {
                 queued,
                 in_flight,
@@ -3085,6 +3444,20 @@ impl ParallelExecutor {
             })
             .await?;
 
-        Ok((false, new_iteration))
+        if dispatch.selected == 0 && was_idle_before_dispatch {
+            // Positive capacity, nothing in flight, and nothing selected: an erroneous
+            // non-deterministic dependency result must not be able to freeze an otherwise idle
+            // scheduler, so leave this input eligible for the next debounced evaluation.
+            info!(
+                queued = queued.len(),
+                available_slots,
+                "Analysis selected no dispatch while idle with positive capacity; leaving the input eligible for re-analysis"
+            );
+            self.forget_completed_analysis_input();
+        } else {
+            self.record_completed_analysis_input(captured_signature, provenance);
+        }
+
+        Ok((false, dispatch.iteration))
     }
 }

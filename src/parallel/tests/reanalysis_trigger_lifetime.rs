@@ -10,7 +10,7 @@
 //! transition step that `execute_with_order_based_reanalysis` calls, so the trigger
 //! lifetime under test is the production code path rather than a test-only copy.
 
-use crate::analyzer::AnalysisResult;
+use crate::analyzer::{AnalysisOutcome, AnalysisResult};
 use crate::config::OrchestratorConfig;
 use crate::events::ExecutionEvent;
 use crate::openspec::{Change, ProposalMetadata};
@@ -82,7 +82,7 @@ fn init_minimal_git_repo(repo_root: &std::path::Path) {
 }
 
 /// The analyzer callback's return type, as required by the scheduler loop.
-type AnalysisFuture<'a> = Pin<Box<dyn Future<Output = AnalysisResult> + Send + 'a>>;
+type AnalysisFuture<'a> = Pin<Box<dyn Future<Output = AnalysisOutcome> + Send + 'a>>;
 
 /// Analyzer test double that counts how many dependency analyses were actually started.
 fn counting_analyzer(
@@ -97,6 +97,7 @@ fn counting_analyzer(
                 dependencies: HashMap::new(),
                 groups: None,
             }
+            .into()
         })
     }
 }
