@@ -20,6 +20,25 @@ use crate::vcs::WorkspaceManager;
 
 use super::{DependencyBlockerFingerprint, ParallelExecutor};
 
+/// The dependency base a scheduler pass evaluates merge evidence against, together with the
+/// revision that ref currently resolves to.
+///
+/// Dependency classification and analysis-input signatures must agree on both halves. Naming
+/// only the ref would miss integration into that ref; reading only the checkout commit would
+/// miss the ref advancing while `HEAD` stays put.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EffectiveDependencyBaseEvidence {
+    pub(super) base_ref: String,
+    pub(super) revision: String,
+}
+
+impl EffectiveDependencyBaseEvidence {
+    /// Canonical encoding for the analysis-input signature.
+    pub(super) fn signature_material(&self) -> String {
+        format!("{}@{}", self.base_ref, self.revision)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DependencyContext {
     repo_root: PathBuf,
@@ -188,25 +207,24 @@ impl DependencyContext {
                 .await
                 .map_err(OrchestratorError::from_vcs_error)?;
 
-            let effective_base =
-                match crate::vcs::git::commands::get_current_branch(&self.repo_root).await {
-                    Ok(Some(current_branch)) if current_branch != original_branch => {
-                        debug!(
-                            original_branch = %original_branch,
-                            effective_dependency_base = %current_branch,
-                            "Using current integration branch as effective dependency base"
-                        );
-                        current_branch
-                    }
-                    Ok(Some(_)) | Ok(None) => original_branch,
-                    Err(err) => {
-                        warn!(
-                            error = %err,
-                            "Failed to determine current branch for effective dependency base"
-                        );
-                        return Err(OrchestratorError::from_vcs_error(err));
-                    }
-                };
+            let effective_base = match workspace_manager.current_branch().await {
+                Ok(Some(current_branch)) if current_branch != original_branch => {
+                    debug!(
+                        original_branch = %original_branch,
+                        effective_dependency_base = %current_branch,
+                        "Using current integration branch as effective dependency base"
+                    );
+                    current_branch
+                }
+                Ok(Some(_)) | Ok(None) => original_branch,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        "Failed to determine current branch for effective dependency base"
+                    );
+                    return Err(OrchestratorError::from_vcs_error(err));
+                }
+            };
 
             self.effective_dependency_base = Some(effective_base);
         }
@@ -215,6 +233,29 @@ impl DependencyContext {
             .effective_dependency_base
             .as_deref()
             .expect("effective dependency base initialized above"))
+    }
+
+    /// Resolve the effective dependency base *and* the revision its ref currently points to.
+    ///
+    /// This is the authoritative repository-visible dependency-base evidence. Analysis-input
+    /// signatures consume it so that suppression is invalidated by exactly the ref whose merge
+    /// evidence [`Self::is_dependency_resolved_with_base`] reads. Substituting the checkout
+    /// `HEAD` commit would leave the signature equal when that ref advances on its own, and the
+    /// only timer evaluation able to observe a newly integrated dependency would be suppressed.
+    pub(super) async fn effective_dependency_base_evidence(
+        &mut self,
+        workspace_manager: &dyn WorkspaceManager,
+    ) -> Result<EffectiveDependencyBaseEvidence> {
+        let base_ref = self
+            .effective_dependency_base(workspace_manager)
+            .await?
+            .to_string();
+        let revision = workspace_manager
+            .revision_for_ref(&base_ref)
+            .await
+            .map_err(OrchestratorError::from_vcs_error)?;
+
+        Ok(EffectiveDependencyBaseEvidence { base_ref, revision })
     }
 
     pub(super) async fn is_dependency_resolved_with_base(

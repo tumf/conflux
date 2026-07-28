@@ -45,6 +45,15 @@ pub(crate) enum DiagnosticDeduplicationKey {
         in_flight_len: usize,
         error: String,
     },
+    /// Ordinary timer analysis is waiting for a bounded fail-open retry deadline.
+    ///
+    /// Nothing was recorded as analyzed; the wake is only rate-limited, so the reason is
+    /// reported separately from unchanged-input suppression.
+    BoundedAnalysisRetryPending {
+        cause: &'static str,
+        queued_len: usize,
+        in_flight_len: usize,
+    },
     DependencyBlocker {
         change_id: String,
         fingerprint: Vec<(String, String)>,

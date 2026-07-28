@@ -36,6 +36,24 @@
 //! Both layers are required: they solve different replay mechanisms, and neither subsumes
 //! the other. Coverage lives in `src/parallel/tests/unchanged_analysis_input.rs`.
 //!
+//! # Bounded fail-open retry
+//!
+//! Neither layer can record anything when a pass produces no completed input: a failed
+//! proposal read or effective-base revision lookup yields no signature, and an analyzer that
+//! returns no usable order proves nothing was analyzed. Both stay fail-open — analysis is
+//! permitted and the loop keeps running — but a persistent failure would then probe and
+//! relaunch the analyzer on every 500 ms wake, which is the replay loop suppression exists to
+//! remove.
+//!
+//! The third layer is therefore a
+//! [`crate::parallel::analysis_signature::BoundedAnalysisRetry`] deadline, held separately
+//! from the completed-input record so unavailable evidence is never mistaken for completed
+//! analysis. It rate-limits the ordinary timer retry to the existing ten-second cadence;
+//! explicit edges still bypass it once per event, and a later successful probe with a usable
+//! result clears it. An unusable result also never ends the loop while queued work remains:
+//! termination stays owned by the canonical drain checks. Loop-level coverage lives in
+//! `src/parallel/tests/analysis_liveness_loop.rs`.
+//!
 //! # Capacity-recovery audit
 //!
 //! Because the sticky reason is gone, every path that releases scheduler-accounted

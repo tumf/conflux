@@ -18,7 +18,7 @@ use crate::orchestration::{
 };
 use crate::parallel::analysis_signature::{
     build_analysis_input_signature, proposal_digest_from_path, AnalysisInputMaterials,
-    AnalysisInputSignature, CompletedAnalysisInput, SUPPRESSED_PROBE_INTERVAL,
+    AnalysisInputSignature, BoundedAnalysisRetry, BoundedRetryCause, CompletedAnalysisInput,
 };
 use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use tokio::sync::{mpsc, Semaphore};
@@ -142,7 +142,7 @@ enum QueueReconciliationDiagnosticLevel {
 }
 
 use super::cleanup::WorkspaceCleanupGuard;
-use super::dependency::DependencyContext;
+use super::dependency::{DependencyContext, EffectiveDependencyBaseEvidence};
 use super::dispatch::archived_dirty_repair_candidate_from_workspace;
 use super::dynamic_queue::ReanalysisReason;
 use super::events::send_event;
@@ -559,6 +559,21 @@ impl ParallelExecutor {
             .effective_dependency_base(self.workspace_manager.as_ref())
             .await
             .map(str::to_string)
+    }
+
+    /// Repository-visible evidence describing the effective dependency base.
+    ///
+    /// Signature probing and dependency merge checks share this one resolution path, so the
+    /// analysis-input signature can never be invalidated by a different ref than the one
+    /// dispatch eligibility is decided from.
+    pub(super) async fn effective_dependency_base_evidence(
+        &self,
+    ) -> Result<EffectiveDependencyBaseEvidence> {
+        let mut dependency_context =
+            DependencyContext::from_executor(self, std::iter::empty::<&str>(), &HashSet::new());
+        dependency_context
+            .effective_dependency_base_evidence(self.workspace_manager.as_ref())
+            .await
     }
 
     /// Check if a dependency is resolved (merged to the effective dependency base).
@@ -2760,7 +2775,7 @@ impl ParallelExecutor {
     ///
     /// Returns `Err` with an operator-visible reason on any read or revision failure so the
     /// caller can fail open rather than suppress analysis on partial input.
-    async fn probe_analysis_signature_materials(
+    pub(super) async fn probe_analysis_signature_materials(
         &self,
         queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
@@ -2781,11 +2796,14 @@ impl ParallelExecutor {
                 Ok((base_revision, digests))
             }
             None => {
+                // The named effective dependency base, not the checkout commit: dependency
+                // merge evidence is read from that ref, and it can advance while `HEAD` does
+                // not.
                 let base_revision = self
-                    .workspace_manager
-                    .get_current_revision()
+                    .effective_dependency_base_evidence()
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.to_string())?
+                    .signature_material();
                 let mut digests = std::collections::HashMap::new();
                 for change_id in referenced_ids {
                     let path = self
@@ -2872,8 +2890,9 @@ impl ParallelExecutor {
 
         if bypasses_unchanged_input_gate(effective_reason) {
             // An explicit edge gets one immediate evaluation per event even when its input
-            // signature matches. Its signature is still captured so that once the edge is
-            // consumed, later timer-only wakes fall back to unchanged-input suppression.
+            // signature matches or a bounded retry deadline is still pending. Its signature is
+            // still captured so that once the edge is consumed, later timer-only wakes fall
+            // back to unchanged-input suppression or to bounded fail-open retry.
             let captured = self
                 .current_analysis_input_signature(
                     queued,
@@ -2882,11 +2901,29 @@ impl ParallelExecutor {
                     available_slots,
                 )
                 .await;
-            self.next_analysis_signature_probe_at = None;
+            self.note_signature_probe_outcome(captured.is_some());
             return UnchangedInputGate::Analyze { captured };
         }
 
         let now = tokio::time::Instant::now();
+
+        // A previous attempt established no completed input. Fail-open must not mean fail-hot:
+        // before the bounded deadline, an ordinary wake performs no probe and no analysis.
+        if let Some(throttle) = self.analysis_retry_throttle {
+            if throttle.blocks(now) {
+                self.emit_bounded_retry_diagnostic(
+                    queued,
+                    in_flight,
+                    max_parallelism,
+                    throttle.cause(),
+                )
+                .await;
+                return UnchangedInputGate::Suppress;
+            }
+            // The deadline passed: this evaluation retries both signature construction and
+            // analysis.
+            self.analysis_retry_throttle = None;
+        }
 
         // While an input is suppressed, only re-probe at the bounded cadence. A 500 ms wake
         // before the deadline must not read proposal files or spawn a VCS subprocess.
@@ -2902,7 +2939,7 @@ impl ParallelExecutor {
             .current_analysis_input_signature(queued, in_flight, max_parallelism, available_slots)
             .await
         else {
-            self.next_analysis_signature_probe_at = None;
+            self.note_signature_probe_outcome(false);
             return UnchangedInputGate::Analyze { captured: None };
         };
 
@@ -2914,7 +2951,7 @@ impl ParallelExecutor {
         match suppressing_record {
             Some(record) => {
                 let degraded = record.is_degraded();
-                self.next_analysis_signature_probe_at = Some(now + SUPPRESSED_PROBE_INTERVAL);
+                self.next_analysis_signature_probe_at = Some(record.next_probe_deadline(now));
                 self.emit_unchanged_analysis_input_diagnostic(
                     queued,
                     in_flight,
@@ -2926,12 +2963,75 @@ impl ParallelExecutor {
                 UnchangedInputGate::Suppress
             }
             None => {
-                self.next_analysis_signature_probe_at = None;
+                self.note_signature_probe_outcome(true);
                 UnchangedInputGate::Analyze {
                     captured: Some(signature),
                 }
             }
         }
+    }
+
+    /// Apply the retry policy implied by one signature-probe attempt.
+    ///
+    /// A usable signature clears any pending fail-open throttle, because the next pass can rely
+    /// on ordinary completed-input suppression instead. An unavailable signature arms the
+    /// bounded deadline so persistent proposal-read or revision-resolution failure retries at
+    /// the ten-second cadence rather than on every 500 ms wake.
+    fn note_signature_probe_outcome(&mut self, signature_available: bool) {
+        self.next_analysis_signature_probe_at = None;
+        self.analysis_retry_throttle = if signature_available {
+            None
+        } else {
+            Some(BoundedAnalysisRetry::after(
+                BoundedRetryCause::SignatureUnavailable,
+                tokio::time::Instant::now(),
+            ))
+        };
+    }
+
+    /// Arm the bounded retry deadline after an attempt that produced no usable result.
+    fn arm_bounded_analysis_retry(&mut self, cause: BoundedRetryCause) {
+        self.next_analysis_signature_probe_at = None;
+        self.analysis_retry_throttle = Some(BoundedAnalysisRetry::after(
+            cause,
+            tokio::time::Instant::now(),
+        ));
+    }
+
+    /// Operator-visible reason for a wake that is waiting on a bounded fail-open retry.
+    async fn emit_bounded_retry_diagnostic(
+        &mut self,
+        queued: &[crate::openspec::Change],
+        in_flight: &HashSet<String>,
+        max_parallelism: usize,
+        cause: BoundedRetryCause,
+    ) {
+        debug!(
+            queued = queued.len(),
+            in_flight = in_flight.len(),
+            cause = cause.as_str(),
+            "Waiting for the bounded dependency-analysis retry deadline"
+        );
+        let key = DiagnosticDeduplicationKey::BoundedAnalysisRetryPending {
+            cause: cause.as_str(),
+            queued_len: queued.len(),
+            in_flight_len: in_flight.len(),
+        };
+        let log_entry = LogEntry::info(format!(
+            "No analysis started: reason={}, queued={}, in_flight={}, max_parallelism={}",
+            cause.as_str(),
+            queued.len(),
+            in_flight.len(),
+            max_parallelism
+        ));
+        self.emit_log_diagnostic_once(
+            key,
+            log_entry,
+            "Suppressing repeated bounded-analysis-retry diagnostic",
+        )
+        .await;
+        self.emit_no_analysis_diagnostic(queued, in_flight, max_parallelism, cause.as_str())
+            .await;
     }
 
     async fn emit_unchanged_analysis_input_diagnostic(
@@ -2991,12 +3091,18 @@ impl ParallelExecutor {
         };
 
         let now = tokio::time::Instant::now();
-        self.last_completed_analysis_input = Some(if provenance.is_degraded() {
+        let record = if provenance.is_degraded() {
             CompletedAnalysisInput::degraded(signature, now)
         } else {
             CompletedAnalysisInput::healthy(signature)
-        });
-        self.next_analysis_signature_probe_at = None;
+        };
+        // Arm the probe deadline at record time so the immediate 500 ms wake after a completed
+        // analysis performs no proposal read and spawns no VCS subprocess just to confirm the
+        // input it was already derived from.
+        self.next_analysis_signature_probe_at = Some(record.next_probe_deadline(now));
+        self.last_completed_analysis_input = Some(record);
+        // A usable result supersedes any bounded fail-open retry.
+        self.analysis_retry_throttle = None;
         debug!(
             degraded = provenance.is_degraded(),
             "Recorded completed dependency-analysis input signature"
@@ -3011,6 +3117,7 @@ impl ParallelExecutor {
     fn forget_completed_analysis_input(&mut self) {
         self.last_completed_analysis_input = None;
         self.next_analysis_signature_probe_at = None;
+        self.analysis_retry_throttle = None;
     }
 
     async fn should_run_analysis_now(
@@ -3109,15 +3216,26 @@ impl ParallelExecutor {
         )
         .await;
 
-        let in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
+        // The analyzer prompt must not depend on `HashSet` iteration order: the signature treats
+        // in-flight membership as a set, so the consumer has to see one deterministic ordering
+        // of that same set.
+        let mut in_flight_ids: Vec<String> = in_flight.iter().cloned().collect();
+        in_flight_ids.sort_unstable();
         let analysis_outcome = analyzer(queued, &in_flight_ids, iteration).await;
 
         if analysis_outcome.result.order.is_empty() {
-            // A terminal path that produced no usable analysis decision must not establish a
-            // completed input, or an unusable result would suppress every later attempt.
+            // An unusable analysis decision must not establish a completed input, or it would
+            // suppress every later attempt. It is also not evidence that queued work finished:
+            // ending the scheduler here would strand reducer-visible queued intent. Keep the
+            // loop alive, let the canonical drain checks own termination, and rate-limit the
+            // retry so a persistently unusable analyzer is not relaunched every 500 ms.
             warn!("No order returned from analysis");
+            let queued_work_remains = !queued.is_empty();
+            if queued_work_remains {
+                self.arm_bounded_analysis_retry(BoundedRetryCause::UnusableAnalysisResult);
+            }
             return DependencyAnalysisAttempt::EmptyOrder(ReanalysisFlowDecision::done(
-                in_flight.is_empty(),
+                !queued_work_remains && in_flight.is_empty(),
                 iteration,
             ));
         }

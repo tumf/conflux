@@ -74,7 +74,12 @@ pub(crate) struct AnalysisInputMaterials<'a> {
     /// Dispatch capacity inputs that gate apply selection.
     pub(crate) available_slots: usize,
     pub(crate) max_parallelism: usize,
-    /// Repository-visible effective dependency-base revision.
+    /// Repository-visible effective dependency-base evidence, encoded as the selected base ref
+    /// and the revision that ref resolves to.
+    ///
+    /// This is the same base dependency classification reads merge evidence from. The checkout
+    /// `HEAD` commit is deliberately not used: the named ref can advance on its own, and an
+    /// equal signature would suppress the only evaluation able to observe that.
     pub(crate) base_revision: &'a str,
     /// Content digest of every queued and in-flight `proposal.md` referenced by the prompt.
     pub(crate) proposal_digests: &'a HashMap<String, String>,
@@ -205,7 +210,8 @@ pub(crate) fn proposal_digest_from_path(path: &Path) -> std::result::Result<Stri
 /// while an input is suppressed.
 #[async_trait::async_trait]
 pub(crate) trait AnalysisInputProbe: Send + Sync {
-    /// Effective dependency-base revision used by dependency classification.
+    /// Effective dependency-base evidence, named and resolved exactly as dependency
+    /// classification evaluates merge evidence.
     async fn base_revision(&self) -> std::result::Result<String, String>;
 
     /// Stable digest of `openspec/changes/<change_id>/proposal.md`.
@@ -249,12 +255,80 @@ impl CompletedAnalysisInput {
         self.degraded_until.is_some()
     }
 
+    /// Earliest instant at which this record's input may be probed again.
+    ///
+    /// The repository probe cadence bounds VCS and filesystem work, but it must not push a
+    /// degraded record's promised retry past its expiry: a probe taken at 4m59s would otherwise
+    /// delay the five-minute retry to 5m09s. The deadline is therefore the earlier of the two
+    /// semantic expiries.
+    pub(crate) fn next_probe_deadline(&self, now: Instant) -> Instant {
+        let bounded_probe = now + SUPPRESSED_PROBE_INTERVAL;
+        match self.degraded_until {
+            Some(degraded_until) if degraded_until < bounded_probe => degraded_until,
+            _ => bounded_probe,
+        }
+    }
+
     /// Whether this record still suppresses an ordinary timer analysis of `signature`.
     pub(crate) fn suppresses(&self, signature: &AnalysisInputSignature, now: Instant) -> bool {
         self.signature == *signature
             && self
                 .degraded_until
                 .is_none_or(|degraded_until| now < degraded_until)
+    }
+}
+
+/// Why an ordinary timer evaluation is waiting before it retries dependency analysis.
+///
+/// Both causes describe an attempt that produced *no* completed input, which is exactly why
+/// they cannot be represented by [`CompletedAnalysisInput`]: unavailable evidence and an
+/// unusable analyzer result are not analysis completions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedRetryCause {
+    /// A proposal read or effective-base revision resolution failed.
+    SignatureUnavailable,
+    /// The analyzer returned no usable order while queued work remained.
+    UnusableAnalysisResult,
+}
+
+impl BoundedRetryCause {
+    /// Stable operator-visible reason slug.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SignatureUnavailable => "analysis_signature_unavailable_retry_pending",
+            Self::UnusableAnalysisResult => "unusable_analysis_result_retry_pending",
+        }
+    }
+}
+
+/// Runtime-only deadline that rate-limits an ordinary timer retry.
+///
+/// Signature construction and unusable results are both fail-open: nothing is recorded as
+/// analyzed and the scheduler keeps running. Without a deadline, though, fail-open becomes
+/// fail-hot — every 500 ms wake would re-read proposals, spawn a VCS subprocess, and relaunch
+/// the analyzer. This bounds that retry to the existing ten-second queue debounce cadence while
+/// leaving explicit scheduler edges free to bypass it once per event.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundedAnalysisRetry {
+    cause: BoundedRetryCause,
+    retry_at: Instant,
+}
+
+impl BoundedAnalysisRetry {
+    pub(crate) fn after(cause: BoundedRetryCause, now: Instant) -> Self {
+        Self {
+            cause,
+            retry_at: now + SUPPRESSED_PROBE_INTERVAL,
+        }
+    }
+
+    pub(crate) fn cause(&self) -> BoundedRetryCause {
+        self.cause
+    }
+
+    /// Whether an ordinary timer evaluation at `now` must still wait.
+    pub(crate) fn blocks(&self, now: Instant) -> bool {
+        now < self.retry_at
     }
 }
 
@@ -484,6 +558,68 @@ mod tests {
         assert!(
             !record.suppresses(&signature(&queued, &[], 1, "rev-1", &digests), now),
             "a changed input must not be suppressed"
+        );
+    }
+
+    #[test]
+    fn healthy_record_probe_deadline_uses_the_bounded_repository_cadence() {
+        let queued = vec![change("queued-a")];
+        let digests = digests(&[("queued-a", "d1")]);
+        let record =
+            CompletedAnalysisInput::healthy(signature(&queued, &[], 0, "main@rev-1", &digests));
+        let now = Instant::now();
+
+        assert_eq!(
+            record.next_probe_deadline(now),
+            now + SUPPRESSED_PROBE_INTERVAL,
+            "a healthy record has no expiry to cap its probe cadence"
+        );
+    }
+
+    #[test]
+    fn degraded_record_probe_deadline_is_capped_at_its_expiry() {
+        let queued = vec![change("queued-a")];
+        let digests = digests(&[("queued-a", "d1")]);
+        let recorded_at = Instant::now();
+        let record = CompletedAnalysisInput::degraded(
+            signature(&queued, &[], 0, "main@rev-1", &digests),
+            recorded_at,
+        );
+
+        assert_eq!(
+            record.next_probe_deadline(recorded_at),
+            recorded_at + SUPPRESSED_PROBE_INTERVAL,
+            "far from expiry the repository cadence is the binding deadline"
+        );
+
+        // One second before expiry, a fresh ten-second probe deadline would push the promised
+        // retry out to 5m09s.
+        let just_before_expiry = recorded_at + DEGRADED_SUPPRESSION_TTL - Duration::from_secs(1);
+        assert_eq!(
+            record.next_probe_deadline(just_before_expiry),
+            recorded_at + DEGRADED_SUPPRESSION_TTL,
+            "the probe cadence must not delay the degraded retry past its expiry"
+        );
+    }
+
+    #[test]
+    fn bounded_retry_blocks_only_until_the_debounce_cadence_elapses() {
+        let now = Instant::now();
+        let retry = BoundedAnalysisRetry::after(BoundedRetryCause::SignatureUnavailable, now);
+
+        assert_eq!(retry.cause(), BoundedRetryCause::SignatureUnavailable);
+        assert!(
+            retry.blocks(now + SUPPRESSED_PROBE_INTERVAL - Duration::from_millis(500)),
+            "a 500 ms wake inside the window must not re-probe or re-analyze"
+        );
+        assert!(
+            !retry.blocks(now + SUPPRESSED_PROBE_INTERVAL),
+            "fail-open must stay open: the deadline has to release the retry"
+        );
+        assert_ne!(
+            BoundedRetryCause::SignatureUnavailable.as_str(),
+            BoundedRetryCause::UnusableAnalysisResult.as_str(),
+            "the two bounded-retry causes must be distinguishable to operators"
         );
     }
 

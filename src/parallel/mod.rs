@@ -50,7 +50,9 @@ pub use merge::MergeAttempt;
 use crate::ai_command_runner::{AiCommandRunner, SharedStaggerState};
 use crate::config::OrchestratorConfig;
 use crate::hooks::HookRunner;
-use crate::parallel::analysis_signature::{AnalysisInputProbe, CompletedAnalysisInput};
+use crate::parallel::analysis_signature::{
+    AnalysisInputProbe, BoundedAnalysisRetry, CompletedAnalysisInput,
+};
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::vcs::WorkspaceManager;
 use std::collections::{HashMap, HashSet};
@@ -234,6 +236,14 @@ pub struct ParallelExecutor {
     /// The scheduler wakes every 500 ms; without this bound each wake would re-read proposal
     /// files and spawn a VCS revision subprocess just to confirm nothing changed.
     next_analysis_signature_probe_at: Option<tokio::time::Instant>,
+    /// Bounded retry deadline for an ordinary timer evaluation that established no completed
+    /// input.
+    ///
+    /// This is deliberately separate from `last_completed_analysis_input`: a failed signature
+    /// probe or an unusable analyzer result proves nothing was analyzed, so it must never be
+    /// recorded as a completion. It only rate-limits the retry, so fail-open stays open without
+    /// becoming a 500 ms probe/analyzer loop.
+    analysis_retry_throttle: Option<BoundedAnalysisRetry>,
     /// Override for dependency-analysis signature probing.
     ///
     /// `None` uses the real repository probe (VCS revision plus
