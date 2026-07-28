@@ -45,3 +45,8 @@ code path.
 
 Archive validation itself is the authoritative final OpenSpec validation gate.
 Expected archive gate: `cflx openspec validate suppress-unchanged-state-timer-reanalysis --archive-gate`
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [ ] src/parallel/tests/executor.rs lines 1152, 1312, 1527, 1734, 1947: heavy-tests-gated ParallelExecutor struct literals are missing new fields last_completed_analysis_input, next_analysis_signature_probe_at, analysis_input_probe; cargo clippy --locked --all-targets --all-features -- -D warnings fails with E0063 and this command runs in the prek pre-commit hook (.pre-commit-config.yaml clippy hook), blocking the archive commit. Add the three fields initialized to None to each initializer, then verify with the exact hook command.
+  evidence: Added `last_completed_analysis_input: None`, `next_analysis_signature_probe_at: None`, `analysis_input_probe: None` to all five heavy-tests-gated `ParallelExecutor` literals in src/parallel/tests/executor.rs (now at lines ~1192, ~1355, ~1573, ~1783, ~1999); `cargo clippy --locked --all-targets --all-features -- -D warnings` finishes clean with no E0063, and `cargo fmt --all --check` plus `cargo test --lib` (2490 passed, 0 failed, 7 ignored) also pass.

@@ -1189,6 +1189,9 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+        last_completed_analysis_input: None,
+        next_analysis_signature_probe_at: None,
+        analysis_input_probe: None,
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1349,6 +1352,9 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+        last_completed_analysis_input: None,
+        next_analysis_signature_probe_at: None,
+        analysis_input_probe: None,
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1564,6 +1570,9 @@ async fn test_merge_retries_when_merge_commit_missing() {
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+        last_completed_analysis_input: None,
+        next_analysis_signature_probe_at: None,
+        analysis_input_probe: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1771,6 +1780,9 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+        last_completed_analysis_input: None,
+        next_analysis_signature_probe_at: None,
+        analysis_input_probe: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1984,6 +1996,9 @@ async fn test_merge_retries_after_pre_commit_changes() {
         resolve_wait_retry_triggered: false,
         last_resolve_wait_base_dirty: None,
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+        last_completed_analysis_input: None,
+        next_analysis_signature_probe_at: None,
+        analysis_input_probe: None,
     };
 
     let revisions = vec![workspace_a.name];
