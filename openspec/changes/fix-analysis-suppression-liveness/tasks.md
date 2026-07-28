@@ -1,0 +1,19 @@
+## Implementation Tasks
+
+- [ ] Make effective dependency-base selection and ref revision resolution authoritative for both dependency classification and analysis signatures; completion requires production code to hash the selected base ref rather than checkout `HEAD`, with a regression where only that ref advances. (verification: unit - `cargo test parallel::tests::unchanged_analysis_input --lib`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Change unusable empty-order handling so queued work keeps the scheduler loop alive without recording a completed signature; completion requires fully drained execution to retain its existing termination behavior. (verification: integration - `cargo test parallel::tests --lib`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Add a paused-time full scheduler-loop regression where queued work remains, no work is in flight, and the analyzer returns an empty order; completion requires the loop to survive the first result and invoke the analyzer again only at the next debounce-eligible evaluation. (verification: integration - `cargo test parallel::tests::unchanged_analysis_input --lib`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Add bounded fail-open state for proposal-read and revision-resolution failures; completion requires no completed signature, no loop exit, and at most one timer-driven probe and analyzer attempt per ten-second cadence while failures persist, with explicit edges retaining one immediate attempt. (verification: integration - `cargo test parallel::tests::unchanged_analysis_input --lib`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Add probe-recovery coverage where persistent signature failure later succeeds without a queue membership change; completion requires the next eligible evaluation to analyze once, record the usable signature, and suppress subsequent unchanged timer wakes. (verification: integration - `cargo test parallel::tests::unchanged_analysis_input --lib`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Deterministically order queued and in-flight inputs before signature construction and analyzer/fallback consumption; completion requires order-only permutations to preserve one semantic input and real membership/content changes to continue invalidating the signature. (verification: unit - `cargo test parallel::tests::unchanged_analysis_input --lib parallel_run_service::tests`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Schedule the first suppressed probe deadline when a completed signature is recorded and cap degraded deadlines at the five-minute expiry; completion requires no immediate 500 ms VCS/proposal probe after a healthy result and one degraded retry on the first eligible wake at or after exactly five paused-time minutes. (verification: integration - `cargo test parallel::tests::unchanged_analysis_input --lib`; verification-id: analysis-suppression-liveness-tests)
+- [ ] Run repository quality gates and all default tests; completion requires `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` to pass, with each new default-path timer test completing under one second. (verification: integration - `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test`; verification-id: analysis-suppression-liveness-tests)
+
+## Future Work
+
+- Consider a separate cost-control policy for deterministic positive-capacity zero-dispatch results only if production evidence shows repeated erroneous analysis remains operationally significant; this proposal preserves the existing liveness-first canonical rule.
+
+## Final Validation
+
+Archive validation itself is the authoritative final OpenSpec validation gate.
+Expected archive gate: `cflx openspec validate fix-analysis-suppression-liveness --archive-gate`
