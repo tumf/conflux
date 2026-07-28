@@ -1,4 +1,5 @@
 use crate::dependency_targets::DependencyTargetClass;
+use crate::openspec::{VerificationCompletionRole, VerificationDeclaration, VerificationRoleIssue};
 use crate::openspec_cmd::dependency_status::classify_proposal_dependency_targets;
 use crate::openspec_cmd::promotion::merge_spec_delta;
 use crate::openspec_cmd::rendering::truncate_for_display;
@@ -115,13 +116,25 @@ impl<'a> ValidationEngine<'a> {
                         }
                         _ => {}
                     }
-                    errors.extend(validate_verification_declarations(
-                        &content,
-                        &proposal_file,
+                    let (verification_errors, verification_warnings) =
+                        validate_verification_declarations(
+                            &content,
+                            &proposal_file,
+                            &self.manager.root_dir,
+                            &change_id,
+                            change_type.as_deref(),
+                        );
+                    errors.extend(verification_errors);
+                    warnings.extend(verification_warnings);
+
+                    let (gate_errors, gate_warnings) = validate_release_gate_dependencies(
                         &self.manager.root_dir,
                         &change_id,
-                        change_type.as_deref(),
-                    ));
+                        &content,
+                        &proposal_file,
+                    );
+                    errors.extend(gate_errors);
+                    warnings.extend(gate_warnings);
                 }
 
                 let dependency_diagnostics =
@@ -447,7 +460,7 @@ fn validate_verification_declarations(
     root_dir: &Path,
     change_id: &str,
     change_type: Option<&str>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let parsed =
         crate::openspec::parse_proposal_frontmatter_strict(proposal_content, proposal_file);
     let mut errors = parsed
@@ -460,6 +473,7 @@ fn validate_verification_declarations(
             )
         })
         .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
     let verifications = parsed
         .metadata
         .map(|metadata| metadata.verifications)
@@ -534,12 +548,347 @@ fn validate_verification_declarations(
                 root_dir, change_id, label, automation,
             ));
         }
+        for issue in crate::openspec::evaluate_verification_role(verification) {
+            let message = verification_role_issue_message(change_id, label, verification, &issue);
+            if issue.is_warning() {
+                warnings.push(message);
+            } else {
+                errors.push(message);
+            }
+        }
     }
 
     if matches!(change_type, Some("implementation" | "hybrid")) && !has_pre_integration {
         errors.push(format!("{}: implementation and hybrid proposals require at least one pre-integration verification with repository-verifiable evidence", change_id));
     }
-    errors
+    (errors, warnings)
+}
+
+/// Render a role-metadata issue as an owning-proposal diagnostic.
+///
+/// Migration guidance is derived from the structured `phase` field rather than
+/// prose so natural-language content never controls the classification.
+fn verification_role_issue_message(
+    change_id: &str,
+    label: &str,
+    verification: &VerificationDeclaration,
+    issue: &VerificationRoleIssue,
+) -> String {
+    match issue {
+        VerificationRoleIssue::UnknownExecutionClass(value) => format!(
+            "{}: verification '{}': invalid execution_class '{}' (must be one of: {})",
+            change_id, label, value, EXECUTION_CLASS_VALUES
+        ),
+        VerificationRoleIssue::UnknownCompletionRole(value) => format!(
+            "{}: verification '{}': invalid completion_role '{}' (must be one of: change-blocking, operational-observation)",
+            change_id, label, value
+        ),
+        VerificationRoleIssue::IncompleteRoleMetadata => format!(
+            "{}: verification '{}': execution_class and completion_role must be declared together",
+            change_id, label
+        ),
+        VerificationRoleIssue::PostIntegrationChangeBlocking(phase) => format!(
+            "{}: verification '{}': completion_role: change-blocking requires phase: pre-integration (found '{}'); declare completion_role: {} instead",
+            change_id,
+            label,
+            phase,
+            VerificationCompletionRole::OperationalObservation.as_str()
+        ),
+        VerificationRoleIssue::NonLocalChangeBlocking(class) => format!(
+            "{}: verification '{}': completion_role: change-blocking requires execution_class: repository-local (found '{}'); non-local outcomes must be completion_role: {} and must not block acceptance, archive, or merge",
+            change_id,
+            label,
+            class.as_str(),
+            VerificationCompletionRole::OperationalObservation.as_str()
+        ),
+        VerificationRoleIssue::LegacyRoleMetadataMissing => {
+            let suggestion = match verification.phase.as_deref() {
+                Some("post-integration") => {
+                    "add execution_class: repository-automation (or another non-local class) and completion_role: operational-observation"
+                }
+                Some("pre-integration") => {
+                    "add execution_class: repository-local and completion_role: change-blocking"
+                }
+                _ => "add execution_class and completion_role",
+            };
+            format!(
+                "{}: verification '{}': legacy declaration without execution_class/completion_role; {} during migration",
+                change_id, label, suggestion
+            )
+        }
+    }
+}
+
+const EXECUTION_CLASS_VALUES: &str = "repository-local, repository-automation, deployed-service, physical-device, external-approval, credentialed-external";
+
+/// Structured release-gate facts about one dependency target proposal.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ReleaseGateTarget {
+    /// The target's own frontmatter could not be decoded.
+    pub(super) metadata_unreadable: bool,
+    /// `(verification id, human-readable non-local reason)` pairs.
+    pub(super) non_local_blockers: Vec<(String, String)>,
+}
+
+/// Extract release-gate facts from already-parsed declarations.
+pub(super) fn release_gate_target_facts(
+    verifications: &[VerificationDeclaration],
+) -> ReleaseGateTarget {
+    ReleaseGateTarget {
+        metadata_unreadable: false,
+        non_local_blockers: verifications
+            .iter()
+            .filter(|declaration| declaration.is_non_local_change_blocker())
+            .map(|declaration| {
+                let reason = match (declaration.execution_class(), declaration.phase.as_deref()) {
+                    (Some(class), _) if !class.is_repository_local() => {
+                        format!("execution class '{}'", class.as_str())
+                    }
+                    (_, Some(phase)) if phase != "pre-integration" => {
+                        format!("phase '{}'", phase)
+                    }
+                    _ => "missing repository-local pre-integration metadata".to_string(),
+                };
+                (verification_label(declaration), reason)
+            })
+            .collect(),
+    }
+}
+
+fn verification_label(declaration: &VerificationDeclaration) -> String {
+    declaration
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("<missing id>")
+        .to_string()
+}
+
+/// Classify one dependency edge from already-collected structured facts.
+///
+/// Pure decision logic: no filesystem, process, or network access, so the
+/// release-gate rule can be verified in isolation from repository layout.
+pub(super) fn classify_release_gate_edge(
+    dependent: &str,
+    dependent_is_observational: bool,
+    dependent_in_flight: bool,
+    target_id: &str,
+    target: &ReleaseGateTarget,
+) -> (Vec<String>, Vec<String>) {
+    if target.metadata_unreadable {
+        return (
+            Vec::new(),
+            vec![format!(
+                "{}: proposal dependency '{}' has unreadable verification metadata; resolve the verification metadata errors reported on '{}' before this dependency edge can be classified",
+                dependent, target_id, target_id
+            )],
+        );
+    }
+
+    // Release observations never block Conflux completion, so an observational
+    // dependent cannot be stalled by the target's observational outcomes.
+    if dependent_is_observational {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    for (verification_id, reason) in &target.non_local_blockers {
+        let message = format!(
+            "{}: proposal dependency '{}' declares non-local change-blocking verification '{}' ({}); a repository-local implementation change must not depend on non-local release acceptance. Remedy: split '{}' into a repository-local implementation change plus a separate operational-observation release change, or remove this hard dependency",
+            dependent, target_id, verification_id, reason, target_id
+        );
+        if dependent_in_flight {
+            warnings.push(format!(
+                "{} (in-flight operation is not interrupted; enforcement applies at the next dispatch eligibility decision)",
+                message
+            ));
+        } else {
+            errors.push(message);
+        }
+    }
+    (errors, warnings)
+}
+
+/// Render reverse-dependency impact warnings for a target that declares a
+/// non-local change blocker.
+pub(super) fn reverse_impact_warnings(
+    target_id: &str,
+    blocker_ids: &[String],
+    queued_dependents: &[String],
+    in_flight_dependents: &[String],
+) -> Vec<String> {
+    if blocker_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if !queued_dependents.is_empty() {
+        warnings.push(format!(
+            "{}: non-local change-blocking verification(s) [{}] affect queued dependents: {}. Those dependents become ineligible at their next dispatch eligibility decision",
+            target_id,
+            blocker_ids.join(", "),
+            queued_dependents.join(", ")
+        ));
+    }
+    if !in_flight_dependents.is_empty() {
+        warnings.push(format!(
+            "{}: in-flight dependents are not interrupted by this verification metadata change: {}",
+            target_id,
+            in_flight_dependents.join(", ")
+        ));
+    }
+    warnings
+}
+
+/// Read a dependency target's structured release-gate facts.
+///
+/// Only valid structured declarations participate; prose is never consulted.
+fn read_release_gate_target(root_dir: &Path, target_id: &str) -> Option<ReleaseGateTarget> {
+    let target_proposal = root_dir
+        .join("openspec/changes")
+        .join(target_id)
+        .join("proposal.md");
+    let content = fs::read_to_string(&target_proposal).ok()?;
+    let parsed = crate::openspec::parse_proposal_frontmatter_strict(&content, &target_proposal);
+    if !parsed.diagnostics.is_empty() {
+        return Some(ReleaseGateTarget {
+            metadata_unreadable: true,
+            non_local_blockers: Vec::new(),
+        });
+    }
+
+    let verifications = parsed.metadata.map(|m| m.verifications).unwrap_or_default();
+    Some(release_gate_target_facts(&verifications))
+}
+
+/// Whether a change is a correctly modeled release-observation change.
+///
+/// Such changes never block Conflux completion, so they may legitimately form
+/// ordered chains among themselves and behind implementation changes.
+pub(super) fn is_observational_release_change(verifications: &[VerificationDeclaration]) -> bool {
+    let declared: Vec<_> = verifications
+        .iter()
+        .filter(|declaration| declaration.declares_role_metadata())
+        .collect();
+    !declared.is_empty()
+        && declared.iter().all(|declaration| {
+            declaration.completion_role()
+                == Some(crate::openspec::VerificationCompletionRole::OperationalObservation)
+        })
+}
+
+/// Reject hard dependency edges that turn non-local release acceptance into an
+/// implementation-graph bottleneck, and report reverse-dependency impact.
+///
+/// Both directions are derived only from valid structured verification
+/// declarations; the classification never reads natural-language content and
+/// never contacts an external system.
+fn validate_release_gate_dependencies(
+    root_dir: &Path,
+    change_id: &str,
+    proposal_content: &str,
+    proposal_file: &Path,
+) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+
+    let parsed =
+        crate::openspec::parse_proposal_frontmatter_strict(proposal_content, proposal_file);
+    let own_verifications = parsed.metadata.map(|m| m.verifications).unwrap_or_default();
+    let dependent_is_observational = is_observational_release_change(&own_verifications);
+
+    let dependencies =
+        crate::openspec::parse_proposal_metadata_from_file(proposal_file).dependencies;
+    let archived_ids = crate::dependency_targets::collect_archived_change_ids(root_dir);
+    let active_ids = super::dependency_status::collect_active_change_ids_from_root(root_dir);
+    let in_flight_ids = super::dependency_status::collect_in_flight_change_ids_from_root(root_dir);
+    // An in-flight dependent keeps running; the new classification only takes
+    // effect at its next dispatch eligibility decision.
+    let dependent_in_flight = in_flight_ids.contains(change_id);
+
+    for dependency in &dependencies {
+        if dependency == change_id || archived_ids.contains(dependency) {
+            continue;
+        }
+        if !active_ids.contains(dependency) && !in_flight_ids.contains(dependency) {
+            // Missing/rejected targets already have dedicated diagnostics.
+            continue;
+        }
+        let Some(target) = read_release_gate_target(root_dir, dependency) else {
+            continue;
+        };
+
+        let (edge_errors, edge_warnings) = classify_release_gate_edge(
+            change_id,
+            dependent_is_observational,
+            dependent_in_flight,
+            dependency,
+            &target,
+        );
+        errors.extend(edge_errors);
+        warnings.extend(edge_warnings);
+    }
+
+    // Reverse-dependency impact: this change is the target that gained a blocker.
+    let own_blockers: Vec<String> = own_verifications
+        .iter()
+        .filter(|declaration| declaration.is_non_local_change_blocker())
+        .map(verification_label)
+        .collect();
+    if !own_blockers.is_empty() {
+        let (queued, in_flight) =
+            collect_dependents(root_dir, change_id, &active_ids, &in_flight_ids);
+        warnings.extend(reverse_impact_warnings(
+            change_id,
+            &own_blockers,
+            &queued,
+            &in_flight,
+        ));
+    }
+
+    (errors, warnings)
+}
+
+/// Collect active dependents of `target_id`, split into queued and in-flight.
+fn collect_dependents(
+    root_dir: &Path,
+    target_id: &str,
+    active_ids: &HashSet<String>,
+    in_flight_ids: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut queued = Vec::new();
+    let mut in_flight = Vec::new();
+
+    for candidate in active_ids.iter().chain(in_flight_ids.iter()) {
+        if candidate == target_id || queued.contains(candidate) || in_flight.contains(candidate) {
+            continue;
+        }
+        let proposal = root_dir
+            .join("openspec/changes")
+            .join(candidate)
+            .join("proposal.md");
+        if !proposal.exists() {
+            continue;
+        }
+        if !crate::openspec::parse_proposal_metadata_from_file(&proposal)
+            .dependencies
+            .iter()
+            .any(|dependency| dependency == target_id)
+        {
+            continue;
+        }
+        if in_flight_ids.contains(candidate) {
+            in_flight.push(candidate.clone());
+        } else {
+            queued.push(candidate.clone());
+        }
+    }
+
+    queued.sort();
+    in_flight.sort();
+    (queued, in_flight)
 }
 
 fn validate_automation_path(
@@ -747,13 +1096,83 @@ pub(crate) fn validate_task_format(content: &str, change_id: &str) -> Vec<String
     errors
 }
 
+/// Extract a `verification-id: <id>` reference from a task or continuation line.
+pub(super) fn extract_verification_id_reference(text: &str) -> Option<String> {
+    static VERIFICATION_ID_RE: OnceLock<Regex> = OnceLock::new();
+    let re = VERIFICATION_ID_RE
+        .get_or_init(|| Regex::new(r"(?i)verification-id\s*:\s*([A-Za-z0-9._-]+)").unwrap());
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Structured verification linkage requirements for one proposal's task list.
+///
+/// The requirement only activates once the proposal has migrated to the role
+/// model; legacy declarations stay compatible and are handled by migration
+/// warnings on the proposal itself.
+struct VerificationLinkage {
+    declared_ids: HashSet<String>,
+    change_blocking_ids: HashSet<String>,
+}
+
+impl VerificationLinkage {
+    fn from_proposal(proposal_content: Option<&str>) -> Option<Self> {
+        let parsed = crate::openspec::parse_proposal_frontmatter_strict(
+            proposal_content?,
+            Path::new("proposal.md"),
+        );
+        let verifications = parsed.metadata.map(|m| m.verifications).unwrap_or_default();
+        if !verifications
+            .iter()
+            .any(VerificationDeclaration::declares_role_metadata)
+        {
+            return None;
+        }
+        Some(Self {
+            declared_ids: verifications
+                .iter()
+                .filter_map(|declaration| declaration.id.clone())
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect(),
+            change_blocking_ids: crate::openspec::change_blocking_verification_ids(&verifications)
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    fn evaluate(&self, change_id: &str, line_num: usize, reference: &str) -> Option<String> {
+        if self.change_blocking_ids.contains(reference) {
+            return None;
+        }
+        if !self.declared_ids.contains(reference) {
+            return Some(format!(
+                "{}: tasks.md:{}: verification-id '{}' is not declared in proposal.md verifications",
+                change_id, line_num, reference
+            ));
+        }
+        Some(format!(
+            "{}: tasks.md:{}: verification-id '{}' is not a change-blocking verification; move the non-local outcome to Future Work or a separate release-observation change",
+            change_id, line_num, reference
+        ))
+    }
+
+    fn missing_reference_message(change_id: &str, line_num: usize) -> String {
+        format!(
+            "{}: tasks.md:{}: active implementation checkbox must reference a change-blocking verification via 'verification-id: <id>'",
+            change_id, line_num
+        )
+    }
+}
+
 pub(super) fn validate_tasks_content(
     content: &str,
     change_id: &str,
     strict: bool,
     evidence_mode: &str,
     change_type: Option<&str>,
-    _proposal_content: Option<&str>,
+    proposal_content: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
@@ -777,6 +1196,13 @@ pub(super) fn validate_tasks_content(
     let mut last_checkbox_line_num: Option<usize> = None;
     let mut pending_behavior_task_without_verification: Option<usize> = None;
     let mut fences = crate::task_parser::FenceTracker::default();
+
+    // Linkage is enforced only for behavior-changing proposals that already
+    // declare structured verification roles.
+    let linkage = (strict && is_behavior_change)
+        .then(|| VerificationLinkage::from_proposal(proposal_content))
+        .flatten();
+    let mut pending_verification_id_line: Option<usize> = None;
 
     for (i, line) in content.lines().enumerate() {
         let line_num = i + 1;
@@ -815,6 +1241,12 @@ pub(super) fn validate_tasks_content(
         }
 
         if let Some(caps) = checkbox_detail_re.captures(line) {
+            // A new checkbox ends the previous checkbox's continuation window.
+            if let Some(unresolved) = pending_verification_id_line.take() {
+                errors.push(VerificationLinkage::missing_reference_message(
+                    change_id, unresolved,
+                ));
+            }
             last_checkbox_line_num = Some(line_num);
             if !in_excluded {
                 let task_text = caps.get(2).map_or("", |m| m.as_str()).trim();
@@ -832,7 +1264,20 @@ pub(super) fn validate_tasks_content(
                         change_id, line_num,
                     ));
                     pending_behavior_task_without_verification = None;
-                } else if strict && evidence_mode != "off" && is_behavior_change {
+                    continue;
+                }
+
+                if let Some(linkage) = linkage.as_ref() {
+                    match extract_verification_id_reference(task_text) {
+                        Some(reference) => {
+                            errors.extend(linkage.evaluate(change_id, line_num, &reference))
+                        }
+                        // The reference may still arrive on a continuation line.
+                        None => pending_verification_id_line = Some(line_num),
+                    }
+                }
+
+                if strict && evidence_mode != "off" && is_behavior_change {
                     if let Some(vtext) = verification_text {
                         if !has_repository_evidence_hint(&vtext) {
                             let msg = format!(
@@ -869,6 +1314,20 @@ pub(super) fn validate_tasks_content(
             if !in_excluded {
                 if let Some(prev_line_num) = last_checkbox_line_num {
                     let vtext = caps.get(1).map_or("", |m| m.as_str()).trim();
+                    if let (Some(linkage), Some(unresolved)) =
+                        (linkage.as_ref(), pending_verification_id_line)
+                    {
+                        if unresolved == prev_line_num {
+                            if let Some(reference) = extract_verification_id_reference(vtext) {
+                                errors.extend(linkage.evaluate(
+                                    change_id,
+                                    prev_line_num,
+                                    &reference,
+                                ));
+                                pending_verification_id_line = None;
+                            }
+                        }
+                    }
                     if strict && evidence_mode != "off" && !vtext.is_empty() {
                         if !has_repository_evidence_hint(vtext) {
                             let msg = format!(
@@ -917,6 +1376,12 @@ pub(super) fn validate_tasks_content(
                 ));
             }
         }
+    }
+
+    if let Some(unresolved) = pending_verification_id_line {
+        errors.push(VerificationLinkage::missing_reference_message(
+            change_id, unresolved,
+        ));
     }
 
     if strict && evidence_mode != "off" {
