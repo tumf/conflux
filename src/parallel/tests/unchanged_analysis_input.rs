@@ -119,6 +119,16 @@ impl FakeAnalysisInputProbe {
         *self.revision.lock().expect("revision lock") = revision.to_string();
     }
 
+    /// Mirror the production encoding, which names the effective dependency-base ref alongside
+    /// the revision that ref resolves to.
+    fn set_effective_base(&self, base_ref: &str, revision: &str) {
+        self.set_revision(&format!("{base_ref}@{revision}"));
+    }
+
+    fn clear_revision_failure(&self) {
+        *self.revision_failure.lock().expect("revision failure lock") = None;
+    }
+
     fn set_proposal_digest(&self, change_id: &str, digest: &str) {
         self.digests
             .lock()
@@ -194,6 +204,8 @@ struct AnalyzerScript {
     dependencies: StdMutex<HashMap<String, Vec<String>>>,
     empty_order: StdMutex<bool>,
     during_analysis: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// In-flight ID lists exactly as the analyzer received them, one entry per invocation.
+    observed_in_flight: StdMutex<Vec<Vec<String>>>,
 }
 
 impl AnalyzerScript {
@@ -205,7 +217,15 @@ impl AnalyzerScript {
             dependencies: StdMutex::new(HashMap::new()),
             empty_order: StdMutex::new(false),
             during_analysis: StdMutex::new(None),
+            observed_in_flight: StdMutex::new(Vec::new()),
         })
+    }
+
+    fn observed_in_flight(&self) -> Vec<Vec<String>> {
+        self.observed_in_flight
+            .lock()
+            .expect("observed in-flight lock")
+            .clone()
     }
 
     fn invocations(&self) -> usize {
@@ -237,8 +257,13 @@ impl AnalyzerScript {
 fn scripted_analyzer(
     script: Arc<AnalyzerScript>,
 ) -> impl for<'a> Fn(&'a [Change], &'a [String], u32) -> AnalysisFuture<'a> + Send + Sync {
-    move |changes: &[Change], _in_flight: &[String], _iteration: u32| -> AnalysisFuture<'_> {
+    move |changes: &[Change], in_flight: &[String], _iteration: u32| -> AnalysisFuture<'_> {
         script.invocations.fetch_add(1, Ordering::SeqCst);
+        script
+            .observed_in_flight
+            .lock()
+            .expect("observed in-flight lock")
+            .push(in_flight.to_vec());
         let order: Vec<String> = if *script.empty_order.lock().expect("empty order lock") {
             Vec::new()
         } else {
@@ -545,24 +570,34 @@ async fn suppressed_wakes_do_not_probe_before_the_bounded_deadline() {
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 1);
 
-    // One probe armed the suppression, and the first suppressed wake probes once more to confirm
-    // the input really is unchanged.
+    // Recording the completed input also arms its probe deadline, so the immediate 500 ms wake
+    // performs no repository I/O at all.
+    let probes_after_analysis = harness.probe.revision_probes();
+    let digest_probes_after_analysis = harness.probe.digest_probes();
     harness.timer_wake().await;
     harness.run_loop_iteration(&analyzer).await;
-    let probes_after_first_suppression = harness.probe.revision_probes();
-    let digest_probes_after_first_suppression = harness.probe.digest_probes();
+    assert_eq!(
+        harness.probe.revision_probes(),
+        probes_after_analysis,
+        "the wake immediately after a completed analysis must not re-probe the VCS revision"
+    );
+    assert_eq!(
+        harness.probe.digest_probes(),
+        digest_probes_after_analysis,
+        "the wake immediately after a completed analysis must not re-read proposal files"
+    );
 
     // Ten seconds of 500 ms wakes must add no probes at all.
     harness.timer_wakes(&analyzer, 18).await;
 
     assert_eq!(
         harness.probe.revision_probes(),
-        probes_after_first_suppression,
+        probes_after_analysis,
         "a suppressed 500 ms wake must not spawn a VCS revision probe"
     );
     assert_eq!(
         harness.probe.digest_probes(),
-        digest_probes_after_first_suppression,
+        digest_probes_after_analysis,
         "a suppressed 500 ms wake must not re-read proposal files"
     );
 
@@ -572,7 +607,7 @@ async fn suppressed_wakes_do_not_probe_before_the_bounded_deadline() {
 
     assert_eq!(
         harness.probe.revision_probes(),
-        probes_after_first_suppression + 1,
+        probes_after_analysis + 1,
         "the first evaluation after the probe deadline must re-confirm repository-visible input"
     );
     assert_eq!(
@@ -1074,11 +1109,7 @@ async fn revision_probe_failure_fails_open_without_recording_suppression() {
 
     // Recovery re-establishes ordinary suppression without any user action.
     harness.probe.set_revision("base-rev-recovered");
-    *harness
-        .probe
-        .revision_failure
-        .lock()
-        .expect("revision failure lock") = None;
+    harness.probe.clear_revision_failure();
     harness.pass_probe_deadline().await;
     harness.run_loop_iteration(&analyzer).await;
     assert_eq!(harness.analyses(), 4);
@@ -1088,6 +1119,337 @@ async fn revision_probe_failure_fails_open_without_recording_suppression() {
         4,
         "once a signature can be built again, unchanged wakes must be suppressed"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn effective_base_ref_change_rearms_analysis() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut harness =
+        SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
+    let analyzer = scripted_analyzer(harness.script.clone());
+    harness.make_queue_debounce_stale().await;
+    harness.occupy_all_capacity();
+    harness.probe.set_effective_base("main", "commit-1");
+
+    harness.run_loop_iteration(&analyzer).await;
+    harness.timer_wakes(&analyzer, 4).await;
+    assert_eq!(harness.analyses(), 1);
+
+    // A stacked run switched the effective dependency base to an integration branch. The commit
+    // it currently resolves to is unchanged, so only the *named* base differs; merge evidence is
+    // now read from a different ref and must be re-evaluated.
+    harness
+        .probe
+        .set_effective_base("integration-1", "commit-1");
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "a changed effective dependency-base ref must re-arm analysis"
+    );
+
+    // And the ordinary case: the same named ref advances on its own.
+    harness.timer_wakes(&analyzer, 4).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "the new base must then be suppressed"
+    );
+    harness
+        .probe
+        .set_effective_base("integration-1", "commit-2");
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+
+    assert_eq!(
+        harness.analyses(),
+        3,
+        "an advancing effective dependency-base ref must re-arm analysis"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn persistent_signature_failure_is_rate_limited_across_timer_wakes() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut harness =
+        SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
+    let analyzer = scripted_analyzer(harness.script.clone());
+    harness.make_queue_debounce_stale().await;
+    harness.occupy_all_capacity();
+    harness.probe.fail_revision("revision resolution failed");
+
+    // The first eligible evaluation fails open: it analyzes despite having no signature.
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "an unavailable signature must permit analysis"
+    );
+    let probes_after_first_attempt = harness.probe.revision_probes();
+
+    // Eight seconds of 500 ms wakes while the failure persists must add no probe and no
+    // analysis: fail-open must not become fail-hot.
+    harness.timer_wakes(&analyzer, 16).await;
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "a persistent signature failure must not relaunch the analyzer on every 500 ms wake; saw \
+         {} analyses",
+        harness.analyses()
+    );
+    assert_eq!(
+        harness.probe.revision_probes(),
+        probes_after_first_attempt,
+        "a throttled wake must not re-probe repository-visible signature material"
+    );
+    let logs = harness.drain_logs();
+    assert!(
+        logs.iter()
+            .any(|message| message.contains("analysis_signature_unavailable_retry_pending")),
+        "the bounded fail-open retry must stay operator-visible; saw {logs:?}"
+    );
+
+    // After the ten-second cadence, exactly one probe and one analysis are retried.
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "the deadline must permit one retry of both signature construction and analysis"
+    );
+    assert_eq!(
+        harness.probe.revision_probes(),
+        probes_after_first_attempt + 1,
+        "the retry must probe exactly once"
+    );
+
+    harness.timer_wakes(&analyzer, 6).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "the retry must re-arm the bounded window rather than a rapid loop"
+    );
+    assert!(
+        !harness.queued.is_empty(),
+        "a fail-open pass must keep queued work alive"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_edge_bypasses_the_signature_failure_retry_deadline_once() {
+    for edge in [
+        ReanalysisReason::QueueNotification,
+        ReanalysisReason::ResolveCompletion,
+        ReanalysisReason::RepairCandidate,
+        ReanalysisReason::SlotRecovery,
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let mut harness =
+            SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
+        let analyzer = scripted_analyzer(harness.script.clone());
+        harness.make_queue_debounce_stale().await;
+        harness.occupy_all_capacity();
+        harness.probe.fail_revision("revision resolution failed");
+
+        harness.run_loop_iteration(&analyzer).await;
+        harness.timer_wakes(&analyzer, 3).await;
+        assert_eq!(
+            harness.analyses(),
+            1,
+            "{edge}: the bounded retry deadline must hold before the edge"
+        );
+
+        // A real state-transition event is worth one immediate attempt even though the retry
+        // deadline has not elapsed.
+        harness.deliver_edge(edge);
+        harness.run_loop_iteration(&analyzer).await;
+        assert_eq!(
+            harness.analyses(),
+            2,
+            "{edge}: an explicit edge must bypass the bounded retry deadline once"
+        );
+
+        // Once consumed, ordinary wakes return to the bounded cadence.
+        harness.deliver_edge(ReanalysisReason::Initial);
+        harness.timer_wakes(&analyzer, 4).await;
+        assert_eq!(
+            harness.analyses(),
+            2,
+            "{edge}: timer wakes after the event must return to bounded retry"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn signature_probe_recovery_reestablishes_suppression_without_a_queue_change() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut harness =
+        SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
+    let analyzer = scripted_analyzer(harness.script.clone());
+    harness.make_queue_debounce_stale().await;
+    harness.occupy_all_capacity();
+    harness.probe.fail_revision("revision resolution failed");
+
+    harness.run_loop_iteration(&analyzer).await;
+    harness.timer_wakes(&analyzer, 4).await;
+    assert_eq!(harness.analyses(), 1, "the failing probe fails open once");
+
+    // The probe recovers on its own. Queue membership, capacity, and proposal content never
+    // changed, so recovery must not depend on any new operator or scheduler event.
+    harness.probe.clear_revision_failure();
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "the first eligible evaluation after recovery must analyze once"
+    );
+    assert_eq!(
+        harness.reanalysis_reason,
+        ReanalysisReason::Initial,
+        "recovery must not rely on an explicit edge"
+    );
+
+    // The recovered signature is a real completed input, so unchanged wakes go quiet again.
+    harness.timer_wakes(&analyzer, 6).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "a recovered signature must re-establish ordinary suppression"
+    );
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "re-probing the recovered unchanged input must not invoke the analyzer"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unusable_empty_result_retries_at_the_bounded_cadence() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut harness =
+        SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
+    harness.script.set_empty_order(true);
+    let analyzer = scripted_analyzer(harness.script.clone());
+    harness.make_queue_debounce_stale().await;
+    harness.occupy_all_capacity();
+
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(harness.analyses(), 1);
+
+    // An unusable result records nothing, but it must not turn into a 500 ms analyzer loop
+    // either.
+    harness.timer_wakes(&analyzer, 18).await;
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "a persistently unusable analyzer must not be relaunched on every wake; saw {} analyses",
+        harness.analyses()
+    );
+
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "the bounded deadline must permit one retry of the unusable input"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn degraded_expiry_is_not_delayed_by_the_repository_probe_cadence() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut harness =
+        SuppressionHarness::new(temp_dir.path().to_path_buf(), vec![test_change("queued-a")]);
+    harness
+        .script
+        .set_provenance(AnalysisProvenance::RecoverableFailureFallback);
+    // Keep the analyzer instantaneous so the degraded record's expiry is exactly five paused
+    // minutes after the wake that records it.
+    harness.script.set_duration(Duration::ZERO);
+    let analyzer = scripted_analyzer(harness.script.clone());
+    harness.make_queue_debounce_stale().await;
+    harness.occupy_all_capacity();
+
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(harness.analyses(), 1);
+
+    // A repository probe lands one second before expiry. Arming a fresh ten-second probe
+    // deadline there would push the promised retry out to 5m09s.
+    tokio::time::sleep(DEGRADED_SUPPRESSION_TTL - Duration::from_secs(1)).await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "the degraded record must still suppress one second before expiry"
+    );
+
+    // The first eligible wake at exactly five minutes must perform the promised retry.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "a probe taken just before expiry must not delay the degraded retry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_flight_order_permutations_produce_one_deterministic_analyzer_input() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut harness = SuppressionHarness::with_config(
+        temp_dir.path().to_path_buf(),
+        vec![test_change("queued-a")],
+        create_test_config(),
+        4,
+    );
+    let analyzer = scripted_analyzer(harness.script.clone());
+    harness.make_queue_debounce_stale().await;
+    harness.occupy_all_capacity();
+    for id in ["inflight-c", "inflight-a", "inflight-b"] {
+        harness.in_flight.insert(id.to_string());
+    }
+
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(harness.analyses(), 1);
+
+    // Rebuild the same in-flight set through a different insertion order. `HashSet` iteration is
+    // not a repository-visible change, so it must neither invalidate the signature nor reorder
+    // the analyzer prompt.
+    harness.in_flight.clear();
+    for id in ["inflight-b", "inflight-c", "inflight-a"] {
+        harness.in_flight.insert(id.to_string());
+    }
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        1,
+        "an order-only permutation of the same in-flight set is one semantic input"
+    );
+
+    // A real membership change still re-arms analysis.
+    harness.in_flight.insert("inflight-d".to_string());
+    harness.pass_probe_deadline().await;
+    harness.run_loop_iteration(&analyzer).await;
+    assert_eq!(
+        harness.analyses(),
+        2,
+        "a real in-flight membership change must re-arm analysis"
+    );
+
+    for observed in harness.script.observed_in_flight() {
+        let mut sorted = observed.clone();
+        sorted.sort();
+        assert_eq!(
+            observed, sorted,
+            "the analyzer must receive one deterministic ordering of the in-flight set"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

@@ -167,6 +167,23 @@ pub async fn is_head_empty_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     Ok(output.trim().is_empty())
 }
 
+/// Resolve the commit a named ref points to.
+///
+/// Dependency merge evidence is evaluated against a named base ref, which can advance while
+/// the checkout commit stays put. Callers that need to notice that advance must resolve the
+/// ref itself instead of reading `HEAD`.
+pub async fn get_ref_revision<P: AsRef<Path>>(cwd: P, reference: &str) -> VcsResult<String> {
+    run_git(
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", reference),
+        ],
+        cwd,
+    )
+    .await
+}
+
 /// Get the current branch name.
 /// Returns None if in detached HEAD state.
 pub async fn get_current_branch<P: AsRef<Path>>(cwd: P) -> VcsResult<Option<String>> {

@@ -150,6 +150,7 @@ impl ParallelExecutor {
             // evaluation always analyzes instead of trusting a previous process's state.
             last_completed_analysis_input: None,
             next_analysis_signature_probe_at: None,
+            analysis_retry_throttle: None,
             analysis_input_probe: None,
         }
     }
@@ -194,6 +195,16 @@ impl ParallelExecutor {
         probe: Arc<dyn crate::parallel::analysis_signature::AnalysisInputProbe>,
     ) {
         self.analysis_input_probe = Some(probe);
+    }
+
+    /// Replace the workspace manager with a double (tests only).
+    ///
+    /// This is what lets effective dependency-base resolution be verified without a real VCS:
+    /// branch selection and ref revision lookup both go through the workspace manager, so a
+    /// recording double can prove which one the scheduler asked for.
+    #[cfg(test)]
+    pub(crate) fn set_workspace_manager(&mut self, workspace_manager: Box<dyn WorkspaceManager>) {
+        self.workspace_manager = workspace_manager;
     }
 
     /// Point acceptance stall state at an isolated root (tests only).

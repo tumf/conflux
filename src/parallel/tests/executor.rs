@@ -1044,6 +1044,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         last_completed_analysis_input: None,
         next_analysis_signature_probe_at: None,
+        analysis_retry_throttle: None,
         analysis_input_probe: None,
     };
 
@@ -1191,6 +1192,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         last_completed_analysis_input: None,
         next_analysis_signature_probe_at: None,
+        analysis_retry_throttle: None,
         analysis_input_probe: None,
     };
 
@@ -1354,6 +1356,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         last_completed_analysis_input: None,
         next_analysis_signature_probe_at: None,
+        analysis_retry_throttle: None,
         analysis_input_probe: None,
     };
 
@@ -1572,6 +1575,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         last_completed_analysis_input: None,
         next_analysis_signature_probe_at: None,
+        analysis_retry_throttle: None,
         analysis_input_probe: None,
     };
 
@@ -1782,6 +1786,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         last_completed_analysis_input: None,
         next_analysis_signature_probe_at: None,
+        analysis_retry_throttle: None,
         analysis_input_probe: None,
     };
 
@@ -1998,6 +2003,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         diagnostic_dedup: DiagnosticDeduplicationStore::new(),
         last_completed_analysis_input: None,
         next_analysis_signature_probe_at: None,
+        analysis_retry_throttle: None,
         analysis_input_probe: None,
     };
 

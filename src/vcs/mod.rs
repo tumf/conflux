@@ -397,6 +397,26 @@ pub trait WorkspaceManager: Send + Sync {
     /// Returns None if the branch has not been captured yet.
     fn original_branch(&self) -> Option<String>;
 
+    /// Branch currently checked out at the repository root, or `None` for detached HEAD.
+    ///
+    /// Effective dependency-base selection compares this against the original branch, so it is
+    /// exposed through the same abstraction that resolves ref revisions. Keeping both behind
+    /// one boundary is what lets dependency classification and analysis-input signatures share
+    /// a single base identity instead of drifting apart.
+    async fn current_branch(&self) -> VcsResult<Option<String>> {
+        crate::vcs::git::commands::get_current_branch(self.repo_root()).await
+    }
+
+    /// Resolve the commit a named ref points to.
+    ///
+    /// For Git: `git rev-parse --verify <reference>^{commit}`.
+    ///
+    /// Dependency merge evidence is read from a named base ref, so callers must resolve that
+    /// ref rather than the checkout `HEAD` commit: the ref can advance while `HEAD` does not.
+    async fn revision_for_ref(&self, reference: &str) -> VcsResult<String> {
+        crate::vcs::git::commands::get_ref_revision(self.repo_root(), reference).await
+    }
+
     /// Find an existing workspace for the given change ID.
     ///
     /// If multiple workspaces exist for the same change_id, returns the newest
