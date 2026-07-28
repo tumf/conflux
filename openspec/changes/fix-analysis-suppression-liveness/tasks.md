@@ -9,7 +9,7 @@
 - [x] Schedule the first suppressed probe deadline when a completed signature is recorded and cap degraded deadlines at the five-minute expiry; completion requires no immediate 500 ms VCS/proposal probe after a healthy result and one degraded retry on the first eligible wake at or after exactly five paused-time minutes. (verification: integration - `cargo test parallel::tests::unchanged_analysis_input --lib`; verification-id: analysis-suppression-liveness-tests)
 - [x] Run repository quality gates and all default tests; completion requires `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test` to pass, with each new default-path timer test completing under one second. (verification: integration - `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test`; verification-id: analysis-suppression-liveness-tests)
 
-## Verification Evidence
+## Verification Evidence Notes
 
 Effective dependency-base authority (task 1):
 
