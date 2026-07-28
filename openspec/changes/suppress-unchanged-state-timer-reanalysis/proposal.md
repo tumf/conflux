@@ -43,10 +43,14 @@ The previous change intentionally rejected a queued-ID-only signature because th
 
 Add process-local scheduler bookkeeping for the last completed dependency-analysis input and suppress only ordinary timer-driven analysis when the current input is unchanged.
 
-- Define a deterministic analysis-input signature from the queued changes as presented to analysis, sorted in-flight IDs, available capacity, and repository-visible effective dependency-base revision or an equivalently authoritative workspace/git generation.
-- Include proposal-derived analysis inputs rather than only queued IDs. The signature must change when dependencies, priority/references used by the prompt, task/progress fields used by selection, or proposal content observable to the configured analyzer changes.
-- Capture the signature immediately before invoking dependency analysis and record that captured value only after the scheduler receives a usable analysis result, including the existing metadata-dependency fallback result.
+- Define a deterministic analysis-input signature from the queued changes as presented to analysis, the exact queued and in-flight proposal files referenced by the prompt, sorted in-flight IDs, available capacity, and repository-visible effective dependency-base revision.
+- Include proposal-derived analysis inputs rather than only queued IDs. The signature must change when dependencies, priority/references used by the prompt, task/progress fields used by selection, or analyzer-readable proposal content for either a queued or in-flight change changes.
+- Capture the signature immediately before invoking dependency analysis and record that captured value only after the scheduler receives a usable analysis result. Extend the analyzer result contract with runtime-only provenance so the scheduler can distinguish a healthy LLM or intentionally metadata-only result from a recoverable LLM failure that used metadata fallback.
 - For an ordinary non-bypass `Initial` timer evaluation, skip dependency analysis when the current signature equals the last completed signature. Emit a deduplicated observable reason for the skip.
+- A healthy result may suppress the same ordinary timer input indefinitely. A recoverable-failure metadata fallback records a degraded signature that expires after a fixed five-minute retry interval, permitting one LLM retry for unchanged input without restoring the rapid loop.
+- Do not arm suppression when analysis produces no selected dispatch while capacity is positive and no work is in flight. Leave that input eligible for the next debounced timer analysis so a non-deterministic erroneous dependency result cannot permanently freeze an otherwise idle scheduler.
+- Signature construction is fail-open. A proposal read or repository revision error yields no signature, cannot suppress or record analysis, emits a deduplicated warning, and does not terminate the scheduler loop.
+- Bound signature probing to no more often than the existing ten-second queue debounce cadence while an input is suppressed. A 500 ms wake must not spawn a VCS subprocess; effective-base revision may be refreshed only at the bounded probe cadence or by an existing repository event.
 - Do not apply the signature gate to real queue additions, completion, repair-candidate, or slot-recovery edges. Those events retain one immediate evaluation per edge even if their analysis input signature is otherwise equal.
 - When queued inputs, in-flight membership, available capacity, or repository-visible integration evidence changes, the signature differs and timer evaluation may analyze again without requiring user action.
 - Preserve the v0.6.200 one-shot trigger lifetime fix. The one-shot edge layer and unchanged ordinary-timer input layer solve separate replay mechanisms and are both required.
@@ -62,15 +66,16 @@ The implementation should reuse existing queue classification and reconciliation
 - Each new completion, repair-candidate, or slot-recovery edge immediately permits one analysis and retains the existing one-shot consumption behavior.
 - A change in queued analysis input, in-flight membership, available capacity, or effective dependency-base revision permits re-analysis and capacity recovery dispatch without user action.
 - Analysis input changes that retain the same change ID, such as proposal dependency or prompt-relevant metadata changes, invalidate the previous signature.
-- An LLM command failure that successfully produces the existing metadata-dependency fallback is treated as a completed degraded analysis for unchanged-state suppression; timer wakes do not repeatedly invoke the failing LLM for the same input.
-- A terminal analyzer path that produces no usable analysis result does not falsely establish a completed-input signature.
+- An LLM command failure that successfully produces the existing metadata-dependency fallback is treated as a degraded completed analysis; unchanged timer wakes do not rapidly repeat it, but exactly one retry becomes eligible after the fixed five-minute degraded interval.
+- A healthy LLM result and an intentionally configured metadata-only result are distinguishable from recoverable-failure fallback, so only the failure fallback uses bounded suppression.
+- A terminal analyzer path that produces no usable analysis result, a signature construction failure, or a zero-dispatch result with positive capacity and no in-flight work does not falsely establish a completed-input signature.
 - Queue classification, reducer reconciliation, dependency blocker checks, and operator-visible diagnostics remain available before an expensive analysis is suppressed.
 - No durable out-of-worktree workflow-control state is added, and process restart begins with no prior analysis signature.
 
 ## Explicit Completion Conditions
 
-- Scheduler runtime state has a typed, deterministic analysis-input signature with documented ordering and repository revision semantics; it is not stored in `~/.local/state/cflx` or another durable location.
-- Ordinary timer analysis checks the signature after queue classification/reconciliation and debounce eligibility but before analyzer invocation; explicit bypass reasons do not use this suppression path.
+- Scheduler runtime state has a typed, deterministic analysis-input signature with documented ordering, queued and in-flight proposal digest, repository revision, healthy/degraded provenance, and degraded-expiry semantics; it is not stored in `~/.local/state/cflx` or another durable location.
+- Ordinary timer analysis checks the signature after queue classification/reconciliation and debounce eligibility but before analyzer invocation; explicit bypass reasons do not use this suppression path. Suppressed-state fingerprint probes occur at most once per existing ten-second debounce interval, not on every 500 ms wake.
 - Signature capture uses the pre-analysis snapshot. A queue or repository change occurring during analysis cannot be hidden by recomputing and storing only the post-analysis state.
 - The existing metadata fallback path communicates a usable result consistently enough that the scheduler records the completed input once and does not retry the same failing LLM on every timer wake.
 - Loop-level paused-time regression coverage reproduces the v0.6.200 state with an analyzer invocation counter and fails if unchanged timer wakes invoke analysis more than once.

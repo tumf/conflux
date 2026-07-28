@@ -16,9 +16,13 @@ resolve、workspace、merge completion、repair candidate addition、または s
 
 scheduler は ordinary timer-driven dependency analysis の直前に、queued change の analysis 入力、in-flight membership、利用可能 capacity、および repository-visible effective dependency-base evidence を表す deterministic runtime signature を評価しなければならない（MUST）。同じ signature に対する usable analysis result が active process 内ですでに完了している場合、明示的な新しい queue addition、completion、repair candidate、または slot recovery event を伴わない timer wake は高価な dependency analyzer を再実行してはならない（MUST NOT）。
 
-signature は同一 change ID の proposal dependency、prompt-relevant metadata、または analyzer が読む proposal content の変更を識別できなければならず（MUST）、queued ID と件数だけで構成してはならない（MUST NOT）。effective dependency-base revision または同等の repository-visible integration generation が変化した場合も signature は変化しなければならない（MUST）。
+signature は同一 change ID の proposal dependency、prompt-relevant metadata、または analyzer が読む proposal content の変更を識別できなければならず（MUST）、queued ID と件数だけで構成してはならない（MUST NOT）。queued と in-flight の双方について prompt が参照する proposal file content を含めなければならない（MUST）。effective dependency-base revision が変化した場合も signature は変化しなければならない（MUST）。
 
-queue addition、completion、repair candidate、および slot recovery の明示的 edge trigger は、matching signature が存在しても event ごとに一度の即時 analysis を許可しなければならない（MUST）。usable LLM result または既存の metadata-dependency fallback result が完了した場合、scheduler は analysis 開始前に取得した signature を completed input として記録しなければならない（MUST）。usable result を生成しない terminal analyzer path は completed signature を記録してはならない（MUST NOT）。
+signature 構築に必要な proposal read または revision resolution が失敗した場合、scheduler は fail-open で dependency analysis を許可し、signature を記録せず、loop を終了してはならない（MUST）。suppressed input の fingerprint probe は既存の 10 秒 queue debounce cadence より頻繁に実行してはならず（MUST NOT）、500 ms timer wake ごとに VCS subprocess を起動してはならない（MUST NOT）。
+
+queue addition、completion、repair candidate、および slot recovery の明示的 edge trigger は、matching signature が存在しても event ごとに一度の即時 analysis を許可しなければならない（MUST）。scheduler は analyzer result provenance を runtime 内で識別しなければならない（MUST）。healthy LLM result または意図的な metadata-only result は non-expiring completed signature を記録してよい。recoverable LLM failure による metadata fallback は degraded signature として記録し、5 分後に unchanged input に対する一度の retry を許可しなければならない（MUST）。usable result を生成しない terminal analyzer path は completed signature を記録してはならない（MUST NOT）。
+
+analysis 後も available capacity が正で、in-flight work が空であり、selected dispatch が 0 件である場合、scheduler はその result による suppression を記録してはならない（MUST NOT）。次の debounce-eligible timer evaluation は同じ input を再分析できなければならない（MUST）。
 
 manual resolve、automatic resolve、workspace task、background merge、deferred retry、または failure / early-return path によって利用可能スロットが回復する場合、scheduler は explicit wake event、slot recovery detection、または現在 signature の変化を検出する有限時間 timer evaluation により queued work を再評価しなければならない（MUST）。sticky な過去 trigger または unchanged completed signature の反復利用だけを capacity-recovery liveness の根拠としてはならない（MUST NOT）。
 
@@ -80,13 +84,39 @@ TUI は distinct な re-analysis attempt を operator-visible に表示しなけ
 - **THEN** analysis input signature は変化する
 - **AND** scheduler は updated repository evidence に対して dependency analysis と dispatch eligibility を再評価する
 
-#### Scenario: metadata fallbackはunchanged failing inputの反復を止める
+#### Scenario: metadata fallbackはrapid retryを止めて有界に復旧する
 
 - **GIVEN** configured LLM analysis command は現在の input に対して recoverable failure を返す
-- **AND** scheduler は metadata-dependency fallback から usable analysis result を得る
-- **WHEN** state change または明示的 edge のない timer wake が繰り返される
+- **AND** scheduler は metadata-dependency fallback から usable degraded result を得る
+- **WHEN** state change または明示的 edge のない timer wake が5分未満の間に繰り返される
 - **THEN** scheduler は同じ failing LLM command を反復起動しない
-- **AND** queue、capacity、proposal、repository evidence、または明示的 edge が変化すれば新しい attempt を実行できる
+- **WHEN** degraded result の記録から5分が経過する
+- **THEN** scheduler は unchanged input に対して一度の LLM retry を許可する
+- **AND** healthy result を得た場合は同じ unchanged input を時間経過だけで再実行しない
+- **AND** queue、capacity、proposal、repository evidence、または明示的 edge が変化すれば5分を待たず新しい attempt を実行できる
+
+#### Scenario: positive capacityのzero dispatchは永久抑止しない
+
+- **GIVEN** queued に classification 上 dispatchable な candidate が存在する
+- **AND** available capacity は正で in-flight work は空である
+- **WHEN** dependency analysis result により selected dispatch が0件になる
+- **THEN** scheduler はその result を unchanged-input suppression として記録しない
+- **AND** 次の debounce-eligible timer evaluation は dependency analyzer を再実行できる
+
+#### Scenario: signature構築失敗はfail-openする
+
+- **GIVEN** proposal file read または effective-base revision resolution が失敗する
+- **WHEN** ordinary timer evaluation が dependency analysis eligibility を評価する
+- **THEN** scheduler は signature unavailable を理由に dependency analysis を抑止しない
+- **AND** completed signature を記録しない
+- **AND** scheduler loop は error をoperator-visibleにしつつ継続する
+
+#### Scenario: suppressed wakeはVCS probeを反復しない
+
+- **GIVEN** current input は completed signature と一致して抑止中である
+- **WHEN** 10秒の probe deadline 前に500 ms timer wakeが繰り返される
+- **THEN** scheduler は proposal fingerprintまたはVCS revisionを再取得しない
+- **AND** probe deadline後の最初のeligible evaluationでのみrepository-visible inputを再確認する
 
 #### Scenario: process restartはruntime suppression stateを継承しない
 

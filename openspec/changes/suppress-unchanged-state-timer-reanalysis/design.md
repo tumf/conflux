@@ -17,7 +17,7 @@ The signature represents the input that can change the dependency-analysis or di
 
 - queued change analysis fields in stable ID order;
 - prompt-relevant proposal input, including declared dependencies and frontmatter fields used by analysis;
-- a repository-visible fingerprint for proposal content the configured analyzer can read;
+- stable content digests of every queued and in-flight `proposal.md` path referenced by the prompt;
 - sorted in-flight change IDs;
 - available dispatch capacity and occupancy inputs that affect it;
 - the effective dependency-base revision or an equivalent authoritative git/tree generation used by dependency classification.
@@ -47,28 +47,32 @@ This placement avoids caching queue classification itself. Repository-visible ca
 
 ## Completion and Fallback Semantics
 
-The public analyzer closure currently returns `AnalysisResult`, and LLM execution failure is converted to a metadata-dependency fallback before the scheduler receives it. That fallback is a usable degraded analysis result, not a terminal analyzer failure.
+The public analyzer closure currently returns only `AnalysisResult`, while LLM execution failure is converted to a metadata-dependency fallback before the scheduler receives it. The implementation must extend this internal runtime contract with provenance: `HealthyLlm`, `IntentionalMetadataOnly`, or `RecoverableFailureFallback`. This provenance is process-local execution metadata, not workflow authority.
 
 Therefore:
 
-- successful LLM output records the captured signature;
-- successful metadata fallback records the captured signature;
+- healthy LLM output and intentionally configured metadata-only output record a non-expiring captured signature;
+- recoverable-failure metadata fallback records the captured signature as degraded with a fixed five-minute expiry;
+- after expiry, exactly one ordinary eligible analysis retry is permitted for unchanged input and may replace the degraded record;
 - an empty or otherwise unusable result that terminates before a dependency-analysis decision does not record a completed signature;
+- a result that selects no dispatch while capacity is positive and `in_flight` is empty does not record a completed signature;
 - recording happens against the pre-analysis snapshot, not a post-analysis recomputation.
 
-Treating fallback as completed prevents a broken or unavailable LLM command from being relaunched on every timer wake. A real queue, edge, capacity, proposal, or repository revision change still re-arms a retry.
+Bounded degraded suppression prevents a broken LLM command from being relaunched on every timer wake while still recovering after a transient outage. A real queue, edge, capacity, proposal, or repository revision change re-arms analysis immediately.
+
+## Signature Failure and Probe Cost
+
+The normative fingerprint is a stable digest of the exact analyzer-input materials: queued `Change` analysis fields in stable ID order, queued and in-flight proposal file contents referenced by the prompt, sorted in-flight IDs, available capacity, and effective dependency-base revision.
+
+Signature construction is fail-open. Any proposal-read or revision-resolution error returns `SignatureUnavailable`, emits a deduplicated warning, permits analysis, records no signature, and does not escape the scheduler loop.
+
+The ordinary scheduler wakes every 500 ms, but signature probing must not run a VCS command at that frequency. Once an input is suppressed, the next fingerprint/revision probe is eligible no more than once per existing ten-second queue debounce interval. Wakes before that deadline use the process-local suppression deadline only to avoid work; they do not inspect VCS or proposal files. Explicit edge reasons bypass suppression and proceed directly to fresh evaluation. If an existing repository-event-maintained revision is available, it may re-arm sooner; otherwise `get_current_revision()` is called only at the bounded probe point.
 
 ## Repository Fingerprint
 
-The preferred repository component is the effective dependency-base revision already exposed by the VCS workspace abstraction. Proposal input that may be dirty or not represented by base `HEAD` must also be represented. The implementation must choose the smallest repository-visible fingerprint that changes when files read by the analyzer change.
+The effective dependency-base revision is obtained through the existing VCS workspace abstraction at the bounded probe point. Dirty or uncommitted proposal input is represented independently by stable content digests of all queued and in-flight proposal paths emitted in the analyzer prompt.
 
-Acceptable implementations include:
-
-- a stable digest of the proposal files and prompt metadata for queued/in-flight changes plus effective base revision;
-- a repository tree/worktree status fingerprint scoped to those proposal paths plus effective base revision;
-- an existing equivalent repository generation if code inspection proves it covers both committed integration and relevant working-tree proposal changes.
-
-A timestamp string alone is insufficient unless its producer is proven to change for every relevant content change. The signature unit tests must mutate same-ID proposal input and observe inequality.
+A different mechanism is allowed only if implementation evidence proves byte-equivalent invalidation for every queued/in-flight proposal input and effective-base change covered by the normative digest. A timestamp, queued ID set, or worktree status category alone is insufficient. Signature tests must mutate same-ID queued and in-flight proposal content independently and observe inequality.
 
 ## Invariants
 
@@ -103,9 +107,9 @@ Rejected because proposal content, dependency metadata, and effective-base integ
 
 Rejected because runtime analysis output must not become hidden authoritative workflow state. Fresh explicit edges and repository changes must invoke analysis.
 
-### Long periodic safety retry
+### Long periodic safety retry for healthy results
 
-Not included in the initial design. A periodic retry weakens the requirement that timer-only unchanged input remain quiescent. It is unnecessary if the signature covers all actual analysis inputs and effective repository evidence. Add it only through a later change backed by a demonstrated unobservable input.
+Rejected because a healthy unchanged input should remain quiescent. The only periodic retry in this change is the fixed five-minute re-arm for a degraded recoverable-failure fallback, where recovery from a transient analyzer outage is a demonstrated requirement.
 
 ## Test Strategy
 
@@ -120,9 +124,13 @@ Required cases:
 - capacity changes without relying on a `SlotRecovery` reason invalidate the signature and reach dispatch evaluation;
 - changing dependencies or prompt-relevant proposal input for the same change ID invalidates the signature;
 - changing only effective dependency-base revision invalidates the signature;
-- a metadata fallback result records the signature and prevents repeated failing-LLM invocation for unchanged timer state;
+- a metadata fallback result records a degraded signature, suppresses rapid retries, and permits exactly one retry after five minutes; a subsequent healthy result becomes non-expiring;
 - an unusable empty result does not incorrectly suppress a later eligible attempt;
-- a queue/proposal change during analysis is detected on the next loop because the stored signature reflects the pre-analysis snapshot;
+- positive capacity with no in-flight work and zero selected dispatch does not arm suppression and remains eligible at the next debounced timer evaluation;
+- queued and in-flight same-ID proposal edits independently invalidate the signature;
+- signature-read and revision failures fail open without panic or recorded suppression;
+- suppressed 500 ms wakes before the ten-second probe deadline perform no proposal reads or VCS revision command;
+- a queue/proposal change during analysis is detected on the next eligible probe because the stored signature reflects the pre-analysis snapshot;
 - a new executor/runtime starts without a previous signature.
 
 All default tests must finish under one second. Timer behavior must use paused time rather than wall-clock sleeps.
