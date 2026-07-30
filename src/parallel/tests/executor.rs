@@ -11592,12 +11592,11 @@ async fn dispatch_scripted_repair_cycle(
             ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
                 observed.apply_invocations += 1;
             }
-            ExecutionEvent::Log(log) => {
+            ExecutionEvent::Log(log)
                 if matches!(log.level, crate::events::LogLevel::Error)
-                    && log.operation.as_deref() == Some("acceptance")
-                {
-                    observed.acceptance_error_logs.push(log.message.clone());
-                }
+                    && log.operation.as_deref() == Some("acceptance") =>
+            {
+                observed.acceptance_error_logs.push(log.message.clone());
             }
             _ => {}
         }
