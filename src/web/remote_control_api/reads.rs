@@ -19,6 +19,7 @@ use super::dto::{
     ALL_ERROR_CODES, API_VERSION, COMMAND_RECORD_TTL_SECS, MAX_COMMAND_RECORDS,
     MAX_CORRELATION_ID_LEN, MAX_EVENTS, MAX_LOGS, SUPPORTED_COMMANDS,
 };
+use super::worktrees::{WorktreeCapabilities, WorktreeResponse, WorktreesResponse};
 use super::RemoteControlState;
 
 /// Responses describe a live process, so nothing may be cached anywhere.
@@ -84,6 +85,7 @@ pub async fn capabilities(State(state): State<RemoteControlState>) -> Response {
             max_correlation_id_len: MAX_CORRELATION_ID_LEN,
         },
         authentication_required: state.auth.is_enforced(),
+        worktrees: WorktreeCapabilities::default(),
     })
 }
 
@@ -163,6 +165,86 @@ pub async fn get_change(
         None => ApiError::new(
             ErrorCode::NotFound,
             format!("change '{change_id}' is not present in this instance"),
+            &correlation.0,
+        )
+        .with_revision(state_revision)
+        .into_response(),
+    }
+}
+
+/// Current worktrees, each with the opaque ID that addresses it.
+///
+/// Unlike the other reads this one observes the repository rather than the
+/// projection, because worktree existence is a filesystem/Git fact and a stale
+/// projection of it would hand a client an ID that no longer names anything.
+#[utoipa::path(
+    get,
+    path = "/api/v2/worktrees",
+    tag = "remote-control",
+    responses(
+        (status = 200, description = "Current worktrees with opaque IDs", body = WorktreesResponse),
+        (status = 409, description = "No worktree runtime is bound yet", body = ApiError),
+        (status = 500, description = "The repository could not be observed", body = ApiError)
+    )
+)]
+pub async fn list_worktrees(
+    State(state): State<RemoteControlState>,
+    Extension(correlation): Extension<CorrelationId>,
+) -> Response {
+    let state_revision = state.projection.revision();
+    match state.worktrees.list().await {
+        Ok(listing) => no_store(WorktreesResponse {
+            instance_id: state.projection.instance_id().to_string(),
+            state_revision,
+            repository_id: listing.repository_id,
+            worktrees: listing.worktrees,
+        }),
+        Err(failure) => ApiError::new(failure.error_code, failure.message, &correlation.0)
+            .with_revision(state_revision)
+            .into_response(),
+    }
+}
+
+/// One worktree, addressed only by its opaque ID.
+#[utoipa::path(
+    get,
+    path = "/api/v2/worktrees/{worktree_id}",
+    tag = "remote-control",
+    params(("worktree_id" = String, Path, description = "Opaque process-local worktree ID")),
+    responses(
+        (status = 200, description = "The requested worktree", body = WorktreeResponse),
+        (status = 404, description = "The ID is unknown or was retired", body = ApiError),
+        (status = 409, description = "No worktree runtime is bound yet", body = ApiError)
+    )
+)]
+pub async fn get_worktree(
+    State(state): State<RemoteControlState>,
+    Extension(correlation): Extension<CorrelationId>,
+    Path(worktree_id): Path<String>,
+) -> Response {
+    let state_revision = state.projection.revision();
+    let listing = match state.worktrees.list().await {
+        Ok(listing) => listing,
+        Err(failure) => {
+            return ApiError::new(failure.error_code, failure.message, &correlation.0)
+                .with_revision(state_revision)
+                .into_response()
+        }
+    };
+
+    match listing
+        .worktrees
+        .into_iter()
+        .find(|worktree| worktree.worktree_id == worktree_id)
+    {
+        Some(worktree) => no_store(WorktreeResponse {
+            instance_id: state.projection.instance_id().to_string(),
+            state_revision,
+            worktree,
+        }),
+        None => ApiError::new(
+            ErrorCode::WorktreeNotFound,
+            format!("worktree '{worktree_id}' is not a current resource in this instance"),
             &correlation.0,
         )
         .with_revision(state_revision)

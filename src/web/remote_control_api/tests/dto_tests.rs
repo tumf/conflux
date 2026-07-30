@@ -22,6 +22,12 @@ fn closed_command_set_matches_the_advertised_list() {
                 r#"{"type":"set_queue_intent","change_id":"a","queued":true}"#.to_string()
             }
             "retry_errors" => r#"{"type":"retry_errors","change_ids":["a"]}"#.to_string(),
+            "create_worktree" => {
+                r#"{"type":"create_worktree","target":{"change_id":"a"},"params":{}}"#.to_string()
+            }
+            "delete_worktree" | "merge_worktree" => {
+                format!(r#"{{"type":"{name}","target":{{"worktree_id":"a"}},"params":{{}}}}"#)
+            }
             _ => format!(r#"{{"type":"{name}","change_id":"a"}}"#),
         };
         let parsed: CommandSpec =

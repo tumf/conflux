@@ -451,6 +451,67 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/StateResponse'
+  /api/v2/worktrees:
+    get:
+      tags:
+      - remote-control
+      summary: Current worktrees, each with the opaque ID that addresses it.
+      description: |-
+        Unlike the other reads this one observes the repository rather than the
+        projection, because worktree existence is a filesystem/Git fact and a stale
+        projection of it would hand a client an ID that no longer names anything.
+      operationId: list_worktrees
+      responses:
+        '200':
+          description: Current worktrees with opaque IDs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorktreesResponse'
+        '409':
+          description: No worktree runtime is bound yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: The repository could not be observed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+  /api/v2/worktrees/{worktree_id}:
+    get:
+      tags:
+      - remote-control
+      summary: One worktree, addressed only by its opaque ID.
+      operationId: get_worktree
+      parameters:
+      - name: worktree_id
+        in: path
+        description: Opaque process-local worktree ID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The requested worktree
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorktreeResponse'
+        '404':
+          description: The ID is unknown or was retired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '409':
+          description: No worktree runtime is bound yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
   /api/v2/ws:
     get:
       tags:
@@ -552,6 +613,7 @@ components:
       - error_codes
       - limits
       - authentication_required
+      - worktrees
       properties:
         api_version:
           type: string
@@ -580,6 +642,9 @@ components:
           items:
             $ref: '#/components/schemas/TransportDescriptor'
           description: Supported event transports and their required client style.
+        worktrees:
+          $ref: '#/components/schemas/WorktreeCapabilities'
+          description: The complete worktree surface, including its conflict-recovery boundary.
     CapabilityLimits:
       type: object
       description: Retention and admission limits advertised to clients.
@@ -732,6 +797,21 @@ components:
           format: int32
           description: Total number of tasks
           minimum: 0
+    ChangeTarget:
+      type: object
+      description: |-
+        Change-addressed command target.
+
+        `deny_unknown_fields` is the security property, not a nicety: it is what makes
+        a smuggled `path`, `branch`, or `base_commit` a schema failure instead of a
+        silently ignored field.
+      required:
+      - change_id
+      properties:
+        change_id:
+          type: string
+          description: Managed, non-archived change ID.
+      additionalProperties: false
     ChangesResponse:
       type: object
       description: '`GET /api/v2/changes` body.'
@@ -966,6 +1046,59 @@ components:
             type: string
             enum:
             - resolve_merge
+      - type: object
+        description: |-
+          Create the managed worktree for an eligible change.
+
+          The change ID is the *only* input: branch, path, and base commit are all
+          server-derived, so no client can steer where the worktree lands or what
+          it is cut from.
+        required:
+        - target
+        - type
+        properties:
+          params:
+            $ref: '#/components/schemas/EmptyParams'
+            description: Reserved and always empty.
+          target:
+            $ref: '#/components/schemas/ChangeTarget'
+            description: The change to create a worktree for.
+          type:
+            type: string
+            enum:
+            - create_worktree
+      - type: object
+        description: Delete a worktree addressed by its opaque ID.
+        required:
+        - target
+        - type
+        properties:
+          params:
+            $ref: '#/components/schemas/EmptyParams'
+            description: Reserved and always empty. There is no teardown bypass or force flag.
+          target:
+            $ref: '#/components/schemas/WorktreeTarget'
+            description: The worktree to delete.
+          type:
+            type: string
+            enum:
+            - delete_worktree
+      - type: object
+        description: Merge a worktree's branch into base.
+        required:
+        - target
+        - type
+        properties:
+          params:
+            $ref: '#/components/schemas/EmptyParams'
+            description: Reserved and always empty.
+          target:
+            $ref: '#/components/schemas/WorktreeTarget'
+            description: The worktree to merge.
+          type:
+            type: string
+            enum:
+            - merge_worktree
       description: |-
         The closed v2 command set.
 
@@ -990,6 +1123,14 @@ components:
           type: string
         success:
           type: boolean
+    EmptyParams:
+      type: object
+      description: |-
+        A parameter object that accepts nothing.
+
+        Present so the wire shape is stable if a parameter is ever added, and so that
+        every unrecognized parameter fails validation today.
+      additionalProperties: false
     ErrorCode:
       type: string
       description: |-
@@ -1009,6 +1150,11 @@ components:
       - idempotency_mismatch
       - registry_capacity
       - validation_failed
+      - worktree_exists
+      - worktree_not_found
+      - worktree_dirty
+      - worktree_dirty_unknown
+      - merge_conflict
       - internal_error
     ErrorResponse:
       type: object
@@ -1397,6 +1543,67 @@ components:
         path:
           type: string
           description: Path the transport is served on.
+    WorktreeCapabilities:
+      type: object
+      description: Worktree section of `GET /api/v2/capabilities`.
+      required:
+      - operations
+      - merge_conflict_recovery
+      - merge_conflict_preserves_state
+      - delete_requires_teardown
+      properties:
+        delete_requires_teardown:
+          type: boolean
+          description: True when deletion always runs managed teardown with no bypass.
+        merge_conflict_preserves_state:
+          type: boolean
+          description: True when a conflicting merge leaves the intermediate Git state in place.
+        merge_conflict_recovery:
+          type: string
+          description: How a merge conflict is recovered from. Always `local_or_tui_required`.
+        operations:
+          type: array
+          items:
+            type: string
+          description: Advertised operations. Nothing outside this list is reachable.
+    WorktreeConflict:
+      type: object
+      description: Conflict evidence attached to a worktree or a failed merge.
+      required:
+      - files
+      - recovery
+      properties:
+        files:
+          type: array
+          items:
+            type: string
+          description: Repository-relative conflicted paths.
+        recovery:
+          type: string
+          description: How the conflict must be resolved. Always `local_or_tui_required`.
+    WorktreeEligibility:
+      type: object
+      description: Which operations this worktree can currently accept, and why not.
+      required:
+      - deletable
+      - mergeable
+      properties:
+        deletable:
+          type: boolean
+          description: True when `delete_worktree` would pass its guards right now.
+        delete_blocked_reason:
+          type:
+          - string
+          - 'null'
+          description: Why deletion is refused, when it is.
+        merge_blocked_reason:
+          type:
+          - string
+          - 'null'
+          description: Why merging is refused, when it is.
+        mergeable:
+          type: boolean
+          description: True when `merge_worktree` would pass its guards right now.
     WorktreeInfo:
       type: object
       description: Information about a git worktree
@@ -1435,6 +1642,117 @@ components:
         path:
           type: string
           description: Path to the worktree
+    WorktreeResource:
+      type: object
+      description: One worktree as `/api/v2` exposes it.
+      required:
+      - worktree_id
+      - repository_id
+      - path
+      - branch
+      - head
+      - is_main
+      - is_detached
+      - has_commits_ahead
+      - operations
+      properties:
+        branch:
+          type: string
+          description: Checked-out branch, empty when detached.
+        conflict:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/WorktreeConflict'
+            description: Conflict evidence, when a base merge would conflict or already has.
+        dirty:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Uncommitted-change state. `null` means it could not be determined, which
+            makes the worktree undeletable rather than deletable.
+        has_commits_ahead:
+          type: boolean
+          description: True when this branch has commits base does not have.
+        head:
+          type: string
+          description: Current HEAD commit.
+        is_detached:
+          type: boolean
+          description: True when HEAD is detached.
+        is_main:
+          type: boolean
+          description: True for the repository's main worktree.
+        operations:
+          $ref: '#/components/schemas/WorktreeEligibility'
+          description: Current operation eligibility.
+        path:
+          type: string
+          description: Repository-relative display path. Never the canonical or absolute root.
+        repository_id:
+          type: string
+          description: 16-hex FNV-1a repository correlation ID. Not a secret, not authorization.
+        worktree_id:
+          type: string
+          description: Random 128-bit process-local hexadecimal ID. The only mutation identity.
+    WorktreeResponse:
+      type: object
+      description: '`GET /api/v2/worktrees/{worktree_id}` body.'
+      required:
+      - instance_id
+      - state_revision
+      - worktree
+      properties:
+        instance_id:
+          type: string
+          description: Process incarnation ID.
+        state_revision:
+          type: integer
+          format: int64
+          description: Revision the worktree was read at.
+          minimum: 0
+        worktree:
+          $ref: '#/components/schemas/WorktreeResource'
+          description: The requested worktree.
+    WorktreeTarget:
+      type: object
+      description: |-
+        Worktree-addressed command target.
+
+        Only the opaque process-local ID addresses a worktree. A path, a branch, or a
+        repository correlation ID is never accepted as mutation identity.
+      required:
+      - worktree_id
+      properties:
+        worktree_id:
+          type: string
+          description: Opaque 128-bit hexadecimal worktree ID from a v2 read.
+      additionalProperties: false
+    WorktreesResponse:
+      type: object
+      description: '`GET /api/v2/worktrees` body.'
+      required:
+      - instance_id
+      - state_revision
+      - repository_id
+      - worktrees
+      properties:
+        instance_id:
+          type: string
+          description: Process incarnation ID.
+        repository_id:
+          type: string
+          description: Repository correlation ID shared by every listed worktree.
+        state_revision:
+          type: integer
+          format: int64
+          description: Revision the list was read at.
+          minimum: 0
+        worktrees:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorktreeResource'
+          description: Current worktrees.
 tags:
 - name: health
   description: Health check endpoints

@@ -43,46 +43,108 @@ fn set_delete_worktree_test_outcome(path: PathBuf, outcome: DeleteWorktreeTestOu
         .insert(path, outcome);
 }
 
-#[cfg(test)]
-async fn remove_worktree_for_tui(
-    _repo_root: &Path,
-    path: &Path,
-    _skip_teardown: bool,
-) -> crate::error::Result<()> {
-    let outcome = DELETE_WORKTREE_TEST_OUTCOMES
-        .lock()
-        .expect("delete worktree test outcomes lock")
-        .remove(path)
-        .unwrap_or(DeleteWorktreeTestOutcome::Success);
+use super::worktrees::load_worktrees_with_conflict_check;
+use crate::worktree_ops::service::{
+    ConflictPolicy, DeleteOptions, WorktreeBackend, WorktreeEventSink, WorktreeOperationEvent,
+    WorktreeService,
+};
 
-    match outcome {
-        DeleteWorktreeTestOutcome::Success => Ok(()),
-        DeleteWorktreeTestOutcome::Failure(message) => {
-            Err(crate::error::OrchestratorError::GitCommand(format!(
-                "stubbed delete failure for {}: {}",
-                path.display(),
-                message
-            )))
-        }
+/// Publish shared worktree operation events onto the TUI's orchestrator channel.
+///
+/// This is the whole reason the TUI and `/api/v2` cannot drift on merge
+/// reporting: both frontends emit from the same points in the same service, and
+/// only the projection into their own event vocabulary differs.
+struct TuiWorktreeEvents {
+    tx: mpsc::Sender<OrchestratorEvent>,
+    repo_root: std::path::PathBuf,
+}
+
+#[async_trait::async_trait]
+impl WorktreeEventSink for TuiWorktreeEvents {
+    async fn emit(&self, event: WorktreeOperationEvent) {
+        let projected = match event {
+            WorktreeOperationEvent::MergeStarted { branch } => {
+                OrchestratorEvent::BranchMergeStarted {
+                    branch_name: branch,
+                }
+            }
+            WorktreeOperationEvent::MergeCompleted { branch } => {
+                OrchestratorEvent::BranchMergeCompleted {
+                    branch_name: branch,
+                }
+            }
+            WorktreeOperationEvent::MergeFailed { branch, error } => {
+                OrchestratorEvent::BranchMergeFailed {
+                    branch_name: branch,
+                    error,
+                }
+            }
+            WorktreeOperationEvent::Refreshed => {
+                match load_worktrees_with_conflict_check(&self.repo_root).await {
+                    Ok(worktrees) => OrchestratorEvent::WorktreesRefreshed { worktrees },
+                    Err(error) => OrchestratorEvent::Log(LogEntry::error(format!(
+                        "Failed to refresh worktrees: {}",
+                        error
+                    ))),
+                }
+            }
+            // Creation and removal are reported by the handler's own log lines.
+            WorktreeOperationEvent::Created { .. } | WorktreeOperationEvent::Deleted { .. } => {
+                return
+            }
+        };
+        let _ = self.tx.send(projected).await;
     }
 }
 
+/// Backend the TUI drives the shared service with.
+///
+/// Swapped for a stub under `cfg(test)` for the same reason the previous direct
+/// removal helper was: these handlers are unit-tested, and a unit test must not
+/// reach a real repository.
 #[cfg(not(test))]
-async fn remove_worktree_for_tui(
+fn build_worktree_backend(
     repo_root: &Path,
-    path: &Path,
-    skip_teardown: bool,
-) -> crate::error::Result<()> {
-    crate::vcs::git::commands::worktree_remove_with_options(
-        repo_root,
-        path.to_string_lossy().as_ref(),
-        crate::vcs::git::commands::WorktreeRemoveOptions { skip_teardown },
+    config: &OrchestratorConfig,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+) -> Arc<dyn WorktreeBackend> {
+    Arc::new(
+        crate::worktree_ops::git_backend::GitWorktreeBackend::new(
+            repo_root.to_path_buf(),
+            Arc::new(config.clone()),
+        )
+        .with_hook_events(tx.clone()),
     )
-    .await
-    .map_err(crate::error::OrchestratorError::from)
 }
 
-use super::worktrees::load_worktrees_with_conflict_check;
+#[cfg(test)]
+fn build_worktree_backend(
+    _repo_root: &Path,
+    _config: &OrchestratorConfig,
+    _tx: &mpsc::Sender<OrchestratorEvent>,
+) -> Arc<dyn WorktreeBackend> {
+    Arc::new(tests::StubWorktreeBackend)
+}
+
+/// Build the shared worktree operation service for the current TUI context.
+fn build_worktree_service(
+    repo_root: &Path,
+    config: &OrchestratorConfig,
+    tx: &mpsc::Sender<OrchestratorEvent>,
+) -> WorktreeService {
+    let workspace_base_dir = config
+        .get_workspace_base_dir()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::config::defaults::default_workspace_base_dir(Some(repo_root)));
+    WorktreeService::new(
+        build_worktree_backend(repo_root, config, tx),
+        Arc::new(TuiWorktreeEvents {
+            tx: tx.clone(),
+            repo_root: repo_root.to_path_buf(),
+        }),
+        workspace_base_dir,
+    )
+}
 
 /// Context for TuiCommand handling
 pub struct TuiCommandContext<'a> {
@@ -354,8 +416,16 @@ pub async fn handle_tui_command(
             )));
             debug_assert_eq!(outcome.mutation, QueueMutation::Removed);
         }
-        TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
-            let delete_result = remove_worktree_for_tui(ctx.repo_root, &path, skip_teardown).await;
+        TuiCommand::DeleteWorktreeByPath(path, _branch_name, skip_teardown) => {
+            // Adapter only: the shared service owns the delete guards, mandatory
+            // teardown ordering, branch cleanup, and the refresh event. The TUI
+            // keeps its local recovery `skip_teardown` escape hatch and its
+            // documented fail-open behavior for an unobservable dirty state;
+            // `/api/v2` passes the fail-closed policy instead.
+            let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
+            let delete_result = service
+                .delete_worktree(&path, DeleteOptions::local(skip_teardown))
+                .await;
             ctx.app.clear_worktree_deleting(&path);
 
             match delete_result {
@@ -365,46 +435,6 @@ pub async fn handle_tui_command(
                         "Deleted worktree: {}",
                         path.display()
                     )));
-
-                    // Delete the associated branch if it exists
-                    if let Some(branch) = branch_name {
-                        match crate::vcs::git::commands::branch_delete(ctx.repo_root, &branch).await
-                        {
-                            Ok(_) => {
-                                info!("Branch deleted after worktree removal: {}", branch);
-                                ctx.app.add_log(LogEntry::success(format!(
-                                    "Deleted branch: {}",
-                                    branch
-                                )));
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Branch deletion failed for '{}' after worktree removal: {} (non-fatal)",
-                                    branch, e
-                                );
-                                ctx.app.add_log(LogEntry::warn(format!(
-                                    "Failed to delete branch '{}': {}",
-                                    branch, e
-                                )));
-                            }
-                        }
-                    }
-
-                    // Refresh worktree list with conflict check
-                    match load_worktrees_with_conflict_check(ctx.repo_root).await {
-                        Ok(worktrees) => {
-                            let _ = ctx
-                                .tx
-                                .send(OrchestratorEvent::WorktreesRefreshed { worktrees })
-                                .await;
-                        }
-                        Err(e) => {
-                            ctx.app.add_log(LogEntry::error(format!(
-                                "Failed to refresh worktrees: {}",
-                                e
-                            )));
-                        }
-                    }
                 }
                 Err(e) => {
                     ctx.app.show_warning_popup(
@@ -530,146 +560,29 @@ pub async fn handle_tui_command(
                 branch_name
             );
 
+            // Adapter only: the shared service owns the merge guards, the base
+            // merge itself, `on_merged` cardinality, and the merge event
+            // sequence. The TUI's policy difference is one value — a conflicting
+            // merge is aborted here, and preserved for `/api/v2` clients that
+            // have no way to resolve it remotely.
+            let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
             let merge_tx = ctx.tx.clone();
-            let merge_repo_root = ctx.repo_root.to_path_buf();
-            let merge_branch = branch_name.clone();
-            let merge_config = ctx.config.clone();
-            let merge_worktree_path = worktree_path.clone();
 
             tokio::spawn(async move {
-                debug!(
-                    "Sending BranchMergeStarted event for branch: {}",
-                    merge_branch
-                );
-                let _ = merge_tx
-                    .send(OrchestratorEvent::BranchMergeStarted {
-                        branch_name: merge_branch.clone(),
-                    })
-                    .await;
-
-                // FIX: Merge in base (main worktree), not in worktree directory
-                // This ensures working directory clean check happens on base side
-                debug!(
-                    "Executing merge in base repository: repo_root={}, branch={}",
-                    merge_repo_root.display(),
-                    merge_branch
-                );
-                match crate::vcs::git::commands::merge_branch(&merge_repo_root, &merge_branch).await
+                if let Err(error) = service
+                    .merge_worktree(&worktree_path, ConflictPolicy::AbortOnConflict)
+                    .await
                 {
-                    Ok(_) => {
-                        debug!("Merge succeeded for branch: {}", merge_branch);
-
-                        // Run on_merged hook before BranchMergeCompleted event (before merged status transition)
-                        // Try to extract change_id from branch name; if it fails, log a warning
-                        if let Some(change_id) =
-                            crate::vcs::GitWorkspaceManager::extract_change_id_from_worktree_name(
-                                &merge_branch,
-                            )
-                        {
-                            // Create hook runner from config
-                            let hooks_config = merge_config.get_hooks();
-                            let merge_repo_root = std::env::current_dir()
-                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                            let hooks = crate::hooks::HookRunner::with_event_tx(
-                                hooks_config,
-                                merge_repo_root,
-                                merge_tx.clone(),
-                            );
-
-                            // Fetch actual task counts from change data
-                            let (completed_tasks, total_tasks) =
-                                match crate::openspec::list_changes_native() {
-                                    Ok(changes) => changes
-                                        .iter()
-                                        .find(|c| c.id == change_id)
-                                        .map(|c| (c.completed_tasks, c.total_tasks))
-                                        .unwrap_or((0, 0)),
-                                    Err(e) => {
-                                        warn!(
-                                            "Failed to fetch task counts for on_merged hook: {}",
-                                            e
-                                        );
-                                        (0, 0)
-                                    }
-                                };
-
-                            let hook_context = crate::hooks::HookContext::new(
-                                0, // changes_processed not available in manual merge
-                                0, // total_changes not available
-                                0, // remaining_changes not available
-                                false,
-                            )
-                            .with_change(&change_id, completed_tasks, total_tasks)
-                            .with_apply_count(0)
-                            .with_parallel_context(&merge_worktree_path.to_string_lossy(), None);
-
-                            if let Err(e) = hooks
-                                .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
-                                .await
-                            {
-                                let message = format!(
-                                    "on_merged hook failed for '{}'; branch merged transition blocked: {}",
-                                    change_id, e
-                                );
-                                warn!("{}", message);
-                                let _ = merge_tx
-                                    .send(OrchestratorEvent::HookFailed {
-                                        change_id: change_id.clone(),
-                                        hook_type: crate::hooks::HookType::OnMerged.to_string(),
-                                        error: e.to_string(),
-                                    })
-                                    .await;
-                                let _ = merge_tx
-                                    .send(OrchestratorEvent::BranchMergeFailed {
-                                        branch_name: merge_branch.clone(),
-                                        error: message,
-                                    })
-                                    .await;
-                                return;
-                            }
-                        } else {
-                            warn!(
-                                "Could not extract change_id from branch name '{}', skipping on_merged hook",
-                                merge_branch
-                            );
-                        }
-
-                        // Send BranchMergeCompleted after on_merged hook (triggers merged status transition)
-                        let _ = merge_tx
-                            .send(OrchestratorEvent::BranchMergeCompleted {
-                                branch_name: merge_branch.clone(),
-                            })
-                            .await;
-
-                        // Refresh worktree list to update UI with conflict check
-                        debug!("Refreshing worktree list after successful merge");
-                        match load_worktrees_with_conflict_check(&merge_repo_root).await {
-                            Ok(worktrees) => {
-                                debug!("Worktree list refreshed: {} worktrees", worktrees.len());
-                                let _ = merge_tx
-                                    .send(OrchestratorEvent::WorktreesRefreshed { worktrees })
-                                    .await;
-                            }
-                            Err(e) => {
-                                debug!("Failed to refresh worktrees: {}", e);
-                                let _ = merge_tx
-                                    .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                                        "Failed to refresh worktrees: {}",
-                                        e
-                                    ))))
-                                    .await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Merge failed for branch {}: {}", merge_branch, e);
-                        let _ = merge_tx
-                            .send(OrchestratorEvent::BranchMergeFailed {
-                                branch_name: merge_branch,
-                                error: format!("{}", e),
-                            })
-                            .await;
-                    }
+                    // Failures that reached a known branch already published
+                    // `BranchMergeFailed`; this line is what reports the ones
+                    // that did not (a busy root, an unobservable worktree).
+                    debug!("Merge refused for branch {}: {}", branch_name, error);
+                    let _ = merge_tx
+                        .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                            "Merge failed for '{}': {}",
+                            branch_name, error
+                        ))))
+                        .await;
                 }
             });
         }
@@ -797,6 +710,84 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::RwLock;
+
+    use crate::worktree_ops::service::{
+        DirtyState, MergeAttempt, WorktreeFacts, WorktreeOpError, WorktreeOpResult,
+    };
+
+    /// Backend the TUI command handlers are unit-tested against.
+    ///
+    /// Every worktree registered through [`set_delete_worktree_test_outcome`] is
+    /// observable and deletable; `remove` replays that registered outcome. No
+    /// repository, process, or filesystem state is involved.
+    pub(super) struct StubWorktreeBackend;
+
+    #[async_trait::async_trait]
+    impl WorktreeBackend for StubWorktreeBackend {
+        async fn observe(&self) -> WorktreeOpResult<Vec<WorktreeFacts>> {
+            Ok(DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .keys()
+                .map(|path| {
+                    let mut facts = WorktreeFacts::new(path.clone(), "feature-a");
+                    facts.dirty = DirtyState::Clean;
+                    facts
+                })
+                .collect())
+        }
+
+        async fn base_head(&self) -> WorktreeOpResult<String> {
+            Ok("stubhead".to_string())
+        }
+
+        async fn create(
+            &self,
+            _path: &Path,
+            _branch: &str,
+            _base_commit: &str,
+        ) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+
+        async fn remove(&self, path: &Path, _skip_teardown: bool) -> WorktreeOpResult<()> {
+            let outcome = DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .remove(path)
+                .unwrap_or(DeleteWorktreeTestOutcome::Success);
+            match outcome {
+                DeleteWorktreeTestOutcome::Success => Ok(()),
+                DeleteWorktreeTestOutcome::Failure(message) => Err(WorktreeOpError::Internal(
+                    format!("stubbed delete failure for {}: {}", path.display(), message),
+                )),
+            }
+        }
+
+        async fn delete_branch(&self, _branch: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+
+        async fn merge_into_base(
+            &self,
+            _branch: &str,
+            _policy: ConflictPolicy,
+        ) -> WorktreeOpResult<MergeAttempt> {
+            Ok(MergeAttempt::Merged)
+        }
+
+        async fn run_on_merged(
+            &self,
+            _change_id: &str,
+            _worktree_path: &Path,
+        ) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+
+        async fn change_is_eligible(&self, _change_id: &str) -> WorktreeOpResult<()> {
+            Ok(())
+        }
+    }
 
     fn create_test_change(id: &str) -> Change {
         Change {

@@ -24,6 +24,7 @@ pub mod projection;
 pub mod reads;
 pub mod registry;
 pub mod stream;
+pub mod worktrees;
 
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use auth::{
 use dto::{CommandSpec, ErrorCode};
 use executor::{CommandFailure, ExecutionSummary, RemoteControlExecutor};
 use projection::Projection;
+use worktrees::{UnboundWorktreeOperations, WorktreeListing, WorktreeOperations};
 
 /// The only v2 path that is served without authentication.
 pub const HEALTH_PATH: &str = "/api/v2/health";
@@ -57,6 +59,9 @@ pub const HEALTH_PATH: &str = "/api/v2/health";
 pub struct RemoteControlRuntime {
     projection: Arc<Projection>,
     executor: tokio::sync::RwLock<Option<Arc<dyn RemoteControlExecutor>>>,
+    /// Worktree reads are bound separately from commands because the read routes
+    /// are mounted before any orchestration runtime exists.
+    worktrees: tokio::sync::RwLock<Option<Arc<dyn WorktreeOperations>>>,
 }
 
 impl Default for RemoteControlRuntime {
@@ -71,6 +76,7 @@ impl RemoteControlRuntime {
         Self {
             projection: Arc::new(Projection::new()),
             executor: tokio::sync::RwLock::new(None),
+            worktrees: tokio::sync::RwLock::new(None),
         }
     }
 
@@ -82,6 +88,11 @@ impl RemoteControlRuntime {
     /// Bind the delegation target once an orchestration runtime exists.
     pub async fn bind(&self, executor: Arc<dyn RemoteControlExecutor>) {
         *self.executor.write().await = Some(executor);
+    }
+
+    /// Bind the worktree port once a repository-backed service exists.
+    pub async fn bind_worktrees(&self, worktrees: Arc<dyn WorktreeOperations>) {
+        *self.worktrees.write().await = Some(worktrees);
     }
 
     /// True once commands can actually be delegated.
@@ -106,6 +117,38 @@ impl RemoteControlExecutor for RemoteControlRuntime {
     }
 }
 
+/// Delegate worktree reads to the bound port, refusing before one exists.
+#[async_trait]
+impl WorktreeOperations for RemoteControlRuntime {
+    async fn list(&self) -> Result<WorktreeListing, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.list().await,
+            None => UnboundWorktreeOperations.list().await,
+        }
+    }
+
+    async fn create(&self, change_id: &str) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.create(change_id).await,
+            None => UnboundWorktreeOperations.create(change_id).await,
+        }
+    }
+
+    async fn delete(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.delete(worktree_id).await,
+            None => UnboundWorktreeOperations.delete(worktree_id).await,
+        }
+    }
+
+    async fn merge(&self, worktree_id: &str) -> Result<ExecutionSummary, CommandFailure> {
+        match self.worktrees.read().await.clone() {
+            Some(port) => port.merge(worktree_id).await,
+            None => UnboundWorktreeOperations.merge(worktree_id).await,
+        }
+    }
+}
+
 /// Shared state for the v2 router.
 #[derive(Clone)]
 pub struct RemoteControlState {
@@ -115,6 +158,8 @@ pub struct RemoteControlState {
     pub auth: Arc<RemoteControlAuth>,
     /// Delegation target for admitted commands.
     pub executor: Arc<dyn RemoteControlExecutor>,
+    /// Worktree reads. Defaults to the unbound port, which refuses.
+    pub worktrees: Arc<dyn WorktreeOperations>,
 }
 
 impl RemoteControlState {
@@ -128,7 +173,14 @@ impl RemoteControlState {
             projection,
             auth,
             executor,
+            worktrees: Arc::new(UnboundWorktreeOperations),
         }
+    }
+
+    /// Attach the worktree read port.
+    pub fn with_worktrees(mut self, worktrees: Arc<dyn WorktreeOperations>) -> Self {
+        self.worktrees = worktrees;
+        self
     }
 }
 
@@ -146,6 +198,8 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/changes", get(reads::list_changes))
         .route("/api/v2/changes/{change_id}", get(reads::get_change))
         .route("/api/v2/logs", get(reads::logs))
+        .route("/api/v2/worktrees", get(reads::list_worktrees))
+        .route("/api/v2/worktrees/{worktree_id}", get(reads::get_worktree))
         .route("/api/v2/commands", post(commands::submit_command))
         .route("/api/v2/commands/{command_id}", get(commands::get_command))
         .route("/api/v2/events", get(stream::events))

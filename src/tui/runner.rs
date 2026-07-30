@@ -435,6 +435,35 @@ async fn run_tui_loop(
             Arc::new(HookRunnerQueueHooks::new(hook_runner)),
             app.execution_marks(),
         ));
+        // The remote worktree port is built once and bound to both halves of v2:
+        // the read routes and the command executor must agree about which
+        // worktrees exist and which opaque IDs address them.
+        let workspace_base_dir = config
+            .get_workspace_base_dir()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                crate::config::defaults::default_workspace_base_dir(Some(&repo_root))
+            });
+        let worktree_service = Arc::new(crate::worktree_ops::service::WorktreeService::new(
+            Arc::new(
+                crate::worktree_ops::git_backend::GitWorktreeBackend::new(
+                    repo_root.clone(),
+                    Arc::new(config.clone()),
+                )
+                .with_hook_events(tx.clone()),
+            ),
+            Arc::new(crate::worktree_ops::service::NullEventSink),
+            workspace_base_dir,
+        ));
+        let worktree_port: Arc<dyn crate::web::remote_control_api::worktrees::WorktreeOperations> =
+            Arc::new(
+                crate::web::remote_control_api::worktrees::RemoteWorktreeOperations::new(
+                    worktree_service,
+                    Arc::new(crate::web::remote_control_api::worktrees::WorktreeRegistry::new()),
+                    repo_root.clone(),
+                ),
+            );
+
         let runtime = ws.remote_control();
         runtime
             .bind(Arc::new(
@@ -442,9 +471,11 @@ async fn run_tui_loop(
                     service,
                     ws.clone(),
                     runtime.projection(),
-                ),
+                )
+                .with_worktrees(worktree_port.clone()),
             ))
             .await;
+        runtime.bind_worktrees(worktree_port).await;
     }
 
     // Manual resolve counter for tracking active manual resolves
