@@ -76,10 +76,8 @@ pub enum SpineCommitClass {
 fn parse_change_integration_subject(subject: &str) -> Option<Vec<String>> {
     let rest = if let Some(rest) = subject.strip_prefix(MERGE_CHANGES_PREFIX) {
         rest
-    } else if let Some(rest) = subject.strip_prefix(MERGE_CHANGE_PREFIX) {
-        rest
     } else {
-        return None;
+        subject.strip_prefix(MERGE_CHANGE_PREFIX)?
     };
 
     let ids: Vec<String> = rest
