@@ -109,11 +109,66 @@ cflx --web
 # Headless run with web monitoring
 cflx run --web
 
-# Custom port and bind address
-cflx --web --web-port 9000 --web-bind 0.0.0.0
+# Custom port, plus a bearer token because the bind is not loopback
+export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
+cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
 ```
 
 Access the dashboard at `http://localhost:<port>/` (port shown in startup log).
+
+### Binding beyond loopback
+
+A non-loopback `--web-bind` requires a bearer token, and the process refuses to
+start without one. Supply it with either:
+
+- `--web-auth-token-env VAR` — recommended; the value never appears in the
+  process's command line.
+- `--web-auth-token TOKEN` — a literal value, visible to anything that can
+  inspect process arguments.
+
+The two are mutually exclusive.
+
+### Remote-control API (`/api/v2`)
+
+Alongside the dashboard, a single running process exposes a versioned
+remote-control contract for scripts and tooling:
+
+```bash
+BASE=http://localhost:9000/api/v2
+AUTH="Authorization: Bearer $CFLX_WEB_TOKEN"
+
+curl "$BASE/health"                          # always unauthenticated
+curl -H "$AUTH" "$BASE/capabilities"         # commands, transports, limits
+curl -H "$AUTH" "$BASE/state"                # coherent snapshot + revision
+
+# Every command needs the revision it was decided against and a replay key.
+curl -H "$AUTH" -H 'Content-Type: application/json' "$BASE/commands" -d '{
+  "type": "set_queue_intent", "change_id": "my-change", "queued": true,
+  "expected_revision": 12, "idempotency_key": "01J8Z...-retry-1"
+}'
+
+# Resume the ordered event stream from a cursor.
+curl -N -H "$AUTH" "$BASE/events?after_sequence=41&instance_id=$INSTANCE_ID"
+```
+
+Notes for client authors:
+
+- `instance_id`, `state_revision`, and `event_sequence` are valid only for one
+  process incarnation. Compare `instance_id` before reusing a cursor; a restart
+  invalidates it.
+- Credentials go in the `Authorization` header only. Tokens in query strings or
+  WebSocket subprotocols are rejected, so browser-native `EventSource` and
+  `WebSocket` cannot be used against a protected `/api/v2`; browsers should read
+  `/api/v2/events` with `fetch()` response streaming. The dashboard itself stays
+  on the legacy `/ws` endpoint.
+- Cross-origin access is same-origin by default. A reverse proxy that changes
+  the externally visible origin must declare it with `--web-allowed-origin`
+  (repeatable, exact `scheme://host[:port]`); wildcards and forwarded headers
+  are never honored.
+- Errors carry a stable `error_code` to branch on — `stale_revision` and
+  `idempotency_mismatch` are both HTTP 409 but mean different things.
+
+The full schema is generated into [`docs/openapi.yaml`](../openapi.yaml).
 
 ## Remote TUI (Server Mode)
 
@@ -324,6 +379,7 @@ cflx run --change urgent-fix,critical-update
 ### Pattern 3: Parallel with Monitoring
 
 ```bash
-# Run parallel with web monitoring
-cflx run --parallel --web --web-bind 0.0.0.0
+# Run parallel with web monitoring reachable from other hosts
+export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
+cflx run --parallel --web --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
 ```

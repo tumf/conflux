@@ -66,12 +66,18 @@ cflx --web
 # Normal mode: headless run + Web UI
 cflx run --web
 
-# Custom port and bind address
-cflx --web --web-port 9000 --web-bind 0.0.0.0
+# Custom port, plus a bearer token because the bind is not loopback
+export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
+cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
 ```
 
 When using the default port (`0`), the OS automatically assigns an available port.
 The bound address is logged when the server starts.
+
+A non-loopback `--web-bind` requires a bearer token for the `/api/v2`
+remote-control API, and the process refuses to start without one. Use
+`--web-auth-token-env VAR` (recommended) or `--web-auth-token TOKEN`; the two are
+mutually exclusive. See [USAGE.md](USAGE.md#remote-control-api-apiv2).
 
 In server mode (`cflx server`), the Web UI is always available on the configured port.
 
@@ -121,7 +127,7 @@ Connect to `ws://localhost:<port>/ws` for real-time state updates.
 | Dashboard not loading | Confirm `--web` is enabled and the URL has the correct port |
 | WebSocket disconnects frequently | Check network stability; the dashboard auto-reconnects |
 | Changes not updating | Refresh the page or confirm the orchestrator is running |
-| Cannot access from another device | Use `--web-bind 0.0.0.0` for local network access |
+| Cannot access from another device | Use `--web-bind 0.0.0.0` for local network access (also requires `--web-auth-token-env`) |
 
 ## Background Service (`cflx service`)
 

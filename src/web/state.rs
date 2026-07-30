@@ -298,6 +298,11 @@ pub struct WebState {
     shared_orchestrator_state: tokio::sync::RwLock<
         Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>>,
     >,
+    /// `/api/v2` projection owner and its late-bound command delegation target.
+    ///
+    /// Created with the process so `instance_id` exists from the first request,
+    /// independently of whether an orchestration runtime is ever bound.
+    remote_control: Arc<crate::web::remote_control_api::RemoteControlRuntime>,
 }
 
 impl WebState {
@@ -311,7 +316,44 @@ impl WebState {
             tx,
             control_tx: Mutex::new(None),
             shared_orchestrator_state: tokio::sync::RwLock::new(None),
+            remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
         }
+    }
+
+    /// The `/api/v2` runtime for this process incarnation.
+    pub fn remote_control(&self) -> Arc<crate::web::remote_control_api::RemoteControlRuntime> {
+        self.remote_control.clone()
+    }
+
+    /// Push the current monitoring snapshot into the v2 projection.
+    ///
+    /// Emits an event (and advances the revision) only when the projected
+    /// snapshot really differs, so a periodic refresh over an idle process is
+    /// invisible to v2 clients.
+    pub async fn sync_remote_control_projection(&self) {
+        let candidate =
+            crate::web::remote_control_api::projection::project_snapshot(&self.get_state().await);
+        self.remote_control
+            .projection()
+            .apply_state_if_changed("state_refreshed", candidate);
+    }
+
+    /// Project one execution event into the v2 projection.
+    ///
+    /// Called after the monitoring snapshot has already absorbed the event, so
+    /// the candidate snapshot and the event describe the same instant.
+    async fn project_execution_event(&self, event: &ExecutionEvent) {
+        use crate::web::remote_control_api::projection as v2;
+
+        let projection = self.remote_control.projection();
+        if let ExecutionEvent::Log(entry) = event {
+            // Observational only: a new sequence, the same revision.
+            projection.apply_log(entry.clone());
+            return;
+        }
+        let (event_type, change_id, payload) = v2::describe_event(event);
+        let candidate = v2::project_snapshot(&self.get_state().await);
+        projection.apply_state(event_type, change_id, payload, candidate);
     }
 
     /// Set the control command channel for web-based execution control
@@ -427,6 +469,8 @@ impl WebState {
         if has_changes {
             self.broadcast_snapshot(new_state.changes).await;
         }
+
+        self.sync_remote_control_projection().await;
     }
 
     /// Update the state with new changes and explicit app_mode (for Run mode)
@@ -501,6 +545,8 @@ impl WebState {
         if has_changes || app_mode_changed {
             self.broadcast_snapshot(new_state.changes).await;
         }
+
+        self.sync_remote_control_projection().await;
     }
 
     /// Apply an execution event to the web state and broadcast updates.
@@ -819,6 +865,10 @@ impl WebState {
         if let Some(update) = broadcast_update {
             let _ = self.tx.send(update);
         }
+
+        // Project into `/api/v2` last, so the candidate snapshot it compares
+        // against is the one this event just produced.
+        self.project_execution_event(event).await;
     }
 
     async fn broadcast_snapshot(&self, changes: Vec<ChangeStatus>) {

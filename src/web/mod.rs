@@ -8,6 +8,8 @@ mod url;
 #[cfg(feature = "web-monitoring")]
 pub mod api;
 #[cfg(feature = "web-monitoring")]
+pub mod remote_control_api;
+#[cfg(feature = "web-monitoring")]
 pub mod state;
 #[cfg(feature = "web-monitoring")]
 pub mod websocket;
@@ -47,6 +49,19 @@ pub struct WebConfig {
     pub bind: String,
     /// Interval in seconds for periodic state refresh from disk (0 to disable)
     pub refresh_interval_secs: u64,
+    /// Literal bearer token for `/api/v2`.
+    ///
+    /// Mutually exclusive with [`Self::auth_token_env`]. A literal value can be
+    /// visible to anything that can inspect process arguments, so the
+    /// environment form is preferred.
+    pub auth_token: Option<String>,
+    /// Name of the environment variable holding the bearer token for `/api/v2`.
+    pub auth_token_env: Option<String>,
+    /// Exact additional origins allowed to make cross-origin `/api/v2` requests.
+    ///
+    /// Exact values only: wildcards are rejected, and forwarded headers are
+    /// never used to widen this list.
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for WebConfig {
@@ -56,6 +71,9 @@ impl Default for WebConfig {
             port: 0, // Auto-assign by OS
             bind: "127.0.0.1".to_string(),
             refresh_interval_secs: 5, // Default: refresh every 5 seconds
+            auth_token: None,
+            auth_token_env: None,
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -67,7 +85,7 @@ impl WebConfig {
             enabled: true,
             port,
             bind,
-            refresh_interval_secs: 5, // Default: refresh every 5 seconds
+            ..Self::default()
         }
     }
 
@@ -76,6 +94,82 @@ impl WebConfig {
     pub fn with_refresh_interval(mut self, secs: u64) -> Self {
         self.refresh_interval_secs = secs;
         self
+    }
+
+    /// Configure `/api/v2` bearer authentication and exact allowed origins.
+    pub fn with_auth(
+        mut self,
+        auth_token: Option<String>,
+        auth_token_env: Option<String>,
+        allowed_origins: Vec<String>,
+    ) -> Self {
+        self.auth_token = auth_token;
+        self.auth_token_env = auth_token_env;
+        self.allowed_origins = allowed_origins;
+        self
+    }
+
+    /// True when the bind address is a loopback address.
+    pub fn is_loopback_bind(&self) -> bool {
+        let host = self
+            .bind
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if host == "localhost" || host == "::1" {
+            return true;
+        }
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    }
+
+    /// Resolve the effective bearer token.
+    ///
+    /// The environment form wins when configured, and an unset or empty variable
+    /// resolves to no token rather than to the literal — otherwise a typo in the
+    /// variable name would silently downgrade a deployment to the wrong secret.
+    pub fn resolve_auth_token(&self) -> Option<String> {
+        if let Some(var) = self.auth_token_env.as_deref() {
+            return std::env::var(var).ok().filter(|value| !value.is_empty());
+        }
+        self.auth_token.clone().filter(|value| !value.is_empty())
+    }
+
+    /// Validate the configuration before anything binds a socket.
+    ///
+    /// Failing here rather than at first request is the point: a process that
+    /// listens on a routable address without credentials has already been
+    /// reachable, and no later check can take that back.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.auth_token.is_some() && self.auth_token_env.is_some() {
+            return Err(
+                "--web-auth-token and --web-auth-token-env are mutually exclusive".to_string(),
+            );
+        }
+        #[cfg(feature = "web-monitoring")]
+        for origin in &self.allowed_origins {
+            if remote_control_api::auth::normalize_origin(origin).is_none() {
+                return Err(format!(
+                    "invalid --web-allowed-origin '{origin}': expected an exact \
+                     http(s)://host[:port] value with no wildcard or path"
+                ));
+            }
+        }
+        if !self.is_loopback_bind()
+            && self
+                .resolve_auth_token()
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(format!(
+                "web monitoring on non-loopback address '{}' requires \
+                 --web-auth-token or --web-auth-token-env",
+                self.bind
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -112,23 +206,21 @@ async fn serve_js() -> Response {
         .into_response()
 }
 
-/// Start the web monitoring server
+/// Build the legacy single-instance monitoring router.
+///
+/// Kept as one function so both entry points serve exactly the same legacy
+/// surface: `/api/*`, `/ws`, and the dashboard files must keep behaving as they
+/// always have once `/api/v2` is mounted next to them.
 #[cfg(feature = "web-monitoring")]
-#[allow(dead_code)]
-pub async fn start_server(
-    config: WebConfig,
-    state: Arc<WebState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
-
-    // CORS configuration for local development
+fn legacy_router(state: Arc<WebState>) -> Router {
+    // Permissive CORS on the legacy surface, unchanged: the dashboard depends on
+    // it. The v2 router applies its own exact-origin policy instead.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build router with API and static routes
-    let app = Router::new()
+    Router::new()
         // Static file routes
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
@@ -181,8 +273,55 @@ pub async fn start_server(
         // WebSocket route
         .route("/ws", get(websocket::ws_handler))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state)
+}
+
+/// Build the `/api/v2` router for a single-instance web server.
+///
+/// Returns an error when the auth/origin policy itself is unusable, so a broken
+/// policy stops the process instead of quietly serving a narrower one.
+#[cfg(feature = "web-monitoring")]
+pub fn remote_control_router(
+    config: &WebConfig,
+    state: Arc<WebState>,
+) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
+    let auth = remote_control_api::auth::RemoteControlAuth::new(
+        config.resolve_auth_token(),
+        &config.allowed_origins,
+    )?;
+    let runtime = state.remote_control();
+    Ok(remote_control_api::router(
+        remote_control_api::RemoteControlState::new(runtime.projection(), Arc::new(auth), runtime),
+    ))
+}
+
+/// Assemble the full single-instance app: legacy surface plus `/api/v2`.
+#[cfg(feature = "web-monitoring")]
+fn build_app(
+    config: &WebConfig,
+    state: Arc<WebState>,
+) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(legacy_router(state.clone())
+        .merge(remote_control_router(config, state)?)
+        .layer(TraceLayer::new_for_http()))
+}
+
+/// The full single-instance app, for compatibility tests.
+#[cfg(all(test, feature = "web-monitoring"))]
+pub(crate) fn build_app_for_test(config: &WebConfig, state: Arc<WebState>) -> Router {
+    build_app(config, state).expect("test configuration must be valid")
+}
+
+/// Start the web monitoring server
+#[cfg(feature = "web-monitoring")]
+#[allow(dead_code)]
+pub async fn start_server(
+    config: WebConfig,
+    state: Arc<WebState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    config.validate()?;
+    let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
+    let app = build_app(&config, state)?;
 
     // Bind to the specified address (port 0 = OS auto-assign)
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -233,70 +372,10 @@ pub async fn spawn_server_with_url(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    // Reject an unsafe configuration before a socket exists, not after.
+    config.validate()?;
     let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
-
-    // CORS configuration for local development
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
-    // Build router with API and static routes
-    let app = Router::new()
-        // Static file routes
-        .route("/", get(serve_index))
-        .route("/style.css", get(serve_css))
-        .route("/app.js", get(serve_js))
-        // API routes
-        .route("/api/health", get(api::health))
-        .route("/api/state", get(api::get_state))
-        .route("/api/changes", get(api::list_changes))
-        .route("/api/changes/{id}", get(api::get_change))
-        // Control API routes
-        .route(
-            "/api/control/start",
-            axum::routing::post(api::control_start),
-        )
-        .route("/api/control/stop", axum::routing::post(api::control_stop))
-        .route(
-            "/api/control/cancel-stop",
-            axum::routing::post(api::control_cancel_stop),
-        )
-        .route(
-            "/api/control/force-stop",
-            axum::routing::post(api::control_force_stop),
-        )
-        .route(
-            "/api/control/retry",
-            axum::routing::post(api::control_retry),
-        )
-        // Worktree API routes
-        .route("/api/worktrees", get(api::list_worktrees))
-        .route(
-            "/api/worktrees/refresh",
-            axum::routing::post(api::refresh_worktrees),
-        )
-        .route(
-            "/api/worktrees/create",
-            axum::routing::post(api::create_worktree),
-        )
-        .route(
-            "/api/worktrees/delete",
-            axum::routing::post(api::delete_worktree),
-        )
-        .route(
-            "/api/worktrees/merge",
-            axum::routing::post(api::merge_worktree),
-        )
-        .route(
-            "/api/worktrees/command",
-            axum::routing::post(api::execute_worktree_command),
-        )
-        // WebSocket route
-        .route("/ws", get(websocket::ws_handler))
-        .layer(cors)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+    let app = build_app(&config, state.clone())?;
 
     // Bind to the specified address (port 0 = OS auto-assign)
     let listener = tokio::net::TcpListener::bind(addr).await?;
