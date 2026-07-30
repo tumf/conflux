@@ -726,29 +726,28 @@ impl Orchestrator {
             return Ok(base.clone());
         }
 
-        let base = match &self.upstream_integration {
-            Some(runtime) => runtime.branch.clone(),
-            None => {
-                let repo_root = std::env::current_dir()?;
-                match git_commands::get_current_branch(&repo_root).await {
-                    Ok(Some(branch)) => branch,
-                    Ok(None) => {
-                        return Err(OrchestratorError::Parse(
+        let base =
+            match &self.upstream_integration {
+                Some(runtime) => runtime.branch.clone(),
+                None => {
+                    let repo_root = std::env::current_dir()?;
+                    match git_commands::get_current_branch(&repo_root).await {
+                        Ok(Some(branch)) => branch,
+                        Ok(None) => return Err(OrchestratorError::Parse(
                             "cannot resolve explicit run targets: HEAD is detached, so there is \
                              no base branch to prove completion against"
                                 .to_string(),
-                        ))
-                    }
-                    Err(err) => {
-                        return Err(OrchestratorError::GitCommand(format!(
-                            "cannot resolve explicit run targets: failed to read the attached \
+                        )),
+                        Err(err) => {
+                            return Err(OrchestratorError::GitCommand(format!(
+                                "cannot resolve explicit run targets: failed to read the attached \
                              base branch: {}",
-                            err
-                        )))
+                                err
+                            )))
+                        }
                     }
                 }
-            }
-        };
+            };
 
         self.captured_base_branch = Some(base.clone());
         Ok(base)
