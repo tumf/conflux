@@ -46,6 +46,8 @@ mod stream_json_textifier;
 mod task_parser;
 mod templates;
 mod tui;
+#[allow(dead_code, unused_imports)]
+mod upstream;
 mod vcs;
 #[cfg(feature = "web-monitoring")]
 mod web;
@@ -667,6 +669,60 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Opt-in upstream integration. When the option is absent no upstream
+            // object is constructed, so the existing execution path performs no
+            // additional fetch, merge, verification, event, or push.
+            let upstream_integration = match args.upstream_integration() {
+                Ok(config) => config,
+                Err(err) => {
+                    eprintln!("Error: {}", err);
+                    std::process::exit(1);
+                }
+            };
+
+            let upstream_runtime = match upstream_integration {
+                Some(config) => {
+                    let repo_root = std::env::current_dir()?;
+                    match upstream::prepare_upstream_integration(
+                        config,
+                        &repo_root,
+                        use_parallel,
+                        args.push.clone(),
+                        git_dir_exists,
+                        args.dry_run,
+                    )
+                    .await
+                    {
+                        Ok(runtime) => Some(runtime),
+                        Err(err) => {
+                            eprintln!("Error: {}", err);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                None => {
+                    // Default-off path: refuse to continue only when repository
+                    // evidence proves an unpushed upstream merge is reachable.
+                    // The scan is offline, so nothing new is fetched here.
+                    if use_parallel && !args.dry_run && git_dir_exists {
+                        let repo_root = std::env::current_dir()?;
+                        if let Err(err) =
+                            upstream::ensure_no_unpushed_upstream_recovery(&repo_root).await
+                        {
+                            if matches!(err, upstream::UpstreamStartupError::Invalid(_)) {
+                                eprintln!("Error: {}", err);
+                                std::process::exit(1);
+                            }
+                            tracing::debug!(
+                                "Upstream recovery scan unavailable, continuing: {}",
+                                err
+                            );
+                        }
+                    }
+                    None
+                }
+            };
+
             // Non-interactive run reports process and orchestration lifecycle
             // through the same observability-only contract as the TUI. Started
             // after startup validation so a rejected invocation never leaves an
@@ -861,6 +917,13 @@ async fn main() -> Result<()> {
 
                 orchestrator
                     .set_lifecycle_handle(lifecycle_handle.clone(), workspace_context.clone());
+
+                // Invocation-scoped; reinstalled on every restart-loop iteration so
+                // an enabled run keeps its selected remote, base branch, and
+                // verification command across orchestrator reconstruction.
+                if let Some(runtime) = upstream_runtime.clone() {
+                    orchestrator.set_upstream_integration(runtime);
+                }
 
                 #[cfg(feature = "web-monitoring")]
                 if let Some(ref web_state) = web_state_arc {

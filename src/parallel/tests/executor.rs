@@ -1046,6 +1046,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         next_analysis_signature_probe_at: None,
         analysis_retry_throttle: None,
         analysis_input_probe: None,
+        upstream: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -1194,6 +1195,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         next_analysis_signature_probe_at: None,
         analysis_retry_throttle: None,
         analysis_input_probe: None,
+        upstream: None,
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1358,6 +1360,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         next_analysis_signature_probe_at: None,
         analysis_retry_throttle: None,
         analysis_input_probe: None,
+        upstream: None,
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1577,6 +1580,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         next_analysis_signature_probe_at: None,
         analysis_retry_throttle: None,
         analysis_input_probe: None,
+        upstream: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1788,6 +1792,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         next_analysis_signature_probe_at: None,
         analysis_retry_throttle: None,
         analysis_input_probe: None,
+        upstream: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2005,6 +2010,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         next_analysis_signature_probe_at: None,
         analysis_retry_throttle: None,
         analysis_input_probe: None,
+        upstream: None,
     };
 
     let revisions = vec![workspace_a.name];

@@ -377,9 +377,50 @@ pub struct RunArgs {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+
+    /// Integrate the selected remote's same-name base branch into the cumulative
+    /// base during the run, and push the verified result once at completion.
+    ///
+    /// `-u` and value-less `--integrate-upstream` select `origin`. A named remote
+    /// requires `=`, as in `--integrate-upstream=upstream`; `-u <remote>` is not
+    /// supported and never consumes a following positional change ID.
+    ///
+    /// Cumulative parallel run mode only. Requires `--upstream-verify-command`.
+    #[arg(
+        long,
+        short = 'u',
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = crate::upstream::DEFAULT_UPSTREAM_REMOTE,
+        value_parser = crate::upstream::options::parse_upstream_remote
+    )]
+    pub integrate_upstream: Option<String>,
+
+    /// Complete repository verification command run after every cumulative base
+    /// tree change and immediately before the final push.
+    ///
+    /// Required when upstream integration is enabled; ignored otherwise.
+    #[arg(long)]
+    pub upstream_verify_command: Option<String>,
 }
 
 impl RunArgs {
+    /// Resolve the invocation-scoped upstream integration configuration.
+    ///
+    /// Returns `Ok(None)` for the default-off path, which installs no upstream
+    /// behavior at all.
+    pub fn upstream_integration(
+        &self,
+    ) -> std::result::Result<
+        Option<crate::upstream::UpstreamIntegrationConfig>,
+        crate::upstream::UpstreamOptionError,
+    > {
+        crate::upstream::resolve_upstream_config(
+            self.integrate_upstream.as_deref(),
+            self.upstream_verify_command.as_deref(),
+        )
+    }
+
     /// Returns None for --all and Some(ids) for explicit selected targets.
     pub fn normalized_target_changes(&self) -> Option<Vec<String>> {
         if self.all {
@@ -859,6 +900,147 @@ pub fn check_parallel_available() -> bool {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn run_args(argv: &[&str]) -> RunArgs {
+        match Cli::parse_from(argv).command {
+            Some(Commands::Run(args)) => args,
+            _ => panic!("expected run subcommand for {:?}", argv),
+        }
+    }
+
+    #[test]
+    fn upstream_integration_is_absent_by_default() {
+        let args = run_args(&["cflx", "run", "--all", "--parallel"]);
+        assert_eq!(args.integrate_upstream, None);
+        assert_eq!(args.upstream_verify_command, None);
+        assert_eq!(args.upstream_integration().unwrap(), None);
+    }
+
+    #[test]
+    fn upstream_integration_short_and_long_aliases_are_equivalent() {
+        let short = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        let long = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--integrate-upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(short.integrate_upstream.as_deref(), Some("origin"));
+        assert_eq!(long.integrate_upstream.as_deref(), Some("origin"));
+        assert_eq!(
+            short.upstream_integration().unwrap(),
+            long.upstream_integration().unwrap()
+        );
+        assert_eq!(
+            short.upstream_integration().unwrap(),
+            Some(crate::upstream::UpstreamIntegrationConfig::new(
+                "origin",
+                "cargo test"
+            ))
+        );
+    }
+
+    #[test]
+    fn upstream_integration_short_option_does_not_consume_change_id() {
+        let args = run_args(&[
+            "cflx",
+            "run",
+            "--parallel",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "my-change",
+        ]);
+        assert_eq!(args.integrate_upstream.as_deref(), Some("origin"));
+        assert_eq!(args.changes, vec!["my-change".to_string()]);
+        assert_eq!(
+            args.normalized_target_changes(),
+            Some(vec!["my-change".to_string()])
+        );
+    }
+
+    #[test]
+    fn upstream_integration_named_remote_requires_equals() {
+        let args = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(args.integrate_upstream.as_deref(), Some("upstream"));
+        assert_eq!(
+            args.upstream_integration().unwrap(),
+            Some(crate::upstream::UpstreamIntegrationConfig::new(
+                "upstream",
+                "cargo test"
+            ))
+        );
+
+        // Space-separated values are not option values; they stay positional.
+        let spaced = run_args(&[
+            "cflx",
+            "run",
+            "--parallel",
+            "--integrate-upstream",
+            "upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(spaced.integrate_upstream.as_deref(), Some("origin"));
+        assert_eq!(spaced.changes, vec!["upstream".to_string()]);
+    }
+
+    #[test]
+    fn upstream_integration_rejects_invalid_remote_value() {
+        let err = Cli::try_parse_from([
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--integrate-upstream=origin:main",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn upstream_integration_requires_verify_command() {
+        let args = run_args(&["cflx", "run", "--all", "--parallel", "-u"]);
+        assert_eq!(
+            args.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::MissingVerifyCommand)
+        );
+    }
+
+    #[test]
+    fn upstream_integration_verify_command_alone_is_rejected() {
+        let args = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(
+            args.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::VerifyCommandWithoutOption)
+        );
+    }
 
     #[test]
     fn test_completion_subcommand_supported_shells() {

@@ -152,6 +152,9 @@ impl ParallelExecutor {
             next_analysis_signature_probe_at: None,
             analysis_retry_throttle: None,
             analysis_input_probe: None,
+            // Default-off: an executor built without an explicit `-u` invocation
+            // installs no upstream coordinator and therefore no new behavior.
+            upstream: None,
         }
     }
 
@@ -182,6 +185,52 @@ impl ParallelExecutor {
 
     pub fn set_explicit_retry(&mut self, explicit_retry: bool) {
         self.explicit_retry = explicit_retry;
+    }
+
+    /// Install invocation-scoped upstream integration.
+    ///
+    /// Fetch, merge, verification, and push run as native Conflux operations
+    /// through [`crate::upstream::git_ops::GitUpstreamOps`] and
+    /// [`crate::upstream::verify::CommandVerifier`]; only bounded repair reaches
+    /// the AI command harness through the existing `resolve_command` runner.
+    pub fn set_upstream_integration(
+        &mut self,
+        runtime: crate::upstream::UpstreamRuntime,
+        shared_stagger_state: SharedStaggerState,
+    ) {
+        use crate::upstream::coordinator::UpstreamCoordinator;
+        use crate::upstream::git_ops::GitUpstreamOps;
+        use crate::upstream::repair::ResolveCommandRepairAgent;
+        use crate::upstream::verify::CommandVerifier;
+
+        let coordinator = UpstreamCoordinator::new(
+            runtime.config.clone(),
+            runtime.branch.clone(),
+            Arc::new(GitUpstreamOps::new(self.repo_root.clone())),
+            Arc::new(CommandVerifier::new(
+                runtime.config.verify_command.clone(),
+                self.repo_root.clone(),
+            )),
+            Arc::new(ResolveCommandRepairAgent::new(
+                self.config.clone(),
+                self.repo_root.clone(),
+                self.max_conflict_retries,
+                shared_stagger_state,
+            )),
+            Arc::new(
+                crate::parallel::upstream_bridge::EventUpstreamObserver::new(self.event_tx.clone()),
+            ),
+        );
+        self.upstream = Some(Arc::new(Mutex::new(coordinator)));
+    }
+
+    /// Whether upstream integration is installed for this executor.
+    ///
+    /// Used by default-off and propagation coverage; the executable itself never
+    /// needs to ask, because every upstream entry point short-circuits already.
+    #[allow(dead_code)]
+    pub fn has_upstream_integration(&self) -> bool {
+        self.upstream.is_some()
     }
 
     /// Override how dependency-analysis signature material is probed.

@@ -17,4 +17,6 @@ mod reanalysis_trigger_lifetime;
 #[cfg(test)]
 mod unchanged_analysis_input;
 #[cfg(test)]
+mod upstream_integration;
+#[cfg(test)]
 mod workspace_resume;

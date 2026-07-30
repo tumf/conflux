@@ -708,6 +708,19 @@ impl ParallelExecutor {
             }
         }
 
+        // Deterministic checkpoint boundary: immediately before a completed
+        // result enters cumulative base. The base lane is already owned and the
+        // base is already known clean here, so the checkpoint may start; results
+        // that arrive while it runs stay queued behind its single fetch.
+        if self.upstream_enabled() {
+            self.run_upstream_checkpoint(
+                crate::upstream::checkpoint::CheckpointTrigger::BeforeBaseIntegration,
+                change_ids.first().map(String::as_str),
+                true,
+            )
+            .await?;
+        }
+
         for change_id in change_ids {
             send_event(
                 &self.event_tx,
@@ -723,6 +736,20 @@ impl ParallelExecutor {
         }
 
         let revision = self.merge_and_resolve(revisions, change_ids).await?;
+
+        // Every completed change result merged into cumulative base runs the
+        // complete verification command before the base lane reopens, so a
+        // worktree accepted on an older base cannot unblock later dispatch.
+        if self.upstream_enabled() {
+            self.run_upstream_base_result_verification(
+                change_ids
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>"),
+            )
+            .await?;
+        }
+
         Ok(MergeAttempt::Merged { revision })
     }
 

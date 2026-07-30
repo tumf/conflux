@@ -77,6 +77,12 @@ pub struct Orchestrator {
     /// Optional observability-only sink projecting execution events onto an
     /// external lifecycle adapter. It never participates in workflow routing.
     lifecycle_sink: Option<Arc<dyn crate::events::EventSink>>,
+    /// Invocation-scoped upstream integration runtime.
+    ///
+    /// `None` is the default-off path: no checkpoint object is installed and no
+    /// upstream fetch, merge, verification, event, or push is added. This is
+    /// deliberately not part of persistent orchestration config.
+    upstream_integration: Option<crate::upstream::UpstreamRuntime>,
 }
 
 /// Control flow result indicating whether to continue or break the main loop
@@ -147,7 +153,22 @@ impl Orchestrator {
             #[cfg(feature = "web-monitoring")]
             execution_mode: "select".to_string(),
             lifecycle_sink: None,
+            upstream_integration: None,
         })
+    }
+
+    /// Install invocation-scoped upstream integration.
+    ///
+    /// Constructors are unchanged when the option is absent, so the default-off
+    /// path cannot accidentally acquire upstream behavior.
+    pub fn set_upstream_integration(&mut self, runtime: crate::upstream::UpstreamRuntime) {
+        self.upstream_integration = Some(runtime);
+    }
+
+    /// Currently installed upstream runtime, if any.
+    #[cfg(test)]
+    pub fn upstream_integration(&self) -> Option<&crate::upstream::UpstreamRuntime> {
+        self.upstream_integration.as_ref()
     }
 
     /// Attach an external lifecycle handle.
@@ -241,6 +262,7 @@ impl Orchestrator {
             #[cfg(feature = "web-monitoring")]
             execution_mode: "select".to_string(),
             lifecycle_sink: None,
+            upstream_integration: None,
         })
     }
 
@@ -1245,6 +1267,9 @@ impl Orchestrator {
         service.set_no_resume(self.no_resume);
         service.set_post_archive_action(self.post_archive_action.clone());
         service.set_shared_orchestrator_state(self.shared_state.clone());
+        if let Some(runtime) = self.upstream_integration.clone() {
+            service.set_upstream_integration(runtime);
+        }
 
         // Check if Git is available for true parallel execution
         service.check_vcs_available().await?;

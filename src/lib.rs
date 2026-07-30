@@ -57,6 +57,7 @@ mod stall;
 mod stream_json_textifier;
 mod task_parser;
 mod templates;
+pub mod upstream;
 mod vcs;
 pub mod worktree_ops;
 

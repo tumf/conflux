@@ -28,6 +28,8 @@ mod orchestration;
 mod output_bridge;
 pub(super) mod queue_state;
 mod types;
+pub(crate) mod upstream_bridge;
+mod upstream_lane;
 mod workspace;
 
 // Re-export unified event type as ParallelEvent for backward compatibility.
@@ -244,6 +246,13 @@ pub struct ParallelExecutor {
     /// recorded as a completion. It only rate-limits the retry, so fail-open stays open without
     /// becoming a 500 ms probe/analyzer loop.
     analysis_retry_throttle: Option<BoundedAnalysisRetry>,
+    /// Invocation-scoped upstream integration coordinator.
+    ///
+    /// `None` is the hard compatibility boundary: no checkpoint runs, no
+    /// upstream fetch/merge/verification/push happens, and no upstream lifecycle
+    /// evidence is emitted. It is installed only from an explicit `cflx run`
+    /// `-u`/`--integrate-upstream` invocation, never from persistent config.
+    upstream: Option<Arc<Mutex<crate::upstream::UpstreamCoordinator>>>,
     /// Override for dependency-analysis signature probing.
     ///
     /// `None` uses the real repository probe (VCS revision plus

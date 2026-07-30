@@ -67,6 +67,61 @@ When completing sequential merges into a target branch, follow this protocol for
 - Final merge commit subject MUST be exactly: `Merge change: <change_id>`
 - These conventions are validated by the orchestrator after resolution.
 
+## Upstream Integration Repair Mode
+
+This mode applies **only** when the orchestrator prompt contains
+`Operation: upstream-integration`. It does not change the sequential-merge mode
+above; the two modes never run together.
+
+In this mode Conflux is integrating a remote base branch into the running
+cumulative base. Conflux itself already performed the fetch and the
+`git merge --no-ff` — you are a repair worker, not the workflow controller.
+
+### What the orchestrator provides
+
+- `Cause`: `textual conflict`, `failed verification command`, or
+  `repository state blocking the cumulative-base push`
+- `Selected remote` and `Cumulative base branch`
+- `Local cumulative revision before integration`
+- `Fetched remote SHA` (when an upstream revision is under integration)
+- `Unmerged files` and the current `git status --porcelain=v2` output
+- `Complete verification command` and its bounded failure output, for semantic repair
+- Sanitized push diagnostics, for push repair
+
+### What to do
+
+1. **Textual conflict**: resolve the conflict markers preserving both the
+   accepted local cumulative intent and the upstream intent, `git add` each
+   resolved file, and complete the in-progress merge with `git commit` (keep the
+   `Cflx-Upstream-*` trailers in the message intact).
+2. **Failed verification command**: make the smallest forward change that makes
+   the complete verification command pass, then commit it as a new commit on top
+   of the current HEAD.
+3. **Repository state blocking the push**: bring the worktree and index back to a
+   clean state by committing or reverting the local mutation. Do not touch the
+   remote.
+
+### Hard bounds in this mode
+
+- Do NOT `git commit --amend`, `git rebase`, `git reset`, `git cherry-pick` over
+  existing history, or otherwise rewrite cumulative history. Repair MAY create
+  new forward commits only.
+- Do NOT run `git push` in any form, and never `--force`. Conflux owns the push.
+- Do NOT alter credentials, remotes, or hook configuration, and do NOT bypass
+  hooks with `--no-verify`.
+- Do NOT remove or contradict the `Cflx-Upstream-Remote`, `Cflx-Upstream-Branch`,
+  or `Cflx-Upstream-SHA` trailers on the upstream merge commit; they are the only
+  restart-recovery evidence.
+
+### How success is decided
+
+Conflux, not you, owns retry limits and convergence. After your attempt it
+revalidates repository state: forward-only ancestry from the repair-start HEAD, a
+clean worktree and index, no unfinished merge, the fetched SHA still an ancestor
+of HEAD, unchanged reachable identity trailers, and a successful rerun of the
+complete verification command. Narrative claims of success are ignored, and a
+zero exit status alone proves nothing.
+
 ## Context Provided by Orchestrator
 
 The orchestrator injects variable context including:
