@@ -101,6 +101,7 @@ use super::types::WorkspaceResult;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 use super::SchedulerLifetime;
+use crate::upstream::coordinator::SchedulerOutcome;
 
 impl ParallelExecutor {
     pub(super) fn is_fully_drained(
@@ -241,6 +242,24 @@ impl ParallelExecutor {
         }
         info!("Preparation complete");
 
+        // Deterministic checkpoint boundary: before the first worktree dispatch.
+        // A disabled run does nothing here.
+        if self.upstream_enabled() {
+            if let Err(err) = self
+                .run_upstream_checkpoint(
+                    crate::upstream::checkpoint::CheckpointTrigger::BeforeFirstDispatch,
+                    None,
+                    false,
+                )
+                .await
+            {
+                let error_msg = format!("Upstream pre-dispatch checkpoint failed: {}", err);
+                error!("{}", error_msg);
+                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                return Err(err);
+            }
+        }
+
         // Initialize scheduler state
         let max_parallelism = self.workspace_manager.max_concurrent();
         let semaphore = Arc::new(Semaphore::new(max_parallelism));
@@ -257,6 +276,10 @@ impl ParallelExecutor {
         // Reanalysis reason is derived from scheduler events/state each iteration.
         let mut reanalysis_reason = ReanalysisReason::Initial;
         let mut cancelled = false;
+        // Explicit scheduler outcome. Only `DrainedSuccessfully` may enter
+        // upstream finalization (final checkpoint, verification, push,
+        // confirmation); blocked/stalled and cancelled outcomes never push.
+        let mut scheduler_outcome = SchedulerOutcome::BlockedOrStalled;
 
         // Main scheduler loop: wait for triggers and dispatch changes
         loop {
@@ -276,6 +299,7 @@ impl ParallelExecutor {
                 )
                 .await;
                 cancelled = true;
+                scheduler_outcome = SchedulerOutcome::Cancelled;
                 join_set.abort_all();
                 while let Some(result) = join_set.join_next().await {
                     if let Err(err) = result {
@@ -331,6 +355,7 @@ impl ParallelExecutor {
                 info!(
                     "All changes completed (queued/in-flight/resolve_wait/manual_resolve empty), stopping"
                 );
+                scheduler_outcome = SchedulerOutcome::DrainedSuccessfully;
                 break;
             }
             if let Some((should_break, new_iteration)) = self
@@ -365,6 +390,17 @@ impl ParallelExecutor {
                 info!(
                     "All automatic scheduler work completed or blocked-only, exiting scheduler loop"
                 );
+                // A fully drained loop is a success; a blocked-only exit is not,
+                // and must never reach finalization.
+                scheduler_outcome = if self.is_fully_drained(
+                    join_set.is_empty(),
+                    queued.is_empty(),
+                    in_flight.is_empty(),
+                ) {
+                    SchedulerOutcome::DrainedSuccessfully
+                } else {
+                    SchedulerOutcome::BlockedOrStalled
+                };
                 break;
             }
 
@@ -400,9 +436,29 @@ impl ParallelExecutor {
         // Send appropriate completion event based on how we exited
         if cancelled {
             send_event(&self.event_tx, ParallelEvent::Stopped).await;
-        } else {
-            send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
+            return Ok(());
         }
+
+        // Upstream finalization owns completion ordering for an opted-in run:
+        // final checkpoint, complete verification against final cumulative HEAD,
+        // fresh ancestry check, one native non-force push, and remote
+        // confirmation. `AllCompleted` follows confirmation, never precedes it.
+        // A disabled run keeps its existing completion semantics.
+        if !self.finalize_upstream(scheduler_outcome).await {
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Error {
+                    message: format!(
+                        "Upstream integration did not complete ({:?}); cumulative base was not published",
+                        scheduler_outcome
+                    ),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
+        send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
     }
 

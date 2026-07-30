@@ -47,6 +47,11 @@ pub struct ParallelRunService {
     ai_runner: AiCommandRunner,
     /// Runtime-only observability dedupe for stable analyzer failure signatures.
     diagnostic_dedup: AnalysisDiagnosticStore,
+    /// Invocation-scoped upstream integration runtime.
+    ///
+    /// `None` installs no checkpoint at all; it is never sourced from persistent
+    /// orchestration config.
+    upstream_integration: Option<crate::upstream::UpstreamRuntime>,
 }
 
 impl ParallelRunService {
@@ -73,6 +78,7 @@ impl ParallelRunService {
             shared_orchestrator_state,
             ai_runner,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
+            upstream_integration: None,
         }
     }
 
@@ -102,6 +108,7 @@ impl ParallelRunService {
             shared_orchestrator_state,
             ai_runner,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
+            upstream_integration: None,
         }
     }
 
@@ -116,6 +123,26 @@ impl ParallelRunService {
 
     pub fn set_post_archive_action(&mut self, action: PostArchiveAction) {
         self.post_archive_action = action;
+    }
+
+    /// Install invocation-scoped upstream integration.
+    pub fn set_upstream_integration(&mut self, runtime: crate::upstream::UpstreamRuntime) {
+        self.upstream_integration = Some(runtime);
+    }
+
+    #[cfg(test)]
+    pub fn upstream_integration(&self) -> Option<&crate::upstream::UpstreamRuntime> {
+        self.upstream_integration.as_ref()
+    }
+
+    /// Install the coordinator on an executor when the option is enabled.
+    ///
+    /// A disabled service leaves the executor untouched, so no upstream object
+    /// is constructed on the default-off path.
+    fn install_upstream_integration(&self, executor: &mut ParallelExecutor) {
+        if let Some(runtime) = &self.upstream_integration {
+            executor.set_upstream_integration(runtime.clone(), self.shared_stagger_state.clone());
+        }
     }
 
     #[cfg(test)]
@@ -178,6 +205,7 @@ impl ParallelRunService {
         );
         executor.set_no_resume(self.no_resume);
         executor.set_post_archive_action(self.post_archive_action.clone());
+        self.install_upstream_integration(&mut executor);
 
         if has_dynamic_queue {
             // Loop-based frontends (TUI/server) should stay alive when idle
@@ -380,6 +408,7 @@ impl ParallelRunService {
         );
         executor.set_no_resume(self.no_resume);
         executor.set_shared_orchestrator_state(self.shared_orchestrator_state.clone());
+        self.install_upstream_integration(&mut executor);
 
         // Set hooks from config
         let hooks =
@@ -921,6 +950,55 @@ mod tests {
         // `.await` points inside single-threaded `#[tokio::test]` runtimes.
         let guard = tracing::subscriber::set_default(subscriber);
         (capture, guard)
+    }
+
+    /// Minimal config satisfying the executor's required command fields.
+    fn upstream_test_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            apply_command: Some("echo apply {change_id}".to_string()),
+            archive_command: Some("echo archive {change_id}".to_string()),
+            resolve_command: Some("echo resolve".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn upstream_integration_is_absent_by_default() {
+        let service = ParallelRunService::new(PathBuf::from("/tmp"), upstream_test_config());
+        assert!(service.upstream_integration().is_none());
+
+        // A disabled service leaves the executor untouched, so no upstream
+        // object is constructed on the default-off path.
+        let mut executor = crate::parallel::ParallelExecutor::new(
+            PathBuf::from("/tmp"),
+            upstream_test_config(),
+            None,
+        );
+        service.install_upstream_integration(&mut executor);
+        assert!(!executor.has_upstream_integration());
+    }
+
+    #[test]
+    fn upstream_integration_propagates_to_service_and_executor() {
+        let runtime = crate::upstream::UpstreamRuntime {
+            config: crate::upstream::UpstreamIntegrationConfig::new("upstream", "cargo test"),
+            branch: "develop".to_string(),
+        };
+        let mut service = ParallelRunService::new(PathBuf::from("/tmp"), upstream_test_config());
+        service.set_upstream_integration(runtime.clone());
+
+        let stored = service.upstream_integration().expect("runtime installed");
+        assert_eq!(stored.config.remote, "upstream");
+        assert_eq!(stored.config.verify_command, "cargo test");
+        assert_eq!(stored.branch, "develop");
+
+        let mut executor = crate::parallel::ParallelExecutor::new(
+            PathBuf::from("/tmp"),
+            upstream_test_config(),
+            None,
+        );
+        service.install_upstream_integration(&mut executor);
+        assert!(executor.has_upstream_integration());
     }
 
     #[test]
