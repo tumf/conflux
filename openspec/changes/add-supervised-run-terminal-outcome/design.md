@@ -20,7 +20,7 @@ The writer does not print a fallback second record. Serialization is covered exh
 
 ### Decision: typed outcome propagation
 
-Human-readable error strings and lifecycle states are not classifiers. Core orchestration returns typed terminal data to the run entrypoint. The upstream finalizer's scheduler outcome and remote-confirmation result are consumed directly.
+Human-readable error strings and lifecycle states are not classifiers. Core orchestration returns typed terminal data to the run entrypoint. This change refines the dependency's aggregate `BlockedOrStalled` scheduler result before it reaches the CLI by adding typed terminal causes to core orchestration: dependency/manual gates become `Blocked`; acceptance holds, exhausted textual/semantic repair, exhausted full verification with safe repository resume evidence, and incomplete publication of a clean verified base become `Stalled`. A generic attempted-execution flag is not sufficient because a pre-existing acceptance or repair hold may be stalled without a new attempt in this process.
 
 Outcome meanings:
 
@@ -28,15 +28,19 @@ Outcome meanings:
 - `blocked`: no safe runnable progress exists because repository-visible dependency/manual gating requires intervention;
 - `stalled`: attempted execution reached a resumable bounded hold such as acceptance stall or unresolved repository repair;
 - `cancelled`: graceful operator signal or typed cancellation stopped the run;
-- `failed`: fatal configuration, authentication, verification, push, command, invariant, or non-resumable error.
+- `failed`: controlled startup configuration/authentication failure, command or invariant failure without safe repository resume evidence, terminal-record emission failure, or another non-resumable error.
 
-`resumable` is derived from the typed repository/workspace outcome, not inferred from exit code or prose. Exit code 2 means a supervisor may offer explicit retry, not that completion occurred.
+`resumable` is derived from the typed repository/workspace outcome, not inferred from exit code or prose. A clean local base at a known cumulative HEAD that has passed required verification but lacks confirmed publication is stalled and resumable, including credential, permission, transport, hook-policy, remote-service, and remote-observation failures during final publication. A startup credential/configuration rejection before repository finalization begins is failed. Exit code 2 means a supervisor may offer explicit retry, not that completion occurred.
 
 ### Decision: result data is privacy-limited and non-authoritative
 
 The schema includes public identifiers and observed SHAs, but no arbitrary errors, command output, environment, credentials, prompts, or config. Failures expose an enum-like `reason_code` and an optional bounded sanitized summary.
 
 The record is an authoritative observation of this process attempt for the supervisor, but never a workflow-control input for cflx. Restart routing is recomputed from the persistent checkout.
+
+### Decision: zero-work follows upstream repository evidence
+
+A fresh zero-change supervised run with no recognized unpublished cumulative/upstream history reports `completed` without verification or push, matching the upstream integration contract. A run with recognized unpublished history performs recovery, full verification, native push, and remote confirmation before it may report `completed`. An all-already-completed explicit target set follows the same rule: classification emptiness does not bypass publication of recognized local history.
 
 ### Decision: lifecycle remains unchanged
 
@@ -62,7 +66,7 @@ The existing adapter continues to receive process and coarse semantic state even
 }
 ```
 
-Optional identity fields are omitted when unavailable. Change arrays are always present, deduplicated, and retain requested order where applicable.
+Optional identity fields are omitted when unavailable. Change arrays are always present, deduplicated, and retain requested order where applicable. Until `resume-explicit-completed-targets` supplies an already-completed classification, `already_completed_changes` remains an empty array; this is a soft implementation-order benefit rather than a hard dependency.
 
 ## Exit Mapping
 
@@ -76,7 +80,9 @@ Optional identity fields are omitted when unavailable. Change arrays are always 
 
 ## Failure Boundaries
 
-- Clap rejection before supervised mode initializes follows clap's existing process contract and may have no terminal record.
+- Clap rejection before supervised mode initializes follows clap's existing process contract and may exit 2 without a terminal record. The supervisor treats every status without exactly one valid record as abnormal, never as a reported blocked/stalled outcome.
 - Controlled startup failure after the option is recognized emits `failed` when the result channel is available.
-- SIGTERM/SIGINT uses bounded graceful cancellation and emits `cancelled`.
-- SIGKILL, abort, runtime panic, container kill after grace, or record-channel failure may leave no valid record; the supervisor combines that absence with process/container status.
+- SIGTERM/SIGINT uses bounded graceful cancellation and emits `cancelled` only after cleanup finishes within the configured/internal deadline.
+- Cancellation cleanup deadline exhaustion exits 1 without a terminal record; the concrete deadline remains an implementation choice covered by bounded process tests.
+- Terminal-record serialization or stdout write failure exits 1 without a fallback record.
+- SIGKILL, abort, runtime panic, or container kill after grace may leave no valid record; the supervisor combines that absence with process/container status.
