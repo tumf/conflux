@@ -50,6 +50,10 @@ KEY OPTIONS:
   --web                 Enable web monitoring server
   --web-port PORT       Web server port (default: 0 = auto-assign)
     --web-bind ADDR       Web server bind address (default: 127.0.0.1)
+  --web-auth-token TOKEN     Bearer token for the /api/v2 remote-control API
+                             (visible in process listings; prefer the -env form)
+  --web-auth-token-env VAR   Environment variable holding that bearer token
+  --web-allowed-origin ORIGIN  Exact extra CORS origin for /api/v2 (repeatable)
     logs                 View persistent Conflux log files without mutating them
     --server URL          Connect TUI to a remote Conflux server
 
@@ -74,6 +78,26 @@ pub struct Cli {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+
+    /// Literal bearer token for the `/api/v2` remote-control API.
+    ///
+    /// Required for any non-loopback `--web-bind`. Prefer
+    /// `--web-auth-token-env`: a literal value here is visible to anything that
+    /// can inspect this process's arguments.
+    #[arg(long, conflicts_with = "web_auth_token_env")]
+    pub web_auth_token: Option<String>,
+
+    /// Environment variable holding the bearer token for the `/api/v2` API.
+    #[arg(long, conflicts_with = "web_auth_token")]
+    pub web_auth_token_env: Option<String>,
+
+    /// Exact additional origin allowed to make cross-origin `/api/v2` requests.
+    ///
+    /// Repeatable. Exact `scheme://host[:port]` values only — wildcards are
+    /// rejected, and forwarded headers never widen this list, so a reverse proxy
+    /// that changes the external origin must name it here.
+    #[arg(long = "web-allowed-origin", value_name = "ORIGIN")]
+    pub web_allowed_origins: Vec<String>,
 
     /// Push completed parallel TUI change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
@@ -378,6 +402,26 @@ pub struct RunArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
 
+    /// Literal bearer token for the `/api/v2` remote-control API.
+    ///
+    /// Required for any non-loopback `--web-bind`. Prefer
+    /// `--web-auth-token-env`: a literal value here is visible to anything that
+    /// can inspect this process's arguments.
+    #[arg(long, conflicts_with = "web_auth_token_env")]
+    pub web_auth_token: Option<String>,
+
+    /// Environment variable holding the bearer token for the `/api/v2` API.
+    #[arg(long, conflicts_with = "web_auth_token")]
+    pub web_auth_token_env: Option<String>,
+
+    /// Exact additional origin allowed to make cross-origin `/api/v2` requests.
+    ///
+    /// Repeatable. Exact `scheme://host[:port]` values only — wildcards are
+    /// rejected, and forwarded headers never widen this list, so a reverse proxy
+    /// that changes the external origin must name it here.
+    #[arg(long = "web-allowed-origin", value_name = "ORIGIN")]
+    pub web_allowed_origins: Vec<String>,
+
     /// Integrate the selected remote's same-name base branch into the cumulative
     /// base during the run, and push the verified result once at completion.
     ///
@@ -486,6 +530,26 @@ pub struct TuiArgs {
     /// Bind address for web monitoring server (default: 127.0.0.1)
     #[arg(long, default_value = "127.0.0.1")]
     pub web_bind: String,
+
+    /// Literal bearer token for the `/api/v2` remote-control API.
+    ///
+    /// Required for any non-loopback `--web-bind`. Prefer
+    /// `--web-auth-token-env`: a literal value here is visible to anything that
+    /// can inspect this process's arguments.
+    #[arg(long, conflicts_with = "web_auth_token_env")]
+    pub web_auth_token: Option<String>,
+
+    /// Environment variable holding the bearer token for the `/api/v2` API.
+    #[arg(long, conflicts_with = "web_auth_token")]
+    pub web_auth_token_env: Option<String>,
+
+    /// Exact additional origin allowed to make cross-origin `/api/v2` requests.
+    ///
+    /// Repeatable. Exact `scheme://host[:port]` values only — wildcards are
+    /// rejected, and forwarded headers never widen this list, so a reverse proxy
+    /// that changes the external origin must name it here.
+    #[arg(long = "web-allowed-origin", value_name = "ORIGIN")]
+    pub web_allowed_origins: Vec<String>,
 
     /// Push completed parallel TUI change branches to a remote instead of merging to base.
     #[arg(long, num_args = 0..=1, default_missing_value = "origin", value_parser = parse_push_remote)]
@@ -2285,6 +2349,221 @@ mod tests {
         assert!(
             help_text.contains("Key bindings"),
             "Help should have 'Key bindings' section"
+        );
+    }
+}
+
+/// Parser coverage for the `/api/v2` remote-control web options.
+///
+/// Named for the capability rather than for `cli` so the change's verification
+/// filter (`cargo test --lib remote_control_api`) reaches the CLI surface too:
+/// a config that only fails at runtime is not a safety property.
+#[cfg(test)]
+mod remote_control_api_cli_tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"))
+    }
+
+    fn parse_err(args: &[&str]) -> String {
+        Cli::try_parse_from(args)
+            .err()
+            .unwrap_or_else(|| panic!("{args:?} must be rejected"))
+            .to_string()
+    }
+
+    #[test]
+    fn web_auth_options_default_to_absent_in_every_web_enabled_scope() {
+        let root = parse(&["cflx", "--web"]);
+        assert_eq!(root.web_auth_token, None);
+        assert_eq!(root.web_auth_token_env, None);
+        assert!(root.web_allowed_origins.is_empty());
+
+        match parse(&["cflx", "run", "--all", "--web"]).command {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.web_auth_token, None);
+                assert_eq!(args.web_auth_token_env, None);
+                assert!(args.web_allowed_origins.is_empty());
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
+
+        match parse(&["cflx", "tui", "--web"]).command {
+            Some(Commands::Tui(args)) => {
+                assert_eq!(args.web_auth_token, None);
+                assert_eq!(args.web_auth_token_env, None);
+                assert!(args.web_allowed_origins.is_empty());
+            }
+            other => panic!("expected tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_literal_token_parses_in_every_web_enabled_scope() {
+        assert_eq!(
+            parse(&["cflx", "--web", "--web-auth-token", "abc"]).web_auth_token,
+            Some("abc".to_string())
+        );
+        match parse(&["cflx", "run", "--all", "--web", "--web-auth-token", "abc"]).command {
+            Some(Commands::Run(args)) => assert_eq!(args.web_auth_token, Some("abc".to_string())),
+            other => panic!("expected run, got {other:?}"),
+        }
+        match parse(&["cflx", "tui", "--web", "--web-auth-token", "abc"]).command {
+            Some(Commands::Tui(args)) => assert_eq!(args.web_auth_token, Some("abc".to_string())),
+            other => panic!("expected tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_environment_form_parses_in_every_web_enabled_scope() {
+        assert_eq!(
+            parse(&["cflx", "--web", "--web-auth-token-env", "CFLX_TOKEN"]).web_auth_token_env,
+            Some("CFLX_TOKEN".to_string())
+        );
+        match parse(&[
+            "cflx",
+            "run",
+            "--all",
+            "--web",
+            "--web-auth-token-env",
+            "CFLX_TOKEN",
+        ])
+        .command
+        {
+            Some(Commands::Run(args)) => {
+                assert_eq!(args.web_auth_token_env, Some("CFLX_TOKEN".to_string()))
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
+        match parse(&["cflx", "tui", "--web", "--web-auth-token-env", "CFLX_TOKEN"]).command {
+            Some(Commands::Tui(args)) => {
+                assert_eq!(args.web_auth_token_env, Some("CFLX_TOKEN".to_string()))
+            }
+            other => panic!("expected tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_sources_are_mutually_exclusive_in_every_web_enabled_scope() {
+        for prefix in [
+            vec!["cflx"],
+            vec!["cflx", "run", "--all"],
+            vec!["cflx", "tui"],
+        ] {
+            let mut args = prefix.clone();
+            args.extend([
+                "--web",
+                "--web-auth-token",
+                "a",
+                "--web-auth-token-env",
+                "V",
+            ]);
+            let error = parse_err(&args);
+            assert!(
+                error.contains("cannot be used with"),
+                "{prefix:?} must reject both token sources, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_origins_are_repeatable_in_every_web_enabled_scope() {
+        let root = parse(&[
+            "cflx",
+            "--web",
+            "--web-allowed-origin",
+            "https://ops.example.com",
+            "--web-allowed-origin",
+            "http://localhost:5173",
+        ]);
+        assert_eq!(
+            root.web_allowed_origins,
+            vec![
+                "https://ops.example.com".to_string(),
+                "http://localhost:5173".to_string()
+            ]
+        );
+
+        match parse(&[
+            "cflx",
+            "run",
+            "--all",
+            "--web",
+            "--web-allowed-origin",
+            "https://a.example",
+            "--web-allowed-origin",
+            "https://b.example",
+        ])
+        .command
+        {
+            Some(Commands::Run(args)) => assert_eq!(args.web_allowed_origins.len(), 2),
+            other => panic!("expected run, got {other:?}"),
+        }
+
+        match parse(&[
+            "cflx",
+            "tui",
+            "--web",
+            "--web-allowed-origin",
+            "https://a.example",
+            "--web-allowed-origin",
+            "https://b.example",
+        ])
+        .command
+        {
+            Some(Commands::Tui(args)) => assert_eq!(args.web_allowed_origins.len(), 2),
+            other => panic!("expected tui, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn help_documents_the_literal_token_exposure_and_the_recommended_form() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--web-auth-token"));
+        assert!(help.contains("--web-auth-token-env"));
+        assert!(help.contains("--web-allowed-origin"));
+        assert!(
+            help.contains("inspect this process's arguments"),
+            "the literal-token exposure must be documented where an operator will read it"
+        );
+        assert!(
+            help.contains("wildcards are\nrejected") || help.contains("wildcards are rejected"),
+            "the exact-origin rule must be documented"
+        );
+    }
+
+    #[test]
+    fn parsed_web_options_flow_into_a_validated_web_config() {
+        let args = parse(&[
+            "cflx",
+            "--web",
+            "--web-bind",
+            "0.0.0.0",
+            "--web-port",
+            "9000",
+            "--web-auth-token",
+            "abc",
+            "--web-allowed-origin",
+            "https://ops.example.com",
+        ]);
+        let config = crate::web::WebConfig::enabled(args.web_port, args.web_bind.clone())
+            .with_auth(
+                args.web_auth_token.clone(),
+                args.web_auth_token_env.clone(),
+                args.web_allowed_origins.clone(),
+            );
+        assert!(config.validate().is_ok());
+        assert_eq!(config.resolve_auth_token().as_deref(), Some("abc"));
+
+        let unsafe_args = parse(&["cflx", "--web", "--web-bind", "0.0.0.0"]);
+        let unsafe_config =
+            crate::web::WebConfig::enabled(unsafe_args.web_port, unsafe_args.web_bind.clone())
+                .with_auth(None, None, Vec::new());
+        assert!(
+            unsafe_config.validate().is_err(),
+            "a routable bind without credentials must never reach a listener"
         );
     }
 }

@@ -160,7 +160,18 @@ async fn launch_tui_inner(
     #[cfg(feature = "web-monitoring")]
     let (web_url, web_state_opt) = if args.web {
         let web_state = std::sync::Arc::new(web::WebState::new(&changes));
-        let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
+        let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone()).with_auth(
+            args.web_auth_token.clone(),
+            args.web_auth_token_env.clone(),
+            args.web_allowed_origins.clone(),
+        );
+        // An unsafe or contradictory web configuration is a hard startup error.
+        // Degrading to "no web server" would leave an operator who asked for a
+        // routable listener believing they had one.
+        if let Err(error) = web_config.validate() {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
         match web::spawn_server_with_url(web_config, web_state.clone()).await {
             Ok((_web_handle, url)) => (Some(url), Some(web_state)),
             Err(e) => {
@@ -592,6 +603,9 @@ async fn main() -> Result<()> {
                 web: cli.web,
                 web_port: cli.web_port,
                 web_bind: cli.web_bind,
+                web_auth_token: cli.web_auth_token,
+                web_auth_token_env: cli.web_auth_token_env,
+                web_allowed_origins: cli.web_allowed_origins,
                 push: cli.push,
                 server: cli.server,
                 server_token: cli.server_token,
@@ -614,7 +628,19 @@ async fn main() -> Result<()> {
             let web_state_arc = if args.web {
                 let initial_changes = openspec::list_changes_native()?;
                 let web_state = std::sync::Arc::new(web::WebState::new(&initial_changes));
-                let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone());
+                let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone())
+                    .with_auth(
+                        args.web_auth_token.clone(),
+                        args.web_auth_token_env.clone(),
+                        args.web_allowed_origins.clone(),
+                    );
+                // An unsafe or contradictory web configuration is a hard startup error.
+                // Degrading to "no web server" would leave an operator who asked for a
+                // routable listener believing they had one.
+                if let Err(error) = web_config.validate() {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
                 match web::spawn_server_with_url(web_config, web_state.clone()).await {
                     Ok((_handle, url)) => {
                         info!("Web monitoring available at: {}", url);

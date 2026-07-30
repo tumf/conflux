@@ -64,12 +64,19 @@ cflx --web
 # 通常モード: ヘッドレス実行 + Web UI
 cflx run --web
 
-# カスタムポートと bind アドレス
-cflx --web --web-port 9000 --web-bind 0.0.0.0
+# カスタムポート。ループバック以外の bind にはベアラートークンが必要
+export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
+cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
 ```
 
 デフォルトポート（0）を使うと、OS が利用可能なポートを自動割当します。
 実際に bind されたアドレスはサーバー起動時にログへ出力されます。
+
+ループバック以外のアドレスに bind する場合、`/api/v2` リモート制御 API 用の
+ベアラートークンが必須で、未指定ならプロセスは起動を拒否します。
+`--web-auth-token-env VAR`（推奨）または `--web-auth-token TOKEN` のどちらか一方を
+指定してください（同時指定は不可）。詳細は
+[USAGE.md](USAGE.md#remote-control-api-apiv2) を参照してください。
 
 サーバーモード（`cflx server`）では、Web UI は設定ポートで常に利用できます。
 
@@ -160,7 +167,7 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0
 | ダッシュボードが開かない | `--web` が有効か確認し、URL に正しいポートが含まれているか確認 |
 | WebSocket が頻繁に切れる | ネットワークの安定性を確認。ダッシュボードは自動再接続します |
 | 変更が更新されない | ページを再読込するか、オーケストレーターが実際に処理中か確認 |
-| 別デバイスからアクセスできない | 外部接続を許可するには `--web-bind 0.0.0.0` を利用（ローカルネットワーク向け） |
+| 別デバイスからアクセスできない | 外部接続を許可するには `--web-bind 0.0.0.0` を利用（ローカルネットワーク向け。`--web-auth-token-env` も必須） |
 | ブラウザコンソールで CORS エラー | クロスオリジン要求では通常の挙動です。サーバー側で CORS ヘッダーを処理します |
 
 ## バックグラウンドサービス (`cflx service`)

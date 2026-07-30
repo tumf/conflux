@@ -771,6 +771,19 @@ impl OperatorCommandService {
         })
     }
 
+    /// Record operator intent to resolve a merge for a change.
+    ///
+    /// The reducer owns whether the intent is valid for the change's current
+    /// wait state, so a frontend never has to decide that itself. Returns true
+    /// when the reducer accepted the intent.
+    pub async fn resolve_merge(&self, change_id: &str) -> bool {
+        let reduce_outcome = {
+            let mut guard = self.state.write().await;
+            guard.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()))
+        };
+        matches!(reduce_outcome, ReduceOutcome::Changed(_))
+    }
+
     /// Route a retry request for one change.
     pub async fn retry_change(&self, change_id: &str) -> OperatorResult<RetryPlan> {
         let display_status = self.display_status(change_id).await;

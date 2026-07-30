@@ -413,6 +413,40 @@ async fn run_tui_loop(
     // Dynamic queue for runtime change additions
     let dynamic_queue = DynamicQueue::new();
 
+    // Bind `/api/v2` command delegation to the shared operator command service.
+    //
+    // The web server started before this point (it owns the URL shown in the
+    // TUI), so v2 refuses commands until the same service the TUI uses exists.
+    // Binding it here is what makes a remote command and a keypress take
+    // identical paths through lifecycle validation and side effects.
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ref ws) = web_state {
+        use crate::orchestration::operator_command::{
+            HookRunnerQueueHooks, OperatorCommandService,
+        };
+        let hook_runner = crate::hooks::HookRunner::with_event_tx(
+            config.get_hooks(),
+            repo_root.clone(),
+            tx.clone(),
+        );
+        let service = Arc::new(OperatorCommandService::new(
+            shared_state.clone(),
+            Arc::new(dynamic_queue.clone()),
+            Arc::new(HookRunnerQueueHooks::new(hook_runner)),
+            app.execution_marks(),
+        ));
+        let runtime = ws.remote_control();
+        runtime
+            .bind(Arc::new(
+                crate::web::remote_control_api::executor::SharedServiceExecutor::new(
+                    service,
+                    ws.clone(),
+                    runtime.projection(),
+                ),
+            ))
+            .await;
+    }
+
     // Manual resolve counter for tracking active manual resolves
     // This allows manual resolves to consume parallel execution slots
     let manual_resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
