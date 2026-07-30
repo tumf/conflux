@@ -8,7 +8,7 @@ info:
   license:
     name: MIT
     identifier: MIT
-  version: 0.6.203
+  version: 0.6.204
 paths:
   /api/changes:
     get:
