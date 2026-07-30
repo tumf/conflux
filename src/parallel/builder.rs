@@ -155,6 +155,8 @@ impl ParallelExecutor {
             // Default-off: an executor built without an explicit `-u` invocation
             // installs no upstream coordinator and therefore no new behavior.
             upstream: None,
+            // Default: explicit targets are resolved before construction.
+            explicit_target_plan: None,
         }
     }
 
@@ -185,6 +187,17 @@ impl ParallelExecutor {
 
     pub fn set_explicit_retry(&mut self, explicit_retry: bool) {
         self.explicit_retry = explicit_retry;
+    }
+
+    /// Install deferred explicit-target classification.
+    ///
+    /// The plan is evaluated once, immediately after the initial upstream
+    /// checkpoint and before any change-worktree creation or reuse registration.
+    pub fn set_explicit_target_plan(
+        &mut self,
+        plan: crate::orchestration::target_resolution::ExplicitTargetPlan,
+    ) {
+        self.explicit_target_plan = Some(plan);
     }
 
     /// Install invocation-scoped upstream integration.

@@ -403,6 +403,12 @@ async fn commit_archive_to_base(repo_root: &Path, archive_leaf: &str, change_id:
         format!("# Archived {change_id}\n"),
     )
     .or_fail("unexpected error");
+    // A real archive moves the change: leaving the active directory behind is
+    // contradictory base evidence, not proof of completion.
+    let active_dir = repo_root.join("openspec/changes").join(change_id);
+    if active_dir.exists() {
+        std::fs::remove_dir_all(&active_dir).or_fail("unexpected error");
+    }
     Command::new("git")
         .args(["add", "-A"])
         .current_dir(repo_root)
@@ -1047,6 +1053,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         analysis_retry_throttle: None,
         analysis_input_probe: None,
         upstream: None,
+        explicit_target_plan: None,
     };
 
     // MergeWait dependencies are NOT skip reasons; they are handled as blocked/queued status
@@ -1196,6 +1203,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         analysis_retry_throttle: None,
         analysis_input_probe: None,
         upstream: None,
+        explicit_target_plan: None,
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1361,6 +1369,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         analysis_retry_throttle: None,
         analysis_input_probe: None,
         upstream: None,
+        explicit_target_plan: None,
     };
 
     let revisions = vec![workspace_a.name.clone()];
@@ -1581,6 +1590,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         analysis_retry_throttle: None,
         analysis_input_probe: None,
         upstream: None,
+        explicit_target_plan: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -1793,6 +1803,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         analysis_retry_throttle: None,
         analysis_input_probe: None,
         upstream: None,
+        explicit_target_plan: None,
     };
 
     let revisions = vec![workspace_a.name, workspace_b.name];
@@ -2011,6 +2022,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         analysis_retry_throttle: None,
         analysis_input_probe: None,
         upstream: None,
+        explicit_target_plan: None,
     };
 
     let revisions = vec![workspace_a.name];
