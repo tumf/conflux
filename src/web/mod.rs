@@ -291,7 +291,14 @@ pub fn remote_control_router(
     )?;
     let runtime = state.remote_control();
     Ok(remote_control_api::router(
-        remote_control_api::RemoteControlState::new(runtime.projection(), Arc::new(auth), runtime),
+        remote_control_api::RemoteControlState::new(
+            runtime.projection(),
+            Arc::new(auth),
+            runtime.clone(),
+        )
+        // The runtime is both the command target and the worktree read port, so
+        // both halves of the API see the same late binding.
+        .with_worktrees(runtime),
     ))
 }
 

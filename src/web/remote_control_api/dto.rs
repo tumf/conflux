@@ -63,6 +63,16 @@ pub enum ErrorCode {
     RegistryCapacity,
     /// The request failed syntax or typed schema validation.
     ValidationFailed,
+    /// A worktree already exists for the addressed change.
+    WorktreeExists,
+    /// No live worktree is bound to the addressed opaque ID.
+    WorktreeNotFound,
+    /// The worktree has uncommitted changes.
+    WorktreeDirty,
+    /// The worktree's dirty state could not be determined, so it fails closed.
+    WorktreeDirtyUnknown,
+    /// The base merge conflicted and its intermediate state was preserved.
+    MergeConflict,
     /// Sanitized server-side failure.
     InternalError,
 }
@@ -73,12 +83,16 @@ impl ErrorCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound | Self::WorktreeNotFound => StatusCode::NOT_FOUND,
             Self::StaleRevision
             | Self::LifecycleConflict
             | Self::TargetIneligible
             | Self::RootBusy
-            | Self::IdempotencyMismatch => StatusCode::CONFLICT,
+            | Self::IdempotencyMismatch
+            | Self::WorktreeExists
+            | Self::WorktreeDirty
+            | Self::WorktreeDirtyUnknown
+            | Self::MergeConflict => StatusCode::CONFLICT,
             Self::RegistryCapacity => StatusCode::SERVICE_UNAVAILABLE,
             Self::ValidationFailed => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
@@ -98,13 +112,18 @@ impl ErrorCode {
             Self::IdempotencyMismatch => "idempotency_mismatch",
             Self::RegistryCapacity => "registry_capacity",
             Self::ValidationFailed => "validation_failed",
+            Self::WorktreeExists => "worktree_exists",
+            Self::WorktreeNotFound => "worktree_not_found",
+            Self::WorktreeDirty => "worktree_dirty",
+            Self::WorktreeDirtyUnknown => "worktree_dirty_unknown",
+            Self::MergeConflict => "merge_conflict",
             Self::InternalError => "internal_error",
         }
     }
 }
 
 /// Every error code, in the order advertised by `/api/v2/capabilities`.
-pub const ALL_ERROR_CODES: [ErrorCode; 11] = [
+pub const ALL_ERROR_CODES: [ErrorCode; 16] = [
     ErrorCode::Unauthorized,
     ErrorCode::Forbidden,
     ErrorCode::NotFound,
@@ -115,6 +134,11 @@ pub const ALL_ERROR_CODES: [ErrorCode; 11] = [
     ErrorCode::IdempotencyMismatch,
     ErrorCode::RegistryCapacity,
     ErrorCode::ValidationFailed,
+    ErrorCode::WorktreeExists,
+    ErrorCode::WorktreeNotFound,
+    ErrorCode::WorktreeDirty,
+    ErrorCode::WorktreeDirtyUnknown,
+    ErrorCode::MergeConflict,
     ErrorCode::InternalError,
 ];
 
@@ -233,7 +257,66 @@ pub enum CommandSpec {
         /// Target change.
         change_id: String,
     },
+    /// Create the managed worktree for an eligible change.
+    ///
+    /// The change ID is the *only* input: branch, path, and base commit are all
+    /// server-derived, so no client can steer where the worktree lands or what
+    /// it is cut from.
+    CreateWorktree {
+        /// The change to create a worktree for.
+        target: ChangeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Delete a worktree addressed by its opaque ID.
+    DeleteWorktree {
+        /// The worktree to delete.
+        target: WorktreeTarget,
+        /// Reserved and always empty. There is no teardown bypass or force flag.
+        #[serde(default)]
+        params: EmptyParams,
+    },
+    /// Merge a worktree's branch into base.
+    MergeWorktree {
+        /// The worktree to merge.
+        target: WorktreeTarget,
+        /// Reserved and always empty.
+        #[serde(default)]
+        params: EmptyParams,
+    },
 }
+
+/// Change-addressed command target.
+///
+/// `deny_unknown_fields` is the security property, not a nicety: it is what makes
+/// a smuggled `path`, `branch`, or `base_commit` a schema failure instead of a
+/// silently ignored field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeTarget {
+    /// Managed, non-archived change ID.
+    pub change_id: String,
+}
+
+/// Worktree-addressed command target.
+///
+/// Only the opaque process-local ID addresses a worktree. A path, a branch, or a
+/// repository correlation ID is never accepted as mutation identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeTarget {
+    /// Opaque 128-bit hexadecimal worktree ID from a v2 read.
+    pub worktree_id: String,
+}
+
+/// A parameter object that accepts nothing.
+///
+/// Present so the wire shape is stable if a parameter is ever added, and so that
+/// every unrecognized parameter fails validation today.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EmptyParams {}
 
 impl CommandSpec {
     /// Wire discriminant of this command.
@@ -249,6 +332,9 @@ impl CommandSpec {
             Self::RetryErrors { .. } => "retry_errors",
             Self::StopAndDequeue { .. } => "stop_and_dequeue",
             Self::ResolveMerge { .. } => "resolve_merge",
+            Self::CreateWorktree { .. } => "create_worktree",
+            Self::DeleteWorktree { .. } => "delete_worktree",
+            Self::MergeWorktree { .. } => "merge_worktree",
         }
     }
 
@@ -261,14 +347,17 @@ impl CommandSpec {
             | Self::RetryChange { change_id }
             | Self::StopAndDequeue { change_id }
             | Self::ResolveMerge { change_id } => Some(change_id),
+            Self::CreateWorktree { target, .. } => Some(&target.change_id),
             Self::Start | Self::Stop | Self::CancelStop | Self::ForceStop => None,
             Self::RetryErrors { .. } => None,
+            // Worktree mutations are addressed by opaque ID, not by change.
+            Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
         }
     }
 }
 
 /// Every supported command type, in the order advertised by capabilities.
-pub const SUPPORTED_COMMANDS: [&str; 10] = [
+pub const SUPPORTED_COMMANDS: [&str; 13] = [
     "start",
     "stop",
     "cancel_stop",
@@ -279,6 +368,9 @@ pub const SUPPORTED_COMMANDS: [&str; 10] = [
     "retry_errors",
     "stop_and_dequeue",
     "resolve_merge",
+    "create_worktree",
+    "delete_worktree",
+    "merge_worktree",
 ];
 
 /// `POST /api/v2/commands` request envelope.
@@ -444,6 +536,8 @@ pub struct CapabilitiesResponse {
     pub limits: CapabilityLimits,
     /// True when bearer authentication is enforced.
     pub authentication_required: bool,
+    /// The complete worktree surface, including its conflict-recovery boundary.
+    pub worktrees: super::worktrees::WorktreeCapabilities,
 }
 
 /// One supported event transport.

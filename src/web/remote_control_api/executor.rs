@@ -160,6 +160,9 @@ pub struct SharedServiceExecutor {
     service: Arc<OperatorCommandService>,
     web_state: Arc<WebState>,
     projection: Arc<super::projection::Projection>,
+    /// The same worktree port the read routes use, so a client cannot be told a
+    /// worktree exists by one half of the API and denied by the other.
+    worktrees: Arc<dyn super::worktrees::WorktreeOperations>,
 }
 
 impl SharedServiceExecutor {
@@ -174,7 +177,17 @@ impl SharedServiceExecutor {
             service,
             web_state,
             projection,
+            worktrees: Arc::new(super::worktrees::UnboundWorktreeOperations),
         }
+    }
+
+    /// Attach the worktree operation port.
+    pub fn with_worktrees(
+        mut self,
+        worktrees: Arc<dyn super::worktrees::WorktreeOperations>,
+    ) -> Self {
+        self.worktrees = worktrees;
+        self
     }
 
     fn lifecycle(
@@ -248,6 +261,18 @@ impl RemoteControlExecutor for SharedServiceExecutor {
                         "'{change_id}' is not waiting on a merge"
                     )))
                 }
+            }
+            // Worktree commands carry no parameters, so there is nothing to
+            // translate here: the closed target is passed straight to the shared
+            // service, which owns every guard.
+            CommandSpec::CreateWorktree { target, .. } => {
+                self.worktrees.create(&target.change_id).await
+            }
+            CommandSpec::DeleteWorktree { target, .. } => {
+                self.worktrees.delete(&target.worktree_id).await
+            }
+            CommandSpec::MergeWorktree { target, .. } => {
+                self.worktrees.merge(&target.worktree_id).await
             }
         }
     }

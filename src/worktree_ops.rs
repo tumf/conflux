@@ -2,6 +2,14 @@
 //!
 //! This module provides shared logic for worktree retrieval, validation, and guard checks
 //! to ensure consistency between TUI and Web interfaces.
+//!
+//! [`service`] adds the frontend-independent *operation* layer on top of these
+//! observations: create, guarded delete, base merge, the repository mutation
+//! guard, hooks, and events. [`git_backend`] is its only real-repository
+//! implementation.
+
+pub mod git_backend;
+pub mod service;
 
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};

@@ -11,6 +11,7 @@ mod projection_tests;
 mod read_tests;
 mod registry_tests;
 mod stream_tests;
+mod worktree_tests;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +29,7 @@ use crate::web::remote_control_api::executor::{
     CommandFailure, ExecutionSummary, RemoteControlExecutor,
 };
 use crate::web::remote_control_api::projection::Projection;
+use crate::web::remote_control_api::worktrees::WorktreeOperations;
 use crate::web::remote_control_api::{router, RemoteControlState};
 
 /// Executor double that records what the API delegated and answers on cue.
@@ -42,6 +44,9 @@ pub(crate) struct RecordingExecutor {
     /// When set, `execute` blocks until the gate is released, which keeps a
     /// command in the in-progress state for capacity and 202 tests.
     gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Worktree commands delegate here, mirroring production wiring where the
+    /// executor and the read routes share one worktree port.
+    worktrees: Mutex<Option<Arc<dyn WorktreeOperations>>>,
 }
 
 impl RecordingExecutor {
@@ -51,7 +56,12 @@ impl RecordingExecutor {
             call_count: AtomicUsize::new(0),
             outcome: Mutex::new(Ok(ExecutionSummary::changed("done"))),
             gate: Mutex::new(None),
+            worktrees: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn bind_worktrees(&self, port: Arc<dyn WorktreeOperations>) {
+        *self.worktrees.lock().unwrap() = Some(port);
     }
 
     pub(crate) fn set_outcome(&self, outcome: Result<ExecutionSummary, CommandFailure>) {
@@ -83,6 +93,22 @@ impl RemoteControlExecutor for RecordingExecutor {
         if let Some(gate) = gate {
             gate.notified().await;
         }
+
+        let worktrees = self.worktrees.lock().unwrap().clone();
+        if let Some(port) = worktrees {
+            match command {
+                CommandSpec::CreateWorktree { target, .. } => {
+                    return port.create(&target.change_id).await
+                }
+                CommandSpec::DeleteWorktree { target, .. } => {
+                    return port.delete(&target.worktree_id).await
+                }
+                CommandSpec::MergeWorktree { target, .. } => {
+                    return port.merge(&target.worktree_id).await
+                }
+                _ => {}
+            }
+        }
         self.outcome.lock().unwrap().clone()
     }
 }
@@ -92,6 +118,7 @@ pub(crate) struct Harness {
     pub(crate) router: axum::Router,
     pub(crate) projection: Arc<Projection>,
     pub(crate) executor: Arc<RecordingExecutor>,
+    pub(crate) worktrees: Arc<worktree_tests::FakeWorktreePort>,
 }
 
 /// Build a harness with the given bearer token and exact allowed origins.
@@ -109,15 +136,17 @@ pub(crate) fn harness_with_projection(
     let auth = RemoteControlAuth::new(token.map(str::to_string), &owned)
         .expect("test origins must be valid");
     let executor = RecordingExecutor::new();
-    let router = router(RemoteControlState::new(
-        projection.clone(),
-        Arc::new(auth),
-        executor.clone(),
-    ));
+    let worktrees = Arc::new(worktree_tests::FakeWorktreePort::default());
+    executor.bind_worktrees(worktrees.clone());
+    let router = router(
+        RemoteControlState::new(projection.clone(), Arc::new(auth), executor.clone())
+            .with_worktrees(worktrees.clone()),
+    );
     Harness {
         router,
         projection,
         executor,
+        worktrees,
     }
 }
 

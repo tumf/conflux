@@ -25,8 +25,8 @@ pub use commit::{
 };
 pub use merge::{
     check_merge_conflicts, first_parent_of, is_ancestor, is_merge_in_progress, merge, merge_branch,
-    merge_commit_hash_by_subject_since, missing_merge_commits_since,
-    presync_merge_subject_mismatches_since,
+    merge_branch_preserving_conflict, merge_commit_hash_by_subject_since,
+    missing_merge_commits_since, presync_merge_subject_mismatches_since, PreservedMergeOutcome,
 };
 #[allow(unused_imports)]
 pub use worktree::{

@@ -3,7 +3,7 @@
 //! This module provides functions for merging branches, detecting conflicts,
 //! and managing merge-related operations.
 
-use super::basic::{is_working_directory_clean, run_git};
+use super::basic::{get_conflict_files, is_working_directory_clean, run_git};
 use crate::vcs::{VcsError, VcsResult};
 use std::path::Path;
 use std::process::Stdio;
@@ -266,6 +266,70 @@ pub async fn merge_branch<P: AsRef<Path>>(cwd: P, branch_name: &str) -> VcsResul
             Err(VcsError::git_command(format!("Merge failed: {}", stderr)))
         }
     }
+}
+
+/// What a conflict-preserving base merge did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreservedMergeOutcome {
+    /// The merge completed and produced a merge commit.
+    Merged,
+    /// The merge conflicted; `MERGE_HEAD` and the conflicted index are still in place.
+    Conflict {
+        /// Repository-relative paths of the unmerged entries.
+        files: Vec<String>,
+    },
+}
+
+/// Merge a branch into the current branch without aborting on conflict.
+///
+/// Same `git merge --no-ff --no-edit <branch>` as [`merge_branch`] and the same
+/// clean-working-directory precondition, but a conflict is reported as a value
+/// with the intermediate merge state left in the repository. Callers that want
+/// the historical auto-abort behavior keep using [`merge_branch`]; callers whose
+/// contract is "preserve the evidence for local resolution" use this one.
+pub async fn merge_branch_preserving_conflict<P: AsRef<Path>>(
+    cwd: P,
+    branch_name: &str,
+) -> VcsResult<PreservedMergeOutcome> {
+    let cwd = cwd.as_ref();
+
+    if !is_working_directory_clean(cwd).await? {
+        return Err(VcsError::git_command(
+            "Working directory is not clean. Commit or stash changes before merging.".to_string(),
+        ));
+    }
+
+    let output = Command::new("git")
+        .args(["merge", "--no-ff", "--no-edit", branch_name])
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(e.to_string()))?;
+
+    if output.status.success() {
+        debug!("Merged branch {} successfully", branch_name);
+        return Ok(PreservedMergeOutcome::Merged);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    if combined.contains("CONFLICT") || combined.contains("Automatic merge failed") {
+        // The index is the authoritative conflict record; the stderr scrape is
+        // only a fallback for the rare case where the index read fails.
+        let files = match get_conflict_files(cwd).await {
+            Ok(files) if !files.is_empty() => files,
+            _ => parse_conflict_files_from_stderr(&combined),
+        };
+        return Ok(PreservedMergeOutcome::Conflict { files });
+    }
+
+    Err(VcsError::git_command(format!(
+        "git merge {} failed: {}",
+        branch_name, combined
+    )))
 }
 
 /// Merge a branch into the current branch.

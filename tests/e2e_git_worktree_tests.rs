@@ -2092,3 +2092,361 @@ async fn explicit_target_resume_all_completed_run_still_publishes_unpushed_histo
         "the cumulative base is published"
     );
 }
+
+// ── Remote worktree operations (real Git worktrees / teardown / merge state) ──
+//
+// These cases prove the parts of `secure-remote-worktree-operations` that are
+// only decidable against a real repository: mandatory teardown, dirty refusal,
+// conflict preservation, `on_merged` ordering, and identity retirement across a
+// real remove-and-recreate. They drive the production port
+// (`RemoteWorktreeOperations` over `GitWorktreeBackend`), not a fake.
+
+#[cfg(feature = "web-monitoring")]
+mod remote_worktree_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use conflux::config::OrchestratorConfig;
+    use conflux::web::remote_control_api::worktrees::{
+        RemoteWorktreeOperations, WorktreeOperations, WorktreeRegistry,
+    };
+    use conflux::worktree_ops::git_backend::GitWorktreeBackend;
+    use conflux::worktree_ops::service::{NullEventSink, WorktreeService};
+
+    pub use super::upstream_integration_support::{configure_identity, git, git_allow_failure};
+
+    /// A real repository plus the production remote worktree port over it.
+    pub struct RemoteFixture {
+        pub _dir: tempfile::TempDir,
+        pub repo: PathBuf,
+        pub workspaces: PathBuf,
+        pub registry: Arc<WorktreeRegistry>,
+        pub port: RemoteWorktreeOperations,
+    }
+
+    /// Build the fixture, or `None` when git is unavailable.
+    pub fn remote_fixture() -> Option<RemoteFixture> {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let workspaces = dir.path().join("workspaces");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&workspaces).unwrap();
+
+        if !git_allow_failure(&repo, &["init", "-b", "main"]) {
+            return None;
+        }
+        configure_identity(&repo);
+        std::fs::write(repo.join("README.md"), "# base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "Initial commit"]);
+
+        let registry = Arc::new(WorktreeRegistry::new());
+        let service = Arc::new(WorktreeService::new(
+            Arc::new(GitWorktreeBackend::new(
+                repo.clone(),
+                Arc::new(OrchestratorConfig::default()),
+            )),
+            Arc::new(NullEventSink),
+            workspaces.clone(),
+        ));
+        let port = RemoteWorktreeOperations::new(service, registry.clone(), repo.clone());
+
+        Some(RemoteFixture {
+            _dir: dir,
+            repo,
+            workspaces,
+            registry,
+            port,
+        })
+    }
+
+    /// Register a managed, non-archived change so create eligibility passes.
+    ///
+    /// Committed, not just written: a base merge requires a clean working tree,
+    /// so leaving the declaration untracked would make every merge case fail for
+    /// a reason that has nothing to do with what is under test.
+    pub fn declare_change(repo: &Path, change_id: &str) {
+        let dir = repo.join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), "# proposal\n").unwrap();
+        std::fs::write(dir.join("tasks.md"), "- [x] done\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-m", &format!("Declare {change_id}")]);
+    }
+
+    /// True when the base repository is sitting on an unresolved merge.
+    pub fn merge_in_progress(repo: &Path) -> bool {
+        repo.join(".git/MERGE_HEAD").exists()
+    }
+
+    /// The opaque ID currently bound to the worktree on `branch`, if any.
+    pub async fn id_for_branch(port: &RemoteWorktreeOperations, branch: &str) -> Option<String> {
+        port.list()
+            .await
+            .ok()?
+            .worktrees
+            .into_iter()
+            .find(|worktree| worktree.branch == branch)
+            .map(|worktree| worktree.worktree_id)
+    }
+}
+
+#[cfg(feature = "web-monitoring")]
+mod remote_worktree_tests {
+    use super::remote_worktree_support::*;
+    use conflux::web::remote_control_api::dto::ErrorCode;
+    use conflux::web::remote_control_api::worktrees::WorktreeOperations;
+
+    #[tokio::test]
+    async fn remote_worktree_create_uses_current_base_head_and_allocates_an_id() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+        std::fs::write(fx.repo.join("second.txt"), "second\n").unwrap();
+        git(&fx.repo, &["add", "."]);
+        git(&fx.repo, &["commit", "-m", "Advance base"]);
+        let head = git(&fx.repo, &["rev-parse", "HEAD"]);
+
+        fx.port.create("change-a").await.expect("create succeeds");
+
+        let worktree_path = fx.workspaces.join("change-a");
+        assert!(worktree_path.is_dir(), "the worktree directory exists");
+        assert_eq!(
+            git(&worktree_path, &["rev-parse", "HEAD"]),
+            head,
+            "the worktree is cut from current managed base HEAD"
+        );
+
+        let listed = fx.port.list().await.expect("list succeeds");
+        let created = listed
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.branch == "change-a")
+            .expect("the created worktree is observable");
+        assert_eq!(created.worktree_id.len(), 32);
+        assert_eq!(created.dirty, Some(false));
+        // Repository-relative, and never the absolute root in any spelling.
+        let raw = serde_json::to_string(&listed.worktrees).unwrap();
+        let canonical = std::fs::canonicalize(&fx.repo).unwrap();
+        assert!(
+            !raw.contains(fx.repo.to_str().unwrap()),
+            "leaked root: {raw}"
+        );
+        assert!(
+            !raw.contains(canonical.to_str().unwrap()),
+            "leaked canonical root: {raw}"
+        );
+        assert_eq!(created.path, "../workspaces/change-a");
+    }
+
+    #[tokio::test]
+    async fn remote_worktree_create_refuses_an_existing_worktree_and_an_unmanaged_change() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+        fx.port.create("change-a").await.expect("first create");
+
+        let failure = fx
+            .port
+            .create("change-a")
+            .await
+            .expect_err("a second create must conflict");
+        assert_eq!(failure.error_code, ErrorCode::WorktreeExists);
+
+        let failure = fx
+            .port
+            .create("never-proposed")
+            .await
+            .expect_err("an unmanaged change must be refused");
+        assert_eq!(failure.error_code, ErrorCode::WorktreeNotFound);
+    }
+
+    #[tokio::test]
+    async fn remote_worktree_delete_runs_teardown_and_retires_the_identity() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+
+        // A real `.wt/teardown` proves the delete path is not bypassing it.
+        let wt_dir = fx.repo.join(".wt");
+        std::fs::create_dir_all(&wt_dir).unwrap();
+        let marker = fx.repo.join("teardown-ran");
+        std::fs::write(
+            wt_dir.join("teardown"),
+            format!("#!/bin/sh\ntouch {}\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                wt_dir.join("teardown"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        git(&fx.repo, &["add", "-A"]);
+        git(&fx.repo, &["commit", "-m", "Add teardown script"]);
+
+        fx.port.create("change-a").await.expect("create succeeds");
+        let id = id_for_branch(&fx.port, "change-a")
+            .await
+            .expect("an ID was allocated");
+
+        fx.port.delete(&id).await.expect("delete succeeds");
+
+        assert!(marker.exists(), "managed teardown must have run");
+        assert!(!fx.workspaces.join("change-a").exists());
+        assert!(fx.registry.is_retired(&id), "the ID must be retired");
+        assert!(fx.registry.resolve(&id).is_none());
+
+        let failure = fx
+            .port
+            .delete(&id)
+            .await
+            .expect_err("a retired ID addresses nothing");
+        assert_eq!(failure.error_code, ErrorCode::WorktreeNotFound);
+    }
+
+    #[tokio::test]
+    async fn remote_worktree_dirty_worktree_is_not_deletable() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+        fx.port.create("change-a").await.expect("create succeeds");
+        let id = id_for_branch(&fx.port, "change-a").await.unwrap();
+
+        std::fs::write(fx.workspaces.join("change-a/dirty.txt"), "uncommitted\n").unwrap();
+
+        let failure = fx
+            .port
+            .delete(&id)
+            .await
+            .expect_err("a dirty worktree must not be deleted");
+        assert_eq!(failure.error_code, ErrorCode::WorktreeDirty);
+        assert!(
+            fx.workspaces.join("change-a").exists(),
+            "a refused delete retains the resource"
+        );
+        assert!(
+            !fx.registry.is_retired(&id),
+            "a refused delete retains the identity binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_worktree_successful_merge_lands_on_base_and_runs_on_merged() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+        fx.port.create("change-a").await.expect("create succeeds");
+
+        let worktree = fx.workspaces.join("change-a");
+        configure_identity(&worktree);
+        std::fs::write(worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "Add feature"]);
+
+        let id = id_for_branch(&fx.port, "change-a").await.unwrap();
+        fx.port.merge(&id).await.expect("merge succeeds");
+
+        assert!(
+            fx.repo.join("feature.txt").exists(),
+            "the base contains the worktree result"
+        );
+        assert!(
+            !merge_in_progress(&fx.repo),
+            "a clean merge leaves no intermediate state"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_worktree_merge_conflict_preserves_state_and_blocks_further_mutation() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+        std::fs::write(fx.repo.join("shared.txt"), "base\n").unwrap();
+        git(&fx.repo, &["add", "."]);
+        git(&fx.repo, &["commit", "-m", "Add shared file"]);
+
+        fx.port.create("change-a").await.expect("create succeeds");
+        let worktree = fx.workspaces.join("change-a");
+        configure_identity(&worktree);
+        std::fs::write(worktree.join("shared.txt"), "from worktree\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "Worktree edit"]);
+
+        // Diverge base so the merge genuinely conflicts.
+        std::fs::write(fx.repo.join("shared.txt"), "from base\n").unwrap();
+        git(&fx.repo, &["add", "."]);
+        git(&fx.repo, &["commit", "-m", "Base edit"]);
+
+        let id = id_for_branch(&fx.port, "change-a").await.unwrap();
+        let failure = fx
+            .port
+            .merge(&id)
+            .await
+            .expect_err("a conflicting merge must fail the command");
+
+        assert_eq!(failure.error_code, ErrorCode::MergeConflict);
+        assert!(failure.message.contains("shared.txt"));
+        assert!(failure.message.contains("local_or_tui_required"));
+        assert!(
+            merge_in_progress(&fx.repo),
+            "the intermediate merge state must be preserved, not aborted"
+        );
+
+        // Until a local resolve or abort happens, further mutation is refused.
+        let busy = fx
+            .port
+            .merge(&id)
+            .await
+            .expect_err("the root stays busy after a preserved conflict");
+        assert_eq!(busy.error_code, ErrorCode::RootBusy);
+        let busy_delete = fx
+            .port
+            .delete(&id)
+            .await
+            .expect_err("the root stays busy for deletion too");
+        assert_eq!(busy_delete.error_code, ErrorCode::RootBusy);
+        assert!(
+            merge_in_progress(&fx.repo),
+            "the retained conflict state is not discarded by the refusals"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_worktree_recreated_worktree_receives_a_new_identity() {
+        let Some(fx) = remote_fixture() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        declare_change(&fx.repo, "change-a");
+
+        fx.port.create("change-a").await.expect("first create");
+        let first = id_for_branch(&fx.port, "change-a").await.unwrap();
+        fx.port.delete(&first).await.expect("delete succeeds");
+
+        fx.port.create("change-a").await.expect("second create");
+        let second = id_for_branch(&fx.port, "change-a").await.unwrap();
+
+        assert_ne!(
+            first, second,
+            "a worktree recreated at the same path must not inherit the retired ID"
+        );
+        assert!(fx.registry.is_retired(&first));
+        assert!(fx.registry.resolve(&second).is_some());
+    }
+}
