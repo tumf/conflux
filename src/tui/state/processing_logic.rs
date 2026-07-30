@@ -62,10 +62,20 @@ pub(super) fn collect_resume_processing_targets(
     Ok(marked_ids)
 }
 
+/// Marked rows whose display status carries retryable evidence.
+///
+/// The retryable vocabulary comes from the shared operator command service, so
+/// terminal errors and resumable acceptance holds stay in sync across frontends.
 pub(super) fn collect_retry_error_targets(changes: &[ChangeState]) -> Vec<String> {
     changes
         .iter()
-        .filter(|c| c.selected && c.display_status_cache == "error")
+        .filter(|c| {
+            c.selected
+                && crate::orchestration::operator_command::classify_retry_route(
+                    &c.display_status_cache,
+                )
+                .is_some()
+        })
         .map(|c| c.id.clone())
         .collect()
 }
@@ -104,12 +114,27 @@ pub(super) fn sync_retry_error_intent(
     };
 
     ids.iter()
-        .filter_map(
-            |id| match guard.apply_command(ReducerCommand::RetryError(id.clone())) {
+        .filter_map(|id| {
+            // Routing is owned by the shared operator command service: terminal
+            // errors clear through RetryError, while a reconciled acceptance hold
+            // only needs ordinary queue intent restored and is consumed later by
+            // the explicit-retry run path (no apply rerun).
+            let route = crate::orchestration::operator_command::classify_retry_route(
+                guard.display_status(id),
+            )?;
+            let command = match route {
+                crate::orchestration::operator_command::RetryRoute::TerminalError => {
+                    ReducerCommand::RetryError(id.clone())
+                }
+                crate::orchestration::operator_command::RetryRoute::AcceptanceStall => {
+                    ReducerCommand::AddToQueue(id.clone())
+                }
+            };
+            match guard.apply_command(command) {
                 ReduceOutcome::Changed(_) => Some(id.clone()),
                 ReduceOutcome::NoOp => None,
-            },
-        )
+            }
+        })
         .collect()
 }
 

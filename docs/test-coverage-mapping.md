@@ -34,6 +34,57 @@ This document maps specification scenarios to their corresponding test implement
 
 ---
 
+## Operator Command Execution (`openspec/specs/operator-command-execution/spec.md`)
+
+すべて `cargo test --lib operator_command` で実行される。
+
+### Requirement: Shared operator command service
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| TUI と直接呼び出しが同一結果 (queue add) | `src/tui/command_handlers.rs::operator_command_parity_tests::operator_command_tui_add_matches_direct_service_add` | ✅ NEW |
+| TUI と直接呼び出しが同一結果 (queue remove) | `src/tui/command_handlers.rs::operator_command_parity_tests::operator_command_tui_remove_matches_direct_service_remove` | ✅ NEW |
+| 型付きコマンド dispatch と直接呼び出しの一致 | `src/orchestration/operator_command/tests.rs::operator_command_typed_dispatch_matches_direct_calls` | ✅ NEW |
+
+### Requirement: Execution intent remains non-authoritative and process-local
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| 再起動でマークが false に戻る | `src/orchestration/operator_command/tests.rs::operator_command_execution_marks_reset_after_process_restart` | ✅ NEW |
+| マークが永続化されない | `src/orchestration/operator_command/tests.rs::operator_command_execution_marks_are_never_persisted` | ✅ NEW |
+| マークが workspace 由来ルーティングを変えない | `src/orchestration/operator_command/tests.rs::operator_command_marks_do_not_change_workspace_derived_routing` | ✅ NEW |
+
+### Requirement: Mode-aware mark and queue behavior
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| モード/状態のライフサイクル行列 | `src/orchestration/operator_command/tests.rs::operator_command_mark_route_matrix_matches_mode_and_status` | ✅ NEW |
+| 依存ブロック時も queue intent を保持 | `src/orchestration/operator_command/tests.rs::operator_command_dependency_blocked_addition_keeps_queue_intent` | ✅ NEW |
+| 再開可能ホールドは stalled のまま | `src/orchestration/operator_command/tests.rs::operator_command_stalled_hold_keeps_stalled_display_status` | ✅ NEW |
+| Error モードは retry を要求 | `src/orchestration/operator_command/tests.rs::operator_command_error_mode_rejects_mark_mutation_without_side_effects` | ✅ NEW |
+| 実行中行はマーク変更不可 | `src/orchestration/operator_command/tests.rs::operator_command_active_rows_reject_mark_mutation_in_running_mode` | ✅ NEW |
+
+### Requirement: Cancellation precedes active dequeue
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| 終了確認後にのみ dequeue | `src/orchestration/operator_command/tests.rs::operator_command_stop_and_dequeue_waits_for_confirmed_termination` | ✅ NEW |
+| ハンドル不在は安全に失敗 | `src/orchestration/operator_command/tests.rs::operator_command_stop_and_dequeue_fails_without_cancellation_handle` | ✅ NEW |
+| キャンセル発行失敗 | `src/orchestration/operator_command/tests.rs::operator_command_stop_and_dequeue_fails_when_cancellation_errors` | ✅ NEW |
+| 終了確認タイムアウト | `src/orchestration/operator_command/tests.rs::operator_command_stop_and_dequeue_times_out_without_termination` | ✅ NEW |
+| TUI 経路も終了確認を待つ | `src/tui/command_handlers.rs::operator_command_parity_tests::operator_command_tui_dequeue_waits_for_confirmed_termination` | ✅ NEW |
+
+### Requirement: Retry routing preserves reconciled evidence
+
+| Scenario | Test | Status |
+|----------|------|--------|
+| terminal error は RetryError | `src/orchestration/operator_command/tests.rs::operator_command_terminal_error_retry_uses_retry_error` | ✅ NEW |
+| acceptance stall は explicit retry | `src/orchestration/operator_command/tests.rs::operator_command_acceptance_stalled_retry_requests_explicit_retry` | ✅ NEW |
+| bulk retry は非対応ホールドを消費しない | `src/orchestration/operator_command/tests.rs::operator_command_bulk_retry_skips_unsupported_holds` | ✅ NEW |
+| TUI retry が explicit retry を要求 | `src/tui/command_handlers.rs::operator_command_parity_tests::operator_command_retry_requests_an_explicit_retry_run` | ✅ NEW |
+
+---
+
 ## Hooks Specification (`openspec/specs/hooks/spec.md`)
 
 ### Requirement: on_queue_add hook
@@ -42,6 +93,9 @@ This document maps specification scenarios to their corresponding test implement
 |----------|------|--------|
 | on_queue_add 設定の解析 | `src/hooks.rs::test_hooks_config_on_queue_add` | ✅ NEW |
 | on_queue_add の実行 | `src/hooks.rs::test_on_queue_add_hook_execution` | ✅ NEW |
+| 共有サービスが 1 回だけ実行 | `src/orchestration/operator_command/tests.rs::operator_command_queue_add_runs_hook_exactly_once` | ✅ NEW |
+| 重複追加では実行しない | `src/orchestration/operator_command/tests.rs::operator_command_duplicate_queue_add_is_a_noop_without_hook` | ✅ NEW |
+| 初期キュー構築では実行しない | `src/orchestration/operator_command/tests.rs::operator_command_service_is_the_only_queue_hook_dispatcher` | ✅ NEW |
 
 ### Requirement: on_queue_remove hook
 
@@ -49,6 +103,8 @@ This document maps specification scenarios to their corresponding test implement
 |----------|------|--------|
 | on_queue_remove 設定の解析 | `src/hooks.rs::test_hooks_config_on_queue_remove` | ✅ NEW |
 | on_queue_remove の実行 | `src/hooks.rs::test_on_queue_remove_hook_execution` | ✅ NEW |
+| 共有サービスが 1 回だけ実行 | `src/orchestration/operator_command/tests.rs::operator_command_queue_remove_runs_hook_exactly_once` | ✅ NEW |
+| no-op 削除では実行しない | `src/orchestration/operator_command/tests.rs::operator_command_removal_of_never_queued_change_runs_no_hook` | ✅ NEW |
 
 ### Requirement: on_approve hook
 
