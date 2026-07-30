@@ -52,6 +52,9 @@ pub struct ParallelRunService {
     /// `None` installs no checkpoint at all; it is never sourced from persistent
     /// orchestration config.
     upstream_integration: Option<crate::upstream::UpstreamRuntime>,
+    /// Explicit-target classification deferred to the executor's post-checkpoint
+    /// boundary. Only an enabled real `-u` run installs one.
+    explicit_target_plan: Option<crate::orchestration::target_resolution::ExplicitTargetPlan>,
 }
 
 impl ParallelRunService {
@@ -79,6 +82,7 @@ impl ParallelRunService {
             ai_runner,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
             upstream_integration: None,
+            explicit_target_plan: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl ParallelRunService {
             ai_runner,
             diagnostic_dedup: Arc::new(Mutex::new(DiagnosticDeduplicationStore::new())),
             upstream_integration: None,
+            explicit_target_plan: None,
         }
     }
 
@@ -135,6 +140,18 @@ impl ParallelRunService {
         self.upstream_integration.as_ref()
     }
 
+    /// Install deferred explicit-target classification.
+    ///
+    /// Used by an enabled real `-u` run, where the requested set must be
+    /// classified against the cumulative base produced by the initial upstream
+    /// checkpoint rather than the pre-checkpoint base.
+    pub fn set_explicit_target_plan(
+        &mut self,
+        plan: crate::orchestration::target_resolution::ExplicitTargetPlan,
+    ) {
+        self.explicit_target_plan = Some(plan);
+    }
+
     /// Install the coordinator on an executor when the option is enabled.
     ///
     /// A disabled service leaves the executor untouched, so no upstream object
@@ -142,6 +159,9 @@ impl ParallelRunService {
     fn install_upstream_integration(&self, executor: &mut ParallelExecutor) {
         if let Some(runtime) = &self.upstream_integration {
             executor.set_upstream_integration(runtime.clone(), self.shared_stagger_state.clone());
+        }
+        if let Some(plan) = &self.explicit_target_plan {
+            executor.set_explicit_target_plan(plan.clone());
         }
     }
 
@@ -234,51 +254,7 @@ impl ParallelRunService {
         &self,
         changes: Vec<Change>,
     ) -> Result<(Vec<Change>, Vec<String>)> {
-        let committed_change_ids: HashSet<String> =
-            match crate::vcs::git::commands::list_changes_in_head(&self.repo_root).await {
-                Ok(ids) => ids.into_iter().collect(),
-                Err(err) => {
-                    warn!(
-                        "Failed to load committed change snapshot; assuming all changes are committed: {}",
-                        err
-                    );
-                    return Ok((changes, Vec::new()));
-                }
-            };
-
-        // Get changes with uncommitted files under openspec/changes/<change_id>/
-        let uncommitted_file_change_ids: HashSet<String> =
-            match crate::vcs::git::commands::list_changes_with_uncommitted_files(&self.repo_root)
-                .await
-            {
-                Ok(ids) => ids.into_iter().collect(),
-                Err(err) => {
-                    warn!(
-                        "Failed to detect uncommitted files in changes; assuming no uncommitted files: {}",
-                        err
-                    );
-                    HashSet::new()
-                }
-            };
-
-        let mut committed = Vec::new();
-        let mut skipped = Vec::new();
-
-        for change in changes {
-            // Exclude if:
-            // 1. Not in HEAD commit tree, OR
-            // 2. Has uncommitted/untracked files under openspec/changes/<change_id>/
-            if !committed_change_ids.contains(&change.id)
-                || uncommitted_file_change_ids.contains(&change.id)
-            {
-                skipped.push(change.id);
-            } else {
-                committed.push(change);
-            }
-        }
-
-        skipped.sort();
-        Ok((committed, skipped))
+        filter_committed_changes_at(&self.repo_root, changes).await
     }
 
     /// Prepare changes for parallel execution: filter committed changes and send warning event if needed.
@@ -851,6 +827,61 @@ impl ParallelRunService {
             analyzer.analyze_groups(changes).await
         }
     }
+}
+
+/// Split changes into those committed to the repository and those skipped.
+///
+/// A change is eligible only when it exists in the HEAD tree and has no
+/// uncommitted or untracked files under `openspec/changes/<change_id>/`. Shared
+/// with the executor so post-checkpoint explicit-target resolution applies the
+/// same eligibility rule as start-time preparation.
+pub(crate) async fn filter_committed_changes_at(
+    repo_root: &std::path::Path,
+    changes: Vec<Change>,
+) -> Result<(Vec<Change>, Vec<String>)> {
+    let committed_change_ids: HashSet<String> =
+        match crate::vcs::git::commands::list_changes_in_head(repo_root).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                warn!(
+                    "Failed to load committed change snapshot; assuming all changes are committed: {}",
+                    err
+                );
+                return Ok((changes, Vec::new()));
+            }
+        };
+
+    // Get changes with uncommitted files under openspec/changes/<change_id>/
+    let uncommitted_file_change_ids: HashSet<String> =
+        match crate::vcs::git::commands::list_changes_with_uncommitted_files(repo_root).await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(err) => {
+                warn!(
+                    "Failed to detect uncommitted files in changes; assuming no uncommitted files: {}",
+                    err
+                );
+                HashSet::new()
+            }
+        };
+
+    let mut committed = Vec::new();
+    let mut skipped = Vec::new();
+
+    for change in changes {
+        // Exclude if:
+        // 1. Not in HEAD commit tree, OR
+        // 2. Has uncommitted/untracked files under openspec/changes/<change_id>/
+        if !committed_change_ids.contains(&change.id)
+            || uncommitted_file_change_ids.contains(&change.id)
+        {
+            skipped.push(change.id);
+        } else {
+            committed.push(change);
+        }
+    }
+
+    skipped.sort();
+    Ok((committed, skipped))
 }
 
 #[cfg(test)]

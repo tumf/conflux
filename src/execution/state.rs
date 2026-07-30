@@ -64,11 +64,207 @@ pub enum WorkspaceState {
     Merged,
 }
 
+/// Why base-completion evidence could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseEvidenceErrorKind {
+    /// The base branch could not be resolved in the repository.
+    MissingBranch,
+    /// A Git command could not be executed.
+    CommandFailure,
+}
+
+/// Typed repository-tree evidence for base-integrated completion.
+///
+/// This is the only accepted proof that a change is already completed: the base
+/// branch HEAD tree. Commit subjects, logs, events, and server state are never
+/// consulted, so the classification stays derivable from repository files alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseCompletionEvidence {
+    /// A matching archive entry exists in the base tree and the active change
+    /// directory is absent from it.
+    Completed,
+    /// No matching archive entry exists in the base tree.
+    NotCompleted,
+    /// The base tree contains both an archive entry and the active change
+    /// directory, so completion cannot be proven.
+    Contradictory { detail: String },
+    /// The base branch or its tree could not be read.
+    EvidenceError {
+        kind: BaseEvidenceErrorKind,
+        detail: String,
+    },
+}
+
+impl BaseCompletionEvidence {
+    /// Whether the evidence proves base-integrated completion.
+    #[allow(dead_code)] // Boolean projection used by evidence consumers/tests.
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    /// Human-facing description used in target diagnostics.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Completed => {
+                "archive entry present in base tree and change directory absent".to_string()
+            }
+            Self::NotCompleted => "no archive entry in base tree".to_string(),
+            Self::Contradictory { detail } => detail.clone(),
+            Self::EvidenceError { detail, .. } => detail.clone(),
+        }
+    }
+}
+
+/// Classify base-integrated completion from the base branch HEAD tree.
+///
+/// The four results are mutually exclusive so contradictions and Git read
+/// failures cannot collapse into "not completed" or "unknown":
+///
+/// * [`BaseCompletionEvidence::Completed`] - archive entry present, change directory absent
+/// * [`BaseCompletionEvidence::NotCompleted`] - no archive entry for the change
+/// * [`BaseCompletionEvidence::Contradictory`] - archive entry AND change directory present
+/// * [`BaseCompletionEvidence::EvidenceError`] - base branch missing or Git command failure
+///
+/// Only the base branch tree is read, so uncommitted working-copy archives and
+/// archive-shaped commit subjects can never pass as completed.
+pub async fn classify_base_completion(
+    change_id: &str,
+    repo_root: &Path,
+    base_branch: &str,
+) -> BaseCompletionEvidence {
+    // Check if base branch exists
+    let rev_parse_output = Command::new("git")
+        .args(["rev-parse", "--verify", base_branch])
+        .current_dir(repo_root)
+        .output()
+        .await;
+
+    let rev_parse_output = match rev_parse_output {
+        Ok(output) => output,
+        Err(e) => {
+            return BaseCompletionEvidence::EvidenceError {
+                kind: BaseEvidenceErrorKind::CommandFailure,
+                detail: format!("Failed to verify base branch: {}", e),
+            }
+        }
+    };
+
+    if !rev_parse_output.status.success() {
+        debug!(
+            base_branch = %base_branch,
+            "classify_base_completion: base branch does not exist"
+        );
+        return BaseCompletionEvidence::EvidenceError {
+            kind: BaseEvidenceErrorKind::MissingBranch,
+            detail: format!("base branch '{}' does not exist", base_branch),
+        };
+    }
+
+    // Check if archive entry exists in base branch HEAD tree
+    let archive_path = format!("{}:openspec/changes/archive/", base_branch);
+    let ls_tree_output = Command::new("git")
+        .args(["ls-tree", "-d", &archive_path])
+        .current_dir(repo_root)
+        .output()
+        .await;
+
+    let ls_tree_output = match ls_tree_output {
+        Ok(output) => output,
+        Err(e) => {
+            return BaseCompletionEvidence::EvidenceError {
+                kind: BaseEvidenceErrorKind::CommandFailure,
+                detail: format!("Failed to list archive tree: {}", e),
+            }
+        }
+    };
+
+    if !ls_tree_output.status.success() {
+        // Archive directory doesn't exist in base branch
+        debug!(
+            base_branch = %base_branch,
+            "classify_base_completion: archive directory does not exist in base branch"
+        );
+        return BaseCompletionEvidence::NotCompleted;
+    }
+
+    // Parse ls-tree output to find matching archive entries
+    let output = String::from_utf8_lossy(&ls_tree_output.stdout);
+    let archive_entry_exists = output.lines().any(|line| {
+        // Parse line format: "040000 tree <hash>\t<name>"
+        if let Some(name) = line.split('\t').nth(1) {
+            name == change_id || name.ends_with(&format!("-{}", change_id))
+        } else {
+            false
+        }
+    });
+
+    if !archive_entry_exists {
+        debug!(
+            change_id = %change_id,
+            base_branch = %base_branch,
+            "classify_base_completion: no archive entry in base branch tree"
+        );
+        return BaseCompletionEvidence::NotCompleted;
+    }
+
+    // Check if the active change directory still exists in base branch HEAD tree.
+    //
+    // The parent directory is listed rather than the change directory itself:
+    // `git ls-tree -d <branch>:openspec/changes/<id>` lists that directory's
+    // *subdirectories*, so a change directory holding only files would look
+    // absent and an archive-plus-active contradiction would read as completed.
+    let changes_path = format!("{}:openspec/changes/", base_branch);
+    let changes_ls_tree = Command::new("git")
+        .args(["ls-tree", "-d", &changes_path])
+        .current_dir(repo_root)
+        .output()
+        .await;
+
+    let changes_ls_tree = match changes_ls_tree {
+        Ok(output) => output,
+        Err(e) => {
+            return BaseCompletionEvidence::EvidenceError {
+                kind: BaseEvidenceErrorKind::CommandFailure,
+                detail: format!("Failed to check change tree: {}", e),
+            }
+        }
+    };
+
+    let change_dir_exists = changes_ls_tree.status.success()
+        && String::from_utf8_lossy(&changes_ls_tree.stdout)
+            .lines()
+            .any(|line| line.split('\t').nth(1) == Some(change_id));
+
+    debug!(
+        change_id = %change_id,
+        base_branch = %base_branch,
+        archive_entry_exists = archive_entry_exists,
+        change_dir_exists = change_dir_exists,
+        "classify_base_completion: checking base branch HEAD tree file state"
+    );
+
+    if change_dir_exists {
+        return BaseCompletionEvidence::Contradictory {
+            detail: format!(
+                "archive entry and active change directory both exist for '{}' in base branch '{}'",
+                change_id, base_branch
+            ),
+        };
+    }
+
+    BaseCompletionEvidence::Completed
+}
+
 /// Check if a change has been merged to the base branch.
 ///
 /// This function checks if the archive entry exists and the change directory
 /// has been removed in the base branch's HEAD tree. It uses file state only
 /// and does NOT check commit messages.
+///
+/// It is a Boolean projection of [`classify_base_completion`]: only
+/// [`BaseCompletionEvidence::Completed`] maps to `true`, while contradictory
+/// evidence and a missing base branch map to `false` and a Git command failure
+/// is an error.
 ///
 /// # Arguments
 ///
@@ -86,90 +282,26 @@ pub async fn is_merged_to_base(
     repo_root: &Path,
     base_branch: &str,
 ) -> Result<bool> {
-    // Check if base branch exists
-    let rev_parse_output = Command::new("git")
-        .args(["rev-parse", "--verify", base_branch])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|e| {
-            OrchestratorError::GitCommand(format!("Failed to verify base branch: {}", e))
-        })?;
-
-    if !rev_parse_output.status.success() {
-        debug!(
-            base_branch = %base_branch,
-            "is_merged_to_base: base branch does not exist"
-        );
-        return Ok(false);
-    }
-
-    // Check if archive entry exists in base branch HEAD tree
-    let archive_path = format!("{}:openspec/changes/archive/", base_branch);
-    let ls_tree_output = Command::new("git")
-        .args(["ls-tree", "-d", &archive_path])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|e| {
-            OrchestratorError::GitCommand(format!("Failed to list archive tree: {}", e))
-        })?;
-
-    if !ls_tree_output.status.success() {
-        // Archive directory doesn't exist in base branch
-        debug!(
-            base_branch = %base_branch,
-            "is_merged_to_base: archive directory does not exist in base branch"
-        );
-        return Ok(false);
-    }
-
-    // Parse ls-tree output to find matching archive entries
-    let output = String::from_utf8_lossy(&ls_tree_output.stdout);
-    let archive_entry_exists = output.lines().any(|line| {
-        // Parse line format: "040000 tree <hash>\t<name>"
-        if let Some(name) = line.split('\t').nth(1) {
-            name == change_id || name.ends_with(&format!("-{}", change_id))
-        } else {
-            false
+    match classify_base_completion(change_id, repo_root, base_branch).await {
+        BaseCompletionEvidence::Completed => Ok(true),
+        BaseCompletionEvidence::NotCompleted => Ok(false),
+        BaseCompletionEvidence::Contradictory { .. } => {
+            tracing::warn!(
+                change_id = %change_id,
+                base_branch = %base_branch,
+                "Archive entry found in base branch but change directory still exists in base branch tree"
+            );
+            Ok(false)
         }
-    });
-
-    // Check if change directory exists in base branch HEAD tree
-    let change_path = format!("{}:openspec/changes/{}", base_branch, change_id);
-    let change_exists_output = Command::new("git")
-        .args(["ls-tree", "-d", &change_path])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .map_err(|e| {
-            OrchestratorError::GitCommand(format!("Failed to check change tree: {}", e))
-        })?;
-
-    let change_dir_exists = change_exists_output.status.success()
-        && !String::from_utf8_lossy(&change_exists_output.stdout)
-            .trim()
-            .is_empty();
-
-    debug!(
-        change_id = %change_id,
-        base_branch = %base_branch,
-        archive_entry_exists = archive_entry_exists,
-        change_dir_exists = change_dir_exists,
-        "is_merged_to_base: checking base branch HEAD tree file state"
-    );
-
-    // Only consider merged if archive entry exists in base AND change directory is gone from base
-    if archive_entry_exists && change_dir_exists {
-        tracing::warn!(
-            change_id = %change_id,
-            base_branch = %base_branch,
-            "Archive entry found in base branch but change directory still exists in base branch tree"
-        );
-        return Ok(false);
+        BaseCompletionEvidence::EvidenceError {
+            kind: BaseEvidenceErrorKind::MissingBranch,
+            ..
+        } => Ok(false),
+        BaseCompletionEvidence::EvidenceError {
+            kind: BaseEvidenceErrorKind::CommandFailure,
+            detail,
+        } => Err(OrchestratorError::GitCommand(detail)),
     }
-
-    Ok(archive_entry_exists && !change_dir_exists)
 }
 
 /// Get the latest WIP snapshot iteration number.

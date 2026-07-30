@@ -9,6 +9,7 @@ pub mod hooks;
 pub mod output;
 pub mod rejection;
 pub mod state;
+pub mod target_resolution;
 
 // Re-exports for convenient access.
 // Some exports are unused until TUI integration is complete.
@@ -29,3 +30,9 @@ pub use rejection::{
 };
 #[allow(unused_imports)]
 pub use state::OrchestratorState;
+#[allow(unused_imports)]
+pub use target_resolution::{
+    resolve_explicit_targets, ExplicitTargetPlan, RepositoryTargetEvidence, ResolvedTarget,
+    TargetClassification, TargetEvidence, TargetResolution, TargetResolutionOptions,
+    WorkspaceResumeEvidence,
+};

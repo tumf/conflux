@@ -8,6 +8,10 @@ use crate::execution::apply::{check_task_progress, create_progress_commit};
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::openspec::{self, Change};
 use crate::orchestration::state::OrchestratorState;
+use crate::orchestration::target_resolution::{
+    resolve_explicit_targets, ExplicitTargetPlan, RepositoryTargetEvidence, TargetResolution,
+    TargetResolutionOptions,
+};
 use crate::orchestration::LogOutputHandler;
 use crate::parallel::PostArchiveAction;
 use crate::parallel_run_service::ParallelRunService;
@@ -83,12 +87,56 @@ pub struct Orchestrator {
     /// upstream fetch, merge, verification, event, or push is added. This is
     /// deliberately not part of persistent orchestration config.
     upstream_integration: Option<crate::upstream::UpstreamRuntime>,
+    /// Base identity captured at run start.
+    ///
+    /// Explicit-target classification reads this base, so a mid-run branch
+    /// change cannot silently move the completion evidence it was resolved
+    /// against.
+    captured_base_branch: Option<String>,
 }
 
 /// Control flow result indicating whether to continue or break the main loop
 enum LoopControl {
     Continue,
     Break { finish_status: &'static str },
+}
+
+/// How explicit targets were resolved for a cumulative parallel run.
+enum ParallelTargets {
+    /// No explicit targets: `--all` semantics, unchanged.
+    All(Vec<Change>),
+    /// Classified against the captured base before dispatch.
+    Resolved(TargetResolution),
+    /// Classification deferred to the post-checkpoint boundary of a real `-u` run.
+    Deferred {
+        plan: ExplicitTargetPlan,
+        seed: Vec<Change>,
+    },
+}
+
+impl ParallelTargets {
+    /// Changes handed to the scheduler at start.
+    fn dispatch_changes(&self) -> Vec<Change> {
+        match self {
+            Self::All(changes) => changes.clone(),
+            Self::Resolved(resolution) => resolution.dispatch_changes(),
+            Self::Deferred { seed, .. } => seed.clone(),
+        }
+    }
+
+    fn plan(&self) -> Option<ExplicitTargetPlan> {
+        match self {
+            Self::Deferred { plan, .. } => Some(plan.clone()),
+            _ => None,
+        }
+    }
+
+    fn resolution(&self) -> Option<&TargetResolution> {
+        match self {
+            Self::Resolved(resolution) => Some(resolution),
+            _ => None,
+        }
+    }
 }
 
 impl Orchestrator {
@@ -154,6 +202,7 @@ impl Orchestrator {
             execution_mode: "select".to_string(),
             lifecycle_sink: None,
             upstream_integration: None,
+            captured_base_branch: None,
         })
     }
 
@@ -263,6 +312,7 @@ impl Orchestrator {
             execution_mode: "select".to_string(),
             lifecycle_sink: None,
             upstream_integration: None,
+            captured_base_branch: None,
         })
     }
 
@@ -665,6 +715,138 @@ impl Orchestrator {
         Ok(filtered)
     }
 
+    /// Capture the base identity attached at run start.
+    ///
+    /// An enabled upstream run names its cumulative base explicitly; every other
+    /// run reads the attached local branch once and reuses it, so classification
+    /// evidence cannot move underneath the run. A missing or detached base
+    /// identity fails here, before any classification could claim completion.
+    async fn capture_base_branch(&mut self) -> Result<String> {
+        if let Some(base) = &self.captured_base_branch {
+            return Ok(base.clone());
+        }
+
+        let base =
+            match &self.upstream_integration {
+                Some(runtime) => runtime.branch.clone(),
+                None => {
+                    let repo_root = std::env::current_dir()?;
+                    match git_commands::get_current_branch(&repo_root).await {
+                        Ok(Some(branch)) => branch,
+                        Ok(None) => return Err(OrchestratorError::Parse(
+                            "cannot resolve explicit run targets: HEAD is detached, so there is \
+                             no base branch to prove completion against"
+                                .to_string(),
+                        )),
+                        Err(err) => {
+                            return Err(OrchestratorError::GitCommand(format!(
+                                "cannot resolve explicit run targets: failed to read the attached \
+                             base branch: {}",
+                                err
+                            )))
+                        }
+                    }
+                }
+            };
+
+        self.captured_base_branch = Some(base.clone());
+        Ok(base)
+    }
+
+    /// Classify explicit parallel targets against the captured base.
+    ///
+    /// Returns `None` when the invocation has no explicit targets, which keeps
+    /// `--all` behavior unchanged.
+    async fn classify_explicit_parallel_targets(
+        &mut self,
+        active_changes: &[Change],
+    ) -> Result<Option<TargetResolution>> {
+        let Some(targets) = self.target_changes.clone() else {
+            return Ok(None);
+        };
+
+        let base_branch = self.capture_base_branch().await?;
+        let repo_root = std::env::current_dir()?;
+        let evidence = RepositoryTargetEvidence::new(repo_root, base_branch);
+        let resolution = resolve_explicit_targets(
+            &targets,
+            active_changes,
+            &evidence,
+            TargetResolutionOptions {
+                no_resume: self.no_resume,
+            },
+        )
+        .await;
+
+        Ok(Some(resolution))
+    }
+
+    /// Build the deferred classification plan for an enabled real `-u` run.
+    async fn explicit_parallel_target_plan(&mut self) -> Result<Option<ExplicitTargetPlan>> {
+        let Some(targets) = self.target_changes.clone() else {
+            return Ok(None);
+        };
+
+        let base_branch = self.capture_base_branch().await?;
+        Ok(Some(ExplicitTargetPlan::new(
+            targets,
+            base_branch,
+            TargetResolutionOptions {
+                no_resume: self.no_resume,
+            },
+        )))
+    }
+
+    /// Report an ordered classification to the operator.
+    fn report_target_resolution(resolution: &TargetResolution) {
+        for line in resolution.report_lines() {
+            info!("{}", line);
+            println!("{}", line);
+        }
+    }
+
+    /// Resolve explicit parallel targets into dispatchable changes.
+    ///
+    /// Ordinary runs classify immediately against the captured local base. An
+    /// enabled real `-u` run defers classification to the post-checkpoint
+    /// boundary inside the executor, because the mandatory initial upstream
+    /// checkpoint can integrate the archive that proves a target is complete.
+    async fn resolve_parallel_targets(
+        &mut self,
+        initial_changes: &[Change],
+    ) -> Result<ParallelTargets> {
+        if self.target_changes.is_none() {
+            return Ok(ParallelTargets::All(initial_changes.to_vec()));
+        }
+
+        if self.upstream_integration.is_some() && !self.dry_run {
+            let plan = self
+                .explicit_parallel_target_plan()
+                .await?
+                .expect("explicit targets present");
+            // Seed the executor with the requested targets that are active right
+            // now. Unknown IDs are not rejected here: the post-checkpoint
+            // classification owns that decision.
+            let requested: HashSet<&str> = plan.requested().iter().map(|id| id.trim()).collect();
+            let seed = initial_changes
+                .iter()
+                .filter(|change| requested.contains(change.id.as_str()))
+                .cloned()
+                .collect();
+            return Ok(ParallelTargets::Deferred { plan, seed });
+        }
+
+        let resolution = self
+            .classify_explicit_parallel_targets(initial_changes)
+            .await?
+            .expect("explicit targets present");
+        Self::report_target_resolution(&resolution);
+        if let Some(err) = resolution.failure_error() {
+            return Err(err);
+        }
+        Ok(ParallelTargets::Resolved(resolution))
+    }
+
     /// Initialize run loop state (shared state, progress display, serial service).
     /// Returns (filtered_initial_changes, serial_service, total_changes).
     async fn initialize_run_loop(
@@ -783,17 +965,23 @@ impl Orchestrator {
         // This prevents mid-run proposals from being processed before they are ready.
         let initial_changes = openspec::list_changes_native()?;
 
-        // Handle parallel mode with the same target validation as serial mode.
+        // Cumulative parallel mode resolves explicit targets from repository
+        // evidence instead of the active list alone, so a repeated target set
+        // that already completed is skipped instead of rejected as unknown.
         if self.parallel && self.dry_run {
-            let filtered_initial = self.filter_requested_changes(&initial_changes)?;
-            return self.run_parallel_dry_run(&filtered_initial).await;
+            // Read-only classification against the current local base: no
+            // network fetch and no workspace mutation or cleanup.
+            let targets = self.resolve_parallel_targets(&initial_changes).await?;
+            return self
+                .run_parallel_dry_run(&targets.dispatch_changes(), targets.resolution())
+                .await;
         }
 
         // Handle parallel execution mode
         if self.parallel {
-            let filtered_initial = self.filter_requested_changes(&initial_changes)?;
+            let targets = self.resolve_parallel_targets(&initial_changes).await?;
             return self
-                .run_parallel(&filtered_initial, cancel_token, graceful_stop_flag)
+                .run_parallel(targets, cancel_token, graceful_stop_flag)
                 .await;
         }
 
@@ -1184,8 +1372,24 @@ impl Orchestrator {
     }
 
     /// Run parallel mode with dry run (preview parallelization groups)
-    async fn run_parallel_dry_run(&self, changes: &[Change]) -> Result<()> {
+    ///
+    /// The optional resolution is the read-only explicit-target classification
+    /// performed against the current local base. Dry run reports it without any
+    /// network fetch, workspace mutation, or workspace cleanup.
+    async fn run_parallel_dry_run(
+        &self,
+        changes: &[Change],
+        resolution: Option<&TargetResolution>,
+    ) -> Result<()> {
         info!("Running parallel mode dry run (preview only)");
+
+        if let Some(resolution) = resolution {
+            println!("\n=== Explicit Target Classification (Dry Run) ===\n");
+            for line in resolution.report_lines() {
+                println!("{}", line);
+            }
+            println!();
+        }
 
         if changes.is_empty() {
             println!("No changes found for parallel execution.");
@@ -1236,15 +1440,36 @@ impl Orchestrator {
     /// Run parallel execution mode
     async fn run_parallel(
         &mut self,
-        changes: &[Change],
+        targets: ParallelTargets,
         cancel_token: tokio_util::sync::CancellationToken,
         graceful_stop_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<()> {
         info!("Running parallel execution mode");
 
+        let changes = targets.dispatch_changes();
+        let changes = changes.as_slice();
+        let explicit_plan = targets.plan();
+
         if changes.is_empty() {
-            info!("No changes found for parallel execution");
-            return Ok(());
+            // An enabled upstream run still enters the executor with an empty
+            // queue: deferred classification, zero-change upstream recovery, and
+            // finalization all live behind that boundary.
+            if self.upstream_integration.is_none() {
+                info!("No changes found for parallel execution");
+                if let Some(resolution) = targets.resolution() {
+                    if !resolution.already_completed_ids().is_empty() {
+                        info!(
+                            "All requested targets are already integrated into base: {}",
+                            resolution.already_completed_ids().join(", ")
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            info!(
+                "No dispatchable changes at start; continuing so upstream integration can \
+                 classify targets and finalize"
+            );
         }
 
         // Store snapshot of change IDs
@@ -1269,6 +1494,9 @@ impl Orchestrator {
         service.set_shared_orchestrator_state(self.shared_state.clone());
         if let Some(runtime) = self.upstream_integration.clone() {
             service.set_upstream_integration(runtime);
+        }
+        if let Some(plan) = explicit_plan.clone() {
+            service.set_explicit_target_plan(plan);
         }
 
         // Check if Git is available for true parallel execution
@@ -1476,6 +1704,15 @@ impl Orchestrator {
             let _ = handle.await;
         }
 
+        // A deferred `-u` classification is resolved inside the executor, after
+        // its initial checkpoint. Report it before propagating any error so the
+        // operator sees which targets were processed, skipped, or unresolved.
+        if let Some(plan) = &explicit_plan {
+            if let Some(resolution) = plan.resolved().await {
+                Self::report_target_resolution(&resolution);
+            }
+        }
+
         result?;
 
         // Report clearly when all requested changes were rejected before any work started.
@@ -1497,6 +1734,9 @@ impl Orchestrator {
 mod tests {
     use super::*;
     use crate::openspec::ProposalMetadata;
+    use crate::orchestration::target_resolution::{
+        BaseCompletionEvidence, BaseEvidenceErrorKind, TargetEvidence, WorkspaceResumeEvidence,
+    };
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -1556,6 +1796,304 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("duplicate change IDs: change-a"));
         assert!(message.contains("unknown change IDs: missing"));
+    }
+
+    /// In-memory evidence double.
+    ///
+    /// Explicit-target classification is decision logic, so it is verified here
+    /// without a repository, worktree, Git process, or clock. Real-boundary
+    /// coverage lives in the heavy `explicit_target_resume_*` e2e suite.
+    struct FakeEvidence {
+        base: HashMap<String, BaseCompletionEvidence>,
+        workspace: HashMap<String, WorkspaceResumeEvidence>,
+    }
+
+    impl FakeEvidence {
+        fn new() -> Self {
+            Self {
+                base: HashMap::new(),
+                workspace: HashMap::new(),
+            }
+        }
+
+        fn with_base(mut self, id: &str, evidence: BaseCompletionEvidence) -> Self {
+            self.base.insert(id.to_string(), evidence);
+            self
+        }
+
+        fn with_workspace(mut self, id: &str, evidence: WorkspaceResumeEvidence) -> Self {
+            self.workspace.insert(id.to_string(), evidence);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TargetEvidence for FakeEvidence {
+        async fn base_completion(&self, change_id: &str) -> BaseCompletionEvidence {
+            self.base
+                .get(change_id)
+                .cloned()
+                .unwrap_or(BaseCompletionEvidence::NotCompleted)
+        }
+
+        async fn workspace_resume(&self, change_id: &str) -> WorkspaceResumeEvidence {
+            self.workspace.get(change_id).cloned().unwrap_or(
+                WorkspaceResumeEvidence::NotResumable {
+                    detail: "no managed workspace".to_string(),
+                },
+            )
+        }
+    }
+
+    fn resumable(id: &str) -> WorkspaceResumeEvidence {
+        WorkspaceResumeEvidence::Resumable {
+            path: PathBuf::from(format!("/tmp/ws-{id}")),
+            change: Box::new(create_test_change(id, 1, 3)),
+        }
+    }
+
+    async fn resolve(
+        requested: &[&str],
+        active: &[Change],
+        evidence: &FakeEvidence,
+        no_resume: bool,
+    ) -> TargetResolution {
+        let requested: Vec<String> = requested.iter().map(|id| id.to_string()).collect();
+        resolve_explicit_targets(
+            &requested,
+            active,
+            evidence,
+            TargetResolutionOptions { no_resume },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_classification_table_covers_every_class() {
+        let active = vec![create_test_change("active-change", 0, 2)];
+        let evidence = FakeEvidence::new()
+            .with_base("completed-change", BaseCompletionEvidence::Completed)
+            .with_base(
+                "contradictory-change",
+                BaseCompletionEvidence::Contradictory {
+                    detail: "archive entry and active change directory both exist".to_string(),
+                },
+            )
+            .with_base(
+                "unreadable-change",
+                BaseCompletionEvidence::EvidenceError {
+                    kind: BaseEvidenceErrorKind::MissingBranch,
+                    detail: "base branch 'main' does not exist".to_string(),
+                },
+            )
+            .with_workspace("resumable-change", resumable("resumable-change"));
+
+        let resolution = resolve(
+            &[
+                "active-change",
+                "completed-change",
+                "resumable-change",
+                "unknown-change",
+                "contradictory-change",
+                "unreadable-change",
+                "active-change",
+            ],
+            &active,
+            &evidence,
+            false,
+        )
+        .await;
+
+        let classified: Vec<(&str, &str)> = resolution
+            .targets
+            .iter()
+            .map(|t| (t.requested_id.as_str(), t.classification.as_str()))
+            .collect();
+        assert_eq!(
+            classified,
+            vec![
+                ("active-change", "active"),
+                ("completed-change", "already_completed"),
+                ("resumable-change", "resumable_workspace"),
+                ("unknown-change", "unknown"),
+                ("contradictory-change", "evidence_error"),
+                ("unreadable-change", "evidence_error"),
+            ],
+            "each class is classified from its own evidence, in deduplicated request order"
+        );
+        assert_eq!(resolution.duplicates, vec!["active-change".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_aggregates_all_diagnostics_in_one_error() {
+        let evidence = FakeEvidence::new().with_base(
+            "broken-change",
+            BaseCompletionEvidence::EvidenceError {
+                kind: BaseEvidenceErrorKind::CommandFailure,
+                detail: "Failed to list archive tree: boom".to_string(),
+            },
+        );
+
+        let resolution = resolve(
+            &["missing-a", "broken-change", "missing-b", "missing-a"],
+            &[],
+            &evidence,
+            false,
+        )
+        .await;
+
+        let message = resolution
+            .failure_error()
+            .expect("unresolvable targets reject the invocation")
+            .to_string();
+        assert!(
+            message.contains("duplicate change IDs: missing-a"),
+            "{message}"
+        );
+        assert!(
+            message.contains("unknown change IDs: missing-a, missing-b"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "unusable change evidence: broken-change (Failed to list archive tree: boom)"
+            ),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_keeps_requested_order_and_separates_completed_ids() {
+        let active = vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-c", 0, 1),
+        ];
+        let evidence = FakeEvidence::new()
+            .with_base("change-b", BaseCompletionEvidence::Completed)
+            .with_workspace("change-d", resumable("change-d"));
+
+        let resolution = resolve(
+            &["change-c", "change-b", "change-d", "change-a"],
+            &active,
+            &evidence,
+            false,
+        )
+        .await;
+
+        assert!(resolution.failure_error().is_none());
+        assert_eq!(
+            resolution.requested_ids(),
+            vec!["change-c", "change-b", "change-d", "change-a"]
+        );
+        assert_eq!(
+            resolution.processed_ids(),
+            vec!["change-c", "change-d", "change-a"],
+            "already-completed IDs are held separately rather than reordering the rest"
+        );
+        assert_eq!(resolution.already_completed_ids(), vec!["change-b"]);
+        assert_eq!(
+            resolution
+                .dispatch_changes()
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["change-c", "change-d", "change-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_prefers_active_over_candidate_workspace() {
+        let active = vec![create_test_change("change-a", 4, 4)];
+        let evidence = FakeEvidence::new().with_workspace("change-a", resumable("change-a"));
+
+        let resolution = resolve(&["change-a"], &active, &evidence, false).await;
+
+        assert_eq!(resolution.active_ids(), vec!["change-a"]);
+        assert!(resolution.resumable_ids().is_empty());
+        assert_eq!(
+            resolution.dispatch_changes()[0].completed_tasks,
+            4,
+            "active metadata wins over workspace-reconstructed metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_no_resume_keeps_completed_but_refuses_workspace_only() {
+        let evidence = FakeEvidence::new()
+            .with_base("done-change", BaseCompletionEvidence::Completed)
+            .with_workspace("workspace-only", resumable("workspace-only"));
+
+        let resolution = resolve(&["done-change", "workspace-only"], &[], &evidence, true).await;
+
+        assert_eq!(
+            resolution.already_completed_ids(),
+            vec!["done-change"],
+            "--no-resume never erases base-integrated completion"
+        );
+        assert_eq!(resolution.resume_refused_ids(), vec!["workspace-only"]);
+        assert!(
+            resolution.dispatch_changes().is_empty(),
+            "a refused target is not dispatched and its workspace is not replaced"
+        );
+        let message = resolution.failure_error().unwrap().to_string();
+        assert!(
+            message.contains("workspace-only change IDs refused by --no-resume"),
+            "{message}"
+        );
+        assert!(message.contains("rerun without --no-resume"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_unreadable_workspace_fails_safely() {
+        let evidence = FakeEvidence::new().with_workspace(
+            "broken-workspace",
+            WorkspaceResumeEvidence::EvidenceError {
+                detail: "managed workspace '/tmp/ws' state is unreadable: git failed".to_string(),
+            },
+        );
+
+        let resolution = resolve(&["broken-workspace"], &[], &evidence, false).await;
+
+        assert_eq!(resolution.evidence_error_ids(), vec!["broken-workspace"]);
+        assert!(resolution.already_completed_ids().is_empty());
+        assert!(resolution.dispatch_changes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_report_lines_expose_ordered_classification() {
+        let active = vec![create_test_change("change-a", 0, 1)];
+        let evidence = FakeEvidence::new()
+            .with_base("change-b", BaseCompletionEvidence::Completed)
+            .with_workspace("change-c", resumable("change-c"));
+
+        let resolution = resolve(
+            &["change-a", "change-b", "change-c", "change-x"],
+            &active,
+            &evidence,
+            false,
+        )
+        .await;
+
+        let lines = resolution.report_lines();
+        assert_eq!(
+            lines[0],
+            "Explicit targets requested: change-a, change-b, change-c, change-x"
+        );
+        assert!(lines.contains(&"  to process: change-a, change-c".to_string()));
+        assert!(lines.contains(&"  resumable workspaces: change-c".to_string()));
+        assert!(lines.contains(&"  already completed (skipped): change-b".to_string()));
+        assert_eq!(resolution.pending_ids(), vec!["change-x"]);
+    }
+
+    #[tokio::test]
+    async fn explicit_target_resume_empty_and_whitespace_targets_are_ignored() {
+        let active = vec![create_test_change("change-a", 0, 1)];
+        let evidence = FakeEvidence::new();
+
+        let resolution = resolve(&["", "  ", " change-a "], &active, &evidence, false).await;
+
+        assert_eq!(resolution.requested_ids(), vec!["change-a"]);
+        assert!(resolution.failure_error().is_none());
     }
 
     #[test]

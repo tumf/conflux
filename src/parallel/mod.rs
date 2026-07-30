@@ -27,6 +27,7 @@ mod merge;
 mod orchestration;
 mod output_bridge;
 pub(super) mod queue_state;
+mod target_plan;
 mod types;
 pub(crate) mod upstream_bridge;
 mod upstream_lane;
@@ -260,6 +261,13 @@ pub struct ParallelExecutor {
     /// suppression coverage does not depend on real VCS subprocesses, and so probe counts and
     /// probe failures can be observed directly.
     analysis_input_probe: Option<Arc<dyn AnalysisInputProbe>>,
+    /// Explicit-target classification deferred to the post-checkpoint boundary.
+    ///
+    /// `None` is the ordinary path: explicit targets were already classified
+    /// against the captured local base before the executor was constructed. A
+    /// real `-u` run installs a plan so classification reads the cumulative base
+    /// produced by the mandatory initial upstream checkpoint instead.
+    explicit_target_plan: Option<crate::orchestration::target_resolution::ExplicitTargetPlan>,
 }
 
 #[cfg(test)]

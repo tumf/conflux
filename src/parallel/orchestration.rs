@@ -185,7 +185,14 @@ impl ParallelExecutor {
             > + Send
             + Sync,
     {
-        if changes.is_empty() {
+        // A deferred explicit-target plan or an enabled upstream run must reach
+        // the checkpoint/classification boundary below even with an empty queue:
+        // classification can still discover resumable work, and an all-completed
+        // run still owes upstream recovery/finalization.
+        let must_reach_upstream_boundary =
+            self.upstream_enabled() || self.explicit_target_plan.is_some();
+
+        if changes.is_empty() && !must_reach_upstream_boundary {
             let (reducer_has_queued_intent, reducer_has_lane_wait) = self
                 .shared_orchestrator_state
                 .as_ref()
@@ -259,6 +266,22 @@ impl ParallelExecutor {
                 return Err(err);
             }
         }
+
+        // Deferred explicit-target classification boundary.
+        //
+        // This runs after the initial upstream checkpoint, so an enabled `-u`
+        // run classifies against the resulting cumulative base, and before any
+        // change-worktree creation or reuse registration, so an unresolvable
+        // target set never mutates a workspace.
+        let changes = match self.apply_explicit_target_plan(changes).await {
+            Ok(changes) => changes,
+            Err(err) => {
+                let error_msg = format!("Explicit target resolution failed: {}", err);
+                error!("{}", error_msg);
+                send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
+                return Err(err);
+            }
+        };
 
         // Initialize scheduler state
         let max_parallelism = self.workspace_manager.max_concurrent();

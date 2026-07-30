@@ -1407,3 +1407,688 @@ async fn upstream_integration_e2e_stale_result_verification_runs_against_current
     }
     assert!(coordinator.pushed_head().is_none());
 }
+
+/// Real-repository fixtures for explicit-target resume classification.
+///
+/// These cases use real Git repositories, real worktrees, and real archive
+/// trees. They are integration/e2e evidence for `explicit-target-resume-tests`,
+/// not unit coverage of the resolver decision table.
+mod explicit_target_resume_support {
+    use std::path::{Path, PathBuf};
+
+    pub use conflux::orchestration::target_resolution::{
+        classify_base_completion, workspace_resume_evidence, BaseCompletionEvidence,
+        BaseEvidenceErrorKind, ExplicitTargetPlan, TargetClassification, TargetResolution,
+        TargetResolutionOptions, WorkspaceResumeEvidence,
+    };
+
+    pub use super::upstream_integration_support::{configure_identity, git, git_allow_failure};
+
+    pub struct Repo {
+        pub _dir: tempfile::TempDir,
+        pub root: PathBuf,
+    }
+
+    /// A repository on branch `main` with one commit, or `None` without git.
+    pub fn repo() -> Option<Repo> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        if !git_allow_failure(&root, &["init", "-b", "main"]) {
+            return None;
+        }
+        configure_identity(&root);
+        std::fs::write(root.join("README.md"), "# base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "Initial commit"]);
+        Some(Repo { _dir: dir, root })
+    }
+
+    /// Write an active OpenSpec change directory (working copy only).
+    pub fn write_active_change(root: &Path, change_id: &str) {
+        let dir = root.join("openspec/changes").join(change_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), format!("# {change_id}\n")).unwrap();
+        std::fs::write(
+            dir.join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .unwrap();
+    }
+
+    /// Write an archive entry (working copy only). `entry_name` may be date-prefixed.
+    pub fn write_archive_entry(root: &Path, entry_name: &str, change_id: &str) {
+        let dir = root.join("openspec/changes/archive").join(entry_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("proposal.md"), format!("# {change_id}\n")).unwrap();
+        std::fs::write(
+            dir.join("tasks.md"),
+            "## Implementation Tasks\n\n- [x] Do the work\n",
+        )
+        .unwrap();
+    }
+
+    pub fn commit_all(root: &Path, message: &str) {
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-m", message]);
+    }
+
+    /// Add a cflx-managed worktree whose branch is the change ID.
+    pub fn add_worktree(root: &Path, change_id: &str) -> PathBuf {
+        let path = root.join(".openspec-worktrees").join(change_id);
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                change_id,
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        path
+    }
+
+    /// Classify a requested target set against the repository's `main` base.
+    pub async fn resolve(root: &Path, requested: &[&str], no_resume: bool) -> TargetResolution {
+        let plan = ExplicitTargetPlan::new(
+            requested.iter().map(|s| s.to_string()).collect(),
+            "main".to_string(),
+            TargetResolutionOptions { no_resume },
+        );
+        plan.resolve(root).await
+    }
+
+    /// Snapshot every path under the repository, for side-effect assertions.
+    pub fn snapshot_tree(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                out.push(
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+                if path.is_dir() {
+                    walk(&path, base, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort();
+        out
+    }
+}
+
+#[tokio::test]
+async fn explicit_target_resume_base_evidence_completed_for_exact_and_date_prefixed_archive() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_archive_entry(&fx.root, "exact-change", "exact-change");
+    write_archive_entry(&fx.root, "2026-07-30-dated-change", "dated-change");
+    commit_all(&fx.root, "Archive both changes");
+
+    assert_eq!(
+        classify_base_completion("exact-change", &fx.root, "main").await,
+        BaseCompletionEvidence::Completed
+    );
+    assert_eq!(
+        classify_base_completion("dated-change", &fx.root, "main").await,
+        BaseCompletionEvidence::Completed,
+        "a date-prefixed archive entry proves the same completion"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_base_evidence_not_completed_without_archive() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // No archive directory at all.
+    assert_eq!(
+        classify_base_completion("missing-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted
+    );
+
+    // An archive directory holding some other change is still NotCompleted.
+    write_archive_entry(&fx.root, "other-change", "other-change");
+    commit_all(&fx.root, "Archive other change");
+    assert_eq!(
+        classify_base_completion("missing-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_base_evidence_contradictory_when_active_dir_remains() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_archive_entry(&fx.root, "2026-07-30-half-change", "half-change");
+    write_active_change(&fx.root, "half-change");
+    commit_all(
+        &fx.root,
+        "Archive half-change without removing the active directory",
+    );
+
+    let evidence = classify_base_completion("half-change", &fx.root, "main").await;
+    assert!(
+        matches!(evidence, BaseCompletionEvidence::Contradictory { .. }),
+        "archive plus active directory must not read as completed: {evidence:?}"
+    );
+
+    // An active change directory always outranks a candidate contradiction, so
+    // this target remains ordinary work rather than a failure.
+    let resolution = resolve(&fx.root, &["half-change"], false).await;
+    assert_eq!(
+        resolution.classification_of("half-change"),
+        Some(TargetClassification::Active)
+    );
+
+    // When the leftover base directory is not an active change (here: no
+    // proposal.md), the contradiction reaches classification as a safe failure
+    // rather than a completion skip.
+    write_archive_entry(&fx.root, "2026-07-30-stub-change", "stub-change");
+    let stub_dir = fx.root.join("openspec/changes/stub-change");
+    std::fs::create_dir_all(&stub_dir).unwrap();
+    std::fs::write(stub_dir.join("tasks.md"), "## Implementation Tasks\n").unwrap();
+    commit_all(
+        &fx.root,
+        "Archive stub-change leaving a stub directory behind",
+    );
+
+    let resolution = resolve(&fx.root, &["stub-change"], false).await;
+    assert_eq!(
+        resolution.classification_of("stub-change"),
+        Some(TargetClassification::EvidenceError)
+    );
+    assert!(resolution.already_completed_ids().is_empty());
+    let message = resolution.failure_error().unwrap().to_string();
+    assert!(
+        message.contains("unusable change evidence: stub-change"),
+        "the contradiction is reported with actionable detail: {message}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_base_evidence_error_on_missing_branch() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_archive_entry(&fx.root, "some-change", "some-change");
+    commit_all(&fx.root, "Archive some-change");
+
+    let evidence = classify_base_completion("some-change", &fx.root, "no-such-branch").await;
+    assert!(
+        matches!(
+            evidence,
+            BaseCompletionEvidence::EvidenceError {
+                kind: BaseEvidenceErrorKind::MissingBranch,
+                ..
+            }
+        ),
+        "an unreadable base branch is an evidence error, not 'not completed': {evidence:?}"
+    );
+
+    // A Git command failure is also an evidence error: run outside any repository.
+    let non_repo = tempfile::tempdir().unwrap();
+    let outside = classify_base_completion("some-change", non_repo.path(), "main").await;
+    assert!(
+        matches!(outside, BaseCompletionEvidence::EvidenceError { .. }),
+        "{outside:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_base_evidence_rejects_uncommitted_and_subject_only_archives() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // 1. A commit subject that looks like an archive, with no tree evidence.
+    std::fs::write(fx.root.join("notes.md"), "note\n").unwrap();
+    commit_all(&fx.root, "Archive: subject-only-change");
+    assert_eq!(
+        classify_base_completion("subject-only-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted,
+        "a commit subject is never accepted as completion proof"
+    );
+
+    // 2. An archive entry that exists only in the uncommitted working copy.
+    write_archive_entry(
+        &fx.root,
+        "2026-07-30-uncommitted-change",
+        "uncommitted-change",
+    );
+    assert_eq!(
+        classify_base_completion("uncommitted-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted,
+        "an uncommitted working-copy archive is not in the base tree"
+    );
+
+    // 3. Committed on another branch only: still not in base.
+    git(&fx.root, &["checkout", "-b", "side"]);
+    commit_all(&fx.root, "Archive uncommitted-change on side branch");
+    assert_eq!(
+        classify_base_completion("uncommitted-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted
+    );
+    assert_eq!(
+        classify_base_completion("uncommitted-change", &fx.root, "side").await,
+        BaseCompletionEvidence::Completed
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_workspace_evidence_requires_more_than_a_name() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "applied-change");
+    commit_all(&fx.root, "Add applied-change");
+
+    // Applied: the worktree carries the active change directory.
+    let applied_ws = add_worktree(&fx.root, "applied-change");
+    let evidence = workspace_resume_evidence("applied-change", &applied_ws, "main").await;
+    assert!(
+        matches!(evidence, WorkspaceResumeEvidence::Resumable { .. }),
+        "{evidence:?}"
+    );
+
+    // Name-only: a worktree that carries no proposal for the change.
+    let bare_ws = add_worktree(&fx.root, "name-only-change");
+    let evidence = workspace_resume_evidence("name-only-change", &bare_ws, "main").await;
+    assert!(
+        matches!(evidence, WorkspaceResumeEvidence::NotResumable { .. }),
+        "a matching workspace name alone is not resume evidence: {evidence:?}"
+    );
+
+    // Missing path: the workspace was removed from disk.
+    let missing = fx.root.join(".openspec-worktrees/never-created");
+    let evidence = workspace_resume_evidence("never-created", &missing, "main").await;
+    assert!(
+        matches!(evidence, WorkspaceResumeEvidence::NotResumable { .. }),
+        "{evidence:?}"
+    );
+
+    // Malformed: a change directory with no proposal.md.
+    let malformed_ws = add_worktree(&fx.root, "malformed-change");
+    std::fs::create_dir_all(malformed_ws.join("openspec/changes/malformed-change")).unwrap();
+    let evidence = workspace_resume_evidence("malformed-change", &malformed_ws, "main").await;
+    assert!(
+        matches!(evidence, WorkspaceResumeEvidence::NotResumable { .. }),
+        "a change directory without a proposal is not resume evidence: {evidence:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_workspace_evidence_accepts_archived_not_integrated() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "archiving-change");
+    commit_all(&fx.root, "Add archiving-change");
+
+    // The worktree archived the change but the archive never reached base.
+    let ws = add_worktree(&fx.root, "archiving-change");
+    std::fs::remove_dir_all(ws.join("openspec/changes/archiving-change")).unwrap();
+    write_archive_entry(&ws, "2026-07-30-archiving-change", "archiving-change");
+    git(&ws, &["add", "-A"]);
+    git(&ws, &["commit", "-m", "Archive: archiving-change"]);
+
+    assert_eq!(
+        classify_base_completion("archiving-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted,
+        "base has not integrated the archive yet"
+    );
+
+    let evidence = workspace_resume_evidence("archiving-change", &ws, "main").await;
+    let WorkspaceResumeEvidence::Resumable { change, .. } = evidence else {
+        panic!("archived-not-integrated workspace must be resumable: {evidence:?}");
+    };
+    assert_eq!(change.id, "archiving-change");
+
+    // Base no longer lists the change as active and never received the archive,
+    // so only the worktree can identify the requested target.
+    std::fs::remove_dir_all(fx.root.join("openspec/changes/archiving-change")).unwrap();
+    commit_all(
+        &fx.root,
+        "Drop archiving-change from base without archiving it",
+    );
+    assert_eq!(
+        classify_base_completion("archiving-change", &fx.root, "main").await,
+        BaseCompletionEvidence::NotCompleted
+    );
+
+    let resolution = resolve(&fx.root, &["archiving-change"], false).await;
+    assert_eq!(
+        resolution.classification_of("archiving-change"),
+        Some(TargetClassification::ResumableWorkspace)
+    );
+    assert_eq!(resolution.processed_ids(), vec!["archiving-change"]);
+    assert!(resolution.failure_error().is_none());
+}
+
+#[tokio::test]
+async fn explicit_target_resume_repeated_target_set_skips_integrated_target() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "change-one");
+    write_active_change(&fx.root, "change-two");
+    commit_all(&fx.root, "Add change-one and change-two");
+
+    // First invocation: both are ordinary active work.
+    let first = resolve(&fx.root, &["change-one", "change-two"], false).await;
+    assert!(first.failure_error().is_none());
+    assert_eq!(first.processed_ids(), vec!["change-one", "change-two"]);
+
+    // change-one is archived and integrated into base.
+    std::fs::remove_dir_all(fx.root.join("openspec/changes/change-one")).unwrap();
+    write_archive_entry(&fx.root, "2026-07-30-change-one", "change-one");
+    commit_all(&fx.root, "Archive: change-one");
+
+    // Repeating the identical target set skips it instead of failing.
+    let second = resolve(&fx.root, &["change-one", "change-two"], false).await;
+    assert!(
+        second.failure_error().is_none(),
+        "a repeated completed target must not be an unknown-ID error: {:?}",
+        second.failure_error().map(|e| e.to_string())
+    );
+    assert_eq!(second.already_completed_ids(), vec!["change-one"]);
+    assert_eq!(second.processed_ids(), vec!["change-two"]);
+    assert_eq!(
+        second.requested_ids(),
+        vec!["change-one", "change-two"],
+        "request order is retained for terminal reporting"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_active_target_wins_over_candidate_workspace() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "dual-change");
+    commit_all(&fx.root, "Add dual-change");
+    let ws = add_worktree(&fx.root, "dual-change");
+    assert!(ws.is_dir());
+
+    let resolution = resolve(&fx.root, &["dual-change"], false).await;
+    assert_eq!(
+        resolution.classification_of("dual-change"),
+        Some(TargetClassification::Active),
+        "an active change is ordinary work even when a managed worktree exists"
+    );
+    assert!(resolution.resumable_ids().is_empty());
+    assert!(ws.is_dir(), "classification must not remove the workspace");
+}
+
+#[tokio::test]
+async fn explicit_target_resume_reports_unknown_and_duplicate_ids_together() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "known-change");
+    commit_all(&fx.root, "Add known-change");
+
+    let before = snapshot_tree(&fx.root);
+    let resolution = resolve(
+        &fx.root,
+        &["known-change", "ghost-a", "known-change", "ghost-b"],
+        false,
+    )
+    .await;
+
+    let message = resolution.failure_error().unwrap().to_string();
+    assert!(
+        message.contains("duplicate change IDs: known-change"),
+        "{message}"
+    );
+    assert!(
+        message.contains("unknown change IDs: ghost-a, ghost-b"),
+        "all unknown IDs are reported together: {message}"
+    );
+    assert_eq!(
+        snapshot_tree(&fx.root),
+        before,
+        "rejection happens before any workspace is created, deleted, or mutated"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_no_resume_keeps_completion_and_preserves_refused_workspace() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // A base-integrated change plus a workspace-only recoverable change.
+    write_active_change(&fx.root, "done-change");
+    write_active_change(&fx.root, "workspace-only");
+    commit_all(&fx.root, "Add both changes");
+
+    let ws = add_worktree(&fx.root, "workspace-only");
+
+    std::fs::remove_dir_all(fx.root.join("openspec/changes/done-change")).unwrap();
+    write_archive_entry(&fx.root, "2026-07-30-done-change", "done-change");
+    // Remove the active copy of workspace-only from base so only the worktree has it.
+    std::fs::remove_dir_all(fx.root.join("openspec/changes/workspace-only")).unwrap();
+    commit_all(
+        &fx.root,
+        "Archive done-change and drop workspace-only from base",
+    );
+
+    let resolution = resolve(&fx.root, &["done-change", "workspace-only"], true).await;
+
+    assert_eq!(
+        resolution.already_completed_ids(),
+        vec!["done-change"],
+        "--no-resume does not erase base-integrated completion"
+    );
+    assert_eq!(resolution.resume_refused_ids(), vec!["workspace-only"]);
+    let message = resolution.failure_error().unwrap().to_string();
+    assert!(message.contains("refused by --no-resume"), "{message}");
+    assert!(
+        ws.is_dir(),
+        "a refused worktree is never implicitly deleted or replaced"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_dry_run_classification_has_no_side_effects() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "active-change");
+    write_active_change(&fx.root, "resumable-change");
+    commit_all(&fx.root, "Add changes");
+
+    let ws = add_worktree(&fx.root, "resumable-change");
+    std::fs::remove_dir_all(fx.root.join("openspec/changes/resumable-change")).unwrap();
+    write_archive_entry(&fx.root, "2026-07-30-completed-change", "completed-change");
+    commit_all(
+        &fx.root,
+        "Archive completed-change, drop resumable-change from base",
+    );
+
+    let before = snapshot_tree(&fx.root);
+    let head_before = git(&fx.root, &["rev-parse", "HEAD"]);
+
+    let resolution = resolve(
+        &fx.root,
+        &[
+            "active-change",
+            "completed-change",
+            "resumable-change",
+            "ghost-change",
+        ],
+        false,
+    )
+    .await;
+
+    assert_eq!(resolution.active_ids(), vec!["active-change"]);
+    assert_eq!(resolution.already_completed_ids(), vec!["completed-change"]);
+    assert_eq!(resolution.resumable_ids(), vec!["resumable-change"]);
+    assert_eq!(resolution.unknown_ids(), vec!["ghost-change"]);
+
+    let lines = resolution.report_lines();
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("already completed (skipped): completed-change")));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("resumable workspaces: resumable-change")));
+
+    assert_eq!(
+        snapshot_tree(&fx.root),
+        before,
+        "read-only classification mutates nothing"
+    );
+    assert_eq!(git(&fx.root, &["rev-parse", "HEAD"]), head_before);
+    assert!(
+        ws.is_dir(),
+        "no workspace cleanup happens during classification"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_classifies_against_post_checkpoint_cumulative_base() {
+    use explicit_target_resume_support::*;
+    let Some(fx) = repo() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    write_active_change(&fx.root, "remote-completed");
+    write_active_change(&fx.root, "local-change");
+    commit_all(&fx.root, "Add both changes");
+
+    let plan = ExplicitTargetPlan::new(
+        vec!["remote-completed".to_string(), "local-change".to_string()],
+        "main".to_string(),
+        TargetResolutionOptions::default(),
+    );
+
+    // Before the checkpoint both targets are ordinary active work.
+    let before = plan.resolve(&fx.root).await;
+    assert_eq!(
+        before.processed_ids(),
+        vec!["remote-completed", "local-change"]
+    );
+
+    // The initial upstream checkpoint integrates a branch that archived one target.
+    git(&fx.root, &["checkout", "-b", "upstream-work"]);
+    std::fs::remove_dir_all(fx.root.join("openspec/changes/remote-completed")).unwrap();
+    write_archive_entry(&fx.root, "2026-07-30-remote-completed", "remote-completed");
+    commit_all(&fx.root, "Archive: remote-completed");
+    git(&fx.root, &["checkout", "main"]);
+    git(
+        &fx.root,
+        &["merge", "--no-ff", "-m", "Merge upstream", "upstream-work"],
+    );
+
+    // Classifying after the checkpoint sees the newly integrated archive.
+    let after = plan.resolve(&fx.root).await;
+    assert!(after.failure_error().is_none());
+    assert_eq!(after.already_completed_ids(), vec!["remote-completed"]);
+    assert_eq!(after.processed_ids(), vec!["local-change"]);
+    assert_eq!(
+        plan.resolved().await.unwrap().already_completed_ids(),
+        vec!["remote-completed"],
+        "the recorded resolution is available to terminal consumers"
+    );
+}
+
+#[tokio::test]
+async fn explicit_target_resume_all_completed_run_still_publishes_unpushed_history() {
+    use explicit_target_resume_support::{
+        resolve, write_active_change, write_archive_entry, TargetClassification,
+    };
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // Every requested target is already archived and integrated into base, and
+    // that integration is not yet published.
+    write_active_change(&fx.repo, "done-one");
+    write_archive_entry(&fx.repo, "2026-07-30-done-one", "done-one");
+    std::fs::remove_dir_all(fx.repo.join("openspec/changes/done-one")).unwrap();
+    git(&fx.repo, &["add", "-A"]);
+    git(&fx.repo, &["commit", "-m", "Archive: done-one"]);
+    add_cumulative_change_merge(&fx.repo, "done-two");
+
+    let resolution = resolve(&fx.repo, &["done-one", "done-two"], false).await;
+    assert!(resolution.failure_error().is_none());
+    assert_eq!(
+        resolution.classification_of("done-one"),
+        Some(TargetClassification::AlreadyCompleted)
+    );
+    assert_eq!(
+        resolution.classification_of("done-two"),
+        Some(TargetClassification::AlreadyCompleted)
+    );
+    assert!(
+        resolution.processed_ids().is_empty(),
+        "there is no change work left to dispatch"
+    );
+
+    // A skip-only run must still verify, push, and confirm the unpublished base.
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    let outcome = coordinator.finalize(drained()).await.unwrap();
+    assert!(
+        matches!(outcome, FinalizeOutcome::Completed { .. }),
+        "an all-already-completed run still finalizes recognized unpublished history: {outcome:?}"
+    );
+    assert_eq!(
+        git(&fx.repo, &["rev-parse", "HEAD"]),
+        git(&fx.repo, &["rev-parse", "origin/main"]),
+        "the cumulative base is published"
+    );
+}
