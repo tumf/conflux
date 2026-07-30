@@ -50,7 +50,8 @@ The CLI contract is:
 - `cflx run -u <remote>` and `cflx run --integrate-upstream=<remote>` enable it for the named remote;
 - omitting `-u`/`--integrate-upstream` preserves the current execution path and performs no new fetch, upstream merge, reverification, or upstream lifecycle event;
 - `-u` is an exact short alias of `--integrate-upstream` and is scoped to `RunArgs`;
-- the option is valid only for cumulative parallel run mode and is rejected before workspace mutation when combined with serial mode, detached HEAD, a missing remote/ref, or per-change `--push` behavior;
+- the option owns the complete bidirectional cumulative-base synchronization cycle: initial fetch validation, safe-point integration, full verification, and one final non-force push to the selected remote's same-name base branch;
+- the option is valid only for cumulative parallel run mode and is rejected before workspace mutation when combined with serial mode, detached HEAD, a missing remote/ref, pre-existing local-only base commits, or per-change `--push` behavior;
 - enabling the option requires an explicit `--upstream-verify-command <command>` so Conflux can enforce the complete repository gate after a changed tree;
 - dry-run validates option compatibility and local remote/base identity without performing fetch, merge, resolve, verification, or push.
 
@@ -64,9 +65,11 @@ At a project base-lane safe point, Conflux shall:
 6. invoke the existing bounded `resolve_command` agent only for textual conflict or bounded semantic repair, never for the ordinary fetch/ancestry/merge operation;
 7. run the explicit full verification command after every actual upstream tree change;
 8. stop in a resumable repository-derived state when resolution or verification cannot converge;
-9. repeat fetch and ancestry validation immediately before a cumulative-base push, and treat a non-force push rejection as a concurrent remote advance that returns to the checkpoint.
+9. after all selected changes are integrated and verified, repeat fetch and ancestry validation and perform the final same-name cumulative-base push outside the AI command harness;
+10. on push failure, classify concurrent advancement and credential/transport failures before deciding whether to refetch, fail directly, or invoke `resolve_command` for repository-repairable evidence;
+11. after any agent repair, re-establish convergence and full verification, then let Conflux—not the agent—retry the non-force push.
 
-Conflux remains the sole writer and workflow controller. `resolve_command` is a repair worker: it receives upstream-specific context, but Conflux owns Git operation selection, retry limits, convergence checks, verification, and continuation decisions.
+Conflux remains the sole writer and workflow controller. `resolve_command` is a repair worker: it receives upstream-specific context, but Conflux owns Git operation selection, push execution, retry limits, convergence checks, verification, and continuation decisions. The agent MUST NOT run or claim success for the final push.
 
 ## Acceptance Criteria
 
@@ -81,9 +84,12 @@ Conflux remains the sole writer and workflow controller. `resolve_command` is a 
 9. Resolve success requires no unmerged entries, no unfinished merge, and ancestry of the fetched remote SHA; repair may add forward commits but may not rewrite cumulative history.
 10. Every actual upstream tree change runs the configured full verification command; failure blocks further base integration and push.
 11. After restart, an unpushed upstream merge is treated as unverified and reruns the full verification command; logs, events, and runtime journals cannot establish completion.
-12. Immediately before cumulative-base push, Conflux fresh-fetches and checks ancestry. A later non-force push rejection returns to the bounded checkpoint flow rather than forcing or declaring success.
-13. Serial mode, TUI, server bare-repository `git-sync`, existing per-change pre-sync, and `PushToRemote` behavior remain unchanged.
-14. Operator output identifies enabled remote, fetched/local revisions, no-op, integration, resolving, reverifying, stalled, retry, and ready outcomes without becoming routing authority.
+12. A successful opted-in run performs one final non-force push of the verified cumulative base to the selected remote's same-name branch; `-u` does not require a second push-enabling option.
+13. Immediately before final push, Conflux fresh-fetches and checks ancestry. A later non-force push rejection returns to the bounded checkpoint flow rather than forcing or declaring success.
+14. Fetch, merge, verification, and push execute as Conflux-owned native operations outside the AI command harness. A push failure invokes `resolve_command` only when repository evidence is repairable; credential, permission, transport, hook-policy, and remote-service failures are reported directly without asking an agent to guess.
+15. After agent repair, Conflux reruns convergence checks and full verification and performs the retry itself; the agent never executes the push.
+16. Serial mode, TUI, server bare-repository `git-sync`, existing per-change pre-sync, and `PushToRemote` behavior remain unchanged.
+17. Operator output identifies enabled remote, fetched/local revisions, no-op, integration, resolving, reverifying, pushing, push-failed, stalled, retry, and completed outcomes without becoming routing authority.
 
 ## Explicit Completion Conditions
 
@@ -93,7 +99,9 @@ Conflux remains the sole writer and workflow controller. `resolve_command` is a 
 - Existing `resolve_command` receives upstream context only on repair paths and Conflux validates convergence after every invocation.
 - Every changed upstream tree executes the provided full verification command; no-op and disabled paths execute none.
 - Restart tests prove unpushed upstream merge commits rerun verification without external durable workflow-control state.
-- Pre-push tests prove a second remote advance and a race-time non-force rejection both return to integration and reverification.
+- Startup tests prove `-u` rejects a base containing pre-existing local-only commits, preventing unrelated local history from being pushed.
+- Finalization tests prove successful opted-in runs push the verified cumulative base exactly once through native Git execution outside `AgentRunner`/the AI command harness.
+- Pre-push tests prove a second remote advance and a race-time non-force rejection both return to integration and reverification; repairable repository failures may hand off to `resolve_command`, while credential/transport/policy failures do not.
 - `cargo test upstream_integration`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and strict OpenSpec validation pass.
 
 ## Out of Scope

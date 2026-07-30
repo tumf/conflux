@@ -9,7 +9,8 @@ A long-running cumulative base is therefore a second integration stream alongsid
 ### Goals
 
 - Preserve current behavior unless run mode receives `-u` or `--integrate-upstream`.
-- Integrate selected remote-base advances inside the cumulative parallel orchestration loop.
+- Integrate selected remote-base advances inside the cumulative parallel orchestration loop and push the verified cumulative result at successful completion.
+- Keep native fetch, merge, verification, and push execution outside the AI command harness.
 - Keep one workspace writer and one project base-lane owner.
 - Let independent change-worktree apply/acceptance continue while blocking their base integration during the checkpoint.
 - Delegate only textual or semantic repair to the configured `resolve_command` agent.
@@ -42,6 +43,7 @@ Startup validation rejects before workspace mutation:
 - non-parallel effective execution;
 - detached HEAD;
 - missing selected remote or same-name remote branch;
+- any commit reachable from starting local base HEAD but not from the freshly observed selected remote base, because `-u` must not push unrelated pre-run local history;
 - missing or empty `--upstream-verify-command`;
 - combination with `--push`, because that path pushes individual completed change branches instead of maintaining the cumulative base;
 - non-Git VCS resolution.
@@ -110,11 +112,20 @@ Ordinary command success does not create Constitution-compatible durable evidenc
 
 Runtime events, logs, TUI projections, or external journals cannot suppress this rerun. Extra verification is preferred to accepting an unverifiable completion claim.
 
-### Decision: final push uses optimistic concurrency
+### Decision: `-u` owns one final native cumulative-base push
 
-Immediately before any cumulative-base push managed by this feature, Conflux fetches again and checks that the latest selected remote SHA is an ancestor of cumulative HEAD. If not, push is suppressed and integration restarts.
+A successful opted-in run is incomplete until Conflux pushes verified cumulative HEAD to the selected remote's same-name base branch. No second push option is required. To prevent accidental publication of unrelated work, startup rejects any local-only commit already present before the run begins.
 
-The actual push remains non-force. If the remote advances between check and push and Git rejects the push, Conflux classifies that rejection as concurrent advancement, returns to the checkpoint, and follows the configured bounded retry policy. Exhaustion stalls with repository evidence intact.
+Fetch, merge, verification command execution, and push are native Conflux operations and do not run through `AgentRunner`, `AiCommandRunner`, or an AI command template. Immediately before final push, Conflux fetches again and checks that the latest selected remote SHA is an ancestor of cumulative HEAD. If not, push is suppressed and integration restarts.
+
+The actual push remains non-force. If the remote advances between check and push and Git rejects the push, Conflux returns directly to fetch/integration. For another push failure, Conflux classifies evidence before agent handoff:
+
+- repository-repairable state, such as rejected local history after an upstream race or a hook that leaves tracked repository changes requiring repair, MAY invoke the existing bounded `resolve_command` with sanitized push diagnostics;
+- credentials, authorization, transport, DNS, remote-service availability, protected-branch policy, and opaque hook rejection are not repository-repairable and MUST fail directly without agent invocation;
+- the agent MUST NOT execute `git push`, alter credentials, bypass hooks, or claim push success;
+- after agent repair, Conflux MUST recheck repository convergence, rerun full verification, fresh-fetch, and execute the non-force push itself.
+
+Retry exhaustion stalls with repository evidence intact. Push success is established only by native command success plus a fresh remote-ref observation showing pushed local HEAD reachable from the selected remote branch.
 
 ## State Flow
 
@@ -142,9 +153,14 @@ REVERIFYING
   -> retry exhausted -> STALLED
 
 READY_TO_PUSH
-  -> fresh fetch; latest remote ancestor -> NON_FORCE_PUSH
+  -> fresh fetch; latest remote ancestor -> NATIVE_NON_FORCE_PUSH
   -> remote advanced -> FETCHING_UPSTREAM
+
+NATIVE_NON_FORCE_PUSH
+  -> success + remote confirmation -> COMPLETED
   -> race-time rejection -> FETCHING_UPSTREAM
+  -> repository-repairable failure -> RESOLVING_UPSTREAM
+  -> credential/transport/policy failure -> STALLED
 ```
 
 ## Failure and Recovery
