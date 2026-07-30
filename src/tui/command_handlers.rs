@@ -4,6 +4,9 @@
 
 use crate::config::OrchestratorConfig;
 use crate::error::Result;
+use crate::orchestration::operator_command::{
+    HookRunnerQueueHooks, OperatorCommandService, QueueMutation,
+};
 use crate::orchestration::state::{ReduceOutcome, ReducerCommand};
 use crate::parallel::PostArchiveAction;
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
@@ -95,6 +98,28 @@ pub struct TuiCommandContext<'a> {
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
 }
 
+/// Build the shared operator command service for the current TUI context.
+///
+/// The TUI is an adapter: lifecycle validation, queue mutation, hook cardinality,
+/// cancellation ordering, and retry routing all live in the shared service so a
+/// remote frontend gets identical behavior.
+fn build_operator_service(
+    ctx: &TuiCommandContext<'_>,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+) -> OperatorCommandService {
+    let hook_runner = crate::hooks::HookRunner::with_event_tx(
+        ctx.config.get_hooks(),
+        ctx.repo_root.to_path_buf(),
+        ctx.tx.clone(),
+    );
+    OperatorCommandService::new(
+        shared_state.clone(),
+        Arc::new(ctx.dynamic_queue.clone()),
+        Arc::new(HookRunnerQueueHooks::new(hook_runner)),
+        ctx.app.execution_marks(),
+    )
+}
+
 /// Handle TuiCommand::StartProcessing
 pub async fn handle_start_processing_command(
     ids: Vec<String>,
@@ -106,7 +131,7 @@ pub async fn handle_start_processing_command(
     orchestrator_cancel: &mut Option<CancellationToken>,
 ) -> Option<tokio::task::JoinHandle<Result<()>>> {
     // Handle web control Start command (empty ids vec) or regular Start
-    let explicit_retry = explicit_retry || (ids.is_empty() && ctx.app.mode == AppMode::Error);
+    let mut explicit_retry = explicit_retry || (ids.is_empty() && ctx.app.mode == AppMode::Error);
     let cmd = if ids.is_empty() {
         // Web control start - determine which command based on app mode
         if ctx.app.mode == AppMode::Error {
@@ -120,6 +145,11 @@ pub async fn handle_start_processing_command(
         // Regular start with specific IDs (from F5 key)
         Some(TuiCommand::StartProcessing(ids.clone()))
     };
+
+    // A retry accepted by the shared retry routing (F5 in Error mode, or the web
+    // control retry) must reach the executor as an explicit retry so a reconciled
+    // acceptance hold resumes acceptance instead of rerunning apply.
+    explicit_retry |= ctx.app.take_pending_explicit_retry();
 
     if let Some(TuiCommand::StartProcessing(selected_ids)) = cmd {
         if !selected_ids.is_empty() {
@@ -269,16 +299,18 @@ pub async fn handle_tui_command(
             return Ok(handle);
         }
         TuiCommand::AddToQueue(id) => {
-            // Apply reducer command first, then push to dynamic queue.
-            let outcome = {
-                let mut guard = shared_state.write().await;
-                if guard.is_terminal_error_change(&id) {
-                    guard.apply_command(ReducerCommand::RetryError(id.clone()))
-                } else {
-                    guard.apply_command(ReducerCommand::AddToQueue(id.clone()))
+            // Adapter only: the shared service owns reducer ordering, dynamic
+            // queue mutation, and on_queue_add cardinality.
+            let service = build_operator_service(ctx, shared_state);
+            let outcome = match service.add_to_queue(&id).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    ctx.app
+                        .add_log(LogEntry::warn(format!("Queue add rejected: {}", error)));
+                    return Ok(None);
                 }
             };
-            if matches!(outcome, crate::orchestration::state::ReduceOutcome::NoOp) {
+            if !outcome.reducer_changed {
                 ctx.app.add_log(LogEntry::warn(format!(
                     "Queue add ignored by reducer: {}",
                     id
@@ -288,8 +320,7 @@ pub async fn handle_tui_command(
             ctx.app.apply_display_statuses_from_reducer(
                 &shared_state.read().await.all_display_statuses(),
             );
-            // Push to dynamic queue for orchestrator to pick up
-            if ctx.dynamic_queue.push(id.clone()).await {
+            if outcome.dynamic_queue_mutated {
                 ctx.app
                     .add_log(LogEntry::info(format!("Added to dynamic queue: {}", id)));
             } else {
@@ -298,33 +329,30 @@ pub async fn handle_tui_command(
             }
         }
         TuiCommand::RemoveFromQueue(id) => {
-            // Apply reducer command first, then remove from dynamic queue.
-            shared_state
-                .write()
-                .await
-                .apply_command(ReducerCommand::RemoveFromQueue(id.clone()));
+            // Adapter only: the shared service owns reducer ordering, dynamic
+            // queue mutation, and on_queue_remove cardinality.
+            let service = build_operator_service(ctx, shared_state);
+            let outcome = match service.remove_from_queue(&id).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    ctx.app
+                        .add_log(LogEntry::warn(format!("Queue remove rejected: {}", error)));
+                    return Ok(None);
+                }
+            };
             ctx.app.apply_display_statuses_from_reducer(
                 &shared_state.read().await.all_display_statuses(),
             );
-            // Remove from dynamic queue so orchestrator won't process it
-            let removed_from_dynamic = ctx.dynamic_queue.remove(&id).await;
-            let removed_from_pending = ctx.dynamic_queue.mark_removed(id.clone()).await;
-            let mut details = Vec::new();
-            if removed_from_dynamic {
-                details.push("also removed from dynamic queue");
-            }
-            if removed_from_pending {
-                details.push("removed from pending");
-            }
-            let suffix = if details.is_empty() {
-                String::new()
+            let suffix = if outcome.dynamic_queue_mutated {
+                " (dynamic queue updated)"
             } else {
-                format!(" ({})", details.join(", "))
+                ""
             };
             ctx.app.add_log(LogEntry::info(format!(
                 "Removed from queue: {}{}",
                 id, suffix
             )));
+            debug_assert_eq!(outcome.mutation, QueueMutation::Removed);
         }
         TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
             let delete_result = remove_worktree_for_tui(ctx.repo_root, &path, skip_teardown).await;
@@ -646,26 +674,32 @@ pub async fn handle_tui_command(
             });
         }
         TuiCommand::DequeueChange(id) => {
-            // Apply reducer command first so shared state reflects stop-and-dequeue intent.
-            shared_state
-                .write()
-                .await
-                .apply_command(ReducerCommand::DequeueChange(id.clone()));
-            // Force-kill the in-flight execution for this change.
-            // force_kill() marks stopped AND immediately cancels the per-change token,
-            // bypassing the 100ms polling delay for truly immediate process termination.
-            let had_token = ctx.dynamic_queue.force_kill(&id).await;
-            if had_token {
-                ctx.app.add_log(LogEntry::info(format!(
-                    "Force-kill issued for active change: {}",
-                    id
-                )));
-            } else {
-                ctx.app.add_log(LogEntry::info(format!(
-                    "Stop-and-dequeue request received for: {}",
-                    id
-                )));
-            }
+            // Cancellation-first: the shared service issues cancellation, waits for
+            // confirmed task termination, and only then applies DequeueChange.
+            // The wait is bounded but can take seconds, so it runs off the TUI
+            // input loop and reports its outcome through the event channel.
+            let service = build_operator_service(ctx, shared_state);
+            let result_tx = ctx.tx.clone();
+            ctx.app.add_log(LogEntry::info(format!(
+                "Stop-and-dequeue request received for: {}",
+                id
+            )));
+            tokio::spawn(async move {
+                let entry = match service.stop_and_dequeue(&id).await {
+                    Ok(crate::orchestration::operator_command::OperatorOutcome::Dequeued {
+                        change_id,
+                    }) => LogEntry::success(format!(
+                        "Stopped and dequeued after confirmed termination: {}",
+                        change_id
+                    )),
+                    Ok(_) => LogEntry::warn(format!("Stop-and-dequeue ignored for: {}", id)),
+                    Err(error) => {
+                        warn!("Stop-and-dequeue failed for {}: {}", id, error);
+                        LogEntry::error(format!("Stop-and-dequeue failed: {}", error))
+                    }
+                };
+                let _ = result_tx.send(OrchestratorEvent::Log(entry)).await;
+            });
         }
         TuiCommand::ResolveMerge(id) => {
             // Apply reducer command first so shared state reflects scheduler-visible resolve intent.
@@ -1370,5 +1404,412 @@ mod tests {
             handle_live.is_none(),
             "live scheduler state must not spawn scheduler"
         );
+    }
+}
+
+/// Adapter parity coverage: the same operator intent must produce identical
+/// reducer transitions, runtime queue state, and cancellation ordering whether it
+/// arrives through the TUI adapter or directly through the shared service.
+#[cfg(test)]
+mod operator_command_parity_tests {
+    use super::*;
+    use crate::orchestration::operator_command::{
+        ExecutionMarkStore, NoopQueueHooks, OperatorCommandService, OperatorOutcome,
+    };
+    use crate::orchestration::state::OrchestratorState;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use tokio::sync::RwLock;
+
+    fn test_change(id: &str) -> crate::openspec::Change {
+        crate::openspec::Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
+        }
+    }
+
+    fn parallel_state(ids: &[&str]) -> Arc<RwLock<OrchestratorState>> {
+        Arc::new(RwLock::new(
+            crate::orchestration::state::OrchestratorState::with_mode(
+                ids.iter().map(|id| id.to_string()).collect(),
+                10,
+                crate::orchestration::state::ExecutionMode::Parallel,
+            ),
+        ))
+    }
+
+    fn direct_service(
+        state: &Arc<RwLock<OrchestratorState>>,
+        queue: &DynamicQueue,
+    ) -> OperatorCommandService {
+        OperatorCommandService::new(
+            state.clone(),
+            Arc::new(queue.clone()),
+            Arc::new(NoopQueueHooks),
+            Arc::new(ExecutionMarkStore::new()),
+        )
+    }
+
+    /// Run one TuiCommand through the adapter and return the resulting state.
+    async fn run_tui_command(
+        command: TuiCommand,
+        state: &Arc<RwLock<OrchestratorState>>,
+        queue: &DynamicQueue,
+    ) {
+        run_tui_command_with_config(command, state, queue, OrchestratorConfig::default()).await
+    }
+
+    async fn run_tui_command_with_config(
+        command: TuiCommand,
+        state: &Arc<RwLock<OrchestratorState>>,
+        queue: &DynamicQueue,
+        config: OrchestratorConfig,
+    ) {
+        let (tx, _rx) = mpsc::channel(64);
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+        let mut app = AppState::new(vec![test_change("change-a")]);
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: Path::new("."),
+            config: &config,
+            tx: &tx,
+            dynamic_queue: queue,
+            remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
+            orchestrator_running: true,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        handle_tui_command(
+            command,
+            &mut ctx,
+            &graceful_stop_flag,
+            state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("tui command should succeed");
+    }
+
+    async fn wait_for_status(state: &Arc<RwLock<OrchestratorState>>, id: &str, expected: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if state.read().await.display_status(id) == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "'{}' never reached status '{}' (last: '{}')",
+                id,
+                expected,
+                state.read().await.display_status(id)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// End-to-end hook wiring: a configured `on_queue_add` really runs, exactly
+    /// once per real dynamic mutation, when the operator adds through the TUI.
+    #[tokio::test]
+    async fn operator_command_tui_add_runs_configured_queue_hook_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("queue-hook.log");
+        let config = OrchestratorConfig {
+            hooks: Some(
+                serde_json::from_str(&format!(
+                    r#"{{"on_queue_add": "printf 'add:{{change_id}}\n' >> {}"}}"#,
+                    marker.display()
+                ))
+                .expect("hooks config"),
+            ),
+            ..Default::default()
+        };
+
+        let state = parallel_state(&["change-a"]);
+        let queue = DynamicQueue::new();
+        run_tui_command_with_config(
+            TuiCommand::AddToQueue("change-a".to_string()),
+            &state,
+            &queue,
+            config.clone(),
+        )
+        .await;
+
+        let after_first = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            after_first, "add:change-a\n",
+            "a real dynamic queue addition must run on_queue_add exactly once"
+        );
+
+        // A duplicate addition is a no-op and must not run the hook again.
+        run_tui_command_with_config(
+            TuiCommand::AddToQueue("change-a".to_string()),
+            &state,
+            &queue,
+            config,
+        )
+        .await;
+
+        let after_duplicate = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            after_duplicate, after_first,
+            "a duplicate addition must not run on_queue_add again"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_command_tui_add_matches_direct_service_add() {
+        let tui_state = parallel_state(&["change-a"]);
+        let tui_queue = DynamicQueue::new();
+        run_tui_command(
+            TuiCommand::AddToQueue("change-a".to_string()),
+            &tui_state,
+            &tui_queue,
+        )
+        .await;
+
+        let service_state = parallel_state(&["change-a"]);
+        let service_queue = DynamicQueue::new();
+        let outcome = direct_service(&service_state, &service_queue)
+            .add_to_queue("change-a")
+            .await
+            .expect("direct add");
+
+        assert!(outcome.reducer_changed && outcome.dynamic_queue_mutated);
+        assert_eq!(
+            tui_state.read().await.display_status("change-a"),
+            service_state.read().await.display_status("change-a"),
+            "TUI and direct service paths must produce the same reducer transition"
+        );
+        assert_eq!(
+            tui_queue.contains("change-a").await,
+            service_queue.contains("change-a").await,
+            "TUI and direct service paths must produce the same dynamic queue state"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_command_tui_remove_matches_direct_service_remove() {
+        let tui_state = parallel_state(&["change-a"]);
+        let tui_queue = DynamicQueue::new();
+        run_tui_command(
+            TuiCommand::AddToQueue("change-a".to_string()),
+            &tui_state,
+            &tui_queue,
+        )
+        .await;
+        run_tui_command(
+            TuiCommand::RemoveFromQueue("change-a".to_string()),
+            &tui_state,
+            &tui_queue,
+        )
+        .await;
+
+        let service_state = parallel_state(&["change-a"]);
+        let service_queue = DynamicQueue::new();
+        let service = direct_service(&service_state, &service_queue);
+        service.add_to_queue("change-a").await.expect("direct add");
+        service
+            .remove_from_queue("change-a")
+            .await
+            .expect("direct remove");
+
+        assert_eq!(
+            tui_state.read().await.display_status("change-a"),
+            service_state.read().await.display_status("change-a")
+        );
+        assert_eq!(
+            tui_queue.contains("change-a").await,
+            service_queue.contains("change-a").await
+        );
+        assert_eq!(
+            tui_queue.drain_removed().await,
+            service_queue.drain_removed().await,
+            "both paths must record the same pending removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_command_tui_dequeue_waits_for_confirmed_termination() {
+        let state = parallel_state(&["change-a"]);
+        let queue = DynamicQueue::new();
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            });
+        }
+
+        let token = CancellationToken::new();
+        queue
+            .register_kill_token("change-a".to_string(), token.clone())
+            .await;
+
+        let worker_queue = queue.clone();
+        let worker = tokio::spawn(async move {
+            token.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            worker_queue.unregister_kill_token("change-a").await;
+        });
+
+        run_tui_command(
+            TuiCommand::DequeueChange("change-a".to_string()),
+            &state,
+            &queue,
+        )
+        .await;
+
+        wait_for_status(&state, "change-a", "not queued").await;
+        worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn operator_command_tui_dequeue_preserves_active_state_without_handle() {
+        let state = parallel_state(&["change-a"]);
+        let queue = DynamicQueue::new();
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            });
+        }
+
+        run_tui_command(
+            TuiCommand::DequeueChange("change-a".to_string()),
+            &state,
+            &queue,
+        )
+        .await;
+
+        // The spawned stop attempt must fail without mutating active state.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            state.read().await.display_status("change-a"),
+            "applying",
+            "a missing cancellation handle must leave the change active"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_command_stop_and_dequeue_service_call_matches_tui_result() {
+        let service_state = parallel_state(&["change-a"]);
+        let service_queue = DynamicQueue::new();
+        {
+            let mut guard = service_state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            });
+        }
+        let token = CancellationToken::new();
+        service_queue
+            .register_kill_token("change-a".to_string(), token.clone())
+            .await;
+        let worker_queue = service_queue.clone();
+        let worker = tokio::spawn(async move {
+            token.cancelled().await;
+            worker_queue.unregister_kill_token("change-a").await;
+        });
+
+        let outcome = direct_service(&service_state, &service_queue)
+            .stop_and_dequeue("change-a")
+            .await
+            .expect("direct stop-and-dequeue");
+
+        assert_eq!(
+            outcome,
+            OperatorOutcome::Dequeued {
+                change_id: "change-a".to_string()
+            }
+        );
+        assert_eq!(
+            service_state.read().await.display_status("change-a"),
+            "not queued"
+        );
+        worker.await.expect("worker task");
+    }
+
+    #[tokio::test]
+    async fn operator_command_retry_requests_an_explicit_retry_run() {
+        let mut app = AppState::new(vec![test_change("change-a")]);
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+                id: "change-a".to_string(),
+                error: "boom".to_string(),
+            });
+        }
+        app.shared_orchestrator_state = Some(state.clone());
+        app.apply_display_statuses_from_reducer(&state.read().await.all_display_statuses());
+        app.mode = AppMode::Error;
+        app.changes[0].selected = true;
+
+        let command = app.retry_error_changes();
+
+        assert!(
+            matches!(command, Some(TuiCommand::StartProcessing(ref ids)) if ids == &vec!["change-a".to_string()]),
+            "a marked error row must be retried"
+        );
+        assert!(
+            app.take_pending_explicit_retry(),
+            "operator retry must request explicit-retry semantics so a reconciled \
+             acceptance hold resumes acceptance instead of rerunning apply"
+        );
+        assert!(
+            !app.take_pending_explicit_retry(),
+            "the explicit-retry request must be consumed exactly once"
+        );
+        assert_eq!(
+            state.read().await.display_status("change-a"),
+            "queued",
+            "retry routing must clear the terminal error through the reducer"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_command_retry_also_covers_acceptance_stalled_rows() {
+        let mut app = AppState::new(vec![test_change("change-a")]);
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::AcceptanceGated {
+                change_id: "change-a".to_string(),
+                blocker: crate::events::StalledBlocker {
+                    category: "acceptance_finding".to_string(),
+                    phase: "acceptance".to_string(),
+                    gate: "acceptance".to_string(),
+                    error_summary: "unresolved finding".to_string(),
+                    evidence: vec!["tests/acceptance.rs:1".to_string()],
+                    next_action: "resolve and retry".to_string(),
+                    resumable: true,
+                    worktree_preserved: true,
+                },
+            });
+        }
+        app.shared_orchestrator_state = Some(state.clone());
+        app.apply_display_statuses_from_reducer(&state.read().await.all_display_statuses());
+        assert_eq!(app.changes[0].display_status_cache, "stalled");
+        app.mode = AppMode::Error;
+        app.changes[0].selected = true;
+
+        let command = app.retry_error_changes();
+
+        assert!(
+            matches!(command, Some(TuiCommand::StartProcessing(ref ids)) if ids == &vec!["change-a".to_string()]),
+            "a marked acceptance-stalled row must be retryable"
+        );
+        assert!(app.take_pending_explicit_retry());
+        assert_eq!(state.read().await.display_status("change-a"), "queued");
     }
 }

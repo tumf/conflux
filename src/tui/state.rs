@@ -269,6 +269,19 @@ pub struct AppState {
     ///
     /// This state is not workflow-control state.
     diagnostic_dedup: DiagnosticDeduplicationStore<DiagnosticDeduplicationKey>,
+    /// Set when the operator accepted a retry that must start the next run with
+    /// explicit-retry semantics.
+    ///
+    /// Explicit retry is what lets a reconciled acceptance hold be consumed and
+    /// acceptance resume without rerunning apply. It is consumed exactly once by
+    /// the start-processing adapter.
+    pending_explicit_retry: bool,
+    /// Process-local execution marks shared with the operator command service.
+    ///
+    /// `ChangeState::selected` stays the rendering projection; this store is the
+    /// frontend-independent copy other adapters read. It is never persisted, so a
+    /// restarted process starts with every mark `false`.
+    execution_marks: std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
 }
 
 // ============================================================================
@@ -437,7 +450,44 @@ impl AppState {
             tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
             diagnostic_dedup: DiagnosticDeduplicationStore::new(),
+            pending_explicit_retry: false,
+            execution_marks: std::sync::Arc::new(
+                crate::orchestration::operator_command::ExecutionMarkStore::new(),
+            ),
         }
+    }
+
+    /// Record that the next run must use explicit-retry semantics.
+    pub fn set_pending_explicit_retry(&mut self) {
+        self.pending_explicit_retry = true;
+    }
+
+    /// Consume the pending explicit-retry request, if any.
+    pub fn take_pending_explicit_retry(&mut self) -> bool {
+        std::mem::take(&mut self.pending_explicit_retry)
+    }
+
+    /// Shared handle to the process-local execution marks.
+    ///
+    /// The operator command service and any future frontend adapter read marks
+    /// through this handle instead of reaching into TUI rendering state.
+    pub fn execution_marks(
+        &self,
+    ) -> std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore> {
+        self.execution_marks.clone()
+    }
+
+    /// Publish the current TUI mark projection into the shared store.
+    ///
+    /// Called after every operator interaction that can change marks so other
+    /// frontends observe the same process-local intent.
+    pub fn publish_execution_marks(&self) {
+        self.execution_marks.replace(
+            self.changes
+                .iter()
+                .filter(|change| change.selected)
+                .map(|change| change.id.clone()),
+        );
     }
 
     pub fn set_tui_config(&mut self, tui_config: TuiConfig) {
@@ -1317,6 +1367,7 @@ impl AppState {
 
 mod guards {
     use super::{ChangeState, TuiCommand, ViewMode, WorktreeInfo};
+    use crate::orchestration::operator_command::{classify_mark_route, MarkRoute, OperatorMode};
 
     /// Result type for merge validation
     pub enum MergeGuardResult {
@@ -1495,125 +1546,100 @@ mod guards {
         None,
     }
 
+    /// Clear the NEW flag once the operator has interacted with a change.
+    fn consume_new_flag(change: &mut ChangeState, new_change_count: &mut usize) {
+        if change.is_new {
+            change.is_new = false;
+            *new_change_count = new_change_count.saturating_sub(1);
+        }
+    }
+
+    /// Toggle the execution mark only, without touching queue or display state.
+    fn toggle_mark_only(
+        change: &mut ChangeState,
+        new_change_count: &mut usize,
+        log: bool,
+    ) -> ToggleActionResult {
+        change.selected = !change.selected;
+        consume_new_flag(change, new_change_count);
+        if !log {
+            return ToggleActionResult::StateOnly(None);
+        }
+        let log_msg = if change.selected {
+            format!("Marked for execution: {}", change.id)
+        } else {
+            format!("Unmarked: {}", change.id)
+        };
+        ToggleActionResult::StateOnly(Some(log_msg))
+    }
+
     /// Handle toggle selection in Select mode
     pub fn handle_toggle_select_mode(
         change: &mut ChangeState,
         new_change_count: &mut usize,
     ) -> ToggleActionResult {
-        change.selected = !change.selected;
-        // Clear NEW flag when user interacts with the change
-        if change.is_new {
-            change.is_new = false;
-            *new_change_count = new_change_count.saturating_sub(1);
+        match classify_mark_route(OperatorMode::Select, &change.display_status_cache) {
+            MarkRoute::MarkOnly => toggle_mark_only(change, new_change_count, false),
+            _ => ToggleActionResult::None,
         }
-        ToggleActionResult::StateOnly(None)
     }
 
     /// Handle toggle selection in Running mode
+    ///
+    /// Routing comes from the shared operator command matrix; this function only
+    /// projects the decision onto TUI state and log messages.
     pub fn handle_toggle_running_mode(
         change: &mut ChangeState,
         new_change_count: &mut usize,
     ) -> ToggleActionResult {
-        match change.display_status_cache.as_str() {
-            "not queued" => {
-                // Emit AddToQueue command; do NOT directly assign display_status_cache here.
-                // The shared reducer state will be updated via apply_command in command_handlers,
-                // and the TUI will derive the display status from the shared state.
-                change.selected = true;
-                // Clear NEW flag when user adds to queue
-                if change.is_new {
-                    change.is_new = false;
-                    *new_change_count = new_change_count.saturating_sub(1);
-                }
-                let id = change.id.clone();
-                let log_msg = format!("Added to queue: {}", id);
-                ToggleActionResult::Command(TuiCommand::AddToQueue(id), Some(log_msg))
-            }
-            "queued" => {
-                // Emit RemoveFromQueue command; do NOT directly assign display_status_cache here.
-                change.selected = false;
-                let id = change.id.clone();
-                let log_msg = format!("Removed from queue: {}", id);
-                ToggleActionResult::Command(TuiCommand::RemoveFromQueue(id), Some(log_msg))
-            }
-            "merge wait" | "resolve pending" => {
-                // Only toggle execution mark (selected), do not modify display_status_cache or DynamicQueue
-                change.selected = !change.selected;
-                // Clear NEW flag when user interacts with the change
-                if change.is_new {
-                    change.is_new = false;
-                    *new_change_count = new_change_count.saturating_sub(1);
-                }
-                let id = change.id.clone();
-                let log_msg = if change.selected {
-                    format!("Marked for execution: {}", id)
-                } else {
-                    format!("Unmarked: {}", id)
+        match classify_mark_route(OperatorMode::Running, &change.display_status_cache) {
+            MarkRoute::QueueIntent => {
+                // Queue intent decides the new mark: unqueued rows are added,
+                // queued rows are removed, and error rows mirror the same pair.
+                let is_error = change.display_status_cache == "error";
+                let add = match change.display_status_cache.as_str() {
+                    "not queued" => true,
+                    "queued" => false,
+                    _ => !change.selected,
                 };
-                ToggleActionResult::StateOnly(Some(log_msg))
-            }
-            "applying" | "accepting" | "archiving" | "resolving" => {
-                // Active changes: Space does NOT trigger force-kill.
-                // Use K key to enter force-kill confirmation mode instead.
-                ToggleActionResult::None
-            }
-            "error" => {
-                // Error rows in Running mode must mirror queue operations:
-                // selected=true => AddToQueue, selected=false => RemoveFromQueue.
-                change.selected = !change.selected;
-                if change.is_new {
-                    change.is_new = false;
-                    *new_change_count = new_change_count.saturating_sub(1);
-                }
+                // Do NOT assign display_status_cache here: the shared service applies
+                // the reducer transition and the TUI derives display status from it.
+                change.selected = add;
+                consume_new_flag(change, new_change_count);
                 let id = change.id.clone();
-                let log_msg = if change.selected {
-                    format!("Marked for retry and added to queue: {}", id)
-                } else {
-                    format!("Retry mark cleared and removed from queue: {}", id)
+                let log_msg = match (is_error, add) {
+                    (true, true) => format!("Marked for retry and added to queue: {}", id),
+                    (true, false) => format!("Retry mark cleared and removed from queue: {}", id),
+                    (false, true) => format!("Added to queue: {}", id),
+                    (false, false) => format!("Removed from queue: {}", id),
                 };
-                if change.selected {
+                if add {
                     ToggleActionResult::Command(TuiCommand::AddToQueue(id), Some(log_msg))
                 } else {
                     ToggleActionResult::Command(TuiCommand::RemoveFromQueue(id), Some(log_msg))
                 }
             }
-            // Completed, Archived, Merged, Blocked - cannot change status
-            _ => ToggleActionResult::None,
+            // MergeWait/ResolveWait rows accept mark-only mutation.
+            MarkRoute::MarkOnly => toggle_mark_only(change, new_change_count, true),
+            // Active rows are stopped with the force-kill control, not with Space;
+            // final rows and retry-owned rows cannot change here.
+            MarkRoute::Immutable | MarkRoute::RetryRequired => ToggleActionResult::None,
         }
     }
 
     /// Handle toggle selection in Stopped mode
+    ///
+    /// In Stopped mode only the execution mark changes. For wait states
+    /// (MergeWait/ResolveWait) and NotQueued, `display_status_cache` MUST remain
+    /// unchanged until the run resumes.
     pub fn handle_toggle_stopped_mode(
         change: &mut ChangeState,
         new_change_count: &mut usize,
     ) -> ToggleActionResult {
-        // In Stopped mode, only toggle execution mark (selected), not display_status_cache.
-        // For wait states (MergeWait/ResolveWait), display_status_cache MUST remain unchanged.
-        // For NotQueued, display_status_cache remains NotQueued until resume.
-        if !matches!(
-            change.display_status_cache.as_str(),
-            "not queued" | "merge wait" | "resolve pending" | "error"
-        ) {
-            // Cannot modify processing/completed states.
-            return ToggleActionResult::None;
+        match classify_mark_route(OperatorMode::Stopped, &change.display_status_cache) {
+            MarkRoute::MarkOnly => toggle_mark_only(change, new_change_count, true),
+            _ => ToggleActionResult::None,
         }
-
-        // Toggle execution mark only
-        change.selected = !change.selected;
-
-        // Clear NEW flag when user interacts with the change
-        if change.is_new {
-            change.is_new = false;
-            *new_change_count = new_change_count.saturating_sub(1);
-        }
-
-        let id = change.id.clone();
-        let log_msg = if change.selected {
-            format!("Marked for execution: {}", id)
-        } else {
-            format!("Unmarked: {}", id)
-        };
-        ToggleActionResult::StateOnly(Some(log_msg))
     }
 }
 

@@ -220,6 +220,9 @@ pub(super) fn toggle_all_marks(state: &mut AppState) -> Vec<TuiCommand> {
     }
     state.add_log(LogEntry::info(summary));
 
+    // Keep the shared process-local mark store in sync with the TUI projection.
+    state.publish_execution_marks();
+
     commands
 }
 
@@ -264,7 +267,11 @@ pub(super) fn toggle_selection(state: &mut AppState) -> Option<TuiCommand> {
     };
     state.new_change_count = new_change_count;
 
-    dispatch_toggle_result(state, result)
+    let command = dispatch_toggle_result(state, result);
+    // Keep the shared process-local mark store in sync with the TUI projection so
+    // other operator frontends observe the same intent.
+    state.publish_execution_marks();
+    command
 }
 
 fn dispatch_toggle_result(
@@ -366,8 +373,13 @@ pub(super) fn retry_error_changes(state: &mut AppState) -> Option<TuiCommand> {
         state.add_log(entry);
     }
 
+    // Operator retry must start the run with explicit-retry semantics so a
+    // reconciled acceptance hold is consumed and acceptance resumes instead of
+    // apply being rerun.
+    state.set_pending_explicit_retry();
     state.reset_for_run();
     state.mode = AppMode::Running;
+    state.publish_execution_marks();
     Some(processing_logic::build_start_command(retry_ids))
 }
 

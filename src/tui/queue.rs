@@ -8,6 +8,17 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 
+/// Execution handle registered while a change owns a running workspace task.
+///
+/// `cancel` requests termination; `done` is cancelled by the executor when the
+/// task actually returned, which is the only observable proof that the process
+/// and task for the change exited.
+#[derive(Clone)]
+struct ChangeExecutionHandle {
+    cancel: CancellationToken,
+    done: CancellationToken,
+}
+
 /// Dynamic queue for runtime change additions
 ///
 /// This struct provides a thread-safe queue for dynamically adding changes
@@ -23,8 +34,8 @@ pub struct DynamicQueue {
     removed: Arc<Mutex<HashSet<String>>>,
     /// Set of change IDs that have been stopped
     stopped: Arc<Mutex<HashSet<String>>>,
-    /// Per-change cancellation tokens for immediate force-kill
-    kill_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Per-change execution handles for immediate force-kill and termination waiting
+    kill_tokens: Arc<Mutex<HashMap<String, ChangeExecutionHandle>>>,
     /// Notification for queue changes (used to wake up re-analysis loop)
     notify: Arc<Notify>,
 }
@@ -161,26 +172,40 @@ impl DynamicQueue {
     /// Called by the parallel executor when spawning a workspace task.
     pub async fn register_kill_token(&self, id: String, token: CancellationToken) {
         let mut tokens = self.kill_tokens.lock().await;
-        tokens.insert(id, token);
+        tokens.insert(
+            id,
+            ChangeExecutionHandle {
+                cancel: token,
+                done: CancellationToken::new(),
+            },
+        );
     }
 
     /// Unregister a per-change cancellation token (cleanup on task completion).
+    ///
+    /// This is the termination handshake: the executor only reaches this point
+    /// after the workspace task returned, so waiters observing `done` learn that
+    /// the task and its child process actually exited.
     pub async fn unregister_kill_token(&self, id: &str) {
-        let mut tokens = self.kill_tokens.lock().await;
-        tokens.remove(id);
+        let handle = {
+            let mut tokens = self.kill_tokens.lock().await;
+            tokens.remove(id)
+        };
+        if let Some(handle) = handle {
+            handle.done.cancel();
+        }
     }
 
-    /// Force-kill a change: mark stopped AND immediately cancel its execution token.
-    /// Returns true if a kill token was found and cancelled.
-    pub async fn force_kill(&self, id: &str) -> bool {
+    /// Mark a change stopped, cancel its execution token, and return the token that
+    /// the executor cancels once the workspace task actually returned.
+    ///
+    /// Returns `None` when no cancellation handle is registered for the change.
+    pub async fn request_cancellation(&self, id: &str) -> Option<CancellationToken> {
         self.mark_stopped(id.to_string()).await;
         let tokens = self.kill_tokens.lock().await;
-        if let Some(token) = tokens.get(id) {
-            token.cancel();
-            true
-        } else {
-            false
-        }
+        let handle = tokens.get(id)?;
+        handle.cancel.cancel();
+        Some(handle.done.clone())
     }
 }
 
@@ -328,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_force_kill_marks_stopped_and_cancels_token() {
+    async fn test_request_cancellation_marks_stopped_and_cancels_token() {
         let queue = DynamicQueue::new();
         let token = CancellationToken::new();
         queue
@@ -336,32 +361,47 @@ mod tests {
             .await;
 
         assert!(!token.is_cancelled());
-        let had_token = queue.force_kill("a").await;
-        assert!(had_token);
+        let done = queue
+            .request_cancellation("a")
+            .await
+            .expect("a registered handle must be returned");
         assert!(token.is_cancelled());
         assert!(queue.is_stopped("a").await);
+        assert!(
+            !done.is_cancelled(),
+            "termination must not be reported before the task completes"
+        );
     }
 
     #[tokio::test]
-    async fn test_force_kill_without_token_still_marks_stopped() {
+    async fn test_request_cancellation_without_token_still_marks_stopped() {
         let queue = DynamicQueue::new();
 
-        let had_token = queue.force_kill("b").await;
-        assert!(!had_token);
+        assert!(queue.request_cancellation("b").await.is_none());
         assert!(queue.is_stopped("b").await);
     }
 
     #[tokio::test]
-    async fn test_unregister_kill_token() {
+    async fn test_unregister_kill_token_confirms_termination() {
         let queue = DynamicQueue::new();
         let token = CancellationToken::new();
         queue
             .register_kill_token("a".to_string(), token.clone())
             .await;
+        let done = queue
+            .request_cancellation("a")
+            .await
+            .expect("handle registered");
+
         queue.unregister_kill_token("a").await;
 
-        let had_token = queue.force_kill("a").await;
-        assert!(!had_token);
-        assert!(!token.is_cancelled());
+        assert!(
+            done.is_cancelled(),
+            "task completion must confirm termination to waiters"
+        );
+        assert!(
+            queue.request_cancellation("a").await.is_none(),
+            "an unregistered change has no cancellation handle"
+        );
     }
 }

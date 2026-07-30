@@ -73,7 +73,7 @@ pub const CLAUDE_TEMPLATE: &str = r#"{
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
   //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
-  //   TUI interaction: on_queue_add, on_queue_remove
+  //   Operator interaction (any frontend): on_queue_add, on_queue_remove
   // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
     // Run lifecycle
@@ -169,7 +169,7 @@ pub const OPENCODE_TEMPLATE: &str = r#"{
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
   //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
-  //   TUI interaction: on_queue_add, on_queue_remove
+  //   Operator interaction (any frontend): on_queue_add, on_queue_remove
   // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
     // Run lifecycle
@@ -265,7 +265,7 @@ pub const CODEX_TEMPLATE: &str = r#"{
   // Available hooks:
   //   Run lifecycle: on_start, on_finish, on_error
   //   Change lifecycle: on_change_start, pre_apply, post_apply, on_change_complete, pre_archive, post_archive, on_change_end, on_merged
-  //   TUI interaction: on_queue_add, on_queue_remove
+  //   Operator interaction (any frontend): on_queue_add, on_queue_remove
   // Available placeholders: {change_id}, {changes_processed}, {total_changes}, {remaining_changes}, {apply_count}, {completed_tasks}, {total_tasks}
   "hooks": {
     // Run lifecycle

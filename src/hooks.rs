@@ -58,10 +58,12 @@ pub enum HookType {
     /// Triggered when a change is merged to base branch
     OnMerged,
 
-    // === User interaction (TUI only) ===
-    /// Triggered when user adds a change to queue (Space key)
+    // === Operator interaction (frontend-independent) ===
+    // Dispatched by the shared operator command service after a real dynamic
+    // queue mutation, regardless of which frontend requested it.
+    /// Triggered when an operator adds a change to the dynamic queue
     OnQueueAdd,
-    /// Triggered when user removes a change from queue (Space key)
+    /// Triggered when an operator removes a change from the dynamic queue
     OnQueueRemove,
 }
 

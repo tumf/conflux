@@ -6,6 +6,7 @@ pub mod acceptance;
 pub mod apply;
 pub mod archive;
 pub mod hooks;
+pub mod operator_command;
 pub mod output;
 pub mod rejection;
 pub mod state;
