@@ -8,7 +8,7 @@
 - [x] **Task 6: Centralize retry routing** so terminal errors use `ReducerCommand::RetryError`, reconciled acceptance stalls consume the existing explicit-retry hold and resume acceptance, and unsupported/binding-mismatched holds retain blocker evidence. (verification: integration - repository fixture and acceptance-state cases in `cargo test --lib operator_command -- --list | grep -q operator_command && cargo test --lib operator_command`; verification-id: operator-command-local)
 - [x] **Task 7: Add restart and compatibility regression coverage** proving execution marks reset, workspace-derived routing is unchanged, and current TUI/existing API behavior still passes. (verification: integration - restart fixture plus existing suites through `cargo test --lib operator_command -- --list | grep -q operator_command && cargo test --lib operator_command`; verification-id: operator-command-local)
 
-## Implementation Evidence
+## Implementation Evidence Notes
 
 - Shared service: `src/orchestration/operator_command.rs` (`OperatorCommand`, `OperatorOutcome`,
   `QueueOutcome`, `OperatorCommandError`, `MarkRoute`/`classify_mark_route`,
