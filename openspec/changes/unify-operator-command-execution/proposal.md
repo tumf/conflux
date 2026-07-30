@@ -20,8 +20,8 @@ verifications:
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/tui/command_handlers.rs
-    evidence: cargo test output for operator_command cases
-    rerun: cargo test operator_command
+    evidence: non-empty operator_command test listing and passing filtered test output
+    rerun: cargo test --lib operator_command -- --list | grep -q operator_command && cargo test --lib operator_command
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -52,7 +52,7 @@ The service will:
 - allow mark mutation in `Select` and `Stopped`, use queue intent for ordinary Running rows, and allow mark-only mutation during `MergeWait` or `ResolveWait`;
 - cancel and confirm active work termination before applying `ReducerCommand::DequeueChange`;
 - route terminal error retry through `ReducerCommand::RetryError` and acceptance-stalled retry through the existing reconciled acceptance-hold path without rerunning apply;
-- invoke `on_queue_add` and `on_queue_remove` exactly once only after a real dynamic queue mutation, never for initial start or no-op requests.
+- invoke `on_queue_add` and `on_queue_remove` exactly once only after a real dynamic queue mutation, never for initial start or no-op requests, and update the canonical hooks contract so these two hooks become frontend-independent while approval hooks remain TUI-only.
 
 ## Acceptance Criteria
 
@@ -70,7 +70,7 @@ The service will:
 - A shared service and command/result types exist outside frontend-specific rendering code and are used by TUI handlers.
 - Tests exercise success, no-op, invalid lifecycle, dependency-blocked queueing, hook cardinality, missing cancellation token, cancellation failure/timeout, terminal retry, acceptance-stalled retry, and restart mark reset.
 - `DynamicQueue::force_kill` result semantics are no longer treated as proof of process termination; active dequeue has an observable completion handshake.
-- `cargo test operator_command`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and strict OpenSpec validation pass.
+- The operator-command verification first proves at least one matching test exists, then runs the filtered tests; `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and strict OpenSpec validation also pass.
 
 ## Out of Scope
 

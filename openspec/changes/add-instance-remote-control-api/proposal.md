@@ -17,13 +17,13 @@ references:
   - "src/remote/client.rs"
 verifications:
   - id: remote-control-api-local
-    requirement: API schema, auth, revision, idempotency, snapshot/event continuity, and shared-command integration are covered by repository-local tests.
+    requirement: API schema, auth, revision, idempotency, snapshot/event continuity, and shared-command integration are covered by non-empty repository-local tests.
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: src/web/api.rs
-    evidence: cargo test output for remote_control_api cases
-    rerun: cargo test remote_control_api
+    evidence: non-empty remote_control_api test listing and passing filtered test output
+    rerun: cargo test --lib remote_control_api -- --list | grep -q remote_control_api && cargo test --lib remote_control_api
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -55,31 +55,41 @@ Add a single-process `/api/v2` resource API:
 - `GET /api/v2/events` using Server-Sent Events
 - `/api/v2/ws` using WebSocket
 
-Command envelopes include `type`, `target`, `params`, optional or command-required `expected_revision`, side-effect-required `idempotency_key`, and optional `correlation_id`. The adapter validates the envelope and delegates operator behavior to the shared command service.
+The initial closed command set is `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, and `resolve_merge`. Unknown command types fail schema validation. Every command is a side effect and requires `expected_revision` plus `idempotency_key`; `correlation_id` is optional.
 
-The process exposes random 128-bit hexadecimal `instance_id`, `command_id`, and generated correlation IDs. `state_revision` and `event_sequence` are process-local `u64` counters. The latest 1000 events, 1000 logs, 1000 idempotency records, and 1000 command records are retained in memory; completed command/idempotency records expire after 24 hours or process exit. A sequence gap requires full resynchronization through `GET /api/v2/state`.
+The process exposes random 128-bit hexadecimal `instance_id`, `command_id`, and generated correlation IDs. Caller correlation IDs are opaque 1-64 character ASCII values matching `[A-Za-z0-9._:-]+`; they are never authorization, lookup, uniqueness, or idempotency inputs.
 
-Add bearer-token configuration through `WebConfig` and every CLI scope that currently exposes `--web`, `--web-bind`, and `--web-port`, using `--web-auth-token` or `--web-auth-token-env`. Non-loopback binding without a token is rejected before listening. `/api/v2/health` remains unauthenticated; when auth is configured, all other v2 HTTP, SSE, and WebSocket paths require bearer auth. V2 defaults to same-origin CORS rather than wildcard CORS.
+One process-local projection actor owns the coherent snapshot, `state_revision`, `event_sequence`, and event/log rings. It serializes command admission and EventSink projection. Under one projection transaction it applies a state-affecting update, increments revision once only when the snapshot changes, allocates the next event sequence, attaches the resulting revision, and appends the event. Observational log events retain the current revision and receive only a new event sequence.
+
+The latest 1000 events and logs are retained. Command and idempotency registries each admit at most 1000 records. Expired or oldest completed records may be evicted, but in-progress records never are. Admission atomically reserves both records before service execution; if capacity cannot be freed without evicting in-progress work, the server returns `503 registry_capacity` and performs no side effect. Completed records expire after 24 hours or process exit. A sequence gap requires full resynchronization through `GET /api/v2/state`.
+
+Idempotency compares the structurally normalized typed tuple `(type, target, params-with-schema-defaults-applied, expected_revision)`. JSON member order and insignificant whitespace are irrelevant; `idempotency_key` and `correlation_id` are excluded. Idempotency lookup occurs before current-revision validation so an exact replay returns its original record even after state advances. A new key is admitted only after its expected revision matches; the shared service still revalidates lifecycle and target eligibility immediately before effects.
+
+Add bearer-token configuration through `WebConfig` and every CLI scope that currently exposes `--web`, `--web-bind`, and `--web-port`, using mutually exclusive `--web-auth-token` or `--web-auth-token-env`. Environment lookup is recommended because literal CLI values may be visible in process inspection. Non-loopback binding without a resolved non-empty token is rejected before listening. `/api/v2/health` remains unauthenticated; all other v2 paths require `Authorization: Bearer` whenever auth is configured.
+
+Browser consumers use `fetch()` with the Authorization header to consume SSE response streaming; native `EventSource` is not a supported authenticated v2 client. V2 WebSocket requires an Authorization header during upgrade and is therefore for non-browser clients; query-string and WebSocket-subprotocol tokens are rejected. The existing browser dashboard remains on the compatible legacy `/ws` path.
+
+V2 allows requests without `Origin`, actual same-origin requests, and optionally configured exact origins. Same-origin compares the parsed Origin scheme/host/port to the server's direct request origin. Reverse proxies that change the externally visible scheme or authority must configure an exact allowed origin; forwarded headers are not trusted for CORS. Wildcards are forbidden. `WebConfig` and the same web-enabled CLI scopes expose repeatable `--web-allowed-origin <origin>` values.
 
 ## Acceptance Criteria
 
-1. A client can discover capabilities and instance incarnation, fetch a coherent full snapshot, submit commands, query command status, and consume ordered SSE or WebSocket events.
+1. A client can discover capabilities and instance incarnation, fetch a coherent full snapshot, submit a closed-set command, query command status, and consume ordered SSE or WebSocket events through the documented client-specific authentication transport.
 2. API commands use the shared operator command service; v2 contains no independent workflow state machine.
-3. `expected_revision` prevents stale destructive or lifecycle-sensitive operations, and the response identifies current revision for resync.
-4. Reusing an idempotency key with the same canonical command returns the original result/status; reusing it with different content returns conflict without execution.
-5. Event and log retention are bounded at 1000 entries; clients can detect sequence gaps and recover through a full state snapshot.
-6. Non-loopback startup without bearer authentication fails; health remains public; protected HTTP/SSE/WebSocket access enforces bearer authentication.
-7. V2 CORS is same-origin by default and does not use wildcard `Any`.
-8. Existing legacy monitoring routes, legacy `/ws`, dashboard, and multi-project `/api/v1` remain compatible.
-9. Error status mapping is stable: `200` completed/no-op, `202` accepted asynchronous command, `401/403` auth, `404` missing resource, `409` revision/lifecycle/eligibility/busy conflict, and `422` schema validation.
+3. Every command requires `expected_revision`; stale new commands fail before service invocation, while exact idempotent replay returns the original command record.
+4. Idempotency is based on normalized typed intent, reserves records before effects, never evicts in-progress work, and never repeats a side effect after capacity pressure.
+5. Snapshot revision, event sequence, snapshot mutation, and event append are serialized through one projection owner; clients detect gaps and recover through a full snapshot.
+6. Non-loopback startup without bearer authentication fails; health remains public; protected HTTP, fetch-streamed SSE, and non-browser WebSocket access enforce bearer authentication without URL/subprotocol token leakage.
+7. V2 CORS is same-origin by default, supports only explicit exact additional origins, and never trusts wildcard or forwarded-header origin expansion.
+8. Structured errors include a stable `error_code`, message, correlation ID, and current revision when applicable.
+9. Existing legacy monitoring routes, legacy `/ws`, dashboard, and multi-project `/api/v1` remain compatible.
 
 ## Explicit Completion Conditions
 
-- Typed v2 request/response DTOs and generated OpenAPI coverage exist for all listed resources.
+- Typed v2 request/response DTOs and generated OpenAPI coverage exist for all listed resources and the closed command set.
 - The v2 router is mounted only in single-instance web monitoring and is not merged into server-mode project API routing.
-- Repository-local tests cover health, protected endpoints, loopback/no-auth, non-loopback startup rejection, malformed/unauthorized WebSocket and SSE access, revision conflict, idempotency replay/conflict/eviction, async command status, event replay/gap, bounded logs, and legacy route compatibility.
-- CLI parser/config tests cover token literal/env precedence and all current web-enabled command scopes.
-- `cargo test remote_control_api`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, generated OpenAPI checks, and strict OpenSpec validation pass.
+- Repository-local tests cover zero-match-resistant verification, health, protected endpoints, loopback/no-auth, non-loopback startup rejection, browser fetch SSE, rejected native EventSource assumptions, authorized/unauthorized WebSocket upgrade, query/subprotocol token rejection, revision conflict, typed error codes, structural idempotency, replay ordering, in-progress capacity pressure, atomic projection, event replay/gap, bounded logs, exact-origin CORS, and legacy compatibility.
+- CLI parser/config tests cover mutually exclusive token sources, literal-token warning/documentation, repeatable exact origins, and every current web-enabled command scope.
+- The verification first proves at least one matching test exists, then runs filtered tests; `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, generated OpenAPI checks, and strict OpenSpec validation also pass.
 
 ## Dependencies
 
@@ -89,6 +99,7 @@ Consumes the base-integrated shared command types/service and lifecycle outcomes
 
 - Multi-project server API changes.
 - Durable command/event/idempotency storage across process restart.
-- Dashboard redesign or a new external client application.
+- Dashboard migration to v2 or a new external client application.
+- Browser-native authenticated WebSocket or native EventSource support.
 - Worktree mutation endpoints, which are added separately.
-- TLS termination, user accounts, OAuth, or distributed leases.
+- TLS termination, user accounts, OAuth, one-time connection tickets, or distributed leases.
