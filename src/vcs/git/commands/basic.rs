@@ -187,12 +187,18 @@ pub async fn get_ref_revision<P: AsRef<Path>>(cwd: P, reference: &str) -> VcsRes
 /// Get the current branch name.
 /// Returns None if in detached HEAD state.
 pub async fn get_current_branch<P: AsRef<Path>>(cwd: P) -> VcsResult<Option<String>> {
-    let branch = run_git(&["rev-parse", "--abbrev-ref", "HEAD"], cwd).await?;
-    if branch == "HEAD" {
+    let cwd = cwd.as_ref();
+    match run_git(&["rev-parse", "--abbrev-ref", "HEAD"], cwd).await {
         // Detached HEAD state
-        Ok(None)
-    } else {
-        Ok(Some(branch))
+        Ok(branch) if branch == "HEAD" => Ok(None),
+        Ok(branch) => Ok(Some(branch)),
+        // An unborn HEAD (freshly initialized repository with no commits) still has
+        // an attached branch, but `rev-parse` cannot resolve it. Fall back to the
+        // symbolic ref so callers see the branch name instead of a git failure.
+        Err(err) => match run_git(&["symbolic-ref", "--short", "HEAD"], cwd).await {
+            Ok(branch) if !branch.is_empty() => Ok(Some(branch)),
+            _ => Err(err),
+        },
     }
 }
 
