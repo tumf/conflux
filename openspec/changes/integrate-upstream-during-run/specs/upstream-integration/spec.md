@@ -2,9 +2,9 @@
 
 ### Requirement: Upstream integration is an opt-in run-mode capability
 
-Conflux MUST preserve existing run behavior unless cumulative parallel `cflx run` is explicitly invoked with `-u` or `--integrate-upstream`. The two option names MUST be exact aliases, MUST select remote `origin` when no value is provided, and MUST select the provided remote when a value is supplied.
+Conflux MUST preserve existing run behavior unless cumulative parallel `cflx run` is explicitly invoked with `-u` or `--integrate-upstream`. The value-less option names MUST be exact aliases selecting remote `origin` and MUST NOT consume following positional change IDs. A named remote MUST be accepted only as `--integrate-upstream=<remote>` with `=` required; `-u <remote>` MUST NOT be supported.
 
-Enabling upstream integration MUST require an explicit complete verification command and MUST own the final verified cumulative-base push to the selected remote's same-name branch. Conflux MUST reject unsupported or incomplete invocation combinations before mutating the workspace, including a starting base containing local-only commits that would publish unrelated pre-run history. The option MUST NOT silently enable upstream integration in serial mode, TUI, server mode, per-change pre-sync, or `PushToRemote` workflows.
+Enabling upstream integration MUST require an explicit complete verification command and MUST own the final verified cumulative-base push to the selected remote's same-name branch. Conflux MUST reject unsupported or incomplete invocation combinations before mutating the workspace, including a starting base containing unrelated local-only commits after the real run's initial fetch; valid trailer-identified Conflux upstream commits MUST enter recovery instead of being rejected. The option MUST NOT silently enable upstream integration in serial mode, TUI, server mode, per-change pre-sync, or `PushToRemote` workflows.
 
 #### Scenario: option is absent
 
@@ -18,7 +18,8 @@ Enabling upstream integration MUST require an explicit complete verification com
 **Given**: one invocation uses `-u` and another uses `--integrate-upstream`
 **When**: neither invocation supplies a remote value
 **Then**: both produce identical enabled runtime configuration for remote `origin`
-**And**: `-u <remote>` and `--integrate-upstream=<remote>` produce identical configuration for the same explicit remote
+**And**: a named remote is accepted only as `--integrate-upstream=<remote>`
+**And**: `-u` does not consume a following change ID as a remote value
 
 #### Scenario: invalid invocation fails before mutation
 
@@ -31,7 +32,8 @@ Enabling upstream integration MUST require an explicit complete verification com
 
 **Given**: upstream integration options are valid
 **When**: the user requests parallel dry-run
-**Then**: Conflux validates static option compatibility and locally resolvable remote/base identity
+**Then**: Conflux validates static option compatibility, selected remote configuration, attached HEAD, repository type, base cleanliness, and non-empty verification command
+**And**: it defers remote branch existence and fetched ancestry validation to the real run's initial fetch
 **And**: it performs no network fetch, merge, resolve command, verification command, or push
 
 ### Requirement: Running cumulative base integrates upstream changes at base-lane safe points
@@ -55,9 +57,10 @@ The safe point MUST require a clean cumulative base and exclusive base-lane owne
 **And**: the freshly fetched remote revision is not an ancestor of cumulative local HEAD
 **When**: Conflux integrates the revision
 **Then**: Conflux itself runs a non-fast-forward merge of the fetched SHA
+**And**: the merge commit records `Cflx-Upstream-Merge: <fetched-sha>` for restart identification and SHA recovery
 **And**: this rule applies to both strictly remote-ahead and diverged histories
 **And**: it does not rebase, fast-forward, reset, amend, or force-push accepted history
-**And**: completed change-worktree results do not enter base until integration and reverification finish
+**And**: completed change-worktree results remain queued and enter base only after integration and reverification finish
 
 #### Scenario: unsafe base lane performs no checkpoint side effect
 
@@ -118,7 +121,7 @@ Conflux, not the agent, MUST own retry limits and convergence decisions. Resolut
 
 ### Requirement: Every upstream tree change passes explicit full reverification
 
-When opt-in upstream integration changes the cumulative base tree, Conflux MUST run the command supplied by `--upstream-verify-command` from the cumulative base root before base integration or push may continue. This applies to conflict-free and agent-repaired merges. Disabled, dry-run, and ancestry-proven no-op paths MUST NOT run the command.
+When opt-in upstream integration changes the cumulative base tree, Conflux MUST run the command supplied by `--upstream-verify-command` from the cumulative base root before base integration may continue. This applies to conflict-free and agent-repaired merges. Independently, every opted-in run MUST execute the complete command against final cumulative HEAD immediately before push, including ancestry-proven upstream no-op runs. Disabled and dry-run paths MUST NOT run it.
 
 A failed verification MAY enter bounded semantic repair through `resolve_command`, but every repair attempt MUST be followed by a successful rerun of the complete verification command. Narrative output, events, logs, or external status MUST NOT substitute for the command result.
 
@@ -132,19 +135,31 @@ A failed verification MAY enter bounded semantic repair through `resolve_command
 
 #### Scenario: restart deliberately reruns verification
 
-**Given**: an upstream merge commit is reachable from cumulative HEAD but is not yet incorporated into the selected remote base
+**Given**: a merge commit carrying a valid `Cflx-Upstream-Merge: <fetched-sha>` trailer is reachable from cumulative HEAD but is not yet incorporated into the selected remote base
 **When**: Conflux restarts or explicitly retries
 **Then**: it treats prior verification completion as unproven
-**And**: it reruns the complete verification command
+**And**: it recovers the fetched SHA from the trailer and validates ancestry
+**And**: it reruns the newly supplied complete verification command
 **And**: surviving or deleted runtime journals, events, or logs do not change that decision
+
+### Requirement: Unfinished upstream recovery blocks option-less continuation
+
+When a trailer-identified Conflux upstream merge is reachable from cumulative HEAD and not incorporated into its selected remote branch, a cumulative parallel run invoked without `-u`/`--integrate-upstream` MUST refuse to continue. The diagnostic MUST require the same selected remote and a newly supplied complete verification command. No external state may supply the previous command or establish completion.
+
+#### Scenario: operator omits upstream option after a crash
+
+**Given**: cumulative HEAD contains an unpushed trailer-identified upstream merge
+**When**: the operator starts cumulative parallel run without upstream integration
+**Then**: Conflux refuses to dispatch, integrate, verify, or push more work
+**And**: it instructs the operator to restart with the trailer-associated remote and an explicit verification command
 
 ### Requirement: Opted-in run completes with a native cumulative-base push
 
-After all selected changes are integrated and the cumulative base passes full verification, `-u`/`--integrate-upstream` MUST make Conflux perform one final push to the selected remote's same-name base branch. No additional push option is required. Fetch, merge, verification, and push MUST execute as native Conflux operations outside the AI command harness, and the push MUST remain non-force.
+After all selected changes are integrated and final cumulative HEAD passes a full verification executed immediately before push, `-u`/`--integrate-upstream` MUST make Conflux perform one final push to the selected remote's same-name base branch. No additional push option is required. Fetch, merge, verification, and push MUST execute as native Conflux operations outside the AI command harness, and the push MUST remain non-force.
 
 Immediately before push, Conflux MUST fetch the selected remote again and verify that its latest same-name branch revision is an ancestor of cumulative local HEAD. If the remote advances before the check, Conflux MUST suppress push and return to integration. If it advances between check and push, Conflux MUST return the non-fast-forward rejection to integration/reverification.
 
-For other push failures, Conflux MUST classify whether repository repair is possible before invoking `resolve_command`. Credential, authorization, transport, remote-service, protected-branch policy, and opaque hook rejection MUST fail without agent invocation. A repair agent MUST NOT execute push, alter credentials, bypass policy/hooks, or establish push success. After repository repair, Conflux MUST rerun convergence checks, complete verification, fresh fetch, and the native non-force push. Push completion MUST be confirmed by observing the pushed local HEAD reachable from the selected remote branch.
+Push MUST use `git push --porcelain`. Conflux MUST classify routing only from machine-readable per-ref status and post-failure `git status --porcelain=v2`: non-fast-forward/fetch-first/stale-info is a race, tracked mutation or unmerged entries is repairable, and every other failure stalls without agent invocation. Human-readable stderr MUST NOT control routing. A repair agent MUST NOT execute push, alter credentials, bypass policy/hooks, or establish push success. After repository repair, Conflux MUST rerun convergence checks, complete verification, fresh fetch, and the native non-force push. Push completion MUST be confirmed through `git ls-remote`: pushed local HEAD MUST equal the observed remote SHA or, after a further remote advance and fresh fetch, be its ancestor. A run MAY make multiple failed race attempts but MUST record at most one successful push and MUST NOT retry after confirmed success.
 
 #### Scenario: successful run performs final push
 
@@ -158,9 +173,10 @@ For other push failures, Conflux MUST classify whether repository repair is poss
 
 #### Scenario: pre-existing local history is not published
 
-**Given**: starting local base contains a commit not reachable from the freshly observed selected remote base
+**Given**: after initial fetch, starting local base contains a commit not reachable from the selected remote base
 **When**: Conflux validates an opted-in invocation
-**Then**: it rejects the run before workspace mutation
+**Then**: it rejects the run before merge/worktree mutation if any such commit lacks a valid Conflux upstream trailer
+**And**: it enters restart recovery instead when every local-only commit is valid trailer-identified Conflux evidence
 **And**: it does not push unrelated local history
 
 #### Scenario: remote advances before push eligibility
@@ -181,14 +197,16 @@ For other push failures, Conflux MUST classify whether repository repair is poss
 
 #### Scenario: non-repairable push failure does not invoke an agent
 
-**Given**: native push fails because of credentials, authorization, transport, remote-service availability, protected-branch policy, or an opaque hook rejection
+**Given**: native porcelain push fails without a race per-ref status
+**And**: post-failure porcelain-v2 status shows no tracked mutation or unmerged entries
 **When**: Conflux classifies the failure
 **Then**: it reports a stalled push outcome with sanitized diagnostics
-**And**: it does not invoke `resolve_command`
+**And**: it does not inspect stderr text for routing or invoke `resolve_command`
 
 #### Scenario: repository-repairable push failure returns to agent then native push
 
-**Given**: native push fails with repository evidence that the bounded repair path can change safely
+**Given**: native porcelain push fails without a race per-ref status
+**And**: post-failure porcelain-v2 status shows tracked mutation or unmerged entries
 **When**: Conflux invokes `resolve_command`
 **Then**: the agent receives sanitized push and repository context but does not execute push
 **And**: Conflux verifies convergence and reruns the complete verification command after repair

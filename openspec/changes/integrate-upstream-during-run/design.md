@@ -29,12 +29,11 @@ A long-running cumulative base is therefore a second integration stream alongsid
 
 ```text
 cflx run --all --parallel -u --upstream-verify-command "cargo test"
-cflx run --all --parallel -u upstream --upstream-verify-command "cargo test"
 cflx run --all --parallel --integrate-upstream --upstream-verify-command "cargo test"
 cflx run --all --parallel --integrate-upstream=upstream --upstream-verify-command "cargo test"
 ```
 
-`-u` is the exact short alias of `--integrate-upstream`. The option accepts zero or one value and uses `origin` when no remote is supplied. The remote branch is the selected remote's branch with the same name as the checked-out cumulative base branch.
+`-u` and value-less `--integrate-upstream` are flags selecting `origin`; neither consumes a following positional change ID. A named remote is accepted only as `--integrate-upstream=<remote>` with `=` required. The remote branch is the selected remote's branch with the same name as the checked-out cumulative base branch.
 
 The option is stored as invocation-scoped runtime configuration and propagated from `RunArgs` through `main`, `Orchestrator`, `ParallelRunService`, and `ParallelExecutor`. It is not added to persistent orchestration config in this change.
 
@@ -42,13 +41,13 @@ Startup validation rejects before workspace mutation:
 
 - non-parallel effective execution;
 - detached HEAD;
-- missing selected remote or same-name remote branch;
-- any commit reachable from starting local base HEAD but not from the freshly observed selected remote base, because `-u` must not push unrelated pre-run local history;
+- missing selected remote configuration before network access or missing same-name remote branch after the initial fetch;
+- any commit reachable from starting local base HEAD but not from the initial-fetch remote SHA unless every such commit is a Conflux upstream merge carrying a valid `Cflx-Upstream-Merge: <fetched-sha>` trailer;
 - missing or empty `--upstream-verify-command`;
 - combination with `--push`, because that path pushes individual completed change branches instead of maintaining the cumulative base;
 - non-Git VCS resolution.
 
-Dry-run validates static option compatibility and locally resolvable remote/base identity but performs no network fetch or workspace mutation.
+Dry-run validates static option compatibility, selected remote configuration, non-empty verification command, repository type, attached HEAD, and local base cleanliness. It performs no network fetch or workspace mutation, so remote branch existence and initial-fetch ancestry are intentionally deferred to a real run.
 
 ## Decisions
 
@@ -71,13 +70,13 @@ Conflux owns retry limits and decides whether the repair converged. Agent narrat
 
 The checkpoint starts only when the cumulative base is clean and the project base lane has no active archive integration, merge, resolve, or rejection review. It pauses new base integrations and dispatch decisions that require changed base evidence.
 
-Apply and acceptance commands already running in independent change worktrees may continue. Their successful results wait for the base lane; they cannot merge into the cumulative base until upstream integration and verification finish. Stale completion events cannot release checkpoint ownership.
+Apply and acceptance commands already running in independent change worktrees may continue. Their successful results remain queued and merge into the cumulative base after the checkpoint releases the lane; they are not discarded. Stale completion events cannot release checkpoint ownership.
 
 ### Decision: every upstream change uses a non-fast-forward merge
 
 A fetched revision already contained in local base is a no-op. Any fetched revision not contained in local base, including a strictly remote-ahead revision, is integrated with `git merge --no-ff <fetched-sha>`.
 
-The merge commit provides repository-visible evidence that an upstream checkpoint changed cumulative history. Rebase, fast-forward integration, reset, amend, and force push are prohibited on the new path.
+The merge commit provides repository-visible evidence that an upstream checkpoint changed cumulative history and MUST include the trailer `Cflx-Upstream-Merge: <fetched-sha>`. Restart identification, fetched-SHA recovery, and ancestry validation use this trailer plus Git ancestry; a trailer-less merge is never classified as a Conflux upstream merge. Rebase, fast-forward integration, reset, amend, and force push are prohibited on the new path.
 
 ### Decision: merge classification comes from repository state
 
@@ -102,30 +101,31 @@ Success requires no unmerged entries, no unfinished merge, and the fetched SHA a
 
 ### Decision: explicit full verification is mandatory after tree change
 
-`--upstream-verify-command` supplies the complete repository gate and runs from the cumulative base root after every actual upstream tree change. It runs after conflict-free and agent-repaired merges, but not for disabled or ancestry-proven no-op paths.
+`--upstream-verify-command` supplies the complete repository gate and runs from the cumulative base root after every actual upstream tree change. It runs after conflict-free and agent-repaired merges. In addition, every opted-in run executes the complete command unconditionally against final cumulative HEAD immediately before push, including ancestry-proven upstream no-op runs. Disabled and dry-run paths execute none.
 
 A non-zero result blocks dispatch requiring new base evidence, base integration, and cumulative-base push. When repair is allowed, `resolve_command` may attempt a bounded semantic repair, followed by a mandatory rerun of the complete command.
 
 ### Decision: restart deliberately reruns verification
 
-Ordinary command success does not create Constitution-compatible durable evidence. Therefore, after process restart, any upstream merge commit reachable from cumulative HEAD but not yet incorporated into the selected remote base is treated as unverified and executes the full verification command again.
+Ordinary command success does not create Constitution-compatible durable evidence. Therefore, after process restart, any valid trailer-identified upstream merge commit reachable from cumulative HEAD but not yet incorporated into the selected remote base is treated as unverified and executes the newly supplied full verification command again.
 
-Runtime events, logs, TUI projections, or external journals cannot suppress this rerun. Extra verification is preferred to accepting an unverifiable completion claim.
+If such evidence exists and cumulative parallel run is invoked without `-u`, startup refuses to continue and requires the operator to select the same remote and supply a verification command. The prior command value is not recovered from external state. Runtime events, logs, TUI projections, or external journals cannot suppress this rerun.
 
 ### Decision: `-u` owns one final native cumulative-base push
 
-A successful opted-in run is incomplete until Conflux pushes verified cumulative HEAD to the selected remote's same-name base branch. No second push option is required. To prevent accidental publication of unrelated work, startup rejects any local-only commit already present before the run begins.
+A successful opted-in run is incomplete until Conflux pushes verified cumulative HEAD to the selected remote's same-name base branch. No second push option is required. After the initial fetch, startup rejects local-only commits not identifiable as Conflux upstream recovery commits; valid trailer-identified Conflux commits enter restart recovery instead.
 
 Fetch, merge, verification command execution, and push are native Conflux operations and do not run through `AgentRunner`, `AiCommandRunner`, or an AI command template. Immediately before final push, Conflux fetches again and checks that the latest selected remote SHA is an ancestor of cumulative HEAD. If not, push is suppressed and integration restarts.
 
-The actual push remains non-force. If the remote advances between check and push and Git rejects the push, Conflux returns directly to fetch/integration. For another push failure, Conflux classifies evidence before agent handoff:
+The actual push remains non-force and uses `git push --porcelain`. Classification uses only machine-readable per-ref status and post-failure `git status --porcelain=v2`:
 
-- repository-repairable state, such as rejected local history after an upstream race or a hook that leaves tracked repository changes requiring repair, MAY invoke the existing bounded `resolve_command` with sanitized push diagnostics;
-- credentials, authorization, transport, DNS, remote-service availability, protected-branch policy, and opaque hook rejection are not repository-repairable and MUST fail directly without agent invocation;
+- per-ref non-fast-forward/fetch-first/stale-info status is a race and returns directly to fetch/integration;
+- tracked worktree mutation or unmerged entries after failure is repository-repairable and MAY invoke bounded `resolve_command` with sanitized diagnostics;
+- every other failure stalls without an agent; stderr text is never routing input;
 - the agent MUST NOT execute `git push`, alter credentials, bypass hooks, or claim push success;
 - after agent repair, Conflux MUST recheck repository convergence, rerun full verification, fresh-fetch, and execute the non-force push itself.
 
-Retry exhaustion stalls with repository evidence intact. Push success is established only by native command success plus a fresh remote-ref observation showing pushed local HEAD reachable from the selected remote branch.
+Race handling may produce multiple failed push attempts, but a run may record at most one successful push and must never retry after confirmed success. Confirmation uses `git ls-remote` network observation: completion requires pushed HEAD equal to the observed remote SHA, or after a further remote advance, pushed HEAD to be an ancestor of the freshly fetched observed SHA. Otherwise control returns to fetching.
 
 ## State Flow
 
