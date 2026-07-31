@@ -14,6 +14,7 @@ The local TUI uses the same parallel executor for change work but keeps a persis
 - Keep one Conflux-owned base lane through merge, verification, push, and remote confirmation.
 - Permit other worktrees to continue independent apply/acceptance while later base integration waits.
 - Preserve all existing native-operation, bounded-repair, non-force, and repository-evidence safety rules.
+- Make opted-in publication intent and incomplete publication derivable after process loss from Git evidence.
 - Support multiple successive publication cycles in one persistent TUI process.
 
 ### Non-Goals
@@ -59,11 +60,19 @@ With upstream integration, local merge completion must not commit the reducer to
 
 A new `synced` state is unnecessary and would duplicate the existing final-status, retry-exclusion, TUI, WebSocket, and API taxonomy already built around `pushed`.
 
+### Decision: publication intent is durable Git evidence
+
+Before an opted-in archived result becomes publication-pending on cumulative base, the integration commit records recognizable trailers binding the change ID, selected remote, and same-name base branch to required publication. This marker is distinct from the existing fetched-SHA identity on upstream merge commits: it identifies why a locally integrated change must not be recovered as ordinary terminal `merged` when no remote advance produced an upstream merge.
+
+Startup and retry compare the marked integration commit with the bound remote branch. A marked commit that is remote-reachable is confirmed publication evidence; one that is not proven remote-reachable remains unpublished. An option-less restart refuses the latter before orchestration mutation and directs the operator to restart with `-u` and a fresh verification command. This keeps routing derivable from Git and remote evidence instead of process memory.
+
+Ordinary disabled-mode merge commits carry no publication-required marker. They retain terminal `merged`; later use of `-u` may publish a cumulative HEAD containing those commits but does not retroactively change their terminal state. Zero-change recovery recognizes only explicit publication-required markers or valid existing upstream recovery trailers, never arbitrary local first-parent history.
+
 ### Decision: coordinator idempotency is revision-scoped, not run-scoped
 
 The current one-successful-push-per-run invariant becomes one-successful-push-per-cumulative-HEAD. The coordinator records the latest confirmed remote-reachable HEAD and may publish again only after cumulative HEAD advances.
 
-A repeated request for the already confirmed HEAD is an idempotent no-op. A later change that advances cumulative HEAD starts a fresh bounded publication cycle. Failed attempts remain bounded per publication cycle and never authorize force-push or duplicate success events.
+A repeated request for the already confirmed HEAD is an idempotent no-op. The in-process record is only an optimization after that HEAD was confirmed by remote observation in the same process. Restart and any ambiguous push/confirmation outcome must re-run `ls-remote` and ancestry classification; the record is never workflow authority. A later change that advances cumulative HEAD starts a fresh bounded publication cycle. Failed attempts remain bounded per publication cycle and never authorize force-push or duplicate success events.
 
 ### Decision: finite run completion and persistent TUI lifetime are projections
 
@@ -76,6 +85,8 @@ This removes final-drain push as the normal publication mechanism. A zero-change
 ### Decision: failure is resumable publication work
 
 An opted-in change whose local integration exists but publication is incomplete must not become ordinary queued apply work. The runtime exposes a visible resumable publication wait/error and reserves the base lane from later integration until retry succeeds or the operator stops the run.
+
+In persistent local TUI, exhausting the bounded publication cycle projects the owning change into the existing recoverable Error-mode interaction. F5 and the equivalent local web-control action invoke explicit retry for publication work, not apply or acceptance. The lane remains unavailable to later completed-result integration while this state is displayed; successful remote confirmation transitions the change to `pushed` and releases waiting integration. Operator stop ends orchestration without claiming publication success. No scheduler or time-based automatic retry is added.
 
 Retry re-evaluates:
 
@@ -119,8 +130,11 @@ RETRY / RESTART
 - Credential, permission, transport, hook-policy, or remote-service failure stalls without agent invocation.
 - Repository mutation or unfinished merge may use the existing bounded repair agent, but Conflux reruns convergence and verification and performs the push itself.
 - Cancellation never marks an unpublished change successful.
+- An opted-in local integration records its publication-required change/remote/branch identity in Git before process loss can leave it pending.
+- Option-less restart refuses a marked integration not proven remote-reachable and never recovers it as terminal `merged`.
 - Restart with a locally integrated unpublished change requires `-u` and a fresh verification command and resumes from repository evidence.
 - Restart after an unconfirmed push checks remote reachability before attempting another push.
+- A disabled-mode change already terminal `merged` is never retroactively promoted; zero-change recovery accepts only explicit opted-in evidence.
 
 ## Risks / Trade-offs
 

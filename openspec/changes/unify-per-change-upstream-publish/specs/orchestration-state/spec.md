@@ -8,7 +8,7 @@ Success events MAY supersede `TerminalState::Error` for the same change because 
 
 Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
 #### Scenario: disabled cumulative merge becomes merged terminal
 
@@ -41,6 +41,25 @@ A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit r
 **Then**: `alpha` does not become `Merged` or `Pushed`
 **And**: reducer-owned state exposes recoverable publication failure or wait evidence
 **And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
 
 #### Scenario: late publication success supersedes recoverable failure
 

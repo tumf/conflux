@@ -18,7 +18,7 @@ references:
   - src/events.rs
 verifications:
   - id: per-change-upstream-unit
-    requirement: Shared run/TUI option parsing, per-change publication ordering, lifecycle transitions, retry routing, and default-off compatibility are covered by repository-local tests.
+    requirement: Shared run/TUI option parsing, per-change publication ordering, durable recovery evidence, lifecycle transitions, explicit TUI retry routing, option-less restart refusal, and default-off compatibility are covered by repository-local tests.
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
@@ -87,11 +87,13 @@ The base lane remains held through local integration, verification, publication,
 
 Without `-u`, existing behavior is unchanged and successful cumulative base integration terminates the change as `merged`. With `-u`, local merge is repository progress rather than terminal success; `pushed` is the only successful terminal state for that change. User-facing `merged` MUST NOT be reported as the final outcome of an opted-in change.
 
-A failed fetch, merge, verification, push, or remote confirmation MUST leave the change in a visible resumable upstream-publication wait/error state, MUST NOT emit `PushCompleted`, and MUST NOT redispatch apply or acceptance. Explicit retry and restart MUST derive the next action from cumulative-base, archive, upstream trailers, and remote ancestry evidence, resume the unpublished change at the upstream publication boundary, and preserve the existing prohibition on force-push, rebase, reset, and amend.
+A failed fetch, merge, verification, push, or remote confirmation MUST leave the change in a visible resumable upstream-publication wait/error state, MUST NOT emit `PushCompleted`, and MUST NOT redispatch apply or acceptance. In persistent local TUI, exhaustion of the bounded publication cycle MUST enter the existing operator-visible recoverable error flow; F5 or equivalent local web-control retry MUST resume publication, retain base-lane ownership while pending, and release the lane for waiting results only after remote confirmation or operator stop. Explicit retry and restart MUST derive the next action from cumulative-base, archive, durable publication-intent trailers, and remote ancestry evidence, resume the unpublished change at the upstream publication boundary, and preserve the existing prohibition on force-push, rebase, reset, and amend.
+
+Before an opted-in archived result can be treated as locally integrated, its cumulative-base integration commit MUST record repository-visible Git identity that binds the change, selected remote, and base branch to required publication. Remote reachability of that marked integration determines whether publication is complete after process loss. An option-less restart that finds a marked integration not proven reachable from its bound remote branch MUST fail before orchestration mutation and MUST NOT reclassify the change as terminal `merged`; recovery requires `-u` and a fresh verification command.
 
 The run frontend exits successfully only after every targeted successful change is `pushed`. The local TUI remains active after each change becomes `pushed` and may accept more queue work; each later completion starts another publication cycle through the same shared service. `AllCompleted` for an opted-in finite run is emitted only after all targeted changes are remotely confirmed. A persistent TUI does not require scheduler drain to publish a completed change.
 
-Fresh zero-change invocations preserve current no-work behavior. Repository-recognized unpublished recovery history may still be verified and published without manufacturing a synthetic change terminal event.
+Fresh zero-change invocations preserve current no-work behavior. Zero-change recovery recognizes only repository-visible integration evidence that explicitly records required upstream publication; it may verify and publish that cumulative history without manufacturing a synthetic change terminal event. A change that previously reached terminal `merged` without opted-in publication is not retroactively promoted to `pushed`, although a later cumulative publication may naturally contain its commits.
 
 ## Acceptance Criteria
 
@@ -100,24 +102,27 @@ Fresh zero-change invocations preserve current no-work behavior. Repository-reco
 3. With `-u`, each accepted and archived change is integrated, verified, natively pushed, and remotely confirmed before that change reaches successful terminal state.
 4. With `-u`, successful change terminal state and display status are `pushed`, not `merged`; `PushCompleted` is emitted only after `git ls-remote` confirmation.
 5. Without `-u`, cumulative parallel changes retain the existing `merged` terminal state and no new fetch, verification, push, or upstream event occurs.
-6. Multiple completed changes may apply and accept concurrently, but their base integration and publication cycles are serialized; a later result does not enter base until the prior result is remotely confirmed or explicitly stalled.
-7. A persistent TUI publishes each completed change without waiting for scheduler drain, remains usable after publication, and can publish later queued changes through fresh publication cycles.
+6. Multiple completed changes may apply and accept concurrently, but their base integration and publication cycles are serialized; a failed or stalled prior publication keeps later results before base integration until explicit retry confirms it or the operator stops orchestration.
+7. A persistent TUI publishes each completed change without waiting for scheduler drain, remains usable after publication, exposes exhausted publication failure through its existing F5/local-web explicit retry flow, and can publish later queued changes through fresh publication cycles.
 8. A finite run emits `AllCompleted` and exits successfully only after every targeted successful change reaches `pushed`; blocked, stalled, failed, or cancelled publication never reports completion.
-9. A publication failure remains visible and resumable, does not regress to ordinary apply work, and retry/restart resumes from repository evidence without duplicate local integration or duplicate confirmed success.
-10. Remote races return to bounded fetch/integration/reverification; repository-repairable failures use the existing bounded repair path; credential, permission, transport, hook-policy, and remote-service failures stall without agent speculation.
-11. Every confirmed publication remains native, non-force, and Conflux-owned; an agent never pushes or establishes remote success.
-12. Unit and real-Git E2E tests prove run/TUI parity, per-change push count and ordering, terminal-state behavior, default-off compatibility, failure suppression, retry, and remote confirmation.
+9. An opted-in local integration records durable Git evidence binding change, remote, and branch before it may become publication-pending; option-less restart refuses marked unpublished history instead of reporting terminal `merged`.
+10. A publication failure remains visible and resumable, does not regress to ordinary apply work, and retry/restart resumes from repository and remote evidence without duplicate local integration or duplicate confirmed success; in-memory confirmed-HEAD state is only an optimization after remote-observed confirmation.
+11. Zero-change recovery recognizes only explicit opted-in publication evidence, and disabled-mode terminal `merged` changes are not retroactively promoted to `pushed`.
+12. Remote races return to bounded fetch/integration/reverification; repository-repairable failures use the existing bounded repair path; credential, permission, transport, hook-policy, and remote-service failures stall without agent speculation.
+13. Every confirmed publication remains native, non-force, and Conflux-owned; an agent never pushes or establishes remote success.
+14. Unit and real-Git E2E tests prove run/TUI parity, per-change push count and ordering, durable crash recovery identity, option-less restart refusal, terminal-state behavior, default-off compatibility, operator-visible TUI retry, lane blocking/release, failure suppression, idempotent recovery, and remote confirmation.
 
 ## Explicit Completion Conditions
 
 - CLI parsing and startup validation cover top-level TUI, explicit `tui`, and `run` upstream options with one normalized runtime configuration and no support in remote-client TUI or server mode.
 - TUI startup passes optional upstream configuration into the same parallel execution builder/service used by `run`; no TUI-specific fetch, verification, push, or confirmation implementation exists.
-- The upstream coordinator exposes a reusable change-scoped publication operation that can confirm more than one successive cumulative HEAD per process while remaining idempotent for an already confirmed HEAD.
-- Post-archive base-lane handling does not finalize an opted-in change at local merge; it runs `on_merged`, verification, fresh remote reconciliation, native push, and remote confirmation before emitting change-scoped successful completion.
-- Reducer and frontend projections represent opted-in confirmed publication as `pushed`, prevent a local `merged` observation from becoming the final opted-in outcome, and preserve `merged` for disabled mode.
-- Failure and retry wiring preserves unpublished repository evidence, exposes a resumable state, prevents ordinary apply redispatch, and resumes publication without rewriting history or duplicating confirmed success.
-- Scheduler tests prove other worktrees may continue apply/acceptance while base integration waits, only one publication owns the base lane, and TUI publication does not depend on finite drain.
-- Real-Git E2E tests use local bare remotes to prove one and multiple change publications, remote advance/race handling, failed verification and push suppression, restart recovery, run completion ordering, and repeated TUI publication cycles.
+- The upstream coordinator exposes a reusable change-scoped publication operation that can confirm more than one successive cumulative HEAD per process while remaining idempotent for an already remote-confirmed HEAD; restart and ambiguous outcomes always re-observe remote ancestry.
+- Post-archive base-lane handling records durable publication identity before treating an opted-in result as locally integrated, does not finalize it at local merge, and runs `on_merged`, verification, fresh remote reconciliation, native push, and remote confirmation before emitting change-scoped successful completion.
+- Reducer and frontend projections represent opted-in confirmed publication as `pushed`, prevent a local or recovered `merged` observation from becoming the final opted-in outcome, preserve `merged` for disabled mode, and route exhausted TUI publication failure through existing explicit retry controls.
+- Failure and retry wiring preserves unpublished repository evidence, exposes a resumable state, prevents ordinary apply redispatch, keeps later base integration blocked, and resumes publication without rewriting history or duplicating confirmed success.
+- Startup and recovery tests prove option-less restart refuses marked unpublished integration, enabled restart resumes it with fresh verification, zero-change recovery requires explicit opted-in evidence, and disabled-mode `merged` is not retroactively promoted.
+- Scheduler tests prove other worktrees may continue apply/acceptance while base integration waits, only one publication owns the base lane, TUI F5/local-web retry resumes publication, lane release follows confirmation or operator stop, and TUI publication does not depend on finite drain.
+- Real-Git E2E tests use local bare remotes to prove durable opted-in integration identity, one and multiple change publications, remote advance/race handling, failed verification and push suppression, option-less refusal, enabled restart recovery, run completion ordering, and repeated TUI publication cycles.
 - `cargo test per_change_upstream`, `cargo test upstream_integration`, `cargo test --features heavy-tests --test e2e_git_worktree_tests per_change_upstream`, `cargo fmt --check`, and `cargo clippy --all-targets --all-features -- -D warnings` pass.
 
 ## Out of Scope

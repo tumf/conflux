@@ -44,7 +44,7 @@ Enabling upstream integration MUST require an explicit complete verification com
 
 When opt-in upstream integration is enabled, cumulative parallel Conflux orchestration MUST refresh and reconcile the selected remote branch with the same name as the checked-out cumulative base branch at deterministic project base-lane checkpoints: before first worktree dispatch, immediately before each completed result enters base, immediately before publishing that result, after a fresh pre-push fetch observes remote advance, and after race-time non-fast-forward push rejection. A persistent local TUI MUST use these boundaries without waiting for scheduler drain. Conflux MUST remain the sole writer and MUST perform ordinary fetch, ancestry classification, merge, push, and confirmation itself; an external supervisor, frontend, or AI agent MUST NOT select or perform that ordinary integration workflow.
 
-The safe point MUST require a clean cumulative base and exclusive base-lane ownership. Independent apply and acceptance commands in change worktrees MAY continue, but completed results MUST enter and publish from cumulative base one at a time. A later result MUST NOT enter cumulative base until the prior integrated result is remotely confirmed or explicitly stalled. Scheduler-loop polling and time-based polling MUST NOT be introduced. The authoritative routing decision MUST be derivable from workspace files, Git state, fetched refs, remote observation, and base-tree comparison.
+The safe point MUST require a clean cumulative base and exclusive base-lane ownership. Independent apply and acceptance commands in change worktrees MAY continue, but completed results MUST enter and publish from cumulative base one at a time. A later result MUST NOT enter cumulative base until the prior integrated result is remotely confirmed. A failed or explicitly stalled publication MUST keep the lane closed until explicit retry succeeds or the operator stops orchestration. Scheduler-loop polling and time-based polling MUST NOT be introduced. The authoritative routing decision MUST be derivable from workspace files, Git state, fetched refs, remote observation, and base-tree comparison.
 
 #### Scenario: unchanged upstream is a checkpoint no-op
 
@@ -82,6 +82,15 @@ The safe point MUST require a clean cumulative base and exclusive base-lane owne
 **Then**: only one change owns the base lane through local merge, verification, push, and remote confirmation
 **And**: the other change remains waiting before base integration
 **And**: after the first change is `pushed`, the second may start a fresh publication cycle
+
+#### Scenario: stalled publication retains ordering
+
+**Given**: change `alpha` owns the base lane and its bounded publication cycle stalls
+**And**: change `beta` is ready for cumulative-base integration
+**When**: no explicit retry has remotely confirmed `alpha`
+**Then**: `beta` remains waiting before base integration
+**And**: independent worktree apply and acceptance may continue
+**And**: only successful retry confirmation or operator stop ends `alpha`'s lane ownership
 
 ### Requirement: Every cumulative base change passes explicit full reverification
 
@@ -124,13 +133,13 @@ A failed verification MAY enter bounded semantic repair through `resolve_command
 
 ### Requirement: Opted-in run completes with a native cumulative-base push
 
-For both finite run and persistent local TUI, `-u`/`--integrate-upstream` MUST make each completed change publish its verified cumulative HEAD to the selected remote's same-name base branch before that change reaches successful terminal state. No additional push option is required. Fetch, merge, verification, push, and confirmation MUST execute as native Conflux operations outside the AI command harness, and the push MUST remain non-force.
+For both finite run and persistent local TUI, `-u`/`--integrate-upstream` MUST make each completed change publish its verified cumulative HEAD to the selected remote's same-name base branch before that change reaches successful terminal state. Before local integration can become publication-pending, its cumulative-base integration commit MUST record recognizable Git trailers binding the change ID, selected remote, and base branch to required publication. These trailers MUST distinguish opted-in unpublished integration from ordinary disabled-mode terminal `merged` history even when no upstream advance created an upstream merge commit. No additional push option is required. Fetch, merge, verification, push, and confirmation MUST execute as native Conflux operations outside the AI command harness, and the push MUST remain non-force.
 
 Immediately before each change publication, Conflux MUST fetch the selected remote and verify that its latest same-name branch revision is an ancestor of cumulative local HEAD. If the remote advances before the check, Conflux MUST suppress push and return to integration. If it advances between check and push, Conflux MUST return the non-fast-forward rejection to integration and reverification.
 
 Push MUST use `git push --porcelain`. Conflux MUST classify routing only from machine-readable per-ref status and post-failure `git status --porcelain=v2`: non-fast-forward/fetch-first/stale-info is a race, tracked mutation or unmerged entries is repairable, and every other failure stalls without agent invocation. Human-readable stderr MUST NOT control routing. A repair agent MUST NOT execute push, alter credentials, bypass policy/hooks, or establish push success. After repository repair, Conflux MUST rerun convergence checks, complete verification, fresh fetch, and the native non-force push.
 
-Push completion MUST be confirmed through `git ls-remote`: pushed local HEAD MUST equal the observed remote SHA or, after a further remote advance and fresh fetch, be its ancestor. Confirmation MUST emit change-scoped `PushCompleted` and transition that change to `pushed`. Local merge alone MUST NOT be the opted-in terminal success. A publication cycle MAY make multiple failed race attempts but MUST record at most one successful push for one cumulative HEAD and MUST NOT push an already confirmed HEAD again. Cancelled, blocked, stalled, verification-failed, push-failed, and unconfirmed outcomes MUST NOT mark the change `pushed`.
+Push completion MUST be confirmed through `git ls-remote`: pushed local HEAD MUST equal the observed remote SHA or, after a further remote advance and fresh fetch, be its ancestor. Confirmation MUST emit change-scoped `PushCompleted` and transition that change to `pushed`. Local merge alone MUST NOT be the opted-in terminal success. A publication cycle MAY make multiple failed race attempts but MUST record at most one successful push for one cumulative HEAD and MUST NOT push an already confirmed HEAD again. Any in-process confirmed-HEAD record MAY suppress a repeated request only after that same process observed remote reachability; restart and ambiguous push or confirmation outcomes MUST re-observe the remote and classify ancestry, and memory MUST NOT be routing authority. Cancelled, blocked, stalled, verification-failed, push-failed, and unconfirmed outcomes MUST NOT mark the change `pushed`.
 
 A finite run MUST emit `AllCompleted` only after every targeted successful change is remotely confirmed as `pushed`. A persistent local TUI MUST publish each completed change without scheduler drain, remain active after publication, and permit a later change to start a new publication cycle.
 
@@ -169,20 +178,40 @@ A finite run MUST emit `AllCompleted` only after every targeted successful chang
 **And**: it does not report that change or an encompassing finite run as successfully complete
 **And**: it preserves resumable publication evidence when repository state permits retry
 
+#### Scenario: option-less restart refuses marked unpublished integration
+
+**Given**: a prior opted-in invocation locally integrated change `alpha`
+**And**: its publication-required integration trailer binds a selected remote and branch
+**And**: that integration is not proven reachable from the bound remote branch
+**When**: Conflux starts cumulative parallel orchestration without `-u`
+**Then**: startup fails before orchestration mutation
+**And**: the diagnostic requires `-u` and a fresh verification command for recovery
+**And**: `alpha` is not classified or displayed as terminal `merged`
+
+#### Scenario: enabled restart resumes marked publication
+
+**Given**: a publication-required integration for change `alpha` is not remote-reachable
+**When**: Conflux restarts with matching `-u` configuration and a fresh verification command
+**Then**: it derives the selected change, remote, branch, and pending publication from Git evidence
+**And**: it reruns verification and publication without ordinary apply or acceptance dispatch
+**And**: it emits `PushCompleted(alpha)` only after remote confirmation
+
 #### Scenario: fresh zero-change invocation manufactures no history
 
 **Given**: upstream integration is enabled with zero selected changes
-**And**: local base has no recognized unpublished cumulative history or upstream recovery evidence
+**And**: local base has no explicit publication-required integration trailer or valid upstream recovery trailer
 **When**: Conflux evaluates the invocation
 **Then**: it performs initial fetch and identity validation and completes as no-work without verification, merge, push, or synthetic change terminal event
+**And**: arbitrary local first-parent history and disabled-mode terminal `merged` changes do not become recovery work
 **And**: a remote-only advance updates observation only and does not create a synthetic local merge
 
 #### Scenario: zero-change recovery publishes without synthetic attribution
 
 **Given**: upstream integration is enabled with zero selected changes
-**And**: local base contains recognized unpublished cumulative history or upstream recovery evidence not attributable to an active change
+**And**: local base contains an explicit publication-required integration trailer or valid upstream recovery trailer not attributable to an active change
 **When**: Conflux evaluates recovery
 **Then**: it performs recovery checkpoint, complete verification, native push, and remote confirmation
+**And**: it does not retroactively promote a disabled-mode terminal `merged` change
 **And**: it does not manufacture `PushCompleted` for a nonexistent change
 
 #### Scenario: remote advances before or during push
