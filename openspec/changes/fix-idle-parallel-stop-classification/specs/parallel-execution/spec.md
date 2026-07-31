@@ -54,7 +54,7 @@ The system SHALL send completion events and messages only when processing comple
 
 ### Requirement: Loop termination reason must be tracked and distinguished
 
-The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, or merge wait. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text.
+The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, or merge wait. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text. Operator cancellation SHALL request cancellation without dropping the running scheduler future and SHALL establish terminal stop only after the scheduler reaches its bounded cleanup barrier, including active task drain and pending background merge/base-lane result handling.
 
 #### Scenario: Operator cancellation reaches terminal classification
 
@@ -62,7 +62,11 @@ The system SHALL track the reason for loop termination as normal completion, gen
 **When** the outer parallel orchestration boundary observes cancellation before the scheduler future returns
 **Then** the termination reason is recorded as stopped or cancelled
 **And** cancellation is not converted to `OrchestratorError::AgentCommand`
+**And** the outer boundary continues polling the scheduler future until its bounded cleanup barrier completes
+**And** active task drain, registered execution-handle cleanup, and pending merge/base-lane result handling precede terminal stop
+**And** a cleanup deadline or managed escalation remains classified as operator cancellation rather than execution failure
 **And** later terminal event handling remains idempotent if the frontend already applied `OrchestratorEvent::Stopped`
+**And** `Processing stopped` is not logged more than once
 
 #### Scenario: Genuine failure remains distinct
 
