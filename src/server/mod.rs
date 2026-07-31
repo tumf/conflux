@@ -166,6 +166,10 @@ pub async fn run_server(
 
     let url = server_base_url(&config.bind, actual_addr.port());
 
+    // Advertise the endpoint only now that the listener is bound and its actual
+    // port is known, so a competing invocation never sees an unreachable URL.
+    crate::repo_lock::publish_api_url(&url);
+
     // Print the accessible base URL to stdout for easy copy-paste.
     // Keep this output minimal (URL only) to support scripts.
     println!("{}", url);

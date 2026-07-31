@@ -47,6 +47,7 @@ mod permission;
 mod process_manager;
 mod progress;
 pub mod remote;
+pub mod repo_lock;
 pub mod runtime;
 mod serial_run_service;
 #[cfg(feature = "web-monitoring")]
