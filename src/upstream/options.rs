@@ -168,6 +168,21 @@ pub fn parse_upstream_remote(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Collapse the two clap spellings of the opt-in into one selected remote.
+///
+/// The spec allows a named remote only as `--integrate-upstream=<remote>`, so
+/// the two spellings are separate clap arguments: `-u` is a strictly value-less
+/// short flag (clap rejects `-u=<remote>`), and `--integrate-upstream` is the
+/// long form that optionally carries `=<remote>`. Both select
+/// [`DEFAULT_UPSTREAM_REMOTE`] when value-less, so they collapse here.
+pub fn selected_upstream_remote(short_opt_in: bool, long_opt_in: Option<&str>) -> Option<String> {
+    match long_opt_in {
+        Some(remote) => Some(remote.to_string()),
+        None if short_opt_in => Some(DEFAULT_UPSTREAM_REMOTE.to_string()),
+        None => None,
+    }
+}
+
 /// Resolve the invocation-scoped configuration from raw CLI values.
 ///
 /// `integrate_upstream` is clap's already-parsed representation: `None` when the

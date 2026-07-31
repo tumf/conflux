@@ -1914,6 +1914,10 @@ mod tests {
     /// every targeted change. Ordering — not just presence — is the contract.
     #[tokio::test]
     async fn per_change_upstream_finite_run_completes_only_after_confirmation() {
+        // The run takes the process-global merge lock for its base lane, so it
+        // must hold the base-lane test mutex (see `crate::parallel`) or another
+        // base-lane test's lock makes this one observe a busy lane.
+        let _serialize = crate::parallel::merge_lock_test_mutex().lock().await;
         let Some((_dir, root)) = per_change_upstream_unpublished_repo() else {
             println!("Skipping test: git not available");
             return;
@@ -1951,6 +1955,7 @@ mod tests {
     /// completion at all, and the change stays resumable.
     #[tokio::test]
     async fn per_change_upstream_finite_run_withholds_completion_when_publication_fails() {
+        let _serialize = crate::parallel::merge_lock_test_mutex().lock().await;
         let Some((_dir, root)) = per_change_upstream_unpublished_repo() else {
             println!("Skipping test: git not available");
             return;

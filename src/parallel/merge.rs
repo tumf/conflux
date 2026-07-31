@@ -1241,6 +1241,11 @@ impl ParallelExecutor {
                 max_retries: max_attempts,
                 shared_stagger_state: self.shared_stagger_state.clone(),
                 auto_resolve_count: self.auto_resolve_count.clone(),
+                // An opted-in change's terminal success is remote confirmation,
+                // not this local merge, so the resolve path must not emit the
+                // merged-finalizing per-change completion. `publish_base_integration`
+                // owns the change-scoped events from here on.
+                publication_owns_completion: self.upstream_enabled(),
             })
             .await?;
 

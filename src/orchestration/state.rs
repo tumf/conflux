@@ -5067,6 +5067,85 @@ mod tests {
         );
     }
 
+    /// Replay the events a *fresh* opted-in cumulative integration actually
+    /// emits, in order, up to the point where publication takes over.
+    ///
+    /// The git-backed merge path emits `MergeStarted` and `ResolveStarted`, then
+    /// the conflict resolver reports `ConflictResolutionStarted` /
+    /// `ConflictResolutionCompleted`. It must *not* emit the per-change
+    /// `ResolveCompleted`, because that finalizes the reducer as terminal
+    /// `merged` before anything has been published.
+    fn per_change_upstream_apply_fresh_integration(state: &mut OrchestratorState, change_id: &str) {
+        use crate::events::ExecutionEvent;
+
+        state.apply_execution_event(&ExecutionEvent::MergeStarted {
+            revisions: vec!["ws-alpha".to_string()],
+        });
+        state.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: change_id.to_string(),
+            command: "merge archived change into base branch (1 revision(s))".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ConflictResolutionStarted);
+        state.apply_execution_event(&ExecutionEvent::ConflictResolutionCompleted);
+    }
+
+    #[test]
+    fn per_change_upstream_fresh_integration_never_displays_merged() {
+        let mut state = per_change_upstream_state("alpha");
+        per_change_upstream_apply_fresh_integration(&mut state, "alpha");
+
+        assert_ne!(
+            state.display_status("alpha"),
+            "merged",
+            "local integration must not finalize an opted-in change"
+        );
+        assert!(
+            !state.is_terminal_change("alpha"),
+            "publication is still owed, so nothing is terminal yet"
+        );
+
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        assert_ne!(state.display_status("alpha"), "merged");
+        assert!(!state.is_terminal_change("alpha"));
+
+        state.apply_execution_event(&per_change_upstream_push_completed("alpha"));
+        assert_eq!(
+            state.display_status("alpha"),
+            "pushed",
+            "remote confirmation is the opted-in terminal state"
+        );
+        assert!(state.is_terminal_change("alpha"));
+    }
+
+    #[test]
+    fn per_change_upstream_fresh_integration_failure_stays_recoverable() {
+        // Same fresh sequence, but publication fails. A terminal `merged` here
+        // would swallow PushFailed and leave no recoverable Error for F5 retry.
+        let mut state = per_change_upstream_state("alpha");
+        per_change_upstream_apply_fresh_integration(&mut state, "alpha");
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        state.apply_execution_event(&per_change_upstream_push_failed("alpha"));
+
+        assert_eq!(
+            state.display_status("alpha"),
+            "error",
+            "a failed publication after a fresh integration must surface as recoverable error"
+        );
+        assert!(
+            state.is_terminal_error_change("alpha"),
+            "explicit F5 retry needs a recoverable error to act on"
+        );
+        assert!(matches!(
+            state.apply_command(ReducerCommand::RetryError("alpha".to_string())),
+            ReduceOutcome::Changed(_)
+        ));
+
+        // Retry succeeds: the recoverable error is superseded by confirmation.
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        state.apply_execution_event(&per_change_upstream_push_completed("alpha"));
+        assert_eq!(state.display_status("alpha"), "pushed");
+    }
+
     #[test]
     fn per_change_upstream_remote_confirmation_becomes_pushed_terminal() {
         let mut state = per_change_upstream_state("alpha");

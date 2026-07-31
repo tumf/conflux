@@ -257,6 +257,22 @@ pub async fn handle_start_processing_command(
                 return None;
             }
 
+            // An opted-in session's terminal success is remote confirmation, and
+            // the serial dispatch branch below carries no upstream runtime — work
+            // dispatched there would finalize as terminal `merged` and publish
+            // nothing. Startup already rejects `-u` with serial effective mode,
+            // but the runtime `=` toggle is allowed in Select/Stopped mode and
+            // would otherwise walk around that validation.
+            if ctx.upstream_runtime.is_some() && !ctx.app.parallel_mode {
+                let message = "Serial mode cannot run while -u/--integrate-upstream is active: \
+                    upstream publication is defined on the cumulative parallel base. \
+                    Press '=' to restore parallel mode."
+                    .to_string();
+                ctx.app.warning_message = Some(message.clone());
+                ctx.app.add_log(LogEntry::error(message));
+                return None;
+            }
+
             graceful_stop_flag.store(false, Ordering::SeqCst);
             let orch_tx = ctx.tx.clone();
             let orch_config = ctx.config.clone();
@@ -1505,6 +1521,10 @@ mod tests {
     /// resumption are covered as one path.
     #[tokio::test]
     async fn per_change_upstream_explicit_tui_retry_resumes_publication() {
+        // Publication resumption takes the process-global merge lock, so this
+        // test must hold the base-lane test mutex (see `crate::parallel`) to
+        // avoid observing a lane another base-lane test owns.
+        let _serialize = crate::parallel::merge_lock_test_mutex().lock().await;
         let Some((dir, root)) = per_change_upstream_unpublished_repo() else {
             println!("Skipping test: git not available");
             return;
@@ -1609,6 +1629,97 @@ mod tests {
             "resumed publication must not redispatch apply or acceptance: {}",
             std::fs::read_to_string(&dispatched).unwrap_or_default()
         );
+    }
+
+    /// The `=` toggle is accepted in Select/Stopped mode, so an opted-in session
+    /// can reach the serial dispatch branch — which carries no upstream runtime
+    /// and would finalize completions as terminal `merged` with nothing
+    /// published. Startup validation cannot see that; dispatch must refuse it.
+    #[tokio::test]
+    async fn per_change_upstream_serial_dispatch_is_refused_while_publication_is_owed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let dispatched = dir.path().join("dispatched.txt");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo apply >> \"{}\"'",
+                dispatched.display()
+            )),
+            ..OrchestratorConfig::default()
+        };
+
+        let mut app = AppState::new(vec![create_test_change("alpha")]);
+        app.parallel_available = true;
+        app.parallel_mode = true;
+        app.mode = AppMode::Select;
+        app.changes[0].selected = true;
+
+        // The operator flips to serial while the session is opted in.
+        assert!(
+            app.toggle_parallel_mode(),
+            "the toggle is reachable in Select mode"
+        );
+        assert!(!app.parallel_mode);
+
+        let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["alpha".to_string()],
+            0,
+            crate::orchestration::state::ExecutionMode::Parallel,
+        )));
+        let (tx, _rx) = mpsc::channel(64);
+        let dynamic_queue = DynamicQueue::new();
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: &root,
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: Some(crate::upstream::UpstreamRuntime {
+                config: crate::upstream::UpstreamIntegrationConfig::new("origin", "exit 0"),
+                branch: "main".to_string(),
+            }),
+            orchestrator_running: false,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        let handle = handle_start_processing_command(
+            vec!["alpha".to_string()],
+            false,
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await;
+
+        assert!(
+            handle.is_none(),
+            "an opted-in session must not dispatch serial work"
+        );
+        assert!(
+            orchestrator_cancel.is_none(),
+            "no orchestrator may be started for the refused dispatch"
+        );
+        assert!(
+            !dispatched.exists(),
+            "the refused dispatch must run no apply command"
+        );
+        let warning = app.warning_message.clone().unwrap_or_default();
+        assert!(
+            warning.contains("-u/--integrate-upstream"),
+            "the operator must be told why the dispatch was refused: {warning}"
+        );
+
+        // Restoring parallel mode restores the publication contract.
+        assert!(app.toggle_parallel_mode());
+        assert!(app.parallel_mode);
     }
 }
 

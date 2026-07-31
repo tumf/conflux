@@ -671,6 +671,14 @@ fn run_logs_subcommand(args: LogsArgs) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Top-level upstream options only reach the bare local TUI. An explicit
+    // subcommand parses its own copies, so accepting them here would silently
+    // drop an opt-in whose publication is part of the success contract.
+    if let Err(error) = cli.validate_upstream_option_placement() {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    }
+
     match cli.command {
         // Completion commands intentionally run before logging/config/orchestration paths.
         Some(Commands::Completion(args)) => {
@@ -698,6 +706,7 @@ async fn main() -> Result<()> {
                 server_token_env: cli.server_token_env,
                 // Bare local TUI carries the same upstream contract as `cflx tui`.
                 integrate_upstream: cli.integrate_upstream,
+                integrate_upstream_default_remote: cli.integrate_upstream_default_remote,
                 upstream_verify_command: cli.upstream_verify_command,
             })
             .await?;

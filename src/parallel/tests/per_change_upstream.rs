@@ -463,7 +463,7 @@ async fn per_change_upstream_base_lane_orders_merge_hook_verification_and_public
         .attempt_merge(
             &["ws-alpha".to_string()],
             &["alpha".to_string()],
-            &[workspace_path.clone()],
+            std::slice::from_ref(&workspace_path),
         )
         .await
         .expect("attempt_merge");
@@ -557,5 +557,33 @@ async fn per_change_upstream_base_lane_orders_merge_hook_verification_and_public
             .iter()
             .any(|event| matches!(event, crate::parallel::ParallelEvent::MergeCompleted { .. })),
         "opted-in local integration is not terminal `merged`"
+    );
+
+    // Absence of `MergeCompleted` alone proves nothing: the git-backed merge path
+    // also emits per-change `ResolveCompleted`, which finalizes the reducer as
+    // terminal `merged` just as effectively. Project every emitted event into the
+    // real reducer, in order, and check what an operator would actually see.
+    let mut state = crate::orchestration::state::OrchestratorState::with_mode(
+        vec!["alpha".to_string()],
+        0,
+        crate::orchestration::state::ExecutionMode::Parallel,
+    );
+    state.apply_execution_event(&crate::parallel::ParallelEvent::ChangeArchived(
+        "alpha".to_string(),
+    ));
+    for event in &events {
+        state.apply_execution_event(event);
+        assert_ne!(
+            state.display_status("alpha"),
+            "merged",
+            "no emitted event may display an opted-in change as merged: {:?}",
+            event
+        );
+    }
+    assert_eq!(
+        state.display_status("alpha"),
+        "pushed",
+        "confirmed publication is the opted-in terminal state; events: {:?}",
+        events
     );
 }

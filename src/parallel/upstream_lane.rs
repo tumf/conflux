@@ -223,7 +223,25 @@ impl ParallelExecutor {
     /// The base lane is taken for each attempt and released when it finishes, so
     /// a stalled publication keeps later results waiting rather than silently
     /// letting them integrate.
-    pub(super) async fn resume_pending_publications(&mut self) {
+    ///
+    /// Every attempt is attributed to the change ID recorded in its marker, so
+    /// resumption produces the same change-scoped `PushStarted`/`PushCompleted`
+    /// pair a fresh integration does. Nothing here may quietly give up: an
+    /// abandoned marker would let run-final publication push the same cumulative
+    /// HEAD with no change attribution, and the run would report completion for
+    /// a change the reducer never saw confirmed.
+    ///
+    /// Returns the change IDs that are still unpublished afterwards.
+    pub(super) async fn resume_pending_publications(&mut self) -> Vec<String> {
+        /// Base-lane contention and transient base dirtiness are both expected
+        /// to clear; a bounded wait is the difference between "resumed" and
+        /// "silently skipped".
+        const BASE_LANE_ATTEMPTS: u32 = 30;
+        const BASE_LANE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        /// Bounded so a wedged lane holder surfaces as owed publication — which
+        /// withholds run completion — instead of hanging the caller forever.
+        const BASE_LANE_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
         let pending: Vec<String> = self
             .pending_publications()
             .await
@@ -231,33 +249,60 @@ impl ParallelExecutor {
             .map(|evidence| evidence.trailers.change_id)
             .collect();
 
+        let mut unpublished = Vec::new();
         for change_id in pending {
-            let Ok(_lane) = super::global_merge_lock().try_lock() else {
-                tracing::info!(
+            // Wait for the base lane rather than skipping: this runs before the
+            // scheduler dispatches and at run finalization, so contention here is
+            // another base operation finishing, not a permanent condition.
+            let lane =
+                tokio::time::timeout(BASE_LANE_ACQUIRE_TIMEOUT, super::global_merge_lock().lock())
+                    .await;
+            let Ok(_lane) = lane else {
+                tracing::error!(
                     change_id = %change_id,
-                    "Base lane busy; deferring publication resumption"
+                    "Base lane never became available; publication remains owed"
                 );
-                return;
+                unpublished.push(change_id);
+                break;
             };
 
-            match super::merge::base_dirty_reason(&self.repo_root).await {
-                Ok(Some(reason)) => {
-                    tracing::warn!(
-                        change_id = %change_id,
-                        reason = %reason,
-                        "Cumulative base is not clean; publication resumption deferred"
-                    );
-                    return;
+            let mut base_ready = false;
+            for attempt in 1..=BASE_LANE_ATTEMPTS {
+                match super::merge::base_dirty_reason(&self.repo_root).await {
+                    Ok(None) => {
+                        base_ready = true;
+                        break;
+                    }
+                    Ok(Some(reason)) => {
+                        tracing::warn!(
+                            change_id = %change_id,
+                            reason = %reason,
+                            attempt,
+                            "Cumulative base is not clean; retrying publication resumption"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            change_id = %change_id,
+                            error = %err,
+                            attempt,
+                            "Base state unavailable; retrying publication resumption"
+                        );
+                    }
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        change_id = %change_id,
-                        error = %err,
-                        "Base state unavailable; publication resumption deferred"
-                    );
-                    return;
-                }
+                tokio::time::sleep(BASE_LANE_RETRY_DELAY).await;
+            }
+
+            if !base_ready {
+                tracing::error!(
+                    change_id = %change_id,
+                    "Cumulative base never became usable; publication remains owed"
+                );
+                unpublished.push(change_id);
+                // Later markers depend on this one's published revision for
+                // unambiguous attribution, so stop here rather than publishing
+                // a cumulative HEAD that carries an unconfirmed change.
+                break;
             }
 
             tracing::info!(
@@ -271,11 +316,25 @@ impl ParallelExecutor {
                     "Publication resumption did not complete; change remains resumable"
                 );
                 // A stalled publication keeps the lane closed for later results
-                // by leaving its marker in place; no further resumption is
-                // attempted in this pass.
-                return;
+                // by leaving its marker in place. Attribution of any later
+                // marker would be ambiguous while this one is unconfirmed.
+                unpublished.push(change_id);
+                break;
+            }
+
+            // Repository evidence, not the call's return value, decides whether
+            // the marker is discharged.
+            if self.has_pending_publication_for(&change_id).await {
+                tracing::warn!(
+                    change_id = %change_id,
+                    "Publication resumption reported success but the marker is still unpublished"
+                );
+                unpublished.push(change_id);
+                break;
             }
         }
+
+        unpublished
     }
 
     /// Own finalization for an opted-in run.
