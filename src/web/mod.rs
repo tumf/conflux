@@ -394,6 +394,11 @@ pub async fn spawn_server_with_url(
     let url = build_access_url(&config.bind, actual_port);
     info!("Web monitoring server listening on {}", url);
 
+    // The listener is bound and its actual address (including an OS-assigned
+    // port) is known, so the repository lock owner can now advertise a URL that
+    // is genuinely reachable. A no-op when this process holds no lock.
+    crate::repo_lock::publish_api_url(&url);
+
     // Spawn periodic refresh task if enabled
     if config.refresh_interval_secs > 0 {
         let state_clone = state;
