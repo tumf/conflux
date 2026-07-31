@@ -83,7 +83,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 qrcode = { version = "0.14", optional = true }
 local-ip-address = { version = "0.6", optional = true }
 utoipa = { version = "5", features = ["axum_extras", "chrono"], optional = true }
-utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = "9", features = ["axum"], optional = true }
 
 # Terminal session dependencies (optional, tied to web-monitoring)
 portable-pty = { version = "0.8", optional = true }

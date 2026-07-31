@@ -29,12 +29,14 @@ pub mod worktrees;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
+use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 
 use async_trait::async_trait;
+use utoipa_swagger_ui::SwaggerUi;
 
 use auth::{
     cors_headers, is_preflight, preflight_response, resolve_correlation_id, CorrelationId,
@@ -47,6 +49,14 @@ use worktrees::{UnboundWorktreeOperations, WorktreeListing, WorktreeOperations};
 
 /// The only v2 path that is served without authentication.
 pub const HEALTH_PATH: &str = "/api/v2/health";
+
+async fn openapi_yaml() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/yaml")],
+        serde_yaml::to_string(&crate::web::openapi::document())
+            .expect("OpenAPI document must serialize as YAML"),
+    )
+}
 
 /// The projection owner plus a late-bound delegation target.
 ///
@@ -190,7 +200,7 @@ impl RemoteControlState {
 /// does not merge it: the two namespaces describe different things and sharing
 /// them would make `instance_id` meaningless.
 pub fn router(state: RemoteControlState) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route(HEALTH_PATH, get(reads::health))
         .route("/api/v2/capabilities", get(reads::capabilities))
         .route("/api/v2/instance", get(reads::instance))
@@ -205,7 +215,14 @@ pub fn router(state: RemoteControlState) -> Router {
         .route("/api/v2/events", get(stream::events))
         .route("/api/v2/ws", get(stream::ws))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), gate))
-        .with_state(state)
+        .with_state(state);
+
+    protected
+        .route("/api/v2/openapi.yaml", get(openapi_yaml))
+        .merge(
+            SwaggerUi::new("/api/v2/docs")
+                .url("/api/v2/openapi.json", crate::web::openapi::document()),
+        )
 }
 
 /// Origin, credential-transport, and bearer enforcement for every v2 request.
