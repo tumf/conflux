@@ -133,6 +133,42 @@ async fn the_legacy_browser_websocket_and_dashboard_files_remain_available() {
 }
 
 #[tokio::test]
+async fn openapi_documents_and_swagger_ui_are_available() {
+    let config = WebConfig::enabled(0, "127.0.0.1".to_string()).with_auth(
+        Some("v2-token".to_string()),
+        None,
+        Vec::new(),
+    );
+    let app = full_app(&config);
+
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/v2/openapi.json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let document = json_body(response).await;
+    assert!(document["paths"].get("/api/v2/commands").is_some());
+
+    let response = app
+        .clone()
+        .oneshot(request(Method::GET, "/api/v2/openapi.yaml"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/yaml"
+    );
+
+    let response = app
+        .oneshot(request(Method::GET, "/api/v2/docs/"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn v2_is_mounted_next_to_the_legacy_surface_not_inside_it() {
     let config = WebConfig::enabled(0, "127.0.0.1".to_string());
     let app = full_app(&config);

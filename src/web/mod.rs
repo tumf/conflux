@@ -8,6 +8,8 @@ mod url;
 #[cfg(feature = "web-monitoring")]
 pub mod api;
 #[cfg(feature = "web-monitoring")]
+pub mod openapi;
+#[cfg(feature = "web-monitoring")]
 pub mod remote_control_api;
 #[cfg(feature = "web-monitoring")]
 pub mod state;
