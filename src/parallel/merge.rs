@@ -329,8 +329,19 @@ impl ParallelExecutor {
                 .await
             {
                 Ok(MergeAttempt::Merged { revision }) => {
+                    // With upstream publication enabled, `attempt_merge` already
+                    // ran `on_merged` and emitted change-scoped publication
+                    // events while it owned the base lane. Local merge is not
+                    // terminal there, so no `MergeCompleted` is sent.
+                    let publication_owned_completion = self.upstream_enabled();
+
                     // Run on_merged hook before merged status transition (MergeCompleted event)
-                    if let Some(ref hooks) = self.hooks {
+                    let merge_hooks = if publication_owned_completion {
+                        None
+                    } else {
+                        self.hooks.as_ref()
+                    };
+                    if let Some(hooks) = merge_hooks {
                         // Fetch actual task counts from change data
                         let (completed_tasks, total_tasks) =
                             match crate::openspec::list_changes_native() {
@@ -396,14 +407,16 @@ impl ParallelExecutor {
                     }
 
                     // Send MergeCompleted after on_merged hook (triggers merged status transition)
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::MergeCompleted {
-                            change_id: workspace_result.change_id.clone(),
-                            revision: revision.clone(),
-                        },
-                    )
-                    .await;
+                    if !publication_owned_completion {
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::MergeCompleted {
+                                change_id: workspace_result.change_id.clone(),
+                                revision: revision.clone(),
+                            },
+                        )
+                        .await;
+                    }
 
                     // Merge succeeded, cleanup workspace
                     send_event(
@@ -664,6 +677,36 @@ impl ParallelExecutor {
             )));
         }
 
+        let primary_change_id = change_ids
+            .first()
+            .map(String::as_str)
+            .unwrap_or("<unknown>");
+
+        // Only one completed result may occupy the base lane through local
+        // integration, verification, publication, and remote confirmation. While
+        // a prior result's publication is unconfirmed, a later result waits here
+        // rather than entering cumulative base; independent worktree apply and
+        // acceptance are unaffected because they never take this lane.
+        //
+        // This is checked before archive verification so a waiting result does no
+        // base work at all while the lane is owed to another change.
+        if self.upstream_enabled() {
+            if let Some(blocking) = self.blocking_publication_change(primary_change_id).await {
+                return Ok(MergeAttempt::Deferred(DeferredMerge::auto(format!(
+                    "Waiting for upstream publication of '{}' to be remotely confirmed",
+                    blocking
+                ))));
+            }
+        }
+
+        // Repository evidence, not process memory, decides whether this change
+        // still needs local integration: a marked-but-unpublished change is
+        // already in cumulative base and owes only publication. Its archive
+        // evidence is already integrated, so re-verifying the (possibly removed)
+        // archive worktree would prove nothing.
+        let resume_publication_only =
+            self.upstream_enabled() && self.has_pending_publication_for(primary_change_id).await;
+
         // Verify that all changes are actually archived before attempting merge.
         // A duplicate post-archive merge can race with a successful merge+cleanup path:
         // the stale path may see the archived worktree as dirty/incomplete even though
@@ -674,7 +717,11 @@ impl ParallelExecutor {
         // never invoke `git status` from a missing archive path. Use the workspace-local
         // archive path only while it exists; otherwise fall back to the stable base
         // repository root for repository-visible evidence.
-        for (change_id, archive_path) in change_ids.iter().zip(archive_paths.iter()) {
+        for (change_id, archive_path) in change_ids
+            .iter()
+            .zip(archive_paths.iter())
+            .filter(|_| !resume_publication_only)
+        {
             let verification_root =
                 archive_completion_verification_root(&self.repo_root, archive_path.as_path());
             if verification_root == self.repo_root.as_path() && !archive_path.exists() {
@@ -712,7 +759,7 @@ impl ParallelExecutor {
         // result enters cumulative base. The base lane is already owned and the
         // base is already known clean here, so the checkpoint may start; results
         // that arrive while it runs stay queued behind its single fetch.
-        if self.upstream_enabled() {
+        if self.upstream_enabled() && !resume_publication_only {
             self.run_upstream_checkpoint(
                 crate::upstream::checkpoint::CheckpointTrigger::BeforeBaseIntegration,
                 change_ids.first().map(String::as_str),
@@ -721,36 +768,231 @@ impl ParallelExecutor {
             .await?;
         }
 
-        for change_id in change_ids {
-            send_event(
-                &self.event_tx,
-                ParallelEvent::ResolveStarted {
-                    change_id: change_id.clone(),
-                    command: format!(
-                        "merge archived change into base branch ({} revision(s))",
-                        revisions.len()
-                    ),
-                },
-            )
-            .await;
-        }
+        let revision = if resume_publication_only {
+            tracing::info!(
+                change_id = %primary_change_id,
+                "Resuming upstream publication for an already integrated change"
+            );
+            git_commands::get_current_commit(&self.repo_root)
+                .await
+                .map_err(OrchestratorError::from_vcs_error)?
+        } else {
+            for change_id in change_ids {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::ResolveStarted {
+                        change_id: change_id.clone(),
+                        command: format!(
+                            "merge archived change into base branch ({} revision(s))",
+                            revisions.len()
+                        ),
+                    },
+                )
+                .await;
+            }
 
-        let revision = self.merge_and_resolve(revisions, change_ids).await?;
+            self.merge_and_resolve(revisions, change_ids).await?
+        };
 
-        // Every completed change result merged into cumulative base runs the
-        // complete verification command before the base lane reopens, so a
-        // worktree accepted on an older base cannot unblock later dispatch.
+        // The base lane is still owned here. Publication runs inside it so the
+        // next completed result cannot enter cumulative base before this one's
+        // published revision is known.
         if self.upstream_enabled() {
-            self.run_upstream_base_result_verification(
-                change_ids
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or("<unknown>"),
+            self.publish_base_integration(
+                primary_change_id,
+                revisions.first().map(String::as_str),
+                resume_publication_only,
             )
             .await?;
         }
 
         Ok(MergeAttempt::Merged { revision })
+    }
+
+    /// Complete the opted-in base-lane sequence for one integrated change.
+    ///
+    /// Ordering is the contract: durable publication identity, then `on_merged`,
+    /// then complete verification, then native push and remote confirmation. A
+    /// failure at any step leaves the change unpublished, emits no
+    /// `PushCompleted`, and keeps the lane closed to later results.
+    ///
+    /// `resuming` means the marker commit already exists, so local integration
+    /// and its `on_merged` hook already happened. Resumption therefore re-runs
+    /// only the unproven part — verification, publication, and confirmation —
+    /// and never fires `on_merged` a second time for the same integration.
+    pub(super) async fn publish_base_integration(
+        &self,
+        change_id: &str,
+        workspace_name: Option<&str>,
+        resuming: bool,
+    ) -> Result<()> {
+        let (remote, branch) = self
+            .upstream_identity()
+            .await
+            .unwrap_or_else(|| ("origin".to_string(), "HEAD".to_string()));
+
+        // Durable identity first: after this commit exists, process loss cannot
+        // make the change look like ordinary terminal `merged` history.
+        if !resuming {
+            if let Err(err) = self.record_publication_intent(change_id).await {
+                self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
+                    .await;
+                return Err(err);
+            }
+        }
+
+        // Publication progress, deliberately *not* `MergeCompleted`: local merge
+        // is not the opted-in terminal success.
+        send_event(
+            &self.event_tx,
+            ParallelEvent::PushStarted {
+                change_id: change_id.to_string(),
+                remote: remote.clone(),
+                branch: branch.clone(),
+            },
+        )
+        .await;
+
+        if !resuming {
+            if let Err(err) = self
+                .run_on_merged_for_publication(change_id, workspace_name)
+                .await
+            {
+                self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
+                    .await;
+                return Err(err);
+            }
+        }
+
+        if let Err(err) = self.run_upstream_base_result_verification(change_id).await {
+            self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
+                .await;
+            return Err(err);
+        }
+
+        match self.publish_completed_change(change_id).await {
+            Ok(super::upstream_lane::PublicationLaneOutcome::Confirmed { head }) => {
+                tracing::info!(
+                    change_id = %change_id,
+                    head = %head,
+                    remote = %remote,
+                    branch = %branch,
+                    "Remote observation confirmed cumulative publication"
+                );
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::PushCompleted {
+                        change_id: change_id.to_string(),
+                        remote,
+                        branch,
+                    },
+                )
+                .await;
+                Ok(())
+            }
+            Ok(super::upstream_lane::PublicationLaneOutcome::Unpublished { reason }) => {
+                self.report_publication_failure(change_id, &remote, &branch, &reason)
+                    .await;
+                Err(OrchestratorError::GitCommand(reason))
+            }
+            Err(err) => {
+                self.report_publication_failure(change_id, &remote, &branch, &err.to_string())
+                    .await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Run `on_merged` for an opted-in publication.
+    ///
+    /// The hook keeps its existing meaning of successful local base integration
+    /// and still runs before publication, so its failure prevents push and final
+    /// success.
+    async fn run_on_merged_for_publication(
+        &self,
+        change_id: &str,
+        workspace_name: Option<&str>,
+    ) -> Result<()> {
+        let Some(hooks) = self.hooks.as_ref() else {
+            return Ok(());
+        };
+
+        let (completed_tasks, total_tasks) = match crate::openspec::list_changes_native() {
+            Ok(changes) => changes
+                .iter()
+                .find(|c| c.id == change_id)
+                .map(|c| (c.completed_tasks, c.total_tasks))
+                .unwrap_or((0, 0)),
+            Err(e) => {
+                tracing::warn!("Failed to fetch task counts for on_merged hook: {}", e);
+                (0, 0)
+            }
+        };
+
+        let workspace_path = workspace_name
+            .and_then(|name| {
+                self.workspace_manager
+                    .workspaces()
+                    .iter()
+                    .find(|w| w.name == name)
+                    .map(|w| w.path.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+
+        let hook_context = crate::hooks::HookContext::new(0, 0, 0, false)
+            .with_change(change_id, completed_tasks, total_tasks)
+            .with_apply_count(0)
+            .with_parallel_context(&workspace_path, None);
+
+        if let Err(e) = hooks
+            .run_hook(crate::hooks::HookType::OnMerged, &hook_context)
+            .await
+        {
+            let message = on_merged_failure_message(change_id, &e);
+            tracing::error!("{}", message);
+            send_event(
+                &self.event_tx,
+                ParallelEvent::HookFailed {
+                    change_id: change_id.to_string(),
+                    hook_type: crate::hooks::HookType::OnMerged.to_string(),
+                    error: e.to_string(),
+                },
+            )
+            .await;
+            return Err(OrchestratorError::GitCommand(message));
+        }
+        Ok(())
+    }
+
+    /// Report a publication failure as recoverable, resumable work.
+    ///
+    /// No `PushCompleted` is emitted, so the change never reaches terminal
+    /// `pushed`; `PushFailed` projects into the existing recoverable error flow
+    /// whose explicit retry (F5 or the local web control) resumes publication.
+    async fn report_publication_failure(
+        &self,
+        change_id: &str,
+        remote: &str,
+        branch: &str,
+        reason: &str,
+    ) {
+        tracing::error!(
+            change_id = %change_id,
+            remote = %remote,
+            branch = %branch,
+            reason = %reason,
+            "Upstream publication did not complete; change remains unpublished"
+        );
+        send_event(
+            &self.event_tx,
+            ParallelEvent::PushFailed {
+                change_id: change_id.to_string(),
+                remote: remote.to_string(),
+                branch: branch.to_string(),
+                error: format!("upstream publication incomplete: {}", reason),
+            },
+        )
+        .await;
     }
 
     #[cfg(test)]
@@ -999,6 +1241,11 @@ impl ParallelExecutor {
                 max_retries: max_attempts,
                 shared_stagger_state: self.shared_stagger_state.clone(),
                 auto_resolve_count: self.auto_resolve_count.clone(),
+                // An opted-in change's terminal success is remote confirmation,
+                // not this local merge, so the resolve path must not emit the
+                // merged-finalizing per-change completion. `publish_base_integration`
+                // owns the change-scoped events from here on.
+                publication_owns_completion: self.upstream_enabled(),
             })
             .await?;
 

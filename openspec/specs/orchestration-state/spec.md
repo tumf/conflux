@@ -8,35 +8,77 @@ Provide a single, reducer-owned model for tracking the runtime lifecycle of each
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, push, or resolve success events.
 
-Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve/push attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
+Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance, apply, archive, resolve, or push attempts are recoverable until the change reaches the terminal success required by its invocation mode or final rejection. Success events MUST NOT overwrite final rejection state.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, pushed, or archived terminal states.
+Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
-<!-- Expected canonical result after archive: `orchestration-state` will include pushed as a terminal success distinct from merged, with the same final-state retry protections as merged. -->
+#### Scenario: disabled cumulative merge becomes merged terminal
 
-#### Scenario: push success becomes pushed terminal state
+**Given**: change `alpha` completes cumulative base integration without upstream integration enabled
+**When**: the reducer receives merge success
+**Then**: terminal state becomes `Merged`
+**And**: display status is `merged`
 
-- **Given**: change `alpha` has completed archive and is running in push post-archive mode
-- **When**: `alpha` receives a push-completed success event
-- **Then**: reducer-owned terminal state for `alpha` becomes `Pushed`
-- **And**: display status for `alpha` is `pushed`
-- **And**: `alpha` is not displayed as `merged`
+#### Scenario: opted-in local merge remains non-terminal
 
-#### Scenario: pushed terminal is not explicit retry candidate
+**Given**: change `alpha` is running with upstream integration enabled
+**When**: its archived result merges successfully into cumulative base
+**Then**: reducer-owned state records publication progress without terminal `Merged`
+**And**: the display does not claim final `merged` success
+**And**: ordinary apply and acceptance dispatch for `alpha` remain disabled
 
-- **Given**: change `alpha` has terminal state `Pushed`
-- **When**: an explicit retry transition is requested for `alpha`
-- **Then**: `alpha` keeps terminal state `Pushed`
-- **And**: `alpha` is not reintroduced as ordinary apply dispatch work
+#### Scenario: remote-confirmed publication becomes pushed terminal
 
-#### Scenario: late push success supersedes recoverable error
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**And**: Conflux confirms through remote observation that cumulative HEAD is reachable from the selected remote base
+**When**: `alpha` receives change-scoped `PushCompleted`
+**Then**: terminal state becomes `Pushed`
+**And**: display status is `pushed`
+**And**: `alpha` is not displayed as `merged`
 
-- **Given**: change `alpha` has terminal state `Error`
-- **When**: `alpha` receives a repository-visible push-completed success event from already-running work
-- **Then**: the success event may supersede the error according to existing success precedence rules
-- **And**: no new ordinary apply dispatch is created solely because the error was superseded
+#### Scenario: publication failure remains resumable
+
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**When**: verification, push, or remote confirmation fails
+**Then**: `alpha` does not become `Merged` or `Pushed`
+**And**: reducer-owned state exposes recoverable publication failure or wait evidence
+**And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
+
+#### Scenario: late publication success supersedes recoverable failure
+
+**Given**: change `alpha` has recoverable publication error state
+**And**: already-running or retried repository work later confirms cumulative HEAD on the selected remote
+**When**: `PushCompleted(alpha)` arrives
+**Then**: terminal state becomes `Pushed`
+**And**: no ordinary apply dispatch is created
+
+#### Scenario: pushed terminal is not retryable
+
+**Given**: change `alpha` has terminal state `Pushed`
+**When**: an explicit retry transition is requested
+**Then**: `alpha` remains `Pushed`
+**And**: it is not reintroduced as apply, acceptance, merge, or publication work
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -386,35 +428,77 @@ When a rejection review is ready to run but the base-mutating lane is occupied b
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, push, or resolve success events.
 
-Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve/push attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
+Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance, apply, archive, resolve, or push attempts are recoverable until the change reaches the terminal success required by its invocation mode or final rejection. Success events MUST NOT overwrite final rejection state.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, pushed, or archived terminal states.
+Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
-<!-- Expected canonical result after archive: `orchestration-state` will include pushed as a terminal success distinct from merged, with the same final-state retry protections as merged. -->
+#### Scenario: disabled cumulative merge becomes merged terminal
 
-#### Scenario: push success becomes pushed terminal state
+**Given**: change `alpha` completes cumulative base integration without upstream integration enabled
+**When**: the reducer receives merge success
+**Then**: terminal state becomes `Merged`
+**And**: display status is `merged`
 
-- **Given**: change `alpha` has completed archive and is running in push post-archive mode
-- **When**: `alpha` receives a push-completed success event
-- **Then**: reducer-owned terminal state for `alpha` becomes `Pushed`
-- **And**: display status for `alpha` is `pushed`
-- **And**: `alpha` is not displayed as `merged`
+#### Scenario: opted-in local merge remains non-terminal
 
-#### Scenario: pushed terminal is not explicit retry candidate
+**Given**: change `alpha` is running with upstream integration enabled
+**When**: its archived result merges successfully into cumulative base
+**Then**: reducer-owned state records publication progress without terminal `Merged`
+**And**: the display does not claim final `merged` success
+**And**: ordinary apply and acceptance dispatch for `alpha` remain disabled
 
-- **Given**: change `alpha` has terminal state `Pushed`
-- **When**: an explicit retry transition is requested for `alpha`
-- **Then**: `alpha` keeps terminal state `Pushed`
-- **And**: `alpha` is not reintroduced as ordinary apply dispatch work
+#### Scenario: remote-confirmed publication becomes pushed terminal
 
-#### Scenario: late push success supersedes recoverable error
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**And**: Conflux confirms through remote observation that cumulative HEAD is reachable from the selected remote base
+**When**: `alpha` receives change-scoped `PushCompleted`
+**Then**: terminal state becomes `Pushed`
+**And**: display status is `pushed`
+**And**: `alpha` is not displayed as `merged`
 
-- **Given**: change `alpha` has terminal state `Error`
-- **When**: `alpha` receives a repository-visible push-completed success event from already-running work
-- **Then**: the success event may supersede the error according to existing success precedence rules
-- **And**: no new ordinary apply dispatch is created solely because the error was superseded
+#### Scenario: publication failure remains resumable
+
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**When**: verification, push, or remote confirmation fails
+**Then**: `alpha` does not become `Merged` or `Pushed`
+**And**: reducer-owned state exposes recoverable publication failure or wait evidence
+**And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
+
+#### Scenario: late publication success supersedes recoverable failure
+
+**Given**: change `alpha` has recoverable publication error state
+**And**: already-running or retried repository work later confirms cumulative HEAD on the selected remote
+**When**: `PushCompleted(alpha)` arrives
+**Then**: terminal state becomes `Pushed`
+**And**: no ordinary apply dispatch is created
+
+#### Scenario: pushed terminal is not retryable
+
+**Given**: change `alpha` has terminal state `Pushed`
+**When**: an explicit retry transition is requested
+**Then**: `alpha` remains `Pushed`
+**And**: it is not reintroduced as apply, acceptance, merge, or publication work
 
 ### Requirement: Resolve Wait Queue Ownership
 
@@ -508,35 +592,77 @@ The shared reducer state that accepts `ResolveMerge` MUST be the same authoritat
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, push, or resolve success events.
 
-Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve/push attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
+Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance, apply, archive, resolve, or push attempts are recoverable until the change reaches the terminal success required by its invocation mode or final rejection. Success events MUST NOT overwrite final rejection state.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, pushed, or archived terminal states.
+Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
-<!-- Expected canonical result after archive: `orchestration-state` will include pushed as a terminal success distinct from merged, with the same final-state retry protections as merged. -->
+#### Scenario: disabled cumulative merge becomes merged terminal
 
-#### Scenario: push success becomes pushed terminal state
+**Given**: change `alpha` completes cumulative base integration without upstream integration enabled
+**When**: the reducer receives merge success
+**Then**: terminal state becomes `Merged`
+**And**: display status is `merged`
 
-- **Given**: change `alpha` has completed archive and is running in push post-archive mode
-- **When**: `alpha` receives a push-completed success event
-- **Then**: reducer-owned terminal state for `alpha` becomes `Pushed`
-- **And**: display status for `alpha` is `pushed`
-- **And**: `alpha` is not displayed as `merged`
+#### Scenario: opted-in local merge remains non-terminal
 
-#### Scenario: pushed terminal is not explicit retry candidate
+**Given**: change `alpha` is running with upstream integration enabled
+**When**: its archived result merges successfully into cumulative base
+**Then**: reducer-owned state records publication progress without terminal `Merged`
+**And**: the display does not claim final `merged` success
+**And**: ordinary apply and acceptance dispatch for `alpha` remain disabled
 
-- **Given**: change `alpha` has terminal state `Pushed`
-- **When**: an explicit retry transition is requested for `alpha`
-- **Then**: `alpha` keeps terminal state `Pushed`
-- **And**: `alpha` is not reintroduced as ordinary apply dispatch work
+#### Scenario: remote-confirmed publication becomes pushed terminal
 
-#### Scenario: late push success supersedes recoverable error
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**And**: Conflux confirms through remote observation that cumulative HEAD is reachable from the selected remote base
+**When**: `alpha` receives change-scoped `PushCompleted`
+**Then**: terminal state becomes `Pushed`
+**And**: display status is `pushed`
+**And**: `alpha` is not displayed as `merged`
 
-- **Given**: change `alpha` has terminal state `Error`
-- **When**: `alpha` receives a repository-visible push-completed success event from already-running work
-- **Then**: the success event may supersede the error according to existing success precedence rules
-- **And**: no new ordinary apply dispatch is created solely because the error was superseded
+#### Scenario: publication failure remains resumable
+
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**When**: verification, push, or remote confirmation fails
+**Then**: `alpha` does not become `Merged` or `Pushed`
+**And**: reducer-owned state exposes recoverable publication failure or wait evidence
+**And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
+
+#### Scenario: late publication success supersedes recoverable failure
+
+**Given**: change `alpha` has recoverable publication error state
+**And**: already-running or retried repository work later confirms cumulative HEAD on the selected remote
+**When**: `PushCompleted(alpha)` arrives
+**Then**: terminal state becomes `Pushed`
+**And**: no ordinary apply dispatch is created
+
+#### Scenario: pushed terminal is not retryable
+
+**Given**: change `alpha` has terminal state `Pushed`
+**When**: an explicit retry transition is requested
+**Then**: `alpha` remains `Pushed`
+**And**: it is not reintroduced as apply, acceptance, merge, or publication work
 
 ### Requirement: Rejection Flow Execution
 
@@ -747,35 +873,77 @@ The operation MUST NOT convert permanent terminal changes such as `Archived`, `M
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, push, or resolve success events.
 
-Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve/push attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
+Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance, apply, archive, resolve, or push attempts are recoverable until the change reaches the terminal success required by its invocation mode or final rejection. Success events MUST NOT overwrite final rejection state.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, pushed, or archived terminal states.
+Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
-<!-- Expected canonical result after archive: `orchestration-state` will include pushed as a terminal success distinct from merged, with the same final-state retry protections as merged. -->
+#### Scenario: disabled cumulative merge becomes merged terminal
 
-#### Scenario: push success becomes pushed terminal state
+**Given**: change `alpha` completes cumulative base integration without upstream integration enabled
+**When**: the reducer receives merge success
+**Then**: terminal state becomes `Merged`
+**And**: display status is `merged`
 
-- **Given**: change `alpha` has completed archive and is running in push post-archive mode
-- **When**: `alpha` receives a push-completed success event
-- **Then**: reducer-owned terminal state for `alpha` becomes `Pushed`
-- **And**: display status for `alpha` is `pushed`
-- **And**: `alpha` is not displayed as `merged`
+#### Scenario: opted-in local merge remains non-terminal
 
-#### Scenario: pushed terminal is not explicit retry candidate
+**Given**: change `alpha` is running with upstream integration enabled
+**When**: its archived result merges successfully into cumulative base
+**Then**: reducer-owned state records publication progress without terminal `Merged`
+**And**: the display does not claim final `merged` success
+**And**: ordinary apply and acceptance dispatch for `alpha` remain disabled
 
-- **Given**: change `alpha` has terminal state `Pushed`
-- **When**: an explicit retry transition is requested for `alpha`
-- **Then**: `alpha` keeps terminal state `Pushed`
-- **And**: `alpha` is not reintroduced as ordinary apply dispatch work
+#### Scenario: remote-confirmed publication becomes pushed terminal
 
-#### Scenario: late push success supersedes recoverable error
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**And**: Conflux confirms through remote observation that cumulative HEAD is reachable from the selected remote base
+**When**: `alpha` receives change-scoped `PushCompleted`
+**Then**: terminal state becomes `Pushed`
+**And**: display status is `pushed`
+**And**: `alpha` is not displayed as `merged`
 
-- **Given**: change `alpha` has terminal state `Error`
-- **When**: `alpha` receives a repository-visible push-completed success event from already-running work
-- **Then**: the success event may supersede the error according to existing success precedence rules
-- **And**: no new ordinary apply dispatch is created solely because the error was superseded
+#### Scenario: publication failure remains resumable
+
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**When**: verification, push, or remote confirmation fails
+**Then**: `alpha` does not become `Merged` or `Pushed`
+**And**: reducer-owned state exposes recoverable publication failure or wait evidence
+**And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
+
+#### Scenario: late publication success supersedes recoverable failure
+
+**Given**: change `alpha` has recoverable publication error state
+**And**: already-running or retried repository work later confirms cumulative HEAD on the selected remote
+**When**: `PushCompleted(alpha)` arrives
+**Then**: terminal state becomes `Pushed`
+**And**: no ordinary apply dispatch is created
+
+#### Scenario: pushed terminal is not retryable
+
+**Given**: change `alpha` has terminal state `Pushed`
+**When**: an explicit retry transition is requested
+**Then**: `alpha` remains `Pushed`
+**And**: it is not reintroduced as apply, acceptance, merge, or publication work
 
 ### Requirement: Rejected terminal state remains distinct from errors
 
@@ -819,35 +987,77 @@ Before returning to apply, the runtime SHALL remove the worktree-local `REJECTED
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, push, or resolve success events.
 
-Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve/push attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
+Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance, apply, archive, resolve, or push attempts are recoverable until the change reaches the terminal success required by its invocation mode or final rejection. Success events MUST NOT overwrite final rejection state.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, pushed, or archived terminal states.
+Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
-<!-- Expected canonical result after archive: `orchestration-state` will include pushed as a terminal success distinct from merged, with the same final-state retry protections as merged. -->
+#### Scenario: disabled cumulative merge becomes merged terminal
 
-#### Scenario: push success becomes pushed terminal state
+**Given**: change `alpha` completes cumulative base integration without upstream integration enabled
+**When**: the reducer receives merge success
+**Then**: terminal state becomes `Merged`
+**And**: display status is `merged`
 
-- **Given**: change `alpha` has completed archive and is running in push post-archive mode
-- **When**: `alpha` receives a push-completed success event
-- **Then**: reducer-owned terminal state for `alpha` becomes `Pushed`
-- **And**: display status for `alpha` is `pushed`
-- **And**: `alpha` is not displayed as `merged`
+#### Scenario: opted-in local merge remains non-terminal
 
-#### Scenario: pushed terminal is not explicit retry candidate
+**Given**: change `alpha` is running with upstream integration enabled
+**When**: its archived result merges successfully into cumulative base
+**Then**: reducer-owned state records publication progress without terminal `Merged`
+**And**: the display does not claim final `merged` success
+**And**: ordinary apply and acceptance dispatch for `alpha` remain disabled
 
-- **Given**: change `alpha` has terminal state `Pushed`
-- **When**: an explicit retry transition is requested for `alpha`
-- **Then**: `alpha` keeps terminal state `Pushed`
-- **And**: `alpha` is not reintroduced as ordinary apply dispatch work
+#### Scenario: remote-confirmed publication becomes pushed terminal
 
-#### Scenario: late push success supersedes recoverable error
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**And**: Conflux confirms through remote observation that cumulative HEAD is reachable from the selected remote base
+**When**: `alpha` receives change-scoped `PushCompleted`
+**Then**: terminal state becomes `Pushed`
+**And**: display status is `pushed`
+**And**: `alpha` is not displayed as `merged`
 
-- **Given**: change `alpha` has terminal state `Error`
-- **When**: `alpha` receives a repository-visible push-completed success event from already-running work
-- **Then**: the success event may supersede the error according to existing success precedence rules
-- **And**: no new ordinary apply dispatch is created solely because the error was superseded
+#### Scenario: publication failure remains resumable
+
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**When**: verification, push, or remote confirmation fails
+**Then**: `alpha` does not become `Merged` or `Pushed`
+**And**: reducer-owned state exposes recoverable publication failure or wait evidence
+**And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
+
+#### Scenario: late publication success supersedes recoverable failure
+
+**Given**: change `alpha` has recoverable publication error state
+**And**: already-running or retried repository work later confirms cumulative HEAD on the selected remote
+**When**: `PushCompleted(alpha)` arrives
+**Then**: terminal state becomes `Pushed`
+**And**: no ordinary apply dispatch is created
+
+#### Scenario: pushed terminal is not retryable
+
+**Given**: change `alpha` has terminal state `Pushed`
+**When**: an explicit retry transition is requested
+**Then**: `alpha` remains `Pushed`
+**And**: it is not reintroduced as apply, acceptance, merge, or publication work
 
 ### Requirement: Reducer Input Precedence and Idempotency
 
@@ -882,35 +1092,77 @@ A `ChangesRefreshed` event containing a change in `merge_wait_ids` represents ar
 
 Reducer-owned orchestration state SHALL reflect the latest repository-visible terminal outcome for a change. A recoverable error terminal state SHALL NOT remain the current display state after the same change later emits archive, merge, push, or resolve success events.
 
-Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance/apply/archive/resolve/push attempts are recoverable until the change reaches a repository-visible terminal success or final rejection. Success events MUST NOT overwrite final rejection state.
+Success events MAY supersede `TerminalState::Error` for the same change because errors from acceptance, apply, archive, resolve, or push attempts are recoverable until the change reaches the terminal success required by its invocation mode or final rejection. Success events MUST NOT overwrite final rejection state.
 
-A recoverable error terminal state MUST gate ordinary apply dispatch. The reducer MUST NOT expose a terminal-error change as queued dispatch work unless an explicit retry transition clears the error terminal state first. Explicit retry MUST be limited to recoverable error states and MUST NOT requeue final rejected, merged, pushed, or archived terminal states.
+Without opt-in upstream integration, successful cumulative base integration SHALL transition a parallel change to terminal `Merged`. With opt-in upstream integration, local cumulative base integration SHALL remain non-terminal publication progress, and only change-scoped `PushCompleted` emitted after selected-remote observation confirms cumulative HEAD reachability SHALL transition the change to terminal `Pushed`. An opted-in change MUST NOT be displayed as final `merged` while publication remains pending, failed, stalled, or unconfirmed.
 
-Non-terminal execution blockers that preserve the change for later resume SHALL be represented as `WaitState::Stalled`, not as terminal `Rejected`. Dependency queue waiting SHALL remain represented separately as dependency blocked state.
+A recoverable error terminal state MUST gate ordinary apply dispatch. Explicit retry MUST be limited to recoverable work and MUST NOT requeue final rejected, merged, pushed, or archived terminal states. Retry of an opted-in locally integrated but unpublished change MUST resume upstream publication and MUST NOT create ordinary apply or acceptance dispatch. In persistent local TUI, a publication failure or stall that exhausts its bounded automatic cycle MUST project into the existing operator-visible recoverable error flow, where F5 or the equivalent local web-control retry starts explicit publication retry. The base lane MUST remain closed to later completed-result integration until remote confirmation succeeds or the operator stops orchestration.
 
-<!-- Expected canonical result after archive: `orchestration-state` will include pushed as a terminal success distinct from merged, with the same final-state retry protections as merged. -->
+#### Scenario: disabled cumulative merge becomes merged terminal
 
-#### Scenario: push success becomes pushed terminal state
+**Given**: change `alpha` completes cumulative base integration without upstream integration enabled
+**When**: the reducer receives merge success
+**Then**: terminal state becomes `Merged`
+**And**: display status is `merged`
 
-- **Given**: change `alpha` has completed archive and is running in push post-archive mode
-- **When**: `alpha` receives a push-completed success event
-- **Then**: reducer-owned terminal state for `alpha` becomes `Pushed`
-- **And**: display status for `alpha` is `pushed`
-- **And**: `alpha` is not displayed as `merged`
+#### Scenario: opted-in local merge remains non-terminal
 
-#### Scenario: pushed terminal is not explicit retry candidate
+**Given**: change `alpha` is running with upstream integration enabled
+**When**: its archived result merges successfully into cumulative base
+**Then**: reducer-owned state records publication progress without terminal `Merged`
+**And**: the display does not claim final `merged` success
+**And**: ordinary apply and acceptance dispatch for `alpha` remain disabled
 
-- **Given**: change `alpha` has terminal state `Pushed`
-- **When**: an explicit retry transition is requested for `alpha`
-- **Then**: `alpha` keeps terminal state `Pushed`
-- **And**: `alpha` is not reintroduced as ordinary apply dispatch work
+#### Scenario: remote-confirmed publication becomes pushed terminal
 
-#### Scenario: late push success supersedes recoverable error
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**And**: Conflux confirms through remote observation that cumulative HEAD is reachable from the selected remote base
+**When**: `alpha` receives change-scoped `PushCompleted`
+**Then**: terminal state becomes `Pushed`
+**And**: display status is `pushed`
+**And**: `alpha` is not displayed as `merged`
 
-- **Given**: change `alpha` has terminal state `Error`
-- **When**: `alpha` receives a repository-visible push-completed success event from already-running work
-- **Then**: the success event may supersede the error according to existing success precedence rules
-- **And**: no new ordinary apply dispatch is created solely because the error was superseded
+#### Scenario: publication failure remains resumable
+
+**Given**: change `alpha` is locally integrated with upstream integration enabled
+**When**: verification, push, or remote confirmation fails
+**Then**: `alpha` does not become `Merged` or `Pushed`
+**And**: reducer-owned state exposes recoverable publication failure or wait evidence
+**And**: explicit retry returns `alpha` to publication work rather than ordinary apply work
+
+#### Scenario: persistent TUI retries failed publication
+
+**Given**: local TUI owns publication for change `alpha`
+**And**: the bounded publication cycle has ended in a recoverable failure or stall
+**When**: the TUI projects its reducer-owned state
+**Then**: it displays `alpha` through the existing recoverable Error-mode interaction
+**And**: F5 or the equivalent local web-control action is available as explicit retry
+**And**: later completed results remain waiting before base integration
+**And**: no ordinary apply or acceptance dispatch for `alpha` is created
+
+#### Scenario: successful TUI retry releases waiting base integration
+
+**Given**: local TUI displays recoverable publication failure for change `alpha`
+**And**: change `beta` is waiting before cumulative-base integration
+**When**: the operator explicitly retries and Conflux remotely confirms `alpha`
+**Then**: `alpha` becomes terminal `Pushed`
+**And**: the base lane becomes available for `beta`
+**And**: the TUI remains active
+
+#### Scenario: late publication success supersedes recoverable failure
+
+**Given**: change `alpha` has recoverable publication error state
+**And**: already-running or retried repository work later confirms cumulative HEAD on the selected remote
+**When**: `PushCompleted(alpha)` arrives
+**Then**: terminal state becomes `Pushed`
+**And**: no ordinary apply dispatch is created
+
+#### Scenario: pushed terminal is not retryable
+
+**Given**: change `alpha` has terminal state `Pushed`
+**When**: an explicit retry transition is requested
+**Then**: `alpha` remains `Pushed`
+**And**: it is not reintroduced as apply, acceptance, merge, or publication work
 
 ### Requirement: WebSocket change status consistency with TUI
 

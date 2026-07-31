@@ -1350,7 +1350,11 @@ impl ParallelExecutor {
     ) -> std::result::Result<MergeTaskOutcome, String> {
         let mut outcome = Ok(MergeTaskOutcome::Merged);
         for change_id in deferred.into_iter().take(1) {
-            if self.is_change_already_merged_to_base(&change_id).await {
+            // A change with durable publication-required evidence is already in
+            // cumulative base but is *not* done: retry must resume publication
+            // rather than be discarded as a stale already-merged retry.
+            let owes_publication = self.has_pending_publication_for(&change_id).await;
+            if !owes_publication && self.is_change_already_merged_to_base(&change_id).await {
                 info!(
                     "Skipping stale deferred merge retry for '{}' because it is already merged to base",
                     change_id
@@ -1440,8 +1444,18 @@ impl ParallelExecutor {
                 Ok(super::merge::MergeAttempt::Merged { revision }) => {
                     info!("Deferred merge succeeded for '{}' on retry", change_id);
 
+                    // With upstream publication enabled the base-lane sequence
+                    // already ran `on_merged` and emitted the change-scoped
+                    // publication events; local merge is not terminal there.
+                    let publication_owned_completion = self.upstream_enabled();
+                    let retry_hooks = if publication_owned_completion {
+                        None
+                    } else {
+                        self.hooks.as_ref()
+                    };
+
                     // Run on_merged hook before merged status transition (MergeCompleted event).
-                    if let Some(ref hooks) = self.hooks {
+                    if let Some(hooks) = retry_hooks {
                         let (completed_tasks, total_tasks) =
                             match crate::openspec::list_changes_native() {
                                 Ok(changes) => changes
@@ -1491,18 +1505,20 @@ impl ParallelExecutor {
                     }
 
                     self.clear_resolve_wait_intent_for_outcome(&change_id).await;
-                    self.mark_deferred_merge_completed_in_shared_state(&change_id, &revision)
-                        .await;
+                    if !publication_owned_completion {
+                        self.mark_deferred_merge_completed_in_shared_state(&change_id, &revision)
+                            .await;
 
-                    // Send MergeCompleted after on_merged hook (triggers merged status transition)
-                    send_event(
-                        &self.event_tx,
-                        ParallelEvent::MergeCompleted {
-                            change_id: change_id.clone(),
-                            revision: revision.clone(),
-                        },
-                    )
-                    .await;
+                        // Send MergeCompleted after on_merged hook (triggers merged status transition)
+                        send_event(
+                            &self.event_tx,
+                            ParallelEvent::MergeCompleted {
+                                change_id: change_id.clone(),
+                                revision: revision.clone(),
+                            },
+                        )
+                        .await;
+                    }
 
                     // Clean up workspace.
                     send_event(

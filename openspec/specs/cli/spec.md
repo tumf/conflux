@@ -6,180 +6,95 @@ Defines CLI commands, subcommands, flags, and their behaviors for the cflx binar
 
 ### Requirement: Subcommand Structure
 
-CLI SHALL have a subcommand structure that supports future command extensions. When `--push [remote]` is provided on the top-level TUI entrypoint without an explicit subcommand, the CLI SHALL launch the local TUI with push post-archive mode configured for local parallel execution. If the remote argument is omitted, the remote SHALL default to `origin`. The remote argument MUST NOT contain `:`; branch selection is unsupported and MUST be rejected before TUI orchestration starts. Top-level TUI `--push` MUST NOT be accepted with `--server` until remote server control can explicitly carry push post-archive configuration.
+CLI SHALL have a subcommand structure that supports future command extensions. Bare invocation SHALL launch local TUI. Bare local TUI SHALL accept the same opt-in cumulative upstream integration options as explicit local `tui`: value-less `-u` and `--integrate-upstream` select `origin`, a named remote is accepted only as `--integrate-upstream=<remote>`, and enablement requires `--upstream-verify-command <command>`.
 
-#### Scenario: Run without subcommand
+When `--push [remote]` is provided on the top-level TUI entrypoint without an explicit subcommand, the CLI SHALL launch local TUI with push post-archive mode configured for local parallel execution. Upstream integration and push post-archive mode MUST remain mutually exclusive. Top-level upstream integration and `--push` MUST NOT be accepted with `--server` because remote-client TUI does not own the local cumulative base.
+
+#### Scenario: run without subcommand
 
 - **WHEN** user runs `cflx` without arguments
-- **THEN** the interactive TUI is launched
+- **THEN** the interactive local TUI is launched
 - **AND** the change list is displayed in selection mode
+- **AND** upstream integration is disabled
 
-#### Scenario: Run with unknown subcommand
+#### Scenario: bare TUI enables upstream integration
+
+- **WHEN** user runs `cflx -u --upstream-verify-command '<command>'`
+- **THEN** the interactive TUI is launched in local cumulative parallel mode
+- **AND** TUI orchestration receives the same upstream runtime configuration as `cflx run -u`
+- **AND** selected remote is `origin`
+
+#### Scenario: bare TUI accepts explicit upstream remote
+
+- **WHEN** user runs `cflx --integrate-upstream=upstream --upstream-verify-command '<command>'`
+- **THEN** local TUI upstream integration selects remote `upstream`
+- **AND** the option does not configure push post-archive mode
+
+#### Scenario: bare TUI rejects incompatible publication modes
+
+- **WHEN** user combines upstream integration with `--push` or `--server`
+- **THEN** TUI orchestration does not start
+- **AND** the CLI identifies the incompatible options before repository mutation
+
+#### Scenario: run with unknown subcommand
 
 - **WHEN** user runs with a non-existent subcommand
 - **THEN** an error message with available subcommands is displayed
-
-#### Scenario: Bare TUI push mode defaults to origin
-
-- **WHEN** user runs `cflx --push`
-- **THEN** the interactive TUI is launched in local mode
-- **AND** TUI parallel execution is configured for push post-archive action
-- **AND** the selected remote is `origin`
-
-#### Scenario: Bare TUI push mode accepts remote name
-
-- **WHEN** user runs `cflx --push upstream`
-- **THEN** the interactive TUI is launched in local mode
-- **AND** TUI parallel execution is configured for push post-archive action
-- **AND** the selected remote is `upstream`
-
-#### Scenario: Bare TUI push mode rejects branch selection
-
-- **WHEN** user runs `cflx --push origin:main`
-- **THEN** TUI orchestration does not start
-- **AND** the CLI reports that branch selection is not supported for `--push`
-
-#### Scenario: Bare TUI push mode rejects remote server mode
-
-- **WHEN** user runs `cflx --push --server http://host:39876`
-- **THEN** TUI orchestration does not start
-- **AND** the CLI reports that `--push` is not supported with remote TUI server mode
 
 ### Requirement: run Subcommand
 
 The `run` subcommand SHALL execute the OpenSpec change workflow orchestration loop only when the operator provides an explicit target mode: `--all`, one or more positional change IDs, or the legacy `--change` option. Positional IDs and legacy `--change` values SHALL be normalized into the same explicit change ID target list. `--all` SHALL target all current changes from the initial run snapshot. The target modes SHALL be mutually exclusive.
 
-When `--push [remote]` is provided with parallel execution, `run` SHALL use push post-archive mode instead of base-merge post-archive mode. If the remote argument is omitted, the remote SHALL default to `origin`. The remote argument MUST NOT contain `:`; branch selection is unsupported and MUST be rejected before orchestration starts.
+The `run` subcommand, explicit local `tui` subcommand, and bare local TUI SHALL expose one normalized cumulative upstream integration contract. Value-less `-u` and `--integrate-upstream` SHALL select `origin`; a named remote SHALL require `--integrate-upstream=<remote>`; enablement SHALL require `--upstream-verify-command <command>`. This capability SHALL use cumulative base merge plus change-scoped upstream publication and SHALL NOT use push post-archive mode.
 
-The explicit `tui` subcommand SHALL accept `--push [remote]` with the same remote defaulting and validation rules as `run --push`. For local TUI mode, the option SHALL configure push post-archive mode for local parallel execution. The option MUST NOT be accepted with `tui --server` until remote server control can explicitly carry push post-archive configuration.
+When `--push [remote]` is provided with parallel execution, `run` or local TUI SHALL instead use push post-archive mode. If the remote argument is omitted, the remote SHALL default to `origin`. Upstream integration and `--push` SHALL be mutually exclusive. Upstream integration SHALL be rejected for remote-client `tui --server`, server orchestration, or serial effective execution before work starts.
 
-<!-- Expected canonical result after archive: `run Subcommand` requires explicit target selection for non-interactive run mode, supports positional IDs and legacy `--change`, removes partial execution for unknown IDs, and documents opt-in parallel and TUI push post-archive mode. -->
+#### Scenario: run enables per-change upstream publication
 
-#### Scenario: Run with positional changes
+- **WHEN** user runs `cflx run --all -u --upstream-verify-command '<command>'`
+- **THEN** run uses cumulative base integration and change-scoped upstream publication for remote `origin`
+- **AND** it does not configure push post-archive mode
+- **AND** each successful targeted change requires terminal `pushed`
 
-- **WHEN** user runs `cflx run a b c`
-- **THEN** only changes `a`, `b`, and `c` are processed
-- **AND** the snapshot log shows only `a`, `b`, and `c`
-- **AND** the behavior is equivalent to starting the TUI with those three changes selected for execution
+#### Scenario: explicit local TUI enables equivalent upstream publication
 
-#### Scenario: Run all changes explicitly
+- **WHEN** user runs `cflx tui --integrate-upstream=upstream --upstream-verify-command '<command>'`
+- **THEN** local TUI installs the same upstream publication runtime used by run
+- **AND** selected remote is `upstream`
+- **AND** each completed change publishes without waiting for TUI shutdown or scheduler drain
 
-- **WHEN** user runs `cflx run --all`
-- **THEN** all current changes from the initial run snapshot are targeted
-- **AND** the behavior is equivalent to using the TUI `x` bulk execution mark before starting
+#### Scenario: missing verification command is rejected
 
-#### Scenario: Bare run is rejected
-
-- **WHEN** user runs `cflx run` without `--all`, positional change IDs, or `--change`
+- **WHEN** user supplies `-u` or `--integrate-upstream` to run or local TUI without a non-empty `--upstream-verify-command`
 - **THEN** orchestration does not start
-- **AND** the command exits with an error explaining that `--all` or at least one change ID is required
+- **AND** no fetch, worktree, merge, verification, or push side effect occurs
 
-#### Scenario: Run with specific legacy change option
+#### Scenario: upstream integration rejects push post-archive mode
 
-- **WHEN** user runs `cflx run --change <id>`
-- **THEN** only the specified change is processed
-- **AND** the specified change is handled through the same normalized explicit target list as positional IDs
+- **WHEN** user combines `-u` or `--integrate-upstream` with `--push`
+- **THEN** parsing or startup validation fails before orchestration
+- **AND** the diagnostic explains that cumulative upstream publication and change-branch push are distinct mutually exclusive modes
 
-#### Scenario: Run with comma-separated legacy changes
+#### Scenario: explicit TUI rejects upstream remote server mode
 
-- **WHEN** user runs `cflx run --change a,b,c`
-- **THEN** only changes `a`, `b`, `c` are processed
-- **AND** the snapshot log shows only `a`, `b`, `c`
-- **AND** duplicate and unknown validation matches positional ID validation
-
-#### Scenario: Unknown explicit change is rejected
-
-- **WHEN** user runs `cflx run nonexistent`
-- **AND** no change named `nonexistent` exists in the initial run snapshot
-- **THEN** orchestration does not start
-- **AND** the command exits with an error naming `nonexistent`
-- **AND** no partial subset of requested changes is processed
-
-#### Scenario: Mixed known and unknown explicit changes are rejected
-
-- **WHEN** user runs `cflx run a nonexistent c`
-- **AND** `a` and `c` exist but `nonexistent` does not
-- **THEN** orchestration does not start
-- **AND** the command exits with an error naming `nonexistent`
-- **AND** neither `a` nor `c` is processed as a partial subset
-
-#### Scenario: Duplicate explicit changes are rejected
-
-- **WHEN** user runs `cflx run a a`
-- **THEN** orchestration does not start
-- **AND** the command exits with an error naming duplicate change `a`
-
-#### Scenario: Target modes are mutually exclusive
-
-- **WHEN** user combines `--all` with positional IDs or `--change`
-- **OR** combines positional IDs with `--change`
-- **THEN** parsing or validation fails before orchestration starts
-- **AND** the error explains that exactly one target mode must be used
-
-#### Scenario: Parallel dry-run honors explicit targets
-
-- **WHEN** user runs `cflx run --parallel --dry-run a c`
-- **THEN** the dry-run plan includes only `a` and `c`
-- **AND** unrequested changes are excluded from dependency grouping output
-
-#### Scenario: Parallel execution honors explicit targets
-
-- **WHEN** user runs `cflx run --parallel a c`
-- **THEN** parallel execution starts only for `a` and `c`
-- **AND** unrequested changes are not scheduled into worktrees
-
-#### Scenario: Run push mode defaults to origin
-
-- **WHEN** user runs `cflx run --parallel --push --all`
-- **THEN** run mode is configured for push post-archive action
-- **AND** the selected remote is `origin`
-- **AND** completed change branches are not configured for base-branch merge
-
-#### Scenario: Run push mode accepts remote name
-
-- **WHEN** user runs `cflx run --parallel --push upstream --all`
-- **THEN** run mode is configured for push post-archive action
-- **AND** the selected remote is `upstream`
-
-#### Scenario: Run push mode rejects branch selection
-
-- **WHEN** user runs `cflx run --parallel --push origin:main --all`
-- **THEN** orchestration does not start
-- **AND** the CLI reports that branch selection is not supported for `--push`
-- **AND** no worktree, apply, acceptance, archive, merge, or push work is started
-
-#### Scenario: Explicit TUI push mode defaults to origin
-
-- **WHEN** user runs `cflx tui --push`
-- **THEN** the interactive TUI is launched in local mode
-- **AND** TUI parallel execution is configured for push post-archive action
-- **AND** the selected remote is `origin`
-
-#### Scenario: Explicit TUI push mode accepts remote name
-
-- **WHEN** user runs `cflx tui --push upstream`
-- **THEN** the interactive TUI is launched in local mode
-- **AND** TUI parallel execution is configured for push post-archive action
-- **AND** the selected remote is `upstream`
-
-#### Scenario: Explicit TUI push mode rejects branch selection
-
-- **WHEN** user runs `cflx tui --push origin:main`
+- **WHEN** user runs `cflx tui -u --upstream-verify-command '<command>' --server http://host:39876`
 - **THEN** TUI orchestration does not start
-- **AND** the CLI reports that branch selection is not supported for `--push`
+- **AND** the CLI reports that upstream integration is available only to local TUI
 
-#### Scenario: Explicit TUI push mode rejects remote server mode
+#### Scenario: successful opted-in run exits after all changes are pushed
 
-- **WHEN** user runs `cflx tui --push --server http://host:39876`
-- **THEN** TUI orchestration does not start
-- **AND** the CLI reports that `--push` is not supported with remote TUI server mode
+- **GIVEN** every targeted successful change has completed remote-confirmed upstream publication
+- **WHEN** `cflx run` reports successful completion
+- **THEN** every such change has display status `pushed`
+- **AND** the command exits promptly with status code 0
+- **AND** it does not wait for an additional stop signal
 
-#### Scenario: Successful run exits promptly
+#### Scenario: local TUI remains active after pushed change
 
-- **GIVEN** orchestration completes successfully and no restart was explicitly requested
-- **WHEN** `cflx run --all` or `cflx run <change-id>...` logs successful completion
-- **THEN** the command exits promptly with status code 0
-- **AND** it does not wait for an additional stop signal before terminating
+- **GIVEN** local TUI runs with upstream integration enabled
+- **WHEN** one selected change reaches `pushed`
+- **THEN** the TUI remains active in its normal persistent lifecycle
+- **AND** a later queued change can execute through the same upstream publication contract
 
 ### Requirement: Orchestration loop runs apply and archive
 
@@ -1391,20 +1306,66 @@ TUIはProcessing/Running中のchangeに対してworktree削除を許可しては
 
 WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})` の形式としなければならない（MUST）。Gitリポジトリで実行中の場合、`git add -A` と `git commit --no-verify --allow-empty` 相当の操作で新規WIPコミットを作成しなければならない（MUST）。既存WIPコミットの `--amend` を使用してはならない（MUST NOT）。
 
+Conflux が所有する WIP スナップショットの `git add -A` または `git commit --no-verify --allow-empty` が、管理対象 worktree の Git directory に解決される `index.lock` を既存ファイルのため作成できず失敗した場合に限り、Conflux は `create_progress_commit` の完全な snapshot sequence を最大3回、固定200ミリ秒間隔、backoffなしで再試行しなければならない（MUST）。Conflux は lock を削除してはならず（MUST NOT）、一般の Git command にこの retry policy を適用してはならない（MUST NOT）。
+
+各 attempt 前に `HEAD_before` を記録し、失敗後の HEAD が前進し、その新HEADの唯一のparentが `HEAD_before` で、subjectが期待するWIP messageと完全一致する場合に限り、その attempt をcommit済みとして扱わなければならない（MUST）。履歴中の同一subjectだけを成功証拠にしてはならない（MUST NOT）。Cancellation は VCS trait の内部ではなく progress-commit orchestration boundary で retryable failure 後、待機前、次 attempt 前に確認しなければならない（MUST）。競合が3回で解消しない場合、および分類条件を満たさない VCS error の場合は、作業内容を保持して診断可能な失敗を返さなければならない（MUST）。
+
 #### Scenario: WIP created after successful apply iteration
+
 - Given: 逐次applyループが実行中である
 - When: applyコマンドが正常に完了しイテレーションが終了する
 - Then: WIPスナップショットが新規コミットとして作成される
 
 #### Scenario: WIP created after failed apply iteration
+
 - Given: 逐次applyループが実行中である
 - When: applyコマンドが失敗してイテレーションが終了する
 - Then: 失敗時点の作業内容がWIPスナップショットとして保存される
 
 #### Scenario: WIP created when no progress is made
+
 - Given: 逐次applyループが実行中である
 - When: applyコマンドは成功したがタスク進捗が増加しない
 - Then: 最新の作業内容を反映したWIPスナップショットが作成される
+
+#### Scenario: Transient index lock clears within retry budget
+
+- **GIVEN** Conflux-owned WIP `git add -A` or WIP commit reports an existing `index.lock` that resolves to the current managed worktree Git directory
+- **AND** the lock becomes available before the third total attempt
+- **WHEN** Conflux retries the complete progress-commit snapshot sequence after the fixed 200 ms delay
+- **THEN** the expected WIP commit is created exactly once
+- **AND** staged and unstaged apply output is included in the snapshot
+- **AND** Conflux does not delete or bypass the lock
+
+#### Scenario: Ambiguous commit completion does not duplicate WIP
+
+- **GIVEN** a WIP commit attempt captured `HEAD_before` and then reports failure
+- **AND** current HEAD advanced to a commit whose only parent is `HEAD_before` and whose subject exactly matches the expected WIP message
+- **WHEN** Conflux evaluates whether another attempt is required
+- **THEN** Conflux recognizes that attempt as committed
+- **AND** no duplicate WIP commit is created
+- **AND** a same-subject commit elsewhere in history is not accepted as evidence
+
+#### Scenario: Persistent index lock exhausts retries safely
+
+- **GIVEN** the managed worktree `index.lock` remains unavailable for all three attempts
+- **WHEN** Conflux exhausts the third attempt
+- **THEN** apply fails with command, working directory, lock contention, and attempt diagnostics
+- **AND** the apply output remains preserved in the workspace
+- **AND** the lock file is not deleted
+
+#### Scenario: Cancellation stops lock retry
+
+- **GIVEN** Conflux has classified a WIP snapshot lock failure as retryable
+- **WHEN** runtime cancellation is observed after that failure, before delay, or before the next attempt
+- **THEN** no further snapshot attempt starts
+- **AND** the workspace state remains preserved
+
+#### Scenario: Non-lock VCS failure is not retried
+
+- **GIVEN** a WIP snapshot fails because of a permission, identity, configuration, hook, conflict, or other non-lock VCS error
+- **WHEN** Conflux classifies the failure
+- **THEN** Conflux returns the structured VCS failure without applying the transient lock retry policy
 
 ### Requirement: Archive Context History
 

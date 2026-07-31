@@ -199,6 +199,15 @@ impl UpstreamGit for GitUpstreamOps {
         })
     }
 
+    async fn commit_empty(&self, message: &str) -> PortResult<String> {
+        self.run_checked(
+            "git commit",
+            &["commit", "--allow-empty", "--no-verify", "-m", message],
+        )
+        .await?;
+        self.head_sha().await
+    }
+
     async fn merge_repository_state(&self) -> PortResult<MergeRepositoryState> {
         let (merge_head_present, _, _) = self
             .run(

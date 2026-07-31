@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 
+use super::publication::{parse_publication_trailers, PublicationTrailers};
 use super::trailers::{validate_upstream_merge, UpstreamTrailers};
 
 /// Subject prefix for a single-change cumulative integration.
@@ -66,6 +67,12 @@ pub enum SpineCommitClass {
     CumulativeChangeIntegration { change_ids: Vec<String> },
     /// Validated Conflux upstream integration merge.
     UpstreamIntegration(UpstreamTrailers),
+    /// Conflux-owned publication-required marker for an opted-in integration.
+    ///
+    /// The marker is an empty forward-only commit, so it has exactly one parent
+    /// and carries no tree change of its own; its whole content is the identity
+    /// binding change, remote, and branch to required publication.
+    PublicationMarker(PublicationTrailers),
     /// Anything else: unrelated local-only history.
     Unrelated { reason: String },
 }
@@ -141,6 +148,22 @@ pub fn classify_spine_commit(
         return SpineCommitClass::CumulativeChangeIntegration { change_ids };
     }
 
+    // A publication marker is Conflux-owned evidence, not unrelated history. It
+    // is only recognized when its recorded remote and branch match the selected
+    // identity: a marker bound to a different remote cannot authorize publishing
+    // this one.
+    if let Some(trailers) = parse_publication_trailers(&commit.message) {
+        if trailers.remote == expected_remote && trailers.branch == expected_branch {
+            return SpineCommitClass::PublicationMarker(trailers);
+        }
+        return SpineCommitClass::Unrelated {
+            reason: format!(
+                "publication marker '{}' binds {}/{}, not the selected {}/{}",
+                subject, trailers.remote, trailers.branch, expected_remote, expected_branch
+            ),
+        };
+    }
+
     match validate_upstream_merge(
         &commit.message,
         &commit.parents,
@@ -161,6 +184,8 @@ pub struct SpineValidation {
     pub upstream_merges: Vec<(String, UpstreamTrailers)>,
     /// Change IDs published by validated cumulative integrations.
     pub integrated_change_ids: Vec<String>,
+    /// Publication-required markers on the spine, oldest first.
+    pub publication_markers: Vec<(String, PublicationTrailers)>,
     /// First rejected commit, when the spine is not publishable.
     pub rejected: Option<(String, String)>,
 }
@@ -183,6 +208,7 @@ pub fn validate_spine(
     let mut validation = SpineValidation {
         upstream_merges: Vec::new(),
         integrated_change_ids: Vec::new(),
+        publication_markers: Vec::new(),
         rejected: None,
     };
 
@@ -194,6 +220,11 @@ pub fn validate_spine(
             SpineCommitClass::UpstreamIntegration(trailers) => {
                 validation
                     .upstream_merges
+                    .push((commit.sha.clone(), trailers));
+            }
+            SpineCommitClass::PublicationMarker(trailers) => {
+                validation
+                    .publication_markers
                     .push((commit.sha.clone(), trailers));
             }
             SpineCommitClass::Unrelated { reason } => {

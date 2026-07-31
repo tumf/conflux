@@ -84,6 +84,14 @@ pub trait UpstreamGit: Send + Sync {
     /// Non-fast-forward merge of `sha` with the supplied trailer-bearing message.
     async fn merge_no_ff(&self, sha: &str, message: &str) -> PortResult<MergeCommandResult>;
 
+    /// Record a forward-only empty commit carrying identity trailers.
+    ///
+    /// Used for the publication-required marker, which must exist in Git before
+    /// an opted-in local integration can be treated as publication-pending. It is
+    /// deliberately additive: no amend, rebase, reset, or force is involved.
+    /// Returns the new cumulative HEAD.
+    async fn commit_empty(&self, message: &str) -> PortResult<String>;
+
     /// `MERGE_HEAD` / unmerged-index evidence.
     async fn merge_repository_state(&self) -> PortResult<MergeRepositoryState>;
 
