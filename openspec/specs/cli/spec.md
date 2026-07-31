@@ -1278,20 +1278,66 @@ TUIはProcessing/Running中のchangeに対してworktree削除を許可しては
 
 WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, apply#{iteration})` の形式としなければならない（MUST）。Gitリポジトリで実行中の場合、`git add -A` と `git commit --no-verify --allow-empty` 相当の操作で新規WIPコミットを作成しなければならない（MUST）。既存WIPコミットの `--amend` を使用してはならない（MUST NOT）。
 
+Conflux が所有する WIP スナップショットの `git add -A` または `git commit --no-verify --allow-empty` が、管理対象 worktree の Git directory に解決される `index.lock` を既存ファイルのため作成できず失敗した場合に限り、Conflux は `create_progress_commit` の完全な snapshot sequence を最大3回、固定200ミリ秒間隔、backoffなしで再試行しなければならない（MUST）。Conflux は lock を削除してはならず（MUST NOT）、一般の Git command にこの retry policy を適用してはならない（MUST NOT）。
+
+各 attempt 前に `HEAD_before` を記録し、失敗後の HEAD が前進し、その新HEADの唯一のparentが `HEAD_before` で、subjectが期待するWIP messageと完全一致する場合に限り、その attempt をcommit済みとして扱わなければならない（MUST）。履歴中の同一subjectだけを成功証拠にしてはならない（MUST NOT）。Cancellation は VCS trait の内部ではなく progress-commit orchestration boundary で retryable failure 後、待機前、次 attempt 前に確認しなければならない（MUST）。競合が3回で解消しない場合、および分類条件を満たさない VCS error の場合は、作業内容を保持して診断可能な失敗を返さなければならない（MUST）。
+
 #### Scenario: WIP created after successful apply iteration
+
 - Given: 逐次applyループが実行中である
 - When: applyコマンドが正常に完了しイテレーションが終了する
 - Then: WIPスナップショットが新規コミットとして作成される
 
 #### Scenario: WIP created after failed apply iteration
+
 - Given: 逐次applyループが実行中である
 - When: applyコマンドが失敗してイテレーションが終了する
 - Then: 失敗時点の作業内容がWIPスナップショットとして保存される
 
 #### Scenario: WIP created when no progress is made
+
 - Given: 逐次applyループが実行中である
 - When: applyコマンドは成功したがタスク進捗が増加しない
 - Then: 最新の作業内容を反映したWIPスナップショットが作成される
+
+#### Scenario: Transient index lock clears within retry budget
+
+- **GIVEN** Conflux-owned WIP `git add -A` or WIP commit reports an existing `index.lock` that resolves to the current managed worktree Git directory
+- **AND** the lock becomes available before the third total attempt
+- **WHEN** Conflux retries the complete progress-commit snapshot sequence after the fixed 200 ms delay
+- **THEN** the expected WIP commit is created exactly once
+- **AND** staged and unstaged apply output is included in the snapshot
+- **AND** Conflux does not delete or bypass the lock
+
+#### Scenario: Ambiguous commit completion does not duplicate WIP
+
+- **GIVEN** a WIP commit attempt captured `HEAD_before` and then reports failure
+- **AND** current HEAD advanced to a commit whose only parent is `HEAD_before` and whose subject exactly matches the expected WIP message
+- **WHEN** Conflux evaluates whether another attempt is required
+- **THEN** Conflux recognizes that attempt as committed
+- **AND** no duplicate WIP commit is created
+- **AND** a same-subject commit elsewhere in history is not accepted as evidence
+
+#### Scenario: Persistent index lock exhausts retries safely
+
+- **GIVEN** the managed worktree `index.lock` remains unavailable for all three attempts
+- **WHEN** Conflux exhausts the third attempt
+- **THEN** apply fails with command, working directory, lock contention, and attempt diagnostics
+- **AND** the apply output remains preserved in the workspace
+- **AND** the lock file is not deleted
+
+#### Scenario: Cancellation stops lock retry
+
+- **GIVEN** Conflux has classified a WIP snapshot lock failure as retryable
+- **WHEN** runtime cancellation is observed after that failure, before delay, or before the next attempt
+- **THEN** no further snapshot attempt starts
+- **AND** the workspace state remains preserved
+
+#### Scenario: Non-lock VCS failure is not retried
+
+- **GIVEN** a WIP snapshot fails because of a permission, identity, configuration, hook, conflict, or other non-lock VCS error
+- **WHEN** Conflux classifies the failure
+- **THEN** Conflux returns the structured VCS failure without applying the transient lock retry policy
 
 ### Requirement: Archive Context History
 
@@ -2156,3 +2202,75 @@ Generated shell completion scripts SHALL provide workspace-local OpenSpec change
 - **AND** does not initialize runtime logging
 - **AND** does not create, update, or delete workflow state
 - **AND** exits with status code 0 and empty stdout when no workspace or no candidates exist
+
+### Requirement: Repository-Scoped Orchestration Lock
+
+Conflux MUST allow at most one local orchestration-owning process for a Git repository at a time. Repository identity MUST be based on the canonical Git common directory so linked worktrees share the same exclusion scope. Ownership MUST use an OS-managed, non-blocking process lock retained for the process lifetime; diagnostic file contents MUST NOT determine lock ownership or workflow state.
+
+#### Scenario: Competing process in the same repository is rejected
+
+- **GIVEN** a local `cflx run`, local TUI, or `cflx server` process owns the repository lock
+- **WHEN** another local orchestration-owning invocation targets the same Git common directory
+- **THEN** the second invocation exits non-zero before starting orchestration, API listeners, lifecycle adapters, or AI subprocesses
+- **AND** the owning process continues unaffected
+
+#### Scenario: Linked worktrees share one lock
+
+- **GIVEN** two worktrees resolve to the same canonical Git common directory
+- **AND** one worktree has a local orchestration-owning Conflux process
+- **WHEN** local orchestration is started from the other worktree
+- **THEN** the second invocation is rejected as a repository lock conflict
+
+#### Scenario: Different repositories run concurrently
+
+- **GIVEN** two working directories resolve to different canonical Git common directories
+- **WHEN** local orchestration is started in both directories
+- **THEN** each process may acquire its own repository lock
+
+#### Scenario: Process termination releases ownership
+
+- **GIVEN** a process owns a repository lock
+- **WHEN** that process exits normally or is terminated abnormally
+- **THEN** the OS releases the lock with the owning file descriptor
+- **AND** a later local orchestration invocation can acquire the lock even if diagnostic metadata remains
+
+#### Scenario: Non-owning commands remain available
+
+- **GIVEN** a process owns a repository lock
+- **WHEN** another invocation runs a non-orchestration command or uses TUI remote-client mode
+- **THEN** that invocation does not attempt to acquire the local orchestration lock
+
+### Requirement: Repository Lock Conflict Diagnostics
+
+A lock owner MUST publish best-effort diagnostic metadata containing its PID, start time, canonical workspace, and invocation mode. After an API listener successfully binds, the owner MUST update the metadata with the actual API base URL. A conflicting invocation MUST display all valid available owner metadata, MUST omit unavailable API information, and MUST remain safe when metadata is missing or malformed.
+
+#### Scenario: Conflict reports an active API endpoint
+
+- **GIVEN** a process owns the repository lock
+- **AND** its API listener has successfully bound and returned an actual accessible URL
+- **WHEN** another local orchestration-owning invocation targets the repository
+- **THEN** the conflict diagnostic includes the owner PID, invocation mode, start time, canonical workspace, and actual API base URL
+- **AND** an OS-assigned port is reported when the owner requested port `0`
+
+#### Scenario: Conflict before API bind omits endpoint
+
+- **GIVEN** a process owns the repository lock
+- **AND** no API listener is active or listener binding has not completed
+- **WHEN** another local orchestration-owning invocation targets the repository
+- **THEN** the conflict diagnostic identifies the owner from valid available metadata
+- **AND** the diagnostic does not claim an API URL
+
+#### Scenario: Malformed metadata does not control ownership
+
+- **GIVEN** the repository lock is held but its diagnostic metadata is absent, incomplete, or malformed
+- **WHEN** another local orchestration-owning invocation attempts startup
+- **THEN** the second invocation is rejected because the OS lock is held
+- **AND** the conflict diagnostic reports a generic live-lock conflict plus any fields that can be read safely
+
+#### Scenario: Stale metadata does not block startup
+
+- **GIVEN** diagnostic metadata remains from a previous process
+- **AND** no process holds the OS lock
+- **WHEN** local orchestration starts
+- **THEN** it acquires the lock and replaces the stale diagnostic metadata
+- **AND** the previous PID or API URL does not affect workflow routing

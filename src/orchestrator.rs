@@ -1137,6 +1137,7 @@ impl Orchestrator {
                     change_id,
                     &progress,
                     iteration,
+                    None,
                 )
                 .await
                 {

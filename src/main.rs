@@ -31,6 +31,8 @@ mod permission;
 mod process_manager;
 mod progress;
 mod remote;
+#[allow(dead_code)]
+mod repo_lock;
 #[allow(dead_code, unused_imports)]
 mod runtime;
 mod serial_run_service;
@@ -444,6 +446,53 @@ fn log_startup(mode: &str) {
     info!("Starting cflx {} mode={}.", VERSION_WITH_BUILD, mode);
 }
 
+/// Classify the parsed CLI invocation for repository-lock purposes.
+///
+/// Returns the entrypoint kind plus whether a TUI invocation is a remote client
+/// (which owns no local orchestration).
+fn repository_lock_invocation(cli: &Cli) -> (repo_lock::InvocationKind, bool) {
+    match &cli.command {
+        None => (repo_lock::InvocationKind::DefaultTui, cli.server.is_some()),
+        Some(Commands::Tui(args)) => (repo_lock::InvocationKind::Tui, args.server.is_some()),
+        Some(Commands::Run(_)) => (repo_lock::InvocationKind::Run, false),
+        Some(Commands::Server(_)) => (repo_lock::InvocationKind::Server, false),
+        _ => (repo_lock::InvocationKind::Other, false),
+    }
+}
+
+/// Take the repository orchestration lock before any startup side effect.
+///
+/// Runs before logging adapters, listeners, AI subprocesses, and orchestration
+/// so a rejected invocation leaves the repository and the existing owner
+/// completely untouched. The acquired lock is retained for the process
+/// lifetime; the OS releases it when the process exits, normally or not.
+fn acquire_repository_lock(cli: &Cli) {
+    let (kind, remote_client) = repository_lock_invocation(cli);
+    let mode = match repo_lock::classify_invocation(kind, remote_client) {
+        repo_lock::LockDecision::Bypass => return,
+        repo_lock::LockDecision::Acquire(mode) => mode,
+    };
+
+    let Ok(workspace) = std::env::current_dir() else {
+        return;
+    };
+
+    match repo_lock::acquire(&workspace, mode) {
+        // No Git repository here, so there is no repository identity to guard.
+        Ok(None) => {}
+        Ok(Some(lock)) => repo_lock::install(lock),
+        Err(err @ repo_lock::LockError::Conflict(_)) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        // An unusable lock file proves no conflict, so refusing to start would
+        // be a worse failure than continuing without exclusion.
+        Err(err) => {
+            eprintln!("Warning: repository lock unavailable, continuing: {err}");
+        }
+    }
+}
+
 fn run_completion_subcommand(args: cli::CompletionArgs) {
     let shell = clap_complete::Shell::from(args.shell);
     let mut command = Cli::command();
@@ -673,11 +722,16 @@ async fn main() -> Result<()> {
 
     // Top-level upstream options only reach the bare local TUI. An explicit
     // subcommand parses its own copies, so accepting them here would silently
-    // drop an opt-in whose publication is part of the success contract.
+    // drop an opt-in whose publication is part of the success contract. This is
+    // a pure usage check, so rejecting here still leaves the repository and any
+    // existing lock owner untouched.
     if let Err(error) = cli.validate_upstream_option_placement() {
         eprintln!("Error: {error}");
         std::process::exit(2);
     }
+
+    // Repository exclusion is decided before anything observable happens.
+    acquire_repository_lock(&cli);
 
     match cli.command {
         // Completion commands intentionally run before logging/config/orchestration paths.
