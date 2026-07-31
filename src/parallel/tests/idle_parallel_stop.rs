@@ -23,8 +23,12 @@
 //!
 //! Tokio time is deliberately not paused here: the loop shells out to git while preparing
 //! for parallel execution, and paused-time auto-advance fires test timers instead of waiting
-//! for those child processes. The waits below are therefore real but short, keeping both
-//! tests inside the 1s default-suite limit.
+//! for those child processes. Real time therefore means the scheduler's own progress is not
+//! controllable, so neither test may order itself against the loop with a fixed sleep: the only
+//! fixed wait is the short window in which terminal stop must *not* appear, and every other wait
+//! is event-driven and returns as soon as the awaited event arrives. Their timeouts are generous
+//! must-arrive bounds that are only ever reached once the assertion has already failed, so both
+//! tests stay well inside the 1s default-suite limit even under full-suite load.
 
 use crate::analyzer::{AnalysisOutcome, AnalysisProvenance, AnalysisResult};
 use crate::config::OrchestratorConfig;
@@ -43,11 +47,17 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// Bounded wait for an event that must arrive; only reached when the assertion fails.
-const EVENT_WAIT: Duration = Duration::from_millis(500);
+/// Bounded wait for an event that must arrive; generous because it is only ever reached when
+/// the assertion has already failed, so it costs nothing on the passing path but keeps the
+/// tests from reporting a false failure when the default suite runs them under heavy load.
+const EVENT_WAIT: Duration = Duration::from_secs(5);
 
 /// Window in which terminal stop must NOT be observed while shutdown work is outstanding.
 const NO_STOP_WINDOW: Duration = Duration::from_millis(150);
+
+/// Operator-visible notice emitted by `drain_pending_merge_results_after_cancellation` once it
+/// starts waiting on the single pending background merge these tests leave outstanding.
+const PENDING_MERGE_NOTICE: &str = "Waiting for 1 pending background merge/base-lane task(s)";
 
 type AnalysisFuture<'a> = Pin<Box<dyn Future<Output = AnalysisOutcome> + Send + 'a>>;
 
@@ -138,6 +148,54 @@ async fn recv_until_stopped(events: &mut mpsc::Receiver<ParallelEvent>, logs: &m
         }
     }
     panic!("scheduler event stream closed before ParallelEvent::Stopped; logs: {logs:?}");
+}
+
+/// Receive scheduler events until the cancellation drain announces the pending background
+/// merge wait, collecting log messages the same way [`recv_until_stopped`] does.
+///
+/// Waiting for this notice — rather than sending the injected merge result on a fixed timer —
+/// is what makes the pending-merge regression deterministic. The notice is emitted from inside
+/// `drain_pending_merge_results_after_cancellation`, so once it is observed the scheduler loop
+/// has already left `wait_for_scheduler_event` and its ordinary `merge_result_rx.recv()` select
+/// arm is unreachable; the drain's own recv loop is then the only possible receiver. On a fixed
+/// timer the two are still racing under suite load, and the select arm can consume the result
+/// before the loop ever observes cancellation, skipping the drain path entirely.
+///
+/// Logs already collected by an earlier bounded wait are checked first, so the notice is not
+/// missed when it arrives during the no-stop window.
+async fn recv_until_pending_merge_notice(
+    events: &mut mpsc::Receiver<ParallelEvent>,
+    logs: &mut Vec<String>,
+) {
+    if logs
+        .iter()
+        .any(|message| message.contains(PENDING_MERGE_NOTICE))
+    {
+        return;
+    }
+    while let Some(event) = events.recv().await {
+        match event {
+            ParallelEvent::Log(entry) => {
+                let is_notice = entry.message.contains(PENDING_MERGE_NOTICE);
+                logs.push(entry.message);
+                if is_notice {
+                    return;
+                }
+            }
+            ParallelEvent::Stopped => panic!(
+                "terminal stop was established while the background merge was still pending, \
+                 without ever telling the operator why stopping waits; logs: {logs:?}"
+            ),
+            ParallelEvent::AllCompleted => {
+                panic!("a cancelled run must not report AllCompleted; logs: {logs:?}")
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "scheduler event stream closed before the pending background merge wait was announced; \
+         logs: {logs:?}"
+    );
 }
 
 #[tokio::test]
@@ -259,6 +317,16 @@ async fn idle_parallel_stop_cancelled_scheduler_handles_pending_merge_before_sto
         "the scheduler loop must still be inside its cleanup barrier"
     );
 
+    // Hand off to the drain before injecting the result: only once the drain has announced the
+    // wait is the loop's ordinary merge-result select arm out of the picture, so the drain's own
+    // recv loop is guaranteed to be the receiver no matter how slowly the loop ran under load.
+    tokio::time::timeout(
+        EVENT_WAIT,
+        recv_until_pending_merge_notice(&mut events, &mut logs),
+    )
+    .await
+    .expect("the operator must see why stopping waits before terminal stop is established");
+
     // The detached merge task finally reports its outcome.
     merge_task
         .send(MergeResult {
@@ -278,11 +346,6 @@ async fn idle_parallel_stop_cancelled_scheduler_handles_pending_merge_before_sto
         pending_merge_count.load(Ordering::SeqCst),
         0,
         "the pending merge result must be handled before terminal stop; logs: {logs:?}"
-    );
-    assert!(
-        logs.iter()
-            .any(|message| message.contains("pending background merge/base-lane task")),
-        "the operator must see why stopping waits; logs: {logs:?}"
     );
 
     scheduler
