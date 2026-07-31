@@ -7,7 +7,9 @@
 - [x] Add a real temporary Git repository test that holds the managed worktree `index.lock`, releases it within the retry budget, and proves the WIP snapshot succeeds without losing staged or unstaged apply output. (verification: integration - `cargo test transient_wip_commit_lock_recovers`; verification-id: transient-wip-lock-tests)
 - [x] Add failure-path tests proving live-lock exhaustion retains the workspace and actionable diagnostics, cancellation prevents another attempt, and representative non-lock Git failures are not retried. (verification: integration - `cargo test transient_wip_commit_lock`; verification-id: transient-wip-lock-tests)
 
-## Implementation Evidence
+## Notes
+
+Implementation evidence:
 
 - Classifier and retry policy: `src/execution/wip_lock_retry.rs`
 - Snapshot orchestration boundary (retry plus cancellation): `src/execution/apply.rs` (`create_progress_commit`, `create_progress_commit_with_environment`)
