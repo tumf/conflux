@@ -24,6 +24,10 @@ else
   echo "dashboard/dist not found at ${ROOT_WORKTREE_PATH}/dashboard/dist; skipping copy (cargo build may fail)" 1>&2
 fi
 
+if [ ! -d .codegraph ]; then
+  codegraph init
+fi
+
 hooks_dir="$(git rev-parse --git-dir 2>/dev/null)/hooks"
 if [ -n "$hooks_dir" ]; then
   case "$hooks_dir" in
