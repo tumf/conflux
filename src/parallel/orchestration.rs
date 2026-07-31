@@ -265,6 +265,12 @@ impl ParallelExecutor {
                 send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
                 return Err(err);
             }
+
+            // Restart and explicit-retry recovery. A publication-required
+            // integration that is not remote-reachable is resumable publication
+            // work; it must never become ordinary apply or acceptance dispatch,
+            // and it must not be reported as terminal `merged`.
+            self.resume_pending_publications().await;
         }
 
         // Deferred explicit-target classification boundary.

@@ -1765,6 +1765,11 @@ impl OrchestratorState {
                 let rt = self.runtime_entry(change_id);
                 if rt.can_success_supersede_terminal() {
                     rt.transition_to_terminal(TerminalState::Pushed);
+                    rt.queue_intent = QueueIntent::NotQueued;
+                    // Confirmed publication ends this change's base-lane work, so
+                    // any retry intent recorded while it was publishing must not
+                    // survive as ordinary merge/resolve work.
+                    self.clear_base_mutating_wait_queues(change_id);
                 }
             }
             ExecutionEvent::PushFailed {
@@ -4986,6 +4991,181 @@ mod tests {
             state.display_status("ff"),
             "merged",
             "Terminal Merged from fast-forward resolve must not regress to merge wait"
+        );
+    }
+
+    // ── Opted-in per-change upstream publication ────────────────────────────
+
+    /// Set a parallel change up to the point where its archived result has just
+    /// been integrated into cumulative base.
+    fn per_change_upstream_state(change_id: &str) -> OrchestratorState {
+        use crate::events::ExecutionEvent;
+
+        let mut state =
+            OrchestratorState::with_mode(vec![change_id.to_string()], 0, ExecutionMode::Parallel);
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived(change_id.to_string()));
+        state
+    }
+
+    fn per_change_upstream_push_started(change_id: &str) -> crate::events::ExecutionEvent {
+        crate::events::ExecutionEvent::PushStarted {
+            change_id: change_id.to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        }
+    }
+
+    fn per_change_upstream_push_completed(change_id: &str) -> crate::events::ExecutionEvent {
+        crate::events::ExecutionEvent::PushCompleted {
+            change_id: change_id.to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        }
+    }
+
+    fn per_change_upstream_push_failed(change_id: &str) -> crate::events::ExecutionEvent {
+        crate::events::ExecutionEvent::PushFailed {
+            change_id: change_id.to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            error: "upstream publication incomplete: verification failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_disabled_cumulative_merge_stays_merged() {
+        use crate::events::ExecutionEvent;
+
+        // Without the option the execution path still emits MergeCompleted, and
+        // that must keep its existing terminal meaning.
+        let mut state = per_change_upstream_state("alpha");
+        state.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "alpha".to_string(),
+            revision: "merge-rev".to_string(),
+        });
+
+        assert_eq!(state.display_status("alpha"), "merged");
+        assert!(state.is_terminal_change("alpha"));
+    }
+
+    #[test]
+    fn per_change_upstream_local_integration_is_not_terminal_merged() {
+        // With the option enabled the execution path suppresses MergeCompleted
+        // and reports publication progress instead, so nothing can observe a
+        // final `merged` while publication is still owed.
+        let mut state = per_change_upstream_state("alpha");
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+
+        assert_ne!(state.display_status("alpha"), "merged");
+        assert!(
+            !state.is_terminal_change("alpha"),
+            "publication progress must remain non-terminal"
+        );
+        assert!(
+            !state.queued_change_ids().contains(&"alpha".to_string()),
+            "a publishing change must not be ordinary queued apply work"
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_remote_confirmation_becomes_pushed_terminal() {
+        let mut state = per_change_upstream_state("alpha");
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        state.apply_execution_event(&per_change_upstream_push_completed("alpha"));
+
+        assert_eq!(state.display_status("alpha"), "pushed");
+        assert!(state.is_terminal_change("alpha"));
+        assert_ne!(state.display_status("alpha"), "merged");
+    }
+
+    #[test]
+    fn per_change_upstream_publication_failure_is_recoverable_not_merged() {
+        let mut state = per_change_upstream_state("alpha");
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        state.apply_execution_event(&per_change_upstream_push_failed("alpha"));
+
+        assert_eq!(
+            state.display_status("alpha"),
+            "error",
+            "a failed publication projects into the existing recoverable error flow"
+        );
+        assert!(
+            state.is_terminal_error_change("alpha"),
+            "the recoverable error must gate ordinary apply dispatch"
+        );
+
+        // Explicit retry (F5 or the equivalent local web control) is accepted.
+        let outcome = state.apply_command(ReducerCommand::RetryError("alpha".to_string()));
+        assert!(matches!(outcome, ReduceOutcome::Changed(_)));
+    }
+
+    #[test]
+    fn per_change_upstream_late_confirmation_supersedes_publication_failure() {
+        let mut state = per_change_upstream_state("alpha");
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        state.apply_execution_event(&per_change_upstream_push_failed("alpha"));
+        assert_eq!(state.display_status("alpha"), "error");
+
+        state.apply_execution_event(&per_change_upstream_push_completed("alpha"));
+
+        assert_eq!(state.display_status("alpha"), "pushed");
+        assert!(
+            !state.queued_change_ids().contains(&"alpha".to_string()),
+            "confirmed publication must not leave ordinary apply dispatch behind"
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_pushed_terminal_is_not_retryable() {
+        let mut state = per_change_upstream_state("alpha");
+        state.apply_execution_event(&per_change_upstream_push_started("alpha"));
+        state.apply_execution_event(&per_change_upstream_push_completed("alpha"));
+
+        assert!(matches!(
+            state.apply_command(ReducerCommand::RetryError("alpha".to_string())),
+            ReduceOutcome::NoOp
+        ));
+        assert_eq!(state.display_status("alpha"), "pushed");
+
+        // Nor may it be reintroduced as merge/resolve work.
+        assert!(matches!(
+            state.apply_command(ReducerCommand::ResolveMerge("alpha".to_string())),
+            ReduceOutcome::NoOp
+        ));
+        assert_eq!(state.display_status("alpha"), "pushed");
+    }
+
+    #[test]
+    fn per_change_upstream_confirmation_clears_base_lane_retry_intent() {
+        use crate::events::ExecutionEvent;
+
+        let mut state = per_change_upstream_state("alpha");
+        // A publication that had to wait behind the lane records resolve-wait
+        // retry intent; confirmation must clear it rather than leave it as
+        // ordinary merge work. The first deferral makes the change idle, which
+        // is the state an auto-resumable lane wait is recorded from.
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "base lane busy".to_string(),
+            auto_resumable: false,
+        });
+        state.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "alpha".to_string(),
+            reason: "waiting for publication of beta".to_string(),
+            auto_resumable: true,
+        });
+        assert!(state
+            .resolve_wait_change_ids()
+            .contains(&"alpha".to_string()));
+
+        state.apply_execution_event(&per_change_upstream_push_completed("alpha"));
+
+        assert_eq!(state.display_status("alpha"), "pushed");
+        assert!(
+            !state
+                .resolve_wait_change_ids()
+                .contains(&"alpha".to_string()),
+            "confirmed publication must clear base-lane retry intent"
         );
     }
 }

@@ -488,9 +488,15 @@ impl ParallelRunService {
         // ResolveWait/RejectWait in the reducer before constructing the executor, and
         // replacing that reducer here creates split-brain retry ownership.
         executor.ensure_shared_orchestrator_state(self.shared_orchestrator_state.clone());
-        let allow_empty_when_resolve_wait = changes.is_empty() && executor.has_resolve_wait();
+        // An opted-in run must reach the executor's upstream boundary even with
+        // an empty queue: a change that is archived and integrated but not yet
+        // published owes only publication, and it is no longer an active change,
+        // so short-circuiting here would strand it unpublished with no way for
+        // an operator retry to resume it.
+        let allow_empty_queue = changes.is_empty()
+            && (executor.has_resolve_wait() || executor.has_upstream_integration());
         let changes = match self
-            .prepare_parallel_execution(changes, &event_tx, allow_empty_when_resolve_wait)
+            .prepare_parallel_execution(changes, &event_tx, allow_empty_queue)
             .await?
         {
             Some(changes) => changes,
@@ -1817,6 +1823,162 @@ mod tests {
         assert!(
             got_rejection,
             "ParallelStartRejected must be forwarded to the callback when all changes are rejected at start time"
+        );
+    }
+
+    // ── Opted-in per-change upstream publication ────────────────────────────
+
+    fn per_change_upstream_git(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// A repository on `main` with a local bare remote, an archived change, and
+    /// a cumulative-base integration that records required publication but was
+    /// never pushed.
+    fn per_change_upstream_unpublished_repo() -> Option<(TempDir, PathBuf)> {
+        let dir = TempDir::new().ok()?;
+        let root = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&root).ok()?;
+        per_change_upstream_git(dir.path(), &["init", "--bare", "-b", "main", "remote.git"])?;
+        per_change_upstream_git(&root, &["init", "-b", "main"])?;
+        per_change_upstream_git(&root, &["config", "user.email", "test@example.com"])?;
+        per_change_upstream_git(&root, &["config", "user.name", "Test User"])?;
+        per_change_upstream_git(&root, &["config", "commit.gpgsign", "false"])?;
+        std::fs::write(root.join("README.md"), "# base\n").ok()?;
+        per_change_upstream_git(&root, &["add", "-A"])?;
+        per_change_upstream_git(&root, &["commit", "-m", "Initial commit"])?;
+        per_change_upstream_git(&root, &["remote", "add", "origin", remote.to_str()?])?;
+        per_change_upstream_git(&root, &["push", "-u", "origin", "main"])?;
+
+        let archive = root.join("openspec/changes/archive/alpha");
+        std::fs::create_dir_all(&archive).ok()?;
+        std::fs::write(archive.join("proposal.md"), "# archived alpha\n").ok()?;
+        per_change_upstream_git(&root, &["add", "-A"])?;
+        per_change_upstream_git(&root, &["commit", "-m", "Archive: alpha"])?;
+        let marker = crate::upstream::publication::format_publication_marker_message(
+            "alpha", "origin", "main",
+        );
+        per_change_upstream_git(&root, &["commit", "--allow-empty", "-m", &marker])?;
+        Some((dir, root))
+    }
+
+    /// Run one finite opted-in run over a repository whose only outstanding work
+    /// is publication, and return the events it emitted in order.
+    async fn per_change_upstream_finite_run(
+        root: &std::path::Path,
+        verify_command: &str,
+    ) -> Vec<ParallelEvent> {
+        let mut service = ParallelRunService::new(root.to_path_buf(), upstream_test_config());
+        service.set_upstream_integration(crate::upstream::UpstreamRuntime {
+            config: crate::upstream::UpstreamIntegrationConfig::new("origin", verify_command),
+            branch: "main".to_string(),
+        });
+
+        // No dynamic queue: this is a finite run, so the scheduler drains and
+        // the run must decide completion for itself.
+        let (event_tx, mut event_rx) = mpsc::channel::<ParallelEvent>(256);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+
+        service
+            .run_parallel_with_channel_and_queue_state(
+                Vec::new(),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .expect("finite opted-in run");
+        collector.await.expect("event collector")
+    }
+
+    /// A finite run may only report completion after the remote has confirmed
+    /// every targeted change. Ordering — not just presence — is the contract.
+    #[tokio::test]
+    async fn per_change_upstream_finite_run_completes_only_after_confirmation() {
+        let Some((_dir, root)) = per_change_upstream_unpublished_repo() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let head = per_change_upstream_git(&root, &["rev-parse", "HEAD"]).expect("head");
+
+        let events = per_change_upstream_finite_run(&root, "exit 0").await;
+
+        let pushed = events
+            .iter()
+            .position(|event| {
+                matches!(event, ParallelEvent::PushCompleted { change_id, .. } if change_id == "alpha")
+            })
+            .expect("the targeted change must reach confirmed publication");
+        let completed = events
+            .iter()
+            .position(|event| matches!(event, ParallelEvent::AllCompleted))
+            .expect("a successful finite run reports completion");
+        assert!(
+            pushed < completed,
+            "AllCompleted must follow remote confirmation, never precede it"
+        );
+        assert_eq!(
+            per_change_upstream_git(&root, &["ls-remote", "origin", "refs/heads/main"])
+                .expect("ls-remote")
+                .split_whitespace()
+                .next()
+                .expect("remote head"),
+            head,
+            "completion is reported against a remotely observed cumulative HEAD"
+        );
+    }
+
+    /// A blocked publication is not a slow success: the run reports no
+    /// completion at all, and the change stays resumable.
+    #[tokio::test]
+    async fn per_change_upstream_finite_run_withholds_completion_when_publication_fails() {
+        let Some((_dir, root)) = per_change_upstream_unpublished_repo() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let remote_before =
+            per_change_upstream_git(&root, &["ls-remote", "origin", "refs/heads/main"])
+                .expect("ls-remote");
+
+        let events = per_change_upstream_finite_run(&root, "exit 1").await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ParallelEvent::AllCompleted)),
+            "a finite run with an unpublished change must not report completion"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                ParallelEvent::PushCompleted { change_id, .. } if change_id == "alpha"
+            )),
+            "failed verification must suppress confirmed publication"
+        );
+        assert_eq!(
+            per_change_upstream_git(&root, &["ls-remote", "origin", "refs/heads/main"])
+                .expect("ls-remote"),
+            remote_before,
+            "nothing may reach the remote when verification fails"
         );
     }
 }

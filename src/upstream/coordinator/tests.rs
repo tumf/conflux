@@ -68,6 +68,8 @@ struct FakeGitInner {
     merge_calls: Vec<(String, String)>,
     push_calls: usize,
     successful_pushes: usize,
+    /// Messages of every forward-only empty commit recorded.
+    empty_commits: Vec<String>,
     next_sha: usize,
 }
 
@@ -174,6 +176,39 @@ impl FakeGit {
 
     fn push_calls(&self) -> usize {
         self.lock().push_calls
+    }
+
+    fn empty_commits(&self) -> Vec<String> {
+        self.lock().empty_commits.clone()
+    }
+
+    /// Merge a change branch into cumulative base with the ordinary
+    /// `Merge change: <id>` subject, as the resolve path does.
+    fn integrate_change(&self, change_id: &str) -> String {
+        let mut inner = self.lock();
+        inner.next_sha += 1;
+        let branch = sha(&format!("wt-{}", change_id));
+        let branch_parent = inner.head.clone();
+        inner.commits.insert(
+            branch.clone(),
+            FakeCommit {
+                message: format!("work for {}\n", change_id),
+                parents: vec![branch_parent],
+                tree_evidence: CommitTreeEvidence::default(),
+            },
+        );
+        let new = sha(&format!("base{}", inner.next_sha));
+        let head = inner.head.clone();
+        inner.commits.insert(
+            new.clone(),
+            FakeCommit {
+                message: format!("Merge change: {}\n", change_id),
+                parents: vec![head, branch],
+                tree_evidence: CommitTreeEvidence::new([change_id.to_string()], []),
+            },
+        );
+        inner.head = new.clone();
+        new
     }
 
     fn is_ancestor_locked(inner: &FakeGitInner, ancestor: &str, descendant: &str) -> bool {
@@ -307,6 +342,24 @@ impl UpstreamGit for FakeGit {
                 })
             }
         }
+    }
+
+    async fn commit_empty(&self, message: &str) -> PortResult<String> {
+        let mut inner = self.lock();
+        inner.next_sha += 1;
+        let new = sha(&format!("marker{}", inner.next_sha));
+        let head = inner.head.clone();
+        inner.commits.insert(
+            new.clone(),
+            FakeCommit {
+                message: message.to_string(),
+                parents: vec![head],
+                tree_evidence: CommitTreeEvidence::default(),
+            },
+        );
+        inner.head = new.clone();
+        inner.empty_commits.push(message.to_string());
+        Ok(new)
     }
 
     async fn merge_repository_state(&self) -> PortResult<MergeRepositoryState> {
@@ -1168,9 +1221,24 @@ async fn upstream_integration_blocked_and_cancelled_outcomes_never_push() {
     }
 }
 
+/// Mark the fixture's existing cumulative history as opted-in publication work.
+///
+/// Under per-change publication, finalization is no longer the normal publishing
+/// mechanism: it is the zero-change recovery boundary, and it recognizes only
+/// explicit opted-in evidence. These cases therefore record the same
+/// publication-required marker the base lane records, then finalize.
+async fn mark_publication_required(h: &mut Harness, change_id: &str) -> String {
+    h.coordinator
+        .record_publication_intent(change_id)
+        .await
+        .unwrap();
+    h.git.head()
+}
+
 #[tokio::test]
 async fn upstream_integration_successful_drain_pushes_once_and_confirms() {
     let mut h = harness();
+    let head = mark_publication_required(&mut h, "a").await;
     let outcome = h
         .coordinator
         .finalize(SchedulerOutcome::DrainedSuccessfully)
@@ -1179,11 +1247,11 @@ async fn upstream_integration_successful_drain_pushes_once_and_confirms() {
     assert_eq!(
         outcome,
         FinalizeOutcome::Completed {
-            pushed_head: sha("local")
+            pushed_head: head.clone()
         }
     );
     assert_eq!(h.git.successful_pushes(), 1);
-    assert_eq!(h.coordinator.pushed_head(), Some(sha("local").as_str()));
+    assert_eq!(h.coordinator.pushed_head(), Some(head.as_str()));
     assert!(h
         .observer
         .events()
@@ -1236,7 +1304,9 @@ async fn upstream_integration_remote_only_advance_creates_no_synthetic_merge() {
 #[tokio::test]
 async fn upstream_integration_noop_run_still_verifies_before_push() {
     let mut h = harness();
-    // Remote at `root` is already integrated, but local work must be published.
+    // Remote at `root` is already integrated, but marked local work must still
+    // be verified and published.
+    mark_publication_required(&mut h, "a").await;
     let outcome = h
         .coordinator
         .finalize(SchedulerOutcome::DrainedSuccessfully)
@@ -1254,6 +1324,7 @@ async fn upstream_integration_noop_run_still_verifies_before_push() {
 #[tokio::test]
 async fn upstream_integration_remote_advance_before_push_returns_to_integration() {
     let mut h = harness();
+    mark_publication_required(&mut h, "a").await;
     // Advance the remote off local history so the pre-push probe must integrate.
     let advanced = h.git.advance_remote("racer", &sha("root"));
     let outcome = h
@@ -1271,6 +1342,7 @@ async fn upstream_integration_remote_advance_before_push_returns_to_integration(
 #[tokio::test]
 async fn upstream_integration_race_rejection_returns_to_checkpoint_then_succeeds() {
     let mut h = harness();
+    mark_publication_required(&mut h, "a").await;
     h.git.lock().push_behaviors.push_back(PushBehavior::Reject {
         porcelain:
             "To fake\n!\trefs/heads/main:refs/heads/main\t[rejected]\t(non-fast-forward)\nDone\n"
@@ -1295,6 +1367,7 @@ async fn upstream_integration_race_rejection_returns_to_checkpoint_then_succeeds
 #[tokio::test]
 async fn upstream_integration_non_repairable_push_failure_stalls_without_agent() {
     let mut h = harness();
+    mark_publication_required(&mut h, "a").await;
     for _ in 0..MAX_FINALIZE_ATTEMPTS {
         h.git
             .lock()
@@ -1341,6 +1414,7 @@ async fn upstream_integration_repairable_push_failure_repairs_then_conflux_pushe
         repair.clone(),
         observer.clone(),
     );
+    coordinator.record_publication_intent("a").await.unwrap();
 
     let outcome = coordinator
         .finalize(SchedulerOutcome::DrainedSuccessfully)
@@ -1366,6 +1440,7 @@ async fn upstream_integration_final_verification_failure_never_pushes() {
         FakeVerifier::scripted([false]),
         FakeRepairAgent::with_attempts(0),
     );
+    mark_publication_required(&mut h, "a").await;
     let outcome = h
         .coordinator
         .finalize(SchedulerOutcome::DrainedSuccessfully)
@@ -1409,4 +1484,363 @@ async fn upstream_integration_reports_lifecycle_without_becoming_routing_authori
         .await
         .unwrap();
     assert!(matches!(repeat, UpstreamStepOutcome::NoOp { .. }));
+}
+
+// ── Change-scoped publication ──────────────────────────────────────────────
+
+/// Publish one completed change end to end: marker, verification, native push,
+/// remote confirmation.
+async fn publish(h: &mut Harness, change_id: &str) -> PublicationOutcome {
+    h.coordinator
+        .record_publication_intent(change_id)
+        .await
+        .unwrap();
+    h.coordinator.publish_change(change_id).await.unwrap()
+}
+
+#[tokio::test]
+async fn per_change_upstream_publishes_one_change_with_one_native_push() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+
+    let outcome = publish(&mut h, "alpha").await;
+
+    let head = h.git.head();
+    assert_eq!(
+        outcome,
+        PublicationOutcome::Published { head: head.clone() }
+    );
+    assert_eq!(h.git.successful_pushes(), 1, "exactly one native push");
+    assert_eq!(h.coordinator.pushed_head(), Some(head.as_str()));
+
+    // The marker binds change, remote, and branch.
+    let markers = h.git.empty_commits();
+    assert_eq!(markers.len(), 1);
+    let trailers = crate::upstream::publication::parse_publication_trailers(&markers[0]).unwrap();
+    assert_eq!(trailers.change_id, "alpha");
+    assert_eq!(trailers.remote, "origin");
+    assert_eq!(trailers.branch, "main");
+
+    // Confirmation is a remote observation, not the push command's exit status.
+    assert!(h
+        .observer
+        .events()
+        .iter()
+        .any(|e| matches!(e, UpstreamEvent::PushConfirmed { head: h2, .. } if h2 == &head)));
+}
+
+#[tokio::test]
+async fn per_change_upstream_does_not_push_an_already_confirmed_head() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    publish(&mut h, "alpha").await;
+
+    // A repeated request for the same cumulative HEAD is an idempotent no-op.
+    let head = h.git.head();
+    let repeat = h.coordinator.publish_change("alpha").await.unwrap();
+
+    assert_eq!(repeat, PublicationOutcome::AlreadyConfirmed { head });
+    assert_eq!(
+        h.git.successful_pushes(),
+        1,
+        "a confirmed revision must never be pushed again"
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_publishes_multiple_successive_changes() {
+    let mut h = harness();
+
+    h.git.integrate_change("alpha");
+    let first = publish(&mut h, "alpha").await;
+    let alpha_head = h.git.head();
+
+    h.git.integrate_change("beta");
+    let second = publish(&mut h, "beta").await;
+    let beta_head = h.git.head();
+
+    assert_eq!(
+        first,
+        PublicationOutcome::Published {
+            head: alpha_head.clone()
+        }
+    );
+    assert_eq!(
+        second,
+        PublicationOutcome::Published {
+            head: beta_head.clone()
+        }
+    );
+    assert_ne!(
+        alpha_head, beta_head,
+        "each change advances cumulative HEAD"
+    );
+    assert_eq!(
+        h.git.successful_pushes(),
+        2,
+        "one confirmed push per advancing cumulative HEAD"
+    );
+    assert_eq!(h.coordinator.pushed_head(), Some(beta_head.as_str()));
+}
+
+#[tokio::test]
+async fn per_change_upstream_confirms_an_interrupted_push_without_pushing_again() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    h.coordinator
+        .record_publication_intent("alpha")
+        .await
+        .unwrap();
+
+    // The prior process pushed but stopped before recording confirmation, so
+    // the remote already contains cumulative HEAD while this process knows
+    // nothing about it.
+    h.git.set_remote_ref(&h.git.head());
+
+    let outcome = h.coordinator.publish_change("alpha").await.unwrap();
+
+    assert_eq!(
+        outcome,
+        PublicationOutcome::AlreadyConfirmed { head: h.git.head() }
+    );
+    assert_eq!(
+        h.git.push_calls(),
+        0,
+        "retry must observe the remote before pushing again"
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_verification_failure_suppresses_push() {
+    let mut h = harness_with(
+        // Every verification attempt fails, including after bounded repair.
+        FakeVerifier::scripted([false, false, false, false, false, false]),
+        FakeRepairAgent::with_attempts(1),
+    );
+    h.git.integrate_change("alpha");
+
+    let outcome = publish(&mut h, "alpha").await;
+
+    assert!(
+        matches!(outcome, PublicationOutcome::Stalled { ref reason } if reason.contains("alpha")),
+        "outcome: {:?}",
+        outcome
+    );
+    assert_eq!(h.git.push_calls(), 0, "a failed verification must not push");
+    assert_eq!(h.coordinator.pushed_head(), None);
+    assert!(!h
+        .observer
+        .events()
+        .iter()
+        .any(|e| matches!(e, UpstreamEvent::PushConfirmed { .. })));
+}
+
+#[tokio::test]
+async fn per_change_upstream_non_repairable_push_failure_stalls_without_agent() {
+    let mut h = harness();
+    {
+        let mut inner = h.git.lock();
+        for _ in 0..MAX_FINALIZE_ATTEMPTS {
+            inner
+                .push_behaviors
+                .push_back(PushBehavior::FailWithoutRefStatus);
+        }
+    }
+    h.git.integrate_change("alpha");
+
+    let outcome = publish(&mut h, "alpha").await;
+
+    assert!(matches!(outcome, PublicationOutcome::Stalled { .. }));
+    assert_eq!(h.coordinator.pushed_head(), None);
+    assert_eq!(
+        h.repair.call_count(),
+        0,
+        "a non-repairable push failure must not invoke the repair agent"
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_remote_race_returns_to_integration_before_publishing() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    h.coordinator
+        .record_publication_intent("alpha")
+        .await
+        .unwrap();
+
+    // The remote advances from the shared root before publication runs, so the
+    // cycle must integrate and reverify rather than pushing stale history.
+    h.git.advance_remote("advanced", &sha("root"));
+
+    let outcome = h.coordinator.publish_change("alpha").await.unwrap();
+
+    assert!(matches!(outcome, PublicationOutcome::Published { .. }));
+    assert!(
+        h.git
+            .merge_calls()
+            .iter()
+            .any(|(target, _)| target == &sha("advanced")),
+        "the remote advance must be integrated with a real merge"
+    );
+    assert_eq!(h.git.successful_pushes(), 1);
+}
+
+// ── Recovery boundaries ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn per_change_upstream_scan_reports_only_unpublished_markers() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    h.coordinator
+        .record_publication_intent("alpha")
+        .await
+        .unwrap();
+
+    let pending = scan_pending_publications(h.git.as_ref()).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].trailers.change_id, "alpha");
+
+    // Once the remote-tracking ref contains the marker, it is published
+    // evidence and no longer pending.
+    h.git.set_remote_ref(&h.git.head());
+    h.git.fetch("origin", "main").await.unwrap();
+    let published = scan_pending_publications(h.git.as_ref()).await.unwrap();
+    assert!(published.is_empty(), "pending: {:?}", published);
+}
+
+#[tokio::test]
+async fn per_change_upstream_scan_ignores_disabled_mode_history() {
+    // Ordinary cumulative merges carry no marker, so a change that reached
+    // terminal `merged` without the option can never be recovered as
+    // publication work.
+    let h = harness();
+    h.git.integrate_change("alpha");
+    h.git.integrate_change("beta");
+
+    let pending = scan_pending_publications(h.git.as_ref()).await.unwrap();
+    assert!(pending.is_empty(), "pending: {:?}", pending);
+}
+
+#[tokio::test]
+async fn per_change_upstream_option_less_refusal_names_the_unpublished_change() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    h.coordinator
+        .record_publication_intent("alpha")
+        .await
+        .unwrap();
+
+    let pending = scan_pending_publications(h.git.as_ref()).await.unwrap();
+    let refusal = publication_recovery_refusal(&pending).expect("refusal");
+
+    match &refusal {
+        UpstreamOptionError::PublicationRecoveryRequiresOption {
+            change_id,
+            remote,
+            branch,
+            ..
+        } => {
+            assert_eq!(change_id, "alpha");
+            assert_eq!(remote, "origin");
+            assert_eq!(branch, "main");
+        }
+        other => panic!("unexpected refusal: {:?}", other),
+    }
+    let message = refusal.to_string();
+    assert!(
+        message.contains("--integrate-upstream=origin"),
+        "{}",
+        message
+    );
+    assert!(message.contains("--upstream-verify-command"), "{}", message);
+    assert!(
+        message.contains("it is not merged"),
+        "the refusal must state plainly that the change is not merged: {}",
+        message
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_zero_change_recovery_requires_explicit_evidence() {
+    // Local history ahead of the remote with no opted-in marker is not recovery
+    // work: finalization completes as no-work without verifying or pushing.
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+
+    let outcome = h
+        .coordinator
+        .finalize(SchedulerOutcome::DrainedSuccessfully)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, FinalizeOutcome::NoWork);
+    assert_eq!(h.git.push_calls(), 0);
+    assert_eq!(h.verifier.calls(), 0);
+    assert!(h.git.merge_calls().is_empty());
+}
+
+#[tokio::test]
+async fn per_change_upstream_zero_change_recovery_publishes_marked_history() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    h.coordinator
+        .record_publication_intent("alpha")
+        .await
+        .unwrap();
+
+    let outcome = h
+        .coordinator
+        .finalize(SchedulerOutcome::DrainedSuccessfully)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::Completed {
+            pushed_head: h.git.head()
+        }
+    );
+    assert_eq!(h.git.successful_pushes(), 1);
+}
+
+#[tokio::test]
+async fn per_change_upstream_finalization_is_a_noop_after_change_publication() {
+    let mut h = harness();
+    h.git.integrate_change("alpha");
+    publish(&mut h, "alpha").await;
+    let head = h.git.head();
+
+    let outcome = h
+        .coordinator
+        .finalize(SchedulerOutcome::DrainedSuccessfully)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, FinalizeOutcome::Completed { pushed_head: head });
+    assert_eq!(
+        h.git.successful_pushes(),
+        1,
+        "finalization must not republish an already confirmed HEAD"
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_cancelled_or_blocked_run_never_publishes() {
+    for outcome in [
+        SchedulerOutcome::Cancelled,
+        SchedulerOutcome::BlockedOrStalled,
+    ] {
+        let mut h = harness();
+        h.git.integrate_change("alpha");
+        h.coordinator
+            .record_publication_intent("alpha")
+            .await
+            .unwrap();
+
+        let finalized = h.coordinator.finalize(outcome).await.unwrap();
+
+        assert!(matches!(finalized, FinalizeOutcome::Skipped { .. }));
+        assert_eq!(h.git.push_calls(), 0);
+        assert_eq!(h.coordinator.pushed_head(), None);
+    }
 }

@@ -13,7 +13,8 @@ use std::fmt;
 use std::path::Path;
 
 use super::coordinator::{
-    scan_unpushed_upstream_merges, upstream_recovery_refusal, validate_initial_fetch,
+    publication_recovery_refusal, scan_pending_publications, scan_unpushed_upstream_merges,
+    upstream_recovery_refusal, validate_initial_fetch,
 };
 use super::git_ops::GitUpstreamOps;
 use super::options::{
@@ -130,15 +131,27 @@ pub async fn prepare_upstream_integration(
     }
 }
 
-/// Refuse an option-less cumulative parallel run while upstream recovery
-/// evidence is reachable from cumulative HEAD.
+/// Refuse an option-less cumulative parallel run while opted-in publication work
+/// is reachable from cumulative HEAD.
 ///
-/// This performs no network access: the trailers name the remote and branch, and
-/// reachability is checked against the local remote-tracking ref.
+/// Two kinds of evidence block an option-less start, and both are offline: the
+/// trailers name the remote and branch, and reachability is checked against the
+/// local remote-tracking ref.
+///
+/// 1. A publication-required integration marker. This is checked first because
+///    it is the case that would otherwise be *misreported* as terminal `merged`:
+///    the change is locally integrated but still owes a confirmed push.
+/// 2. An unpushed Conflux upstream merge, as before.
 pub async fn ensure_no_unpushed_upstream_recovery(
     repo_root: &Path,
 ) -> Result<(), UpstreamStartupError> {
     let git = GitUpstreamOps::new(repo_root);
+
+    let pending_publications = scan_pending_publications(&git).await?;
+    if let Some(err) = publication_recovery_refusal(&pending_publications) {
+        return Err(UpstreamStartupError::Invalid(err));
+    }
+
     let evidence = scan_unpushed_upstream_merges(&git).await?;
     match upstream_recovery_refusal(&evidence) {
         Some(err) => Err(UpstreamStartupError::Invalid(err)),
@@ -191,6 +204,9 @@ mod tests {
             _message: &str,
         ) -> PortResult<crate::upstream::ports::MergeCommandResult> {
             unreachable!("static precondition observation must not merge")
+        }
+        async fn commit_empty(&self, _message: &str) -> PortResult<String> {
+            unreachable!("static precondition observation must not commit")
         }
         async fn merge_repository_state(&self) -> PortResult<MergeRepositoryState> {
             Ok(self.merge_state)

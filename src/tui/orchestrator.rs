@@ -14,6 +14,7 @@ use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler
 use crate::parallel::PostArchiveAction;
 use crate::serial_run_service::SerialRunService;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -27,6 +28,20 @@ fn configure_parallel_post_archive_action(
     action: PostArchiveAction,
 ) {
     service.set_post_archive_action(action);
+}
+
+/// Install the invocation-scoped upstream publication runtime, if any.
+///
+/// A `None` runtime leaves the service untouched, which is the hard default-off
+/// boundary: no coordinator is constructed, so nothing fetches, verifies,
+/// pushes, or confirms.
+fn configure_parallel_upstream_integration(
+    service: &mut crate::parallel_run_service::ParallelRunService,
+    runtime: Option<crate::upstream::UpstreamRuntime>,
+) {
+    if let Some(runtime) = runtime {
+        service.set_upstream_integration(runtime);
+    }
 }
 
 fn post_archive_dispatch_event(
@@ -987,6 +1002,7 @@ pub async fn run_orchestrator(
 pub async fn run_orchestrator_parallel(
     change_ids: Vec<String>,
     explicit_retry: bool,
+    repo_root: PathBuf,
     config: OrchestratorConfig,
     tx: mpsc::Sender<OrchestratorEvent>,
     cancel_token: CancellationToken,
@@ -995,9 +1011,10 @@ pub async fn run_orchestrator_parallel(
     shared_state: Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     manual_resolve_counter: Arc<std::sync::atomic::AtomicUsize>,
     post_archive_action: PostArchiveAction,
+    upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
 ) -> Result<()> {
-    use crate::openspec::list_changes_native;
+    use crate::openspec::list_changes_native_from;
     use crate::parallel::ParallelEvent;
     use crate::parallel_run_service::ParallelRunService;
 
@@ -1008,14 +1025,15 @@ pub async fn run_orchestrator_parallel(
         ))))
         .await;
 
-    // Get repo root
-    let repo_root = std::env::current_dir()?;
-
     // Create ParallelRunService and bind it to the caller-owned reducer so empty
     // manual resolve startup observes the same ResolveWait/RejectWait intent that
     // accepted the TUI command.
     let mut service = ParallelRunService::new(repo_root.clone(), config.clone());
     configure_parallel_post_archive_action(&mut service, post_archive_action);
+    // The local TUI implements no Git operation of its own: it hands the same
+    // validated runtime to the same shared parallel service `cflx run` uses, so
+    // both frontends drive one change-scoped publication implementation.
+    configure_parallel_upstream_integration(&mut service, upstream_runtime);
     service.set_shared_orchestrator_state(shared_state.clone());
 
     // Check if Git is available for parallel execution
@@ -1030,7 +1048,7 @@ pub async fn run_orchestrator_parallel(
     let mut had_errors = false;
 
     // Fetch all changes for UI refresh
-    let all_changes = list_changes_native()?;
+    let all_changes = list_changes_native_from(&repo_root)?;
 
     let committed_change_ids: HashSet<String> =
         match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
@@ -1068,7 +1086,8 @@ pub async fn run_orchestrator_parallel(
     let _ = tx
         .send(OrchestratorEvent::ChangesRefreshed {
             changes: all_changes,
-            rejected_changes: crate::openspec::list_rejected_changes_native().unwrap_or_default(),
+            rejected_changes: crate::openspec::list_rejected_changes_native_from(&repo_root)
+                .unwrap_or_default(),
             committed_change_ids,
             uncommitted_file_change_ids,
             worktree_change_ids: HashSet::new(),
@@ -1294,6 +1313,74 @@ mod tests {
                 remote: "origin".to_string()
             }
         );
+    }
+
+    fn upstream_test_service(
+        temp: &tempfile::TempDir,
+    ) -> crate::parallel_run_service::ParallelRunService {
+        crate::parallel_run_service::ParallelRunService::new(
+            temp.path().to_path_buf(),
+            crate::config::OrchestratorConfig::default(),
+        )
+    }
+
+    fn upstream_test_runtime() -> crate::upstream::UpstreamRuntime {
+        crate::upstream::UpstreamRuntime {
+            config: crate::upstream::UpstreamIntegrationConfig::new("origin", "cargo test"),
+            branch: "main".to_string(),
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_absent_configuration_installs_nothing_in_tui() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut service = upstream_test_service(&temp_dir);
+
+        super::configure_parallel_upstream_integration(&mut service, None);
+
+        assert!(
+            service.upstream_integration().is_none(),
+            "a TUI without -u must install no upstream coordinator"
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_local_tui_and_run_install_equivalent_runtime() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // The `run` frontend installs the runtime directly on the shared service.
+        let mut run_service = upstream_test_service(&temp_dir);
+        run_service.set_upstream_integration(upstream_test_runtime());
+
+        // The TUI frontend routes through its own wiring helper.
+        let mut tui_service = upstream_test_service(&temp_dir);
+        super::configure_parallel_upstream_integration(
+            &mut tui_service,
+            Some(upstream_test_runtime()),
+        );
+
+        assert_eq!(
+            tui_service.upstream_integration(),
+            run_service.upstream_integration(),
+            "local TUI and run must construct one identical publication runtime"
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_persistent_tui_reconstruction_retains_configuration() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let runtime = Some(upstream_test_runtime());
+
+        // A persistent TUI builds a fresh service for every orchestrator start;
+        // the invocation-scoped runtime must survive each reconstruction.
+        for _ in 0..3 {
+            let mut service = upstream_test_service(&temp_dir);
+            super::configure_parallel_upstream_integration(&mut service, runtime.clone());
+            assert_eq!(
+                service.upstream_integration(),
+                Some(&upstream_test_runtime())
+            );
+        }
     }
 
     /// Test that the archive path uses the correct directory structure.

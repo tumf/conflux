@@ -116,6 +116,28 @@ pub struct Cli {
     #[arg(long)]
     pub server_token_env: Option<String>,
 
+    /// Publish every completed change's verified cumulative base to the selected
+    /// remote's same-name branch before that change succeeds.
+    ///
+    /// Same contract as `cflx run -u`: `-u` and value-less `--integrate-upstream`
+    /// select `origin`, a named remote requires `--integrate-upstream=<remote>`,
+    /// and `--upstream-verify-command` is mandatory. Local TUI only.
+    #[arg(
+        long,
+        short = 'u',
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = crate::upstream::DEFAULT_UPSTREAM_REMOTE,
+        value_parser = crate::upstream::options::parse_upstream_remote
+    )]
+    pub integrate_upstream: Option<String>,
+
+    /// Complete repository verification command run before every publication.
+    ///
+    /// Required when upstream integration is enabled; ignored otherwise.
+    #[arg(long)]
+    pub upstream_verify_command: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -459,9 +481,13 @@ impl RunArgs {
         Option<crate::upstream::UpstreamIntegrationConfig>,
         crate::upstream::UpstreamOptionError,
     > {
-        crate::upstream::resolve_upstream_config(
+        crate::upstream::options::resolve_frontend_upstream_config(
             self.integrate_upstream.as_deref(),
             self.upstream_verify_command.as_deref(),
+            self.push.as_deref(),
+            // `run` has no remote-client mode; server orchestration exposes no
+            // upstream option at all.
+            false,
         )
     }
 
@@ -567,6 +593,50 @@ pub struct TuiArgs {
     /// Name of the environment variable that holds the bearer token for the remote server
     #[arg(long)]
     pub server_token_env: Option<String>,
+
+    /// Publish every completed change's verified cumulative base to the selected
+    /// remote's same-name branch before that change succeeds.
+    ///
+    /// Same contract as `cflx run -u`: `-u` and value-less `--integrate-upstream`
+    /// select `origin`, a named remote requires `--integrate-upstream=<remote>`,
+    /// and `--upstream-verify-command` is mandatory. Local TUI only; a
+    /// `--server` remote-client TUI rejects it.
+    #[arg(
+        long,
+        short = 'u',
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = crate::upstream::DEFAULT_UPSTREAM_REMOTE,
+        value_parser = crate::upstream::options::parse_upstream_remote
+    )]
+    pub integrate_upstream: Option<String>,
+
+    /// Complete repository verification command run before every publication.
+    ///
+    /// Required when upstream integration is enabled; ignored otherwise.
+    #[arg(long)]
+    pub upstream_verify_command: Option<String>,
+}
+
+impl TuiArgs {
+    /// Resolve the invocation-scoped upstream integration configuration.
+    ///
+    /// Identical normalization to [`RunArgs::upstream_integration`], plus the
+    /// TUI-only rejections (`--push`, remote-client `--server`). Returns
+    /// `Ok(None)` for the default-off path, which installs no upstream behavior.
+    pub fn upstream_integration(
+        &self,
+    ) -> std::result::Result<
+        Option<crate::upstream::UpstreamIntegrationConfig>,
+        crate::upstream::UpstreamOptionError,
+    > {
+        crate::upstream::options::resolve_frontend_upstream_config(
+            self.integrate_upstream.as_deref(),
+            self.upstream_verify_command.as_deref(),
+            self.push.as_deref(),
+            self.server.is_some(),
+        )
+    }
 }
 
 /// Template options for init command
@@ -1104,6 +1174,202 @@ mod tests {
             args.upstream_integration(),
             Err(crate::upstream::UpstreamOptionError::VerifyCommandWithoutOption)
         );
+    }
+
+    fn tui_args(argv: &[&str]) -> TuiArgs {
+        match Cli::parse_from(argv).command {
+            Some(Commands::Tui(args)) => args,
+            _ => panic!("expected tui subcommand for {:?}", argv),
+        }
+    }
+
+    /// Bare `cflx` has no subcommand; it forwards its own options into `TuiArgs`,
+    /// exactly as `main` does.
+    fn bare_tui_args(argv: &[&str]) -> TuiArgs {
+        let cli = Cli::parse_from(argv);
+        assert!(cli.command.is_none(), "expected bare invocation");
+        TuiArgs {
+            config: cli.config,
+            web: cli.web,
+            web_port: cli.web_port,
+            web_bind: cli.web_bind,
+            web_auth_token: cli.web_auth_token,
+            web_auth_token_env: cli.web_auth_token_env,
+            web_allowed_origins: cli.web_allowed_origins,
+            push: cli.push,
+            server: cli.server,
+            server_token: cli.server_token,
+            server_token_env: cli.server_token_env,
+            integrate_upstream: cli.integrate_upstream,
+            upstream_verify_command: cli.upstream_verify_command,
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_is_absent_by_default_for_tui() {
+        let bare = bare_tui_args(&["cflx"]);
+        assert_eq!(bare.integrate_upstream, None);
+        assert_eq!(bare.upstream_verify_command, None);
+        assert_eq!(bare.upstream_integration().unwrap(), None);
+
+        let explicit = tui_args(&["cflx", "tui"]);
+        assert_eq!(explicit.upstream_integration().unwrap(), None);
+    }
+
+    #[test]
+    fn per_change_upstream_run_bare_tui_and_explicit_tui_are_equivalent() {
+        let run = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        let bare = bare_tui_args(&["cflx", "-u", "--upstream-verify-command", "cargo test"]);
+        let explicit = tui_args(&[
+            "cflx",
+            "tui",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+
+        let expected = Some(crate::upstream::UpstreamIntegrationConfig::new(
+            "origin",
+            "cargo test",
+        ));
+        assert_eq!(run.upstream_integration().unwrap(), expected);
+        assert_eq!(bare.upstream_integration().unwrap(), expected);
+        assert_eq!(explicit.upstream_integration().unwrap(), expected);
+    }
+
+    #[test]
+    fn per_change_upstream_tui_accepts_explicit_remote_with_equals_only() {
+        let explicit = tui_args(&[
+            "cflx",
+            "tui",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(
+            explicit.upstream_integration().unwrap(),
+            Some(crate::upstream::UpstreamIntegrationConfig::new(
+                "upstream",
+                "cargo test"
+            ))
+        );
+
+        let bare = bare_tui_args(&[
+            "cflx",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(bare.integrate_upstream.as_deref(), Some("upstream"));
+        assert_eq!(bare.push, None, "upstream must not configure push mode");
+
+        // A space-separated remote is not an option value for the value-less alias.
+        let spaced = tui_args(&[
+            "cflx",
+            "tui",
+            "--integrate-upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(spaced.integrate_upstream.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn per_change_upstream_tui_rejects_push_and_server() {
+        let with_push = tui_args(&[
+            "cflx",
+            "tui",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--push",
+        ]);
+        assert_eq!(
+            with_push.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::ConflictsWithPush)
+        );
+
+        let with_server = tui_args(&[
+            "cflx",
+            "tui",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--server",
+            "http://host:39876",
+        ]);
+        assert_eq!(
+            with_server.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::RemoteClientUnsupported)
+        );
+
+        let bare_push = bare_tui_args(&[
+            "cflx",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--push",
+        ]);
+        assert_eq!(
+            bare_push.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::ConflictsWithPush)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_tui_requires_verify_command() {
+        let missing = tui_args(&["cflx", "tui", "-u"]);
+        assert_eq!(
+            missing.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::MissingVerifyCommand)
+        );
+
+        let orphan_command = tui_args(&["cflx", "tui", "--upstream-verify-command", "cargo test"]);
+        assert_eq!(
+            orphan_command.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::VerifyCommandWithoutOption)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_run_rejects_push_combination_at_parse_time() {
+        let args = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--push",
+        ]);
+        assert_eq!(
+            args.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::ConflictsWithPush)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_is_exposed_in_tui_help() {
+        use clap::CommandFactory;
+        let help = Cli::command()
+            .find_subcommand_mut("tui")
+            .expect("tui subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--integrate-upstream"), "help: {}", help);
+        assert!(help.contains("--upstream-verify-command"), "help: {}", help);
+
+        let top = Cli::command().render_long_help().to_string();
+        assert!(top.contains("--integrate-upstream"), "help: {}", top);
     }
 
     #[test]

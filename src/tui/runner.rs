@@ -51,6 +51,7 @@ pub async fn run_tui(
         web_state,
         None,
         PostArchiveAction::MergeToBase,
+        None,
         LifecycleHandle::disabled(),
     )
     .await
@@ -241,6 +242,7 @@ pub async fn run_tui_with_remote(
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
     post_archive_action: PostArchiveAction,
+    upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     lifecycle: LifecycleHandle,
 ) -> Result<()> {
     // Set up panic hook to restore terminal on panic
@@ -265,6 +267,7 @@ pub async fn run_tui_with_remote(
         web_state,
         remote_client,
         post_archive_action,
+        upstream_runtime,
         lifecycle,
     )
     .await;
@@ -285,6 +288,7 @@ async fn run_tui_loop(
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
     remote_client: Option<crate::remote::RemoteClient>,
     post_archive_action: PostArchiveAction,
+    upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     lifecycle: LifecycleHandle,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()?;
@@ -1063,6 +1067,9 @@ async fn run_tui_loop(
                 dynamic_queue: &dynamic_queue,
                 remote_client: remote_client_actions.clone(),
                 post_archive_action: post_archive_action.clone(),
+                // Invocation-scoped; every orchestrator start in this persistent
+                // TUI process reconstructs the same publication runtime.
+                upstream_runtime: upstream_runtime.clone(),
                 orchestrator_running: orchestrator_handle
                     .as_ref()
                     .is_some_and(|handle| !handle.is_finished()),

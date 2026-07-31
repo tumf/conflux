@@ -45,6 +45,8 @@ pub enum UpstreamOptionError {
     NotParallelMode,
     /// `--push` maintains per-change branches instead of the cumulative base.
     ConflictsWithPush,
+    /// Remote-client TUI (`--server`) owns no local cumulative base.
+    RemoteClientUnsupported,
     /// HEAD is not attached to a branch, so there is no same-name remote branch.
     DetachedHead,
     /// Workspace is not resolvable as a Git repository.
@@ -63,6 +65,18 @@ pub enum UpstreamOptionError {
         remote: String,
         branch: String,
         merge_commit: String,
+    },
+    /// A publication-required cumulative-base integration is not proven
+    /// remote-reachable and `-u` was omitted.
+    ///
+    /// This is the option-less restart refusal: the marked change is *not*
+    /// terminal `merged`, so recovery requires restarting with `-u` and a fresh
+    /// verification command.
+    PublicationRecoveryRequiresOption {
+        change_id: String,
+        remote: String,
+        branch: String,
+        integration_commit: String,
     },
 }
 
@@ -89,6 +103,10 @@ impl fmt::Display for UpstreamOptionError {
             Self::ConflictsWithPush => write!(
                 f,
                 "-u/--integrate-upstream cannot be combined with --push: --push publishes individual change branches instead of the cumulative base"
+            ),
+            Self::RemoteClientUnsupported => write!(
+                f,
+                "-u/--integrate-upstream is available only to local TUI: a --server remote-client TUI does not own the local cumulative base"
             ),
             Self::DetachedHead => write!(
                 f,
@@ -122,6 +140,16 @@ impl fmt::Display for UpstreamOptionError {
                 f,
                 "unpushed upstream merge {} for {}/{} requires restarting with --integrate-upstream={} and an explicit --upstream-verify-command",
                 merge_commit, remote, branch, remote
+            ),
+            Self::PublicationRecoveryRequiresOption {
+                change_id,
+                remote,
+                branch,
+                integration_commit,
+            } => write!(
+                f,
+                "change '{}' was integrated into cumulative base at {} for required publication to {}/{} and is not proven reachable from that remote branch; it is not merged. Restart with --integrate-upstream={} and a fresh --upstream-verify-command to resume publication",
+                change_id, integration_commit, remote, branch, remote
             ),
         }
     }
@@ -175,6 +203,34 @@ pub fn resolve_upstream_config(
     };
 
     Ok(Some(UpstreamIntegrationConfig::new(remote, verify_command)))
+}
+
+/// Normalize the shared upstream contract for one frontend invocation.
+///
+/// `run`, bare local TUI, and explicit local `tui` all route through this, so
+/// the three entrypoints cannot drift: the same raw option values produce the
+/// same [`UpstreamIntegrationConfig`], and the same incompatible combinations
+/// are rejected before any orchestration mutation.
+///
+/// `remote_client` is true for `tui --server`, which owns no local cumulative
+/// base and therefore cannot run this protocol.
+pub fn resolve_frontend_upstream_config(
+    integrate_upstream: Option<&str>,
+    upstream_verify_command: Option<&str>,
+    push_remote: Option<&str>,
+    remote_client: bool,
+) -> Result<Option<UpstreamIntegrationConfig>, UpstreamOptionError> {
+    let config = resolve_upstream_config(integrate_upstream, upstream_verify_command)?;
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if push_remote.is_some() {
+        return Err(UpstreamOptionError::ConflictsWithPush);
+    }
+    if remote_client {
+        return Err(UpstreamOptionError::RemoteClientUnsupported);
+    }
+    Ok(Some(config))
 }
 
 /// Repository/invocation facts that can be checked without network access.
@@ -357,6 +413,93 @@ mod tests {
             Err(UpstreamOptionError::BaseNotClean(
                 "uncommitted changes".into()
             ))
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_frontends_normalize_to_one_configuration() {
+        // `run`, bare local TUI, and explicit local `tui` supply the same raw
+        // values, so all three must produce one identical configuration.
+        let run = resolve_frontend_upstream_config(
+            Some(DEFAULT_UPSTREAM_REMOTE),
+            Some("cargo test"),
+            None,
+            false,
+        );
+        let bare_tui = resolve_frontend_upstream_config(
+            Some(DEFAULT_UPSTREAM_REMOTE),
+            Some("cargo test"),
+            None,
+            false,
+        );
+        let explicit_tui = resolve_frontend_upstream_config(
+            Some(DEFAULT_UPSTREAM_REMOTE),
+            Some("cargo test"),
+            None,
+            false,
+        );
+        assert_eq!(run, bare_tui);
+        assert_eq!(bare_tui, explicit_tui);
+        assert_eq!(
+            run.unwrap(),
+            Some(UpstreamIntegrationConfig::new("origin", "cargo test"))
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_frontend_default_off_installs_nothing() {
+        assert_eq!(
+            resolve_frontend_upstream_config(None, None, Some("origin"), true),
+            Ok(None),
+            "a disabled invocation must not be rejected by upstream-only constraints"
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_frontend_rejects_push_and_remote_client() {
+        assert_eq!(
+            resolve_frontend_upstream_config(
+                Some("origin"),
+                Some("cargo test"),
+                Some("origin"),
+                false
+            ),
+            Err(UpstreamOptionError::ConflictsWithPush)
+        );
+        assert_eq!(
+            resolve_frontend_upstream_config(Some("origin"), Some("cargo test"), None, true),
+            Err(UpstreamOptionError::RemoteClientUnsupported)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_frontend_requires_verify_command_and_valid_remote() {
+        assert_eq!(
+            resolve_frontend_upstream_config(Some("origin"), None, None, false),
+            Err(UpstreamOptionError::MissingVerifyCommand)
+        );
+        assert_eq!(
+            resolve_frontend_upstream_config(Some("origin"), Some("  "), None, false),
+            Err(UpstreamOptionError::MissingVerifyCommand)
+        );
+        assert_eq!(
+            resolve_frontend_upstream_config(Some("origin:main"), Some("cargo test"), None, false),
+            Err(UpstreamOptionError::InvalidRemote("origin:main".into()))
+        );
+        assert_eq!(
+            resolve_frontend_upstream_config(None, Some("cargo test"), None, false),
+            Err(UpstreamOptionError::VerifyCommandWithoutOption)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_frontend_accepts_explicit_remote() {
+        assert_eq!(
+            resolve_frontend_upstream_config(Some("upstream"), Some("cargo test"), None, false),
+            Ok(Some(UpstreamIntegrationConfig::new(
+                "upstream",
+                "cargo test"
+            )))
         );
     }
 

@@ -155,6 +155,12 @@ pub struct TuiCommandContext<'a> {
     pub dynamic_queue: &'a DynamicQueue,
     pub remote_client: Option<crate::remote::RemoteClient>,
     pub post_archive_action: PostArchiveAction,
+    /// Invocation-scoped upstream publication runtime for local parallel TUI.
+    ///
+    /// `None` is the default-off boundary: the parallel service installs no
+    /// coordinator, so no fetch, verification, push, or confirmation happens and
+    /// cumulative base integration keeps its existing terminal `merged` meaning.
+    pub upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     pub orchestrator_running: bool,
     #[cfg(feature = "web-monitoring")]
     pub web_state: &'a Option<Arc<crate::web::WebState>>,
@@ -260,6 +266,10 @@ pub async fn handle_start_processing_command(
             let orch_shared_state = shared_state.clone();
             let orch_manual_resolve = manual_resolve_counter.clone();
             let post_archive_action = ctx.post_archive_action.clone();
+            let upstream_runtime = ctx.upstream_runtime.clone();
+            // The TUI already resolved its repository root; the orchestrator
+            // uses that instead of re-deriving the process working directory.
+            let orch_repo_root = ctx.repo_root.to_path_buf();
             *orchestrator_cancel = Some(orch_cancel.clone());
             let use_parallel = ctx.app.parallel_mode;
             #[cfg(feature = "web-monitoring")]
@@ -271,6 +281,7 @@ pub async fn handle_start_processing_command(
                     run_orchestrator_parallel(
                         selected_ids,
                         explicit_retry,
+                        orch_repo_root.clone(),
                         orch_config,
                         orch_tx.clone(),
                         orch_cancel,
@@ -279,6 +290,7 @@ pub async fn handle_start_processing_command(
                         orch_shared_state,
                         orch_manual_resolve.clone(),
                         post_archive_action.clone(),
+                        upstream_runtime.clone(),
                         orch_web_state,
                     )
                     .await
@@ -301,6 +313,7 @@ pub async fn handle_start_processing_command(
                     run_orchestrator_parallel(
                         selected_ids,
                         explicit_retry,
+                        orch_repo_root.clone(),
                         orch_config,
                         orch_tx.clone(),
                         orch_cancel,
@@ -309,6 +322,7 @@ pub async fn handle_start_processing_command(
                         orch_shared_state,
                         orch_manual_resolve,
                         post_archive_action,
+                        upstream_runtime,
                     )
                     .await
                 } else {
@@ -649,6 +663,8 @@ pub async fn handle_tui_command(
                 let orch_shared_state = shared_state.clone();
                 let orch_manual_resolve = manual_resolve_counter.clone();
                 let post_archive_action = ctx.post_archive_action.clone();
+                let upstream_runtime = ctx.upstream_runtime.clone();
+                let orch_repo_root = ctx.repo_root.to_path_buf();
                 *orchestrator_cancel = Some(orch_cancel.clone());
 
                 #[cfg(feature = "web-monitoring")]
@@ -659,6 +675,7 @@ pub async fn handle_tui_command(
                     let result = run_orchestrator_parallel(
                         Vec::new(),
                         false,
+                        orch_repo_root.clone(),
                         orch_config,
                         orch_tx,
                         orch_cancel,
@@ -667,6 +684,7 @@ pub async fn handle_tui_command(
                         orch_shared_state,
                         orch_manual_resolve,
                         post_archive_action.clone(),
+                        upstream_runtime.clone(),
                         orch_web_state,
                     )
                     .await;
@@ -675,6 +693,7 @@ pub async fn handle_tui_command(
                     let result = run_orchestrator_parallel(
                         Vec::new(),
                         false,
+                        orch_repo_root.clone(),
                         orch_config,
                         orch_tx,
                         orch_cancel,
@@ -683,6 +702,7 @@ pub async fn handle_tui_command(
                         orch_shared_state,
                         orch_manual_resolve,
                         post_archive_action,
+                        upstream_runtime,
                     )
                     .await;
 
@@ -831,6 +851,7 @@ mod tests {
             dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: false,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -942,6 +963,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: false,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1013,6 +1035,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1068,6 +1091,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: false,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1102,6 +1126,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1156,6 +1181,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1223,6 +1249,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1286,6 +1313,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1339,6 +1367,7 @@ mod tests {
                 dynamic_queue: &dynamic_queue,
                 remote_client: None,
                 post_archive_action: PostArchiveAction::MergeToBase,
+                upstream_runtime: None,
                 orchestrator_running: running,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &None,
@@ -1375,6 +1404,7 @@ mod tests {
             dynamic_queue: &dynamic_queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
@@ -1394,6 +1424,190 @@ mod tests {
         assert!(
             handle_live.is_none(),
             "live scheduler state must not spawn scheduler"
+        );
+    }
+
+    // ── Opted-in per-change upstream publication ────────────────────────────
+
+    /// Run `git` in `cwd`, returning trimmed stdout on success.
+    fn git_in(cwd: &Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// A repository on `main` with a real local bare remote `origin`, one
+    /// archived change, and a publication-required integration that never
+    /// reached the remote.
+    fn per_change_upstream_unpublished_repo() -> Option<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().ok()?;
+        let root = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir_all(&root).ok()?;
+        git_in(dir.path(), &["init", "--bare", "-b", "main", "remote.git"])?;
+        git_in(&root, &["init", "-b", "main"])?;
+        git_in(&root, &["config", "user.email", "test@example.com"])?;
+        git_in(&root, &["config", "user.name", "Test User"])?;
+        git_in(&root, &["config", "commit.gpgsign", "false"])?;
+        std::fs::write(root.join("README.md"), "# base\n").ok()?;
+        git_in(&root, &["add", "-A"])?;
+        git_in(&root, &["commit", "-m", "Initial commit"])?;
+        git_in(&root, &["remote", "add", "origin", remote.to_str()?])?;
+        git_in(&root, &["push", "-u", "origin", "main"])?;
+
+        // `alpha` is already accepted, archived, and integrated into cumulative
+        // base; only publication is owed.
+        let archive = root.join("openspec/changes/archive/alpha");
+        std::fs::create_dir_all(&archive).ok()?;
+        std::fs::write(archive.join("proposal.md"), "# archived alpha\n").ok()?;
+        git_in(&root, &["add", "-A"])?;
+        git_in(&root, &["commit", "-m", "Archive: alpha"])?;
+        let marker = crate::upstream::publication::format_publication_marker_message(
+            "alpha", "origin", "main",
+        );
+        git_in(&root, &["commit", "--allow-empty", "-m", &marker])?;
+        Some((dir, root))
+    }
+
+    /// The recoverable-error projection a failed publication leaves behind.
+    async fn per_change_upstream_failed_publication_state() -> Arc<RwLock<OrchestratorState>> {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::ExecutionMode;
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 0, ExecutionMode::Parallel);
+        state.apply_execution_event(&ExecutionEvent::ChangeArchived("alpha".to_string()));
+        state.apply_execution_event(&ExecutionEvent::PushStarted {
+            change_id: "alpha".to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::PushFailed {
+            change_id: "alpha".to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
+            error: "upstream publication incomplete: verification failed".to_string(),
+        });
+        assert_eq!(state.display_status("alpha"), "error");
+        Arc::new(RwLock::new(state))
+    }
+
+    /// Exhausted publication in a persistent local TUI surfaces as Error mode,
+    /// and the operator's explicit retry (F5, or the local web control's Start)
+    /// must resume *publication* — not rerun apply. This drives the real
+    /// command handler so the retry routing, the runtime hand-off, and the
+    /// resumption are covered as one path.
+    #[tokio::test]
+    async fn per_change_upstream_explicit_tui_retry_resumes_publication() {
+        let Some((dir, root)) = per_change_upstream_unpublished_repo() else {
+            println!("Skipping test: git not available");
+            return;
+        };
+        let base_head = git_in(&root, &["rev-parse", "HEAD"]).expect("base head");
+
+        // Any apply, acceptance, or archive dispatch would leave a sentinel
+        // behind; publication resumption must create none of them.
+        let dispatched = dir.path().join("dispatched.txt");
+        let sentinel =
+            |label: &str| format!("sh -c 'echo {label} >> \"{}\"'", dispatched.display());
+        let config = OrchestratorConfig {
+            apply_command: Some(sentinel("apply")),
+            acceptance_command: Some(sentinel("acceptance")),
+            archive_command: Some(sentinel("archive")),
+            resolve_command: Some(sentinel("resolve")),
+            workspace_base_dir: Some(dir.path().join("workspaces").to_string_lossy().to_string()),
+            ..OrchestratorConfig::default()
+        };
+
+        let shared_state = per_change_upstream_failed_publication_state().await;
+        let mut app = AppState::new(vec![create_test_change("alpha")]);
+        app.parallel_mode = true;
+        app.shared_orchestrator_state = Some(shared_state.clone());
+        app.apply_display_statuses_from_reducer(&shared_state.read().await.all_display_statuses());
+        assert_eq!(app.changes[0].display_status_cache, "error");
+        app.mode = AppMode::Error;
+        app.changes[0].selected = true;
+
+        let (tx, mut rx) = mpsc::channel(256);
+        let dynamic_queue = DynamicQueue::new();
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let mut orchestrator_cancel: Option<CancellationToken> = None;
+        let mut ctx = TuiCommandContext {
+            app: &mut app,
+            repo_root: &root,
+            config: &config,
+            tx: &tx,
+            dynamic_queue: &dynamic_queue,
+            remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: Some(crate::upstream::UpstreamRuntime {
+                config: crate::upstream::UpstreamIntegrationConfig::new("origin", "exit 0"),
+                branch: "main".to_string(),
+            }),
+            orchestrator_running: false,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        };
+
+        // The local web control's Start sends no IDs; Error mode turns it into
+        // the same explicit retry F5 produces.
+        let handle = handle_start_processing_command(
+            Vec::new(),
+            false,
+            &mut ctx,
+            &graceful_stop_flag,
+            &shared_state,
+            &manual_resolve_counter,
+            &mut orchestrator_cancel,
+        )
+        .await
+        .expect("explicit retry must start a local orchestrator run");
+
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(
+                    &event,
+                    crate::events::ExecutionEvent::PushCompleted { change_id, .. }
+                        if change_id == "alpha"
+                ) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("explicit retry must reach publication rather than hang");
+        assert!(
+            confirmed,
+            "explicit retry must resume publication for the unpublished change"
+        );
+
+        // A persistent TUI stays alive after publishing, so the operator ends it.
+        orchestrator_cancel
+            .expect("retry must own a cancellation token")
+            .cancel();
+        let _ = handle.await;
+
+        assert_eq!(
+            git_in(&root, &["ls-remote", "origin", "refs/heads/main"])
+                .expect("ls-remote")
+                .split_whitespace()
+                .next()
+                .expect("remote head"),
+            base_head,
+            "confirmation is a remote observation of the integrated cumulative HEAD"
+        );
+        assert!(
+            !dispatched.exists(),
+            "resumed publication must not redispatch apply or acceptance: {}",
+            std::fs::read_to_string(&dispatched).unwrap_or_default()
         );
     }
 }
@@ -1473,6 +1687,7 @@ mod operator_command_parity_tests {
             dynamic_queue: queue,
             remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
             orchestrator_running: true,
             #[cfg(feature = "web-monitoring")]
             web_state: &None,
