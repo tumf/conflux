@@ -530,24 +530,54 @@ pub async fn handle_tui_command(
             }
         }
         TuiCommand::ForceStop => {
-            // Force stop immediately
+            // Immediate stop. `AppMode::Stopping` describes TUI lifecycle only, so
+            // the force-vs-ordinary decision comes from one runtime activity
+            // snapshot shared with the Esc key path.
             if matches!(ctx.app.mode, AppMode::Running | AppMode::Stopping) {
-                ctx.app.stop_mode = StopMode::ForceStopped;
+                let snapshot = crate::tui::stop_classification::collect_stop_activity_snapshot(
+                    ctx.dynamic_queue,
+                    shared_state,
+                )
+                .await;
+                let classification = snapshot.classify();
+
+                // One cancellation mechanism for both reporting classes:
+                // classification controls reporting and waiting, never whether
+                // managed cleanup runs.
                 if let Some(cancel) = orchestrator_cancel {
                     cancel.cancel();
                 }
-                ctx.app
-                    .handle_orchestrator_event(OrchestratorEvent::Stopped);
-                ctx.app.current_change = None;
-                ctx.app.add_log(LogEntry::warn("Force stopped"));
 
-                // Forward stopped event to web state
-                #[cfg(feature = "web-monitoring")]
-                if let Some(ref web_state) = ctx.web_state {
-                    use crate::events::ExecutionEvent;
-                    web_state
-                        .apply_execution_event(&ExecutionEvent::Stopped)
-                        .await;
+                if classification.process_report.is_force_stop() {
+                    ctx.app.stop_mode = StopMode::ForceStopped;
+                    ctx.app.add_log(LogEntry::warn("Force stopped"));
+                }
+
+                // A live parallel scheduler with in-flight execution or pending
+                // background merge/base-lane work owns the terminal stop: it must
+                // reach its cancellation-safe boundary first. Everything else has
+                // nothing left to drain, so terminal stop applies immediately.
+                let scheduler_owns_terminal_stop = ctx.orchestrator_running
+                    && snapshot.scheduler_owns_cleanup()
+                    && classification.shutdown_barrier.is_required();
+
+                if scheduler_owns_terminal_stop {
+                    ctx.app.add_log(LogEntry::info(
+                        "Waiting for in-flight work to reach a safe stop boundary...",
+                    ));
+                } else {
+                    ctx.app
+                        .handle_orchestrator_event(OrchestratorEvent::Stopped);
+                    ctx.app.current_change = None;
+
+                    // Forward stopped event to web state
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(ref web_state) = ctx.web_state {
+                        use crate::events::ExecutionEvent;
+                        web_state
+                            .apply_execution_event(&ExecutionEvent::Stopped)
+                            .await;
+                    }
                 }
             } else {
                 ctx.app.add_log(LogEntry::warn(format!(
@@ -2128,5 +2158,237 @@ mod operator_command_parity_tests {
         );
         assert!(app.take_pending_explicit_retry());
         assert_eq!(state.read().await.display_status("change-a"), "queued");
+    }
+
+    /// Build a stop-path command context bound to a live parallel scheduler.
+    fn stop_command_context<'a>(
+        app: &'a mut AppState,
+        tx: &'a mpsc::Sender<OrchestratorEvent>,
+        dynamic_queue: &'a DynamicQueue,
+        config: &'a OrchestratorConfig,
+        orchestrator_running: bool,
+    ) -> TuiCommandContext<'a> {
+        TuiCommandContext {
+            app,
+            repo_root: Path::new("."),
+            config,
+            tx,
+            dynamic_queue,
+            remote_client: None,
+            post_archive_action: PostArchiveAction::MergeToBase,
+            upstream_runtime: None,
+            orchestrator_running,
+            #[cfg(feature = "web-monitoring")]
+            web_state: &None,
+        }
+    }
+
+    struct StopCommandResult {
+        app: AppState,
+        cancel: CancellationToken,
+    }
+
+    impl StopCommandResult {
+        fn log_count(&self, needle: &str) -> usize {
+            self.app
+                .logs
+                .iter()
+                .filter(|entry| entry.message.contains(needle))
+                .count()
+        }
+    }
+
+    /// Run `TuiCommand::ForceStop` against a prepared reducer/queue snapshot.
+    async fn run_force_stop(
+        state: &Arc<RwLock<OrchestratorState>>,
+        queue: &DynamicQueue,
+        orchestrator_running: bool,
+    ) -> StopCommandResult {
+        let (tx, _rx) = mpsc::channel(64);
+        let config = OrchestratorConfig::default();
+        let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+        let manual_resolve_counter = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let mut orchestrator_cancel = Some(cancel.clone());
+        let mut app = AppState::new(vec![test_change("change-a")]);
+        app.mode = AppMode::Stopping;
+        app.stop_mode = StopMode::ImmediatePending;
+        app.changes[0].selected = true;
+        app.changes[0].set_display_status_cache("applying");
+        app.publish_execution_marks();
+
+        {
+            let mut ctx = stop_command_context(&mut app, &tx, queue, &config, orchestrator_running);
+            handle_tui_command(
+                TuiCommand::ForceStop,
+                &mut ctx,
+                &graceful_stop_flag,
+                state,
+                &manual_resolve_counter,
+                &mut orchestrator_cancel,
+            )
+            .await
+            .expect("force stop command");
+        }
+
+        StopCommandResult { app, cancel }
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_active_execution_reports_force_stop() {
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            });
+        }
+        let queue = DynamicQueue::new();
+        queue
+            .register_kill_token("change-a".to_string(), CancellationToken::new())
+            .await;
+
+        let result = run_force_stop(&state, &queue, true).await;
+
+        assert!(
+            result.cancel.is_cancelled(),
+            "an active execution must still request managed cancellation"
+        );
+        assert_eq!(result.log_count("Force stopped"), 1);
+        assert_eq!(result.app.stop_mode, StopMode::ForceStopped);
+        assert_eq!(
+            result.app.mode,
+            AppMode::Stopping,
+            "the scheduler owns terminal stop while in-flight cleanup is pending"
+        );
+        assert_eq!(result.log_count("Processing stopped"), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_merge_wait_does_not_claim_process_termination() {
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "manual resolution required".to_string(),
+                auto_resumable: false,
+            });
+        }
+        let queue = DynamicQueue::new();
+
+        let result = run_force_stop(&state, &queue, true).await;
+
+        assert!(
+            result.cancel.is_cancelled(),
+            "an idle scheduler must still be cancelled"
+        );
+        assert_eq!(
+            result.log_count("Force stopped"),
+            0,
+            "an idle wait must not claim forceful process termination"
+        );
+        assert_eq!(result.log_count("Processing stopped"), 1);
+        assert_eq!(result.app.mode, AppMode::Stopped);
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_deferred_merge_wait_is_an_ordinary_stop() {
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "lane occupied".to_string(),
+                auto_resumable: true,
+            });
+        }
+        let queue = DynamicQueue::new();
+
+        let result = run_force_stop(&state, &queue, true).await;
+
+        assert_eq!(result.log_count("Force stopped"), 0);
+        assert_eq!(result.log_count("Processing stopped"), 1);
+        assert_eq!(result.app.mode, AppMode::Stopped);
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_pending_background_merge_waits_for_safe_boundary() {
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "merge".to_string(),
+            });
+        }
+        let queue = DynamicQueue::new();
+
+        let result = run_force_stop(&state, &queue, true).await;
+
+        assert!(result.cancel.is_cancelled());
+        assert_eq!(
+            result.log_count("Force stopped"),
+            0,
+            "a background merge is shutdown work, not a force-stopped agent process"
+        );
+        assert_eq!(
+            result.app.mode,
+            AppMode::Stopping,
+            "terminal stop waits for the base-lane operation to reach its boundary"
+        );
+        assert_eq!(result.log_count("Processing stopped"), 0);
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_without_live_scheduler_applies_terminal_stop() {
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "merge".to_string(),
+            });
+        }
+        let queue = DynamicQueue::new();
+
+        let result = run_force_stop(&state, &queue, false).await;
+
+        assert_eq!(
+            result.app.mode,
+            AppMode::Stopped,
+            "with no live scheduler there is nothing left to drain"
+        );
+        assert_eq!(result.log_count("Processing stopped"), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_preserves_execution_marks_and_resets_queue_status() {
+        let state = parallel_state(&["change-a"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "manual resolution required".to_string(),
+                auto_resumable: false,
+            });
+        }
+        let queue = DynamicQueue::new();
+
+        let result = run_force_stop(&state, &queue, true).await;
+
+        assert!(
+            result.app.changes[0].selected,
+            "stopped-state handling must preserve execution marks"
+        );
+        assert_eq!(
+            result.app.execution_marks().marked_ids(),
+            vec!["change-a".to_string()]
+        );
+        assert_eq!(
+            result.app.changes[0].display_status_cache, "not queued",
+            "transient in-flight presentation must reset on stop"
+        );
     }
 }

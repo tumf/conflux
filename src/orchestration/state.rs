@@ -729,6 +729,21 @@ impl OrchestratorState {
             .unwrap_or(false)
     }
 
+    /// Return true when any change is running agent-driven workspace execution.
+    ///
+    /// Applying, accepting, and archiving are the activities backed by an agent
+    /// command process. Resolving and rejecting occupy the base-mutating lane and
+    /// are scheduler-owned shutdown work, so they are deliberately excluded here:
+    /// they must never justify a force-stopped-process claim.
+    pub fn is_agent_execution_active(&self) -> bool {
+        self.change_runtime.values().any(|rt| {
+            matches!(
+                rt.activity,
+                ActivityState::Applying | ActivityState::Accepting | ActivityState::Archiving
+            ) && !rt.is_terminal()
+        })
+    }
+
     /// Return true when any change is currently in resolving activity.
     pub fn is_resolving_active(&self) -> bool {
         self.change_runtime

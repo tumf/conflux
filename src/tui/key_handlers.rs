@@ -279,33 +279,59 @@ pub async fn handle_merge_key(ctx: &mut KeyEventContext<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Handle Esc key: Graceful stop or force stop
-pub fn handle_esc_key(ctx: &mut KeyEventContext<'_>) {
-    // Handle stop in Running or Stopping mode
-    match ctx.app.mode {
-        AppMode::Running => {
-            // First Esc: Graceful stop
-            ctx.app.stop_mode = StopMode::GracefulPending;
-            ctx.graceful_stop_flag.store(true, Ordering::SeqCst);
-            ctx.app.mode = AppMode::Stopping;
-            ctx.app
-                .add_log(LogEntry::warn("Stopping after current change completes..."));
-        }
-        AppMode::Stopping => {
-            // Second Esc: Force stop
-            ctx.app.stop_mode = StopMode::ForceStopped;
-            if let Some(cancel) = ctx.orchestrator_cancel {
-                cancel.cancel();
-            }
-            // Use OrchestratorEvent::Stopped to properly reset queue status
-            // and preserve execution marks (same as graceful stop)
-            ctx.app
-                .handle_orchestrator_event(OrchestratorEvent::Stopped);
-            ctx.app.current_change = None;
-            ctx.app.add_log(LogEntry::warn("Force stopped"));
-        }
-        _ => {}
+/// What the Esc key must do for the current typed TUI state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EscStopAction {
+    /// First Esc: request a graceful stop at the next safe boundary.
+    RequestGracefulStop,
+    /// Second Esc: enqueue the shared immediate-stop command.
+    ///
+    /// The key path never applies stop effects itself, so it cannot claim a
+    /// force stop from `AppMode::Stopping` alone.
+    RequestImmediateStop,
+    /// Esc is not a stop control in this state, or an immediate stop was already
+    /// requested and must not be duplicated.
+    None,
+}
+
+/// Decide the Esc stop action from typed TUI state only.
+pub(crate) fn esc_stop_action(mode: &AppMode, stop_mode: &StopMode) -> EscStopAction {
+    match mode {
+        AppMode::Running => EscStopAction::RequestGracefulStop,
+        AppMode::Stopping if *stop_mode == StopMode::ImmediatePending => EscStopAction::None,
+        AppMode::Stopping => EscStopAction::RequestImmediateStop,
+        _ => EscStopAction::None,
     }
+}
+
+pub(crate) async fn handle_esc_key_inner(
+    app: &mut AppState,
+    graceful_stop_flag: &AtomicBool,
+    cmd_tx: &mpsc::Sender<TuiCommand>,
+) {
+    match esc_stop_action(&app.mode, &app.stop_mode) {
+        EscStopAction::RequestGracefulStop => {
+            app.stop_mode = StopMode::GracefulPending;
+            graceful_stop_flag.store(true, Ordering::SeqCst);
+            app.mode = AppMode::Stopping;
+            app.add_log(LogEntry::warn("Stopping after current change completes..."));
+        }
+        EscStopAction::RequestImmediateStop => {
+            app.stop_mode = StopMode::ImmediatePending;
+            let _ = cmd_tx.send(TuiCommand::ForceStop).await;
+        }
+        EscStopAction::None => {}
+    }
+}
+
+/// Handle Esc key: Graceful stop or immediate stop
+///
+/// The second Esc does not apply stop effects here. It enqueues the shared
+/// [`TuiCommand::ForceStop`] so both the key path and the command-dispatch path
+/// consume one runtime activity snapshot, issue one cancellation request, and
+/// report force stop only when an agent execution was actually active.
+pub async fn handle_esc_key(ctx: &mut KeyEventContext<'_>) {
+    handle_esc_key_inner(ctx.app, ctx.graceful_stop_flag, ctx.cmd_tx).await;
 }
 
 fn handle_start_key_inner(
@@ -774,7 +800,7 @@ pub async fn handle_key_event(
             // Note: D key removed from Changes view as per spec
         }
         (KeyCode::Esc, _) => {
-            handle_esc_key(ctx);
+            handle_esc_key(ctx).await;
         }
         _ if ctx.app.tui_config.matches_start_key(&key) => {
             cmd_to_start = handle_start_key(ctx);
@@ -1685,5 +1711,99 @@ mod tests {
         request_local_tui_quit(&mut app, &None);
 
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn idle_parallel_stop_second_esc_requests_the_shared_immediate_stop_command() {
+        assert_eq!(
+            esc_stop_action(&AppMode::Running, &StopMode::None),
+            EscStopAction::RequestGracefulStop
+        );
+        assert_eq!(
+            esc_stop_action(&AppMode::Stopping, &StopMode::GracefulPending),
+            EscStopAction::RequestImmediateStop
+        );
+    }
+
+    #[test]
+    fn idle_parallel_stop_repeated_esc_does_not_duplicate_the_stop_request() {
+        assert_eq!(
+            esc_stop_action(&AppMode::Stopping, &StopMode::ImmediatePending),
+            EscStopAction::None
+        );
+        assert_eq!(
+            esc_stop_action(&AppMode::Stopped, &StopMode::None),
+            EscStopAction::None
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_second_esc_routes_through_force_stop_command() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Stopping;
+        app.stop_mode = StopMode::GracefulPending;
+        let flag = inert_stop_flag();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+
+        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ForceStop)),
+            "the second Esc must route through the shared stop command"
+        );
+        assert_eq!(app.stop_mode, StopMode::ImmediatePending);
+        assert_eq!(
+            app.mode,
+            AppMode::Stopping,
+            "the key path must not apply terminal stop effects itself"
+        );
+        assert!(
+            !app.logs
+                .iter()
+                .any(|entry| entry.message.contains("Force stopped")),
+            "the key path must not claim a force stop from AppMode::Stopping alone"
+        );
+        assert!(
+            !app.logs
+                .iter()
+                .any(|entry| entry.message.contains("Processing stopped")),
+            "terminal stop reporting is owned by the Stopped transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_repeated_esc_sends_one_stop_command() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Stopping;
+        app.stop_mode = StopMode::GracefulPending;
+        let flag = inert_stop_flag();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+
+        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ForceStop)));
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a repeated Esc must not enqueue a second cancellation request"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_parallel_stop_first_esc_keeps_graceful_stop_contract() {
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        app.mode = AppMode::Running;
+        let flag = inert_stop_flag();
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+
+        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+
+        assert_eq!(app.mode, AppMode::Stopping);
+        assert_eq!(app.stop_mode, StopMode::GracefulPending);
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(app.logs.iter().any(|entry| entry
+            .message
+            .contains("Stopping after current change completes")));
     }
 }

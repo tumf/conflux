@@ -44,6 +44,94 @@ fn configure_parallel_upstream_integration(
     }
 }
 
+/// Bounded deadline for the scheduler's cancellation cleanup barrier.
+///
+/// Operator cancellation keeps polling the running scheduler future so inner
+/// task abort, join draining, execution-handle release, pending merge/base-lane
+/// result handling, and workspace-guard drop can complete. Exceeding this
+/// deadline escalates to managed cleanup; it never reclassifies the run as an
+/// execution failure.
+const PARALLEL_CANCELLATION_CLEANUP_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+/// How one parallel orchestration boundary run reached its terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParallelTermination {
+    /// The scheduler future returned without operator cancellation.
+    SchedulerReturned,
+    /// Operator cancellation; the scheduler reached its cleanup barrier.
+    CancelledAfterCleanup,
+    /// Operator cancellation; the cleanup barrier hit its bounded deadline.
+    CancelledAfterCleanupTimeout,
+}
+
+impl ParallelTermination {
+    /// True when the run ended through operator cancellation.
+    pub(crate) fn is_operator_cancellation(self) -> bool {
+        matches!(
+            self,
+            ParallelTermination::CancelledAfterCleanup
+                | ParallelTermination::CancelledAfterCleanupTimeout
+        )
+    }
+}
+
+/// Keep polling an already-running scheduler future after cancellation was
+/// requested, under a bounded cleanup deadline.
+///
+/// The scheduler future is deliberately not dropped on cancellation: dropping it
+/// would abandon inner abort/drain, execution-handle release, pending merge
+/// result handling, and workspace-guard drop. A deadline overrun returns without
+/// a scheduler result so the caller can escalate managed cleanup, and the
+/// outcome stays operator cancellation either way.
+pub(crate) async fn drain_cancelled_scheduler<T, F>(
+    scheduler: F,
+    cleanup_deadline: std::time::Duration,
+) -> (ParallelTermination, Option<T>)
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::time::timeout(cleanup_deadline, scheduler).await {
+        Ok(result) => (ParallelTermination::CancelledAfterCleanup, Some(result)),
+        Err(_) => (ParallelTermination::CancelledAfterCleanupTimeout, None),
+    }
+}
+
+/// Terminal reporting class for one parallel orchestration boundary run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParallelTerminalReport {
+    /// Normal completion: success log and `AllCompleted`.
+    Completed,
+    /// Genuine execution error: failure log, completion-with-errors, `AllCompleted`.
+    Failed,
+    /// Operator stop or scheduler-reported stop: one stop diagnostic only, with
+    /// no execution-failure, completion, or `AllCompleted` output.
+    Stopped,
+}
+
+/// Classify terminal reporting for one parallel orchestration boundary run.
+///
+/// Operator cancellation is a stopped outcome, never an agent-command failure,
+/// even when the bounded cleanup barrier had to escalate. Only a scheduler that
+/// returned on its own may report a genuine execution error.
+pub(crate) fn classify_parallel_terminal_report(
+    termination: ParallelTermination,
+    scheduler_failed: bool,
+    scheduler_reported_stop: bool,
+    reducer_owned_lane_wait_or_active: bool,
+) -> ParallelTerminalReport {
+    if termination.is_operator_cancellation() || scheduler_reported_stop {
+        return ParallelTerminalReport::Stopped;
+    }
+    if scheduler_failed {
+        return ParallelTerminalReport::Failed;
+    }
+    if reducer_owned_lane_wait_or_active {
+        return ParallelTerminalReport::Stopped;
+    }
+    ParallelTerminalReport::Completed
+}
+
 fn post_archive_dispatch_event(
     state: &crate::orchestration::state::OrchestratorState,
     change_id: &str,
@@ -1044,9 +1132,6 @@ pub async fn run_orchestrator_parallel(
     // Create shared queue change timestamp for debouncing
     let shared_queue_change = Arc::new(tokio::sync::Mutex::new(None::<std::time::Instant>));
 
-    let mut stopped_or_cancelled = false;
-    let mut had_errors = false;
-
     // Fetch all changes for UI refresh
     let all_changes = list_changes_native_from(&repo_root)?;
 
@@ -1121,101 +1206,116 @@ pub async fn run_orchestrator_parallel(
     // Create event channel for forwarding to TUI
     let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
 
-    // Spawn event forwarding task
+    // Spawn event forwarding task.
+    //
+    // The forwarder deliberately does not break on the global cancellation token:
+    // the scheduler keeps emitting cleanup events (and its own `Stopped`) while it
+    // drains after cancellation, and a forwarder that quit early would both hide
+    // those events and let a full channel block the very cleanup the outer
+    // boundary is waiting for. It ends when the scheduler future is dropped and
+    // closes the channel, or on a terminal event.
     let forward_tx = tx.clone();
-    let forward_cancel = cancel_token.clone();
     let merge_deferred_stop = Arc::new(AtomicBool::new(false));
     let forward_merge_stop = merge_deferred_stop.clone();
     let forward_shared_state = shared_state.clone();
     #[cfg(feature = "web-monitoring")]
     let forward_web_tx = web_event_tx.clone();
     let forward_handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = forward_cancel.cancelled() => {
+        while let Some(event) = parallel_rx.recv().await {
+            match event {
+                ParallelEvent::AllCompleted => {
+                    // AllCompleted signals execution completion
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(tx) = &forward_web_tx {
+                        let _ = tx.send(ParallelEvent::AllCompleted);
+                    }
                     break;
                 }
-                event = parallel_rx.recv() => {
-                    match event {
-                        Some(ParallelEvent::AllCompleted) => {
-                            // AllCompleted signals execution completion
-                            #[cfg(feature = "web-monitoring")]
-                            if let Some(tx) = &forward_web_tx {
-                                let _ = tx.send(ParallelEvent::AllCompleted);
-                            }
-                            break;
-                        }
-                        Some(ParallelEvent::Stopped) => {
-                            forward_merge_stop.store(true, Ordering::SeqCst);
-                            let _ = forward_tx.send(ParallelEvent::Stopped).await;
-                            #[cfg(feature = "web-monitoring")]
-                            if let Some(tx) = &forward_web_tx {
-                                let _ = tx.send(ParallelEvent::Stopped);
-                            }
-                            break;
-                        }
-                        Some(parallel_event) => {
-                            // Forward to TUI first (before acquiring write lock)
-                            // This prevents TUI updates from being blocked when acceptance tests run for a long time
-                            let _ = forward_tx.send(parallel_event.clone()).await;
-                            // Apply to shared orchestration state
-                            {
-                                let mut state = forward_shared_state.write().await;
-                                crate::orchestration::state::OrchestratorState::apply_execution_event(
-                                    &mut state,
-                                    &parallel_event,
-                                );
-                            }
-                            // Forward to WebState
-                            #[cfg(feature = "web-monitoring")]
-                            if let Some(tx) = &forward_web_tx {
-                                let _ = tx.send(parallel_event);
-                            }
-                        }
-                        None => {
-                            break;
-                        }
+                ParallelEvent::Stopped => {
+                    forward_merge_stop.store(true, Ordering::SeqCst);
+                    let _ = forward_tx.send(ParallelEvent::Stopped).await;
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(tx) = &forward_web_tx {
+                        let _ = tx.send(ParallelEvent::Stopped);
+                    }
+                    break;
+                }
+                parallel_event => {
+                    // Forward to TUI first (before acquiring write lock)
+                    // This prevents TUI updates from being blocked when acceptance tests run for a long time
+                    let _ = forward_tx.send(parallel_event.clone()).await;
+                    // Apply to shared orchestration state
+                    {
+                        let mut state = forward_shared_state.write().await;
+                        crate::orchestration::state::OrchestratorState::apply_execution_event(
+                            &mut state,
+                            &parallel_event,
+                        );
+                    }
+                    // Forward to WebState
+                    #[cfg(feature = "web-monitoring")]
+                    if let Some(tx) = &forward_web_tx {
+                        let _ = tx.send(parallel_event);
                     }
                 }
             }
         }
     });
 
-    // Execute all changes using slot-driven continuous dispatch
-    let result = tokio::select! {
+    // Execute all changes using slot-driven continuous dispatch.
+    //
+    // The scheduler future is owned here so operator cancellation can keep
+    // polling it instead of dropping it: the scheduler itself performs inner task
+    // abort, join draining, execution-handle release, pending merge/base-lane
+    // result handling, and workspace-guard drop.
+    let mut scheduler = Box::pin(service.run_parallel_with_channel_and_queue_state(
+        changes_to_process.clone(),
+        parallel_tx,
+        Some(cancel_token.clone()),
+        Some(shared_queue_change.clone()),
+        Some(Arc::new(dynamic_queue.clone())),
+        Some(manual_resolve_counter.clone()),
+        Some(shared_state.clone()),
+        explicit_retry,
+    ));
+
+    let (termination, result) = tokio::select! {
+        biased;
+        result = &mut scheduler => (ParallelTermination::SchedulerReturned, Some(result)),
         _ = cancel_token.cancelled() => {
             let change_ids: Vec<String> = changes_to_process.iter().map(|c| c.id.clone()).collect();
-            let cancel_msg = format!(
-                "Cancelled parallel execution ({} changes: {})",
-                change_ids.len(),
-                change_ids.join(", ")
-            );
             let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(
-                    cancel_msg.clone(),
-                )))
+                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "Cancelled parallel execution ({} changes: {})",
+                    change_ids.len(),
+                    change_ids.join(", ")
+                ))))
                 .await;
-            Err(crate::error::OrchestratorError::AgentCommand(cancel_msg))
-        }
-        result = service.run_parallel_with_channel_and_queue_state(
-            changes_to_process.clone(),
-            parallel_tx,
-            Some(cancel_token.clone()),
-            Some(shared_queue_change.clone()),
-            Some(Arc::new(dynamic_queue.clone())),
-            Some(manual_resolve_counter.clone()),
-            Some(shared_state.clone()),
-            explicit_retry,
-        ) => {
-            result
+            drain_cancelled_scheduler(&mut scheduler, PARALLEL_CANCELLATION_CLEANUP_DEADLINE).await
         }
     };
 
+    if termination == ParallelTermination::CancelledAfterCleanupTimeout {
+        // Escalate to managed cleanup by dropping the scheduler, which aborts the
+        // remaining work and releases its resources. This stays an operator
+        // cancellation and is never reported as an execution failure.
+        let _ = tx
+            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                "Stop cleanup exceeded {}s; escalating to managed cleanup",
+                PARALLEL_CANCELLATION_CLEANUP_DEADLINE.as_secs()
+            ))))
+            .await;
+    }
+
+    // Drop the scheduler before joining the forwarder: dropping it closes the
+    // event channel, which is how the forwarder observes the end of the run.
+    drop(scheduler);
+
     // Wait for forward task to complete
     let _ = forward_handle.await;
-    if merge_deferred_stop.load(Ordering::SeqCst) {
-        stopped_or_cancelled = true;
-    }
+
+    let scheduler_reported_stop = merge_deferred_stop.load(Ordering::SeqCst);
+    let scheduler_failed = matches!(result, Some(Err(_)));
 
     let has_reducer_owned_lane_wait_or_active = {
         let state = shared_state.read().await;
@@ -1224,38 +1324,52 @@ pub async fn run_orchestrator_parallel(
             || state.is_base_mutating_lane_occupied()
     };
 
-    match result {
-        Ok(_) => {
-            if merge_deferred_stop.load(Ordering::SeqCst) {
+    let report = classify_parallel_terminal_report(
+        termination,
+        scheduler_failed,
+        scheduler_reported_stop,
+        has_reducer_owned_lane_wait_or_active,
+    );
+
+    match report {
+        ParallelTerminalReport::Stopped => {
+            if termination.is_operator_cancellation() {
+                // Operator cancellation owns exactly one terminal stop transition.
+                // The frontend may already have applied `Stopped`; that handler is
+                // idempotent, so a late delivery reconciles state without adding a
+                // duplicate terminal message.
+                let _ = tx.send(OrchestratorEvent::Stopped).await;
+            } else if scheduler_reported_stop {
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(format!(
                         "Execution stopped with deferred merges ({} changes processed)",
                         changes_to_process.len()
                     ))))
                     .await;
-            } else if has_reducer_owned_lane_wait_or_active {
+            } else {
                 let _ = tx
                     .send(OrchestratorEvent::Log(LogEntry::warn(format!(
                         "Execution paused with reducer-owned lane retry work still pending or active ({} changes processed)",
                         changes_to_process.len()
                     ))))
                     .await;
-                stopped_or_cancelled = true;
-            } else {
+            }
+        }
+        ParallelTerminalReport::Failed => {
+            if let Some(Err(e)) = &result {
                 let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::success(format!(
-                        "Execution completed ({} changes processed)",
-                        changes_to_process.len()
+                    .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                        "Execution failed: {}",
+                        e
                     ))))
                     .await;
             }
         }
-        Err(e) => {
-            had_errors = true;
+        ParallelTerminalReport::Completed => {
             let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::error(format!(
-                    "Execution failed: {}",
-                    e
+                .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                    "Execution completed ({} changes processed)",
+                    changes_to_process.len()
                 ))))
                 .await;
         }
@@ -1269,21 +1383,24 @@ pub async fn run_orchestrator_parallel(
     }
 
     // Only send completion message and AllCompleted event if not stopped/cancelled
-    if !stopped_or_cancelled {
-        if had_errors {
+    match report {
+        ParallelTerminalReport::Stopped => {}
+        ParallelTerminalReport::Failed => {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::warn(
                     "Processing completed with errors".to_string(),
                 )))
                 .await;
-        } else {
+            let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+        }
+        ParallelTerminalReport::Completed => {
             let _ = tx
                 .send(OrchestratorEvent::Log(LogEntry::success(
                     "All parallel changes completed".to_string(),
                 )))
                 .await;
+            let _ = tx.send(OrchestratorEvent::AllCompleted).await;
         }
-        let _ = tx.send(OrchestratorEvent::AllCompleted).await;
     }
     Ok(())
 }
@@ -1755,5 +1872,169 @@ mod tests {
         // Verify that only the non-blocked change remains selectable
         assert_eq!(pending_changes.len(), 1);
         assert!(pending_changes.contains(other_change_id));
+    }
+
+    // ---------------------------------------------------------------------
+    // Idle parallel stop: cancellation cleanup barrier and terminal reporting
+    // ---------------------------------------------------------------------
+
+    use super::{
+        classify_parallel_terminal_report, drain_cancelled_scheduler, ParallelTerminalReport,
+        ParallelTermination,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const TEST_CLEANUP_DEADLINE: Duration = Duration::from_secs(120);
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_parallel_stop_cancellation_does_not_drop_the_scheduler_future() {
+        let cleanup_done = Arc::new(AtomicBool::new(false));
+        let scheduler_cleanup = cleanup_done.clone();
+
+        // Stands in for the scheduler's post-cancellation work: abort, join
+        // drain, execution-handle release, and workspace-guard drop.
+        let scheduler = async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            scheduler_cleanup.store(true, Ordering::SeqCst);
+            Ok::<(), String>(())
+        };
+
+        let (termination, result) =
+            drain_cancelled_scheduler(scheduler, TEST_CLEANUP_DEADLINE).await;
+
+        assert_eq!(termination, ParallelTermination::CancelledAfterCleanup);
+        assert!(matches!(result, Some(Ok(()))));
+        assert!(
+            cleanup_done.load(Ordering::SeqCst),
+            "cancellation must keep polling the scheduler so its cleanup completes"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_parallel_stop_pending_merge_results_drain_before_terminal_stop() {
+        let handled_merges = Arc::new(AtomicUsize::new(0));
+        let scheduler_merges = handled_merges.clone();
+        let (merge_tx, mut merge_rx) = tokio::sync::mpsc::channel::<&'static str>(4);
+
+        // Stands in for a scheduler that still owns pending background merge
+        // results when cancellation arrives.
+        let scheduler = async move {
+            while let Some(_merge_result) = merge_rx.recv().await {
+                scheduler_merges.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok::<(), String>(())
+        };
+
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = merge_tx.send("merged").await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = merge_tx.send("deferred").await;
+        });
+
+        let (termination, result) =
+            drain_cancelled_scheduler(scheduler, TEST_CLEANUP_DEADLINE).await;
+        producer.await.expect("merge producer");
+
+        assert_eq!(termination, ParallelTermination::CancelledAfterCleanup);
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(
+            handled_merges.load(Ordering::SeqCst),
+            2,
+            "pending base-lane results must be handled before terminal stop"
+        );
+        assert_eq!(
+            classify_parallel_terminal_report(termination, false, true, false),
+            ParallelTerminalReport::Stopped,
+            "a drained pending merge is never a force-stopped agent process failure"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_parallel_stop_cleanup_deadline_escalates_without_execution_failure() {
+        let scheduler = std::future::pending::<Result<(), String>>();
+
+        let (termination, result) =
+            drain_cancelled_scheduler(scheduler, TEST_CLEANUP_DEADLINE).await;
+
+        assert_eq!(
+            termination,
+            ParallelTermination::CancelledAfterCleanupTimeout
+        );
+        assert!(result.is_none());
+        assert!(termination.is_operator_cancellation());
+        assert_eq!(
+            classify_parallel_terminal_report(termination, false, false, false),
+            ParallelTerminalReport::Stopped,
+            "a bounded cleanup escalation stays operator cancellation"
+        );
+    }
+
+    #[test]
+    fn idle_parallel_stop_operator_cancellation_is_not_an_execution_failure() {
+        for termination in [
+            ParallelTermination::CancelledAfterCleanup,
+            ParallelTermination::CancelledAfterCleanupTimeout,
+        ] {
+            assert_eq!(
+                classify_parallel_terminal_report(termination, true, false, false),
+                ParallelTerminalReport::Stopped,
+                "cancellation must never be reported as an agent-command failure"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_parallel_stop_genuine_failure_keeps_execution_error_reporting() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                true,
+                false,
+                false
+            ),
+            ParallelTerminalReport::Failed
+        );
+    }
+
+    #[test]
+    fn idle_parallel_stop_normal_completion_still_reports_completion() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                false,
+                false,
+                false
+            ),
+            ParallelTerminalReport::Completed
+        );
+    }
+
+    #[test]
+    fn idle_parallel_stop_scheduler_reported_stop_suppresses_completion() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                false,
+                true,
+                false
+            ),
+            ParallelTerminalReport::Stopped
+        );
+    }
+
+    #[test]
+    fn idle_parallel_stop_reducer_lane_wait_pauses_instead_of_completing() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::Stopped
+        );
     }
 }

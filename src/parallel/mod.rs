@@ -261,6 +261,14 @@ pub struct ParallelExecutor {
     /// suppression coverage does not depend on real VCS subprocesses, and so probe counts and
     /// probe failures can be observed directly.
     analysis_input_probe: Option<Arc<dyn AnalysisInputProbe>>,
+    /// Override for the scheduler loop's background merge/base-lane result channel.
+    ///
+    /// `None` is the ordinary path: the loop creates its own channel per run. Tests
+    /// inject a double so the cancellation cleanup barrier can be driven
+    /// deterministically — a pending merge can be left outstanding across cancellation
+    /// and completed on demand — without spawning real detached merge tasks.
+    #[cfg(test)]
+    merge_result_channel_override: Option<(mpsc::Sender<MergeResult>, mpsc::Receiver<MergeResult>)>,
     /// Explicit-target classification deferred to the post-checkpoint boundary.
     ///
     /// `None` is the ordinary path: explicit targets were already classified

@@ -27,6 +27,12 @@ pub enum StopMode {
     None,
     /// Graceful stop requested, waiting for current process
     GracefulPending,
+    /// Immediate stop requested; runtime activity has not been classified yet.
+    ///
+    /// The second Esc only enqueues the shared stop command. Whether the stop is
+    /// truthfully a force stop is decided asynchronously from one runtime
+    /// activity snapshot, never from `AppMode::Stopping` alone.
+    ImmediatePending,
     /// Force stop executed
     ForceStopped,
 }

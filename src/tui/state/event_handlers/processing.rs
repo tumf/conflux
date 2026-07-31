@@ -176,7 +176,15 @@ impl AppState {
         }
     }
 
+    /// Apply a terminal `Stopped` transition.
+    ///
+    /// The first transition into `AppMode::Stopped` owns the terminal
+    /// `Processing stopped` message. A repeated or late `Stopped` delivery (for
+    /// example the scheduler's own cancellation event arriving after the
+    /// frontend already applied the stop) still reconciles queue and mode state,
+    /// but must not append a duplicate terminal message.
     pub(crate) fn handle_stopped(&mut self) {
+        let already_stopped = matches!(self.mode, AppMode::Stopped);
         self.reset_analysis_log_dedupe();
         self.mode = AppMode::Stopped;
         self.current_change = None;
@@ -196,7 +204,9 @@ impl AppState {
                 change.set_display_status_cache("not queued");
             }
         }
-        self.add_log(LogEntry::warn("Processing stopped"));
+        if !already_stopped {
+            self.add_log(LogEntry::warn("Processing stopped"));
+        }
     }
 
     pub(crate) fn handle_progress_updated(
@@ -229,6 +239,13 @@ mod tests {
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
         }
+    }
+
+    fn count_logs(app: &AppState, needle: &str) -> usize {
+        app.logs
+            .iter()
+            .filter(|entry| entry.message.contains(needle))
+            .count()
     }
 
     fn count_analysis_logs(app: &AppState, remaining_changes: usize) -> usize {
@@ -453,5 +470,55 @@ mod tests {
         app.try_transition_to_select();
 
         assert_eq!(app.mode, AppMode::Running);
+    }
+
+    #[test]
+    fn idle_parallel_stop_first_stopped_transition_owns_the_terminal_message() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        app.changes[0].selected = true;
+
+        app.handle_stopped();
+
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(count_logs(&app, "Processing stopped"), 1);
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(app.changes[0].selected, "execution marks must be preserved");
+    }
+
+    #[test]
+    fn idle_parallel_stop_repeated_stopped_delivery_does_not_duplicate_the_message() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        app.changes[0].selected = true;
+
+        app.handle_stopped();
+        // A late scheduler-side `Stopped` arriving after the frontend already
+        // applied the stop only reconciles state.
+        app.handle_stopped();
+        app.handle_stopped();
+
+        assert_eq!(count_logs(&app, "Processing stopped"), 1);
+        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.changes[0].display_status_cache, "not queued");
+        assert!(app.changes[0].selected, "execution marks must be preserved");
+    }
+
+    #[test]
+    fn idle_parallel_stop_new_run_can_report_its_own_terminal_stop() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+
+        app.handle_stopped();
+        app.mode = AppMode::Running;
+        app.handle_stopped();
+
+        assert_eq!(
+            count_logs(&app, "Processing stopped"),
+            2,
+            "a later run owns its own terminal stop message"
+        );
     }
 }

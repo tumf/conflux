@@ -103,6 +103,19 @@ use super::ParallelExecutor;
 use super::SchedulerLifetime;
 use crate::upstream::coordinator::SchedulerOutcome;
 
+/// Bounded deadline for handling pending background merge/base-lane results on the
+/// cancellation exit.
+///
+/// The scheduler must not establish terminal stop while a detached post-archive merge
+/// or base-lane retry may still be mutating the base repository, so the cancellation
+/// exit keeps receiving merge results until `pending_merge_count` reaches zero. This
+/// deadline is deliberately shorter than the outer boundary's cleanup barrier
+/// (`crate::tui::orchestrator::PARALLEL_CANCELLATION_CLEANUP_DEADLINE`, 120s) so a
+/// merge task that never reports escalates through this bounded wait — with an
+/// operator-visible diagnostic — instead of consuming the whole outer barrier.
+pub(super) const CANCELLATION_MERGE_DRAIN_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
 impl ParallelExecutor {
     pub(super) fn is_fully_drained(
         &self,
@@ -294,7 +307,7 @@ impl ParallelExecutor {
         let max_parallelism = self.workspace_manager.max_concurrent();
         let semaphore = Arc::new(Semaphore::new(max_parallelism));
         let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
-        let (merge_result_tx, mut merge_result_rx) = tokio::sync::mpsc::channel(64);
+        let (merge_result_tx, mut merge_result_rx) = self.take_merge_result_channel();
         let mut in_flight: HashSet<String> = HashSet::new();
         let mut queued: Vec<crate::openspec::Change> = changes;
         let mut iteration = 1u32;
@@ -338,7 +351,18 @@ impl ParallelExecutor {
                         }
                     }
                 }
+                // Aborted tasks never reach `handle_workspace_completion`, so their
+                // registered execution handles are released here instead.
+                self.release_execution_handles_after_cancellation().await;
                 in_flight.clear();
+                // Detached background merge / base-lane tasks may still be mutating the
+                // base repository. Terminal stop follows their result handling.
+                self.drain_pending_merge_results_after_cancellation(
+                    &merge_result_tx,
+                    &mut merge_result_rx,
+                    CANCELLATION_MERGE_DRAIN_DEADLINE,
+                )
+                .await;
                 break;
             }
 
@@ -538,6 +562,106 @@ impl ParallelExecutor {
 
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
         Ok(())
+    }
+
+    /// Channel used by the scheduler loop for background merge / base-lane results.
+    ///
+    /// Production runs always create a fresh channel here; only tests may install a
+    /// double first (see `ParallelExecutor::merge_result_channel_override`).
+    fn take_merge_result_channel(
+        &mut self,
+    ) -> (
+        tokio::sync::mpsc::Sender<super::MergeResult>,
+        tokio::sync::mpsc::Receiver<super::MergeResult>,
+    ) {
+        #[cfg(test)]
+        {
+            if let Some(channel) = self.merge_result_channel_override.take() {
+                return channel;
+            }
+        }
+        tokio::sync::mpsc::channel(64)
+    }
+
+    /// Release every registered per-change execution handle after cancellation aborted
+    /// the in-flight workspace tasks.
+    ///
+    /// `handle_workspace_completion` owns handle release on the ordinary completion path,
+    /// but an aborted task never returns through it. The dynamic queue outlives one run,
+    /// so a handle left registered here would keep reporting positive execution evidence
+    /// into a later stop decision in the same session and turn an idle stop into a
+    /// "Force stopped" claim about an agent process that no longer exists.
+    async fn release_execution_handles_after_cancellation(&self) {
+        let Some(queue) = self.dynamic_queue.as_ref() else {
+            return;
+        };
+        let released = queue.release_all_execution_handles().await;
+        if released > 0 {
+            info!(
+                released,
+                "Released registered execution handles for aborted in-flight changes after cancellation"
+            );
+        }
+    }
+
+    /// Keep handling pending background merge / base-lane results after cancellation,
+    /// under a bounded deadline.
+    ///
+    /// Post-archive merge and base-lane retry tasks are detached, so cancellation does not
+    /// abort them: they may still be mutating the base repository when the scheduler loop
+    /// breaks. Terminal `Stopped` must not be established before those outcomes have been
+    /// received, so this waits for `pending_merge_count` to reach zero through the ordinary
+    /// `handle_merge_result_with_tx` path. Exceeding `deadline` leaves the run cancelled and
+    /// escalates to the outer bounded cleanup barrier; it is never an execution failure.
+    async fn drain_pending_merge_results_after_cancellation(
+        &mut self,
+        merge_result_tx: &tokio::sync::mpsc::Sender<super::MergeResult>,
+        merge_result_rx: &mut tokio::sync::mpsc::Receiver<super::MergeResult>,
+        deadline: std::time::Duration,
+    ) {
+        let pending = self.pending_merge_count.load(Ordering::Relaxed);
+        if pending == 0 {
+            return;
+        }
+
+        let waiting_msg = format!(
+            "Waiting for {} pending background merge/base-lane task(s) to reach a safe boundary before stopping",
+            pending
+        );
+        info!("{}", waiting_msg);
+        send_event(
+            &self.event_tx,
+            ParallelEvent::Log(LogEntry::info(&waiting_msg)),
+        )
+        .await;
+
+        let drained = tokio::time::timeout(deadline, async {
+            while self.pending_merge_count.load(Ordering::Relaxed) > 0 {
+                // The scheduler still holds a sender, so `None` only happens if the
+                // channel is closed elsewhere; treat it as nothing left to receive.
+                let Some(merge_result) = merge_result_rx.recv().await else {
+                    break;
+                };
+                self.handle_merge_result_with_tx(merge_result, merge_result_tx)
+                    .await;
+            }
+        })
+        .await;
+
+        if drained.is_err() {
+            let timeout_msg = format!(
+                "Pending background merge/base-lane task(s) did not report within {}s while stopping; continuing shutdown",
+                deadline.as_secs()
+            );
+            warn!("{}", timeout_msg);
+            send_event(
+                &self.event_tx,
+                ParallelEvent::Log(LogEntry::warn(&timeout_msg)),
+            )
+            .await;
+        } else {
+            info!("Pending background merge/base-lane tasks reached a safe boundary; stopping");
+        }
     }
 
     /// Run the scheduler loop's queued re-analysis/dispatch evaluation and apply the
