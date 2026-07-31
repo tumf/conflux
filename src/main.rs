@@ -395,7 +395,7 @@ fn acquire_repository_lock(cli: &Cli) {
         // No Git repository here, so there is no repository identity to guard.
         Ok(None) => {}
         Ok(Some(lock)) => repo_lock::install(lock),
-        Err(err @ repo_lock::LockError::Conflict { .. }) => {
+        Err(err @ repo_lock::LockError::Conflict(_)) => {
             eprintln!("{err}");
             std::process::exit(1);
         }

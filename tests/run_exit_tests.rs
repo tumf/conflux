@@ -547,6 +547,18 @@ fn conflict_reports_a_published_api_url() {
     drop(owner);
 }
 
+/// Ensures a spawned daemon never outlives the test, including on panic.
+#[cfg(feature = "web-monitoring")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(feature = "web-monitoring")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Poll `path` until it contains a URL line, or the timeout expires.
 ///
 /// The daemon writes startup logs to stdout as well, so the URL is matched by
@@ -583,21 +595,23 @@ fn server_publishes_its_bound_api_url_and_kill_releases_the_lock() {
 
     // Port 0 forces an OS-assigned port, so a correct diagnostic can only come
     // from the address the listener actually bound.
-    let mut server = Command::new(env!("CARGO_BIN_EXE_cflx"))
-        .args([
-            "server",
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-        ])
-        .current_dir(tmp.path())
-        .stdout(std::process::Stdio::from(stdout_file))
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("failed to spawn cflx server");
+    let mut server = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_cflx"))
+            .args([
+                "server",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+            ])
+            .current_dir(tmp.path())
+            .stdout(std::process::Stdio::from(stdout_file))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn cflx server"),
+    );
 
     let url = wait_for_url_line(&stdout_path, Duration::from_secs(30));
     assert!(!url.ends_with(":0"), "expected an OS-assigned port: {url}");
@@ -609,7 +623,7 @@ fn server_publishes_its_bound_api_url_and_kill_releases_the_lock() {
         "expected the actual bound API URL {url}, got stderr={stderr}"
     );
     assert!(
-        stderr.contains(&server.id().to_string()),
+        stderr.contains(&server.0.id().to_string()),
         "expected the server pid, got stderr={stderr}"
     );
     assert!(
@@ -618,8 +632,8 @@ fn server_publishes_its_bound_api_url_and_kill_releases_the_lock() {
     );
 
     // Abnormal termination releases the lock through file-descriptor semantics.
-    server.kill().unwrap();
-    server.wait().unwrap();
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
     let reacquired = repo_lock::acquire(tmp.path(), InvocationMode::Run)
         .expect("lock must be acquirable after the owner is killed");
     assert!(reacquired.is_some());

@@ -277,14 +277,19 @@ pub fn discover_common_dir(workspace: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The repository and, when readable, the owner a conflict was lost to.
+#[derive(Debug)]
+pub struct LockConflict {
+    pub common_dir: PathBuf,
+    pub owner: Option<OwnerMetadata>,
+}
+
 /// Why a repository lock could not be acquired.
 #[derive(Debug)]
 pub enum LockError {
-    /// Another live process holds the OS lock.
-    Conflict {
-        common_dir: PathBuf,
-        owner: Option<OwnerMetadata>,
-    },
+    /// Another live process holds the OS lock. Boxed to keep this error small
+    /// enough to travel in a `Result` without bloating the success path.
+    Conflict(Box<LockConflict>),
     /// The lock file itself could not be opened or locked.
     Io { path: PathBuf, source: io::Error },
 }
@@ -292,8 +297,12 @@ pub enum LockError {
 impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LockError::Conflict { common_dir, owner } => {
-                write!(f, "{}", conflict_message(common_dir, owner.as_ref()))
+            LockError::Conflict(conflict) => {
+                write!(
+                    f,
+                    "{}",
+                    conflict_message(&conflict.common_dir, conflict.owner.as_ref())
+                )
             }
             LockError::Io { path, source } => {
                 write!(
@@ -382,10 +391,10 @@ pub fn acquire(
     match try_lock_exclusive(&file) {
         Ok(true) => {}
         Ok(false) => {
-            return Err(LockError::Conflict {
+            return Err(LockError::Conflict(Box::new(LockConflict {
                 common_dir,
                 owner: read_owner_metadata(&owner_path),
-            })
+            })))
         }
         Err(source) => {
             return Err(LockError::Io {
