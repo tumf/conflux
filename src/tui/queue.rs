@@ -196,6 +196,16 @@ impl DynamicQueue {
         }
     }
 
+    /// Number of currently registered per-change execution handles.
+    ///
+    /// A handle is registered exactly while a workspace task (the agent command
+    /// path) owns a change, so a zero count is positive evidence that no agent
+    /// process is running and an immediate stop must not claim force termination.
+    pub async fn registered_execution_count(&self) -> usize {
+        let tokens = self.kill_tokens.lock().await;
+        tokens.len()
+    }
+
     /// Mark a change stopped, cancel its execution token, and return the token that
     /// the executor cancels once the workspace task actually returned.
     ///

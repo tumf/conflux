@@ -18,6 +18,7 @@ pub mod queue;
 mod render;
 mod runner;
 mod state;
+pub mod stop_classification;
 mod terminal;
 mod type_impls;
 pub mod types;
