@@ -26,6 +26,7 @@ use super::ports::{
     PortResult, RepairCause, RepairRequest, UpstreamEvent, UpstreamGit, UpstreamObserver,
     UpstreamPortError, UpstreamRepairAgent, UpstreamVerifier,
 };
+use super::publication::{parse_publication_trailers, PublicationEvidence};
 use super::spine::{validate_spine, SpineValidation};
 use super::trailers::{format_upstream_merge_message, parse_upstream_trailers, UpstreamTrailers};
 
@@ -68,6 +69,25 @@ pub enum FinalizeOutcome {
     /// A non-drained scheduler outcome; finalization was not entered.
     Skipped { reason: String },
     /// Finalization could not converge; resumable.
+    Stalled { reason: String },
+}
+
+/// Result of one change-scoped publication cycle.
+///
+/// Publication is revision-scoped, not run-scoped: a cycle publishes exactly the
+/// cumulative HEAD that was made eligible, and a persistent process may run as
+/// many successive cycles as there are advancing cumulative HEADs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationOutcome {
+    /// Cumulative HEAD was verified, natively pushed, and remotely confirmed.
+    Published { head: String },
+    /// Remote observation already contains cumulative HEAD, so no push ran.
+    ///
+    /// This covers both the idempotent repeat request and the interrupted-push
+    /// recovery case, where the remote is observed before anything is pushed.
+    AlreadyConfirmed { head: String },
+    /// The bounded cycle did not converge. Publication remains resumable and no
+    /// success is claimed.
     Stalled { reason: String },
 }
 
@@ -128,6 +148,75 @@ pub async fn scan_unpushed_upstream_merges(
     }
 
     Ok(evidence)
+}
+
+/// Label a publication stall with the change it is attributed to, when there is
+/// one. Zero-change recovery has no change to attribute and stays unlabeled.
+fn describe_publication_stall(attribution: Option<&str>, reason: &str) -> String {
+    match attribution {
+        Some(change_id) => format!("publishing '{}': {}", change_id, reason),
+        None => reason.to_string(),
+    }
+}
+
+/// Bounded offline scan for publication-required integrations that are not
+/// proven reachable from their bound remote branch.
+///
+/// Like [`scan_unpushed_upstream_merges`] this performs **no** network access
+/// and needs no selected remote: the marker itself names the remote and branch,
+/// and reachability is checked against the local remote-tracking ref. A marker
+/// whose remote-tracking ref is missing counts as unpublished, because nothing
+/// locally proves it was published.
+///
+/// Ordinary disabled-mode merges carry no marker, so they can never be surfaced
+/// here and are never retroactively promoted.
+pub async fn scan_pending_publications(
+    git: &dyn UpstreamGit,
+) -> PortResult<Vec<PublicationEvidence>> {
+    let head = git.head_sha().await?;
+    let commits = git
+        .first_parent_commits(None, &head, Some(RECOVERY_SCAN_LIMIT))
+        .await?;
+
+    let mut evidence = Vec::new();
+    for commit in commits {
+        let Some(trailers) = parse_publication_trailers(&commit.message) else {
+            continue;
+        };
+
+        let tracking_ref = format!("refs/remotes/{}/{}", trailers.remote, trailers.branch);
+        let published = match git.local_ref_sha(&tracking_ref).await? {
+            Some(remote_sha) => git.is_ancestor(&commit.sha, &remote_sha).await?,
+            None => false,
+        };
+        if !published {
+            evidence.push(PublicationEvidence {
+                commit: commit.sha,
+                trailers,
+            });
+        }
+    }
+
+    Ok(evidence)
+}
+
+/// Refuse an option-less cumulative parallel run while a publication-required
+/// integration is not proven remote-reachable.
+///
+/// The diagnostic names the change, remote, and branch so the operator can
+/// restart with matching `-u` and a newly supplied verification command. The
+/// change is explicitly *not* reported as terminal `merged`.
+pub fn publication_recovery_refusal(
+    evidence: &[PublicationEvidence],
+) -> Option<UpstreamOptionError> {
+    evidence.first().map(
+        |found| UpstreamOptionError::PublicationRecoveryRequiresOption {
+            change_id: found.trailers.change_id.clone(),
+            remote: found.trailers.remote.clone(),
+            branch: found.trailers.branch.clone(),
+            integration_commit: found.commit.clone(),
+        },
+    )
 }
 
 /// Refuse an option-less cumulative parallel run while upstream recovery evidence exists.
@@ -203,8 +292,14 @@ pub struct UpstreamCoordinator {
     repair_agent: Arc<dyn UpstreamRepairAgent>,
     observer: Arc<dyn UpstreamObserver>,
     scheduler: CheckpointScheduler,
-    /// At most one successful push per run; never retried after confirmation.
-    pushed_head: Option<String>,
+    /// Latest cumulative HEAD this process observed as remote-reachable.
+    ///
+    /// This is an optimization only, and only after a remote observation made in
+    /// this same process: it suppresses a repeated request for an already
+    /// confirmed HEAD. It is never restart or ambiguous-outcome authority —
+    /// every cycle that has not observed the remote for the current HEAD
+    /// re-observes it.
+    confirmed_head: Option<String>,
 }
 
 impl UpstreamCoordinator {
@@ -224,7 +319,7 @@ impl UpstreamCoordinator {
             repair_agent,
             observer,
             scheduler: CheckpointScheduler::new(),
-            pushed_head: None,
+            confirmed_head: None,
         }
     }
 
@@ -236,8 +331,9 @@ impl UpstreamCoordinator {
         &self.branch
     }
 
+    /// Latest cumulative HEAD confirmed remote-reachable in this process.
     pub fn pushed_head(&self) -> Option<&str> {
-        self.pushed_head.as_deref()
+        self.confirmed_head.as_deref()
     }
 
     /// Batched completed results waiting behind the active checkpoint.
@@ -724,55 +820,73 @@ impl UpstreamCoordinator {
         Ok(Some(UpstreamStepOutcome::Stalled { reason }))
     }
 
-    // ── Finalization ───────────────────────────────────────────────────────
+    // ── Publication ────────────────────────────────────────────────────────
 
-    /// Own finalization ordering for the run.
+    /// Record the publication-required marker for an opted-in local integration.
     ///
-    /// Only a successful drain may enter final checkpoint, verification, native
-    /// non-force push, and remote confirmation.
-    pub async fn finalize(&mut self, outcome: SchedulerOutcome) -> PortResult<FinalizeOutcome> {
-        match outcome {
-            SchedulerOutcome::BlockedOrStalled => {
-                return Ok(FinalizeOutcome::Skipped {
-                    reason: "scheduler exited blocked or stalled".to_string(),
-                })
-            }
-            SchedulerOutcome::Cancelled => {
-                return Ok(FinalizeOutcome::Skipped {
-                    reason: "run was cancelled".to_string(),
-                })
-            }
-            SchedulerOutcome::DrainedSuccessfully => {}
-        }
+    /// This must succeed *before* the integration may be treated as locally
+    /// integrated, because it is the only evidence that survives process loss and
+    /// distinguishes "integrated, still owes a push" from ordinary terminal
+    /// `merged` history.
+    pub async fn record_publication_intent(&mut self, change_id: &str) -> PortResult<String> {
+        let message = super::publication::format_publication_marker_message(
+            change_id,
+            &self.config.remote,
+            &self.branch,
+        );
+        self.git.commit_empty(&message).await
+    }
 
-        if let Some(head) = self.pushed_head.clone() {
-            // At most one successful push per run; never retried after confirmation.
-            return Ok(FinalizeOutcome::Completed { pushed_head: head });
+    /// Publish the cumulative HEAD that a completed change just produced.
+    ///
+    /// Idempotency is revision-scoped: an already confirmed HEAD is a no-op, and
+    /// a later change that advances cumulative HEAD starts a fresh bounded cycle.
+    /// The in-process record is consulted only for a HEAD this process already
+    /// observed on the remote; every other request re-observes the remote.
+    pub async fn publish_change(&mut self, change_id: &str) -> PortResult<PublicationOutcome> {
+        let head = self.git.head_sha().await?;
+        if self.confirmed_head.as_deref() == Some(head.as_str()) {
+            // Repeated request for the same confirmed revision: no second push.
+            return Ok(PublicationOutcome::AlreadyConfirmed { head });
         }
+        self.run_publication_cycle(Some(change_id)).await
+    }
 
+    /// The bounded publication cycle shared by change publication and
+    /// zero-change recovery.
+    ///
+    /// `attribution` only labels diagnostics; routing never depends on it.
+    async fn run_publication_cycle(
+        &mut self,
+        attribution: Option<&str>,
+    ) -> PortResult<PublicationOutcome> {
         let remote = self.config.remote.clone();
         let branch = self.branch.clone();
 
         for attempt in 1..=MAX_FINALIZE_ATTEMPTS {
-            // Zero-change no-work probe. Performed before any integration so a
-            // remote-only advance never manufactures a synthetic local merge.
+            // Observe the remote before doing anything else. If cumulative HEAD
+            // is already reachable, an interrupted prior push already succeeded
+            // and must not be repeated.
             self.git.fetch(&remote, &branch).await?;
             let Some(fetched_sha) = self.git.fetched_sha(&remote, &branch).await? else {
-                return Ok(FinalizeOutcome::Stalled {
+                return Ok(PublicationOutcome::Stalled {
                     reason: format!("remote '{}' has no branch '{}'", remote, branch),
                 });
             };
             let head = self.git.head_sha().await?;
             if self.git.is_ancestor(&head, &fetched_sha).await? {
+                self.confirmed_head = Some(head.clone());
                 self.observer
-                    .observe(UpstreamEvent::NoOp {
-                        fetched_sha: fetched_sha.clone(),
+                    .observe(UpstreamEvent::PushConfirmed {
+                        remote: remote.clone(),
+                        branch: branch.clone(),
+                        head: head.clone(),
                     })
                     .await;
-                return Ok(FinalizeOutcome::NoWork);
+                return Ok(PublicationOutcome::AlreadyConfirmed { head });
             }
 
-            // Final checkpoint: integrate any remote advance and reverify.
+            // Integrate any remote advance and reverify before publishing.
             let trigger = if attempt == 1 {
                 CheckpointTrigger::AfterDrain
             } else {
@@ -783,32 +897,38 @@ impl UpstreamCoordinator {
                 .await?
             {
                 UpstreamStepOutcome::Stalled { reason } => {
-                    return Ok(FinalizeOutcome::Stalled { reason })
+                    return Ok(PublicationOutcome::Stalled {
+                        reason: describe_publication_stall(attribution, &reason),
+                    })
                 }
                 UpstreamStepOutcome::Deferred { reason } => {
-                    return Ok(FinalizeOutcome::Stalled { reason })
+                    return Ok(PublicationOutcome::Stalled {
+                        reason: describe_publication_stall(attribution, &reason),
+                    })
                 }
                 UpstreamStepOutcome::NoOp { .. } => {
                     // Ancestry-proven upstream no-op still runs the complete
-                    // command against final cumulative HEAD before push.
+                    // command against the exact cumulative HEAD being published.
                     let head = self.git.head_sha().await?;
                     if let Some(UpstreamStepOutcome::Stalled { reason }) = self
                         .verify_with_semantic_repair_for_base_result(&head)
                         .await?
                     {
-                        return Ok(FinalizeOutcome::Stalled { reason });
+                        return Ok(PublicationOutcome::Stalled {
+                            reason: describe_publication_stall(attribution, &reason),
+                        });
                     }
                 }
                 UpstreamStepOutcome::Integrated { .. } => {
                     // The checkpoint already ran the complete command against the
-                    // integrated tree, which is final cumulative HEAD here.
+                    // integrated tree, which is the cumulative HEAD to publish.
                 }
             }
 
             // Fresh pre-push ancestry check.
             self.git.fetch(&remote, &branch).await?;
             let Some(fresh_sha) = self.git.fetched_sha(&remote, &branch).await? else {
-                return Ok(FinalizeOutcome::Stalled {
+                return Ok(PublicationOutcome::Stalled {
                     reason: format!("remote '{}' has no branch '{}'", remote, branch),
                 });
             };
@@ -841,16 +961,21 @@ impl UpstreamCoordinator {
                 match class {
                     PushFailureClass::Race => continue,
                     PushFailureClass::Stalled => {
-                        return Ok(FinalizeOutcome::Stalled {
-                            reason: format!(
+                        return Ok(PublicationOutcome::Stalled {
+                            reason: describe_publication_stall(
+                                attribution,
+                                &format!(
                             "native push to {}/{} failed without repairable repository evidence",
                             remote, branch
                         ),
+                            ),
                         })
                     }
                     PushFailureClass::RepositoryRepairable => {
                         if let Some(stall) = self.repair_push_repository(&head).await? {
-                            return Ok(FinalizeOutcome::Stalled { reason: stall });
+                            return Ok(PublicationOutcome::Stalled {
+                                reason: describe_publication_stall(attribution, &stall),
+                            });
                         }
                         continue;
                     }
@@ -858,7 +983,8 @@ impl UpstreamCoordinator {
             }
 
             // Remote confirmation. Completion is a network observation, not the
-            // push command's exit status.
+            // push command's exit status. An ambiguous outcome falls through to
+            // another cycle, which re-observes the remote before pushing again.
             let observed = self.git.ls_remote_sha(&remote, &branch).await?;
             let Some(observed) = observed else {
                 continue;
@@ -872,7 +998,7 @@ impl UpstreamCoordinator {
                 continue;
             }
 
-            self.pushed_head = Some(head.clone());
+            self.confirmed_head = Some(head.clone());
             self.observer
                 .observe(UpstreamEvent::PushConfirmed {
                     remote: remote.clone(),
@@ -881,15 +1007,85 @@ impl UpstreamCoordinator {
                 })
                 .await;
             self.observer.observe(UpstreamEvent::Completed).await;
+            return Ok(PublicationOutcome::Published { head });
+        }
+
+        Ok(PublicationOutcome::Stalled {
+            reason: describe_publication_stall(
+                attribution,
+                &format!(
+                    "publication did not converge within {} attempts",
+                    MAX_FINALIZE_ATTEMPTS
+                ),
+            ),
+        })
+    }
+
+    // ── Finalization ───────────────────────────────────────────────────────
+
+    /// Own finalization ordering for the run.
+    ///
+    /// With per-change publication this is no longer the normal publication
+    /// mechanism: each completed change already published at its own boundary.
+    /// Finalization remains the zero-change recovery boundary and the final
+    /// gate that refuses to report completion while anything is unpublished.
+    ///
+    /// Recovery here is deliberately narrow. Only explicit opted-in evidence —
+    /// a publication-required marker or a valid upstream recovery trailer that
+    /// is not remote-reachable — is recognized. Arbitrary local first-parent
+    /// history and disabled-mode terminal `merged` changes never become work.
+    pub async fn finalize(&mut self, outcome: SchedulerOutcome) -> PortResult<FinalizeOutcome> {
+        match outcome {
+            SchedulerOutcome::BlockedOrStalled => {
+                return Ok(FinalizeOutcome::Skipped {
+                    reason: "scheduler exited blocked or stalled".to_string(),
+                })
+            }
+            SchedulerOutcome::Cancelled => {
+                return Ok(FinalizeOutcome::Skipped {
+                    reason: "run was cancelled".to_string(),
+                })
+            }
+            SchedulerOutcome::DrainedSuccessfully => {}
+        }
+
+        let head = self.git.head_sha().await?;
+        if self.confirmed_head.as_deref() == Some(head.as_str()) {
+            // Every completed change already published this cumulative HEAD.
             return Ok(FinalizeOutcome::Completed { pushed_head: head });
         }
 
-        Ok(FinalizeOutcome::Stalled {
-            reason: format!(
-                "upstream finalization did not converge within {} attempts",
-                MAX_FINALIZE_ATTEMPTS
-            ),
-        })
+        if !self.has_explicit_recovery_evidence().await? {
+            // No opted-in evidence: a fresh zero-change invocation completes as
+            // no-work without verification, merge, push, or synthetic events.
+            return Ok(FinalizeOutcome::NoWork);
+        }
+
+        match self.run_publication_cycle(None).await? {
+            PublicationOutcome::Published { head } => {
+                Ok(FinalizeOutcome::Completed { pushed_head: head })
+            }
+            PublicationOutcome::AlreadyConfirmed { head } => {
+                Ok(FinalizeOutcome::Completed { pushed_head: head })
+            }
+            PublicationOutcome::Stalled { reason } => Ok(FinalizeOutcome::Stalled { reason }),
+        }
+    }
+
+    /// Whether cumulative history carries explicit opted-in publication evidence
+    /// that is not proven reachable from the selected remote branch.
+    async fn has_explicit_recovery_evidence(&self) -> PortResult<bool> {
+        let pending_publications = scan_pending_publications(self.git.as_ref()).await?;
+        if pending_publications
+            .iter()
+            .any(|evidence| evidence.trailers.remote == self.config.remote)
+        {
+            return Ok(true);
+        }
+        let pending_upstream = scan_unpushed_upstream_merges(self.git.as_ref()).await?;
+        Ok(pending_upstream
+            .iter()
+            .any(|evidence| evidence.trailers.remote == self.config.remote))
     }
 
     /// Bounded repository repair after a push failure.

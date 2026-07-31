@@ -302,6 +302,37 @@ pub struct ResolveMergesWithRetryArgs<'a> {
     pub max_retries: u32,
     pub shared_stagger_state: crate::ai_command_runner::SharedStaggerState,
     pub auto_resolve_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Upstream publication, not local integration, owns the change's terminal
+    /// success for this cumulative merge.
+    ///
+    /// A per-change `ResolveCompleted` finalizes the reducer as terminal
+    /// `merged`, which for an opted-in change is wrong twice over: the change is
+    /// not yet published, and a terminal state swallows the later `PushFailed`
+    /// that F5 retry needs. Publication emits its own change-scoped progress, so
+    /// the finalizing event is suppressed here — mirroring the `MergeCompleted`
+    /// suppression on the same path.
+    pub publication_owns_completion: bool,
+}
+
+/// Emit the per-change resolve completion unless publication owns completion.
+async fn send_resolve_completed(
+    event_tx: &Option<mpsc::Sender<ParallelEvent>>,
+    change_ids: &[String],
+    publication_owns_completion: bool,
+) {
+    if publication_owns_completion {
+        return;
+    }
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveCompleted {
+                change_id: change_id.to_string(),
+                worktree_change_ids: None,
+            },
+        )
+        .await;
+    }
 }
 
 /// Attempt to resolve merges with retries using the configured resolve command.
@@ -317,6 +348,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
         max_retries,
         shared_stagger_state,
         auto_resolve_count,
+        publication_owns_completion,
     } = args;
 
     // Create RAII guard to ensure counter is decremented on all exit paths
@@ -354,16 +386,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             .await
             .map_err(OrchestratorError::from)?;
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-            for change_id in change_ids {
-                send_event(
-                    event_tx,
-                    ParallelEvent::ResolveCompleted {
-                        change_id: change_id.to_string(),
-                        worktree_change_ids: None,
-                    },
-                )
-                .await;
-            }
+            send_resolve_completed(event_tx, change_ids, publication_owns_completion).await;
             return Ok(());
         }
 
@@ -384,16 +407,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
                 revisions.join(", ")
             );
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-            for change_id in change_ids {
-                send_event(
-                    event_tx,
-                    ParallelEvent::ResolveCompleted {
-                        change_id: change_id.to_string(),
-                        worktree_change_ids: None,
-                    },
-                )
-                .await;
-            }
+            send_resolve_completed(event_tx, change_ids, publication_owns_completion).await;
             return Ok(());
         }
 
@@ -900,16 +914,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
 
             // Send ResolveCompleted for each change_id to update TUI status
-            for change_id in change_ids {
-                send_event(
-                    event_tx,
-                    ParallelEvent::ResolveCompleted {
-                        change_id: change_id.to_string(),
-                        worktree_change_ids: None,
-                    },
-                )
-                .await;
-            }
+            send_resolve_completed(event_tx, change_ids, publication_owns_completion).await;
 
             // Guard will decrement auto resolve counter on drop
             return Ok(());

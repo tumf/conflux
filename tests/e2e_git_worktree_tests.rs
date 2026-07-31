@@ -620,7 +620,9 @@ mod upstream_integration_support {
     use conflux::upstream::verify::CommandVerifier;
 
     pub use conflux::upstream::checkpoint::CheckpointTrigger;
-    pub use conflux::upstream::coordinator::{FinalizeOutcome, UpstreamStepOutcome};
+    pub use conflux::upstream::coordinator::{
+        scan_pending_publications, FinalizeOutcome, PublicationOutcome, UpstreamStepOutcome,
+    };
 
     pub fn git(cwd: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -734,8 +736,36 @@ mod upstream_integration_support {
         git(repo, &["rev-parse", "HEAD"])
     }
 
+    /// Record the publication-required marker the base lane writes after an
+    /// opted-in change integrates into cumulative base.
+    ///
+    /// This is a real commit in a real repository, so everything derived from it
+    /// (restart refusal, retry routing, recovery) is exercised against genuine
+    /// Git evidence rather than a fixture flag.
+    pub fn mark_publication_required(repo: &Path, change_id: &str) -> String {
+        let message = conflux::upstream::publication::format_publication_marker_message(
+            change_id, "origin", "main",
+        );
+        git(repo, &["commit", "--allow-empty", "-m", &message]);
+        git(repo, &["rev-parse", "HEAD"])
+    }
+
+    /// Integrate a change into cumulative base exactly as an opted-in run does:
+    /// the `Merge change:` integration commit, then its publication marker.
+    pub fn integrate_and_mark(repo: &Path, change_id: &str) -> String {
+        add_cumulative_change_merge(repo, change_id);
+        mark_publication_required(repo, change_id)
+    }
+
+    pub fn ops(repo: &Path) -> GitUpstreamOps {
+        GitUpstreamOps::new(repo)
+    }
+
     /// Verification command that always succeeds, executed as a real process.
     pub const PASSING_COMMAND: &str = "exit 0";
+
+    /// Verification command that always fails, executed as a real process.
+    pub const FAILING_COMMAND: &str = "exit 1";
 
     /// A repair agent that runs a real shell script in the repository.
     pub struct ScriptRepairAgent {
@@ -1130,8 +1160,7 @@ async fn upstream_integration_e2e_successful_drain_pushes_once_and_confirms() {
         return;
     };
 
-    add_cumulative_change_merge(&fx.repo, "local-change");
-    let local_head = git(&fx.repo, &["rev-parse", "HEAD"]);
+    let local_head = integrate_and_mark(&fx.repo, "local-change");
 
     let mut coordinator = coordinator(
         &fx.repo,
@@ -1203,7 +1232,7 @@ async fn upstream_integration_e2e_push_race_returns_to_integration_then_succeeds
 
     // Local work plus a concurrent remote advance: the pre-push check must
     // suppress the stale push, integrate, reverify, and only then publish.
-    add_cumulative_change_merge(&fx.repo, "local-change");
+    integrate_and_mark(&fx.repo, "local-change");
     let racing_sha = write_and_commit(&fx.clone2, "upstream.md", "upstream\n", "upstream work");
     git(&fx.clone2, &["push", "origin", "main"]);
 
@@ -1236,7 +1265,7 @@ async fn upstream_integration_e2e_hook_rejected_push_stalls_without_agent() {
         return;
     };
 
-    add_cumulative_change_merge(&fx.repo, "local-change");
+    integrate_and_mark(&fx.repo, "local-change");
 
     // A real pre-receive hook rejection: not a race, and the local tree is clean,
     // so this must stall with no agent invocation.
@@ -1406,6 +1435,453 @@ async fn upstream_integration_e2e_stale_result_verification_runs_against_current
         other => panic!("expected stall, got {:?}", other),
     }
     assert!(coordinator.pushed_head().is_none());
+}
+
+// ── Per-change upstream publication (real Git / bare remote / processes) ────
+//
+// These cases prove the change-scoped publication contract against genuine
+// repositories, a real local bare remote, real `git` subprocesses, and real
+// verification-command processes. A stubbed publication, run-only wiring,
+// missing crash evidence, a premature `merged`, or an unconfirmed push all fail
+// here.
+
+#[tokio::test]
+async fn per_change_upstream_e2e_publishes_one_change_and_confirms_remotely() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    let head = integrate_and_mark(&fx.repo, "alpha");
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+
+    let outcome = coordinator.publish_change("alpha").await.unwrap();
+
+    assert_eq!(
+        outcome,
+        PublicationOutcome::Published { head: head.clone() }
+    );
+    let observed = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(
+        observed.starts_with(&head),
+        "remote must actually contain the published revision: {}",
+        observed
+    );
+
+    // Once published, the marker is no longer outstanding work.
+    git(&fx.repo, &["fetch", "origin", "main"]);
+    let pending = scan_pending_publications(&ops(&fx.repo)).await.unwrap();
+    assert!(pending.is_empty(), "pending: {:?}", pending);
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_persistent_process_publishes_multiple_changes() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // One long-lived coordinator, as a persistent local TUI keeps: publication
+    // happens at each change boundary and never waits for scheduler drain.
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+
+    let alpha_head = integrate_and_mark(&fx.repo, "alpha");
+    let first = coordinator.publish_change("alpha").await.unwrap();
+    assert_eq!(
+        first,
+        PublicationOutcome::Published {
+            head: alpha_head.clone()
+        }
+    );
+
+    let beta_head = integrate_and_mark(&fx.repo, "beta");
+    let second = coordinator.publish_change("beta").await.unwrap();
+    assert_eq!(
+        second,
+        PublicationOutcome::Published {
+            head: beta_head.clone()
+        }
+    );
+
+    assert_ne!(alpha_head, beta_head);
+    let observed = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(observed.starts_with(&beta_head), "remote: {}", observed);
+    assert!(git_allow_failure(
+        &fx.repo,
+        &["merge-base", "--is-ancestor", &alpha_head, &beta_head]
+    ));
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_records_durable_identity_without_an_upstream_merge() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // The remote never advances, so no upstream merge commit is ever created.
+    // The publication marker is therefore the only crash evidence available.
+    let marker = integrate_and_mark(&fx.repo, "alpha");
+
+    let log = git(&fx.repo, &["log", "--format=%s"]);
+    assert!(!log.contains("Merge upstream:"), "log: {}", log);
+
+    let pending = scan_pending_publications(&ops(&fx.repo)).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].commit, marker);
+    assert_eq!(pending[0].trailers.change_id, "alpha");
+    assert_eq!(pending[0].trailers.remote, "origin");
+    assert_eq!(pending[0].trailers.branch, "main");
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_option_less_restart_refuses_marked_unpublished_integration() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    integrate_and_mark(&fx.repo, "alpha");
+    let head_before = git(&fx.repo, &["rev-parse", "HEAD"]);
+    let remote_before = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+
+    let refusal = conflux::upstream::ensure_no_unpushed_upstream_recovery(&fx.repo)
+        .await
+        .expect_err("an option-less restart must refuse marked unpublished history");
+
+    let message = refusal.to_string();
+    assert!(message.contains("alpha"), "{}", message);
+    assert!(
+        message.contains("--integrate-upstream=origin"),
+        "{}",
+        message
+    );
+    assert!(message.contains("--upstream-verify-command"), "{}", message);
+    assert!(
+        message.contains("it is not merged"),
+        "the change must not be reported as terminal merged: {}",
+        message
+    );
+
+    // Refusal happens before any orchestration mutation.
+    assert_eq!(git(&fx.repo, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]),
+        remote_before
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_enabled_restart_resumes_publication() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    let head = integrate_and_mark(&fx.repo, "alpha");
+
+    // A brand-new process: nothing but repository and remote evidence exists.
+    let mut restarted = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    let pending = scan_pending_publications(&ops(&fx.repo)).await.unwrap();
+    assert_eq!(pending.len(), 1);
+
+    let outcome = restarted
+        .publish_change(&pending[0].trailers.change_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        PublicationOutcome::Published { head: head.clone() }
+    );
+    let observed = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(observed.starts_with(&head), "remote: {}", observed);
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_failed_verification_suppresses_push_and_stays_resumable() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    let head = integrate_and_mark(&fx.repo, "alpha");
+    let remote_before = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+
+    let mut failing = coordinator(
+        &fx.repo,
+        FAILING_COMMAND,
+        std::sync::Arc::new(ZeroBudgetRepairAgent),
+    );
+    let outcome = failing.publish_change("alpha").await.unwrap();
+
+    assert!(
+        matches!(outcome, PublicationOutcome::Stalled { .. }),
+        "outcome: {:?}",
+        outcome
+    );
+    assert!(failing.pushed_head().is_none());
+    assert_eq!(
+        git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]),
+        remote_before,
+        "a failed verification must publish nothing"
+    );
+
+    // The change is still resumable from repository evidence.
+    let pending = scan_pending_publications(&ops(&fx.repo)).await.unwrap();
+    assert_eq!(pending.len(), 1);
+
+    // Explicit retry with a working verification command completes it.
+    let mut retried = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    let retry = retried.publish_change("alpha").await.unwrap();
+    assert_eq!(retry, PublicationOutcome::Published { head: head.clone() });
+    let observed = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(observed.starts_with(&head), "remote: {}", observed);
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_remote_advance_is_integrated_before_publication() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    integrate_and_mark(&fx.repo, "alpha");
+    let racing = write_and_commit(&fx.clone2, "upstream.md", "upstream\n", "upstream work");
+    git(&fx.clone2, &["push", "origin", "main"]);
+
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    let outcome = coordinator.publish_change("alpha").await.unwrap();
+
+    let published = match outcome {
+        PublicationOutcome::Published { head } => head,
+        other => panic!("expected publication, got {:?}", other),
+    };
+    assert!(
+        git_allow_failure(
+            &fx.repo,
+            &["merge-base", "--is-ancestor", &racing, &published]
+        ),
+        "the remote advance must be integrated, never force-pushed over"
+    );
+    let observed = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+    assert!(observed.starts_with(&published), "remote: {}", observed);
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_push_rejection_stalls_without_agent() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    integrate_and_mark(&fx.repo, "alpha");
+
+    let hook = fx.remote.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let remote_before = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    let outcome = coordinator.publish_change("alpha").await.unwrap();
+
+    assert!(
+        matches!(outcome, PublicationOutcome::Stalled { .. }),
+        "outcome: {:?}",
+        outcome
+    );
+    assert!(coordinator.pushed_head().is_none());
+    assert_eq!(
+        git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]),
+        remote_before
+    );
+    assert!(!scan_pending_publications(&ops(&fx.repo))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_interrupted_push_is_confirmed_without_a_second_push() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    let head = integrate_and_mark(&fx.repo, "alpha");
+    // The prior process pushed but stopped before recording confirmation.
+    git(&fx.repo, &["push", "origin", "main"]);
+
+    // A deny-everything hook proves no second push is attempted: if publication
+    // tried to push again it would fail instead of confirming.
+    let hook = fx.remote.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    let outcome = coordinator.publish_change("alpha").await.unwrap();
+
+    assert_eq!(outcome, PublicationOutcome::AlreadyConfirmed { head });
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_zero_change_recovery_requires_explicit_evidence() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // Unmarked cumulative history is not recovery work.
+    add_cumulative_change_merge(&fx.repo, "disabled-mode-change");
+    let head_before = git(&fx.repo, &["rev-parse", "HEAD"]);
+    let remote_before = git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]);
+
+    let mut coordinator = coordinator(
+        &fx.repo,
+        PASSING_COMMAND,
+        std::sync::Arc::new(ForbiddenRepairAgent),
+    );
+    assert_eq!(
+        coordinator.finalize(drained()).await.unwrap(),
+        FinalizeOutcome::NoWork
+    );
+    assert_eq!(git(&fx.repo, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        git(&fx.repo, &["ls-remote", "origin", "refs/heads/main"]),
+        remote_before
+    );
+
+    // An explicit marker is recovery work, and publishing it does not
+    // retroactively make the earlier disabled-mode change a published change.
+    let marked = mark_publication_required(&fx.repo, "opted-in-change");
+    let outcome = coordinator.finalize(drained()).await.unwrap();
+    assert_eq!(
+        outcome,
+        FinalizeOutcome::Completed {
+            pushed_head: marked
+        }
+    );
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_default_off_history_never_blocks_startup() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    add_cumulative_change_merge(&fx.repo, "disabled-mode-change");
+
+    // A disabled run starts normally: ordinary terminal `merged` history is not
+    // publication evidence and is never promoted.
+    conflux::upstream::ensure_no_unpushed_upstream_recovery(&fx.repo)
+        .await
+        .expect("disabled-mode history must not block an option-less start");
+    assert!(scan_pending_publications(&ops(&fx.repo))
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn per_change_upstream_e2e_run_and_local_tui_construct_one_runtime() {
+    use upstream_integration_support::*;
+    let Some(fx) = fixture() else {
+        println!("Skipping test: git not available");
+        return;
+    };
+
+    // Both frontends normalize the same raw option values, then run the same
+    // startup validation against the same repository.
+    let from_run = conflux::upstream::resolve_frontend_upstream_config(
+        Some("origin"),
+        Some("exit 0"),
+        None,
+        false,
+    )
+    .expect("run options")
+    .expect("enabled");
+    let from_tui = conflux::upstream::resolve_frontend_upstream_config(
+        Some("origin"),
+        Some("exit 0"),
+        None,
+        false,
+    )
+    .expect("tui options")
+    .expect("enabled");
+    assert_eq!(from_run, from_tui);
+
+    let run_runtime = conflux::upstream::prepare_upstream_integration(
+        from_run, &fx.repo, true, None, true, false,
+    )
+    .await
+    .expect("run startup validation");
+    let tui_runtime = conflux::upstream::prepare_upstream_integration(
+        from_tui, &fx.repo, true, None, true, false,
+    )
+    .await
+    .expect("local TUI startup validation");
+
+    assert_eq!(run_runtime, tui_runtime);
+    assert_eq!(run_runtime.branch, "main");
+
+    // A remote-client TUI cannot own the local cumulative base.
+    assert!(conflux::upstream::resolve_frontend_upstream_config(
+        Some("origin"),
+        Some("exit 0"),
+        None,
+        true,
+    )
+    .is_err());
 }
 
 /// Real-repository fixtures for explicit-target resume classification.
@@ -2052,13 +2528,14 @@ async fn explicit_target_resume_all_completed_run_still_publishes_unpushed_histo
     };
 
     // Every requested target is already archived and integrated into base, and
-    // that integration is not yet published.
+    // that integration is opted-in but not yet published: the marker is what
+    // makes it recognized recovery work rather than terminal `merged` history.
     write_active_change(&fx.repo, "done-one");
     write_archive_entry(&fx.repo, "2026-07-30-done-one", "done-one");
     std::fs::remove_dir_all(fx.repo.join("openspec/changes/done-one")).unwrap();
     git(&fx.repo, &["add", "-A"]);
     git(&fx.repo, &["commit", "-m", "Archive: done-one"]);
-    add_cumulative_change_merge(&fx.repo, "done-two");
+    integrate_and_mark(&fx.repo, "done-two");
 
     let resolution = resolve(&fx.repo, &["done-one", "done-two"], false).await;
     assert!(resolution.failure_error().is_none());

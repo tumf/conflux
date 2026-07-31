@@ -30,6 +30,7 @@ pub mod coordinator;
 pub mod git_ops;
 pub mod options;
 pub mod ports;
+pub mod publication;
 pub mod repair;
 pub mod spine;
 pub mod startup;
@@ -43,8 +44,12 @@ pub use classify::{
 };
 pub use coordinator::{SchedulerOutcome, UpstreamCoordinator, UpstreamStepOutcome};
 pub use options::{
-    resolve_upstream_config, validate_static_preconditions, StaticPreconditions,
-    UpstreamIntegrationConfig, UpstreamOptionError, DEFAULT_UPSTREAM_REMOTE,
+    resolve_frontend_upstream_config, resolve_upstream_config, validate_static_preconditions,
+    StaticPreconditions, UpstreamIntegrationConfig, UpstreamOptionError, DEFAULT_UPSTREAM_REMOTE,
+};
+pub use publication::{
+    format_publication_marker_message, parse_publication_trailers, PublicationEvidence,
+    PublicationTrailers, TRAILER_PUBLISH_BRANCH, TRAILER_PUBLISH_CHANGE, TRAILER_PUBLISH_REMOTE,
 };
 pub use spine::{classify_spine_commit, SpineCommitClass};
 pub use startup::{

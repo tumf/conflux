@@ -117,6 +117,79 @@ fn lifecycle_process_context() -> LifecycleContext {
     }
 }
 
+/// Validate and construct the local TUI's upstream runtime before any TUI or
+/// orchestration state exists.
+///
+/// This is deliberately the same contract as `cflx run`: it resolves the option
+/// through the shared frontend normalizer, then runs the same static and
+/// initial-fetch validation. A remote-client TUI is rejected by the normalizer,
+/// so no repository observation is attempted for it.
+///
+/// The default-off path additionally refuses to start while repository evidence
+/// proves an unpublished opted-in integration, which is the option-less restart
+/// refusal. That scan is offline, so a disabled TUI gains no network access.
+async fn resolve_tui_upstream_runtime(
+    args: &TuiArgs,
+    config: &OrchestratorConfig,
+) -> Option<upstream::UpstreamRuntime> {
+    let upstream_config = match args.upstream_integration() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let git_dir_exists = cli::check_git_directory();
+    // Local TUI upstream publication is a cumulative parallel capability; the
+    // effective mode is resolved exactly as the TUI itself resolves it.
+    let use_parallel = config.resolve_parallel_mode(false, git_dir_exists);
+
+    let repo_root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            if upstream_config.is_some() {
+                eprintln!("Error: upstream integration requires a readable workspace: {err}");
+                std::process::exit(1);
+            }
+            return None;
+        }
+    };
+
+    match upstream_config {
+        Some(upstream_config) => {
+            match upstream::prepare_upstream_integration(
+                upstream_config,
+                &repo_root,
+                use_parallel,
+                args.push.clone(),
+                git_dir_exists,
+                false,
+            )
+            .await
+            {
+                Ok(runtime) => Some(runtime),
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => {
+            if args.server.is_none() && use_parallel && git_dir_exists {
+                if let Err(err) = upstream::ensure_no_unpushed_upstream_recovery(&repo_root).await {
+                    if matches!(err, upstream::UpstreamStartupError::Invalid(_)) {
+                        eprintln!("Error: {err}");
+                        std::process::exit(1);
+                    }
+                    tracing::debug!("Upstream recovery scan unavailable, continuing: {}", err);
+                }
+            }
+            None
+        }
+    }
+}
+
 async fn launch_tui(args: TuiArgs) -> Result<()> {
     let post_archive_action = tui_post_archive_action(&args)?;
 
@@ -125,6 +198,10 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
 
     let config = OrchestratorConfig::load(args.config.as_deref())?;
     tui::log_deduplicator::configure_logging(config.get_logging());
+
+    // Startup validation runs before the terminal is taken over, so a rejected
+    // invocation reports plainly and leaves no orchestration state behind.
+    let upstream_runtime = resolve_tui_upstream_runtime(&args, &config).await;
 
     // Start the optional external lifecycle adapter before the interactive TUI
     // is presented. Failures here are observability-only and never block startup.
@@ -136,7 +213,14 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
         context: lifecycle_process_context(),
     });
 
-    let result = launch_tui_inner(args, config, post_archive_action, lifecycle.handle()).await;
+    let result = launch_tui_inner(
+        args,
+        config,
+        post_archive_action,
+        upstream_runtime,
+        lifecycle.handle(),
+    )
+    .await;
 
     lifecycle.shutdown().await;
 
@@ -147,6 +231,7 @@ async fn launch_tui_inner(
     args: TuiArgs,
     config: OrchestratorConfig,
     post_archive_action: PostArchiveAction,
+    upstream_runtime: Option<upstream::UpstreamRuntime>,
     lifecycle: lifecycle_integration::LifecycleHandle,
 ) -> Result<()> {
     let changes = if args.server.is_some() {
@@ -208,6 +293,7 @@ async fn launch_tui_inner(
         web_state_opt,
         remote_client,
         post_archive_action,
+        upstream_runtime,
         lifecycle,
     )
     .await
@@ -634,6 +720,16 @@ fn run_logs_subcommand(args: LogsArgs) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Top-level upstream options only reach the bare local TUI. An explicit
+    // subcommand parses its own copies, so accepting them here would silently
+    // drop an opt-in whose publication is part of the success contract. This is
+    // a pure usage check, so rejecting here still leaves the repository and any
+    // existing lock owner untouched.
+    if let Err(error) = cli.validate_upstream_option_placement() {
+        eprintln!("Error: {error}");
+        std::process::exit(2);
+    }
+
     // Repository exclusion is decided before anything observable happens.
     acquire_repository_lock(&cli);
 
@@ -662,6 +758,10 @@ async fn main() -> Result<()> {
                 server: cli.server,
                 server_token: cli.server_token,
                 server_token_env: cli.server_token_env,
+                // Bare local TUI carries the same upstream contract as `cflx tui`.
+                integrate_upstream: cli.integrate_upstream,
+                integrate_upstream_default_remote: cli.integrate_upstream_default_remote,
+                upstream_verify_command: cli.upstream_verify_command,
             })
             .await?;
         }

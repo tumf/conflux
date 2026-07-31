@@ -276,6 +276,7 @@ async fn test_resolve_merges_with_retry_args_struct() {
         max_retries,
         shared_stagger_state,
         auto_resolve_count,
+        publication_owns_completion: false,
     };
 
     // Verify fields are accessible
@@ -310,6 +311,7 @@ fn test_resolve_merges_with_retry_args_clone() {
         max_retries,
         shared_stagger_state,
         auto_resolve_count,
+        publication_owns_completion: false,
     };
 
     let args2 = args1.clone(); // Clone instead of Copy

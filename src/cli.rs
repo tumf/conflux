@@ -116,8 +116,104 @@ pub struct Cli {
     #[arg(long)]
     pub server_token_env: Option<String>,
 
+    /// Publish every completed change's verified cumulative base to the selected
+    /// remote's same-name branch before that change succeeds.
+    ///
+    /// Same contract as `cflx run -u`: `-u` and value-less `--integrate-upstream`
+    /// select `origin`, a named remote requires `--integrate-upstream=<remote>`,
+    /// and `--upstream-verify-command` is mandatory. Local TUI only.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = crate::upstream::DEFAULT_UPSTREAM_REMOTE,
+        value_parser = crate::upstream::options::parse_upstream_remote
+    )]
+    pub integrate_upstream: Option<String>,
+
+    /// Publish to `origin`; short value-less spelling of `--integrate-upstream`.
+    ///
+    /// A named remote is available only as `--integrate-upstream=<remote>`, so
+    /// `-u` takes no value at all and `-u=<remote>` is a parse error.
+    #[arg(short = 'u', action = clap::ArgAction::SetTrue, conflicts_with = "integrate_upstream")]
+    pub integrate_upstream_default_remote: bool,
+
+    /// Complete repository verification command run before every publication.
+    ///
+    /// Requires `-u`/`--integrate-upstream`; rejected without it.
+    #[arg(long)]
+    pub upstream_verify_command: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+/// Rejection of a top-level upstream option that an explicit subcommand ignores.
+///
+/// The top-level `-u` / `--integrate-upstream` / `--upstream-verify-command`
+/// options exist only to give bare `cflx` the same contract as `cflx tui`. When
+/// an explicit subcommand follows, the subcommand parses its own options and the
+/// top-level values are never read — so accepting them would silently drop an
+/// opt-in whose publication is part of the success contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopLevelUpstreamOptionError {
+    /// Spelling the operator used, as it must be repositioned.
+    pub option: &'static str,
+    /// Subcommand that would have ignored it.
+    pub subcommand: &'static str,
+}
+
+impl std::fmt::Display for TopLevelUpstreamOptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} must follow the '{}' subcommand: 'cflx {} {}' applies to the subcommand, while 'cflx {} {}' would be ignored",
+            self.option, self.subcommand, self.subcommand, self.option, self.option, self.subcommand
+        )
+    }
+}
+
+impl std::error::Error for TopLevelUpstreamOptionError {}
+
+impl Cli {
+    /// Name of the subcommand for diagnostics, when one was given.
+    fn subcommand_name(&self) -> Option<&'static str> {
+        match self.command.as_ref()? {
+            Commands::Run(_) => Some("run"),
+            Commands::Tui(_) => Some("tui"),
+            Commands::Init(_) => Some("init"),
+            Commands::CheckConflicts(_) => Some("check-conflicts"),
+            Commands::Server(_) => Some("server"),
+            Commands::Project(_) => Some("project"),
+            Commands::Service(_) => Some("service"),
+            Commands::InstallSkills(_) => Some("install-skills"),
+            Commands::Logs(_) => Some("logs"),
+            Commands::Openspec(_) => Some("openspec"),
+            Commands::Completion(_) => Some("completion"),
+            Commands::Complete(_) => Some("__complete"),
+        }
+    }
+
+    /// Reject top-level upstream options that an explicit subcommand would drop.
+    ///
+    /// Called before any orchestration, logging, or workspace mutation.
+    pub fn validate_upstream_option_placement(
+        &self,
+    ) -> std::result::Result<(), TopLevelUpstreamOptionError> {
+        let Some(subcommand) = self.subcommand_name() else {
+            return Ok(());
+        };
+        let option = if self.integrate_upstream_default_remote {
+            "-u"
+        } else if self.integrate_upstream.is_some() {
+            "--integrate-upstream"
+        } else if self.upstream_verify_command.is_some() {
+            "--upstream-verify-command"
+        } else {
+            return Ok(());
+        };
+        Err(TopLevelUpstreamOptionError { option, subcommand })
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -432,7 +528,6 @@ pub struct RunArgs {
     /// Cumulative parallel run mode only. Requires `--upstream-verify-command`.
     #[arg(
         long,
-        short = 'u',
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = crate::upstream::DEFAULT_UPSTREAM_REMOTE,
@@ -440,10 +535,17 @@ pub struct RunArgs {
     )]
     pub integrate_upstream: Option<String>,
 
+    /// Publish to `origin`; short value-less spelling of `--integrate-upstream`.
+    ///
+    /// A named remote is available only as `--integrate-upstream=<remote>`, so
+    /// `-u` takes no value at all and `-u=<remote>` is a parse error.
+    #[arg(short = 'u', action = clap::ArgAction::SetTrue, conflicts_with = "integrate_upstream")]
+    pub integrate_upstream_default_remote: bool,
+
     /// Complete repository verification command run after every cumulative base
     /// tree change and immediately before the final push.
     ///
-    /// Required when upstream integration is enabled; ignored otherwise.
+    /// Requires `-u`/`--integrate-upstream`; rejected without it.
     #[arg(long)]
     pub upstream_verify_command: Option<String>,
 }
@@ -459,9 +561,17 @@ impl RunArgs {
         Option<crate::upstream::UpstreamIntegrationConfig>,
         crate::upstream::UpstreamOptionError,
     > {
-        crate::upstream::resolve_upstream_config(
+        let selected = crate::upstream::options::selected_upstream_remote(
+            self.integrate_upstream_default_remote,
             self.integrate_upstream.as_deref(),
+        );
+        crate::upstream::options::resolve_frontend_upstream_config(
+            selected.as_deref(),
             self.upstream_verify_command.as_deref(),
+            self.push.as_deref(),
+            // `run` has no remote-client mode; server orchestration exposes no
+            // upstream option at all.
+            false,
         )
     }
 
@@ -567,6 +677,60 @@ pub struct TuiArgs {
     /// Name of the environment variable that holds the bearer token for the remote server
     #[arg(long)]
     pub server_token_env: Option<String>,
+
+    /// Publish every completed change's verified cumulative base to the selected
+    /// remote's same-name branch before that change succeeds.
+    ///
+    /// Same contract as `cflx run -u`: `-u` and value-less `--integrate-upstream`
+    /// select `origin`, a named remote requires `--integrate-upstream=<remote>`,
+    /// and `--upstream-verify-command` is mandatory. Local TUI only; a
+    /// `--server` remote-client TUI rejects it.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = crate::upstream::DEFAULT_UPSTREAM_REMOTE,
+        value_parser = crate::upstream::options::parse_upstream_remote
+    )]
+    pub integrate_upstream: Option<String>,
+
+    /// Publish to `origin`; short value-less spelling of `--integrate-upstream`.
+    ///
+    /// A named remote is available only as `--integrate-upstream=<remote>`, so
+    /// `-u` takes no value at all and `-u=<remote>` is a parse error.
+    #[arg(short = 'u', action = clap::ArgAction::SetTrue, conflicts_with = "integrate_upstream")]
+    pub integrate_upstream_default_remote: bool,
+
+    /// Complete repository verification command run before every publication.
+    ///
+    /// Requires `-u`/`--integrate-upstream`; rejected without it.
+    #[arg(long)]
+    pub upstream_verify_command: Option<String>,
+}
+
+impl TuiArgs {
+    /// Resolve the invocation-scoped upstream integration configuration.
+    ///
+    /// Identical normalization to [`RunArgs::upstream_integration`], plus the
+    /// TUI-only rejections (`--push`, remote-client `--server`). Returns
+    /// `Ok(None)` for the default-off path, which installs no upstream behavior.
+    pub fn upstream_integration(
+        &self,
+    ) -> std::result::Result<
+        Option<crate::upstream::UpstreamIntegrationConfig>,
+        crate::upstream::UpstreamOptionError,
+    > {
+        let selected = crate::upstream::options::selected_upstream_remote(
+            self.integrate_upstream_default_remote,
+            self.integrate_upstream.as_deref(),
+        );
+        crate::upstream::options::resolve_frontend_upstream_config(
+            selected.as_deref(),
+            self.upstream_verify_command.as_deref(),
+            self.push.as_deref(),
+            self.server.is_some(),
+        )
+    }
 }
 
 /// Template options for init command
@@ -1000,7 +1164,10 @@ mod tests {
             "--upstream-verify-command",
             "cargo test",
         ]);
-        assert_eq!(short.integrate_upstream.as_deref(), Some("origin"));
+        // `-u` is its own value-less argument, so equivalence is asserted on the
+        // remote both spellings select rather than on one shared raw field.
+        assert!(short.integrate_upstream_default_remote);
+        assert_eq!(short.integrate_upstream, None);
         assert_eq!(long.integrate_upstream.as_deref(), Some("origin"));
         assert_eq!(
             short.upstream_integration().unwrap(),
@@ -1026,7 +1193,7 @@ mod tests {
             "cargo test",
             "my-change",
         ]);
-        assert_eq!(args.integrate_upstream.as_deref(), Some("origin"));
+        assert!(args.integrate_upstream_default_remote);
         assert_eq!(args.changes, vec!["my-change".to_string()]);
         assert_eq!(
             args.normalized_target_changes(),
@@ -1104,6 +1271,369 @@ mod tests {
             args.upstream_integration(),
             Err(crate::upstream::UpstreamOptionError::VerifyCommandWithoutOption)
         );
+    }
+
+    fn tui_args(argv: &[&str]) -> TuiArgs {
+        match Cli::parse_from(argv).command {
+            Some(Commands::Tui(args)) => args,
+            _ => panic!("expected tui subcommand for {:?}", argv),
+        }
+    }
+
+    /// Bare `cflx` has no subcommand; it forwards its own options into `TuiArgs`,
+    /// exactly as `main` does.
+    fn bare_tui_args(argv: &[&str]) -> TuiArgs {
+        let cli = Cli::parse_from(argv);
+        assert!(cli.command.is_none(), "expected bare invocation");
+        TuiArgs {
+            config: cli.config,
+            web: cli.web,
+            web_port: cli.web_port,
+            web_bind: cli.web_bind,
+            web_auth_token: cli.web_auth_token,
+            web_auth_token_env: cli.web_auth_token_env,
+            web_allowed_origins: cli.web_allowed_origins,
+            push: cli.push,
+            server: cli.server,
+            server_token: cli.server_token,
+            server_token_env: cli.server_token_env,
+            integrate_upstream: cli.integrate_upstream,
+            integrate_upstream_default_remote: cli.integrate_upstream_default_remote,
+            upstream_verify_command: cli.upstream_verify_command,
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_is_absent_by_default_for_tui() {
+        let bare = bare_tui_args(&["cflx"]);
+        assert_eq!(bare.integrate_upstream, None);
+        assert_eq!(bare.upstream_verify_command, None);
+        assert_eq!(bare.upstream_integration().unwrap(), None);
+
+        let explicit = tui_args(&["cflx", "tui"]);
+        assert_eq!(explicit.upstream_integration().unwrap(), None);
+    }
+
+    #[test]
+    fn per_change_upstream_run_bare_tui_and_explicit_tui_are_equivalent() {
+        let run = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        let bare = bare_tui_args(&["cflx", "-u", "--upstream-verify-command", "cargo test"]);
+        let explicit = tui_args(&[
+            "cflx",
+            "tui",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+
+        let expected = Some(crate::upstream::UpstreamIntegrationConfig::new(
+            "origin",
+            "cargo test",
+        ));
+        assert_eq!(run.upstream_integration().unwrap(), expected);
+        assert_eq!(bare.upstream_integration().unwrap(), expected);
+        assert_eq!(explicit.upstream_integration().unwrap(), expected);
+    }
+
+    #[test]
+    fn per_change_upstream_tui_accepts_explicit_remote_with_equals_only() {
+        let explicit = tui_args(&[
+            "cflx",
+            "tui",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(
+            explicit.upstream_integration().unwrap(),
+            Some(crate::upstream::UpstreamIntegrationConfig::new(
+                "upstream",
+                "cargo test"
+            ))
+        );
+
+        let bare = bare_tui_args(&[
+            "cflx",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(bare.integrate_upstream.as_deref(), Some("upstream"));
+        assert_eq!(bare.push, None, "upstream must not configure push mode");
+
+        // A space-separated remote is not an option value for the value-less alias.
+        let spaced = tui_args(&[
+            "cflx",
+            "tui",
+            "--integrate-upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        assert_eq!(spaced.integrate_upstream.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn per_change_upstream_tui_rejects_push_and_server() {
+        let with_push = tui_args(&[
+            "cflx",
+            "tui",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--push",
+        ]);
+        assert_eq!(
+            with_push.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::ConflictsWithPush)
+        );
+
+        let with_server = tui_args(&[
+            "cflx",
+            "tui",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--server",
+            "http://host:39876",
+        ]);
+        assert_eq!(
+            with_server.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::RemoteClientUnsupported)
+        );
+
+        let bare_push = bare_tui_args(&[
+            "cflx",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--push",
+        ]);
+        assert_eq!(
+            bare_push.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::ConflictsWithPush)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_tui_requires_verify_command() {
+        let missing = tui_args(&["cflx", "tui", "-u"]);
+        assert_eq!(
+            missing.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::MissingVerifyCommand)
+        );
+
+        let orphan_command = tui_args(&["cflx", "tui", "--upstream-verify-command", "cargo test"]);
+        assert_eq!(
+            orphan_command.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::VerifyCommandWithoutOption)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_run_rejects_push_combination_at_parse_time() {
+        let args = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "-u",
+            "--upstream-verify-command",
+            "cargo test",
+            "--push",
+        ]);
+        assert_eq!(
+            args.upstream_integration(),
+            Err(crate::upstream::UpstreamOptionError::ConflictsWithPush)
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_short_flag_never_carries_a_remote() {
+        // A named remote is spec-restricted to `--integrate-upstream=<remote>`,
+        // so the short spelling must take no value on any of the three
+        // entrypoints while the long spelling keeps accepting one.
+        for argv in [
+            vec!["cflx", "run", "--all", "--parallel", "-u=upstream"],
+            vec!["cflx", "-u=upstream"],
+            vec!["cflx", "tui", "-u=upstream"],
+        ] {
+            let err = Cli::try_parse_from(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("-u must not accept a remote value: {:?}", argv));
+            assert_ne!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "rejection must be a parse error, not help: {:?}",
+                argv
+            );
+        }
+
+        // The equals form still parses everywhere and selects the named remote.
+        let run = run_args(&[
+            "cflx",
+            "run",
+            "--all",
+            "--parallel",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        let bare = bare_tui_args(&[
+            "cflx",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        let explicit = tui_args(&[
+            "cflx",
+            "tui",
+            "--integrate-upstream=upstream",
+            "--upstream-verify-command",
+            "cargo test",
+        ]);
+        let expected = Some(crate::upstream::UpstreamIntegrationConfig::new(
+            "upstream",
+            "cargo test",
+        ));
+        assert_eq!(run.upstream_integration().unwrap(), expected);
+        assert_eq!(bare.upstream_integration().unwrap(), expected);
+        assert_eq!(explicit.upstream_integration().unwrap(), expected);
+    }
+
+    #[test]
+    fn per_change_upstream_short_flag_still_selects_the_default_remote() {
+        // Removing the short alias from the valued argument must not change what
+        // a value-less `-u` resolves to.
+        for args in [
+            run_args(&[
+                "cflx",
+                "run",
+                "--all",
+                "--parallel",
+                "-u",
+                "--upstream-verify-command",
+                "cargo test",
+            ])
+            .upstream_integration(),
+            bare_tui_args(&["cflx", "-u", "--upstream-verify-command", "cargo test"])
+                .upstream_integration(),
+            tui_args(&[
+                "cflx",
+                "tui",
+                "-u",
+                "--upstream-verify-command",
+                "cargo test",
+            ])
+            .upstream_integration(),
+        ] {
+            assert_eq!(
+                args.unwrap(),
+                Some(crate::upstream::UpstreamIntegrationConfig::new(
+                    "origin",
+                    "cargo test"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_top_level_options_are_rejected_before_a_subcommand() {
+        // `cflx -u run ...` parses, but `Commands::Run` reads its own options, so
+        // the opt-in would be dropped and the run would succeed in merged mode.
+        for (argv, option) in [
+            (vec!["cflx", "-u", "run", "--all", "--parallel"], "-u"),
+            (
+                vec!["cflx", "--integrate-upstream=upstream", "run", "--all"],
+                "--integrate-upstream",
+            ),
+            (
+                vec![
+                    "cflx",
+                    "--upstream-verify-command",
+                    "cargo test",
+                    "run",
+                    "--all",
+                ],
+                "--upstream-verify-command",
+            ),
+            (vec!["cflx", "-u", "tui"], "-u"),
+        ] {
+            let cli = Cli::try_parse_from(&argv)
+                .unwrap_or_else(|e| panic!("expected {:?} to parse: {e}", argv));
+            let error = cli
+                .validate_upstream_option_placement()
+                .expect_err(&format!("{:?} must not silently drop the opt-in", argv));
+            assert_eq!(error.option, option, "{:?}", argv);
+            assert!(
+                error.to_string().contains(error.subcommand),
+                "the diagnostic must name the subcommand: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_top_level_options_stay_valid_for_bare_invocation() {
+        let bare = Cli::try_parse_from(["cflx", "-u", "--upstream-verify-command", "cargo test"])
+            .expect("bare invocation parses");
+        assert_eq!(bare.validate_upstream_option_placement(), Ok(()));
+
+        let plain_subcommand =
+            Cli::try_parse_from(["cflx", "run", "--all", "--parallel"]).expect("run parses");
+        assert_eq!(
+            plain_subcommand.validate_upstream_option_placement(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn per_change_upstream_verify_command_help_states_it_is_rejected_alone() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let run = command
+            .find_subcommand_mut("run")
+            .expect("run subcommand")
+            .render_long_help()
+            .to_string();
+        let tui = command
+            .find_subcommand_mut("tui")
+            .expect("tui subcommand")
+            .render_long_help()
+            .to_string();
+        let top = Cli::command().render_long_help().to_string();
+
+        for (entrypoint, help) in [("run", &run), ("tui", &tui), ("bare", &top)] {
+            assert!(
+                help.contains("Requires `-u`/`--integrate-upstream`; rejected without it."),
+                "{entrypoint} help must not claim the verification command is ignored: {help}"
+            );
+            assert!(
+                !help.contains("ignored otherwise"),
+                "{entrypoint} help retains the stale wording: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn per_change_upstream_is_exposed_in_tui_help() {
+        use clap::CommandFactory;
+        let help = Cli::command()
+            .find_subcommand_mut("tui")
+            .expect("tui subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--integrate-upstream"), "help: {}", help);
+        assert!(help.contains("--upstream-verify-command"), "help: {}", help);
+
+        let top = Cli::command().render_long_help().to_string();
+        assert!(top.contains("--integrate-upstream"), "help: {}", top);
     }
 
     #[test]

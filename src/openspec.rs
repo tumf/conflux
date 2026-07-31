@@ -812,10 +812,6 @@ pub fn list_changes_native_from(base_path: &Path) -> Result<Vec<Change>> {
 ///
 /// Unlike [`list_changes_native`], this function intentionally returns only
 /// marker-bearing rows and is not used for execution candidate discovery.
-pub fn list_rejected_changes_native() -> Result<Vec<Change>> {
-    list_rejected_changes_native_from(Path::new("."))
-}
-
 pub fn list_rejected_changes_native_from(base_path: &Path) -> Result<Vec<Change>> {
     let changes_dir = base_path.join("openspec/changes");
 
@@ -1089,12 +1085,7 @@ mod tests {
         fs::write(active_dir.join("proposal.md"), "# proposal").unwrap();
         fs::write(active_dir.join("tasks.md"), "- [ ] pending task").unwrap();
 
-        let original_dir = env::current_dir().unwrap();
-        env::set_current_dir(temp_dir.path()).unwrap();
-
-        let result = list_rejected_changes_native().unwrap();
-
-        env::set_current_dir(original_dir).unwrap();
+        let result = list_rejected_changes_native_from(temp_dir.path()).unwrap();
 
         assert_eq!(result.len(), 1, "only rejected rows should be returned");
         assert_eq!(result[0].id, "change-rejected");

@@ -265,6 +265,13 @@ impl ParallelExecutor {
                 send_event(&self.event_tx, ParallelEvent::Error { message: error_msg }).await;
                 return Err(err);
             }
+
+            // Restart and explicit-retry recovery. A publication-required
+            // integration that is not remote-reachable is resumable publication
+            // work; it must never become ordinary apply or acceptance dispatch,
+            // and it must not be reported as terminal `merged`. Anything left
+            // unpublished here is re-attempted at the completion gate below.
+            let _ = self.resume_pending_publications().await;
         }
 
         // Deferred explicit-target classification boundary.
@@ -462,6 +469,29 @@ impl ParallelExecutor {
             return Ok(());
         }
 
+        // Every change that reached cumulative base owes change-scoped remote
+        // confirmation before this run may report completion. Run-final
+        // publication publishes the cumulative HEAD with no change attribution,
+        // so a marker that survives to finalization would be published as
+        // anonymous run work and the reducer would never see that change reach
+        // `pushed`. Discharge markers here, under their own change IDs, first.
+        if self.upstream_enabled() {
+            let stranded = self.resume_pending_publications().await;
+            if !stranded.is_empty() {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Error {
+                        message: format!(
+                            "Upstream publication is still owed for {}; cumulative base was not published",
+                            stranded.join(", ")
+                        ),
+                    },
+                )
+                .await;
+                return Ok(());
+            }
+        }
+
         // Upstream finalization owns completion ordering for an opted-in run:
         // final checkpoint, complete verification against final cumulative HEAD,
         // fresh ancestry check, one native non-force push, and remote
@@ -479,6 +509,31 @@ impl ParallelExecutor {
             )
             .await;
             return Ok(());
+        }
+
+        // Finalization can itself integrate upstream and record a new marker, so
+        // repository evidence — not the pre-finalize scan — is the authoritative
+        // completion gate.
+        if self.upstream_enabled() {
+            let stranded: Vec<String> = self
+                .pending_publications()
+                .await
+                .into_iter()
+                .map(|evidence| evidence.trailers.change_id)
+                .collect();
+            if !stranded.is_empty() {
+                send_event(
+                    &self.event_tx,
+                    ParallelEvent::Error {
+                        message: format!(
+                            "Upstream publication is still owed for {}; the run is not complete",
+                            stranded.join(", ")
+                        ),
+                    },
+                )
+                .await;
+                return Ok(());
+            }
         }
 
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
