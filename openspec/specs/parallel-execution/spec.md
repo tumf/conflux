@@ -851,71 +851,78 @@ WIPコミットメッセージは `WIP: {change_id} ({completed}/{total} tasks, 
 
 ### Requirement: Parallel execution completion status must accurately reflect actual processing outcome
 
-The system SHALL send completion events and messages only when processing completes normally, not when stopped or cancelled by the user.
-
-The system SHALL distinguish between successful completion, completion with errors, graceful stop, and cancellation.
-
-**Priority**: HIGH
-**Rationale**: Incorrect completion messages mislead users about the processing status and can cause confusion when resuming work.
+The system SHALL send completion events and messages only when processing completes normally, not when stopped or cancelled by the user. The system SHALL distinguish successful completion, completion with errors, graceful stop, active-execution force stop, and scheduler-only cancellation. Operator cancellation MUST NOT be represented as an agent-command failure.
 
 #### Scenario: Graceful stop during parallel execution should not show success message
 
 **Given** the orchestrator is running in parallel mode
 **And** at least one change is queued for processing
-**When** the user triggers graceful stop (ESC key) before any change completes
-**Then** the orchestrator should stop processing
-**And** should send `OrchestratorEvent::Stopped`
-**And** should NOT send `OrchestratorEvent::AllCompleted`
-**And** should NOT display "All parallel changes completed" message
-**And** should NOT display "All changes processed successfully" message
-**And** should display "Processing stopped" message only
+**When** the user triggers graceful stop before processing completes
+**Then** the orchestrator stops processing after the graceful boundary
+**And** sends `OrchestratorEvent::Stopped`
+**And** does not send `OrchestratorEvent::AllCompleted`
+**And** displays `Processing stopped` without a success completion message
 
-#### Scenario: Force stop (cancel) during parallel execution should not show success message
+#### Scenario: Force stop of active execution remains cancellation rather than failure
 
 **Given** the orchestrator is running in parallel mode
-**And** at least one change is queued for processing
-**When** cancellation is triggered via cancel token
-**Then** the orchestrator should immediately stop
-**And** should display "Parallel execution cancelled" message
-**And** should NOT send `OrchestratorEvent::AllCompleted`
-**And** should NOT display any success completion messages
+**And** an agent command or in-flight execution is active
+**When** the user triggers force stop
+**Then** active execution cancellation and managed process cleanup are requested
+**And** the outcome is classified as stopped or cancelled
+**And** the system does not display `Execution failed: Agent command failed`
+**And** the system does not display `Processing completed with errors`
+**And** the system does not send `OrchestratorEvent::AllCompleted`
+
+#### Scenario: Scheduler-only stop does not claim forceful process termination
+
+**Given** the parallel scheduler remains alive in `MergeWait`, `ResolveWait`, deferred merge, or idle waiting
+**And** no agent command or in-flight execution is active
+**When** the user requests immediate stop
+**Then** the scheduler/orchestrator is cancelled
+**And** `Processing stopped` is displayed once
+**And** no force-stop, process-termination, execution-failure, or normal-completion message is displayed
+**And** `OrchestratorEvent::AllCompleted` is not sent
 
 #### Scenario: Successful parallel execution completion shows success message
 
 **Given** the orchestrator is running in parallel mode
 **And** multiple changes are queued for processing
-**When** all changes complete successfully without errors
-**Then** the orchestrator should send `OrchestratorEvent::AllCompleted`
-**And** should display "All parallel changes completed" success message
-**And** should display "All changes processed successfully" message
+**When** all changes complete successfully without errors or cancellation
+**Then** the orchestrator sends `OrchestratorEvent::AllCompleted`
+**And** displays the existing successful completion messages
 
-#### Scenario: Parallel execution with partial errors shows warning message
+#### Scenario: Parallel execution with genuine errors shows warning message
 
 **Given** the orchestrator is running in parallel mode
-**And** multiple changes are queued for processing
-**When** at least one batch fails with an error
-**And** the orchestrator continues processing remaining changes
-**And** all queued changes have been attempted
-**Then** the orchestrator should send `OrchestratorEvent::AllCompleted`
-**And** should display "Processing completed with errors" warning message
-**And** should NOT display "All changes processed successfully" message
+**When** a non-cancellation execution error occurs
+**And** all eligible queued work has been attempted
+**Then** the orchestrator sends `OrchestratorEvent::AllCompleted`
+**And** displays `Processing completed with errors`
+**And** does not display a successful completion message
 
 ### Requirement: Loop termination reason must be tracked and distinguished
 
-The system SHALL track the reason for loop termination (cancellation, graceful stop, normal completion, or merge_wait) using local state flags.
+The system SHALL track the reason for loop termination as normal completion, genuine execution error, graceful stop, active-execution force stop, scheduler-only cancellation, or merge wait. This termination reason SHALL control terminal logs and events without inferring process activity from TUI mode or error-message text. Operator cancellation SHALL request cancellation without dropping the running scheduler future and SHALL establish terminal stop only after the scheduler reaches its bounded cleanup barrier, including active task drain and pending background merge/base-lane result handling.
 
-The system SHALL use this information to conditionally send completion events and messages.
+#### Scenario: Operator cancellation reaches terminal classification
 
-加えて、`merge_wait` が残っている場合でも実行可能な change の処理が完了したときは `OrchestratorEvent::AllCompleted` を送信し、オーケストレーションは完了状態に遷移しなければならない（MUST）。
+**Given** the global parallel cancellation token is triggered by an operator stop
+**When** the outer parallel orchestration boundary observes cancellation before the scheduler future returns
+**Then** the termination reason is recorded as stopped or cancelled
+**And** cancellation is not converted to `OrchestratorError::AgentCommand`
+**And** the outer boundary continues polling the scheduler future until its bounded cleanup barrier completes
+**And** active task drain, registered execution-handle cleanup, and pending merge/base-lane result handling precede terminal stop
+**And** a cleanup deadline or managed escalation remains classified as operator cancellation rather than execution failure
+**And** later terminal event handling remains idempotent if the frontend already applied `OrchestratorEvent::Stopped`
+**And** `Processing stopped` is not logged more than once
 
-ただし、成功完了メッセージは `merge_wait` の有無を誤解させないように設計しなければならない（SHALL）。
+#### Scenario: Genuine failure remains distinct
 
-#### Scenario: マージ待ちが残る場合でも完了イベントを送信する
-- **GIVEN** 並列実行で少なくとも 1 件の change が `MergeWait` で残っている
-- **AND** 実行可能な queued change の処理がすべて完了している
-- **WHEN** 並列実行ループが終了処理に入る
-- **THEN** システムは `OrchestratorEvent::AllCompleted` を送信する
-- **AND** オーケストレーションは完了状態に遷移する
+**Given** a parallel service or command fails without operator cancellation
+**When** the outer parallel orchestration boundary handles the result
+**Then** the termination reason is recorded as genuine execution error
+**And** existing failure and completion-with-errors reporting remains enabled
 
 ### Requirement: Parallel Execution with Hooks
 
@@ -1794,56 +1801,57 @@ Git backend では archive-complete 後の merge/dependency 判定に先立っ�
 
 ### Requirement: Parallel execution completion status must accurately reflect actual processing outcome
 
-The system SHALL send completion events and messages only when processing completes normally, not when stopped or cancelled by the user.
-
-The system SHALL distinguish between successful completion, completion with errors, graceful stop, and cancellation.
+The system SHALL send completion events and messages only when processing completes normally, not when stopped or cancelled by the user. The system SHALL distinguish successful completion, completion with errors, graceful stop, active-execution force stop, and scheduler-only cancellation. Operator cancellation MUST NOT be represented as an agent-command failure.
 
 The parallel execution subsystem SHALL NOT run a merge stall monitor based on historical base-branch merge commit timestamps. Queue execution MUST NOT be interrupted or annotated by a monitor that does not observe current queue or scheduler progress.
-
-**Priority**: HIGH
-**Rationale**: Incorrect completion messages mislead users about the processing status and can cause confusion when resuming work. A monitor that watches unrelated historical merge activity does not represent actual queue health and should not participate in parallel execution.
 
 #### Scenario: Graceful stop during parallel execution should not show success message
 
 **Given** the orchestrator is running in parallel mode
 **And** at least one change is queued for processing
-**When** the user triggers graceful stop (ESC key) before any change completes
-**Then** the orchestrator should stop processing
-**And** should send `OrchestratorEvent::Stopped`
-**And** should NOT send `OrchestratorEvent::AllCompleted`
-**And** should NOT display "All parallel changes completed" message
-**And** should NOT display "All changes processed successfully" message
-**And** should display "Processing stopped" message only
+**When** the user triggers graceful stop before processing completes
+**Then** the orchestrator stops processing after the graceful boundary
+**And** sends `OrchestratorEvent::Stopped`
+**And** does not send `OrchestratorEvent::AllCompleted`
+**And** displays `Processing stopped` without a success completion message
 
-#### Scenario: Force stop (cancel) during parallel execution should not show success message
+#### Scenario: Force stop of active execution remains cancellation rather than failure
 
 **Given** the orchestrator is running in parallel mode
-**And** at least one change is queued for processing
-**When** cancellation is triggered via cancel token
-**Then** the orchestrator should immediately stop
-**And** should display "Parallel execution cancelled" message
-**And** should NOT send `OrchestratorEvent::AllCompleted`
-**And** should NOT display any success completion messages
+**And** an agent command or in-flight execution is active
+**When** the user triggers force stop
+**Then** active execution cancellation and managed process cleanup are requested
+**And** the outcome is classified as stopped or cancelled
+**And** the system does not display `Execution failed: Agent command failed`
+**And** the system does not display `Processing completed with errors`
+**And** the system does not send `OrchestratorEvent::AllCompleted`
+
+#### Scenario: Scheduler-only stop does not claim forceful process termination
+
+**Given** the parallel scheduler remains alive in `MergeWait`, `ResolveWait`, deferred merge, or idle waiting
+**And** no agent command or in-flight execution is active
+**When** the user requests immediate stop
+**Then** the scheduler/orchestrator is cancelled
+**And** `Processing stopped` is displayed once
+**And** no force-stop, process-termination, execution-failure, or normal-completion message is displayed
+**And** `OrchestratorEvent::AllCompleted` is not sent
 
 #### Scenario: Successful parallel execution completion shows success message
 
 **Given** the orchestrator is running in parallel mode
 **And** multiple changes are queued for processing
-**When** all changes complete successfully without errors
-**Then** the orchestrator should send `OrchestratorEvent::AllCompleted`
-**And** should display "All parallel changes completed" success message
-**And** should display "All changes processed successfully" message
+**When** all changes complete successfully without errors or cancellation
+**Then** the orchestrator sends `OrchestratorEvent::AllCompleted`
+**And** displays the existing successful completion messages
 
-#### Scenario: Parallel execution with partial errors shows warning message
+#### Scenario: Parallel execution with genuine errors shows warning message
 
 **Given** the orchestrator is running in parallel mode
-**And** multiple changes are queued for processing
-**When** at least one batch fails with an error
-**And** the orchestrator continues processing remaining changes
-**And** all queued changes have been attempted
-**Then** the orchestrator should send `OrchestratorEvent::AllCompleted`
-**And** should display "Processing completed with errors" warning message
-**And** should NOT display "All changes processed successfully" message
+**When** a non-cancellation execution error occurs
+**And** all eligible queued work has been attempted
+**Then** the orchestrator sends `OrchestratorEvent::AllCompleted`
+**And** displays `Processing completed with errors`
+**And** does not display a successful completion message
 
 #### Scenario: Parallel execution does not start merge stall monitoring
 
