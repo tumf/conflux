@@ -196,6 +196,29 @@ impl DynamicQueue {
         }
     }
 
+    /// Release every registered per-change execution handle, firing each done
+    /// handshake.
+    ///
+    /// Ordinary completion releases one handle at a time through
+    /// [`Self::unregister_kill_token`]. Operator cancellation aborts in-flight
+    /// workspace tasks instead of completing them, so the scheduler releases the
+    /// registry itself on its cancellation exit: this queue outlives a single run
+    /// (one instance per TUI session), so a handle left behind by an aborted task
+    /// would later be read as proof that an agent process is still running and
+    /// would misclassify a subsequent idle stop as a force stop.
+    ///
+    /// Returns the number of handles released.
+    pub async fn release_all_execution_handles(&self) -> usize {
+        let handles = {
+            let mut tokens = self.kill_tokens.lock().await;
+            std::mem::take(&mut *tokens)
+        };
+        for handle in handles.values() {
+            handle.done.cancel();
+        }
+        handles.len()
+    }
+
     /// Number of currently registered per-change execution handles.
     ///
     /// A handle is registered exactly while a workspace task (the agent command

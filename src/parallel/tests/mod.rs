@@ -11,6 +11,8 @@ mod effective_dependency_base;
 #[cfg(test)]
 mod executor;
 #[cfg(test)]
+mod idle_parallel_stop;
+#[cfg(test)]
 mod manual_resolve;
 #[cfg(test)]
 mod reanalysis_trigger_lifetime;
