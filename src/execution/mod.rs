@@ -9,11 +9,13 @@
 //! - `types` - Common type definitions (`ExecutionContext`, `ExecutionResult`, `ProgressInfo`)
 //! - `archive` - Common archive operation logic (path verification, task completion)
 //! - `apply` - Common apply operation logic (iteration control, progress commits)
+//! - `wip_lock_retry` - Transient WIP snapshot `index.lock` retry policy
 
 pub mod apply;
 pub mod archive;
 pub mod state;
 pub mod types;
+pub mod wip_lock_retry;
 
 // Re-export apply items for convenience.
 // Note: Some items are currently unused but will be used as the refactoring progresses

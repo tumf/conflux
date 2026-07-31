@@ -16,6 +16,9 @@
 use crate::agent::{AgentRunner, OutputLine};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
+use crate::execution::wip_lock_retry::{
+    run_wip_snapshot_with_retry, GitWipSnapshotEnvironment, WipSnapshotEnvironment,
+};
 use crate::history::OutputCollector;
 use crate::hooks::{HookContext, HookRunner, HookType};
 use crate::stall::{StallDetector, StallPhase};
@@ -445,6 +448,34 @@ pub async fn create_progress_commit<W: WorkspaceManager + ?Sized>(
     change_id: &str,
     progress: &TaskProgress,
     iteration: u32,
+    cancel_token: Option<&CancellationToken>,
+) -> VcsResult<()> {
+    create_progress_commit_with_environment(
+        workspace_manager,
+        workspace_path,
+        change_id,
+        progress,
+        iteration,
+        cancel_token,
+        &GitWipSnapshotEnvironment,
+    )
+    .await
+}
+
+/// `create_progress_commit` with an injectable snapshot environment.
+///
+/// The snapshot sequence is retried as a whole so that index-lock contention at
+/// either the staging or the commit step is covered by one policy. Only the
+/// orchestration boundary knows about cancellation; the `WorkspaceManager`
+/// contract is unchanged.
+pub async fn create_progress_commit_with_environment<W: WorkspaceManager + ?Sized>(
+    workspace_manager: &W,
+    workspace_path: &Path,
+    change_id: &str,
+    progress: &TaskProgress,
+    iteration: u32,
+    cancel_token: Option<&CancellationToken>,
+    environment: &dyn WipSnapshotEnvironment,
 ) -> VcsResult<()> {
     let commit_message = format_wip_commit_message(change_id, progress, iteration);
 
@@ -453,20 +484,29 @@ pub async fn create_progress_commit<W: WorkspaceManager + ?Sized>(
         change_id, commit_message
     );
 
-    // Snapshot working copy changes first to capture workspace state.
-    workspace_manager
-        .snapshot_working_copy(workspace_path)
-        .await?;
+    run_wip_snapshot_with_retry(
+        move || async move {
+            // Snapshot working copy changes first to capture workspace state.
+            workspace_manager
+                .snapshot_working_copy(workspace_path)
+                .await?;
 
-    workspace_manager
-        .create_iteration_snapshot(
-            workspace_path,
-            change_id,
-            iteration,
-            progress.completed,
-            progress.total,
-        )
-        .await?;
+            workspace_manager
+                .create_iteration_snapshot(
+                    workspace_path,
+                    change_id,
+                    iteration,
+                    progress.completed,
+                    progress.total,
+                )
+                .await
+        },
+        environment,
+        workspace_path,
+        &commit_message,
+        cancel_token,
+    )
+    .await?;
 
     debug!(
         "Progress commit created for {} ({})",
@@ -1363,6 +1403,7 @@ where
                     change_id,
                     &new_progress,
                     iteration,
+                    cancel_token,
                 )
                 .await
                 {
