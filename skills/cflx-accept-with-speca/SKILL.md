@@ -64,7 +64,9 @@ The Conflux runtime classifies a completed acceptance run that emits no canonica
 
 Apply the same structured verification-phase semantics as `cflx-accept`. `pre-integration` declarations require current-revision repository evidence and runnable local verification. `post-integration` declarations require review of repository-automation ownership, tracked repository automation, trigger, evidence publication, rerun action, prerequisites, and fixture/local evidence; do not fetch an undeployed or external target.
 
-Missing, placeholder, or incorrectly wired repository automation is a repository-fixable FAIL. A correctly wired post-integration declaration with pending operational evidence is not a FAIL. A non-mockable external prerequisite that makes the declared automation unusable is a stalled hold with the prerequisite owner and next rerun or unblock action preserved. Never claim an unobserved operational outcome succeeded.
+Missing, placeholder, or incorrectly wired repository automation is a repository-fixable FAIL. A correctly wired post-integration declaration with pending operational evidence is not a FAIL. A non-mockable external prerequisite is a stalled hold **only** when it makes a `completion_role: change-blocking` verification's declared automation unusable, with the prerequisite owner and next rerun or unblock action preserved. Never claim an unobserved operational outcome succeeded.
+
+`completion_role` gating is identical to `cflx-accept`: only `phase: pre-integration` + `completion_role: change-blocking` + `execution_class: repository-local` may block the verdict. A `completion_role: operational-observation` verification with an unavailable prerequisite is acknowledged as pending — never `FAIL`, never stalled — and acceptance emits `PASS` when every change-blocking verification passes.
 
 ## Official NyxFoundation/speca Runner Adapter (Optional)
 
