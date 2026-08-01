@@ -145,14 +145,8 @@ pub struct ParallelExecutor {
     repo_root: PathBuf,
     /// Disable automatic workspace resume (always create new workspaces)
     no_resume: bool,
-    /// Consume a resumable acceptance stall after resolving its workspace.
+    /// Release the automatic repair budget for an explicitly retried change.
     explicit_retry: bool,
-    /// Override for the acceptance stall state root.
-    ///
-    /// `None` uses Conflux's XDG state area. Tests set an isolated temporary
-    /// root so runtime stall state never leaks into a developer's real state
-    /// directory and concurrent tests cannot see each other's holds.
-    acceptance_stall_state_root: Option<PathBuf>,
     /// Tracker for failed changes to enable skipping dependent changes
     failed_tracker: FailedChangeTracker,
     /// Change-level dependencies (change_id -> dependency ids)

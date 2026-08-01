@@ -30,9 +30,7 @@ use crate::orchestration::{
     acceptance_test_streaming, archive_change, AcceptanceResult, ArchiveContext, ArchiveResult,
     OutputHandler,
 };
-use crate::parallel::acceptance_state::{
-    parse_blocked_marker, AcceptanceRetryContext, AcceptanceStallStore,
-};
+use crate::parallel::acceptance_state::{parse_blocked_marker, AcceptanceRetryContext};
 use crate::stall::{StallDetector, StallPhase};
 use crate::task_parser;
 use crate::task_parser::TaskProgress;
@@ -42,6 +40,23 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// A validated Acceptance stall hold for the active serial run.
+///
+/// This is the whole hold. It exists only in memory for the lifetime of one
+/// process, mirroring the reducer-owned hold parallel mode keeps, and it may
+/// only suppress ordinary dispatch, drive the `stalled` presentation, and make
+/// an explicit retry resume at Acceptance. It never proves implementation
+/// completion, Acceptance PASS, archive readiness, or merge eligibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceStallHold {
+    /// Apply revision observed when the hold was recorded.
+    pub apply_revision: String,
+    /// Validated blocker as reported by the Acceptance reviewer.
+    pub blocker: crate::acceptance::AcceptanceBlocker,
+    /// Acceptance retry count observed when the hold was recorded.
+    pub retry_count: u32,
+}
 
 /// Service for serial execution of changes.
 ///
@@ -77,12 +92,12 @@ pub struct SerialRunService {
     /// This is deliberately not persisted: a restarted process starts a fresh
     /// acceptance sequence instead of trusting a generated checkpoint.
     acceptance_retry: HashMap<String, AcceptanceRetryContext>,
-    /// Override for the acceptance stall state root.
+    /// Validated Acceptance stall holds for the active run, keyed by change ID.
     ///
-    /// `None` uses Conflux's XDG state area. Tests set an isolated temporary
-    /// root so runtime stall state never leaks into a developer's real state
-    /// directory and concurrent tests cannot see each other's holds.
-    acceptance_stall_state_root: Option<PathBuf>,
+    /// Serial's counterpart to the parallel reducer hold. It is in-memory only:
+    /// nothing is written outside the repository, so a restart finds this map
+    /// empty and workspace evidence alone decides the next action.
+    acceptance_stall_holds: HashMap<String, AcceptanceStallHold>,
     /// Changes whose next processing step must be acceptance, not apply or
     /// archive, because an explicit retry consumed a resumable runtime hold.
     ///
@@ -119,7 +134,7 @@ impl SerialRunService {
             changes_processed: 0,
             iteration: 0,
             acceptance_retry: HashMap::new(),
-            acceptance_stall_state_root: None,
+            acceptance_stall_holds: HashMap::new(),
             acceptance_resume: HashSet::new(),
             accepted_change_ids: HashSet::new(),
             acceptance_repair_holds: HashSet::new(),
@@ -130,20 +145,6 @@ impl SerialRunService {
     #[allow(dead_code)] // Reserved for future TUI integration
     pub fn repo_root(&self) -> &PathBuf {
         &self.repo_root
-    }
-
-    /// Point acceptance stall state at an isolated root (tests only).
-    #[cfg(test)]
-    pub fn set_acceptance_stall_state_root(&mut self, root: PathBuf) {
-        self.acceptance_stall_state_root = Some(root);
-    }
-
-    /// Open the acceptance stall store for this service.
-    fn acceptance_stall_store(&self) -> Result<AcceptanceStallStore> {
-        match &self.acceptance_stall_state_root {
-            Some(root) => Ok(AcceptanceStallStore::new(root.clone())),
-            None => AcceptanceStallStore::discover(),
-        }
     }
 
     /// Get the current iteration number
@@ -248,51 +249,35 @@ impl SerialRunService {
 
     /// Consume a resumable acceptance stall for an explicit serial retry.
     ///
-    /// The hold lives outside the worktree, so consuming it leaves the managed
-    /// worktree untouched. A non-resumable or absent hold is refused rather than
-    /// silently discarded, and a refusal keeps the change stalled with its
-    /// blocker evidence intact.
+    /// The hold lives in memory, so consuming it leaves the managed worktree
+    /// untouched. A non-resumable or absent hold is refused rather than silently
+    /// discarded, and a refusal keeps the change stalled with its blocker
+    /// evidence intact.
     pub async fn consume_explicit_acceptance_retry(&mut self, change_id: &str) -> Result<bool> {
         // An explicit operator retry is the only thing that grants a new
-        // automatic repair opportunity, so it runs before the durable-hold
-        // lookup: a repair stop is deliberately in-memory and has no record to
-        // load. Occurrence evidence and the latest findings are preserved.
+        // automatic repair opportunity, so it runs before the stall-hold lookup:
+        // a repair stop is a separate in-memory hold. Occurrence evidence and
+        // the latest findings are preserved.
         let released_repair_hold = self.release_repair_budget_for_explicit_retry(change_id);
-        let store = self.acceptance_stall_store()?;
-        let base_branch = self.current_branch_for_facts().await;
-        // A legacy acceptance-origin marker must become runtime state before
-        // retry looks for a record, otherwise an operator retrying a legacy hold
-        // is refused for a hold that is really there.
-        self.migrate_legacy_acceptance_marker(&store, change_id, &base_branch)
-            .await;
-        let Some(record) = crate::execution::state::load_valid_acceptance_stall(
-            &store,
-            &self.repo_root,
-            &self.repo_root,
-            change_id,
-            &base_branch,
-        )
-        .await?
-        else {
+        let Some(hold) = self.acceptance_stall_holds.get(change_id) else {
             return Ok(released_repair_hold);
         };
-        if !record.resumable {
+        if !hold.blocker.resumable {
             return Ok(released_repair_hold);
         }
-        let consumed = store.consume(&record.repository_id, &record.change_id)?;
-        if consumed {
-            self.stalled_change_ids.remove(change_id);
-            // The consumed hold proved a complete apply revision, so the next
-            // pass resumes at acceptance instead of rerunning apply or falling
-            // through to archive on `change.is_complete()`.
-            self.acceptance_resume.insert(change_id.to_string());
-            info!(
-                "Explicit retry for {}: resuming at acceptance against apply revision {} without \
-                 rerunning apply",
-                change_id, record.apply_revision
-            );
-        }
-        Ok(consumed || released_repair_hold)
+        let apply_revision = hold.apply_revision.clone();
+        self.acceptance_stall_holds.remove(change_id);
+        self.stalled_change_ids.remove(change_id);
+        // The consumed hold observed a complete apply revision, so the next pass
+        // resumes at acceptance instead of rerunning apply or falling through to
+        // archive on `change.is_complete()`.
+        self.acceptance_resume.insert(change_id.to_string());
+        info!(
+            "Explicit retry for {}: resuming at acceptance against apply revision {} without \
+             rerunning apply",
+            change_id, apply_revision
+        );
+        Ok(true)
     }
 
     /// Release an in-run repair hold so an explicit retry may start one more
@@ -335,46 +320,26 @@ impl SerialRunService {
         ChangeProcessResult::Stalled { error }
     }
 
-    /// Branch used as the base reference when gathering reconciliation facts.
+    /// Record a validated external acceptance blocker as an in-memory stall
+    /// hold.
     ///
-    /// Serial mode runs directly in the repository, so the checked-out branch is
-    /// the best available base reference; `main` is a safe fallback because the
-    /// derived facts only ever *reduce* a record's authority.
-    async fn current_branch_for_facts(&self) -> String {
-        crate::vcs::git::commands::get_current_branch(&self.repo_root)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| "main".to_string())
-    }
-
-    /// Persist a validated external acceptance blocker as a runtime stall hold.
+    /// Nothing is written outside the repository. The hold binds the apply
+    /// revision only so an explicit retry can report which revision it resumes
+    /// against; a revision that cannot be resolved is a hard failure, mirroring
+    /// parallel dispatch, which stalls only against a revision it actually
+    /// observed.
     async fn record_acceptance_stall(
         &mut self,
         change_id: &str,
         blocker: &crate::acceptance::AcceptanceBlocker,
     ) -> ChangeProcessResult {
-        let store = match self.acceptance_stall_store() {
-            Ok(store) => store,
-            Err(error) => {
-                return ChangeProcessResult::AcceptanceCommandFailed {
-                    error: format!("Failed to open acceptance stall state: {error}"),
-                }
-            }
-        };
-        let base_branch = self.current_branch_for_facts().await;
-        // A record born without a revision can never reconcile: `revision_exists`
-        // rejects an empty revision, so the hold would be quarantined on the next
-        // load and the blocker evidence would silently vanish. Fail loudly
-        // instead, mirroring parallel dispatch, which persists only a revision it
-        // actually resolved.
         let apply_revision = match crate::vcs::git::commands::get_current_commit(&self.repo_root)
             .await
         {
             Ok(revision) if !revision.trim().is_empty() => revision,
             Ok(_) => {
                 return ChangeProcessResult::AcceptanceCommandFailed {
-                    error: "Failed to persist acceptance stalled evidence: current apply revision \
+                    error: "Failed to record acceptance stalled evidence: current apply revision \
                             resolved to an empty commit id"
                         .to_string(),
                 }
@@ -382,7 +347,7 @@ impl SerialRunService {
             Err(error) => {
                 return ChangeProcessResult::AcceptanceCommandFailed {
                     error: format!(
-                        "Failed to persist acceptance stalled evidence: could not resolve the \
+                        "Failed to record acceptance stalled evidence: could not resolve the \
                          current apply revision: {error}"
                     ),
                 }
@@ -393,34 +358,30 @@ impl SerialRunService {
             .get(change_id)
             .map_or(0, |context| context.cycle_count);
 
-        match crate::execution::state::persist_acceptance_stall(
-            &store,
-            &self.repo_root,
-            &self.repo_root,
-            change_id,
-            &base_branch,
-            &apply_revision,
-            blocker,
-            retry_count,
-        )
-        .await
-        {
-            Ok(record) => {
-                warn!(
-                    "Acceptance stalled for {} on a validated external blocker ({}); worktree \
-                     preserved and apply revision {} unchanged",
-                    change_id, record.category, record.apply_revision
-                );
-                self.mark_stalled(change_id, &record.next_action);
-                ChangeProcessResult::AcceptanceStalled {
-                    blocker: record.to_stalled_blocker(),
-                    error: format!("{}: {}", record.category, record.next_action),
-                }
-            }
-            Err(error) => ChangeProcessResult::AcceptanceCommandFailed {
-                error: format!("Failed to persist acceptance stalled evidence: {error}"),
+        warn!(
+            "Acceptance stalled for {} on a validated external blocker ({}); worktree preserved \
+             and apply revision {} unchanged",
+            change_id, blocker.category, apply_revision
+        );
+        self.acceptance_stall_holds.insert(
+            change_id.to_string(),
+            AcceptanceStallHold {
+                apply_revision,
+                blocker: blocker.clone(),
+                retry_count,
             },
+        );
+        self.mark_stalled(change_id, &blocker.next_action);
+        ChangeProcessResult::AcceptanceStalled {
+            blocker: blocker.to_stalled_blocker(),
+            error: format!("{}: {}", blocker.category, blocker.next_action),
         }
+    }
+
+    /// In-memory acceptance stall hold for the active run, when one exists.
+    #[allow(dead_code)] // Consumed by acceptance stall lifecycle regression coverage.
+    pub fn acceptance_stall_hold(&self, change_id: &str) -> Option<&AcceptanceStallHold> {
+        self.acceptance_stall_holds.get(change_id)
     }
 
     /// Acceptance retry context accumulated during the active run.
@@ -510,111 +471,6 @@ impl SerialRunService {
         agent.seed_acceptance_history(history);
     }
 
-    /// One-time migration of a legacy acceptance-origin marker into runtime
-    /// stall state, so serial recovers the same hold parallel dispatch does.
-    ///
-    /// A stalled acceptance hold never commits, so current HEAD is the apply
-    /// revision the marker was written against. Migration is best-effort:
-    /// anything it cannot prove is acceptance-owned stays exactly where it is
-    /// and keeps its conservative blocked handling.
-    async fn migrate_legacy_acceptance_marker(
-        &self,
-        store: &AcceptanceStallStore,
-        change_id: &str,
-        base_branch: &str,
-    ) {
-        use crate::parallel::acceptance_state::MarkerMigration;
-
-        let Ok(head) = crate::vcs::git::commands::get_current_commit(&self.repo_root).await else {
-            return;
-        };
-        let facts = match crate::execution::state::gather_workspace_facts(
-            &self.repo_root,
-            &self.repo_root,
-            change_id,
-            &head,
-            base_branch,
-        )
-        .await
-        {
-            Ok(facts) => facts,
-            Err(error) => {
-                warn!(
-                    "Could not gather workspace facts for {change_id} stall reconciliation: {error}"
-                );
-                return;
-            }
-        };
-
-        match crate::parallel::acceptance_state::migrate_legacy_acceptance_marker(
-            store,
-            &self.repo_root,
-            &facts,
-            &head,
-        ) {
-            Ok(MarkerMigration::Migrated { category }) => info!(
-                "Migrated legacy acceptance blocker marker for {change_id} into runtime stall \
-                 state (category {category})"
-            ),
-            Ok(MarkerMigration::Preserved { reason }) => debug!(
-                change_id = %change_id,
-                reason = %reason,
-                "Preserved non-acceptance blocked marker unchanged"
-            ),
-            Ok(MarkerMigration::NotApplicable) => {}
-            Err(error) => {
-                warn!("Legacy acceptance marker migration degraded for {change_id}: {error}")
-            }
-        }
-    }
-
-    /// Reconcile runtime acceptance stall state before any serial routing.
-    ///
-    /// Serial's counterpart to the parallel dispatch reconciliation block. The
-    /// record lives outside the worktree and may only suppress dispatch and
-    /// restore the operator-facing `stalled` hold; it never advances the
-    /// workflow and never touches the worktree. A legacy acceptance-origin
-    /// marker is migrated first so both modes recover the same hold.
-    async fn preflight_acceptance_stall(
-        &mut self,
-        change_id: &str,
-    ) -> Result<Option<ChangeProcessResult>> {
-        let store = self.acceptance_stall_store()?;
-        let base_branch = self.current_branch_for_facts().await;
-
-        self.migrate_legacy_acceptance_marker(&store, change_id, &base_branch)
-            .await;
-
-        // An explicit retry already consumed the hold for this change; the
-        // resume request wins so retry cannot be re-suppressed by a stale read.
-        if self.acceptance_resume.contains(change_id) {
-            return Ok(None);
-        }
-
-        let record = crate::execution::state::load_valid_acceptance_stall(
-            &store,
-            &self.repo_root,
-            &self.repo_root,
-            change_id,
-            &base_branch,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            warn!("Could not load acceptance stall state for {change_id}: {error}");
-            None
-        });
-
-        let Some(record) = record else {
-            return Ok(None);
-        };
-        let error = format!("{}: {}", record.category, record.next_action);
-        self.mark_stalled(change_id, &record.next_action);
-        Ok(Some(ChangeProcessResult::AcceptanceStalled {
-            blocker: record.to_stalled_blocker(),
-            error,
-        }))
-    }
-
     fn preflight_blocked_marker(&mut self, change_id: &str) -> Result<Option<ChangeProcessResult>> {
         if let Some(marker) = parse_blocked_marker(&self.repo_root, change_id)? {
             let error = format!("Blocked marker ({:?}): {}", marker.origin, marker.reason);
@@ -655,10 +511,6 @@ impl SerialRunService {
         self.iteration += 1;
         let change_id = &change.id;
 
-        if let Some(result) = self.preflight_acceptance_stall(change_id).await? {
-            return Ok(result);
-        }
-
         if let Some(result) = self.preflight_blocked_marker(change_id)? {
             return Ok(result);
         }
@@ -694,7 +546,7 @@ impl SerialRunService {
             // Archive is reachable only through an acceptance PASS observed in
             // this run. After a restart — or after an explicit acceptance retry —
             // complete unarchived work is accepted again rather than archived on
-            // an inferred prior verdict (constitutional law 1a fail-safe).
+            // an inferred prior verdict (constitutional law 1 fail-safe).
             if resume_at_acceptance || !self.accepted_change_ids.contains(change_id) {
                 info!(
                     "Change {} is complete but unaccepted in this run, running acceptance before \
@@ -2048,21 +1900,21 @@ mod tests {
         }
     }
 
+    /// Run one bare-gated change and hand back the service so the in-memory
+    /// stall hold — the only place a hold exists now — can be inspected.
     async fn run_serial_bare_gated_change(
         temp_dir: &std::path::Path,
         state_dir: &std::path::Path,
         change_id: &str,
         bare_attempts: u32,
         final_verdict: &str,
-        stall_state_root: &std::path::Path,
-    ) -> ChangeProcessResult {
+    ) -> (SerialRunService, ChangeProcessResult) {
         let config = serial_bare_gated_config(change_id, state_dir, bare_attempts, final_verdict);
         let mut service = SerialRunService::new(temp_dir.to_path_buf(), config.clone());
-        service.set_acceptance_stall_state_root(stall_state_root.to_path_buf());
         let mut agent = AgentRunner::new(config.clone());
         let ai_runner = serial_test_ai_runner();
 
-        service
+        let result = service
             .process_change(
                 &create_test_change(change_id, 0, 1),
                 &mut agent,
@@ -2076,7 +1928,9 @@ mod tests {
                 None,
             )
             .await
-            .unwrap()
+            .unwrap();
+
+        (service, result)
     }
 
     fn serial_porcelain_status(repo_root: &std::path::Path) -> String {
@@ -2120,14 +1974,12 @@ mod tests {
         let change_id = "serial-bare-gated-pass";
         init_serial_repo(temp_dir.path(), change_id);
 
-        let stall_state = TempDir::new().unwrap();
-        let result = run_serial_bare_gated_change(
+        let (service, result) = run_serial_bare_gated_change(
             temp_dir.path(),
             state_dir.path(),
             change_id,
             2,
             "ACCEPTANCE: PASS\n",
-            stall_state.path(),
         )
         .await;
 
@@ -2160,8 +2012,9 @@ mod tests {
             );
         }
 
-        // No change-directory artifact and no durable stalled record.
+        // No change-directory artifact and no stalled hold.
         assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
+        assert!(service.acceptance_stall_hold(change_id).is_none());
     }
 
     /// Three consecutive bare-gated results exhaust the shared budget and become
@@ -2173,14 +2026,12 @@ mod tests {
         let change_id = "serial-bare-gated-exhausted";
         init_serial_repo(temp_dir.path(), change_id);
 
-        let stall_state = TempDir::new().unwrap();
-        let result = run_serial_bare_gated_change(
+        let (service, result) = run_serial_bare_gated_change(
             temp_dir.path(),
             state_dir.path(),
             change_id,
             5,
             "ACCEPTANCE: PASS\n",
-            stall_state.path(),
         )
         .await;
 
@@ -2204,6 +2055,10 @@ mod tests {
             "no fourth protocol retry may start after exhaustion"
         );
         assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
+        assert!(
+            service.acceptance_stall_hold(change_id).is_none(),
+            "evidence-free gated input must never create a hold"
+        );
     }
 
     /// A validated structured blocker stalls immediately — no protocol retry —
@@ -2212,7 +2067,6 @@ mod tests {
     async fn serial_structured_blocker_stalls_on_the_first_result() {
         let temp_dir = TempDir::new().unwrap();
         let state_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         let change_id = "serial-structured-stall";
         init_serial_repo(temp_dir.path(), change_id);
 
@@ -2222,15 +2076,9 @@ mod tests {
             r#""next_action":"await CB-42 then retry acceptance","resumable":true}}"#,
             "\n"
         );
-        let result = run_serial_bare_gated_change(
-            temp_dir.path(),
-            state_dir.path(),
-            change_id,
-            0,
-            verdict,
-            stall_state.path(),
-        )
-        .await;
+        let (service, result) =
+            run_serial_bare_gated_change(temp_dir.path(), state_dir.path(), change_id, 0, verdict)
+                .await;
 
         match &result {
             ChangeProcessResult::AcceptanceStalled { blocker, error } => {
@@ -2257,23 +2105,21 @@ mod tests {
         );
         assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
 
-        // The hold lives outside the worktree and carries the explicit category.
-        let store =
-            crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
-        let record = store
-            .load(
-                &crate::parallel::acceptance_state::repository_identity(temp_dir.path()),
-                change_id,
-            )
-            .unwrap()
-            .expect("a validated blocker must persist a runtime hold");
-        assert_eq!(record.category, "external_approval");
-        assert_eq!(record.phase, "acceptance");
-        assert!(record.resumable);
+        // The hold lives in memory only and carries the explicit category.
+        let hold = service
+            .acceptance_stall_hold(change_id)
+            .expect("a validated blocker must record an in-memory hold");
+        assert_eq!(hold.blocker.category, "external_approval");
+        assert!(hold.blocker.resumable);
         assert_eq!(
-            record.evidence,
+            hold.blocker.evidence,
             ["change board ticket CB-42 awaits sign-off"]
         );
+        assert!(
+            !hold.apply_revision.trim().is_empty(),
+            "the hold must bind the observed apply revision"
+        );
+        assert!(service.is_stalled(change_id));
     }
 
     /// Serial parity with parallel: a status-only acceptance exit re-runs the
@@ -3180,58 +3026,63 @@ mod tests {
         }
     }
 
-    async fn persist_serial_stall(
-        repo_root: &std::path::Path,
-        stall_state: &std::path::Path,
+    /// Record an in-memory stall hold on `service` the same way acceptance does.
+    async fn record_serial_stall(
+        service: &mut SerialRunService,
         change_id: &str,
         resumable: bool,
-    ) -> crate::parallel::acceptance_state::AcceptanceStallRecord {
-        let store = AcceptanceStallStore::new(stall_state);
-        let apply_revision = crate::vcs::git::commands::get_current_commit(repo_root)
+    ) -> ChangeProcessResult {
+        service
+            .record_acceptance_stall(
+                change_id,
+                &crate::acceptance::AcceptanceBlocker {
+                    category: "external_service".to_string(),
+                    evidence: vec!["staging registry returned 503".to_string()],
+                    next_action: "wait for the registry then retry acceptance".to_string(),
+                    resumable,
+                    prerequisite_owner: Some("platform".to_string()),
+                    evidence_ids: Vec::new(),
+                },
+            )
             .await
-            .unwrap();
-        crate::execution::state::persist_acceptance_stall(
-            &store,
-            repo_root,
-            repo_root,
-            change_id,
-            "main",
-            &apply_revision,
-            &crate::acceptance::AcceptanceBlocker {
-                category: "external_service".to_string(),
-                evidence: vec!["staging registry returned 503".to_string()],
-                next_action: "wait for the registry then retry acceptance".to_string(),
-                resumable,
-                prerequisite_owner: Some("platform".to_string()),
-                evidence_ids: Vec::new(),
-            },
-            0,
-        )
-        .await
-        .unwrap()
     }
 
-    /// Restart must reconstruct a runtime acceptance stall instead of archiving
-    /// the complete change: the hold survives the process, and archive is not
-    /// reachable while it holds.
+    /// A stall holds only for the lifetime of the process that recorded it.
+    /// After a restart — a brand-new service — the complete unarchived change
+    /// runs acceptance again instead of restoring the stall or archiving on an
+    /// inferred prior PASS.
     #[tokio::test]
-    async fn serial_restart_restores_runtime_acceptance_stall_before_archive() {
+    async fn serial_restart_drops_the_stall_and_reruns_acceptance_before_archive() {
         let temp_dir = TempDir::new().unwrap();
         let state_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         let change_id = "serial-restart-stall";
         init_serial_repo(temp_dir.path(), change_id);
         let apply_revision = crate::vcs::git::commands::get_current_commit(temp_dir.path())
             .await
             .unwrap();
 
-        persist_serial_stall(temp_dir.path(), stall_state.path(), change_id, true).await;
+        // The stalling process holds the change out of ordinary dispatch.
+        let config = serial_counting_pass_config(change_id, state_dir.path());
+        let mut stalled_service =
+            SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
+        let stalled = record_serial_stall(&mut stalled_service, change_id, true).await;
+        assert!(matches!(
+            stalled,
+            ChangeProcessResult::AcceptanceStalled { .. }
+        ));
+        assert!(stalled_service.is_stalled(change_id));
+        assert_eq!(
+            stalled_service
+                .select_next_change(&[create_test_change(change_id, 1, 1)])
+                .map(|change| change.id.clone()),
+            None,
+            "the in-memory hold must suppress ordinary dispatch in its own process"
+        );
 
         // A brand-new service stands in for a restarted process: it has no
-        // in-memory acceptance history at all.
-        let config = serial_counting_pass_config(change_id, state_dir.path());
+        // in-memory acceptance history and no hold at all.
         let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
+        assert!(service.acceptance_stall_hold(change_id).is_none());
         let mut agent = AgentRunner::new(config.clone());
         let ai_runner = serial_test_ai_runner();
 
@@ -3251,33 +3102,22 @@ mod tests {
             .await
             .unwrap();
 
-        match &result {
-            ChangeProcessResult::AcceptanceStalled { blocker, error } => {
-                assert_eq!(blocker.category, "external_service");
-                assert_eq!(blocker.evidence, ["staging registry returned 503"]);
-                assert!(error.starts_with("external_service:"), "{error}");
-            }
-            other => panic!("restart must restore the runtime stall, got {other:?}"),
-        }
-        assert!(service.is_stalled(change_id));
+        assert!(
+            matches!(result, ChangeProcessResult::AcceptancePassed),
+            "a restart must re-run acceptance for a complete unarchived change, got {result:?}"
+        );
+        assert!(!service.is_stalled(change_id));
         assert_eq!(
             serial_acceptance_invocations(state_dir.path()),
-            0,
-            "a restored hold must not start acceptance"
+            1,
+            "a restart must run acceptance exactly once"
         );
-        // The hold advanced nothing: no archive, clean worktree, apply revision
-        // untouched.
-        assert!(temp_dir
-            .path()
-            .join("openspec/changes")
-            .join(change_id)
-            .exists());
-        assert_eq!(serial_porcelain_status(temp_dir.path()), "");
         assert_eq!(
             crate::vcs::git::commands::get_current_commit(temp_dir.path())
                 .await
                 .unwrap(),
-            apply_revision
+            apply_revision,
+            "restarting must not rerun apply"
         );
         assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
     }
@@ -3288,13 +3128,11 @@ mod tests {
     #[tokio::test]
     async fn serial_acceptance_stall_displays_as_stalled_with_structured_metadata() {
         let temp_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         let change_id = "serial-stall-display";
         init_serial_repo(temp_dir.path(), change_id);
 
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
 
         let result = service
             .record_acceptance_stall(
@@ -3365,19 +3203,15 @@ mod tests {
     async fn explicit_serial_retry_resumes_at_acceptance_without_rerunning_apply() {
         let temp_dir = TempDir::new().unwrap();
         let state_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         let change_id = "serial-retry-resume";
         init_serial_repo(temp_dir.path(), change_id);
         let apply_revision = crate::vcs::git::commands::get_current_commit(temp_dir.path())
             .await
             .unwrap();
 
-        let record =
-            persist_serial_stall(temp_dir.path(), stall_state.path(), change_id, true).await;
-
         let config = serial_counting_pass_config(change_id, state_dir.path());
         let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
+        record_serial_stall(&mut service, change_id, true).await;
         let mut agent = AgentRunner::new(config.clone());
         let ai_runner = serial_test_ai_runner();
 
@@ -3389,10 +3223,8 @@ mod tests {
             "a resumable hold must accept explicit retry"
         );
         assert!(!service.is_stalled(change_id));
-        let store = AcceptanceStallStore::new(stall_state.path());
-        assert_eq!(
-            store.load(&record.repository_id, change_id).unwrap(),
-            None,
+        assert!(
+            service.acceptance_stall_hold(change_id).is_none(),
             "a successful retry consumes the hold"
         );
 
@@ -3441,13 +3273,11 @@ mod tests {
     async fn serial_complete_change_reruns_acceptance_before_archive_after_restart() {
         let temp_dir = TempDir::new().unwrap();
         let state_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         let change_id = "serial-failsafe-rerun";
         init_serial_repo(temp_dir.path(), change_id);
 
         let config = serial_counting_pass_config(change_id, state_dir.path());
         let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
         let mut agent = AgentRunner::new(config.clone());
         let ai_runner = serial_test_ai_runner();
 
@@ -3481,10 +3311,8 @@ mod tests {
     async fn serial_stall_refuses_to_persist_without_an_apply_revision() {
         // No git repository at all, so `get_current_commit` cannot resolve HEAD.
         let temp_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
 
         let result = service
             .record_acceptance_stall(
@@ -3507,104 +3335,9 @@ mod tests {
             other => panic!("an unresolvable revision must fail loudly, got {other:?}"),
         }
         assert!(!service.is_stalled("no-revision"));
-        let store = AcceptanceStallStore::new(stall_state.path());
-        assert_eq!(
-            crate::execution::state::load_valid_acceptance_stall(
-                &store,
-                temp_dir.path(),
-                temp_dir.path(),
-                "no-revision",
-                "main",
-            )
-            .await
-            .unwrap(),
-            None,
-            "no hold may be created from an unresolved revision"
-        );
-    }
-
-    /// Serial must migrate a legacy acceptance-origin marker into runtime state
-    /// exactly like parallel dispatch does, so the same hold is recoverable in
-    /// both modes and explicit retry can consume it.
-    #[tokio::test]
-    async fn serial_migrates_a_legacy_acceptance_marker_into_runtime_state() {
-        use crate::parallel::acceptance_state::write_legacy_acceptance_marker;
-
-        let temp_dir = TempDir::new().unwrap();
-        let state_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
-        let change_id = "serial-legacy-marker";
-        init_serial_repo(temp_dir.path(), change_id);
-        let apply_revision = crate::vcs::git::commands::get_current_commit(temp_dir.path())
-            .await
-            .unwrap();
-
-        write_legacy_acceptance_marker(
-            temp_dir.path(),
-            change_id,
-            "acceptance_gated",
-            &["managed verification job 42 is still running".to_string()],
-            &AcceptanceRetryContext {
-                finding_identities: vec!["external|job 42|verification".to_string()],
-                semantic_fingerprint: Some("baseline".to_string()),
-                cycle_count: 2,
-                ..AcceptanceRetryContext::default()
-            },
-            "no_semantic_progress",
-            &["verification job 42".to_string()],
-            true,
-            "wait for job 42 then retry acceptance",
-        )
-        .unwrap();
-
-        let config = serial_counting_pass_config(change_id, state_dir.path());
-        let mut service = SerialRunService::new(temp_dir.path().to_path_buf(), config.clone());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
-        let mut agent = AgentRunner::new(config.clone());
-        let ai_runner = serial_test_ai_runner();
-
-        let result = service
-            .process_change(
-                &create_test_change(change_id, 1, 1),
-                &mut agent,
-                &ai_runner,
-                &HookRunner::new(HooksConfig::default(), temp_dir.path()),
-                &NullOutputHandler::new(),
-                1,
-                1,
-                || false,
-                || false,
-                None,
-            )
-            .await
-            .unwrap();
-
-        // The legacy marker became a structured runtime hold instead of an
-        // opaque marker-based stall, and the marker residue is gone.
-        match &result {
-            ChangeProcessResult::AcceptanceStalled { blocker, .. } => {
-                assert_eq!(blocker.category, "pending_verification");
-                assert_eq!(blocker.next_action, "wait for job 42 then retry acceptance");
-            }
-            other => panic!("a legacy acceptance marker must migrate, got {other:?}"),
-        }
-        assert_eq!(serial_acceptance_invocations(state_dir.path()), 0);
-        assert_acceptance_added_no_worktree_artifact(temp_dir.path(), change_id);
-        assert_eq!(serial_porcelain_status(temp_dir.path()), "");
-
-        // Explicit retry now finds the migrated hold instead of refusing it.
         assert!(
-            service
-                .consume_explicit_acceptance_retry(change_id)
-                .await
-                .unwrap(),
-            "a migrated legacy hold must be retryable"
-        );
-        assert_eq!(
-            crate::vcs::git::commands::get_current_commit(temp_dir.path())
-                .await
-                .unwrap(),
-            apply_revision
+            service.acceptance_stall_hold("no-revision").is_none(),
+            "no hold may be created from an unresolved revision"
         );
     }
 
@@ -3714,38 +3447,28 @@ mod tests {
     #[tokio::test]
     async fn explicit_serial_retry_refuses_a_non_resumable_hold_and_keeps_it() {
         let temp_dir = TempDir::new().unwrap();
-        let stall_state = TempDir::new().unwrap();
         init_serial_repo(temp_dir.path(), "non-resumable");
 
         let mut service =
             SerialRunService::new(temp_dir.path().to_path_buf(), OrchestratorConfig::default());
-        service.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
-
-        let store =
-            crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
-        let apply_revision = crate::vcs::git::commands::get_current_commit(temp_dir.path())
-            .await
-            .unwrap();
-        let record = crate::execution::state::persist_acceptance_stall(
-            &store,
-            temp_dir.path(),
-            temp_dir.path(),
-            "non-resumable",
-            "main",
-            &apply_revision,
-            &crate::acceptance::AcceptanceBlocker {
-                category: "human_decision".to_string(),
-                evidence: vec!["the approach needs an owner decision".to_string()],
-                next_action: "owner decides the approach".to_string(),
-                resumable: false,
-                prerequisite_owner: Some("architecture".to_string()),
-                evidence_ids: Vec::new(),
-            },
-            0,
-        )
-        .await
-        .unwrap();
-        assert!(!record.resumable);
+        service
+            .record_acceptance_stall(
+                "non-resumable",
+                &crate::acceptance::AcceptanceBlocker {
+                    category: "human_decision".to_string(),
+                    evidence: vec!["the approach needs an owner decision".to_string()],
+                    next_action: "owner decides the approach".to_string(),
+                    resumable: false,
+                    prerequisite_owner: Some("architecture".to_string()),
+                    evidence_ids: Vec::new(),
+                },
+            )
+            .await;
+        let before = service
+            .acceptance_stall_hold("non-resumable")
+            .expect("hold must exist")
+            .clone();
+        assert!(!before.blocker.resumable);
 
         assert!(
             !service
@@ -3755,11 +3478,16 @@ mod tests {
             "a non-resumable hold must refuse explicit retry"
         );
 
-        let preserved = store
-            .load(&record.repository_id, "non-resumable")
-            .unwrap()
-            .expect("a refused retry must keep the blocker evidence");
-        assert_eq!(preserved, record);
+        assert_eq!(
+            service
+                .acceptance_stall_hold("non-resumable")
+                .expect("a refused retry must keep the blocker evidence"),
+            &before
+        );
+        assert!(
+            service.is_stalled("non-resumable"),
+            "a refused retry must leave the change stalled"
+        );
     }
 
     /// An apply-origin marker is never treated as an acceptance hold, so an

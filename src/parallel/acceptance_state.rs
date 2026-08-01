@@ -6,18 +6,19 @@
 //! checkpoint: after a restart, complete but unarchived work is accepted again
 //! rather than trusting an inferred prior PASS.
 //!
-//! A *validated* external blocker is different. It is a temporary hold that must
-//! survive restart without mutating the managed worktree, so it is stored in the
-//! versioned, revision-bound [`AcceptanceStallStore`] under Conflux's XDG state
-//! area. Per constitutional law 1a that record may control only dispatch
-//! suppression, `stalled` presentation, and acceptance-only explicit retry: it
-//! can never prove implementation completion, acceptance PASS, archive
-//! readiness, or merge eligibility.
+//! A *validated* external blocker is a temporary hold that lives in the
+//! in-memory `OrchestratorState` for the lifetime of one process. Per
+//! constitutional law 1 nothing about it is written outside the managed
+//! worktree, so a restart drops the hold and complete unarchived work is
+//! accepted again rather than inferred to have passed.
 //!
 //! Acceptance no longer writes `APPLY_BLOCKED/marker.md`. Apply-origin and
-//! unknown-origin markers keep their existing conservative handling, and legacy
-//! acceptance-origin markers are migrated once (see
-//! [`migrate_legacy_acceptance_marker`]).
+//! unknown-origin markers keep their existing conservative handling.
+//!
+//! [`AcceptanceStallRecord`], [`AcceptanceStallStore`], and
+//! [`migrate_legacy_acceptance_marker`] are the retired disk-persistence types.
+//! No production path reads or writes them; they are scheduled for deletion
+//! after one release cycle.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -227,11 +228,11 @@ pub fn parse_blocked_marker(
     }))
 }
 
-/// Versioned, revision-bound acceptance stall record.
+/// Retired versioned, revision-bound acceptance stall record.
 ///
-/// Stored outside every managed worktree. Its authority is deliberately narrow
-/// (constitutional law 1a): dispatch suppression, `stalled` presentation, and
-/// acceptance-only explicit retry. Nothing here is completion evidence.
+/// No production path constructs, reads, or writes this any more: the stall
+/// hold is in-memory reducer state. Kept for one release cycle so an operator
+/// can still inspect leftover files under `~/.local/state/cflx/acceptance-stalls/`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptanceStallRecord {
     /// Schema version; must equal [`ACCEPTANCE_STALL_SCHEMA`].
@@ -315,7 +316,7 @@ impl AcceptanceStallRecord {
     }
 }
 
-/// Current repository/worktree facts a stall record is reconciled against.
+/// Current repository/worktree facts describing a managed workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceFacts {
     pub repository_id: String,
@@ -331,78 +332,8 @@ pub struct WorkspaceFacts {
     pub change_active: bool,
 }
 
-/// Outcome of reconciling a stored stall record against current facts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StallReconciliation {
-    /// The record still binds to reality and may control routing.
-    Valid,
-    /// The record lost its binding. It must be invalidated or quarantined and
-    /// routing recomputed from repository evidence.
-    Invalid { reason: String },
-}
-
-impl StallReconciliation {
-    #[cfg(test)]
-    pub fn is_valid(&self) -> bool {
-        matches!(self, StallReconciliation::Valid)
-    }
-}
-
-/// Reconcile a stored stall record against current repository/worktree facts.
-///
-/// Pure decision logic: every input is a fact gathered by the caller, so this is
-/// unit-testable without touching git, the filesystem, or a real worktree.
-///
-/// Checks run in the order the design specifies, so the reported reason names
-/// the first binding that actually broke.
-pub fn reconcile_acceptance_stall(
-    record: &AcceptanceStallRecord,
-    facts: &WorkspaceFacts,
-) -> StallReconciliation {
-    let invalid = |reason: String| StallReconciliation::Invalid { reason };
-
-    if record.schema != ACCEPTANCE_STALL_SCHEMA {
-        return invalid(format!(
-            "unsupported acceptance stall schema '{}'",
-            record.schema
-        ));
-    }
-    if record.repository_id != facts.repository_id {
-        return invalid("stall record belongs to a different repository".to_string());
-    }
-    if record.change_id != facts.change_id {
-        return invalid("stall record belongs to a different change".to_string());
-    }
-    if !facts.change_active {
-        return invalid("change is archived or merged; stall record is obsolete".to_string());
-    }
-    if record.worktree_id != facts.worktree_id {
-        return invalid(
-            "managed worktree identity changed; the recorded worktree was deleted, recreated, \
-             or its path reused"
-                .to_string(),
-        );
-    }
-    if record.worktree_path != facts.worktree_path {
-        return invalid("managed worktree path changed since the hold was recorded".to_string());
-    }
-    if !facts.apply_revision_exists {
-        return invalid(format!(
-            "recorded apply revision {} no longer exists",
-            record.apply_revision
-        ));
-    }
-    if !facts.head_descends_from_apply_revision {
-        return invalid(format!(
-            "current HEAD no longer descends from the recorded apply revision {}",
-            record.apply_revision
-        ));
-    }
-    StallReconciliation::Valid
-}
-
-/// Stable identity for a repository, used as the storage key and as the first
-/// reconciliation guard.
+/// Stable identity for a repository, used as the storage key for the retired
+/// stall store.
 pub fn repository_identity(repo_root: &Path) -> String {
     fs::canonicalize(repo_root)
         .unwrap_or_else(|_| repo_root.to_path_buf())
@@ -414,10 +345,7 @@ pub fn repository_identity(repo_root: &Path) -> String {
 ///
 /// For a linked git worktree this is the `gitdir:` pointer written into
 /// `<worktree>/.git`, which changes when the worktree is recreated under a
-/// different name. Combined with the apply-revision ancestry check in
-/// [`reconcile_acceptance_stall`], a worktree that is deleted and rebuilt at the
-/// same path fails reconciliation because the fresh checkout no longer carries
-/// the recorded apply commit.
+/// different name.
 pub fn worktree_identity(worktree_path: &Path) -> String {
     let git_pointer = worktree_path.join(".git");
     match fs::read_to_string(&git_pointer) {
@@ -427,12 +355,13 @@ pub fn worktree_identity(worktree_path: &Path) -> String {
     }
 }
 
-/// Versioned, atomic store for acceptance stall records.
+/// Retired versioned, atomic store for acceptance stall records.
 ///
-/// The store lives outside every managed worktree, so creating, reading,
-/// reconciling, consuming, and quarantining records never dirties a worktree.
-/// The root is injectable so tests run against an isolated temporary directory
-/// with no real credentials, services, or shared state.
+/// No production path opens this store any more. It is kept for one release
+/// cycle alongside [`AcceptanceStallRecord`] so leftover files under
+/// `~/.local/state/cflx/acceptance-stalls/` remain readable by an operator; they
+/// are deliberately never loaded and never deleted, so a concurrently running
+/// older Conflux sharing the same state directory keeps its own holds.
 #[derive(Debug, Clone)]
 pub struct AcceptanceStallStore {
     root: PathBuf,
@@ -974,96 +903,6 @@ mod tests {
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")),
             "no temporary file may survive a failed write"
         );
-    }
-
-    /// Reconciliation matrix: exactly one broken binding per case, and each must
-    /// invalidate the record with a reason naming what actually broke.
-    #[test]
-    fn acceptance_state_reconciliation_rejects_every_broken_binding() {
-        assert_eq!(
-            reconcile_acceptance_stall(&record(), &facts()),
-            StallReconciliation::Valid
-        );
-        assert!(reconcile_acceptance_stall(&record(), &facts()).is_valid());
-
-        let cases: Vec<(&str, AcceptanceStallRecord, WorkspaceFacts)> = vec![
-            (
-                "schema",
-                AcceptanceStallRecord {
-                    schema: "acceptance-stall-v0".to_string(),
-                    ..record()
-                },
-                facts(),
-            ),
-            (
-                "different repository",
-                record(),
-                WorkspaceFacts {
-                    repository_id: "/elsewhere".to_string(),
-                    ..facts()
-                },
-            ),
-            (
-                "different change",
-                record(),
-                WorkspaceFacts {
-                    change_id: "other-change".to_string(),
-                    ..facts()
-                },
-            ),
-            (
-                "archived or merged",
-                record(),
-                WorkspaceFacts {
-                    change_active: false,
-                    ..facts()
-                },
-            ),
-            (
-                "worktree identity",
-                record(),
-                WorkspaceFacts {
-                    worktree_id: "gitdir: /repo/.git/worktrees/ws-recreated".to_string(),
-                    ..facts()
-                },
-            ),
-            (
-                "worktree path",
-                record(),
-                WorkspaceFacts {
-                    worktree_path: "/repo/../worktrees/reused".to_string(),
-                    ..facts()
-                },
-            ),
-            (
-                "apply revision",
-                record(),
-                WorkspaceFacts {
-                    apply_revision_exists: false,
-                    ..facts()
-                },
-            ),
-            (
-                "ancestry",
-                record(),
-                WorkspaceFacts {
-                    head_descends_from_apply_revision: false,
-                    ..facts()
-                },
-            ),
-        ];
-
-        for (label, stored, current) in cases {
-            match reconcile_acceptance_stall(&stored, &current) {
-                StallReconciliation::Invalid { reason } => assert!(
-                    !reason.is_empty(),
-                    "{label} mismatch must report a diagnostic"
-                ),
-                StallReconciliation::Valid => {
-                    panic!("{label} mismatch must invalidate the record")
-                }
-            }
-        }
     }
 
     /// The storage key must stay stable, filesystem-safe, and collision-free

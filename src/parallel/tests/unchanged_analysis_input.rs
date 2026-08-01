@@ -316,8 +316,6 @@ struct SuppressionHarness {
     probe: Arc<FakeAnalysisInputProbe>,
     script: Arc<AnalyzerScript>,
     events: mpsc::Receiver<ExecutionEvent>,
-    /// Keeps the isolated acceptance-stall state root alive for the harness's lifetime.
-    _stall_state_root: TempDir,
 }
 
 impl SuppressionHarness {
@@ -337,8 +335,6 @@ impl SuppressionHarness {
         executor.set_analysis_input_probe(probe.clone());
         // Isolate acceptance-stall state so queue classification never touches (or is slowed by)
         // the developer's real Conflux state directory.
-        let stall_state_root = TempDir::new().expect("create stall state root");
-        executor.set_acceptance_stall_state_root(stall_state_root.path().to_path_buf());
         Self {
             executor,
             queued,
@@ -354,7 +350,6 @@ impl SuppressionHarness {
             probe,
             script: AnalyzerScript::new(),
             events,
-            _stall_state_root: stall_state_root,
         }
     }
 

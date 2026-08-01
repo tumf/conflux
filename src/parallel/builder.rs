@@ -116,7 +116,6 @@ impl ParallelExecutor {
             repo_root,
             no_resume: false,
             explicit_retry: false,
-            acceptance_stall_state_root: None,
             failed_tracker: FailedChangeTracker::new(),
             change_dependencies: HashMap::new(),
             resolve_wait_changes: HashSet::new(),
@@ -270,24 +269,6 @@ impl ParallelExecutor {
     #[cfg(test)]
     pub(crate) fn set_workspace_manager(&mut self, workspace_manager: Box<dyn WorkspaceManager>) {
         self.workspace_manager = workspace_manager;
-    }
-
-    /// Point acceptance stall state at an isolated root (tests only).
-    #[cfg(test)]
-    pub fn set_acceptance_stall_state_root(&mut self, root: std::path::PathBuf) {
-        self.acceptance_stall_state_root = Some(root);
-    }
-
-    /// Open the acceptance stall store for this executor.
-    pub(crate) fn acceptance_stall_store(
-        &self,
-    ) -> crate::error::Result<crate::parallel::acceptance_state::AcceptanceStallStore> {
-        match &self.acceptance_stall_state_root {
-            Some(root) => {
-                Ok(crate::parallel::acceptance_state::AcceptanceStallStore::new(root.clone()))
-            }
-            None => crate::parallel::acceptance_state::AcceptanceStallStore::discover(),
-        }
     }
 
     /// Set shared reducer state for scheduler-owned resolve retry intent.

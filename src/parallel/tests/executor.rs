@@ -1009,7 +1009,6 @@ fn test_skip_reason_for_merge_deferred_dependency() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
-        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1160,7 +1159,6 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
-        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1327,7 +1325,6 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
-        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1549,7 +1546,6 @@ async fn test_merge_retries_when_merge_commit_missing() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
-        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1763,7 +1759,6 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
-        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -1983,7 +1978,6 @@ async fn test_merge_retries_after_pre_commit_changes() {
     let ai_runner = AiCommandRunner::new(queue_config, shared_stagger_state.clone());
 
     let executor = ParallelExecutor {
-        acceptance_stall_state_root: None,
         workspace_manager: Box::new(manager),
         config,
         apply_command: String::new(),
@@ -7215,17 +7209,30 @@ struct GatedDispatch {
     prompts: Vec<String>,
 }
 
+/// Reducer state standing in for one Conflux process lifetime.
+///
+/// An acceptance stall now lives here and nowhere else, so passing a fresh
+/// state models a restart and reusing one models a second dispatch inside the
+/// same process.
+fn new_process_state(change_id: &str) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
+    Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        10,
+        crate::orchestration::state::ExecutionMode::Parallel,
+    )))
+}
+
 /// Dispatch one change against a gated-then-final acceptance fixture.
 ///
-/// `stall_state_root` isolates runtime stall state per test, so nothing reaches
-/// a developer's real XDG state directory and concurrent tests cannot observe
-/// each other's holds.
+/// `shared_state` is the reducer that owns the in-memory acceptance hold for
+/// this simulated process. Nothing is read from or written to the XDG state
+/// area, so tests cannot observe each other's holds.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_gated_run(
     repo_root: &std::path::Path,
     workspace_base_dir: &std::path::Path,
     state_dir: &std::path::Path,
-    stall_state_root: &std::path::Path,
+    shared_state: &Arc<tokio::sync::RwLock<OrchestratorState>>,
     change_id: &str,
     bare_attempts: u32,
     final_verdict: &str,
@@ -7273,7 +7280,7 @@ async fn dispatch_gated_run(
 
     let (tx, mut rx) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(repo_root.to_path_buf(), config, Some(tx));
-    executor.set_acceptance_stall_state_root(stall_state_root.to_path_buf());
+    executor.set_shared_orchestrator_state(shared_state.clone());
     executor.set_explicit_retry(explicit_retry);
     let semaphore = Arc::new(Semaphore::new(1));
     let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
@@ -7385,15 +7392,15 @@ async fn parallel_bare_gated_retries_then_passes_without_stalling() {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
     let state_dir = TempDir::new().or_fail("create fixture state dir");
-    let stall_state = TempDir::new().or_fail("create stall state root");
     let change_id = "parallel-bare-gated-pass";
+    let shared_state = new_process_state(change_id);
     init_missing_verdict_repo(repo_dir.path(), change_id).await;
 
     let observed = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
         state_dir.path(),
-        stall_state.path(),
+        &shared_state,
         change_id,
         2,
         "ACCEPTANCE: PASS\n",
@@ -7445,15 +7452,15 @@ async fn parallel_bare_gated_exhaustion_is_terminal_and_creates_no_hold() {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
     let state_dir = TempDir::new().or_fail("create fixture state dir");
-    let stall_state = TempDir::new().or_fail("create stall state root");
     let change_id = "parallel-bare-gated-exhausted";
+    let shared_state = new_process_state(change_id);
     init_missing_verdict_repo(repo_dir.path(), change_id).await;
 
     let observed = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
         state_dir.path(),
-        stall_state.path(),
+        &shared_state,
         change_id,
         5,
         "ACCEPTANCE: PASS\n",
@@ -7478,43 +7485,42 @@ async fn parallel_bare_gated_exhaustion_is_terminal_and_creates_no_hold() {
     assert_eq!(observed.apply_invocations, 1);
     assert!(observed.stalled_events.is_empty());
 
-    // No durable hold anywhere, and the worktree is untouched by acceptance.
-    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
-    assert!(store
-        .load(
-            &crate::parallel::acceptance_state::repository_identity(repo_dir.path()),
-            change_id
-        )
-        .or_fail("read stall store")
-        .is_none());
+    // No hold anywhere, and the worktree is untouched by acceptance.
+    assert!(shared_state
+        .read()
+        .await
+        .acceptance_stalled_change_ids()
+        .is_empty());
     assert_eq!(workspace_porcelain_status(&observed.workspace_path), "");
 }
 
-/// A validated structured blocker stalls immediately, records a revision-bound
-/// hold outside the worktree, and preserves the clean worktree and apply commit.
-/// A restart then restores `stalled` without re-running anything, and an
-/// explicit retry resumes acceptance only.
+/// A validated structured blocker stalls immediately, records the hold in the
+/// reducer only, and preserves the clean worktree and apply commit. A restart —
+/// a fresh reducer — must then run acceptance again rather than restoring the
+/// stall, and an explicit retry inside the same process must resume acceptance
+/// without rerunning apply.
 /// Heavy: three full dispatch rounds against real git worktrees put this over
 /// the one-second default-suite budget. The individual behaviours it chains are
-/// also covered by faster default tests (stall persistence and restart
-/// reconciliation in `execution::state`, dispatch suppression in
-/// `runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid`); this
+/// also covered by faster default tests (blocker projection in
+/// `execution::state`, reducer hold semantics in `orchestration::state`,
+/// dispatch suppression in
+/// `in_memory_stalled_change_is_not_requeued_until_its_hold_is_cleared`); this
 /// test exists to prove they compose end to end.
 #[cfg(feature = "heavy-tests")]
 #[tokio::test]
-async fn parallel_validated_blocker_stalls_survives_restart_and_retries_acceptance_only() {
+async fn parallel_validated_blocker_stalls_then_restart_reruns_acceptance() {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
-    let stall_state = TempDir::new().or_fail("create stall state root");
     let change_id = "parallel-validated-stall";
     init_missing_verdict_repo(repo_dir.path(), change_id).await;
 
     // --- 1. Enter the stall -------------------------------------------------
+    let first_process = new_process_state(change_id);
     let first = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
         TempDir::new().or_fail("state dir").path(),
-        stall_state.path(),
+        &first_process,
         change_id,
         0,
         VALIDATED_BLOCKER_VERDICT,
@@ -7548,24 +7554,24 @@ async fn parallel_validated_blocker_stalls_survives_restart_and_retries_acceptan
         .join("APPLY_BLOCKED")
         .exists());
 
-    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
-    let repository_id = crate::parallel::acceptance_state::repository_identity(repo_dir.path());
-    let record = store
-        .load(&repository_id, change_id)
-        .or_fail("read stall store")
-        .or_fail("a validated blocker must persist a runtime hold");
-    assert_eq!(record.category, "credential");
-    assert_eq!(record.apply_revision, apply_revision);
-    assert_eq!(record.phase, "acceptance");
-    assert!(record.resumable);
+    // The hold exists in the reducer and nowhere else.
+    assert!(first_process
+        .read()
+        .await
+        .acceptance_stalled_change_ids()
+        .contains(change_id));
+    assert_eq!(
+        first_process.read().await.display_status(change_id),
+        "stalled"
+    );
 
-    // --- 2. Restart: the hold suppresses dispatch entirely ------------------
-    let restart_state = TempDir::new().or_fail("restart state dir");
+    // --- 2. Restart: no hold survives, so acceptance runs again -------------
+    let restarted_process = new_process_state(change_id);
     let restarted = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
-        restart_state.path(),
-        stall_state.path(),
+        TempDir::new().or_fail("restart state dir").path(),
+        &restarted_process,
         change_id,
         0,
         VALIDATED_BLOCKER_VERDICT,
@@ -7575,15 +7581,12 @@ async fn parallel_validated_blocker_stalls_survives_restart_and_retries_acceptan
 
     assert!(restarted.result.error.is_none());
     assert_eq!(
-        restarted.acceptance_invocations, 0,
-        "a reconciled hold must start neither apply nor acceptance"
+        restarted.acceptance_invocations, 1,
+        "a restart must run acceptance again for a complete unarchived apply"
     );
-    assert_eq!(restarted.apply_invocations, 0);
-    assert_eq!(restarted.stalled_events.len(), 1);
-    assert_eq!(restarted.stalled_events[0].category, "credential");
     assert_eq!(
-        restarted.stalled_events[0].next_action,
-        "provision STAGING_API_KEY then retry acceptance"
+        restarted.apply_invocations, 0,
+        "a restart must not rerun apply for a complete apply revision"
     );
     assert_eq!(workspace_porcelain_status(&first.workspace_path), "");
     assert_eq!(
@@ -7593,12 +7596,11 @@ async fn parallel_validated_blocker_stalls_survives_restart_and_retries_acceptan
     );
 
     // --- 3. Explicit retry resumes acceptance only --------------------------
-    let retry_state = TempDir::new().or_fail("retry state dir");
     let retried = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
-        retry_state.path(),
-        stall_state.path(),
+        TempDir::new().or_fail("retry state dir").path(),
+        &restarted_process,
         change_id,
         0,
         "ACCEPTANCE: PASS\n",
@@ -7614,30 +7616,23 @@ async fn parallel_validated_blocker_stalls_survives_restart_and_retries_acceptan
         retried.apply_invocations, 0,
         "explicit retry must resume at acceptance without rerunning apply"
     );
-    assert!(
-        store
-            .load(&repository_id, change_id)
-            .or_fail("read stall store")
-            .is_none(),
-        "a successful explicit retry consumes the hold"
-    );
 }
 
-/// Ordinary queue reconciliation must not re-submit a runtime-stalled change,
-/// and a hold that has lost its binding must release the change again.
+/// Ordinary queue reconciliation must not re-submit an in-memory-stalled
+/// change, and clearing the hold must release the change again.
 #[tokio::test]
-async fn runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid() {
+async fn in_memory_stalled_change_is_not_requeued_until_its_hold_is_cleared() {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
-    let stall_state = TempDir::new().or_fail("create stall state root");
     let change_id = "parallel-queue-stalled";
     init_missing_verdict_repo(repo_dir.path(), change_id).await;
 
+    let shared_state = new_process_state(change_id);
     let observed = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
         TempDir::new().or_fail("state dir").path(),
-        stall_state.path(),
+        &shared_state,
         change_id,
         0,
         VALIDATED_BLOCKER_VERDICT,
@@ -7651,17 +7646,16 @@ async fn runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid() {
         ..Default::default()
     });
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
-    executor.set_acceptance_stall_state_root(stall_state.path().to_path_buf());
+    executor.set_shared_orchestrator_state(shared_state.clone());
 
     let queued = vec![make_test_change(change_id)];
     let classification = executor
         .classify_queued_work(&queued, &HashSet::new())
         .await;
-
     assert_eq!(
         classification.class_for(change_id),
         Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
-        "a runtime-stalled change must not be classified as dispatchable"
+        "an in-memory stalled change must not be classified as dispatchable"
     );
     assert!(
         !classification.has_dispatchable_apply(),
@@ -7669,20 +7663,12 @@ async fn runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid() {
     );
     assert!(classification.has_blocked_or_waiting_work());
 
-    // Once the hold loses its binding it is quarantined and the change is free
-    // to be dispatched again — a stale record can never block work forever.
-    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
-    let repository_id = crate::parallel::acceptance_state::repository_identity(repo_dir.path());
-    let mut record = store
-        .load(&repository_id, change_id)
-        .or_fail("read stall store")
-        .or_fail("hold must exist");
-    record.apply_revision = "0".repeat(40);
-    std::fs::write(
-        store.record_path(&repository_id, change_id),
-        serde_json::to_vec_pretty(&record).or_fail("encode record"),
-    )
-    .or_fail("plant stale record");
+    // An explicit operator retry clears the hold and the change is dispatchable
+    // again — a hold can never block work forever.
+    shared_state
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
 
     let classification = executor
         .classify_queued_work(&queued, &HashSet::new())
@@ -7690,27 +7676,25 @@ async fn runtime_stalled_change_is_not_requeued_until_its_hold_is_invalid() {
     assert_ne!(
         classification.class_for(change_id),
         Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
-        "a hold that lost its binding must release the change"
+        "a cleared hold must release the change"
     );
 }
 
-/// Explicit retry is a preparation transaction. When it refuses to proceed —
-/// here because the hold is not resumable — the blocker evidence must survive
-/// untouched and no ambiguous work may be dispatched.
+/// A restart is modelled by a fresh reducer: no hold exists, so the same queued
+/// change is dispatchable again and acceptance decides its fate.
 #[tokio::test]
-async fn refused_explicit_retry_retains_the_acceptance_hold() {
+async fn restart_drops_the_in_memory_stall_and_makes_the_change_dispatchable() {
     let repo_dir = TempDir::new().or_fail("create temp repo");
     let workspace_base = TempDir::new().or_fail("create temp workspace base");
-    let stall_state = TempDir::new().or_fail("create stall state root");
-    let change_id = "parallel-retry-refused";
+    let change_id = "parallel-restart-stalled";
     init_missing_verdict_repo(repo_dir.path(), change_id).await;
 
-    // Enter a stall, then rewrite the hold as non-resumable.
+    let stalled_process = new_process_state(change_id);
     let observed = dispatch_gated_run(
         repo_dir.path(),
         workspace_base.path(),
         TempDir::new().or_fail("state dir").path(),
-        stall_state.path(),
+        &stalled_process,
         change_id,
         0,
         VALIDATED_BLOCKER_VERDICT,
@@ -7719,59 +7703,52 @@ async fn refused_explicit_retry_retains_the_acceptance_hold() {
     .await;
     assert_eq!(observed.stalled_events.len(), 1);
 
-    let store = crate::parallel::acceptance_state::AcceptanceStallStore::new(stall_state.path());
-    let repository_id = crate::parallel::acceptance_state::repository_identity(repo_dir.path());
-    let mut record = store
-        .load(&repository_id, change_id)
-        .or_fail("read stall store")
-        .or_fail("hold must exist");
-    record.resumable = false;
-    let before = store.save(&record).or_fail("store non-resumable hold");
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        ..Default::default()
+    });
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, None);
+    executor.set_shared_orchestrator_state(new_process_state(change_id));
 
-    // Explicit retry must refuse and change nothing.
-    let retried = dispatch_gated_run(
-        repo_dir.path(),
-        workspace_base.path(),
-        TempDir::new().or_fail("retry state dir").path(),
-        stall_state.path(),
-        change_id,
-        0,
-        "ACCEPTANCE: PASS\n",
-        true,
-    )
-    .await;
-
-    assert_eq!(
-        retried.acceptance_invocations, 0,
-        "a refused retry must not dispatch acceptance"
+    let queued = vec![make_test_change(change_id)];
+    let classification = executor
+        .classify_queued_work(&queued, &HashSet::new())
+        .await;
+    assert_ne!(
+        classification.class_for(change_id),
+        Some(crate::parallel::queue_state::QueuedWorkClass::AcceptanceStalled),
+        "no stall state may survive a restart"
     );
-    assert_eq!(
-        retried.apply_invocations, 0,
-        "a refused retry must not dispatch apply"
-    );
-
-    let after = store
-        .load(&repository_id, change_id)
-        .or_fail("read stall store")
-        .or_fail("a refused retry must retain the blocker evidence");
-    assert_eq!(after, before);
-    assert_eq!(workspace_porcelain_status(&observed.workspace_path), "");
 }
 
-/// Cleanup, archive, and merge decisions must stay entirely repository-derived.
-/// Runtime stall state is not an input to any of them, so none of those modules
-/// may reach for the store at all.
+/// The whole acceptance stall lifecycle — recording a hold, suppressing
+/// dispatch, presenting `stalled`, and consuming an explicit retry — must do no
+/// file I/O at all. No module that participates in it may reach for the retired
+/// out-of-worktree store, so deleting `~/.local/state/cflx/**` cannot change the
+/// next action for any workspace.
 #[test]
-fn cleanup_archive_and_merge_do_not_consult_acceptance_stall_state() {
+fn acceptance_stall_lifecycle_does_no_file_io() {
     for (label, source) in [
+        ("parallel dispatch", include_str!("../dispatch.rs")),
+        ("queue classification", include_str!("../queue_state.rs")),
+        (
+            "serial run service",
+            include_str!("../../serial_run_service.rs"),
+        ),
+        ("reducer", include_str!("../../orchestration/state.rs")),
         ("cleanup", include_str!("../cleanup.rs")),
         ("merge", include_str!("../merge.rs")),
         ("archive", include_str!("../../execution/archive.rs")),
     ] {
-        for forbidden in ["AcceptanceStallStore", "load_valid_acceptance_stall"] {
+        for forbidden in [
+            "AcceptanceStallStore",
+            "load_valid_acceptance_stall",
+            "persist_acceptance_stall",
+            "acceptance-stalls",
+        ] {
             assert!(
                 !source.contains(forbidden),
-                "{label} must not consult acceptance stall state ({forbidden})"
+                "{label} must not consult out-of-worktree acceptance stall state ({forbidden})"
             );
         }
     }
