@@ -245,80 +245,91 @@ acceptance_prompt_mode の `full` は互換エイリアスとして扱い、`con
 
 ### Requirement: Apply prompt MUST escalate implementation blockers
 
-apply プロンプトは、仕様矛盾や非モック可能な外部制限により実装が不可能と判断した場合、Implementation Blocker を記録してエスカレーションしなければならない（MUST）。
+Apply guidance MUST distinguish repository-fixable work, mockable dependencies, non-repository external prerequisites, and terminal rejection proposals.
 
-Implementation Blocker の記録は以下を満たさなければならない（MUST）。
-- `openspec/changes/{change_id}/tasks.md` に `## Implementation Blocker #<n>` セクションを追加する
-- セクション内に「カテゴリ」「根拠（ファイルパス/ログ）」「影響範囲」「解除アクション」を明記する
-- セクション内の箇条書きにチェックボックスを付けてはならない（MUST NOT）
-- stdout に `IMPLEMENTATION_BLOCKER:` ブロックを出力し、tasks.md と同じ内容を含める
-- recoverable blocker では terminal rejection artifact を生成せず、machine-readable apply outcome として `BLOCKED` を返す
-- `REJECTED.md` を生成してよいのは、change 全体の reject 提案として recovery より closure が妥当である理由を apply が明示できる場合に限る
+When Apply cannot proceed because of a recoverable prerequisite, it MUST append `## Implementation Blocker #<n>` to `openspec/changes/{change_id}/tasks.md`. The section MUST contain category, concrete file or log evidence, affected scope, prerequisite or owner, verifiable unblock condition, next action, and resumability, and its bullets MUST NOT use checkboxes. Apply MUST emit an `IMPLEMENTATION_BLOCKER:` stdout block with the same facts and return the compatible machine-readable `BLOCKED` outcome without creating `REJECTED.md`.
 
-#### Scenario: apply が recoverable blocker を BLOCKED outcome として記録する
+Apply guidance MUST state that the agent reports facts and that Conflux validates those facts and owns the final `blocked` versus `stalled` lifecycle classification. The agent MUST NOT claim canonical lifecycle status from prose or outcome token spelling. `REJECTED.md` is permitted only when Apply explicitly establishes why closing the whole change is more appropriate than recovery.
 
-- **GIVEN** apply が仕様矛盾、fixture 不足、追加情報待ち、または依存未解消により現時点では実装を進められない
-- **AND** blocker section に解除条件を書ける
-- **WHEN** apply がエスカレーションを行う
-- **THEN** tasks.md に `## Implementation Blocker #<n>` セクションが追加される
-- **AND** stdout に `IMPLEMENTATION_BLOCKER:` ブロックが出力される
-- **AND** apply outcome は `BLOCKED` として報告される
-- **AND** worktree-local `REJECTED.md` は生成されない
+#### Scenario: Apply records a recoverable prerequisite
 
-#### Scenario: apply が terminal rejection proposal を明示的に区別する
+- **GIVEN** Apply verifies that repository-only work and test doubles cannot satisfy a current prerequisite
+- **WHEN** it escalates the blocker
+- **THEN** tasks.md gains `## Implementation Blocker #<n>` with category, evidence, affected scope, prerequisite or owner, unblock condition, next action, and resumability
+- **AND** the section contains no checkboxes
+- **AND** stdout contains the matching `IMPLEMENTATION_BLOCKER:` block
+- **AND** Apply emits the compatible machine-readable `BLOCKED` outcome
+- **AND** it does not create `REJECTED.md`
+- **AND** it leaves final lifecycle classification to Conflux
 
-- **GIVEN** apply が proposal の前提破綻や superseded 状態により change 全体を閉じるべきと判断する
-- **WHEN** apply が rejection proposal を出す
-- **THEN** stdout には recoverable blocker と区別された rejection proposal outcome が出力される
-- **AND** worktree-local `REJECTED.md` 生成はこの outcome に限定される
+#### Scenario: Apply does not externalize repository work
 
-#### Scenario: infrastructure verification blocker is not terminal rejection
+- **GIVEN** code, tests, specs, tasks, documentation, fixtures, mocks, or stubs can resolve the finding
+- **WHEN** Apply evaluates whether to escalate
+- **THEN** it continues repository work or reports a repository-fixable failure
+- **AND** it does not label the finding as an external prerequisite
 
-- **GIVEN** apply or verification observes an external/local infrastructure failure such as Docker daemon unavailable, Docker image pull DNS timeout, package registry timeout, port conflict, third-party outage, or rate limiting
+#### Scenario: Apply distinguishes terminal rejection proposal
+
+- **GIVEN** Apply establishes that a proposal premise is invalid or superseded and the whole change should close
+- **WHEN** it proposes rejection
+- **THEN** stdout distinguishes the rejection proposal from a recoverable blocker outcome
+- **AND** worktree-local `REJECTED.md` is limited to this outcome
+
+#### Scenario: Infrastructure verification blocker is not terminal rejection
+
+- **GIVEN** Apply or verification observes Docker unavailability, image-pull DNS timeout, package-registry timeout, port conflict, third-party outage, rate limiting, or another infrastructure condition
 - **AND** no independent evidence shows that the proposal premise is invalid or obsolete
 - **WHEN** the agent records the blocker
-- **THEN** prompt guidance directs the agent to record a recoverable blocker or stalled hold
-- **AND** prompt guidance does not direct the agent to create `REJECTED.md` as a terminal rejection marker for that infrastructure condition
+- **THEN** guidance directs it to record recoverable structured blocker facts
+- **AND** guidance does not direct it to create `REJECTED.md`
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-Acceptance prompts and distributed Acceptance skills MUST distinguish repository-fixable findings, validated stalled blockers, and protocol-invalid bare blocker verdicts.
+Acceptance prompts and distributed Acceptance skills MUST distinguish repository-fixable findings, validated external prerequisite evidence, stalled execution conditions, and protocol-invalid bare blocker verdicts.
 
-A stalled handoff MUST include an explicit supported category, concrete non-empty evidence, next action, and resumability, and MUST state why repository-only Apply work cannot resolve the prerequisite. During compatibility migration, the machine-readable verdict MAY use the parser-supported `gated` token only when the structured blocker payload accompanies it. Bare `{"acceptance":"gated"}`, `ACCEPTANCE: GATED`, or legacy `blocked` input is a protocol error subject to bounded Acceptance retry and MUST NOT be presented as sufficient stalled evidence.
+For an external prerequisite, Acceptance MUST report an explicit supported category, concrete non-empty evidence, prerequisite or owner, verifiable unblock condition, next action, and resumability, and MUST state why repository-only Apply work or a test double cannot resolve it. Acceptance MUST state that Conflux owns final lifecycle classification and MUST NOT create a runtime marker under the change directory.
 
-Guidance MUST use `stalled` for user-facing lifecycle taxonomy, MUST NOT instruct Acceptance to create `APPLY_BLOCKED` or another runtime marker under the change directory, and MUST NOT infer credential, infrastructure, or other categories from narrative prose. Repository-fixable code, tests, specs, tasks, documentation, or mockable dependencies remain FAIL findings returned to Apply.
+Acceptance MUST use FAIL for repository-fixable findings. Repeated findings, no semantic progress, and exhausted repair policy are stalled execution inputs rather than external prerequisites. Bare `gated` or legacy `blocked` compatibility input remains protocol-incomplete and MUST NOT directly set lifecycle state or cause runtime to infer a category from prose.
 
-#### Scenario: Acceptance emits structured blocker handoff
+#### Scenario: Acceptance reports complete external blocker facts
 
-- **GIVEN** Acceptance verifies a prerequisite that repository-only work cannot resolve
-- **WHEN** the reviewer emits a stalled compatibility handoff
-- **THEN** it supplies an explicit supported category, concrete evidence, next action, and resumability with the machine-readable verdict
-- **AND** runtime/user-facing status is `stalled`
-- **AND** the reviewer does not create a marker in the change directory
+- **GIVEN** Acceptance verifies a non-repository prerequisite that Apply and test doubles cannot resolve
+- **WHEN** it emits a compatibility blocker verdict
+- **THEN** it includes category, evidence, prerequisite or owner, unblock condition, next action, and resumability
+- **AND** it leaves `blocked` versus `stalled` lifecycle classification to Conflux
+- **AND** it creates no change-directory runtime marker
 
-#### Scenario: bare GATED is corrected by retry
+#### Scenario: Acceptance distinguishes stall from external wait
 
-- **GIVEN** an Acceptance response emits bare `gated` or legacy `blocked` without the required blocker fields
-- **WHEN** runtime invokes the bounded corrective retry
-- **THEN** prompt guidance identifies the prior output as protocol-incomplete
-- **AND** it asks for one canonical repository-fixable verdict or one fully structured stalled blocker
-- **AND** it does not suggest a category or fabricate evidence for the reviewer
+- **GIVEN** Acceptance repeats the same finding, observes no semantic progress, or reaches exhausted repair policy
+- **WHEN** it reports the execution condition
+- **THEN** it does not fabricate an external prerequisite
+- **AND** Conflux may classify the validated execution outcome as `stalled`
+
+#### Scenario: Bare compatibility verdict remains protocol-invalid
+
+- **GIVEN** Acceptance emits bare `gated` or legacy `blocked` without required structured fields
+- **WHEN** runtime performs bounded corrective retry
+- **THEN** guidance requests either a repository-fixable FAIL or complete blocker facts
+- **AND** guidance does not suggest a category or fabricate evidence
+- **AND** the token alone sets neither canonical `blocked` nor canonical `stalled`
 
 #### Scenario: Acceptance uses FAIL for repository-fixable issues
 
 - **GIVEN** Acceptance finds code, tests, tasks, specs, documentation, or a mockable dependency that repository work can resolve
-- **WHEN** the reviewer emits a machine-readable verdict
+- **WHEN** it emits a machine-readable verdict
 - **THEN** it uses FAIL with concrete current-worktree findings
-- **AND** no stalled state or change-directory blocker marker is requested
+- **AND** no blocked or stalled runtime marker is requested
 
-#### Scenario: non-mockable credential blocker retains explicit evidence
+#### Scenario: Non-mockable credential blocker retains explicit evidence
 
 - **GIVEN** a required credential is non-mockable for the declared verification phase
-- **AND** Acceptance identifies the credential name or owning prerequisite and the exact rerun action
-- **WHEN** it emits a structured blocker
+- **AND** Acceptance identifies the credential name or owning prerequisite and exact rerun action
+- **WHEN** it emits structured blocker facts
 - **THEN** it explicitly selects category `credential`
-- **AND** it includes the concrete evidence and next action
-- **AND** runtime does not derive the category merely because narrative text contains credential, token, or auth
+- **AND** it includes concrete evidence, unblock condition, and next action
+- **AND** runtime does not derive the category from narrative credential, token, or auth words
 
 ### Requirement: Prompts MUST apply a mock-first external dependency policy
 
@@ -751,43 +762,50 @@ The skill MUST NOT require changing `acceptance_command` merely to opt into SPEC
 
 ### Requirement: Acceptance prompt MUST evaluate implementation blockers
 
-Acceptance prompts and distributed Acceptance skills MUST distinguish repository-fixable findings, validated stalled blockers, and protocol-invalid bare blocker verdicts.
+Acceptance prompts and distributed Acceptance skills MUST distinguish repository-fixable findings, validated external prerequisite evidence, stalled execution conditions, and protocol-invalid bare blocker verdicts.
 
-A stalled handoff MUST include an explicit supported category, concrete non-empty evidence, next action, and resumability, and MUST state why repository-only Apply work cannot resolve the prerequisite. During compatibility migration, the machine-readable verdict MAY use the parser-supported `gated` token only when the structured blocker payload accompanies it. Bare `{"acceptance":"gated"}`, `ACCEPTANCE: GATED`, or legacy `blocked` input is a protocol error subject to bounded Acceptance retry and MUST NOT be presented as sufficient stalled evidence.
+For an external prerequisite, Acceptance MUST report an explicit supported category, concrete non-empty evidence, prerequisite or owner, verifiable unblock condition, next action, and resumability, and MUST state why repository-only Apply work or a test double cannot resolve it. Acceptance MUST state that Conflux owns final lifecycle classification and MUST NOT create a runtime marker under the change directory.
 
-Guidance MUST use `stalled` for user-facing lifecycle taxonomy, MUST NOT instruct Acceptance to create `APPLY_BLOCKED` or another runtime marker under the change directory, and MUST NOT infer credential, infrastructure, or other categories from narrative prose. Repository-fixable code, tests, specs, tasks, documentation, or mockable dependencies remain FAIL findings returned to Apply.
+Acceptance MUST use FAIL for repository-fixable findings. Repeated findings, no semantic progress, and exhausted repair policy are stalled execution inputs rather than external prerequisites. Bare `gated` or legacy `blocked` compatibility input remains protocol-incomplete and MUST NOT directly set lifecycle state or cause runtime to infer a category from prose.
 
-#### Scenario: Acceptance emits structured blocker handoff
+#### Scenario: Acceptance reports complete external blocker facts
 
-- **GIVEN** Acceptance verifies a prerequisite that repository-only work cannot resolve
-- **WHEN** the reviewer emits a stalled compatibility handoff
-- **THEN** it supplies an explicit supported category, concrete evidence, next action, and resumability with the machine-readable verdict
-- **AND** runtime/user-facing status is `stalled`
-- **AND** the reviewer does not create a marker in the change directory
+- **GIVEN** Acceptance verifies a non-repository prerequisite that Apply and test doubles cannot resolve
+- **WHEN** it emits a compatibility blocker verdict
+- **THEN** it includes category, evidence, prerequisite or owner, unblock condition, next action, and resumability
+- **AND** it leaves `blocked` versus `stalled` lifecycle classification to Conflux
+- **AND** it creates no change-directory runtime marker
 
-#### Scenario: bare GATED is corrected by retry
+#### Scenario: Acceptance distinguishes stall from external wait
 
-- **GIVEN** an Acceptance response emits bare `gated` or legacy `blocked` without the required blocker fields
-- **WHEN** runtime invokes the bounded corrective retry
-- **THEN** prompt guidance identifies the prior output as protocol-incomplete
-- **AND** it asks for one canonical repository-fixable verdict or one fully structured stalled blocker
-- **AND** it does not suggest a category or fabricate evidence for the reviewer
+- **GIVEN** Acceptance repeats the same finding, observes no semantic progress, or reaches exhausted repair policy
+- **WHEN** it reports the execution condition
+- **THEN** it does not fabricate an external prerequisite
+- **AND** Conflux may classify the validated execution outcome as `stalled`
+
+#### Scenario: Bare compatibility verdict remains protocol-invalid
+
+- **GIVEN** Acceptance emits bare `gated` or legacy `blocked` without required structured fields
+- **WHEN** runtime performs bounded corrective retry
+- **THEN** guidance requests either a repository-fixable FAIL or complete blocker facts
+- **AND** guidance does not suggest a category or fabricate evidence
+- **AND** the token alone sets neither canonical `blocked` nor canonical `stalled`
 
 #### Scenario: Acceptance uses FAIL for repository-fixable issues
 
 - **GIVEN** Acceptance finds code, tests, tasks, specs, documentation, or a mockable dependency that repository work can resolve
-- **WHEN** the reviewer emits a machine-readable verdict
+- **WHEN** it emits a machine-readable verdict
 - **THEN** it uses FAIL with concrete current-worktree findings
-- **AND** no stalled state or change-directory blocker marker is requested
+- **AND** no blocked or stalled runtime marker is requested
 
-#### Scenario: non-mockable credential blocker retains explicit evidence
+#### Scenario: Non-mockable credential blocker retains explicit evidence
 
 - **GIVEN** a required credential is non-mockable for the declared verification phase
-- **AND** Acceptance identifies the credential name or owning prerequisite and the exact rerun action
-- **WHEN** it emits a structured blocker
+- **AND** Acceptance identifies the credential name or owning prerequisite and exact rerun action
+- **WHEN** it emits structured blocker facts
 - **THEN** it explicitly selects category `credential`
-- **AND** it includes the concrete evidence and next action
-- **AND** runtime does not derive the category merely because narrative text contains credential, token, or auth
+- **AND** it includes concrete evidence, unblock condition, and next action
+- **AND** runtime does not derive the category from narrative credential, token, or auth words
 
 ### Requirement: Acceptance skills MUST define a JSON-primary verdict contract
 
