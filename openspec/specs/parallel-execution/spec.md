@@ -3192,50 +3192,44 @@ The scheduler SHALL maintain a single `DependencyContext` implementation that en
 
 Ordinary Acceptance retry bookkeeping during an active serial or parallel run MUST remain in memory and MUST NOT use `.cflx/acceptance-state.json` or a worktree checkpoint. Acceptance MUST NOT create an Acceptance-origin `APPLY_BLOCKED/marker.md` or another change-directory artifact.
 
-A validated Acceptance stalled hold MUST be stored in versioned, atomic Conflux runtime state outside the worktree. The record MUST bind repository identity, change ID, managed worktree identity/path, branch when available, Apply revision, stalled phase, retry count, explicit blocker category and evidence, resumability, next action, and timestamps. Runtime MUST reconcile that binding with current repository/Git/worktree facts before the record controls dispatch or retry.
+A validated Acceptance stalled hold MUST be stored in the in-memory `OrchestratorState` only. It MUST NOT be persisted to `~/.local/state/cflx/acceptance-stalls/` or any other out-of-worktree durable location. The in-memory state binds change ID, blocker category, evidence, next action, and resumability for the lifetime of the current process.
 
-Runtime state MAY control ordinary dispatch suppression, stalled presentation, explicit retry eligibility, and Acceptance resume phase. It MUST NOT prove implementation completion, Acceptance PASS, archive readiness, merge eligibility, or base integration. If state is absent or invalid while repository evidence shows a complete unarchived Apply revision, Conflux MUST run Acceptance again and MUST NOT infer PASS.
+In-memory state MAY control ordinary dispatch suppression, stalled presentation, explicit retry eligibility, and Acceptance resume phase. It MUST NOT prove implementation completion, Acceptance PASS, archive readiness, merge eligibility, or base integration. Process restart MUST clear all in-memory stall state. When repository evidence shows a complete unarchived Apply revision, Conflux MUST run Acceptance again and MUST NOT infer PASS.
 
-#### Scenario: validated stall survives restart without dirtying worktree
+#### Scenario: stalled hold is process-lifetime only
 
 - **GIVEN** Acceptance records a validated resumable external blocker for a complete Apply revision
 - **AND** the managed worktree is clean
-- **WHEN** Conflux restarts and reconciles a matching runtime record
-- **THEN** it restores execution `stalled` and the recorded next action
-- **AND** ordinary dispatch starts neither Apply, Acceptance, nor archive
+- **WHEN** the current Conflux process displays the stalled status
+- **THEN** ordinary dispatch starts neither Apply, Acceptance, nor archive
 - **AND** the worktree remains clean and the Apply commit remains unchanged
+- **AND** no stall file is written under `~/.local/state/cflx/`
 
-#### Scenario: missing runtime state reruns Acceptance
+#### Scenario: restart clears stall and re-runs acceptance
 
-- **GIVEN** a complete unarchived Apply revision exists
-- **AND** no valid Acceptance stall record exists after restart
-- **WHEN** Conflux derives the next action
-- **THEN** it runs Acceptance again
-- **AND** it does not infer prior PASS, enter archive, or rerun Apply solely from missing runtime metadata
+- **GIVEN** a change was stalled in a previous Conflux process
+- **AND** the worktree contains a complete unarchived Apply revision
+- **WHEN** a new Conflux process starts and reconciles workspace state
+- **THEN** the stalled status is not restored
+- **AND** Conflux runs Acceptance again
+- **AND** it does not infer prior PASS, enter archive, or rerun Apply solely from missing stall state
 
-#### Scenario: stale state cannot override repository evidence
+#### Scenario: stale stall files are ignored, not consulted or removed
 
-- **GIVEN** a stored stall has a mismatched repository, worktree identity, path reuse guard, Apply revision, ancestry, or active-change state
-- **WHEN** restart or retry reconciliation evaluates it
-- **THEN** the record is invalidated or quarantined with a diagnostic
-- **AND** routing is recomputed from repository/Git/worktree evidence
-- **AND** the stale record cannot suppress cleanup or authorize archive or merge
+- **GIVEN** files exist under `~/.local/state/cflx/acceptance-stalls/` from a previous version
+- **WHEN** a new Conflux process starts and dispatches the same change
+- **THEN** no stall file is read and none controls routing
+- **AND** the files are left in place so a concurrent older process keeps its own holds
+- **AND** no managed worktree is mutated
 
-#### Scenario: explicit retry resumes Acceptance transactionally
+#### Scenario: explicit retry resumes Acceptance from in-memory hold
 
-- **GIVEN** a valid resumable Acceptance stall matches the current Apply revision
+- **GIVEN** a valid resumable Acceptance stall exists in the current in-memory state
+- **AND** the Apply revision matches
 - **WHEN** an operator explicitly retries it
 - **THEN** runtime prepares and starts Acceptance without rerunning Apply
-- **AND** the prior hold is consumed only across a successful dispatch-preparation boundary
+- **AND** the in-memory hold is consumed across a successful dispatch-preparation boundary
 - **AND** preparation failure retains the blocker evidence and does not dispatch ambiguous work
-
-#### Scenario: legacy Acceptance marker migrates conservatively
-
-- **GIVEN** a legacy marker is proven Acceptance-origin, resumable, structurally valid, and bindable to the current repository, worktree, and Apply revision
-- **WHEN** Conflux performs one-time migration
-- **THEN** it writes the runtime record before removing generated marker residue
-- **AND** successful migration is idempotent and leaves the worktree clean
-- **AND** Apply-origin, unknown-origin, non-resumable, malformed, or ambiguous markers are not silently migrated or deleted
 
 ### Requirement: Runtime acceptance follow-up preserves completed repair work
 
@@ -3375,7 +3369,7 @@ A completed runtime-owned finding MUST remain completed during apply hydration a
 
 Serial and parallel Acceptance execution MUST NOT create, read, update, or delete `.cflx/acceptance-state.json`. Acceptance PASS for an active run MAY be held in memory only until archive handoff. After restart, incomplete archive work MUST be accepted again unless repository evidence already proves archive or base integration.
 
-A versioned out-of-worktree Acceptance stall record is not a PASS checkpoint. It MAY represent only a validated temporary external hold bound to current repository/worktree/Apply evidence and MUST be ignored or invalidated when reconciliation fails.
+No out-of-worktree Acceptance stall record exists. In-memory stall state MAY represent a validated temporary external hold bound to the current process lifetime and MUST NOT survive restart.
 
 #### Scenario: uninterrupted pass reaches archive without checkpoint
 
@@ -3384,11 +3378,11 @@ A versioned out-of-worktree Acceptance stall record is not a PASS checkpoint. It
 - **THEN** archive handoff proceeds for that accepted revision
 - **AND** neither `.cflx/acceptance-state.json` nor a persisted PASS record exists
 
-#### Scenario: runtime stall cannot substitute for PASS
+#### Scenario: in-memory stall cannot substitute for PASS
 
-- **GIVEN** a valid or stale Acceptance stall record exists
+- **GIVEN** an in-memory stall state exists
 - **WHEN** Conflux evaluates archive readiness
-- **THEN** the record cannot prove PASS or authorize archive
+- **THEN** the in-memory state cannot prove PASS or authorize archive
 - **AND** Acceptance must pass for the current revision through the normal execution path
 
 #### Scenario: runtime metadata cannot dirty post-archive worktree
@@ -3404,7 +3398,7 @@ A versioned out-of-worktree Acceptance stall record is not a PASS checkpoint. It
 - **AND** an unrelated user file remains modified
 - **WHEN** post-archive merge verification runs
 - **THEN** the unrelated dirty worktree remains concrete manual blocker evidence
-- **AND** externalizing Acceptance stall state does not suppress the deferral
+- **AND** in-memory stall state does not suppress the deferral
 
 ### Requirement: Apply completion MUST validate task format before acceptance
 
