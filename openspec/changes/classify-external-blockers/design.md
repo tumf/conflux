@@ -29,6 +29,8 @@ The classifier requires:
 
 Repository-fixable work and mockable dependencies are not external blockers. Missing or contradictory fields produce protocol correction or a repository-fixable finding, not an inferred external wait.
 
+Permission-denial stalls and publication or upstream stalls retain their existing stalled/error routing in this change. Reclassifying those inputs requires separate evidence contracts and is out of scope.
+
 ## State and restart boundary
 
 Reducer-owned classification is in memory and may suppress dispatch and drive display during the process lifetime. It cannot establish completion, acceptance pass, archive readiness, merge eligibility, or integration. No durable state is added outside the workspace.
@@ -37,7 +39,9 @@ On restart, Conflux reconstructs routing from workspace files, git state, and ba
 
 ## Scheduling and retry
 
-External-blocked changes are excluded from ordinary dispatch. They do not prevent unrelated ready changes from progressing and do not masquerade as proposal dependencies. Explicit retry first reconciles current workspace identity and evidence. It clears or changes classification only when the current condition supports retry; unsupported or unchanged blockers retain their evidence.
+External-blocked changes are excluded from ordinary dispatch. They do not prevent unrelated ready changes from progressing and do not masquerade as proposal dependencies. A proposal that depends on an externally blocked proposal remains dependency-blocked until that dependency completes.
+
+Explicit operator retry first validates current workspace identity and then always permits the blocked phase to run again. The new execution result is the evidence test: an unresolved prerequisite is reported and classified as blocked again, while a resolved prerequisite permits progress. Preserving prior metadata means retaining it for explanation and comparison until the new result arrives; it does not authorize refusing operator-requested dispatch indefinitely.
 
 ## Surface contract
 

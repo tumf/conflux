@@ -8,7 +8,7 @@ references:
   - src/parallel/acceptance_state.rs
   - src/runtime/proposal.rs
   - src/runtime/reducer.rs
-  - src/server/api/websocket.rs
+  - src/server/api/ws.rs
   - dashboard/src/api/types.ts
   - dashboard/src/components/ChangeRow.tsx
   - skills/cflx-apply/SKILL.md
@@ -55,7 +55,8 @@ Represent blocker kind separately from blocker source so dependency waits and ex
 - Proposal dependency waits remain `blocked` but are distinguishable from external prerequisite waits in metadata and operator-facing detail.
 - No-progress detection, repeated acceptance findings, retry exhaustion, invalid bare blocker verdicts after bounded correction, and unsupported or evidence-free blocker claims are not classified as external `blocked`; applicable terminal execution holds remain `stalled` or protocol errors.
 - The orchestrator performs the final classification from validated structured evidence. Agents do not directly set canonical lifecycle status.
-- Explicit retry or workspace reconciliation clears or reclassifies an external block only after current evidence shows its unblock condition changed; restart does not trust out-of-worktree state.
+- Explicit operator retry validates workspace identity and always permits the blocked phase to run again; that execution supplies fresh classification evidence, while restart does not trust out-of-worktree state.
+- A change depending on an externally blocked proposal remains dependency `blocked`; unrelated ready changes continue.
 - TUI, WebSocket/API, and dashboard surfaces expose the same reducer-derived `blocked` or `stalled` status and preserve a machine-readable blocker kind.
 - Existing compatibility parsing for `gated` and legacy `blocked` acceptance verdict tokens remains accepted as input, but token text alone never determines lifecycle classification.
 
@@ -64,7 +65,7 @@ Represent blocker kind separately from blocker source so dependency waits and ex
 - Runtime/reducer state contains distinct external-blocked and stalled transitions plus blocker-kind metadata, with transition guards and snapshot tests.
 - Parallel scheduling and the maintained orchestration path suppress ordinary dispatch for external-blocked changes without treating them as dependency edges or silently retrying them.
 - Apply and Acceptance result handling validates category, evidence, unblock condition, next action, and resumability before emitting the external-blocked transition; malformed or bare compatibility verdicts follow bounded protocol correction.
-- Explicit retry and restart/reconciliation tests prove stale in-memory blocked state has no durable routing authority and current workspace evidence controls the next action.
+- Explicit retry tests prove operator retry runs the blocked phase after workspace identity validation and uses the fresh result to reclassify; restart tests prove stale in-memory blocked state has no durable routing authority.
 - TUI, server payload, dashboard types/components, and their tests agree on `blocked` versus `stalled` and expose whether a blocked row is dependency-blocked or externally blocked.
 - Bundled Apply and Acceptance skills state that agents report blocker evidence while Conflux owns lifecycle classification.
 - `cargo test --all-features`, `cargo clippy --all-targets --all-features -- -D warnings`, dashboard tests/typecheck, and strict OpenSpec validation pass.
