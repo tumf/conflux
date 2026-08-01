@@ -77,6 +77,10 @@ impl ProjectRuntimeState {
         self.proposals_with(|status| matches!(status, ProposalStatus::DependencyBlocked { .. }))
     }
 
+    pub fn external_blocked_proposals(&self) -> Vec<ProposalId> {
+        self.proposals_with(|status| matches!(status, ProposalStatus::ExternalBlocked { .. }))
+    }
+
     pub fn merge_wait_proposals(&self) -> Vec<ProposalId> {
         self.proposals_with(|status| matches!(status, ProposalStatus::MergeWait { .. }))
     }

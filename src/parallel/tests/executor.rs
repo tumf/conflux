@@ -7381,6 +7381,7 @@ fn workspace_head(workspace_path: &std::path::Path) -> String {
 const VALIDATED_BLOCKER_VERDICT: &str = concat!(
     r#"{"acceptance":"gated","blocker":{"category":"credential","#,
     r#""evidence":["STAGING_API_KEY is unset in the verification environment"],"#,
+    r#""unblock_condition":"STAGING_API_KEY is present in the verification environment","#,
     r#""next_action":"provision STAGING_API_KEY then retry acceptance","resumable":true}}"#,
     "\n"
 );
@@ -7554,7 +7555,8 @@ async fn parallel_validated_blocker_stalls_then_restart_reruns_acceptance() {
         .join("APPLY_BLOCKED")
         .exists());
 
-    // The hold exists in the reducer and nowhere else.
+    // The hold exists in the reducer and nowhere else, and it is a validated
+    // external prerequisite wait rather than an execution stall.
     assert!(first_process
         .read()
         .await
@@ -7562,7 +7564,16 @@ async fn parallel_validated_blocker_stalls_then_restart_reruns_acceptance() {
         .contains(change_id));
     assert_eq!(
         first_process.read().await.display_status(change_id),
-        "stalled"
+        "blocked"
+    );
+    assert_eq!(
+        first_process
+            .read()
+            .await
+            .change_runtime(change_id)
+            .expect("runtime entry for an externally blocked change")
+            .blocker_kind(),
+        crate::orchestration::state::BlockerKind::External
     );
 
     // --- 2. Restart: no hold survives, so acceptance runs again -------------

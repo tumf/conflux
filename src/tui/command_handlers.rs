@@ -2138,6 +2138,10 @@ mod operator_command_parity_tests {
                     gate: "acceptance".to_string(),
                     error_summary: "unresolved finding".to_string(),
                     evidence: vec!["tests/acceptance.rs:1".to_string()],
+                    // No unblock condition and an unsupported category: this
+                    // stays an execution stall, never an external wait.
+                    unblock_condition: None,
+                    prerequisite_owner: None,
                     next_action: "resolve and retry".to_string(),
                     resumable: true,
                     worktree_preserved: true,
@@ -2158,6 +2162,90 @@ mod operator_command_parity_tests {
         );
         assert!(app.take_pending_explicit_retry());
         assert_eq!(state.read().await.display_status("change-a"), "queued");
+    }
+
+    /// The TUI renders dependency waits, external prerequisite waits, and
+    /// execution stalls from one reducer snapshot, and only the external wait is
+    /// explicitly retryable.
+    #[tokio::test]
+    async fn tui_distinguishes_dependency_external_and_stalled_rows_from_the_reducer() {
+        let mut app = AppState::new(vec![
+            test_change("dependency-wait"),
+            test_change("external-wait"),
+            test_change("execution-stall"),
+        ]);
+        let state = parallel_state(&["dependency-wait", "external-wait", "execution-stall"]);
+        {
+            let mut guard = state.write().await;
+            guard.apply_execution_event(&crate::events::ExecutionEvent::DependencyBlocked {
+                change_id: "dependency-wait".to_string(),
+                dependency_ids: vec!["alpha".to_string()],
+            });
+            guard.apply_execution_event(&crate::events::ExecutionEvent::AcceptanceGated {
+                change_id: "external-wait".to_string(),
+                blocker: crate::events::StalledBlocker::acceptance_external(
+                    "credential",
+                    "STAGING_API_KEY is unset",
+                ),
+            });
+            let denial = crate::permission::classify_permission_denial(&[Some(
+                "Read permission denied for /private/secret.txt",
+            )])
+            .expect("denial should classify");
+            guard.apply_execution_event(&crate::events::ExecutionEvent::ExecutionBlocked {
+                change_id: "execution-stall".to_string(),
+                blocker: crate::events::StalledBlocker::permission_denial("acceptance", &denial),
+            });
+        }
+
+        let (display_map, blocker_views) = {
+            let guard = state.read().await;
+            (guard.all_display_statuses(), guard.all_blocker_views())
+        };
+        app.apply_display_statuses_from_reducer(&display_map);
+        app.apply_blocker_views_from_reducer(&blocker_views);
+
+        let row = |id: &str| {
+            app.changes
+                .iter()
+                .find(|change| change.id == id)
+                .expect("row")
+        };
+
+        // Both waits are `blocked`; the badge is what keeps them apart.
+        assert_eq!(row("dependency-wait").display_status_cache, "blocked");
+        assert_eq!(row("external-wait").display_status_cache, "blocked");
+        assert_eq!(row("execution-stall").display_status_cache, "stalled");
+        assert_eq!(row("dependency-wait").status_badge(), "blocked:dependency");
+        assert_eq!(row("external-wait").status_badge(), "blocked:external");
+        assert_eq!(row("execution-stall").status_badge(), "stalled");
+
+        // The external wait exposes its category, condition, and next action.
+        let detail = row("external-wait")
+            .blocker_detail_cache
+            .clone()
+            .expect("external detail");
+        assert!(detail.contains("credential"));
+        assert!(detail.contains("unblock when"));
+        assert!(detail.contains("next action"));
+
+        // Retry routing follows the blocker kind, not the shared status word.
+        use crate::orchestration::operator_command::classify_retry_route;
+        assert!(classify_retry_route(
+            &row("dependency-wait").display_status_cache,
+            row("dependency-wait").blocker_kind_cache
+        )
+        .is_none());
+        assert!(classify_retry_route(
+            &row("external-wait").display_status_cache,
+            row("external-wait").blocker_kind_cache
+        )
+        .is_some());
+        assert!(classify_retry_route(
+            &row("execution-stall").display_status_cache,
+            row("execution-stall").blocker_kind_cache
+        )
+        .is_some());
     }
 
     /// Build a stop-path command context bound to a live parallel scheduler.

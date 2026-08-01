@@ -240,6 +240,12 @@ pub enum RejectionOutcome {
     Block,
 }
 
+/// Blocker facts an execution phase reports to the orchestrator.
+///
+/// This is *reported evidence*, not a lifecycle decision. The orchestrator runs
+/// [`crate::orchestration::blocker_classification::classify_execution_hold`] over
+/// these facts to decide between external `blocked` and execution `stalled`; a
+/// phase can never assign canonical lifecycle status by populating this struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StalledBlocker {
     pub category: String,
@@ -247,6 +253,14 @@ pub struct StalledBlocker {
     pub gate: String,
     pub error_summary: String,
     pub evidence: Vec<String>,
+    /// Verifiable condition that clears an external prerequisite wait.
+    ///
+    /// `None` for execution holds (no-progress, repeated findings, exhausted
+    /// retry, permission denial), which is exactly what keeps them out of the
+    /// external `blocked` classification.
+    pub unblock_condition: Option<String>,
+    /// Owning team/role or named prerequisite, when the reporter supplied one.
+    pub prerequisite_owner: Option<String>,
     pub next_action: String,
     pub resumable: bool,
     pub worktree_preserved: bool,
@@ -268,6 +282,11 @@ impl StalledBlocker {
                 denial.evidence
             ),
             evidence: vec![denial.evidence.clone()],
+            // A repeated permission denial is an execution hold, not a named
+            // external prerequisite: it deliberately supplies no unblock
+            // condition, so the classifier keeps it on the `stalled` path.
+            unblock_condition: None,
+            prerequisite_owner: None,
             next_action: denial.format_guidance(),
             resumable: true,
             worktree_preserved: true,
@@ -294,6 +313,8 @@ impl StalledBlocker {
             phase: "acceptance".to_string(),
             gate: "acceptance".to_string(),
             evidence: vec![error_summary.clone()],
+            unblock_condition: Some(format!("the external prerequisite behind '{error_summary}' is satisfied")),
+            prerequisite_owner: None,
             error_summary,
             next_action: "resolve the external verification blocker and rerun acceptance"
                 .to_string(),
@@ -304,11 +325,12 @@ impl StalledBlocker {
 
     pub fn summary(&self) -> String {
         format!(
-            "category={}, phase={}, gate={}, evidence={}, resumable={}, next_action={}, error={}",
+            "category={}, phase={}, gate={}, evidence={}, unblock_condition={}, resumable={}, next_action={}, error={}",
             self.category,
             self.phase,
             self.gate,
             self.evidence.join(" | "),
+            self.unblock_condition.as_deref().unwrap_or("none reported"),
             self.resumable,
             self.next_action,
             self.error_summary

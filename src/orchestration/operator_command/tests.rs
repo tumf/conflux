@@ -29,7 +29,30 @@ fn acceptance_blocker() -> StalledBlocker {
         gate: "acceptance".to_string(),
         error_summary: "unresolved acceptance finding".to_string(),
         evidence: vec!["tests/acceptance.rs:1".to_string()],
+        // Repository-fixable facts with no unblock condition: the classifier
+        // keeps this an execution stall rather than an external wait.
+        unblock_condition: None,
+        prerequisite_owner: None,
         next_action: "resolve finding and retry".to_string(),
+        resumable: true,
+        worktree_preserved: true,
+    }
+}
+
+/// Reported facts that validate as a non-repository prerequisite, which the
+/// orchestrator classifies as an external `blocked` wait.
+fn external_prerequisite_blocker() -> StalledBlocker {
+    StalledBlocker {
+        category: "credential".to_string(),
+        phase: "acceptance".to_string(),
+        gate: "acceptance".to_string(),
+        error_summary: "STAGING_API_KEY is unset".to_string(),
+        evidence: vec!["verification run reported STAGING_API_KEY is unset".to_string()],
+        unblock_condition: Some(
+            "STAGING_API_KEY is present in the verification environment".to_string(),
+        ),
+        prerequisite_owner: Some("platform".to_string()),
+        next_action: "provision STAGING_API_KEY then retry acceptance".to_string(),
         resumable: true,
         worktree_preserved: true,
     }
@@ -1086,5 +1109,119 @@ async fn operator_command_marks_do_not_change_workspace_derived_routing() {
     assert_eq!(
         before, after_clear,
         "clearing marks must not change workspace-derived routing"
+    );
+}
+
+/// Explicit operator retry always permits the blocked phase to run again: the
+/// hold is released so the next execution result — not the preserved metadata —
+/// decides whether the change is blocked again or progresses.
+#[tokio::test]
+async fn operator_command_retry_reruns_an_externally_blocked_change() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: external_prerequisite_blocker(),
+        });
+    }
+
+    {
+        let guard = fixture.state.read().await;
+        assert_eq!(guard.display_status("change-a"), "blocked");
+        assert_eq!(
+            guard.change_runtime("change-a").unwrap().blocker_kind(),
+            crate::orchestration::state::BlockerKind::External
+        );
+        assert!(guard
+            .externally_blocked_change_ids()
+            .contains("change-a"));
+    }
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("an external prerequisite wait is explicitly retryable");
+    assert_eq!(plan.change_ids, ["change-a"]);
+    assert!(plan.explicit_retry, "the blocked phase must run again");
+
+    let guard = fixture.state.read().await;
+    assert_eq!(guard.display_status("change-a"), "queued");
+    assert!(
+        guard.externally_blocked_change_ids().is_empty(),
+        "the hold must be released so fresh evidence can reclassify"
+    );
+}
+
+/// A dependency wait is not explicitly retryable: it clears when the dependency
+/// completes, so a retry request must not be routed as an acceptance hold even
+/// though both waits display as `blocked`.
+#[tokio::test]
+async fn operator_command_retry_is_unsupported_for_a_dependency_wait() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "change-a".to_string(),
+            dependency_ids: vec!["alpha".to_string()],
+        });
+    }
+
+    let error = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect_err("a dependency wait carries no retryable evidence");
+    assert!(matches!(
+        error,
+        OperatorCommandError::RetryUnsupported { ref display_status, .. }
+            if display_status == "blocked"
+    ));
+    assert_eq!(
+        fixture.state.read().await.display_status("change-a"),
+        "blocked",
+        "a refused retry must leave the dependency wait untouched"
+    );
+}
+
+/// An externally blocked change must not stop unrelated ready work, and a
+/// proposal that depends on it keeps its own dependency blocker kind rather than
+/// inheriting the external one.
+#[tokio::test]
+async fn externally_blocked_change_does_not_block_unrelated_or_dependent_kinds() {
+    let fixture = fixture(&["alpha", "beta", "gamma"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "alpha".to_string(),
+            blocker: external_prerequisite_blocker(),
+        });
+        guard.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "beta".to_string(),
+            dependency_ids: vec!["alpha".to_string()],
+        });
+        guard.apply_command(ReducerCommand::AddToQueue("gamma".to_string()));
+    }
+
+    let guard = fixture.state.read().await;
+    assert_eq!(guard.display_status("alpha"), "blocked");
+    assert_eq!(guard.display_status("beta"), "blocked");
+    assert_eq!(guard.display_status("gamma"), "queued");
+
+    assert_eq!(
+        guard.change_runtime("beta").unwrap().blocker_kind(),
+        crate::orchestration::state::BlockerKind::Dependency,
+        "a dependent must not inherit the external blocker kind"
+    );
+    assert_eq!(
+        guard.externally_blocked_change_ids(),
+        std::collections::HashSet::from(["alpha".to_string()]),
+        "only the change with the validated prerequisite is externally blocked"
+    );
+    assert_eq!(
+        guard.queued_change_ids(),
+        vec!["gamma".to_string()],
+        "unrelated ready work continues"
     );
 }

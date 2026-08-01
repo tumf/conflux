@@ -63,6 +63,8 @@ mod tests {
             status: "applying".to_string(),
             iteration_number: None,
             selected: true,
+            blocker_kind: None,
+            blocker_detail: None,
         }
     }
 

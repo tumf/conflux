@@ -36,6 +36,16 @@ pub struct RemoteChange {
     /// Whether this change is selected for execution
     #[serde(default = "default_selected")]
     pub selected: bool,
+    /// Machine-readable blocker kind for a `blocked` change: `dependency` or
+    /// `external`.
+    ///
+    /// Reducer-derived, never inferred by the server or by a client. `None` for
+    /// every non-blocked status, including `stalled`.
+    #[serde(default)]
+    pub blocker_kind: Option<String>,
+    /// Operator-facing blocker detail for a blocked or stalled change.
+    #[serde(default)]
+    pub blocker_detail: Option<String>,
 }
 
 /// Default value for `selected` field (true) to ensure backward compatibility.

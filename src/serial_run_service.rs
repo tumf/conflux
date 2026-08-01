@@ -945,7 +945,7 @@ impl SerialRunService {
                             error!("{} for {}", error, change.id);
                             break Ok(ChangeProcessResult::AcceptanceCommandFailed { error });
                         }
-                        Some(AcceptanceBlockerDecision::Stall { blocker }) => {
+                        Some(AcceptanceBlockerDecision::ExternalBlocker { blocker }) => {
                             break Ok(self.record_acceptance_stall(&change.id, &blocker).await);
                         }
                         None => unreachable!(
@@ -965,6 +965,8 @@ impl SerialRunService {
                     let stall = crate::acceptance::AcceptanceBlocker {
                         category: "policy".to_string(),
                         evidence: blocker.evidence.clone(),
+                        unblock_condition: "the reported policy prerequisite is satisfied"
+                            .to_string(),
                         next_action: blocker.next_action.clone(),
                         resumable: blocker.resumable,
                         prerequisite_owner: None,
@@ -2073,6 +2075,7 @@ mod tests {
         let verdict = concat!(
             r#"{"acceptance":"gated","blocker":{"category":"external_approval","#,
             r#""evidence":["change board ticket CB-42 awaits sign-off"],"#,
+            r#""unblock_condition":"CB-42 is signed off","#,
             r#""next_action":"await CB-42 then retry acceptance","resumable":true}}"#,
             "\n"
         );
@@ -2084,9 +2087,14 @@ mod tests {
             ChangeProcessResult::AcceptanceStalled { blocker, error } => {
                 assert!(error.starts_with("external_approval:"), "{error}");
                 assert!(error.contains("await CB-42"), "{error}");
-                // The structured payload survives to the consumer, so serial can
-                // display `stalled` with the same evidence parallel emits.
+                // The structured payload survives to the consumer, so serial
+                // hands the classifier the same facts parallel does and reaches
+                // the same external `blocked` classification.
                 assert_eq!(blocker.category, "external_approval");
+                assert_eq!(
+                    blocker.unblock_condition.as_deref(),
+                    Some("CB-42 is signed off")
+                );
                 assert_eq!(blocker.phase, "acceptance");
                 assert_eq!(
                     blocker.evidence,
@@ -2989,6 +2997,7 @@ mod tests {
                     blocker: crate::acceptance::AcceptanceBlocker {
                         category: "external_service".to_string(),
                         evidence: vec!["registry returned 503".to_string()],
+                        unblock_condition: "the registry answers with 200".to_string(),
                         next_action: "wait for the registry then retry acceptance".to_string(),
                         resumable: true,
                         prerequisite_owner: None,
@@ -3038,6 +3047,7 @@ mod tests {
                 &crate::acceptance::AcceptanceBlocker {
                     category: "external_service".to_string(),
                     evidence: vec!["staging registry returned 503".to_string()],
+                    unblock_condition: "the staging registry answers with 200".to_string(),
                     next_action: "wait for the registry then retry acceptance".to_string(),
                     resumable,
                     prerequisite_owner: Some("platform".to_string()),
@@ -3126,7 +3136,7 @@ mod tests {
     /// operator-facing lifecycle: `stalled`, not an opaque processing error, and
     /// not cleared immediately after being marked.
     #[tokio::test]
-    async fn serial_acceptance_stall_displays_as_stalled_with_structured_metadata() {
+    async fn serial_validated_blocker_displays_as_blocked_with_structured_metadata() {
         let temp_dir = TempDir::new().unwrap();
         let change_id = "serial-stall-display";
         init_serial_repo(temp_dir.path(), change_id);
@@ -3140,6 +3150,7 @@ mod tests {
                 &crate::acceptance::AcceptanceBlocker {
                     category: "external_service".to_string(),
                     evidence: vec!["staging registry returned 503".to_string()],
+                    unblock_condition: "the staging registry answers with 200".to_string(),
                     next_action: "wait for the registry then retry acceptance".to_string(),
                     resumable: true,
                     prerequisite_owner: Some("platform".to_string()),
@@ -3170,20 +3181,24 @@ mod tests {
             state.apply_execution_event(event);
         }
 
-        assert_eq!(state.display_status(change_id), "stalled");
+        assert_eq!(state.display_status(change_id), "blocked");
         let runtime = state
             .change_runtime(change_id)
-            .expect("runtime entry for a stalled serial change");
+            .expect("runtime entry for an externally blocked serial change");
+        assert_eq!(
+            runtime.blocker_kind(),
+            crate::orchestration::state::BlockerKind::External
+        );
         assert_eq!(
             runtime.blocked_metadata.blocker_reason.as_deref(),
-            Some("acceptance-gated:external_service")
+            Some("external-blocked:external_service")
         );
         let unblock = runtime
             .blocked_metadata
             .unblock_metadata
             .as_deref()
             .expect("structured unblock metadata");
-        assert!(unblock.contains("resumable=true"), "{unblock}");
+        assert!(unblock.contains("unblock when"), "{unblock}");
         assert!(
             unblock.contains("staging registry returned 503"),
             "{unblock}"
@@ -3320,6 +3335,8 @@ mod tests {
                 &crate::acceptance::AcceptanceBlocker {
                     category: "credential".to_string(),
                     evidence: vec!["STAGING_API_KEY is unset".to_string()],
+                    unblock_condition: "STAGING_API_KEY is present in the verification environment"
+                        .to_string(),
                     next_action: "provision STAGING_API_KEY then retry acceptance".to_string(),
                     resumable: true,
                     prerequisite_owner: None,
@@ -3457,6 +3474,7 @@ mod tests {
                 &crate::acceptance::AcceptanceBlocker {
                     category: "human_decision".to_string(),
                     evidence: vec!["the approach needs an owner decision".to_string()],
+                    unblock_condition: "the architecture owner records a decision".to_string(),
                     next_action: "owner decides the approach".to_string(),
                     resumable: false,
                     prerequisite_owner: Some("architecture".to_string()),

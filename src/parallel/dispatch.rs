@@ -70,6 +70,11 @@ fn stalled_blocker_from_marker(marker: &BlockedMarker) -> crate::events::Stalled
         gate: marker.reason.clone(),
         error_summary: marker.reason.clone(),
         evidence: marker.evidence.clone(),
+        // A legacy marker carries no verifiable unblock condition and no owner,
+        // so it can never be promoted to an external `blocked` wait; it keeps
+        // its conservative stalled handling.
+        unblock_condition: None,
+        prerequisite_owner: None,
         next_action: marker.next_action.clone(),
         resumable: marker.resumable,
         worktree_preserved: marker.worktree_preserved,
@@ -2379,9 +2384,12 @@ impl ParallelExecutor {
                         if let AcceptanceRetryDecision::Stall { reason, external_blockers } = decision {
                             // Repeated findings and cycle exhaustion are runtime
                             // retry judgements, not reviewer-validated external
-                            // blockers: no category is invented and no durable
-                            // hold is written. Only an explicit structured
-                            // blocker reaches runtime stall state.
+                            // prerequisites: no category is invented, no unblock
+                            // condition is fabricated, and nothing durable is
+                            // written. They classify as execution `stalled`, the
+                            // same outcome serial mode reaches, so both modes
+                            // agree and neither presents this as a wait on a
+                            // named prerequisite.
                             let error = format!(
                                 "Acceptance stopped retrying {change_id} ({reason}). External blocker \
                                  context: {}. Explicit retry is required.",
@@ -2391,7 +2399,55 @@ impl ParallelExecutor {
                                     external_blockers.join(" | ")
                                 }
                             );
+                            // The classifier owns the decision even here, so an
+                            // execution stop cannot pick up an external category
+                            // by taking a different code path.
+                            let stop_reason =
+                                crate::orchestration::blocker_classification::execution_stop_reason_for(reason);
+                            let stalled_category = match crate::orchestration::blocker_classification::classify_execution_stop(
+                                stop_reason,
+                                error.clone(),
+                            ) {
+                                crate::orchestration::blocker_classification::LifecycleClassification::Stalled { reason, .. } => reason,
+                                other => unreachable!(
+                                    "an execution stop must classify as stalled, got {other:?}"
+                                ),
+                            };
+                            let stalled_blocker = crate::events::StalledBlocker {
+                                category: stalled_category,
+                                phase: "acceptance".to_string(),
+                                gate: "acceptance_retry_policy".to_string(),
+                                error_summary: error.clone(),
+                                evidence: if external_blockers.is_empty() {
+                                    vec![error.clone()]
+                                } else {
+                                    external_blockers.clone()
+                                },
+                                // Deliberately absent: an exhausted retry budget
+                                // names no verifiable external condition, which
+                                // is what keeps it out of external `blocked`.
+                                unblock_condition: None,
+                                prerequisite_owner: None,
+                                next_action: "inspect the repeated findings and request an explicit retry"
+                                    .to_string(),
+                                resumable: true,
+                                worktree_preserved: true,
+                            };
+                            record_stall_in_shared_state(
+                                &shared_orchestrator_state,
+                                &crate::events::ExecutionEvent::ExecutionBlocked {
+                                    change_id: change_id.clone(),
+                                    blocker: stalled_blocker.clone(),
+                                },
+                            )
+                            .await;
                             if let Some(ref tx) = event_tx {
+                                let _ = tx
+                                    .send(ParallelEvent::ExecutionBlocked {
+                                        change_id: change_id.clone(),
+                                        blocker: stalled_blocker,
+                                    })
+                                    .await;
                                 let _ = tx
                                     .send(ParallelEvent::Log(
                                         LogEntry::error(error.clone())
@@ -2402,7 +2458,9 @@ impl ParallelExecutor {
                                     .await;
                             }
                             cancel_monitor.abort();
-                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(error), rejected: None };
+                            // No `error`: the change is held, not failed, so the
+                            // worktree stays preserved for the explicit retry.
+                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: None, rejected: None };
                         }
                         if !findings.is_empty() {
                             if let Ok(tasks_path) = task_parser::resolve_acceptance_follow_up_tasks_path(&change_id, workspace.path.as_path()) {
@@ -2639,20 +2697,25 @@ impl ParallelExecutor {
                     )) => {
                         // One shared decision API drives both modes: bare or
                         // invalid compatibility input gets bounded acceptance-only
-                        // retry, and only a validated structured blocker becomes a
-                        // durable revision-bound stall.
+                        // retry and sets no lifecycle state, while a validated
+                        // structured payload goes to the orchestrator's
+                        // classifier.
                         match decide_acceptance_blocker(&mut protocol, &result) {
                             Some(AcceptanceBlockerDecision::ProtocolRetry { progress, .. }) => {
+                                let diagnostic = crate::orchestration::blocker_classification::bare_compatibility_diagnostic(
+                                    "gated",
+                                    progress.clone(),
+                                );
                                 warn!(
                                     "Bare acceptance blocker for {} (cycle {}): {}",
-                                    change_id, cycle_count, progress
+                                    change_id, cycle_count, diagnostic
                                 );
                                 if let Some(ref tx) = event_tx {
                                     let _ = tx
                                         .send(ParallelEvent::Log(
                                             LogEntry::info(format!(
                                                 "{} (cycle {})",
-                                                progress, cycle_count
+                                                diagnostic, cycle_count
                                             ))
                                             .with_change_id(&change_id)
                                             .with_operation("acceptance")
@@ -2693,14 +2756,15 @@ impl ParallelExecutor {
                                     rejected: None,
                                 };
                             }
-                            Some(AcceptanceBlockerDecision::Stall { blocker }) => {
-                                // The validated blocker becomes an in-memory
-                                // reducer hold bound to this process only. The
-                                // worktree is left exactly as acceptance found
-                                // it, and no record is written outside it.
+                            Some(AcceptanceBlockerDecision::ExternalBlocker { blocker }) => {
+                                // The reported facts become an in-memory reducer
+                                // hold bound to this process only; the reducer's
+                                // classifier decides `blocked` versus `stalled`.
+                                // The worktree is left exactly as acceptance
+                                // found it, and no record is written outside it.
                                 let stalled_blocker = blocker.to_stalled_blocker();
                                 warn!(
-                                    "Acceptance stalled for {} on a validated external blocker ({})",
+                                    "Acceptance reported a validated external blocker for {} ({})",
                                     change_id, blocker.category
                                 );
                                 record_stall_in_shared_state(
@@ -2728,7 +2792,7 @@ impl ParallelExecutor {
                                     let _ = tx
                                         .send(ParallelEvent::Log(
                                             LogEntry::warn(format!(
-                                                "Acceptance stalled ({}) on a validated external blocker; \
+                                                "Acceptance blocked ({}) on a validated external prerequisite; \
                                                  worktree preserved and apply revision {} unchanged",
                                                 blocker.category, revision
                                             ))

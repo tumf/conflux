@@ -368,10 +368,13 @@ pub(super) async fn list_remote_changes_in_worktree(
         }
     };
 
-    let status_map: std::collections::HashMap<String, &'static str> = {
+    // Status and blocker view come from one reducer snapshot, so a payload can
+    // never pair a `blocked` status with a stale or missing blocker kind.
+    let (status_map, blocker_views) = {
         let guard = shared_orchestrator_state.read().await;
-        guard.all_display_statuses()
+        (guard.all_display_statuses(), guard.all_blocker_views())
     };
+    let status_map: std::collections::HashMap<String, &'static str> = status_map;
 
     let mut changes = Vec::new();
 
@@ -427,6 +430,12 @@ pub(super) async fn list_remote_changes_in_worktree(
         )
         .await;
 
+        // The blocker view is only meaningful for the reducer-derived status;
+        // a fallback status computed from workspace scanning carries none.
+        let blocker_view = status_map
+            .get(dir_name)
+            .and_then(|_| blocker_views.get(dir_name));
+
         changes.push(RemoteChange {
             id: dir_name.to_string(),
             project: project_id.to_string(),
@@ -436,6 +445,10 @@ pub(super) async fn list_remote_changes_in_worktree(
             status,
             iteration_number,
             selected: true,
+            blocker_kind: blocker_view
+                .and_then(|view| view.kind.as_str())
+                .map(str::to_string),
+            blocker_detail: blocker_view.and_then(|view| view.detail.clone()),
         });
     }
 
@@ -603,6 +616,64 @@ mod tests {
             dependency_ids: vec!["change-b".to_string()],
         });
         assert_eq!(orchestrator_state.display_status("change-a"), "blocked");
+    }
+
+    /// WebSocket payloads carry the reducer's own blocker view, so a client can
+    /// tell a dependency wait from an external prerequisite wait without
+    /// re-deriving anything from the status string.
+    #[test]
+    fn test_ws_blocker_views_distinguish_dependency_external_and_stalled() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+        use crate::orchestration::state::{BlockerKind, ExecutionMode, OrchestratorState};
+
+        let mut state = OrchestratorState::with_mode(
+            vec![
+                "dependency-wait".to_string(),
+                "external-wait".to_string(),
+                "execution-stall".to_string(),
+            ],
+            1,
+            ExecutionMode::Parallel,
+        );
+        state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "dependency-wait".to_string(),
+            dependency_ids: vec!["alpha".to_string()],
+        });
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "external-wait".to_string(),
+            blocker: StalledBlocker::acceptance_external("credential", "STAGING_API_KEY is unset"),
+        });
+        let denial = crate::permission::classify_permission_denial(&[Some(
+            "Read permission denied for /private/secret.txt",
+        )])
+        .expect("denial should classify");
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: "execution-stall".to_string(),
+            blocker: StalledBlocker::permission_denial("acceptance", &denial),
+        });
+
+        let status_map = state.all_display_statuses();
+        let views = state.all_blocker_views();
+
+        // Every payload status stays inside the reducer's vocabulary.
+        for (id, expected_status, expected_kind) in [
+            ("dependency-wait", "blocked", Some("dependency")),
+            ("external-wait", "blocked", Some("external")),
+            ("execution-stall", "stalled", None),
+        ] {
+            assert_eq!(status_map[id], expected_status, "{id} status");
+            let view = &views[id];
+            assert_eq!(view.status, expected_status, "{id} view status");
+            assert_eq!(view.kind.as_str(), expected_kind, "{id} blocker kind");
+            assert!(view.detail.is_some(), "{id} must carry operator detail");
+        }
+
+        assert_eq!(views["execution-stall"].kind, BlockerKind::None);
+        // The external wait keeps its unblock condition and next action.
+        let external_detail = views["external-wait"].detail.as_deref().unwrap();
+        assert!(external_detail.contains("credential"));
+        assert!(external_detail.contains("unblock when"));
+        assert!(external_detail.contains("next action"));
     }
 
     #[tokio::test]

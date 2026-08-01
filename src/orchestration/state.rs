@@ -123,9 +123,43 @@ pub enum WaitState {
     RejectWait,
     /// Waiting because a dependency has not yet completed.
     DependencyBlocked,
+    /// Waiting because the orchestrator validated a non-repository prerequisite
+    /// reported by Apply or Acceptance.
+    ///
+    /// Displays as `blocked` alongside [`WaitState::DependencyBlocked`], but
+    /// keeps its own blocker kind so the two waits stay distinguishable and the
+    /// external wait never becomes a synthetic proposal dependency edge.
+    ExternalBlocked,
     /// Waiting because apply/rejecting reported a resumable hold,
     /// including acceptance gate observations before follow-up routing.
     Stalled,
+}
+
+/// Machine-readable reason a change is `blocked`.
+///
+/// Mirrors [`crate::runtime::proposal::BlockerKind`] on the reducer that owns
+/// operator-facing display, so surfaces never re-derive the kind from prose,
+/// filenames, or task text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockerKind {
+    /// The change is not blocked.
+    #[default]
+    None,
+    /// Waiting on an unarchived proposal dependency.
+    Dependency,
+    /// Waiting on a validated non-repository prerequisite.
+    External,
+}
+
+impl BlockerKind {
+    /// Stable token exposed to TUI, WebSocket/API, and the dashboard.
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Dependency => Some("dependency"),
+            Self::External => Some("external"),
+        }
+    }
 }
 
 /// Additional metadata preserved while a change is blocked.
@@ -147,6 +181,42 @@ pub struct BlockedMetadata {
     pub acceptance_stall: bool,
     /// Whether the blocker declared that work can resume once the external
     /// prerequisite is satisfied.
+    pub resumable: bool,
+    /// Machine-readable blocker kind for a `blocked` change.
+    ///
+    /// `None` for stalled holds: an execution stop is not a wait on a named
+    /// prerequisite, and calling it one would hide why automation gave up.
+    pub blocker_kind: BlockerKind,
+    /// Verifiable condition that clears a validated external prerequisite wait.
+    pub unblock_condition: Option<String>,
+    /// Owning team/role or named prerequisite for an external wait.
+    pub prerequisite_owner: Option<String>,
+    /// Phase that observed a validated external prerequisite.
+    pub blocker_origin: Option<String>,
+}
+
+/// Reducer-derived operator-facing view of one blocked or stalled change.
+///
+/// Every surface consumes this instead of inferring lifecycle state itself, so
+/// TUI, WebSocket/API, and the dashboard cannot disagree about whether a row is
+/// dependency-blocked, externally blocked, or stalled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockerView {
+    /// Reducer display status: `blocked` or `stalled`.
+    pub status: &'static str,
+    /// Machine-readable blocker kind; `None` for a stalled execution hold.
+    pub kind: BlockerKind,
+    /// Machine-readable blocker reason/category.
+    pub category: Option<String>,
+    /// One-line operator-facing explanation.
+    pub detail: Option<String>,
+    /// Verifiable condition that clears an external wait.
+    pub unblock_condition: Option<String>,
+    /// Owning team/role for an external wait.
+    pub prerequisite_owner: Option<String>,
+    /// Phase that observed an external prerequisite.
+    pub origin: Option<String>,
+    /// Whether work can resume once the prerequisite is satisfied.
     pub resumable: bool,
 }
 
@@ -221,6 +291,10 @@ impl ChangeRuntimeState {
             worktree_snapshot: Some(worktree_snapshot.into()),
             acceptance_stall: false,
             resumable: false,
+            blocker_kind: BlockerKind::None,
+            unblock_condition: None,
+            prerequisite_owner: None,
+            blocker_origin: None,
         };
     }
 
@@ -270,9 +344,49 @@ impl ChangeRuntimeState {
         self.blocked_metadata.resumable = resumable;
     }
 
-    /// Whether an Acceptance-owned in-memory stall currently holds this change.
+    /// Record a validated external prerequisite wait.
+    ///
+    /// This is the only way to reach [`WaitState::ExternalBlocked`], and it is
+    /// reachable only from the orchestrator's classifier — an agent cannot set
+    /// it by choosing a verdict word. The hold is in-memory reducer state for
+    /// one process lifetime: it may suppress ordinary dispatch and drive the
+    /// `blocked` presentation, and it never establishes completion, Acceptance
+    /// PASS, archive readiness, or merge eligibility.
+    fn transition_to_external_blocked(
+        &mut self,
+        blocker: &crate::runtime::proposal::ExternalBlockerInfo,
+        worktree_snapshot: impl Into<String>,
+    ) {
+        self.activity = ActivityState::Idle;
+        self.wait_state = WaitState::ExternalBlocked;
+        self.terminal = TerminalState::None;
+        self.blocked_metadata = BlockedMetadata {
+            blocker_reason: Some(format!("external-blocked:{}", blocker.category)),
+            unblock_metadata: Some(blocker.summary()),
+            worktree_snapshot: Some(worktree_snapshot.into()),
+            acceptance_stall: matches!(
+                blocker.origin,
+                crate::runtime::proposal::BlockerOrigin::Acceptance
+            ),
+            resumable: blocker.resumable,
+            blocker_kind: BlockerKind::External,
+            unblock_condition: Some(blocker.unblock_condition.clone()),
+            prerequisite_owner: blocker.prerequisite_owner.clone(),
+            blocker_origin: Some(blocker.origin.as_str().to_string()),
+        };
+    }
+
+    /// Whether an Acceptance-owned in-memory hold currently keeps this change
+    /// out of ordinary dispatch.
+    ///
+    /// Both the execution `stalled` hold and a validated external `blocked` wait
+    /// observed by Acceptance qualify: they suppress dispatch identically and
+    /// differ only in how they are explained to an operator.
     pub fn is_acceptance_stalled(&self) -> bool {
-        matches!(self.wait_state, WaitState::Stalled) && self.blocked_metadata.acceptance_stall
+        matches!(
+            self.wait_state,
+            WaitState::Stalled | WaitState::ExternalBlocked
+        ) && self.blocked_metadata.acceptance_stall
     }
 
     /// Whether the current Acceptance hold allows an acceptance-only retry.
@@ -281,6 +395,50 @@ impl ChangeRuntimeState {
     /// would dispatch ambiguous work the operator has not unblocked.
     pub fn is_resumable_acceptance_stall(&self) -> bool {
         self.is_acceptance_stalled() && self.blocked_metadata.resumable
+    }
+
+    /// Whether a validated external prerequisite currently blocks this change.
+    #[allow(dead_code)] // Consumed by external-blocked lifecycle regression coverage.
+    pub fn is_external_blocked(&self) -> bool {
+        matches!(self.wait_state, WaitState::ExternalBlocked)
+    }
+
+    /// Machine-readable blocker kind for a `blocked` change.
+    ///
+    /// Derived from the wait state, never from the recorded metadata alone, so a
+    /// stale metadata field can never make a non-blocked change look blocked.
+    pub fn blocker_kind(&self) -> BlockerKind {
+        match self.wait_state {
+            WaitState::DependencyBlocked => BlockerKind::Dependency,
+            WaitState::ExternalBlocked => BlockerKind::External,
+            _ => BlockerKind::None,
+        }
+    }
+
+    /// Operator-facing blocker detail for a blocked or stalled row.
+    pub fn blocker_detail(&self) -> Option<&str> {
+        self.blocked_metadata.unblock_metadata.as_deref()
+    }
+
+    /// Reducer-derived blocker view for a blocked or stalled row.
+    ///
+    /// Returns `None` for every other status so a surface can never render a
+    /// blocker badge on a change that is not actually held.
+    pub fn blocker_view(&self) -> Option<BlockerView> {
+        let status = self.display_status();
+        if !matches!(status, "blocked" | "stalled") {
+            return None;
+        }
+        Some(BlockerView {
+            status,
+            kind: self.blocker_kind(),
+            category: self.blocked_metadata.blocker_reason.clone(),
+            detail: self.blocker_detail().map(str::to_string),
+            unblock_condition: self.blocked_metadata.unblock_condition.clone(),
+            prerequisite_owner: self.blocked_metadata.prerequisite_owner.clone(),
+            origin: self.blocked_metadata.blocker_origin.clone(),
+            resumable: self.blocked_metadata.resumable,
+        })
     }
 
     /// Check whether this runtime state represents active execution
@@ -360,7 +518,9 @@ impl ChangeRuntimeState {
             WaitState::MergeWait => return "merge wait",
             WaitState::ResolveWait => return "resolve pending",
             WaitState::RejectWait => return "reject pending",
-            WaitState::DependencyBlocked => return "blocked",
+            // Dependency waits and validated external prerequisite waits share
+            // the `blocked` word; `blocker_kind()` is what keeps them apart.
+            WaitState::DependencyBlocked | WaitState::ExternalBlocked => return "blocked",
             WaitState::Stalled => return "stalled",
             WaitState::None => {}
         }
@@ -593,6 +753,20 @@ impl OrchestratorState {
     /// returns an empty set and repository evidence alone decides the next
     /// action. Apply-origin and dependency blockers are deliberately excluded —
     /// only an Acceptance-phase blocker observation sets the flag.
+    /// Changes held by a validated external prerequisite, whichever phase
+    /// observed it.
+    ///
+    /// Ordinary dispatch must skip these. They are *not* dependency edges: a
+    /// dependent proposal keeps its own dependency blocker kind, and unrelated
+    /// ready changes stay eligible.
+    pub fn externally_blocked_change_ids(&self) -> HashSet<String> {
+        self.change_runtime
+            .iter()
+            .filter(|(_, rt)| rt.is_external_blocked())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     pub fn acceptance_stalled_change_ids(&self) -> HashSet<String> {
         self.change_runtime
             .iter()
@@ -1116,6 +1290,26 @@ impl OrchestratorState {
             .collect()
     }
 
+    /// Reducer-derived blocker views for every change currently blocked or
+    /// stalled.
+    ///
+    /// This is the single source TUI, WebSocket/API, and the dashboard read, so
+    /// no surface has to re-derive `blocked` versus `stalled` — or the blocker
+    /// kind — from filenames, prose, or task text.
+    pub fn all_blocker_views(&self) -> HashMap<String, BlockerView> {
+        self.change_runtime
+            .iter()
+            .filter_map(|(id, rt)| rt.blocker_view().map(|view| (id.clone(), view)))
+            .collect()
+    }
+
+    /// Reducer-derived blocker view for one change.
+    pub fn blocker_view(&self, change_id: &str) -> Option<BlockerView> {
+        self.change_runtime
+            .get(change_id)
+            .and_then(ChangeRuntimeState::blocker_view)
+    }
+
     /// Return true if the change has reached a terminal state.
     pub fn is_terminal_change(&self, change_id: &str) -> bool {
         self.change_runtime
@@ -1299,8 +1493,14 @@ impl OrchestratorState {
             if rt.is_terminal() {
                 return ReduceOutcome::NoOp;
             }
+            // An explicit operator retry always releases a blocked/stalled hold
+            // so the held phase can run again. The new execution result — not
+            // the preserved metadata — is what reclassifies the change.
             if !rt.dequeued
-                && !matches!(rt.wait_state, WaitState::Stalled)
+                && !matches!(
+                    rt.wait_state,
+                    WaitState::Stalled | WaitState::ExternalBlocked
+                )
                 && (rt.is_active() || rt.queue_intent == QueueIntent::Queued)
             {
                 return ReduceOutcome::NoOp;
@@ -1915,35 +2115,77 @@ impl OrchestratorState {
             ExecutionEvent::AcceptanceGated { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.transition_to_acceptance_stalled(
-                        format!("acceptance-gated:{}", blocker.category),
-                        blocker.summary(),
-                        blocker.worktree_snapshot(),
-                        blocker.resumable,
+                    // The agent reported facts; the orchestrator decides the
+                    // lifecycle. A complete, validated payload becomes external
+                    // `blocked`; anything weaker stays an Acceptance-owned
+                    // `stalled` hold rather than an inferred external wait.
+                    let classification =
+                        crate::orchestration::blocker_classification::classify_reported_facts(
+                            blocker,
+                        );
+                    tracing::debug!(
+                        change_id = %change_id,
+                        reported_category = %blocker.category,
+                        classified_as = ?classification.display_status(),
+                        "classified acceptance blocker facts"
                     );
+                    match classification {
+                        crate::orchestration::blocker_classification::LifecycleClassification::ExternalBlocked(info) => {
+                            rt.transition_to_external_blocked(&info, blocker.worktree_snapshot());
+                        }
+                        crate::orchestration::blocker_classification::LifecycleClassification::Stalled { detail, .. } => {
+                            rt.transition_to_acceptance_stalled(
+                                format!("acceptance-gated:{}", blocker.category),
+                                detail,
+                                blocker.worktree_snapshot(),
+                                blocker.resumable,
+                            );
+                        }
+                        crate::orchestration::blocker_classification::LifecycleClassification::ProtocolCorrection { .. } => {}
+                    }
                 }
             }
             ExecutionEvent::ExecutionBlocked { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    let blocker_reason = format!("execution-blocked:{}", blocker.category);
-                    // An Acceptance-phase blocker (for example a repeated
-                    // permission denial during acceptance) holds dispatch the
-                    // same way a validated acceptance blocker does. Apply-phase
-                    // blockers keep their own conservative handling.
-                    if blocker.phase == "acceptance" {
-                        rt.transition_to_acceptance_stalled(
-                            blocker_reason,
+                    use crate::orchestration::blocker_classification as classification;
+                    // A repeated permission/tool-policy denial is an execution
+                    // stop, not a wait on a named prerequisite, so it is
+                    // classified as one rather than being offered to the
+                    // external-claim validator at all.
+                    let classified = if classification::is_permission_denial(blocker) {
+                        classification::classify_execution_stop(
+                            classification::ExecutionStopReason::PermissionDenial,
                             blocker.summary(),
-                            blocker.worktree_snapshot(),
-                            blocker.resumable,
-                        );
+                        )
                     } else {
-                        rt.transition_to_stalled(
-                            blocker_reason,
-                            blocker.summary(),
-                            blocker.worktree_snapshot(),
-                        );
+                        classification::classify_reported_facts(blocker)
+                    };
+                    let blocker_reason = format!("execution-blocked:{}", blocker.category);
+                    match classified {
+                        crate::orchestration::blocker_classification::LifecycleClassification::ExternalBlocked(info) => {
+                            rt.transition_to_external_blocked(&info, blocker.worktree_snapshot());
+                        }
+                        // An Acceptance-phase execution hold (for example a
+                        // repeated permission denial during acceptance) holds
+                        // dispatch the same way a validated acceptance blocker
+                        // does. Apply-phase holds keep their own conservative
+                        // handling.
+                        _ if blocker.phase == "acceptance" => {
+                            rt.transition_to_acceptance_stalled(
+                                blocker_reason,
+                                blocker.summary(),
+                                blocker.worktree_snapshot(),
+                                blocker.resumable,
+                            );
+                        }
+                        _ => {
+                            rt.transition_to_stalled(
+                                blocker_reason,
+                                blocker.summary(),
+                                blocker.worktree_snapshot(),
+                            );
+                        }
                     }
                 }
             }
@@ -3053,9 +3295,9 @@ mod tests {
 
     /// The explicit category reaches reducer state verbatim, and prose never
     /// overrides it — the same narrative under a different category must produce
-    /// a different stalled classification.
+    /// a different external blocker classification.
     #[test]
-    fn test_explicit_blocker_categories_reach_stalled_metadata_without_prose_inference() {
+    fn test_explicit_blocker_categories_reach_blocked_metadata_without_prose_inference() {
         // Every message below contains words the old classifier keyed on
         // (docker, daemon, timeout, credential, still running). None of them may
         // change the category.
@@ -3090,11 +3332,14 @@ mod tests {
             let runtime = state
                 .change_runtime(&change_id)
                 .expect("runtime after blocker classification");
-            assert_eq!(state.display_status(&change_id), "stalled");
+            // A validated non-repository prerequisite is `blocked`, and its
+            // blocker kind says why — never a dependency edge, never a stall.
+            assert_eq!(state.display_status(&change_id), "blocked");
+            assert_eq!(runtime.blocker_kind(), BlockerKind::External);
             assert!(matches!(runtime.terminal, TerminalState::None));
             assert_eq!(
                 runtime.blocked_metadata.blocker_reason.as_deref(),
-                Some(format!("acceptance-gated:{explicit_category}").as_str()),
+                Some(format!("external-blocked:{explicit_category}").as_str()),
                 "the explicit category must survive verbatim for {message}"
             );
             assert!(
@@ -3144,7 +3389,7 @@ mod tests {
     }
 
     #[test]
-    fn test_acceptance_gated_transitions_to_stalled_with_structured_metadata() {
+    fn test_acceptance_gated_transitions_to_external_blocked_with_structured_metadata() {
         use crate::events::{ExecutionEvent, StalledBlocker};
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
@@ -3164,34 +3409,164 @@ mod tests {
         let runtime = state
             .change_runtime("c")
             .expect("runtime for c after acceptance gated");
-        assert_eq!(state.display_status("c"), "stalled");
+        assert_eq!(state.display_status("c"), "blocked");
+        assert_eq!(runtime.blocker_kind(), BlockerKind::External);
         assert_eq!(runtime.activity, ActivityState::Idle);
-        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert_eq!(runtime.wait_state, WaitState::ExternalBlocked);
         assert!(matches!(runtime.terminal, TerminalState::None));
         assert_eq!(
             runtime.blocked_metadata.blocker_reason.as_deref(),
-            Some("acceptance-gated:pending_verification")
+            Some("external-blocked:pending_verification")
         );
         let unblock = runtime
             .blocked_metadata
             .unblock_metadata
             .as_deref()
             .expect("unblock metadata");
-        assert!(unblock.contains("phase=acceptance"));
-        assert!(unblock.contains("gate=acceptance"));
-        assert!(unblock.contains("resumable=true"));
+        assert!(unblock.contains("external blocker (pending_verification)"));
+        assert!(unblock.contains("reported by acceptance"));
+        assert!(unblock.contains("unblock when"));
+        assert!(unblock.contains("next action"));
         assert!(unblock.contains("docker image pull failed"));
+        assert!(runtime.blocked_metadata.unblock_condition.is_some());
+        assert_eq!(
+            runtime.blocked_metadata.blocker_origin.as_deref(),
+            Some("acceptance")
+        );
         assert_eq!(
             runtime.blocked_metadata.worktree_snapshot.as_deref(),
             Some("existing worktree and WIP context are preserved while stalled")
         );
     }
 
-    /// The whole Acceptance stall hold is this reducer entry. It suppresses
+    /// Acceptance facts that do not validate as a non-repository prerequisite
+    /// stay `stalled`. An unsupported category and a missing unblock condition
+    /// must not be promoted into an inferred external wait.
+    #[test]
+    fn test_unvalidated_acceptance_blocker_facts_remain_stalled() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker {
+                category: "acceptance_finding".to_string(),
+                phase: "acceptance".to_string(),
+                gate: "acceptance".to_string(),
+                error_summary: "unresolved finding".to_string(),
+                evidence: vec!["src/lib.rs:1 missing coverage".to_string()],
+                unblock_condition: None,
+                prerequisite_owner: None,
+                next_action: "resolve the finding and retry".to_string(),
+                resumable: true,
+                worktree_preserved: true,
+            },
+        });
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert_eq!(state.display_status("c"), "stalled");
+        assert_eq!(runtime.wait_state, WaitState::Stalled);
+        assert_eq!(runtime.blocker_kind(), BlockerKind::None);
+        assert!(runtime.blocked_metadata.unblock_condition.is_none());
+        // The unsupported category is reported first, and the detail keeps the
+        // reason so an operator can see exactly what disqualified the claim.
+        assert!(runtime
+            .blocked_metadata
+            .unblock_metadata
+            .as_deref()
+            .unwrap_or_default()
+            .contains("'acceptance_finding' is not one of"));
+    }
+
+    /// Dependency waits and external prerequisite waits are both `blocked` and
+    /// stay distinguishable, and neither is confused with an execution stall.
+    #[test]
+    fn test_dependency_and_external_waits_share_blocked_but_keep_their_kind() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(
+            vec![
+                "dependency-wait".to_string(),
+                "external-wait".to_string(),
+                "execution-stall".to_string(),
+            ],
+            0,
+        );
+        state.apply_execution_event(&ExecutionEvent::DependencyBlocked {
+            change_id: "dependency-wait".to_string(),
+            dependency_ids: vec!["alpha".to_string()],
+        });
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "external-wait".to_string(),
+            blocker: StalledBlocker::acceptance_external("credential", "STAGING_API_KEY is unset"),
+        });
+        let denial = crate::permission::classify_permission_denial(&[Some(
+            "Read permission denied for /private/secret.txt",
+        )])
+        .expect("denial should classify");
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: "execution-stall".to_string(),
+            blocker: StalledBlocker::permission_denial("acceptance", &denial),
+        });
+
+        assert_eq!(state.display_status("dependency-wait"), "blocked");
+        assert_eq!(state.display_status("external-wait"), "blocked");
+        assert_eq!(state.display_status("execution-stall"), "stalled");
+
+        assert_eq!(
+            state
+                .change_runtime("dependency-wait")
+                .unwrap()
+                .blocker_kind(),
+            BlockerKind::Dependency
+        );
+        assert_eq!(
+            state.change_runtime("external-wait").unwrap().blocker_kind(),
+            BlockerKind::External
+        );
+        assert_eq!(
+            state
+                .change_runtime("execution-stall")
+                .unwrap()
+                .blocker_kind(),
+            BlockerKind::None
+        );
+
+        // Every surface reads one reducer-derived view, so none of them has to
+        // re-derive `blocked` versus `stalled` or the blocker kind.
+        let views = state.all_blocker_views();
+        assert_eq!(views["dependency-wait"].status, "blocked");
+        assert_eq!(views["dependency-wait"].kind, BlockerKind::Dependency);
+        assert_eq!(views["external-wait"].status, "blocked");
+        assert_eq!(views["external-wait"].kind, BlockerKind::External);
+        assert_eq!(views["external-wait"].origin.as_deref(), Some("acceptance"));
+        assert!(views["external-wait"].unblock_condition.is_some());
+        assert_eq!(views["execution-stall"].status, "stalled");
+        assert_eq!(views["execution-stall"].kind, BlockerKind::None);
+        assert!(views["execution-stall"].unblock_condition.is_none());
+
+        // Only the external wait is suppressed as an external prerequisite hold.
+        assert_eq!(
+            state.externally_blocked_change_ids(),
+            HashSet::from(["external-wait".to_string()])
+        );
+
+        // The external wait never becomes a dependency edge.
+        assert!(state
+            .change_runtime("external-wait")
+            .unwrap()
+            .blocked_metadata
+            .blocker_reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("external-blocked:"));
+    }
+
+    /// The whole Acceptance-owned hold is this reducer entry. It suppresses
     /// ordinary dispatch, carries resumability, is dropped by an explicit retry,
     /// and — because it is only in memory — does not exist in a fresh reducer.
     #[test]
-    fn acceptance_stall_hold_is_in_memory_only_and_clears_on_retry_or_restart() {
+    fn acceptance_hold_is_in_memory_only_and_clears_on_retry_or_restart() {
         use crate::events::{ExecutionEvent, StalledBlocker};
 
         let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
@@ -3201,6 +3576,7 @@ mod tests {
         });
 
         let runtime = state.change_runtime("c").expect("runtime for c");
+        assert!(runtime.is_external_blocked());
         assert!(runtime.is_acceptance_stalled());
         assert!(runtime.is_resumable_acceptance_stall());
         assert_eq!(
@@ -3208,20 +3584,27 @@ mod tests {
             HashSet::from(["c".to_string()]),
             "the hold must be visible to queue classification"
         );
-        assert_eq!(state.display_status("c"), "stalled");
+        assert_eq!(state.display_status("c"), "blocked");
 
-        // An explicit operator retry consumes the hold in the same process.
+        // An explicit operator retry consumes the hold in the same process, so
+        // the blocked phase runs again and its fresh result reclassifies.
         state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
         assert!(state.acceptance_stalled_change_ids().is_empty());
-        assert!(!state
-            .change_runtime("c")
-            .expect("runtime for c")
-            .is_acceptance_stalled());
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert!(!runtime.is_acceptance_stalled());
+        assert!(!runtime.is_external_blocked());
+        assert_eq!(runtime.blocker_kind(), BlockerKind::None);
+        assert!(runtime.blocked_metadata.unblock_condition.is_none());
+        assert_eq!(state.display_status("c"), "queued");
 
         // A restart is a fresh reducer: no hold survives it, so the change is
         // dispatchable again and repository evidence decides the next action.
         let restarted = OrchestratorState::new(vec!["c".to_string()], 0);
         assert!(restarted.acceptance_stalled_change_ids().is_empty());
+        assert!(!restarted
+            .change_runtime("c")
+            .map(ChangeRuntimeState::is_external_blocked)
+            .unwrap_or(false));
     }
 
     /// Only Acceptance-phase blockers create an Acceptance hold. An apply-origin

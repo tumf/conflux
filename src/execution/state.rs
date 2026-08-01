@@ -751,6 +751,8 @@ mod tests {
         AcceptanceBlocker {
             category: "credential".to_string(),
             evidence: vec!["STAGING_API_KEY is unset in the verification environment".to_string()],
+            unblock_condition: "STAGING_API_KEY is present in the verification environment"
+                .to_string(),
             next_action: "provision STAGING_API_KEY then retry acceptance".to_string(),
             resumable: true,
             prerequisite_owner: Some("platform".to_string()),
@@ -780,12 +782,17 @@ mod tests {
     /// A validated blocker projects to the operator-facing view without any
     /// store, file, or revision binding: the whole hold is in memory.
     #[test]
-    fn validated_blocker_projects_to_the_stalled_presentation() {
+    fn validated_blocker_projects_to_the_external_blocked_presentation() {
         let blocker = external_blocker().to_stalled_blocker();
 
         assert_eq!(blocker.category, "credential");
         assert_eq!(blocker.phase, "acceptance");
         assert_eq!(blocker.gate, "acceptance");
+        assert_eq!(
+            blocker.unblock_condition.as_deref(),
+            Some("STAGING_API_KEY is present in the verification environment")
+        );
+        assert_eq!(blocker.prerequisite_owner.as_deref(), Some("platform"));
         assert_eq!(
             blocker.next_action,
             "provision STAGING_API_KEY then retry acceptance"
@@ -796,6 +803,81 @@ mod tests {
             blocker.evidence,
             vec!["STAGING_API_KEY is unset in the verification environment".to_string()]
         );
+
+        // The orchestrator, not the reporter, turns these facts into `blocked`.
+        match crate::orchestration::blocker_classification::classify_reported_facts(&blocker) {
+            crate::orchestration::blocker_classification::LifecycleClassification::ExternalBlocked(
+                info,
+            ) => {
+                assert_eq!(info.category, "credential");
+                assert_eq!(
+                    info.origin,
+                    crate::runtime::proposal::BlockerOrigin::Acceptance
+                );
+            }
+            other => panic!("expected external blocked, got {other:?}"),
+        }
+    }
+
+    /// Constitutional restart contract: a validated external blocked hold has no
+    /// durable backing, so deleting or never having runtime state cannot change
+    /// the next action for identical workspace contents, and stale blocked
+    /// metadata can never authorize acceptance PASS, archive, or merge.
+    #[tokio::test]
+    async fn external_blocked_runtime_state_has_no_restart_routing_authority() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{
+            BlockerKind, ExecutionMode, OrchestratorState, TerminalState,
+        };
+
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        commit(repo.path(), "Apply: test-change");
+
+        // Workspace evidence before any runtime state exists.
+        let routed_without_runtime_state =
+            detect_workspace_state("test-change", repo.path(), "main")
+                .await
+                .unwrap();
+
+        let mut held = OrchestratorState::with_mode(
+            vec!["test-change".to_string()],
+            1,
+            ExecutionMode::Parallel,
+        );
+        held.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "test-change".to_string(),
+            blocker: external_blocker().to_stalled_blocker(),
+        });
+        let runtime = held.change_runtime("test-change").expect("runtime entry");
+        assert_eq!(held.display_status("test-change"), "blocked");
+        assert_eq!(runtime.blocker_kind(), BlockerKind::External);
+        // The hold proves nothing about completion or archive readiness.
+        assert!(matches!(runtime.terminal, TerminalState::None));
+
+        // Identical workspace contents route identically while the hold exists.
+        let routed_with_runtime_state = detect_workspace_state("test-change", repo.path(), "main")
+            .await
+            .unwrap();
+        assert_eq!(routed_with_runtime_state, routed_without_runtime_state);
+
+        // A restart is a fresh reducer: the hold simply does not exist, and the
+        // complete unarchived apply revision returns to acceptance.
+        let restarted = OrchestratorState::with_mode(
+            vec!["test-change".to_string()],
+            1,
+            ExecutionMode::Parallel,
+        );
+        assert!(restarted.externally_blocked_change_ids().is_empty());
+        assert!(restarted.all_blocker_views().is_empty());
+        assert_eq!(
+            detect_workspace_state("test-change", repo.path(), "main")
+                .await
+                .unwrap(),
+            WorkspaceState::Applied,
+            "a complete unarchived apply must return to acceptance after restart"
+        );
+        assert_eq!(porcelain_status(repo.path()), "", "the worktree stays clean");
     }
 
     /// Legacy acceptance-origin markers migrate once, leave no residue, and are

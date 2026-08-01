@@ -148,13 +148,24 @@ pub enum RetryRoute {
     AcceptanceStall,
 }
 
-/// Decide the retry route for a change from its display status.
+/// Decide the retry route for a change from its reducer-derived status and
+/// blocker kind.
+///
+/// `blocked` is not retryable on its own: a dependency wait clears when the
+/// dependency completes, while a validated external prerequisite wait is
+/// explicitly retryable so the blocked phase can run again and supply fresh
+/// classification evidence.
 ///
 /// Returns `None` when the status carries no retryable evidence.
-pub fn classify_retry_route(display_status: &str) -> Option<RetryRoute> {
-    match display_status {
-        "error" => Some(RetryRoute::TerminalError),
-        "stalled" => Some(RetryRoute::AcceptanceStall),
+pub fn classify_retry_route(
+    display_status: &str,
+    blocker_kind: crate::orchestration::state::BlockerKind,
+) -> Option<RetryRoute> {
+    use crate::orchestration::state::BlockerKind;
+    match (display_status, blocker_kind) {
+        ("error", _) => Some(RetryRoute::TerminalError),
+        ("stalled", _) => Some(RetryRoute::AcceptanceStall),
+        ("blocked", BlockerKind::External) => Some(RetryRoute::AcceptanceStall),
         _ => None,
     }
 }
@@ -784,10 +795,21 @@ impl OperatorCommandService {
         matches!(reduce_outcome, ReduceOutcome::Changed(_))
     }
 
+    /// Reducer-derived blocker kind for a change.
+    async fn blocker_kind(&self, change_id: &str) -> crate::orchestration::state::BlockerKind {
+        self.state
+            .read()
+            .await
+            .change_runtime(change_id)
+            .map(crate::orchestration::state::ChangeRuntimeState::blocker_kind)
+            .unwrap_or_default()
+    }
+
     /// Route a retry request for one change.
     pub async fn retry_change(&self, change_id: &str) -> OperatorResult<RetryPlan> {
         let display_status = self.display_status(change_id).await;
-        let Some(route) = classify_retry_route(&display_status) else {
+        let blocker_kind = self.blocker_kind(change_id).await;
+        let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
             return Err(OperatorCommandError::RetryUnsupported {
                 change_id: change_id.to_string(),
                 display_status,
@@ -809,7 +831,8 @@ impl OperatorCommandService {
         };
         for change_id in change_ids {
             let display_status = self.display_status(change_id).await;
-            let Some(route) = classify_retry_route(&display_status) else {
+            let blocker_kind = self.blocker_kind(change_id).await;
+            let Some(route) = classify_retry_route(&display_status, blocker_kind) else {
                 continue;
             };
             let accepted = self.apply_retry_route(change_id, route).await;

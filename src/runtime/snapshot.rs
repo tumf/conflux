@@ -31,6 +31,7 @@ pub struct RuntimeCompatibilityView {
     pub queued: Vec<ProposalId>,
     pub stalled: Vec<ProposalId>,
     pub dependency_blocked: Vec<ProposalId>,
+    pub external_blocked: Vec<ProposalId>,
     pub merge_wait: Vec<ProposalId>,
     pub resolve_wait: Vec<ProposalId>,
     pub rejected: Vec<ProposalId>,
@@ -53,6 +54,7 @@ impl From<&ProjectRuntimeState> for RuntimeCompatibilityView {
             queued: project.queued_proposals(),
             stalled: project.stalled_proposals(),
             dependency_blocked: project.dependency_blocked_proposals(),
+            external_blocked: project.external_blocked_proposals(),
             merge_wait: project.merge_wait_proposals(),
             resolve_wait: project.resolve_wait_proposals(),
             rejected: project.rejected_proposals(),
@@ -130,5 +132,59 @@ mod tests {
             .compatibility
             .dispatch_candidates
             .is_empty());
+    }
+
+    /// Snapshots keep dependency and external waits in separate compatibility
+    /// buckets so no consumer has to re-derive the blocker kind.
+    #[test]
+    fn snapshot_separates_dependency_external_and_stalled_holds() {
+        use crate::runtime::proposal::{BlockerInfo, BlockerOrigin, ExternalBlockerInfo};
+        let mut orchestrator = OrchestratorRuntimeState::default();
+        let project = orchestrator.ensure_project(ProjectId::from("project-a"));
+        project.set_proposal_status(
+            ProposalId::from_change_id("dependency-wait"),
+            ProposalStatus::DependencyBlocked {
+                blocker: BlockerInfo::new("dependency", "waiting for alpha"),
+                revision: RuntimeRevision(1),
+            },
+        );
+        project.set_proposal_status(
+            ProposalId::from_change_id("external-wait"),
+            ProposalStatus::ExternalBlocked {
+                blocker: ExternalBlockerInfo {
+                    origin: BlockerOrigin::Apply,
+                    category: "infrastructure".to_string(),
+                    evidence: vec!["docker daemon is unavailable".to_string()],
+                    prerequisite_owner: None,
+                    unblock_condition: "the docker daemon accepts connections".to_string(),
+                    next_action: "start the docker daemon then retry apply".to_string(),
+                    resumable: true,
+                },
+                revision: RuntimeRevision(2),
+            },
+        );
+        project.set_proposal_status(
+            ProposalId::from_change_id("execution-stall"),
+            ProposalStatus::Stalled {
+                blocker: BlockerInfo::new("repeated_acceptance_findings", "no progress"),
+                revision: RuntimeRevision(3),
+            },
+        );
+
+        let snapshot = OrchestratorSnapshot::from(&orchestrator);
+        let compatibility = &snapshot.projects[0].compatibility;
+        assert_eq!(
+            compatibility.dependency_blocked,
+            vec![ProposalId::from_change_id("dependency-wait")]
+        );
+        assert_eq!(
+            compatibility.external_blocked,
+            vec![ProposalId::from_change_id("external-wait")]
+        );
+        assert_eq!(
+            compatibility.stalled,
+            vec![ProposalId::from_change_id("execution-stall")]
+        );
+        assert!(compatibility.dispatch_candidates.is_empty());
     }
 }

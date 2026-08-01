@@ -8,6 +8,7 @@ export type ChangeStatus =
   | 'idle'
   | 'not queued'
   | 'queued'
+  | 'blocked'
   | 'stalled'
   | 'applying'
   | 'accepting'
@@ -17,6 +18,33 @@ export type ChangeStatus =
   | 'merged'
   | 'rejected'
   | 'error';
+
+/**
+ * Why a change is `blocked`.
+ *
+ * Reducer-derived and closed: the dashboard never infers the kind from prose or
+ * status text.
+ */
+export type BlockerKind = 'dependency' | 'external';
+
+/**
+ * Every blocker kind the orchestrator can emit.
+ *
+ * The server payload is untrusted JSON, so the union above is erased at
+ * runtime. This array is the enforceable form of the same closed set.
+ */
+export const BLOCKER_KINDS: readonly BlockerKind[] = ['dependency', 'external'];
+
+/**
+ * Narrow an untrusted payload value to a {@link BlockerKind}.
+ *
+ * Anything outside the closed set — including a kind a newer orchestrator might
+ * add — becomes `null` rather than being rendered as an unknown badge. Showing a
+ * kind the dashboard does not understand would be a claim it cannot back.
+ */
+export function toBlockerKind(value: unknown): BlockerKind | null {
+  return BLOCKER_KINDS.includes(value as BlockerKind) ? (value as BlockerKind) : null;
+}
 
 export type RemoteSyncState = 'up_to_date' | 'ahead' | 'behind' | 'diverged' | 'unknown';
 
@@ -61,6 +89,15 @@ export interface RemoteChange {
   iteration_number: number | null;
   /** Whether this change is selected for execution */
   selected: boolean;
+  /**
+   * Machine-readable blocker kind for a `blocked` change.
+   *
+   * Absent or null for every other status, including `stalled`: an execution
+   * stall is not a wait on a named prerequisite.
+   */
+  blocker_kind?: BlockerKind | null;
+  /** Operator-facing blocker detail for a blocked or stalled change. */
+  blocker_detail?: string | null;
 }
 
 export interface RemoteLogEntry {

@@ -383,9 +383,13 @@ pub enum AcceptanceBlockerDecision {
     /// Bare or invalid blocker input with budget spent: terminal acceptance
     /// protocol error requiring explicit retry.
     ProtocolExhausted { error: String },
-    /// Validated structured external blocker: persist a revision-bound runtime
-    /// stall and display `stalled`.
-    Stall {
+    /// Structured external blocker facts that passed acceptance-payload
+    /// validation.
+    ///
+    /// This is still only *reported evidence*. The orchestrator's classifier
+    /// makes the final lifecycle call, which for a complete payload is external
+    /// `blocked` — never `stalled`, and never a dependency edge.
+    ExternalBlocker {
         blocker: crate::acceptance::AcceptanceBlocker,
     },
 }
@@ -421,10 +425,11 @@ pub fn decide_acceptance_blocker(
             })
         }
         AcceptanceResult::Stalled { blocker } => {
-            // A validated stall is a canonical verdict: it resets every protocol
-            // sequence and follows the durable stalled-hold path.
+            // A validated blocker payload is a canonical verdict: it resets every
+            // protocol sequence and hands complete facts to the orchestrator's
+            // lifecycle classifier.
             driver.observe_canonical_verdict();
-            Some(AcceptanceBlockerDecision::Stall {
+            Some(AcceptanceBlockerDecision::ExternalBlocker {
                 blocker: blocker.clone(),
             })
         }
@@ -1633,6 +1638,7 @@ mod tests {
         crate::acceptance::AcceptanceBlocker {
             category: "pending_verification".to_string(),
             evidence: vec!["managed verification job 42 is still running".to_string()],
+            unblock_condition: "managed verification job 42 reports a terminal result".to_string(),
             next_action: "wait for job 42 then retry acceptance".to_string(),
             resumable: true,
             prerequisite_owner: None,
@@ -2109,6 +2115,7 @@ mod tests {
         let blocker = crate::acceptance::AcceptanceBlocker {
             category: "human_decision".to_string(),
             evidence: vec!["the credential token auth story needs an owner decision".to_string()],
+            unblock_condition: "the architecture owner records a decision".to_string(),
             next_action: "owner decides the approach".to_string(),
             resumable: false,
             prerequisite_owner: Some("architecture".to_string()),
@@ -2122,7 +2129,7 @@ mod tests {
                 blocker: blocker.clone(),
             },
         ) {
-            Some(AcceptanceBlockerDecision::Stall { blocker: stalled }) => {
+            Some(AcceptanceBlockerDecision::ExternalBlocker { blocker: stalled }) => {
                 assert_eq!(stalled, blocker);
                 assert_eq!(
                     stalled.category, "human_decision",

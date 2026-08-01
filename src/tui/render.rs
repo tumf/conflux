@@ -586,7 +586,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 let parsed = split_remote_change_id(&change.id);
                 let display_id = parsed.change;
 
-                let status_text = format!("[{}]", change.display_status_cache.as_str());
+                let status_text = format!("[{}]", change.status_badge());
 
                 let mut spans = vec![
                     Span::styled(
@@ -910,14 +910,10 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                         };
                         (format!("{} ", spinner_char), status)
                     }
-                    "archived" | "merged" | "error" => (
-                        String::new(),
-                        format!("[{}]", change.display_status_cache.as_str()),
-                    ),
-                    _ => (
-                        String::new(),
-                        format!("[{}]", change.display_status_cache.as_str()),
-                    ),
+                    // A blocked row carries its blocker kind in the badge so a
+                    // dependency wait and an external prerequisite wait stay
+                    // distinguishable without a separate lookup.
+                    _ => (String::new(), format!("[{}]", change.status_badge())),
                 };
 
                 // Pre-calculate widths before moving values into Spans
@@ -3997,6 +3993,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 3,
             display_status_cache: "not queued".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
             selected: false,
