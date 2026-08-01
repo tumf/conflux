@@ -5,6 +5,7 @@ dependencies: []
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/parallel-execution/spec.md
+  - openspec/specs/orchestration-state/spec.md
   - openspec/specs/runtime-state/spec.md
   - src/parallel/acceptance_state.rs
   - src/parallel/dispatch.rs
@@ -43,7 +44,7 @@ This contradicts the core constitutional principle that workflow state must be d
 
 1. **Amend constitution law 1a**: Remove the narrow runtime pause/resume exception. All runtime state stays in-memory.
 2. **Remove disk persistence in code**: Stop calling `AcceptanceStallStore::save()`, stop loading on restart. Keep the struct and store as dead code for one release cycle, then remove in a follow-up.
-3. **Update specs**: Align `parallel-execution` spec with in-memory-only stall semantics.
+3. **Update specs**: Align `parallel-execution` and `orchestration-state` specs with in-memory-only stall semantics.
 4. **Clean up existing stall files**: On restart, delete any stale `~/.local/state/cflx/acceptance-stalls/` entries so they don't accumulate.
 
 ## Acceptance Criteria
@@ -65,8 +66,9 @@ This contradicts the core constitutional principle that workflow state must be d
 - Startup code cleans up existing stall files under `~/.local/state/cflx/acceptance-stalls/`.
 - Unit tests confirm: no file I/O during stalled hold lifecycle.
 - Integration test: restart a run where a change was stalled mid-run; acceptance re-runs.
-- `openspec/CONSTITUTION.md` law 1a is removed.
+- `openspec/CONSTITUTION.md` law 1a is removed and law 1 is amended to remove the dangling reference and clarify ephemeral in-memory state is permitted.
 - `openspec/specs/parallel-execution/spec.md` MODIFIED to remove out-of-worktree persistence language.
+- `openspec/specs/orchestration-state/spec.md` MODIFIED to replace out-of-worktree persistence with in-memory-only semantics.
 
 ## Out of Scope
 

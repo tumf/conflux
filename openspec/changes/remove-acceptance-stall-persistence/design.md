@@ -50,7 +50,7 @@ Restart:
 - `AcceptanceStallStore::load()` calls on restart
 - `persist_acceptance_stall()` and `record_acceptance_stall()` disk I/O
 - `preflight_acceptance_stall()` and `reconcile_acceptance_stall()` disk reads
-- Startup cleanup of stale `~/.local/state/cflx/acceptance-stalls/` entries
+- Stale `~/.local/state/cflx/acceptance-stalls/` entries are simply ignored (never loaded, never deleted — this avoids destroying holds of concurrently running old-cflx processes sharing the same state directory)
 
 ### Risk
 
