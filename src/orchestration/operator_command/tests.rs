@@ -922,6 +922,42 @@ async fn operator_command_acceptance_stalled_retry_requests_explicit_retry() {
     );
 }
 
+/// Explicit retry is refused for a non-resumable Acceptance hold: the blocker
+/// evidence the operator still owns must survive, and no ambiguous work may be
+/// dispatched past it.
+#[tokio::test]
+async fn operator_command_retry_refuses_a_non_resumable_acceptance_stall() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: StalledBlocker {
+                resumable: false,
+                ..acceptance_blocker()
+            },
+        });
+    }
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("refusal is not an error");
+    assert!(
+        plan.change_ids.is_empty() && plan.routes.is_empty() && !plan.explicit_retry,
+        "a non-resumable acceptance hold must dispatch nothing"
+    );
+
+    let guard = fixture.state.read().await;
+    assert_eq!(
+        guard.display_status("change-a"),
+        "stalled",
+        "a refused retry must keep the change stalled with its blocker evidence"
+    );
+    assert!(guard.acceptance_stalled_change_ids().contains("change-a"));
+}
+
 #[tokio::test]
 async fn operator_command_retry_rejects_changes_without_retryable_evidence() {
     let fixture = fixture(&["change-a"]);

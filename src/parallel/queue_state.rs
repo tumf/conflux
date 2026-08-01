@@ -2305,48 +2305,6 @@ impl ParallelExecutor {
         outcome
     }
 
-    /// Change IDs currently held by a valid runtime acceptance stall.
-    ///
-    /// Reconciliation failures are not errors here: a record that no longer
-    /// binds is quarantined by the loader and simply omitted, so repository
-    /// evidence resumes control.
-    async fn acceptance_stalled_change_ids(
-        &self,
-        queued: &[crate::openspec::Change],
-    ) -> HashSet<String> {
-        let mut stalled = HashSet::new();
-        if queued.is_empty() {
-            return stalled;
-        }
-        let Ok(store) = self.acceptance_stall_store() else {
-            return stalled;
-        };
-        let base_branch = self
-            .workspace_manager
-            .original_branch()
-            .unwrap_or_else(|| "main".to_string());
-
-        for change in queued {
-            let Ok(Some(workspace_path)) =
-                crate::vcs::git::get_worktree_path_for_change(&self.repo_root, &change.id).await
-            else {
-                continue;
-            };
-            if let Ok(Some(_record)) = crate::execution::state::load_valid_acceptance_stall(
-                &store,
-                &self.repo_root,
-                &workspace_path,
-                &change.id,
-                &base_branch,
-            )
-            .await
-            {
-                stalled.insert(change.id.clone());
-            }
-        }
-        stalled
-    }
-
     pub(super) async fn classify_queued_work(
         &self,
         queued: &[crate::openspec::Change],
@@ -2360,29 +2318,29 @@ impl ParallelExecutor {
             in_flight,
         );
 
-        let (reducer_queued, merge_wait_ids, resolve_wait_ids, reject_wait_ids) = self
-            .shared_orchestrator_state
-            .as_ref()
-            .and_then(|state| state.try_read().ok())
-            .map(|state| {
-                (
-                    state.queued_change_ids(),
-                    state.merge_wait_change_ids(),
-                    state.resolve_wait_change_ids(),
-                    state.reject_wait_change_ids(),
-                )
-            })
-            .unwrap_or_default();
+        // A validated acceptance stall is reducer-owned in-memory state, so it
+        // is read from the same snapshot as the other wait lanes. Nothing is
+        // loaded from disk: after a restart the reducer holds no stall, the
+        // change is dispatched again, and workspace evidence routes a complete
+        // unarchived apply revision back to acceptance.
+        let (reducer_queued, merge_wait_ids, resolve_wait_ids, reject_wait_ids, acceptance_stalled) =
+            self.shared_orchestrator_state
+                .as_ref()
+                .and_then(|state| state.try_read().ok())
+                .map(|state| {
+                    (
+                        state.queued_change_ids(),
+                        state.merge_wait_change_ids(),
+                        state.resolve_wait_change_ids(),
+                        state.reject_wait_change_ids(),
+                        state.acceptance_stalled_change_ids(),
+                    )
+                })
+                .unwrap_or_default();
 
         let merge_wait_set: HashSet<String> = merge_wait_ids.into_iter().collect();
         let resolve_wait_set: HashSet<String> = resolve_wait_ids.into_iter().collect();
         let reject_wait_set: HashSet<String> = reject_wait_ids.into_iter().collect();
-
-        // A reconciled acceptance stall keeps its change out of ordinary
-        // dispatch entirely. Reconciliation runs here rather than at dispatch
-        // time so a record that has lost its binding is quarantined and the
-        // change becomes dispatchable again on the very next cycle.
-        let acceptance_stalled = self.acceptance_stalled_change_ids(queued).await;
 
         for change in queued {
             seen_ids.insert(change.id.clone());

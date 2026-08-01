@@ -26,12 +26,13 @@ In-memory state MAY control ordinary dispatch suppression, stalled presentation,
 - **AND** Conflux runs Acceptance again
 - **AND** it does not infer prior PASS, enter archive, or rerun Apply solely from missing stall state
 
-#### Scenario: stale stall files are cleaned up on startup
+#### Scenario: stale stall files are ignored, not consulted or removed
 
 - **GIVEN** files exist under `~/.local/state/cflx/acceptance-stalls/` from a previous version
-- **WHEN** a new Conflux process starts
-- **THEN** those files are deleted before acceptance dispatch begins
-- **AND** the deletion does not mutate any managed worktree
+- **WHEN** a new Conflux process starts and dispatches the same change
+- **THEN** no stall file is read and none controls routing
+- **AND** the files are left in place so a concurrent older process keeps its own holds
+- **AND** no managed worktree is mutated
 
 #### Scenario: explicit retry resumes Acceptance from in-memory hold
 

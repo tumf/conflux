@@ -902,11 +902,11 @@ impl FindingRepairLedger {
 /// Structured, mode-independent diagnostics for a repair stop.
 ///
 /// Serial and parallel build this from the same inputs so equivalent
-/// observations produce equivalent operator evidence. Per constitutional law 1a
-/// this record controls only stalled presentation, dispatch suppression, and
-/// explicit-retry eligibility: it never proves implementation completion,
-/// finding closure, Acceptance PASS, archive readiness, or merge eligibility,
-/// and it is never written into a managed worktree.
+/// observations produce equivalent operator evidence. It is in-memory state for
+/// one process lifetime and controls only stalled presentation, dispatch
+/// suppression, and explicit-retry eligibility: it never proves implementation
+/// completion, finding closure, Acceptance PASS, archive readiness, or merge
+/// eligibility, and it is never written into a managed worktree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptanceRepairStop {
     pub change_id: String,

@@ -37,7 +37,7 @@ pub const SUPPORTED_BLOCKER_CATEGORIES: &[&str] = &[
 ///
 /// Every field here is authored by the acceptance reviewer. A payload that
 /// satisfies [`validate_acceptance_blocker`] is the *only* input that may enter
-/// the durable `stalled` hold; anything weaker stays on the bounded
+/// the in-memory `stalled` hold; anything weaker stays on the bounded
 /// protocol-error path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptanceBlocker {
@@ -53,6 +53,30 @@ pub struct AcceptanceBlocker {
     pub prerequisite_owner: Option<String>,
     /// Optional stable identifiers for the evidence entries.
     pub evidence_ids: Vec<String>,
+}
+
+impl AcceptanceBlocker {
+    /// Operator-facing blocker view for lifecycle events and status displays.
+    ///
+    /// The category is copied verbatim; it is never re-derived from prose. This
+    /// is the single projection serial and parallel share, so equivalent
+    /// blockers reach the reducer as equivalent `stalled` presentations.
+    pub fn to_stalled_blocker(&self) -> crate::events::StalledBlocker {
+        crate::events::StalledBlocker {
+            category: self.category.clone(),
+            phase: "acceptance".to_string(),
+            gate: "acceptance".to_string(),
+            error_summary: format!(
+                "validated external acceptance blocker ({}): {}",
+                self.category,
+                self.evidence.join(" | ")
+            ),
+            evidence: self.evidence.clone(),
+            next_action: self.next_action.clone(),
+            resumable: self.resumable,
+            worktree_preserved: true,
+        }
+    }
 }
 
 /// Why a `gated`/legacy-`blocked` verdict failed to qualify as a validated

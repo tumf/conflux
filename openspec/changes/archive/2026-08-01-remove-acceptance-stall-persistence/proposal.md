@@ -45,14 +45,14 @@ This contradicts the core constitutional principle that workflow state must be d
 1. **Amend constitution law 1a**: Remove the narrow runtime pause/resume exception. All runtime state stays in-memory.
 2. **Remove disk persistence in code**: Stop calling `AcceptanceStallStore::save()`, stop loading on restart. Keep the struct and store as dead code for one release cycle, then remove in a follow-up.
 3. **Update specs**: Align `parallel-execution` and `orchestration-state` specs with in-memory-only stall semantics.
-4. **Clean up existing stall files**: On restart, delete any stale `~/.local/state/cflx/acceptance-stalls/` entries so they don't accumulate.
+4. **Ignore existing stall files**: Never load `~/.local/state/cflx/acceptance-stalls/` entries again. They are also never deleted, so a concurrently running older Conflux sharing the same state directory does not lose its holds.
 
 ## Acceptance Criteria
 
 - Acceptance stall is recorded only in `OrchestratorState` in-memory (`WaitState::Stalled`).
 - No JSON file is written to `~/.local/state/cflx/acceptance-stalls/` during acceptance.
 - Process restart always re-runs acceptance for applied-but-unarchived workspaces.
-- Existing stale stall files under `~/.local/state/cflx/acceptance-stalls/` are cleaned up on startup.
+- Existing stale stall files under `~/.local/state/cflx/acceptance-stalls/` are never read and never deleted.
 - Explicit operator retry of a stalled change still works (in-memory: consumes the hold, resumes acceptance).
 - Constitution law 1a is removed.
 
@@ -63,7 +63,7 @@ This contradicts the core constitutional principle that workflow state must be d
 - `preflight_acceptance_stall()` in `src/serial_run_service.rs` no longer loads from disk.
 - `reconcile_acceptance_stall()` in `src/parallel/acceptance_state.rs` no longer reads disk records.
 - `load_valid_acceptance_stall()` in `src/execution/state.rs` is removed or refactored.
-- Startup code cleans up existing stall files under `~/.local/state/cflx/acceptance-stalls/`.
+- No startup or dispatch code reads, writes, or deletes files under `~/.local/state/cflx/acceptance-stalls/`.
 - Unit tests confirm: no file I/O during stalled hold lifecycle.
 - Integration test: restart a run where a change was stalled mid-run; acceptance re-runs.
 - `openspec/CONSTITUTION.md` law 1a is removed and law 1 is amended to remove the dangling reference and clarify ephemeral in-memory state is permitted.

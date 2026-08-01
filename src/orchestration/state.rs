@@ -137,6 +137,17 @@ pub struct BlockedMetadata {
     pub unblock_metadata: Option<String>,
     /// Optional snapshot of worktree context captured when blocker was recorded.
     pub worktree_snapshot: Option<String>,
+    /// True when the hold originated in the Acceptance phase.
+    ///
+    /// This is the whole Acceptance stall hold. It is reducer-owned in-memory
+    /// state for one process lifetime — nothing is written outside the managed
+    /// worktree — and it may only suppress ordinary dispatch, drive the
+    /// `stalled` presentation, and make an explicit retry eligible. It never
+    /// proves PASS, archive readiness, or merge eligibility.
+    pub acceptance_stall: bool,
+    /// Whether the blocker declared that work can resume once the external
+    /// prerequisite is satisfied.
+    pub resumable: bool,
 }
 
 /// Terminal outcome for a change (once reached, no further transitions).
@@ -208,6 +219,8 @@ impl ChangeRuntimeState {
             blocker_reason: Some(blocker_reason.into()),
             unblock_metadata: Some(unblock_metadata.into()),
             worktree_snapshot: Some(worktree_snapshot.into()),
+            acceptance_stall: false,
+            resumable: false,
         };
     }
 
@@ -237,6 +250,37 @@ impl ChangeRuntimeState {
         self.wait_state = WaitState::Stalled;
         self.terminal = TerminalState::None;
         self.set_blocked_metadata(blocker_reason, unblock_metadata, worktree_snapshot);
+    }
+
+    /// Record a recoverable stalled state that Acceptance owns.
+    ///
+    /// Identical to [`Self::transition_to_stalled`] except that it also marks
+    /// the hold as Acceptance-owned and carries the blocker's resumability,
+    /// which together keep the change out of ordinary dispatch until an
+    /// explicit retry of a resumable hold — or a restart — clears it.
+    fn transition_to_acceptance_stalled(
+        &mut self,
+        blocker_reason: impl Into<String>,
+        unblock_metadata: impl Into<String>,
+        worktree_snapshot: impl Into<String>,
+        resumable: bool,
+    ) {
+        self.transition_to_stalled(blocker_reason, unblock_metadata, worktree_snapshot);
+        self.blocked_metadata.acceptance_stall = true;
+        self.blocked_metadata.resumable = resumable;
+    }
+
+    /// Whether an Acceptance-owned in-memory stall currently holds this change.
+    pub fn is_acceptance_stalled(&self) -> bool {
+        matches!(self.wait_state, WaitState::Stalled) && self.blocked_metadata.acceptance_stall
+    }
+
+    /// Whether the current Acceptance hold allows an acceptance-only retry.
+    ///
+    /// A non-resumable hold keeps its blocker evidence instead: retrying past it
+    /// would dispatch ambiguous work the operator has not unblocked.
+    pub fn is_resumable_acceptance_stall(&self) -> bool {
+        self.is_acceptance_stalled() && self.blocked_metadata.resumable
     }
 
     /// Check whether this runtime state represents active execution
@@ -541,6 +585,20 @@ impl OrchestratorState {
     /// Get skipped change IDs.
     pub fn skipped_change_ids(&self) -> &HashSet<String> {
         &self.skipped_change_ids
+    }
+
+    /// Change IDs currently held by an in-memory Acceptance stall.
+    ///
+    /// This is the whole hold: nothing is persisted, so a restarted process
+    /// returns an empty set and repository evidence alone decides the next
+    /// action. Apply-origin and dependency blockers are deliberately excluded —
+    /// only an Acceptance-phase blocker observation sets the flag.
+    pub fn acceptance_stalled_change_ids(&self) -> HashSet<String> {
+        self.change_runtime
+            .iter()
+            .filter(|(_, rt)| rt.is_acceptance_stalled())
+            .map(|(change_id, _)| change_id.clone())
+            .collect()
     }
 
     /// Mark a change as stalled.
@@ -1857,21 +1915,36 @@ impl OrchestratorState {
             ExecutionEvent::AcceptanceGated { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.transition_to_stalled(
+                    rt.transition_to_acceptance_stalled(
                         format!("acceptance-gated:{}", blocker.category),
                         blocker.summary(),
                         blocker.worktree_snapshot(),
+                        blocker.resumable,
                     );
                 }
             }
             ExecutionEvent::ExecutionBlocked { change_id, blocker } => {
                 let rt = self.runtime_entry(change_id);
                 if !rt.is_terminal() && !rt.dequeued {
-                    rt.transition_to_stalled(
-                        format!("execution-blocked:{}", blocker.category),
-                        blocker.summary(),
-                        blocker.worktree_snapshot(),
-                    );
+                    let blocker_reason = format!("execution-blocked:{}", blocker.category);
+                    // An Acceptance-phase blocker (for example a repeated
+                    // permission denial during acceptance) holds dispatch the
+                    // same way a validated acceptance blocker does. Apply-phase
+                    // blockers keep their own conservative handling.
+                    if blocker.phase == "acceptance" {
+                        rt.transition_to_acceptance_stalled(
+                            blocker_reason,
+                            blocker.summary(),
+                            blocker.worktree_snapshot(),
+                            blocker.resumable,
+                        );
+                    } else {
+                        rt.transition_to_stalled(
+                            blocker_reason,
+                            blocker.summary(),
+                            blocker.worktree_snapshot(),
+                        );
+                    }
                 }
             }
 
@@ -3111,6 +3184,88 @@ mod tests {
         assert_eq!(
             runtime.blocked_metadata.worktree_snapshot.as_deref(),
             Some("existing worktree and WIP context are preserved while stalled")
+        );
+    }
+
+    /// The whole Acceptance stall hold is this reducer entry. It suppresses
+    /// ordinary dispatch, carries resumability, is dropped by an explicit retry,
+    /// and — because it is only in memory — does not exist in a fresh reducer.
+    #[test]
+    fn acceptance_stall_hold_is_in_memory_only_and_clears_on_retry_or_restart() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker::acceptance_external("credential", "STAGING_API_KEY is unset"),
+        });
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert!(runtime.is_acceptance_stalled());
+        assert!(runtime.is_resumable_acceptance_stall());
+        assert_eq!(
+            state.acceptance_stalled_change_ids(),
+            HashSet::from(["c".to_string()]),
+            "the hold must be visible to queue classification"
+        );
+        assert_eq!(state.display_status("c"), "stalled");
+
+        // An explicit operator retry consumes the hold in the same process.
+        state.apply_command(ReducerCommand::AddToQueue("c".to_string()));
+        assert!(state.acceptance_stalled_change_ids().is_empty());
+        assert!(!state
+            .change_runtime("c")
+            .expect("runtime for c")
+            .is_acceptance_stalled());
+
+        // A restart is a fresh reducer: no hold survives it, so the change is
+        // dispatchable again and repository evidence decides the next action.
+        let restarted = OrchestratorState::new(vec!["c".to_string()], 0);
+        assert!(restarted.acceptance_stalled_change_ids().is_empty());
+    }
+
+    /// Only Acceptance-phase blockers create an Acceptance hold. An apply-origin
+    /// blocker still stalls, but must not be mistaken for an acceptance-only
+    /// retry candidate.
+    #[test]
+    fn apply_phase_blocker_stalls_without_creating_an_acceptance_hold() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let denial = crate::permission::classify_permission_denial(&[Some(
+            "Read permission denied for /private/secret.txt",
+        )])
+        .expect("denial should classify");
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker::permission_denial("apply", &denial),
+        });
+
+        assert_eq!(state.display_status("c"), "stalled");
+        assert!(state.acceptance_stalled_change_ids().is_empty());
+    }
+
+    /// A non-resumable Acceptance blocker holds dispatch but must not authorize
+    /// an acceptance-only retry past evidence the operator still owns.
+    #[test]
+    fn non_resumable_acceptance_hold_is_not_retry_eligible() {
+        use crate::events::{ExecutionEvent, StalledBlocker};
+
+        let mut state = OrchestratorState::new(vec!["c".to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "c".to_string(),
+            blocker: StalledBlocker {
+                resumable: false,
+                ..StalledBlocker::acceptance_external("human_decision", "owner must decide")
+            },
+        });
+
+        let runtime = state.change_runtime("c").expect("runtime for c");
+        assert!(runtime.is_acceptance_stalled());
+        assert!(!runtime.is_resumable_acceptance_stall());
+        assert_eq!(
+            state.acceptance_stalled_change_ids(),
+            HashSet::from(["c".to_string()])
         );
     }
 

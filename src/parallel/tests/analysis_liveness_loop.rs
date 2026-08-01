@@ -146,8 +146,6 @@ async fn run_scheduler_loop(
         test_config(workspace_base.path()),
         Some(event_tx),
     );
-    let stall_state_root = TempDir::new().expect("create stall state root");
-    executor.set_acceptance_stall_state_root(stall_state_root.path().to_path_buf());
     let cancel_token = CancellationToken::new();
     executor.set_cancel_token(cancel_token.clone());
 

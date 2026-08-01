@@ -38,8 +38,7 @@ use tracing::debug;
 use crate::error::{OrchestratorError, Result};
 use crate::execution::archive::is_archive_commit_complete;
 use crate::parallel::acceptance_state::{
-    parse_blocked_marker, reconcile_acceptance_stall, repository_identity, worktree_identity,
-    AcceptanceStallRecord, AcceptanceStallStore, StallReconciliation, WorkspaceFacts,
+    parse_blocked_marker, repository_identity, worktree_identity, WorkspaceFacts,
 };
 
 /// Workspace state for resume detection.
@@ -620,6 +619,11 @@ pub async fn detect_workspace_state(
 /// Every value here is read from git and the filesystem right now. The stall
 /// record contributes only the `apply_revision` being checked, so a stale or
 /// forged record cannot make its own binding look valid.
+///
+/// Retired along with the stall record itself: no production path calls this any
+/// more. Kept for one release cycle, then removed with
+/// [`crate::parallel::acceptance_state::AcceptanceStallRecord`].
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle.
 pub async fn gather_workspace_facts(
     repo_root: &Path,
     workspace_path: &Path,
@@ -657,6 +661,7 @@ pub async fn gather_workspace_facts(
 
 /// Canonical string form of a worktree path, so equivalent paths compare equal
 /// across symlinked and relative spellings.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle.
 pub fn canonical_path_string(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -665,6 +670,7 @@ pub fn canonical_path_string(path: &Path) -> String {
 }
 
 /// Whether `revision` resolves to an existing commit object in `workspace_path`.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle.
 async fn revision_exists(workspace_path: &Path, revision: &str) -> bool {
     if revision.trim().is_empty() {
         return false;
@@ -676,84 +682,6 @@ async fn revision_exists(workspace_path: &Path, revision: &str) -> bool {
         .await
         .map(|output| output.status.success())
         .unwrap_or(false)
-}
-
-/// Persist a validated external acceptance blocker as a revision-bound runtime
-/// hold.
-///
-/// Shared by serial and parallel orchestration so equivalent blockers produce
-/// equivalent records. The write lands outside the worktree, so the managed
-/// worktree stays exactly as acceptance left it — clean, with the apply commit
-/// intact.
-#[allow(clippy::too_many_arguments)]
-pub async fn persist_acceptance_stall(
-    store: &AcceptanceStallStore,
-    repo_root: &Path,
-    workspace_path: &Path,
-    change_id: &str,
-    base_branch: &str,
-    apply_revision: &str,
-    blocker: &crate::acceptance::AcceptanceBlocker,
-    retry_count: u32,
-) -> Result<AcceptanceStallRecord> {
-    let facts = gather_workspace_facts(
-        repo_root,
-        workspace_path,
-        change_id,
-        apply_revision,
-        base_branch,
-    )
-    .await?;
-    store.save(&AcceptanceStallRecord::new(
-        &facts,
-        blocker,
-        apply_revision,
-        retry_count,
-    ))
-}
-
-/// Load and reconcile the acceptance stall hold for a change.
-///
-/// Returns the record only when it still binds to the current repository,
-/// worktree, active change, and apply revision. A record that fails
-/// reconciliation is quarantined with its diagnostic and reported as absent, so
-/// routing falls back to repository evidence.
-///
-/// This never inspects or mutates the worktree contents, so a stalled change's
-/// worktree stays exactly as acceptance left it.
-pub async fn load_valid_acceptance_stall(
-    store: &AcceptanceStallStore,
-    repo_root: &Path,
-    workspace_path: &Path,
-    change_id: &str,
-    base_branch: &str,
-) -> Result<Option<AcceptanceStallRecord>> {
-    let repository_id = repository_identity(repo_root);
-    let Some(record) = store.load(&repository_id, change_id)? else {
-        return Ok(None);
-    };
-
-    let facts = gather_workspace_facts(
-        repo_root,
-        workspace_path,
-        change_id,
-        &record.apply_revision,
-        base_branch,
-    )
-    .await?;
-
-    match reconcile_acceptance_stall(&record, &facts) {
-        StallReconciliation::Valid => Ok(Some(record)),
-        StallReconciliation::Invalid { reason } => {
-            debug!(
-                change_id = %change_id,
-                reason = %reason,
-                "Quarantining acceptance stall record that lost its binding"
-            );
-            store.quarantine(&repository_id, change_id, &reason)?;
-            Ok(None)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -798,7 +726,7 @@ mod tests {
     use crate::acceptance::AcceptanceBlocker;
     use crate::parallel::acceptance_state::{
         migrate_legacy_acceptance_marker, write_legacy_acceptance_marker, AcceptanceRetryContext,
-        BlockedMarkerOrigin, MarkerMigration,
+        AcceptanceStallStore, BlockedMarkerOrigin, MarkerMigration,
     };
 
     fn head_revision(repo_root: &Path) -> String {
@@ -830,132 +758,14 @@ mod tests {
         }
     }
 
-    /// Entering a validated stall must leave the managed worktree exactly as
-    /// acceptance found it: clean, with the apply commit intact.
-    #[tokio::test]
-    async fn acceptance_stall_persists_outside_a_clean_worktree() {
-        let repo = TempDir::new().unwrap();
-        let state_root = TempDir::new().unwrap();
-        init_git_repo(repo.path());
-        commit(repo.path(), "Apply: test-change");
-        let apply_revision = head_revision(repo.path());
-
-        let store = AcceptanceStallStore::new(state_root.path());
-        let record = persist_acceptance_stall(
-            &store,
-            repo.path(),
-            repo.path(),
-            "test-change",
-            "main",
-            &apply_revision,
-            &external_blocker(),
-            2,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(record.category, "credential");
-        assert_eq!(record.apply_revision, apply_revision);
-        assert_eq!(record.phase, "acceptance");
-        assert_eq!(record.retry_count, 2);
-        assert!(record.resumable);
-        assert_eq!(record.prerequisite_owner.as_deref(), Some("platform"));
-        assert!(!record.created_at.is_empty() && !record.updated_at.is_empty());
-
-        // Nothing entered the repository at all.
-        assert_eq!(porcelain_status(repo.path()), "");
-        assert!(!repo
-            .path()
-            .join("openspec/changes/test-change/APPLY_BLOCKED")
-            .exists());
-        assert!(!repo.path().join(".cflx/acceptance-state.json").exists());
-        assert_eq!(head_revision(repo.path()), apply_revision);
-
-        // The hold is reconstructed verbatim after a "restart".
-        let restored =
-            load_valid_acceptance_stall(&store, repo.path(), repo.path(), "test-change", "main")
-                .await
-                .unwrap()
-                .expect("matching record must survive restart");
-        assert_eq!(restored, record);
-
-        let blocker = restored.to_stalled_blocker();
-        assert_eq!(blocker.category, "credential");
-        assert_eq!(blocker.phase, "acceptance");
-        assert_eq!(
-            blocker.next_action,
-            "provision STAGING_API_KEY then retry acceptance"
-        );
-        assert!(blocker.resumable);
-        assert!(blocker.worktree_preserved);
-    }
-
-    /// The workspace state machine must stay entirely repository-derived: a
-    /// runtime stall never shadows the apply commit or invents archive
-    /// readiness.
-    #[tokio::test]
-    async fn runtime_stall_does_not_shadow_repository_derived_workspace_state() {
-        let repo = TempDir::new().unwrap();
-        let state_root = TempDir::new().unwrap();
-        init_git_repo(repo.path());
-        commit(repo.path(), "Initial commit");
-        commit(repo.path(), "Apply: test-change");
-        let apply_revision = head_revision(repo.path());
-
-        let before = detect_workspace_state("test-change", repo.path(), "main")
-            .await
-            .unwrap();
-
-        let store = AcceptanceStallStore::new(state_root.path());
-        persist_acceptance_stall(
-            &store,
-            repo.path(),
-            repo.path(),
-            "test-change",
-            "main",
-            &apply_revision,
-            &external_blocker(),
-            1,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            detect_workspace_state("test-change", repo.path(), "main")
-                .await
-                .unwrap(),
-            before,
-            "runtime stall state must not change repository-derived workspace state"
-        );
-        assert_ne!(
-            detect_workspace_state("test-change", repo.path(), "main")
-                .await
-                .unwrap(),
-            WorkspaceState::Archived
-        );
-        assert_eq!(porcelain_status(repo.path()), "");
-    }
-
-    /// Losing the runtime record must fail safe to acceptance, never to an
-    /// inferred PASS or an archive jump.
+    /// Losing (or never having) runtime stall state must fail safe to
+    /// acceptance, never to an inferred PASS or an archive jump. This is the
+    /// restart contract now that no stall record exists on disk at all.
     #[tokio::test]
     async fn missing_runtime_state_leaves_a_complete_apply_routed_to_acceptance() {
         let repo = TempDir::new().unwrap();
-        let state_root = TempDir::new().unwrap();
         init_git_repo(repo.path());
         commit(repo.path(), "Apply: test-change");
-
-        let store = AcceptanceStallStore::new(state_root.path());
-        assert!(load_valid_acceptance_stall(
-            &store,
-            repo.path(),
-            repo.path(),
-            "test-change",
-            "main"
-        )
-        .await
-        .unwrap()
-        .is_none());
 
         let state = detect_workspace_state("test-change", repo.path(), "main")
             .await
@@ -967,191 +777,25 @@ mod tests {
         );
     }
 
-    /// Reconciliation matrix over real git fixtures: every broken binding must
-    /// quarantine the record and hand routing back to repository evidence.
-    #[tokio::test]
-    async fn stale_records_are_quarantined_and_cannot_control_routing() {
-        let repo = TempDir::new().unwrap();
-        let other_repo = TempDir::new().unwrap();
-        init_git_repo(repo.path());
-        init_git_repo(other_repo.path());
-        commit(repo.path(), "Apply: test-change");
-        commit(other_repo.path(), "unrelated");
-        let apply_revision = head_revision(repo.path());
-        let other_repo_identity = repository_identity(other_repo.path());
+    /// A validated blocker projects to the operator-facing view without any
+    /// store, file, or revision binding: the whole hold is in memory.
+    #[test]
+    fn validated_blocker_projects_to_the_stalled_presentation() {
+        let blocker = external_blocker().to_stalled_blocker();
 
-        // Each case breaks exactly one binding of an otherwise-valid record. The
-        // mutated record is planted at the *correct* storage key so the loader
-        // finds it and reconciliation — not key lookup — is what rejects it.
-        type BreakBinding = Box<dyn Fn(&mut AcceptanceStallRecord)>;
-        let cases: Vec<(&str, BreakBinding)> = vec![
-            (
-                "schema",
-                Box::new(|record: &mut AcceptanceStallRecord| {
-                    record.schema = "acceptance-stall-v99".to_string()
-                }),
-            ),
-            (
-                "repository",
-                Box::new({
-                    let other = other_repo_identity.clone();
-                    move |record: &mut AcceptanceStallRecord| record.repository_id = other.clone()
-                }),
-            ),
-            (
-                "worktree identity (deleted, recreated, or path reused)",
-                Box::new(|record: &mut AcceptanceStallRecord| {
-                    record.worktree_id = "gitdir: /other/.git/worktrees/ws-other".to_string()
-                }),
-            ),
-            (
-                "worktree path",
-                Box::new(|record: &mut AcceptanceStallRecord| {
-                    record.worktree_path = "/moved/elsewhere".to_string()
-                }),
-            ),
-            (
-                "apply revision",
-                Box::new(|record: &mut AcceptanceStallRecord| {
-                    record.apply_revision = "0".repeat(40)
-                }),
-            ),
-        ];
-
-        let repository_id = repository_identity(repo.path());
-        for (label, mutate) in cases {
-            let state_root = TempDir::new().unwrap();
-            let store = AcceptanceStallStore::new(state_root.path());
-            let mut record = persist_acceptance_stall(
-                &store,
-                repo.path(),
-                repo.path(),
-                "test-change",
-                "main",
-                &apply_revision,
-                &external_blocker(),
-                0,
-            )
-            .await
-            .unwrap();
-            mutate(&mut record);
-
-            let path = store.record_path(&repository_id, "test-change");
-            std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-
-            let loaded = load_valid_acceptance_stall(
-                &store,
-                repo.path(),
-                repo.path(),
-                "test-change",
-                "main",
-            )
-            .await
-            .unwrap();
-            assert!(
-                loaded.is_none(),
-                "a record with a broken {label} binding must not control routing"
-            );
-            assert!(
-                !path.exists(),
-                "the invalid {label} record must be quarantined, not left in place"
-            );
-            assert_eq!(
-                detect_workspace_state("test-change", repo.path(), "main")
-                    .await
-                    .unwrap(),
-                WorkspaceState::Applied,
-                "routing must fall back to repository evidence for broken {label}"
-            );
-            assert_eq!(porcelain_status(repo.path()), "");
-        }
-    }
-
-    /// A record whose change is archived or merged loses authority even though
-    /// every path and revision still matches.
-    #[tokio::test]
-    async fn archived_change_invalidates_its_stall_record() {
-        let repo = TempDir::new().unwrap();
-        let state_root = TempDir::new().unwrap();
-        init_git_repo(repo.path());
-        commit(repo.path(), "Apply: test-change");
-        let apply_revision = head_revision(repo.path());
-
-        let store = AcceptanceStallStore::new(state_root.path());
-        let record = persist_acceptance_stall(
-            &store,
-            repo.path(),
-            repo.path(),
-            "test-change",
-            "main",
-            &apply_revision,
-            &external_blocker(),
-            0,
-        )
-        .await
-        .unwrap();
-
-        let facts = WorkspaceFacts {
-            change_active: false,
-            ..gather_workspace_facts(
-                repo.path(),
-                repo.path(),
-                "test-change",
-                &apply_revision,
-                "main",
-            )
-            .await
-            .unwrap()
-        };
-        match reconcile_acceptance_stall(&record, &facts) {
-            StallReconciliation::Invalid { reason } => {
-                assert!(reason.contains("archived or merged"), "got {reason}")
-            }
-            StallReconciliation::Valid => panic!("an archived change must invalidate its hold"),
-        }
-    }
-
-    /// Explicit retry consumes the hold transactionally and is idempotent, so a
-    /// retry racing a restart cannot double-consume or fail.
-    #[tokio::test]
-    async fn explicit_retry_consumption_is_idempotent_and_worktree_neutral() {
-        let repo = TempDir::new().unwrap();
-        let state_root = TempDir::new().unwrap();
-        init_git_repo(repo.path());
-        commit(repo.path(), "Apply: test-change");
-        let apply_revision = head_revision(repo.path());
-
-        let store = AcceptanceStallStore::new(state_root.path());
-        let record = persist_acceptance_stall(
-            &store,
-            repo.path(),
-            repo.path(),
-            "test-change",
-            "main",
-            &apply_revision,
-            &external_blocker(),
-            0,
-        )
-        .await
-        .unwrap();
-
-        assert!(store.consume(&record.repository_id, "test-change").unwrap());
-        assert!(
-            !store.consume(&record.repository_id, "test-change").unwrap(),
-            "consuming an absent hold must be a safe no-op"
+        assert_eq!(blocker.category, "credential");
+        assert_eq!(blocker.phase, "acceptance");
+        assert_eq!(blocker.gate, "acceptance");
+        assert_eq!(
+            blocker.next_action,
+            "provision STAGING_API_KEY then retry acceptance"
         );
-        assert!(load_valid_acceptance_stall(
-            &store,
-            repo.path(),
-            repo.path(),
-            "test-change",
-            "main"
-        )
-        .await
-        .unwrap()
-        .is_none());
-        assert_eq!(porcelain_status(repo.path()), "");
-        assert_eq!(head_revision(repo.path()), apply_revision);
+        assert!(blocker.resumable);
+        assert!(blocker.worktree_preserved);
+        assert_eq!(
+            blocker.evidence,
+            vec!["STAGING_API_KEY is unset in the verification environment".to_string()]
+        );
     }
 
     /// Legacy acceptance-origin markers migrate once, leave no residue, and are
@@ -1210,11 +854,10 @@ mod tests {
         assert_eq!(porcelain_status(repo.path()), "");
         assert_eq!(head_revision(repo.path()), apply_revision);
 
-        let record =
-            load_valid_acceptance_stall(&store, repo.path(), repo.path(), "test-change", "main")
-                .await
-                .unwrap()
-                .expect("migration must produce a usable hold");
+        let record = store
+            .load(&repository_identity(repo.path()), "test-change")
+            .unwrap()
+            .expect("migration must produce a usable record");
         assert_eq!(record.retry_count, 3);
         assert_eq!(record.apply_revision, apply_revision);
         assert!(record.resumable);
@@ -1231,8 +874,8 @@ mod tests {
             MarkerMigration::NotApplicable
         );
         assert_eq!(
-            load_valid_acceptance_stall(&store, repo.path(), repo.path(), "test-change", "main")
-                .await
+            store
+                .load(&repository_identity(repo.path()), "test-change")
                 .unwrap(),
             Some(record)
         );
@@ -1318,11 +961,11 @@ mod tests {
         assert_eq!(porcelain_status(repo.path()), "");
         assert_eq!(head_revision(repo.path()), apply_revision);
         assert_eq!(
-            load_valid_acceptance_stall(&store, repo.path(), repo.path(), "test-change", "main")
-                .await
+            store
+                .load(&repository_identity(repo.path()), "test-change")
                 .unwrap(),
             None,
-            "a preserved marker must not create runtime stall state"
+            "a preserved marker must not create a migrated record"
         );
     }
 
@@ -1442,17 +1085,11 @@ mod tests {
                 "{label} marker must be left byte-identical"
             );
             assert!(
-                load_valid_acceptance_stall(
-                    &store,
-                    repo.path(),
-                    repo.path(),
-                    "test-change",
-                    "main"
-                )
-                .await
-                .unwrap()
-                .is_none(),
-                "{label} marker must not create runtime stall state"
+                store
+                    .load(&repository_identity(repo.path()), "test-change")
+                    .unwrap()
+                    .is_none(),
+                "{label} marker must not create a migrated record"
             );
         }
 

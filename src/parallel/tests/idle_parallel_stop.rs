@@ -203,7 +203,6 @@ async fn idle_parallel_stop_cancelled_scheduler_releases_registered_execution_ha
     let repo_dir = TempDir::new().unwrap();
     init_minimal_git_repo(repo_dir.path());
     let workspace_base = TempDir::new().expect("create workspace base");
-    let stall_state_root = TempDir::new().expect("create stall state root");
 
     let (event_tx, mut events) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(
@@ -211,7 +210,6 @@ async fn idle_parallel_stop_cancelled_scheduler_releases_registered_execution_ha
         test_config(workspace_base.path()),
         Some(event_tx),
     );
-    executor.set_acceptance_stall_state_root(stall_state_root.path().to_path_buf());
     let cancel_token = CancellationToken::new();
     executor.set_cancel_token(cancel_token.clone());
 
@@ -268,7 +266,6 @@ async fn idle_parallel_stop_cancelled_scheduler_handles_pending_merge_before_sto
     let repo_dir = TempDir::new().unwrap();
     init_minimal_git_repo(repo_dir.path());
     let workspace_base = TempDir::new().expect("create workspace base");
-    let stall_state_root = TempDir::new().expect("create stall state root");
 
     let (event_tx, mut events) = mpsc::channel(256);
     let mut executor = ParallelExecutor::new(
@@ -276,7 +273,6 @@ async fn idle_parallel_stop_cancelled_scheduler_handles_pending_merge_before_sto
         test_config(workspace_base.path()),
         Some(event_tx),
     );
-    executor.set_acceptance_stall_state_root(stall_state_root.path().to_path_buf());
     let cancel_token = CancellationToken::new();
     executor.set_cancel_token(cancel_token.clone());
 

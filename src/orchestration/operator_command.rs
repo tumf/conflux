@@ -823,9 +823,31 @@ impl OperatorCommandService {
     async fn apply_retry_route(&self, change_id: &str, route: RetryRoute) -> RetryPlan {
         let command = match route {
             RetryRoute::TerminalError => ReducerCommand::RetryError(change_id.to_string()),
-            // A reconciled acceptance hold resumes through the explicit-retry run
-            // path; the reducer only has to restore ordinary queue intent.
-            RetryRoute::AcceptanceStall => ReducerCommand::AddToQueue(change_id.to_string()),
+            // An in-memory acceptance hold resumes through the explicit-retry run
+            // path; the reducer only has to restore ordinary queue intent. A
+            // non-resumable hold is refused so its blocker evidence survives and
+            // no ambiguous work is dispatched.
+            RetryRoute::AcceptanceStall => {
+                let refuse = {
+                    let guard = self.state.read().await;
+                    guard.change_runtime(change_id).is_some_and(|rt| {
+                        rt.is_acceptance_stalled() && !rt.is_resumable_acceptance_stall()
+                    })
+                };
+                if refuse {
+                    tracing::warn!(
+                        change_id = %change_id,
+                        "Explicit retry refused: the acceptance stall is not resumable, so its \
+                         blocker evidence is retained"
+                    );
+                    return RetryPlan {
+                        change_ids: Vec::new(),
+                        routes: Vec::new(),
+                        explicit_retry: false,
+                    };
+                }
+                ReducerCommand::AddToQueue(change_id.to_string())
+            }
         };
         let reduce_outcome = {
             let mut guard = self.state.write().await;
