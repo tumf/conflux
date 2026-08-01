@@ -313,7 +313,9 @@ impl StalledBlocker {
             phase: "acceptance".to_string(),
             gate: "acceptance".to_string(),
             evidence: vec![error_summary.clone()],
-            unblock_condition: Some(format!("the external prerequisite behind '{error_summary}' is satisfied")),
+            unblock_condition: Some(format!(
+                "the external prerequisite behind '{error_summary}' is satisfied"
+            )),
             prerequisite_owner: None,
             error_summary,
             next_action: "resolve the external verification blocker and rerun acceptance"

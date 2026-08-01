@@ -940,9 +940,8 @@ mod tests {
         }
         // Evidence must exist in the workspace, not only in narrative output.
         assert!(
-            CFLX_APPLY_SKILL_MD.contains(
-                "evidence that exists only in narrative output is not evidence"
-            ),
+            CFLX_APPLY_SKILL_MD
+                .contains("evidence that exists only in narrative output is not evidence"),
             "cflx-apply must require workspace-visible blocker evidence"
         );
         // The compatible outcome token is returned without a rejection artifact.

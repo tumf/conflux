@@ -1133,9 +1133,7 @@ async fn operator_command_retry_reruns_an_externally_blocked_change() {
             guard.change_runtime("change-a").unwrap().blocker_kind(),
             crate::orchestration::state::BlockerKind::External
         );
-        assert!(guard
-            .externally_blocked_change_ids()
-            .contains("change-a"));
+        assert!(guard.externally_blocked_change_ids().contains("change-a"));
     }
 
     let plan = fixture

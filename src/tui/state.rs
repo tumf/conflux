@@ -379,10 +379,7 @@ impl ChangeState {
     }
 
     /// Adopt a reducer-derived blocker view verbatim.
-    pub fn set_blocker_view(
-        &mut self,
-        view: Option<&crate::orchestration::state::BlockerView>,
-    ) {
+    pub fn set_blocker_view(&mut self, view: Option<&crate::orchestration::state::BlockerView>) {
         match view {
             Some(view) => {
                 self.blocker_kind_cache = view.kind;

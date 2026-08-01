@@ -3521,7 +3521,10 @@ mod tests {
             BlockerKind::Dependency
         );
         assert_eq!(
-            state.change_runtime("external-wait").unwrap().blocker_kind(),
+            state
+                .change_runtime("external-wait")
+                .unwrap()
+                .blocker_kind(),
             BlockerKind::External
         );
         assert_eq!(

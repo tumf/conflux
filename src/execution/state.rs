@@ -877,7 +877,11 @@ mod tests {
             WorkspaceState::Applied,
             "a complete unarchived apply must return to acceptance after restart"
         );
-        assert_eq!(porcelain_status(repo.path()), "", "the worktree stays clean");
+        assert_eq!(
+            porcelain_status(repo.path()),
+            "",
+            "the worktree stays clean"
+        );
     }
 
     /// Legacy acceptance-origin markers migrate once, leave no residue, and are

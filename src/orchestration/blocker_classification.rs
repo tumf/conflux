@@ -268,9 +268,7 @@ pub fn claim_from_reported_facts(blocker: &crate::events::StalledBlocker) -> Ext
 /// to make. `stalled` is the conservative answer: it keeps the change out of
 /// ordinary dispatch and visible to an operator without claiming a prerequisite
 /// nobody verified.
-pub fn classify_reported_facts(
-    blocker: &crate::events::StalledBlocker,
-) -> LifecycleClassification {
+pub fn classify_reported_facts(blocker: &crate::events::StalledBlocker) -> LifecycleClassification {
     let hold = ExecutionHold::ExternalPrerequisiteClaim(claim_from_reported_facts(blocker));
     match classify_execution_hold(&hold) {
         LifecycleClassification::ProtocolCorrection { reason } => {
