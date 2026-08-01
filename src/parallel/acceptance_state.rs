@@ -25,6 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 use crate::error::{OrchestratorError, Result};
@@ -36,6 +37,7 @@ const MARKER_VERSION: &str = "acceptance-stalled-v1";
 ///
 /// Reading a record with any other schema is a hard refusal: the record is
 /// quarantined and cannot control routing.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 pub const ACCEPTANCE_STALL_SCHEMA: &str = "acceptance-stall-v1";
 
 /// In-memory acceptance retry context for one active orchestration run.
@@ -119,6 +121,7 @@ fn marker_path(workspace_path: &Path, change_id: &str) -> PathBuf {
     change_dir(workspace_path, change_id).join(BLOCKED_MARKER_FILE)
 }
 
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         OrchestratorError::Io(std::io::Error::new(
@@ -233,6 +236,7 @@ pub fn parse_blocked_marker(
 /// No production path constructs, reads, or writes this any more: the stall
 /// hold is in-memory reducer state. Kept for one release cycle so an operator
 /// can still inspect leftover files under `~/.local/state/cflx/acceptance-stalls/`.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcceptanceStallRecord {
     /// Schema version; must equal [`ACCEPTANCE_STALL_SCHEMA`].
@@ -266,6 +270,7 @@ pub struct AcceptanceStallRecord {
     pub updated_at: String,
 }
 
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 impl AcceptanceStallRecord {
     /// Build a record from a validated blocker and the current repository facts.
     pub fn new(
@@ -317,6 +322,7 @@ impl AcceptanceStallRecord {
 }
 
 /// Current repository/worktree facts describing a managed workspace.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceFacts {
     pub repository_id: String,
@@ -362,11 +368,13 @@ pub fn worktree_identity(worktree_path: &Path) -> String {
 /// `~/.local/state/cflx/acceptance-stalls/` remain readable by an operator; they
 /// are deliberately never loaded and never deleted, so a concurrently running
 /// older Conflux sharing the same state directory keeps its own holds.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 #[derive(Debug, Clone)]
 pub struct AcceptanceStallStore {
     root: PathBuf,
 }
 
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 impl AcceptanceStallStore {
     /// Build a store rooted at an explicit directory (used by tests).
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -497,6 +505,7 @@ impl AcceptanceStallStore {
 }
 
 /// Map an arbitrary identity string to a filesystem-safe, stable key.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 fn stable_key(value: &str) -> String {
     let hash = value
         .as_bytes()
@@ -525,6 +534,7 @@ fn stable_key(value: &str) -> String {
 }
 
 /// Outcome of the one-time legacy acceptance marker migration.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerMigration {
     /// No marker was present, or nothing needed to change.
@@ -549,6 +559,7 @@ pub enum MarkerMigration {
 /// The runtime record is written *before* the marker is removed, so an
 /// interruption can only leave a duplicate hold (idempotently re-migrated),
 /// never a lost one.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 pub fn migrate_legacy_acceptance_marker(
     store: &AcceptanceStallStore,
     workspace_path: &Path,
@@ -653,6 +664,7 @@ pub fn migrate_legacy_acceptance_marker(
 /// "not tracked" only because the caller has already established that the marker
 /// is untracked generated residue in that case; a *failed* lookup inside a real
 /// repository is conservatively reported as tracked so migration refuses.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 fn marker_is_tracked(workspace_path: &Path, change_id: &str) -> bool {
     let path = marker_path(workspace_path, change_id);
     let output = std::process::Command::new("git")
@@ -675,6 +687,7 @@ fn marker_is_tracked(workspace_path: &Path, change_id: &str) -> bool {
 /// The removal is verified: `git status --porcelain` scoped to the marker
 /// directory must come back empty, so a migration can never silently hand back a
 /// dirty managed worktree.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 fn remove_generated_marker(workspace_path: &Path, change_id: &str) -> Result<()> {
     let path = marker_path(workspace_path, change_id);
     if path.exists() {
@@ -689,6 +702,7 @@ fn remove_generated_marker(workspace_path: &Path, change_id: &str) -> Result<()>
 }
 
 /// Fail loudly when removing the generated marker left git-visible residue.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle (see module docs).
 fn verify_marker_removal_left_worktree_clean(workspace_path: &Path, path: &Path) -> Result<()> {
     let Some(marker_dir) = path.parent() else {
         return Ok(());

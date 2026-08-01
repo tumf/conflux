@@ -619,6 +619,11 @@ pub async fn detect_workspace_state(
 /// Every value here is read from git and the filesystem right now. The stall
 /// record contributes only the `apply_revision` being checked, so a stale or
 /// forged record cannot make its own binding look valid.
+///
+/// Retired along with the stall record itself: no production path calls this any
+/// more. Kept for one release cycle, then removed with
+/// [`crate::parallel::acceptance_state::AcceptanceStallRecord`].
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle.
 pub async fn gather_workspace_facts(
     repo_root: &Path,
     workspace_path: &Path,
@@ -656,6 +661,7 @@ pub async fn gather_workspace_facts(
 
 /// Canonical string form of a worktree path, so equivalent paths compare equal
 /// across symlinked and relative spellings.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle.
 pub fn canonical_path_string(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -664,6 +670,7 @@ pub fn canonical_path_string(path: &Path) -> String {
 }
 
 /// Whether `revision` resolves to an existing commit object in `workspace_path`.
+#[allow(dead_code)] // Retired disk persistence; kept for one release cycle.
 async fn revision_exists(workspace_path: &Path, revision: &str) -> bool {
     if revision.trim().is_empty() {
         return false;
