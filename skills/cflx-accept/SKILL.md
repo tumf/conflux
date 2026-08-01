@@ -121,7 +121,55 @@ The Conflux runtime classifies a completed acceptance run that emits no canonica
 
 Structured `proposal.md` frontmatter verification declarations are authoritative over prose. For `pre-integration`, evaluate current-revision repository evidence and runnable local verification. For `post-integration`, evaluate repository-automation ownership, the tracked automation, trigger, evidence publication contract, rerun action, prerequisites, and fixture/local evidence without fetching an undeployed or external target.
 
-Missing, placeholder, or incorrectly wired repository automation is a repository-fixable FAIL. A correctly wired post-integration declaration whose operational result is pending is not a FAIL. A non-mockable external prerequisite that makes declared automation unusable is a stalled hold; preserve the prerequisite owner and next rerun or unblock action. Never describe an unobserved post-integration operational outcome as successful.
+Missing, placeholder, or incorrectly wired repository automation is a repository-fixable FAIL. A correctly wired post-integration declaration whose operational result is pending is not a FAIL. A non-mockable external prerequisite is a stalled hold **only** when it makes a `completion_role: change-blocking` verification's declared automation unusable; preserve the prerequisite owner and next rerun or unblock action. Never describe an unobserved post-integration operational outcome as successful.
+
+#### Completion Role Gating
+
+`completion_role` decides whether a verification can block acceptance at all. It outranks the prerequisite's availability, the execution class, and how the declaration reads in prose. Only `completion_role: change-blocking` can gate the verdict; `completion_role: operational-observation` is non-blocking by definition, so an unavailable prerequisite for one is a fact to acknowledge, never a hold.
+
+| `phase` | `completion_role` | Declared automation state | Verdict |
+| --- | --- | --- | --- |
+| `pre-integration` | `change-blocking` | missing, placeholder, or mis-wired in this repository | `FAIL` (repository-fixable) |
+| `pre-integration` | `change-blocking` | repository-complete, local verification passes | not a blocker; PASS on other grounds |
+| `pre-integration` | `change-blocking` | repository-complete, but a non-mockable external prerequisite makes it unusable | stalled hold (`gated` + structured `blocker`) |
+| `post-integration` | `operational-observation` | missing, placeholder, or mis-wired repository automation | `FAIL` (repository-fixable) |
+| `post-integration` | `operational-observation` | correctly wired, operational result pending | acknowledge as pending; never `FAIL`, never stalled |
+| `post-integration` | `operational-observation` | correctly wired, prerequisite unavailable (external build, credential, physical device, undeployed target) | acknowledge as pending; never `FAIL`, never stalled |
+| any | `operational-observation` | any state other than missing/mis-wired repository automation | acknowledge as pending; never `FAIL`, never stalled |
+
+Rules that follow from the table:
+
+- A verification is eligible for a stalled hold only when it is `phase: pre-integration` **and** `completion_role: change-blocking` **and** `execution_class: repository-local`. No other declaration may pause the workflow.
+- For `completion_role: operational-observation`, the only repository-fixable defect is the automation wiring itself (missing workflow, placeholder script, unpublished evidence contract, absent rerun action). Everything downstream of correct wiring is pending, not failing.
+- Do not convert an unavailable prerequisite for an operational observation into a `pending_verification` or `infrastructure` blocker. Record it as a pending operational outcome in the verdict prose instead.
+- When every `completion_role: change-blocking` verification passes, emit `PASS` even if one or more operational observations remain pending.
+- Acknowledging an observation as pending is not the same as claiming it succeeded. State that it is unobserved and name the prerequisite that is still missing.
+
+#### Example: post-integration physical-device scan
+
+A change declares two verifications:
+
+```yaml
+verifications:
+  - id: qr-encode-unit
+    phase: pre-integration
+    execution_class: repository-local
+    completion_role: change-blocking
+    automation: cargo test qr_encode
+  - id: physical-scan-observation
+    phase: post-integration
+    execution_class: external
+    completion_role: operational-observation
+    automation: docs/manual/physical-scan.md
+    prerequisites:
+      - compatible external scanner build (not yet released)
+```
+
+`cargo test qr_encode` passes and `docs/manual/physical-scan.md` documents a real procedure, owner, trigger, and rerun action. The scanner build does not exist yet, so the scan cannot be performed.
+
+Correct verdict: `PASS`. The change-blocking verification passed, and the physical scan is acknowledged as a pending operational observation whose prerequisite is an unreleased external build. Emitting `gated` here — the acceptance error this rubric exists to prevent — would stall the workflow on a verification that was declared non-blocking by design.
+
+Had `docs/manual/physical-scan.md` been absent or a placeholder, the correct verdict would instead be `FAIL`, because apply can write that procedure with repository-only work.
 
 ### Verification Planning & Ownership
 
@@ -179,6 +227,7 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Repository-fixable vs stalled-hold rubric:
   - `FAIL`: repository-only autonomous work (code/tests/spec/tasks/docs in this repo) can resolve the issue.
   - Stalled hold via a structured `gated` payload: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, missing upstream constraint resolution, or recoverable infrastructure/credential/pending verification blocker).
+  - When the blocker comes from a declared verification, the stalled hold requires `completion_role: change-blocking`; see [Completion Role Gating](#completion-role-gating). An unavailable prerequisite for a `completion_role: operational-observation` verification is a pending observation, not a hold.
 
 ## Structured stalled blocker contract
 

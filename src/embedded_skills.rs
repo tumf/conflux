@@ -322,6 +322,56 @@ mod tests {
         );
     }
 
+    /// `completion_role: operational-observation` is non-blocking by design, so
+    /// the acceptance skills must never let an unavailable prerequisite for one
+    /// turn into a stalled hold. The unconditional phrasing this replaced made a
+    /// reviewer stall a change on a physical-device observation.
+    #[test]
+    fn acceptance_skills_scope_stalled_holds_to_change_blocking_verifications() {
+        for (label, content) in [
+            ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
+            ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
+        ] {
+            assert!(
+                content.contains("only** when it makes a `completion_role: change-blocking`"),
+                "{label} must scope the stalled hold to change-blocking verifications"
+            );
+            assert!(
+                content.contains("completion_role: operational-observation"),
+                "{label} must name the non-blocking completion role"
+            );
+            // The exact sentence that mis-stalled a change: a prerequisite alone,
+            // with no completion-role qualifier, justifying a hold.
+            assert!(
+                !content.contains(
+                    "A non-mockable external prerequisite that makes declared automation unusable \
+                     is a stalled hold"
+                ) && !content.contains(
+                    "A non-mockable external prerequisite that makes the declared automation \
+                     unusable is a stalled hold"
+                ),
+                "{label} must not keep the unconditional stalled-hold rule"
+            );
+        }
+
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("#### Completion Role Gating"),
+            "cflx-accept must carry the completion-role decision table"
+        );
+        // The rubric has to be a table an agent can read off, not inferred prose.
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains(
+                "| `post-integration` | `operational-observation` | correctly wired, prerequisite \
+                 unavailable"
+            ),
+            "cflx-accept decision table must cover the unavailable-prerequisite observation row"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("#### Example: post-integration physical-device scan"),
+            "cflx-accept must show a concrete non-blocking observation example"
+        );
+    }
+
     /// The embedded copies and the on-disk sources must not drift: the skill
     /// files shipped in the binary are what the reviewer actually reads.
     #[test]
