@@ -398,6 +398,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             display_status_cache: display_status_cache.to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
             selected: false,

@@ -98,22 +98,31 @@ When `--push [remote]` is provided with parallel execution, `run` or local TUI S
 
 ### Requirement: Orchestration loop runs apply and archive
 
-acceptance ループは change に対して `acceptance_command` を実行し、出力テキストから pass/fail/continue と互換入力としての gated/blocked blocker verdict を判定して処理を分岐しなければならない（SHALL）。
+The orchestration loop SHALL run the configured Apply and Acceptance commands and parse their machine-readable outcomes. It SHALL continue to accept `gated` and legacy `blocked` acceptance tokens as compatibility input, but token spelling alone SHALL NOT determine operator-facing lifecycle status.
 
-移行期間中は、旧 integration 互換のため legacy `blocked` acceptance verdict input と既存 `gated` acceptance verdict input を受理してもよい（MAY）が、operator-facing lifecycle/status wording は `stalled` を用いなければならない（MUST）。
+Conflux SHALL classify validated non-repository prerequisite evidence as `blocked`. It SHALL classify no-progress, repeated-finding, and exhausted-retry execution stops as `stalled`. Invalid bare compatibility blocker input SHALL use bounded protocol correction and SHALL set neither lifecycle state without sufficient evidence.
 
-#### Scenario: CLI treats gated input as stalled acceptance blocker
-- **GIVEN** acceptance output が `ACCEPTANCE: GATED` または `{"acceptance":"gated"}` を示す
-- **WHEN** CLI acceptance loop が verdict を解釈する
-- **THEN** change は acceptance blocker outcome として処理される
-- **AND** paused lifecycle/status wording は `stalled` になる
-- **AND** dependency wait の `blocked` terminology とは混同されない
+#### Scenario: Structured external prerequisite displays blocked
 
-#### Scenario: CLI still accepts legacy blocked verdict during migration
-- **GIVEN** acceptance output が旧 `ACCEPTANCE: BLOCKED` を示す
-- **WHEN** compatibility-aware CLI runtime が verdict を解釈する
-- **THEN** change は acceptance blocker outcome として処理される
-- **AND** canonical docs と新規 lifecycle/status tests は `stalled` を期待し、`gated` を表示状態として期待しない
+- **GIVEN** Apply or Acceptance emits complete structured evidence for a non-repository prerequisite
+- **WHEN** the orchestration loop validates and classifies the result
+- **THEN** the change lifecycle status is `blocked`
+- **AND** the status detail identifies the blocker kind as external
+
+#### Scenario: No-progress execution displays stalled
+
+- **GIVEN** a change makes no semantic progress, repeats a finding, or exhausts its retry policy
+- **WHEN** the orchestration loop finalizes the execution hold
+- **THEN** the lifecycle status is `stalled`
+- **AND** it is not presented as a dependency or external wait
+
+#### Scenario: Legacy token remains input compatibility only
+
+- **GIVEN** Acceptance emits legacy `blocked` or `gated`
+- **WHEN** the orchestration loop parses the verdict
+- **THEN** the token remains accepted as compatibility syntax
+- **AND** complete structured facts are still required for external `blocked`
+- **AND** bare input follows bounded protocol correction
 
 ### Requirement: Default TUI Launch
 
@@ -416,23 +425,28 @@ The running mode footer SHALL display a progress bar for overall processing prog
 
 ### Requirement: Processing Item Spinner Animation
 
-TUI は実行中の表示を processing ではなくフェーズ別の語彙で示さなければならない（SHALL）。apply の実行中は `applying`、acceptance 実行中は `accepting`、archive 実行中は `archiving`、resolve 実行中は `resolving`、依存待ちの change は `blocked` を表示すること。反復回数がある場合は `status:iteration` 形式で表示すること。
+The TUI SHALL display phase-specific vocabulary for active work: `applying`, `accepting`, `archiving`, and `resolving`. It SHALL display `blocked` for both dependency waits and validated external prerequisite waits, with detail that identifies the blocker kind. It SHALL display `stalled` for no-progress or exhausted execution holds. When an iteration number applies, the display SHALL retain the `status:iteration` format.
 
-#### Scenario: Applying 状態の表示
-- **GIVEN** TUI が running mode で change を処理している
-- **WHEN** apply が実行中である
-- **THEN** change のステータス表示は `applying` となる
+#### Scenario: Dependency wait displays blocked
 
-#### Scenario: Resolving の iteration 表示
-- **GIVEN** change の queue_status が resolving である
-- **AND** iteration_number が 2 である
-- **WHEN** TUI が change 行を表示する
-- **THEN** ステータス表示は `resolving:2` となる
+- **GIVEN** a change waits on an unarchived proposal dependency
+- **WHEN** the TUI renders the change
+- **THEN** its status is `blocked`
+- **AND** its detail identifies a dependency blocker
 
-#### Scenario: 依存待ちの表示
-- **GIVEN** change の queue_status が依存待ちである
-- **WHEN** TUI が change 行を表示する
-- **THEN** ステータス表示は `blocked` となる
+#### Scenario: External prerequisite displays blocked
+
+- **GIVEN** the orchestrator has validated an external prerequisite blocker
+- **WHEN** the TUI renders the change
+- **THEN** its status is `blocked`
+- **AND** its detail exposes the external category, unblock condition, and next action
+
+#### Scenario: Exhausted execution displays stalled
+
+- **GIVEN** automatic execution stopped after no progress or retry exhaustion
+- **WHEN** the TUI renders the change
+- **THEN** its status is `stalled`
+- **AND** the row is not described as waiting on a dependency or external prerequisite
 
 ### Requirement: Completion Detection Retry Settings
 

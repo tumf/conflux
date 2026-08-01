@@ -73,6 +73,7 @@ pub(super) fn collect_retry_error_targets(changes: &[ChangeState]) -> Vec<String
             c.selected
                 && crate::orchestration::operator_command::classify_retry_route(
                     &c.display_status_cache,
+                    c.blocker_kind_cache,
                 )
                 .is_some()
         })
@@ -119,8 +120,13 @@ pub(super) fn sync_retry_error_intent(
             // errors clear through RetryError, while a reconciled acceptance hold
             // only needs ordinary queue intent restored and is consumed later by
             // the explicit-retry run path (no apply rerun).
+            let blocker_kind = guard
+                .change_runtime(id)
+                .map(crate::orchestration::state::ChangeRuntimeState::blocker_kind)
+                .unwrap_or_default();
             let route = crate::orchestration::operator_command::classify_retry_route(
                 guard.display_status(id),
+                blocker_kind,
             )?;
             let command = match route {
                 crate::orchestration::operator_command::RetryRoute::TerminalError => {

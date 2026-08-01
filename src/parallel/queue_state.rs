@@ -2318,25 +2318,41 @@ impl ParallelExecutor {
             in_flight,
         );
 
-        // A validated acceptance stall is reducer-owned in-memory state, so it
-        // is read from the same snapshot as the other wait lanes. Nothing is
-        // loaded from disk: after a restart the reducer holds no stall, the
-        // change is dispatched again, and workspace evidence routes a complete
-        // unarchived apply revision back to acceptance.
-        let (reducer_queued, merge_wait_ids, resolve_wait_ids, reject_wait_ids, acceptance_stalled) =
-            self.shared_orchestrator_state
-                .as_ref()
-                .and_then(|state| state.try_read().ok())
-                .map(|state| {
-                    (
-                        state.queued_change_ids(),
-                        state.merge_wait_change_ids(),
-                        state.resolve_wait_change_ids(),
-                        state.reject_wait_change_ids(),
-                        state.acceptance_stalled_change_ids(),
-                    )
-                })
-                .unwrap_or_default();
+        // Acceptance holds and validated external prerequisite waits are both
+        // reducer-owned in-memory state, so they are read from the same snapshot
+        // as the other wait lanes. Nothing is loaded from disk: after a restart
+        // the reducer holds neither, the change is dispatched again, and
+        // workspace evidence routes a complete unarchived apply revision back to
+        // acceptance.
+        let (
+            reducer_queued,
+            merge_wait_ids,
+            resolve_wait_ids,
+            reject_wait_ids,
+            acceptance_stalled,
+            externally_blocked,
+        ) = self
+            .shared_orchestrator_state
+            .as_ref()
+            .and_then(|state| state.try_read().ok())
+            .map(|state| {
+                (
+                    state.queued_change_ids(),
+                    state.merge_wait_change_ids(),
+                    state.resolve_wait_change_ids(),
+                    state.reject_wait_change_ids(),
+                    state.acceptance_stalled_change_ids(),
+                    state.externally_blocked_change_ids(),
+                )
+            })
+            .unwrap_or_default();
+        // An apply-origin external blocker suppresses dispatch exactly like an
+        // acceptance-origin one; only the explanation differs.
+        let held: HashSet<String> = acceptance_stalled
+            .into_iter()
+            .chain(externally_blocked)
+            .collect();
+        let acceptance_stalled = held;
 
         let merge_wait_set: HashSet<String> = merge_wait_ids.into_iter().collect();
         let resolve_wait_set: HashSet<String> = resolve_wait_ids.into_iter().collect();

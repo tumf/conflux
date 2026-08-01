@@ -190,22 +190,29 @@ Do not confuse the two evidence forms:
 
 If apply determines the change is currently impossible to implement because the change intent is terminally invalid (for example: spec contradiction or policy/constitution constraint), do not loop blindly.
 
-Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection proposals. Docker daemon unavailable, Docker image pull DNS/network timeout, package registry timeout, external service outage, missing non-mockable external credential, rate limit, port conflict, and managed verification jobs that are still running/pending are non-terminal stalled holds. Record concrete blocker details in `tasks.md` and use the runtime's stalled/blocker handoff artifacts; do not create `REJECTED.md` for these recoverable cases.
+Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection proposals. Docker daemon unavailable, Docker image pull DNS/network timeout, package registry timeout, external service outage, missing non-mockable external credential, rate limit, port conflict, and managed verification jobs that are still running/pending are non-terminal recoverable holds. Record concrete blocker details in `tasks.md` and use the runtime's blocker handoff artifacts; do not create `REJECTED.md` for these recoverable cases.
+
+**You report facts; Conflux owns the lifecycle classification.** Conflux validates what you record and decides whether the change becomes operator-facing `blocked` (a validated non-repository prerequisite with a verifiable unblock condition) or `stalled` (no semantic progress, repeated findings, or an exhausted retry budget). Never assert a canonical lifecycle status in prose, and never treat the `BLOCKED` outcome token spelling as the classification itself. Repository-fixable work and anything a mock, fake, stub, or fixture can satisfy is not an external prerequisite — keep working on it instead.
 
 1. Add a new section to `openspec/changes/<change-id>/tasks.md`:
    ```markdown
    ## Implementation Blocker #<n>
-   - category: <spec_contradiction|external_non_mockable|policy_constraint|other>
+   - category: <credential|external_approval|policy|external_service|pending_verification|infrastructure|schema_incompatibility|human_decision>
    - summary: <one-line human-facing blocker summary>
    - evidence:
       - <file/path:line or concrete command output>
    - impact: <what cannot be completed>
+   - prerequisite_owner: <team_or_role that owns the prerequisite>
+   - unblock_condition: <verifiable condition whose satisfaction clears the wait>
    - unblock_actions:
       - <specific follow-up action 1>
       - <specific follow-up action 2>
+   - resumable: <true|false>
    - owner: <team_or_role>
    - decision_due: <YYYY-MM-DD>
    ```
+
+   Every field above is required for a recoverable external prerequisite. `unblock_condition` is what an observer can check; `unblock_actions` are what someone does about it. Omitting either leaves the report incomplete, and Conflux will not classify an incomplete report as external `blocked`.
 2. For terminal-invalid blockers only, create or update `openspec/changes/<change-id>/REJECTED.md` as an **apply-generated rejection proposal artifact** (not terminal by itself). Include at minimum:
    ```markdown
    # REJECTED
@@ -223,7 +230,9 @@ Recoverable infrastructure blockers MUST NOT be escalated as terminal rejection 
    rejection_proposal: openspec/changes/<change-id>/REJECTED.md
    human_action_required: acceptance must confirm rejection proposal
    ```
-5. Keep evidence concrete and actionable so acceptance can judge whether loop stop is warranted.
+
+   For a recoverable external prerequisite the same block MUST carry the same facts as the tasks.md section — `category`, `evidence`, `prerequisite_owner`, `unblock_condition`, `next_action`, and `resumable` — and MUST return the compatible machine-readable `BLOCKED` outcome without creating `REJECTED.md`.
+5. Keep evidence concrete and actionable so acceptance can judge whether loop stop is warranted. Conflux compares the workspace-visible `## Implementation Blocker #<n>` section against the stdout block, so evidence that exists only in narrative output is not evidence.
 
 ## Apply Completion Criteria
 

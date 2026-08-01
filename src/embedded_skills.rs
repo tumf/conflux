@@ -255,8 +255,14 @@ mod tests {
             ("cflx-accept", CFLX_ACCEPT_SKILL_MD),
             ("cflx-accept-with-speca", CFLX_ACCEPT_WITH_SPECA_SKILL_MD),
         ] {
-            // The four required fields the runtime validates.
-            for field in ["category", "evidence", "next_action", "resumable"] {
+            // The five required fields the runtime validates.
+            for field in [
+                "category",
+                "evidence",
+                "unblock_condition",
+                "next_action",
+                "resumable",
+            ] {
                 assert!(
                     content.contains(field),
                     "{label} must document the required blocker field `{field}`"
@@ -280,10 +286,15 @@ mod tests {
             );
             assert!(
                 content.contains(
-                    "The runtime records stalled holds outside the worktree and\nkeeps the \
-                     worktree clean."
+                    "Conflux holds this state in memory for the current process\nonly and keeps \
+                     the worktree clean."
                 ),
-                "{label} must state that stalled holds live outside the worktree"
+                "{label} must state that the hold is process-local in-memory state"
+            );
+            // Conflux owns the lifecycle word; the reviewer only reports facts.
+            assert!(
+                content.contains("Conflux owns the final `blocked` versus `stalled`"),
+                "{label} must defer lifecycle classification to Conflux"
             );
             for forbidden in [
                 "create a marker under the change directory",
@@ -316,9 +327,14 @@ mod tests {
             CFLX_ACCEPT_SKILL_MD.contains("emit `FAIL` or `CONTINUE` instead"),
             "cflx-accept must route incomplete evidence back to FAIL/CONTINUE"
         );
+        // The operator-facing vocabulary is now two words, and Conflux picks
+        // between them from validated evidence rather than from token spelling.
         assert!(
-            CFLX_ACCEPT_SKILL_MD.contains("The operator-facing lifecycle term is `stalled`"),
-            "cflx-accept must keep `stalled` as the lifecycle term"
+            CFLX_ACCEPT_SKILL_MD.contains(
+                "Conflux — not this skill — classifies the validated result as operator-facing \
+                 `blocked` (a validated non-repository prerequisite) or `stalled`"
+            ),
+            "cflx-accept must name both operator-facing lifecycle terms and their owner"
         );
     }
 
@@ -899,6 +915,76 @@ mod tests {
         assert!(
             CFLX_APPLY_SKILL_MD.contains("do not create `REJECTED.md` for these recoverable cases"),
             "cflx-apply must prohibit REJECTED.md for recoverable infrastructure blockers"
+        );
+    }
+
+    /// Apply reports workspace-visible facts and defers the lifecycle word to
+    /// Conflux. The escalation template must name every field the classifier
+    /// requires, and must keep the tasks.md section and the stdout block bound
+    /// to the same facts.
+    #[test]
+    fn test_apply_skill_reports_blocker_facts_and_defers_classification() {
+        for required in [
+            "You report facts; Conflux owns the lifecycle classification.",
+            "## Implementation Blocker #<n>",
+            "IMPLEMENTATION_BLOCKER:",
+            "prerequisite_owner:",
+            "unblock_condition:",
+            "unblock_actions:",
+            "resumable:",
+        ] {
+            assert!(
+                CFLX_APPLY_SKILL_MD.contains(required),
+                "cflx-apply must state the blocker reporting contract: {required:?}"
+            );
+        }
+        // Evidence must exist in the workspace, not only in narrative output.
+        assert!(
+            CFLX_APPLY_SKILL_MD
+                .contains("evidence that exists only in narrative output is not evidence"),
+            "cflx-apply must require workspace-visible blocker evidence"
+        );
+        // The compatible outcome token is returned without a rejection artifact.
+        assert!(
+            CFLX_APPLY_SKILL_MD
+                .contains("return the compatible machine-readable `BLOCKED` outcome without creating `REJECTED.md`"),
+            "cflx-apply must keep a recoverable blocker off the rejection path"
+        );
+        // Token spelling is transport syntax, never the classification.
+        assert!(
+            CFLX_APPLY_SKILL_MD
+                .contains("never treat the `BLOCKED` outcome token spelling as the classification"),
+            "cflx-apply must forbid classifying from the outcome token alone"
+        );
+    }
+
+    /// Acceptance must separate external prerequisites from execution
+    /// conditions, and must not fabricate prerequisite facts for the latter.
+    #[test]
+    fn test_acceptance_skill_separates_execution_conditions_from_prerequisites() {
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains(
+                "Repeated findings, absent semantic progress, and an exhausted repair budget are \
+                 **execution conditions**, not external prerequisites."
+            ),
+            "cflx-accept must distinguish execution conditions from external prerequisites"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD
+                .contains("do not fabricate a category, evidence, or unblock condition for them"),
+            "cflx-accept must forbid inventing prerequisite facts for an execution stop"
+        );
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains("Token spelling alone never sets either."),
+            "cflx-accept must state that token spelling does not choose the lifecycle"
+        );
+        // The condition and the action are separate required facts.
+        assert!(
+            CFLX_ACCEPT_SKILL_MD.contains(
+                "the condition is what\nan observer can check, the action is what someone does \
+                 about it"
+            ),
+            "cflx-accept must distinguish unblock_condition from next_action"
         );
     }
 

@@ -143,6 +143,14 @@ pub struct ChangeState {
     pub total_tasks: u32,
     /// Display status cache (from reducer/TUI events)
     pub display_status_cache: String,
+    /// Reducer-derived blocker kind for a `blocked` row.
+    ///
+    /// Cached from [`crate::orchestration::state::OrchestratorState::all_blocker_views`]
+    /// rather than re-derived here, so the TUI can distinguish a dependency wait
+    /// from an external prerequisite wait without inferring anything itself.
+    pub blocker_kind_cache: crate::orchestration::state::BlockerKind,
+    /// Reducer-derived operator-facing blocker detail for a blocked/stalled row.
+    pub blocker_detail_cache: Option<String>,
     /// Display color cache for status
     pub display_color_cache: Color,
     /// Error message cache for error status
@@ -305,6 +313,8 @@ impl ChangeState {
             selected: false, // Always start unselected
             is_new: false,
             display_status_cache: "not queued".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
             is_parallel_eligible: true,
@@ -344,6 +354,41 @@ impl ChangeState {
         };
         if status != "error" {
             self.error_message_cache = None;
+        }
+        // Leaving a blocked/stalled row drops its blocker view, so a stale
+        // badge can never outlive the hold that produced it.
+        if !matches!(status, "blocked" | "stalled") {
+            self.blocker_kind_cache = crate::orchestration::state::BlockerKind::None;
+            self.blocker_detail_cache = None;
+        }
+    }
+
+    /// Status text for the row badge.
+    ///
+    /// A blocked row appends its reducer-derived blocker kind so an operator can
+    /// tell a dependency wait from an external prerequisite wait at a glance;
+    /// every other status keeps its plain word.
+    pub fn status_badge(&self) -> String {
+        match (
+            self.display_status_cache.as_str(),
+            self.blocker_kind_cache.as_str(),
+        ) {
+            ("blocked", Some(kind)) => format!("blocked:{kind}"),
+            (status, _) => status.to_string(),
+        }
+    }
+
+    /// Adopt a reducer-derived blocker view verbatim.
+    pub fn set_blocker_view(&mut self, view: Option<&crate::orchestration::state::BlockerView>) {
+        match view {
+            Some(view) => {
+                self.blocker_kind_cache = view.kind;
+                self.blocker_detail_cache = view.detail.clone();
+            }
+            None => {
+                self.blocker_kind_cache = crate::orchestration::state::BlockerKind::None;
+                self.blocker_detail_cache = None;
+            }
         }
     }
 
@@ -1038,6 +1083,20 @@ impl AppState {
                     }
                 }
             }
+        }
+    }
+
+    /// Sync blocker views from the reducer.
+    ///
+    /// Kept separate from the display-status sync so a row's `blocked` versus
+    /// `stalled` word and its blocker kind always come from the same reducer
+    /// snapshot instead of being inferred independently here.
+    pub fn apply_blocker_views_from_reducer(
+        &mut self,
+        blocker_views: &HashMap<String, crate::orchestration::state::BlockerView>,
+    ) {
+        for change in &mut self.changes {
+            change.set_blocker_view(blocker_views.get(&change.id));
         }
     }
 
@@ -1972,6 +2031,8 @@ mod tests {
             completed_tasks: 3,
             total_tasks: 6,
             display_status_cache: "not queued".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::DarkGray,
             error_message_cache: None,
             selected: false,
@@ -2829,6 +2890,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             display_status_cache: "archived".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::Blue,
             error_message_cache: None,
             selected: false,
@@ -2847,6 +2910,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             display_status_cache: "merged".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::LightBlue,
             error_message_cache: None,
             selected: false,
@@ -3045,6 +3110,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             display_status_cache: "applying".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::Cyan,
             error_message_cache: None,
             selected: false,
@@ -3072,6 +3139,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             display_status_cache: "applying".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::Cyan,
             error_message_cache: None,
             selected: false,
@@ -3103,6 +3172,8 @@ mod tests {
             completed_tasks: 0,
             total_tasks: 1,
             display_status_cache: "applying".to_string(),
+            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
+            blocker_detail_cache: None,
             display_color_cache: Color::Cyan,
             error_message_cache: None,
             selected: false,

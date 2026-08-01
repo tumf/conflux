@@ -1010,12 +1010,16 @@ async fn run_tui_loop(
             //   terminal, and queue states cannot be regressed by the next display snapshot.
             // Phase 6.1: TUI derives queue_status from the reducer display snapshot.
             if should_apply_event_to_tui_reducer(&event) {
-                let display_map = {
+                // Status and blocker view are read from the same reducer
+                // snapshot so a row's `blocked`/`stalled` word and its blocker
+                // kind can never disagree.
+                let (display_map, blocker_views) = {
                     let mut state = shared_state.write().await;
                     state.apply_execution_event(&event);
-                    state.all_display_statuses()
+                    (state.all_display_statuses(), state.all_blocker_views())
                 };
                 app.apply_display_statuses_from_reducer(&display_map);
+                app.apply_blocker_views_from_reducer(&blocker_views);
             }
 
             // Forward execution events to web state (web-monitoring feature only)

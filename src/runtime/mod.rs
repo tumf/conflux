@@ -25,7 +25,8 @@ pub use ids::{OrchestratorId, ProjectId, ProposalId};
 pub use orchestrator::{OrchestratorLifecycleStatus, OrchestratorRuntimeState};
 pub use project::{BaseLaneOwner, BaseLaneOwnerKind, ProjectRuntimeState, ProjectStatus};
 pub use proposal::{
-    BlockerInfo, ProposalRuntimeState, ProposalStatus, RuntimeRevision, WorkspaceRef,
+    BlockerInfo, BlockerKind, BlockerOrigin, ExternalBlockerInfo, ProposalRuntimeState,
+    ProposalStatus, RuntimeRevision, WorkspaceRef,
 };
 pub use reducer::{OrchestratorEvent, ProjectEvent, ProposalEvent, RuntimeEvent};
 pub use snapshot::{

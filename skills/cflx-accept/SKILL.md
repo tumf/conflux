@@ -30,14 +30,18 @@ machine-readable payload, on its own line:
 - FAIL:     `{"acceptance":"fail","findings":[<finding>, ...]}` — each `<finding>`
   is either a **structured repository finding** (preferred) or a legacy string.
 - CONTINUE: `{"acceptance":"continue"}`
-- STALLED HOLD (compatibility token) — **requires a structured blocker payload**:
+- EXTERNAL BLOCKER (compatibility token) — **requires a structured blocker payload**:
 
 ```json
-{"acceptance":"gated","blocker":{"category":"credential","evidence":["STAGING_API_KEY is unset in the verification environment"],"next_action":"provision STAGING_API_KEY, then retry acceptance","resumable":true}}
+{"acceptance":"gated","blocker":{"category":"credential","evidence":["STAGING_API_KEY is unset in the verification environment"],"unblock_condition":"STAGING_API_KEY is present in the verification environment","next_action":"provision STAGING_API_KEY, then retry acceptance","resumable":true}}
 ```
 
-A bare `{"acceptance":"gated"}` is a **protocol error**, not a stalled hold. See
-"Structured stalled blocker contract" below.
+A bare `{"acceptance":"gated"}` is a **protocol error**, not a hold. See
+"Structured external blocker contract" below.
+
+You report facts; **Conflux owns the final `blocked` versus `stalled`
+classification**. Never claim a lifecycle status in prose, and never treat the
+`gated` or legacy `blocked` token spelling as the lifecycle decision.
 
 ### Structured repository finding contract
 
@@ -222,25 +226,30 @@ Before running checks, read `proposal.md` and detect the `Change Type` field:
 - Final OpenSpec validation, archive-gate validation, and archive readiness are not implementation tasks; if they need to be documented, require a non-checkbox `## Final Validation` or notes section.
 - A valid `Implementation Blocker #<n>` with concrete evidence and unblock actions creates a stalled acceptance hold for operators and lifecycle/status displays.
 - Recoverable infrastructure blockers are non-terminal stalled holds, not rejection evidence. Examples include Docker daemon/image pull failures, DNS/network timeouts, package registry outages, missing non-mockable credentials, port conflicts, and pending managed verification jobs.
-- Legacy `blocked` acceptance verdict is input compatibility; `gated` is also compatibility/protocol terminology and MUST NOT be treated as operator-facing lifecycle taxonomy. The operator-facing lifecycle term is `stalled`.
+- Legacy `blocked` acceptance verdict is input compatibility; `gated` is also compatibility/protocol terminology and MUST NOT be treated as operator-facing lifecycle taxonomy. Conflux — not this skill — classifies the validated result as operator-facing `blocked` (a validated non-repository prerequisite) or `stalled` (no semantic progress, repeated findings, or exhausted repair policy). Token spelling alone never sets either.
+- Repeated findings, absent semantic progress, and an exhausted repair budget are **execution conditions**, not external prerequisites. Report them as what you observed and do not fabricate a category, evidence, or unblock condition for them; Conflux classifies those as `stalled`.
 - Do not require or create terminal `REJECTED.md` evidence for recoverable infrastructure blockers unless independent evidence proves the change intent is invalid, obsolete, contradictory, or constitution-violating.
 - Repository-fixable vs stalled-hold rubric:
   - `FAIL`: repository-only autonomous work (code/tests/spec/tasks/docs in this repo) can resolve the issue.
   - Stalled hold via a structured `gated` payload: repository-only work cannot resolve it in apply (human decision, repo-external prerequisite, unresolved external dependency, missing upstream constraint resolution, or recoverable infrastructure/credential/pending verification blocker).
   - When the blocker comes from a declared verification, the stalled hold requires `completion_role: change-blocking`; see [Completion Role Gating](#completion-role-gating). An unavailable prerequisite for a `completion_role: operational-observation` verification is a pending observation, not a hold.
 
-## Structured stalled blocker contract
+## Structured external blocker contract
 
-A stalled hold pauses the whole workflow, so it must be earned with evidence.
-The runtime accepts one only when the `gated` verdict carries a `blocker` object
-with **all four** required fields:
+An external blocker pauses the whole workflow, so it must be earned with
+evidence. The runtime accepts one only when the `gated` verdict carries a
+`blocker` object with **all five** required fields:
 
 | Field | Requirement |
 | --- | --- |
 | `category` | Exactly one of: `credential`, `external_approval`, `policy`, `external_service`, `pending_verification`, `infrastructure`, `schema_incompatibility`, `human_decision` |
 | `evidence` | Non-empty array of concrete observed evidence strings |
-| `next_action` | Non-empty string describing what unblocks the hold |
+| `unblock_condition` | Non-empty string naming a **verifiable** condition whose satisfaction clears the wait |
+| `next_action` | Non-empty string describing the action that satisfies the condition |
 | `resumable` | Boolean — whether acceptance can resume once the prerequisite is met |
+
+`unblock_condition` and `next_action` are different things: the condition is what
+an observer can check, the action is what someone does about it. Supply both.
 
 Optional: `prerequisite_owner` (owning team/role) and `evidence_ids` (stable
 identifiers).
@@ -253,14 +262,15 @@ narrative does not produce category `credential`, and it never will.
 
 Anything short of the full payload — a bare `{"acceptance":"gated"}`, a plain
 `ACCEPTANCE: GATED` line, an unsupported category, an empty `evidence` array, a
-missing `next_action`, or a missing `resumable` — is an **acceptance protocol
-error**. The runtime does not stall on it. It re-runs acceptance within a fixed
-retry budget and then reports a terminal protocol error. If you cannot supply
-all four fields from real evidence, emit `FAIL` or `CONTINUE` instead.
+missing `unblock_condition`, a missing `next_action`, or a missing `resumable` —
+is an **acceptance protocol error**. The runtime sets neither `blocked` nor
+`stalled` from it. It re-runs acceptance within a fixed retry budget and then
+reports a terminal protocol error. If you cannot supply all five fields from real
+evidence, emit `FAIL` or `CONTINUE` instead.
 
 Never create `APPLY_BLOCKED`, a marker file, or any other runtime artifact under
-the change directory. The runtime records stalled holds outside the worktree and
-keeps the worktree clean.
+the change directory. Conflux holds this state in memory for the current process
+only and keeps the worktree clean.
 - For behavior-changing work, missing/ambiguous verification planning is FAIL (not CONTINUE)
 
 ## Portable Interface Constraint

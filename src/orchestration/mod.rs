@@ -5,6 +5,7 @@
 pub mod acceptance;
 pub mod apply;
 pub mod archive;
+pub mod blocker_classification;
 pub mod hooks;
 pub mod operator_command;
 pub mod output;
@@ -20,6 +21,11 @@ pub use acceptance::{acceptance_test_streaming, build_acceptance_tail_findings, 
 pub use apply::{apply_change, apply_change_streaming, ApplyContext, ApplyResult};
 #[allow(unused_imports)]
 pub use archive::{archive_change, archive_change_streaming, ArchiveContext, ArchiveResult};
+#[allow(unused_imports)]
+pub use blocker_classification::{
+    classify_execution_hold, classify_reported_facts, ExecutionHold, ExecutionStopReason,
+    ExternalBlockerClaim, LifecycleClassification,
+};
 #[allow(unused_imports)]
 pub use output::{
     ChannelOutputHandler, ContextualOutputHandler, LogOutputHandler, OutputHandler, OutputMessage,

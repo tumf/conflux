@@ -195,6 +195,8 @@ pub fn make_remote_change(id: &str, project: &str) -> RemoteChange {
         status: "queued".to_string(),
         iteration_number: None,
         selected: true,
+        blocker_kind: None,
+        blocker_detail: None,
     }
 }
 

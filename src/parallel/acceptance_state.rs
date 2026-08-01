@@ -314,6 +314,10 @@ impl AcceptanceStallRecord {
                 self.evidence.join(" | ")
             ),
             evidence: self.evidence.clone(),
+            // Retired disk records predate the explicit unblock condition, so
+            // they report none and can only ever classify as stalled.
+            unblock_condition: None,
+            prerequisite_owner: self.prerequisite_owner.clone(),
             next_action: self.next_action.clone(),
             resumable: self.resumable,
             worktree_preserved: true,
@@ -638,6 +642,9 @@ pub fn migrate_legacy_acceptance_marker(
     let blocker = crate::acceptance::AcceptanceBlocker {
         category: "pending_verification".to_string(),
         evidence: migrated_evidence,
+        // Legacy markers predate the explicit unblock condition; the migrated
+        // next action is the only condition text available.
+        unblock_condition: next_action.to_string(),
         next_action: next_action.to_string(),
         resumable: true,
         prerequisite_owner: None,
@@ -753,6 +760,8 @@ mod tests {
         crate::acceptance::AcceptanceBlocker {
             category: "credential".to_string(),
             evidence: vec!["STAGING_API_KEY is unset".to_string()],
+            unblock_condition: "STAGING_API_KEY is present in the verification environment"
+                .to_string(),
             next_action: "provision STAGING_API_KEY then retry acceptance".to_string(),
             resumable: true,
             prerequisite_owner: Some("platform".to_string()),
@@ -940,6 +949,7 @@ mod tests {
             category: "human_decision".to_string(),
             // Prose full of credential words must not change the category.
             evidence: vec!["needs a credential token auth decision from the owner".to_string()],
+            unblock_condition: "the owner records a decision".to_string(),
             next_action: "owner decides".to_string(),
             resumable: false,
             prerequisite_owner: None,

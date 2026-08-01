@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from 'react';
 import { toast } from 'sonner';
-import { RemoteChange } from '../api/types';
+import { BlockerKind, RemoteChange, toBlockerKind } from '../api/types';
 import { APIError, stopAndDequeueChange, toggleChangeSelection } from '../api/restClient';
 import { StopChangeDialog } from './StopChangeDialog';
 
@@ -16,6 +16,7 @@ const statusConfig: Record<string, { color: string; bg: string }> = {
   idle: { color: 'text-[#71717a]', bg: 'bg-[#27272a]' },
   'not queued': { color: 'text-[#71717a]', bg: 'bg-[#27272a]' },
   queued: { color: 'text-[#3b82f6]', bg: 'bg-[#1e3a5f]/50' },
+  blocked: { color: 'text-[#a1a1aa]', bg: 'bg-[#27272a]/80' },
   stalled: { color: 'text-[#facc15]', bg: 'bg-[#422006]/50' },
   applying: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
   accepting: { color: 'text-[#f59e0b]', bg: 'bg-[#451a03]/50' },
@@ -31,6 +32,7 @@ const progressBarColor: Record<string, string> = {
   idle: 'bg-[#3f3f46]',
   'not queued': 'bg-[#3f3f46]',
   queued: 'bg-[#3b82f6]',
+  blocked: 'bg-[#71717a]',
   stalled: 'bg-[#facc15]',
   applying: 'bg-[#f59e0b]',
   accepting: 'bg-[#f59e0b]',
@@ -57,10 +59,24 @@ export function ChangeRow({
       ? Math.round((change.completed_tasks / change.total_tasks) * 100)
       : 0;
 
+  // A blocked row appends its reducer-derived blocker kind so a dependency wait
+  // and an external prerequisite wait stay distinguishable while sharing the
+  // `blocked` lifecycle word. The kind is never inferred from the status text,
+  // and a value outside the closed set is dropped rather than displayed.
+  const blockerKind: BlockerKind | null =
+    change.status === 'blocked' ? toBlockerKind(change.blocker_kind) : null;
+
   const statusDisplay =
     change.iteration_number != null && change.iteration_number > 0
       ? `${change.status}:${change.iteration_number}`
-      : change.status;
+      : blockerKind != null
+        ? `${change.status}:${blockerKind}`
+        : change.status;
+
+  const blockerDetail =
+    change.status === 'blocked' || change.status === 'stalled'
+      ? (change.blocker_detail ?? null)
+      : null;
 
   const cfg = statusConfig[change.status] ?? statusConfig.idle;
   const barColor = progressBarColor[change.status] ?? progressBarColor.idle;
@@ -181,7 +197,10 @@ export function ChangeRow({
                 Stop & dequeue
               </button>
             )}
-            <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${cfg.color} ${cfg.bg}`}>
+            <span
+              className={`rounded px-1.5 py-0.5 text-xs font-medium ${cfg.color} ${cfg.bg}`}
+              data-blocker-kind={blockerKind ?? undefined}
+            >
               {statusDisplay}
             </span>
           </div>
@@ -206,6 +225,12 @@ export function ChangeRow({
 
         {change.status === 'error' && (
           <p className="text-xs text-[#ef4444]">Error</p>
+        )}
+
+        {blockerDetail != null && (
+          <p className="text-xs text-[#a1a1aa]" data-testid="blocker-detail">
+            {blockerDetail}
+          </p>
         )}
       </div>
 

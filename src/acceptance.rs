@@ -45,6 +45,12 @@ pub struct AcceptanceBlocker {
     pub category: String,
     /// Concrete non-empty evidence for the external prerequisite.
     pub evidence: Vec<String>,
+    /// Verifiable condition whose satisfaction clears the wait.
+    ///
+    /// Distinct from [`Self::next_action`]: the condition is what an observer
+    /// can check, the action is what someone does about it. The orchestrator
+    /// requires both before it will classify the report as external `blocked`.
+    pub unblock_condition: String,
     /// Operator-facing action that can unblock the hold.
     pub next_action: String,
     /// Whether acceptance can resume once the prerequisite is satisfied.
@@ -56,11 +62,12 @@ pub struct AcceptanceBlocker {
 }
 
 impl AcceptanceBlocker {
-    /// Operator-facing blocker view for lifecycle events and status displays.
+    /// Reported blocker facts for lifecycle events and status displays.
     ///
-    /// The category is copied verbatim; it is never re-derived from prose. This
-    /// is the single projection serial and parallel share, so equivalent
-    /// blockers reach the reducer as equivalent `stalled` presentations.
+    /// Every field is copied verbatim; nothing is re-derived from prose. This is
+    /// the single projection serial and parallel share, so equivalent blockers
+    /// reach the orchestrator's classifier as equivalent facts — and therefore
+    /// receive the same lifecycle classification in both modes.
     pub fn to_stalled_blocker(&self) -> crate::events::StalledBlocker {
         crate::events::StalledBlocker {
             category: self.category.clone(),
@@ -72,6 +79,8 @@ impl AcceptanceBlocker {
                 self.evidence.join(" | ")
             ),
             evidence: self.evidence.clone(),
+            unblock_condition: Some(self.unblock_condition.clone()),
+            prerequisite_owner: self.prerequisite_owner.clone(),
             next_action: self.next_action.clone(),
             resumable: self.resumable,
             worktree_preserved: true,
@@ -94,6 +103,8 @@ pub enum BlockerRejection {
     UnsupportedCategory(String),
     /// `evidence` was absent, not an array, or contained no non-blank entry.
     EmptyEvidence,
+    /// `unblock_condition` was absent or blank.
+    MissingUnblockCondition,
     /// `next_action` was absent or blank.
     MissingNextAction,
     /// `resumable` was absent or not a boolean.
@@ -118,6 +129,9 @@ impl BlockerRejection {
             BlockerRejection::EmptyEvidence => {
                 "blocker payload has no concrete evidence entries".to_string()
             }
+            BlockerRejection::MissingUnblockCondition => {
+                "blocker payload has no verifiable unblock_condition".to_string()
+            }
             BlockerRejection::MissingNextAction => "blocker payload has no next_action".to_string(),
             BlockerRejection::MissingResumable => {
                 "blocker payload has no boolean resumable field".to_string()
@@ -129,8 +143,10 @@ impl BlockerRejection {
 /// Validate a raw `blocker` payload from a `gated` verdict object.
 ///
 /// Validation is purely structural and explicit: the category must be one the
-/// runtime supports, evidence must be concrete, and the reviewer must state
-/// both a next action and resumability. Nothing is inferred from prose.
+/// runtime supports, evidence must be concrete, and the reviewer must state a
+/// verifiable unblock condition, a next action, and resumability. Nothing is
+/// inferred from prose, and a payload missing any required field routes to
+/// bounded protocol correction rather than to an inferred external wait.
 pub fn validate_acceptance_blocker(
     payload: Option<&serde_json::Value>,
 ) -> std::result::Result<AcceptanceBlocker, BlockerRejection> {
@@ -157,6 +173,13 @@ pub fn validate_acceptance_blocker(
         return Err(BlockerRejection::EmptyEvidence);
     }
 
+    let unblock_condition = object
+        .get("unblock_condition")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(BlockerRejection::MissingUnblockCondition)?;
+
     let next_action = object
         .get("next_action")
         .and_then(|value| value.as_str())
@@ -172,6 +195,7 @@ pub fn validate_acceptance_blocker(
     Ok(AcceptanceBlocker {
         category: category.to_string(),
         evidence,
+        unblock_condition: unblock_condition.to_string(),
         next_action: next_action.to_string(),
         resumable,
         prerequisite_owner: object
@@ -754,6 +778,7 @@ pub(crate) struct JsonVerdict {
 /// {"acceptance":"fail","findings":["src/foo.rs:10 issue"]}
 /// {"acceptance":"gated","blocker":{"category":"credential",
 ///   "evidence":["STAGING_API_KEY is unset in the verification environment"],
+///   "unblock_condition":"STAGING_API_KEY is present in the verification environment",
 ///   "next_action":"provision STAGING_API_KEY then retry acceptance",
 ///   "resumable":true}}
 /// ```
@@ -1999,7 +2024,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
         format!("{{\"acceptance\":\"gated\",\"blocker\":{blocker}}}\n")
     }
 
-    const VALID_BLOCKER: &str = r#"{"category":"credential","evidence":["STAGING_API_KEY unset in the verification environment"],"next_action":"provision STAGING_API_KEY then retry acceptance","resumable":true}"#;
+    const VALID_BLOCKER: &str = r#"{"category":"credential","evidence":["STAGING_API_KEY unset in the verification environment"],"unblock_condition":"STAGING_API_KEY is present in the verification environment","next_action":"provision STAGING_API_KEY then retry acceptance","resumable":true}"#;
 
     #[test]
     fn structured_blocker_becomes_validated_stall_with_explicit_category() {
@@ -2009,6 +2034,10 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
                 assert_eq!(
                     blocker.evidence,
                     ["STAGING_API_KEY unset in the verification environment"]
+                );
+                assert_eq!(
+                    blocker.unblock_condition,
+                    "STAGING_API_KEY is present in the verification environment"
                 );
                 assert_eq!(
                     blocker.next_action,
@@ -2024,7 +2053,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
 
     #[test]
     fn structured_blocker_preserves_optional_owner_and_evidence_ids() {
-        let blocker = r#"{"category":"external_approval","evidence":["change board ticket CB-42 is awaiting sign-off"],"next_action":"await CB-42 approval then retry acceptance","resumable":true,"prerequisite_owner":"release-management","evidence_ids":["CB-42",""," "]}"#;
+        let blocker = r#"{"category":"external_approval","evidence":["change board ticket CB-42 is awaiting sign-off"],"unblock_condition":"CB-42 is approved","next_action":"await CB-42 approval then retry acceptance","resumable":true,"prerequisite_owner":"release-management","evidence_ids":["CB-42",""," "]}"#;
         match parse_acceptance_output(&structured_gated(blocker)) {
             AcceptanceResult::Stalled { blocker } => {
                 assert_eq!(blocker.category, "external_approval");
@@ -2042,7 +2071,7 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
     fn every_supported_category_is_accepted_verbatim() {
         for category in SUPPORTED_BLOCKER_CATEGORIES {
             let blocker = format!(
-                r#"{{"category":"{category}","evidence":["concrete evidence"],"next_action":"resolve then retry","resumable":false}}"#
+                r#"{{"category":"{category}","evidence":["concrete evidence"],"unblock_condition":"the prerequisite is satisfied","next_action":"resolve then retry","resumable":false}}"#
             );
             match parse_acceptance_output(&structured_gated(&blocker)) {
                 AcceptanceResult::Stalled { blocker } => {
@@ -2063,43 +2092,51 @@ ACCEPTANCE: PASSAll acceptance criteria verified:
             (r#""credential""#, BlockerRejection::NotAnObject),
             (r#"["credential"]"#, BlockerRejection::NotAnObject),
             (
-                r#"{"evidence":["e"],"next_action":"a","resumable":true}"#,
+                r#"{"evidence":["e"],"unblock_condition":"c","next_action":"a","resumable":true}"#,
                 BlockerRejection::MissingCategory,
             ),
             (
-                r#"{"category":"   ","evidence":["e"],"next_action":"a","resumable":true}"#,
+                r#"{"category":"   ","evidence":["e"],"unblock_condition":"c","next_action":"a","resumable":true}"#,
                 BlockerRejection::MissingCategory,
             ),
             (
-                r#"{"category":"flaky_test","evidence":["e"],"next_action":"a","resumable":true}"#,
+                r#"{"category":"flaky_test","evidence":["e"],"unblock_condition":"c","next_action":"a","resumable":true}"#,
                 BlockerRejection::UnsupportedCategory("flaky_test".to_string()),
             ),
             (
-                r#"{"category":"credential","evidence":[],"next_action":"a","resumable":true}"#,
+                r#"{"category":"credential","evidence":[],"unblock_condition":"c","next_action":"a","resumable":true}"#,
                 BlockerRejection::EmptyEvidence,
             ),
             (
-                r#"{"category":"credential","evidence":["  "],"next_action":"a","resumable":true}"#,
+                r#"{"category":"credential","evidence":["  "],"unblock_condition":"c","next_action":"a","resumable":true}"#,
                 BlockerRejection::EmptyEvidence,
             ),
             (
-                r#"{"category":"credential","next_action":"a","resumable":true}"#,
+                r#"{"category":"credential","unblock_condition":"c","next_action":"a","resumable":true}"#,
                 BlockerRejection::EmptyEvidence,
             ),
             (
-                r#"{"category":"credential","evidence":["e"],"resumable":true}"#,
+                r#"{"category":"credential","evidence":["e"],"next_action":"a","resumable":true}"#,
+                BlockerRejection::MissingUnblockCondition,
+            ),
+            (
+                r#"{"category":"credential","evidence":["e"],"unblock_condition":"  ","next_action":"a","resumable":true}"#,
+                BlockerRejection::MissingUnblockCondition,
+            ),
+            (
+                r#"{"category":"credential","evidence":["e"],"unblock_condition":"c","resumable":true}"#,
                 BlockerRejection::MissingNextAction,
             ),
             (
-                r#"{"category":"credential","evidence":["e"],"next_action":"  ","resumable":true}"#,
+                r#"{"category":"credential","evidence":["e"],"unblock_condition":"c","next_action":"  ","resumable":true}"#,
                 BlockerRejection::MissingNextAction,
             ),
             (
-                r#"{"category":"credential","evidence":["e"],"next_action":"a"}"#,
+                r#"{"category":"credential","evidence":["e"],"unblock_condition":"c","next_action":"a"}"#,
                 BlockerRejection::MissingResumable,
             ),
             (
-                r#"{"category":"credential","evidence":["e"],"next_action":"a","resumable":"yes"}"#,
+                r#"{"category":"credential","evidence":["e"],"unblock_condition":"c","next_action":"a","resumable":"yes"}"#,
                 BlockerRejection::MissingResumable,
             ),
         ];

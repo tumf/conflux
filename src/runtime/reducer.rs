@@ -1,7 +1,9 @@
 use crate::runtime::ids::{ProjectId, ProposalId};
 use crate::runtime::orchestrator::{OrchestratorLifecycleStatus, OrchestratorRuntimeState};
 use crate::runtime::project::{ProjectRuntimeState, ProjectStatus};
-use crate::runtime::proposal::{BlockerInfo, ProposalStatus, RuntimeRevision, WorkspaceRef};
+use crate::runtime::proposal::{
+    BlockerInfo, ExternalBlockerInfo, ProposalStatus, RuntimeRevision, WorkspaceRef,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
@@ -41,6 +43,12 @@ pub enum ProposalEvent {
     },
     DependencyBlocked {
         blocker: BlockerInfo,
+        revision: RuntimeRevision,
+    },
+    /// The orchestrator validated an external prerequisite report and classified
+    /// it as an external `blocked` wait.
+    ExternalBlocked {
+        blocker: ExternalBlockerInfo,
         revision: RuntimeRevision,
     },
     ApplyStarted {
@@ -142,6 +150,9 @@ impl ProjectRuntimeState {
             ProposalEvent::Queue { revision } => ProposalStatus::Queued { revision },
             ProposalEvent::DependencyBlocked { blocker, revision } => {
                 ProposalStatus::DependencyBlocked { blocker, revision }
+            }
+            ProposalEvent::ExternalBlocked { blocker, revision } => {
+                ProposalStatus::ExternalBlocked { blocker, revision }
             }
             ProposalEvent::ApplyStarted {
                 workspace,
@@ -383,6 +394,117 @@ mod tests {
             project.proposal_status(&ProposalId::from_change_id("stopped")),
             Some(ProposalStatus::Stopped { .. })
         ));
+    }
+
+    fn external_blocker() -> ExternalBlockerInfo {
+        use crate::runtime::proposal::BlockerOrigin;
+        ExternalBlockerInfo {
+            origin: BlockerOrigin::Acceptance,
+            category: "external_service".to_string(),
+            evidence: vec!["staging deploy queue is offline".to_string()],
+            prerequisite_owner: Some("platform".to_string()),
+            unblock_condition: "the staging deploy queue accepts jobs again".to_string(),
+            next_action: "retry acceptance once the queue is online".to_string(),
+            resumable: true,
+        }
+    }
+
+    /// Applying an external-blocked event replaces any stalled state and vice
+    /// versa: one canonical status field means the two can never coexist.
+    #[test]
+    fn external_blocked_and_stalled_events_replace_rather_than_accumulate() {
+        use crate::runtime::proposal::BlockerKind;
+        let mut state = OrchestratorRuntimeState::default();
+
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::ExternalBlocked {
+                blocker: external_blocker(),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        let project = state.projects.get(&ProjectId::from("project")).unwrap();
+        let status = project
+            .proposal_status(&ProposalId::from_change_id("change-a"))
+            .unwrap();
+        assert_eq!(status.display_status(), "blocked");
+        assert_eq!(status.blocker_kind(), Some(BlockerKind::External));
+        assert_eq!(
+            project.external_blocked_proposals(),
+            vec![ProposalId::from_change_id("change-a")]
+        );
+        assert!(project.stalled_proposals().is_empty());
+
+        // A later stalled observation supersedes it rather than coexisting.
+        state.apply_event(event(
+            "project",
+            "change-a",
+            ProposalEvent::Stalled {
+                blocker: BlockerInfo::new("repeated_acceptance_findings", "no semantic progress"),
+                revision: RuntimeRevision(2),
+            },
+        ));
+        let project = state.projects.get(&ProjectId::from("project")).unwrap();
+        let status = project
+            .proposal_status(&ProposalId::from_change_id("change-a"))
+            .unwrap();
+        assert_eq!(status.display_status(), "stalled");
+        assert_eq!(status.blocker_kind(), None);
+        assert!(project.external_blocked_proposals().is_empty());
+    }
+
+    /// An external-blocked proposal is never a dependency edge: its dependent
+    /// keeps its own dependency blocker kind and unrelated work stays queued.
+    #[test]
+    fn external_blocked_proposal_does_not_become_a_dependency_edge() {
+        use crate::runtime::proposal::BlockerKind;
+        let mut state = OrchestratorRuntimeState::default();
+        state.apply_event(event(
+            "project",
+            "alpha",
+            ProposalEvent::ExternalBlocked {
+                blocker: external_blocker(),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "beta",
+            ProposalEvent::DependencyBlocked {
+                blocker: BlockerInfo::new("dependency", "waiting for alpha"),
+                revision: RuntimeRevision(1),
+            },
+        ));
+        state.apply_event(event(
+            "project",
+            "gamma",
+            ProposalEvent::Queue {
+                revision: RuntimeRevision(1),
+            },
+        ));
+
+        let project = state.projects.get(&ProjectId::from("project")).unwrap();
+        assert_eq!(
+            project
+                .proposal_status(&ProposalId::from_change_id("beta"))
+                .unwrap()
+                .blocker_kind(),
+            Some(BlockerKind::Dependency)
+        );
+        assert_eq!(
+            project.dependency_blocked_proposals(),
+            vec![ProposalId::from_change_id("beta")]
+        );
+        assert_eq!(
+            project.external_blocked_proposals(),
+            vec![ProposalId::from_change_id("alpha")]
+        );
+        // Ordinary dispatch suppresses both waits but not the unrelated change.
+        assert_eq!(
+            project.dispatch_candidates(),
+            vec![ProposalId::from_change_id("gamma")]
+        );
     }
 
     #[test]
