@@ -319,14 +319,25 @@ pub fn is_permission_denial(blocker: &crate::events::StalledBlocker) -> bool {
     blocker.gate == "permission_policy"
 }
 
-/// Map an acceptance retry-policy stop reason onto a classifier stop reason.
+/// Map an acceptance retry-policy or repair-gate stop reason onto a classifier
+/// stop reason.
 ///
-/// Unrecognized reasons fall back to "no semantic progress", which is the
-/// conservative reading: automation stopped and an operator must look.
+/// Both families of stop are runtime execution judgements, so they share one
+/// mapping and cannot diverge by call site. Unrecognized reasons fall back to
+/// "no semantic progress", which is the conservative reading: automation
+/// stopped and an operator must look.
 pub fn execution_stop_reason_for(retry_reason: &str) -> ExecutionStopReason {
     match retry_reason {
-        "repeated_acceptance_findings" => ExecutionStopReason::RepeatedFinding,
+        "repeated_acceptance_findings"
+        | crate::orchestration::acceptance::REPEATED_FINDING_REASON => {
+            ExecutionStopReason::RepeatedFinding
+        }
         "acceptance_cycle_limit_exhausted" => ExecutionStopReason::RetryExhausted,
+        // A repair delta that never touched the declared files produced no
+        // progress on the finding it claimed to repair.
+        crate::orchestration::acceptance::REMEDIATION_MISMATCH_REASON => {
+            ExecutionStopReason::NoSemanticProgress
+        }
         _ => ExecutionStopReason::NoSemanticProgress,
     }
 }

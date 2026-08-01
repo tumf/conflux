@@ -63,6 +63,118 @@ async fn record_stall_in_shared_state(
     }
 }
 
+/// Build the acceptance-phase stalled hold for an evidenced repair stop.
+///
+/// A repair stop — a repeated finding ID, or a repair delta that never touched
+/// the declared files — is the runtime's own judgement about its automatic
+/// repair budget, never a reviewer-validated external prerequisite. It is
+/// therefore routed through the same classifier the retry-policy stall uses, so
+/// no category is invented, no unblock condition is fabricated, and a stop can
+/// never acquire an external category by taking a different code path. This is
+/// the parallel expression of serial's `hold_repair_stop`.
+fn repair_stop_stalled_blocker(
+    stop: &crate::orchestration::acceptance::AcceptanceRepairStop,
+    error_summary: &str,
+) -> crate::events::StalledBlocker {
+    use crate::orchestration::blocker_classification as classification;
+
+    let stop_reason = classification::execution_stop_reason_for(stop.reason);
+    let stalled_category =
+        match classification::classify_execution_stop(stop_reason, error_summary.to_string()) {
+            classification::LifecycleClassification::Stalled { reason, .. } => reason,
+            other => unreachable!("an execution stop must classify as stalled, got {other:?}"),
+        };
+
+    // Concrete, operator-actionable evidence drawn from the stop record itself;
+    // the full machine-readable diagnostics stay in the summary.
+    let mut evidence = Vec::new();
+    if !stop.repeated_identities.is_empty() {
+        evidence.push(format!(
+            "findings still open after their one automatic repair: {}",
+            stop.repeated_identities.join(", ")
+        ));
+    }
+    let uncovered = stop.coverage.uncovered();
+    if !uncovered.is_empty() {
+        evidence.push(format!(
+            "declared files missing from the repair delta: {}",
+            uncovered.join(", ")
+        ));
+    }
+    evidence.extend(stop.remediation_evidence.iter().cloned());
+    if evidence.is_empty() {
+        evidence.push(error_summary.to_string());
+    }
+
+    crate::events::StalledBlocker {
+        category: stalled_category,
+        phase: "acceptance".to_string(),
+        gate: "acceptance_repair_policy".to_string(),
+        error_summary: error_summary.to_string(),
+        evidence,
+        // Deliberately absent: an exhausted repair budget names no verifiable
+        // external condition, which is what keeps it out of external `blocked`.
+        unblock_condition: None,
+        prerequisite_owner: None,
+        next_action: stop.next_action.clone(),
+        resumable: stop.resumable,
+        worktree_preserved: true,
+    }
+}
+
+/// Hold a change on an evidenced repair stop instead of failing it.
+///
+/// Returns a `WorkspaceResult` with no `error`, so the scheduler records a hold
+/// rather than `mark_failed` + `ProcessingError`, and the reducer's
+/// acceptance-hold branch lands on non-terminal `stalled` with the worktree
+/// preserved for an explicit retry. Nothing here proves completion, finding
+/// closure, or acceptance PASS.
+async fn hold_repair_stop(
+    change_id: String,
+    workspace_name: String,
+    stop: &crate::orchestration::acceptance::AcceptanceRepairStop,
+    acceptance_iteration: Option<u32>,
+    event_tx: &Option<tokio::sync::mpsc::Sender<ParallelEvent>>,
+    shared_orchestrator_state: &Option<
+        Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    >,
+) -> WorkspaceResult {
+    let error = stop.summary();
+    let blocker = repair_stop_stalled_blocker(stop, &error);
+    record_stall_in_shared_state(
+        shared_orchestrator_state,
+        &crate::events::ExecutionEvent::ExecutionBlocked {
+            change_id: change_id.clone(),
+            blocker: blocker.clone(),
+        },
+    )
+    .await;
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(ParallelEvent::ExecutionBlocked {
+                change_id: change_id.clone(),
+                blocker,
+            })
+            .await;
+        let mut log = LogEntry::error(error.clone())
+            .with_change_id(&change_id)
+            .with_operation("acceptance");
+        if let Some(iteration) = acceptance_iteration {
+            log = log.with_iteration(iteration);
+        }
+        let _ = tx.send(ParallelEvent::Log(log)).await;
+    }
+    // No `error`: the change is held, not failed, so the worktree stays
+    // preserved for the explicit retry.
+    WorkspaceResult {
+        change_id,
+        workspace_name,
+        final_revision: None,
+        error: None,
+        rejected: None,
+    }
+}
+
 fn stalled_blocker_from_marker(marker: &BlockedMarker) -> crate::events::StalledBlocker {
     crate::events::StalledBlocker {
         category: "acceptance_marker".to_string(),
@@ -584,6 +696,179 @@ mod tests {
                 "acceptance-secret-value-scan: required_changes tests/support/relay.ts",
                 "acceptance-secret-value-scan: verification runtime/recovery.integration.test.ts",
             ]
+        );
+    }
+
+    /// Drive one repair stop through the real parallel hold path and report
+    /// what the scheduler and the reducer would each observe.
+    ///
+    /// In-memory only: an mpsc channel and an `OrchestratorState`, no worktree,
+    /// git, or process boundary.
+    async fn observe_repair_stop_hold(
+        stop: &crate::orchestration::acceptance::AcceptanceRepairStop,
+        acceptance_iteration: Option<u32>,
+    ) -> (
+        crate::parallel::types::WorkspaceResult,
+        crate::events::StalledBlocker,
+        crate::orchestration::state::OrchestratorState,
+    ) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::orchestration::state::OrchestratorState::new(vec![stop.change_id.clone()], 0),
+        ));
+        shared.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::AcceptanceStarted {
+                change_id: stop.change_id.clone(),
+                command: "accept".to_string(),
+            },
+        );
+
+        let result = super::hold_repair_stop(
+            stop.change_id.clone(),
+            format!("ws-{}", stop.change_id),
+            stop,
+            acceptance_iteration,
+            &Some(tx),
+            &Some(shared.clone()),
+        )
+        .await;
+
+        let mut emitted = None;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::parallel::ParallelEvent::ExecutionBlocked { blocker, .. } = event {
+                emitted = Some(blocker);
+            }
+        }
+        let state = shared.read().await.clone();
+        (
+            result,
+            emitted.expect("a repair stop must emit an ExecutionBlocked hold"),
+            state,
+        )
+    }
+
+    fn assert_non_terminal_acceptance_stall(
+        result: &crate::parallel::types::WorkspaceResult,
+        blocker: &crate::events::StalledBlocker,
+        state: &crate::orchestration::state::OrchestratorState,
+        change_id: &str,
+    ) {
+        // A hold, not a failure: an `error` here would route through
+        // `mark_failed` + `ProcessingError` and land on `TerminalState::Error`.
+        assert_eq!(result.error, None, "a repair stop must not fail the change");
+        assert_eq!(result.rejected, None);
+        assert_eq!(result.final_revision, None);
+
+        assert_eq!(blocker.phase, "acceptance");
+        assert_eq!(blocker.gate, "acceptance_repair_policy");
+        assert!(blocker.resumable);
+        assert!(blocker.worktree_preserved);
+        // No verifiable external condition is invented, which is what keeps the
+        // stop out of external `blocked`.
+        assert_eq!(blocker.unblock_condition, None);
+        assert_eq!(blocker.prerequisite_owner, None);
+        assert!(
+            !blocker.evidence.is_empty(),
+            "a stalled hold must carry concrete evidence"
+        );
+
+        assert_eq!(state.display_status(change_id), "stalled");
+        let runtime = state
+            .change_runtime(change_id)
+            .expect("runtime entry for the held change");
+        assert!(
+            matches!(
+                runtime.terminal,
+                crate::orchestration::state::TerminalState::None
+            ),
+            "a repair stop must stay non-terminal, got {:?}",
+            runtime.terminal
+        );
+        assert_eq!(
+            runtime.wait_state,
+            crate::orchestration::state::WaitState::Stalled
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_repeated_finding_stop_holds_as_non_terminal_stalled() {
+        let mut retry = AcceptanceRetryContext::default();
+        let findings = [secret_value_finding()];
+        let normalized = crate::orchestration::acceptance::normalize_findings(&findings);
+        let crate::orchestration::acceptance::FindingRepairDecision::Repair { identities } =
+            retry.repair_ledger.observe_fail(&normalized)
+        else {
+            panic!("first observation must allow one repair");
+        };
+        retry.repair_ledger.record_repair_dispatched(&identities);
+        let crate::orchestration::acceptance::FindingRepairDecision::Stop {
+            repeated_identities,
+            ..
+        } = retry.repair_ledger.observe_fail(&normalized)
+        else {
+            panic!("a repeated ID must stop automatic repair");
+        };
+
+        let stop = crate::orchestration::acceptance::repeated_finding_stop(
+            "change-a",
+            &findings,
+            &retry.repair_ledger,
+            repeated_identities,
+            Some("fail-rev"),
+            Some("apply-rev"),
+            &[
+                "tests/support/relay.ts".to_string(),
+                "runtime/recovery.integration.test.ts".to_string(),
+            ],
+            &["reran the relay suite".to_string()],
+        );
+
+        let (result, blocker, state) = observe_repair_stop_hold(&stop, Some(3)).await;
+        assert_non_terminal_acceptance_stall(&result, &blocker, &state, "change-a");
+        // The stop reason survives as the stalled category, so a repeated
+        // finding is never presented as an external wait.
+        assert_eq!(blocker.category, "repeated_acceptance_findings");
+        assert!(
+            blocker
+                .evidence
+                .iter()
+                .any(|entry| entry.contains("acceptance-secret-value-scan")),
+            "{:?}",
+            blocker.evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_remediation_mismatch_stop_holds_as_non_terminal_stalled() {
+        let retry = AcceptanceRetryContext {
+            findings: vec![secret_value_finding()],
+            fail_revision: Some("fail-rev".to_string()),
+            ..AcceptanceRetryContext::default()
+        };
+        let crate::orchestration::acceptance::RepairGateDecision::Stop(stop) =
+            crate::orchestration::acceptance::decide_repair_gate(
+                "change-a",
+                &retry.findings,
+                &retry.repair_ledger,
+                retry.fail_revision.as_deref(),
+                Some("apply-rev"),
+                &["tests/calibration.test.ts".to_string()],
+                &["adjusted calibration threshold".to_string()],
+            )
+        else {
+            panic!("calibration-only repair must hold before acceptance");
+        };
+
+        let (result, blocker, state) = observe_repair_stop_hold(&stop, None).await;
+        assert_non_terminal_acceptance_stall(&result, &blocker, &state, "change-a");
+        assert_eq!(blocker.category, "no_semantic_progress");
+        assert!(
+            blocker
+                .evidence
+                .iter()
+                .any(|entry| entry.contains("tests/support/relay.ts")),
+            "{:?}",
+            blocker.evidence
         );
     }
 
@@ -2116,24 +2401,19 @@ impl ParallelExecutor {
                                 &remediation_evidence,
                             )
                         {
-                            let error = stop.summary();
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::Log(
-                                        LogEntry::error(error.clone())
-                                            .with_change_id(&change_id)
-                                            .with_operation("acceptance"),
-                                    ))
-                                    .await;
-                            }
                             cancel_monitor.abort();
-                            return WorkspaceResult {
+                            // A coverage stop is an execution hold, not a
+                            // failure: same stalled presentation serial reaches
+                            // through `ChangeProcessResult::Stalled`.
+                            return hold_repair_stop(
                                 change_id,
-                                workspace_name: workspace.name,
-                                final_revision: None,
-                                error: Some(error),
-                                rejected: None,
-                            };
+                                workspace.name,
+                                &stop,
+                                None,
+                                &event_tx,
+                                &shared_orchestrator_state,
+                            )
+                            .await;
                         }
                     }
                     agent.seed_acceptance_history(acceptance_history.lock().await.clone());
@@ -2344,19 +2624,19 @@ impl ParallelExecutor {
                                 &changed_files,
                                 &remediation_evidence,
                             );
-                            let error = stop.summary();
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx
-                                    .send(ParallelEvent::Log(
-                                        LogEntry::error(error.clone())
-                                            .with_change_id(&change_id)
-                                            .with_operation("acceptance")
-                                            .with_iteration(acceptance_iteration),
-                                    ))
-                                    .await;
-                            }
                             cancel_monitor.abort();
-                            return WorkspaceResult { change_id, workspace_name: workspace.name, final_revision: None, error: Some(error), rejected: None };
+                            // A repeated finding ID is an execution hold, not a
+                            // failure: same stalled presentation serial reaches
+                            // through `ChangeProcessResult::Stalled`.
+                            return hold_repair_stop(
+                                change_id,
+                                workspace.name,
+                                &stop,
+                                Some(acceptance_iteration),
+                                &event_tx,
+                                &shared_orchestrator_state,
+                            )
+                            .await;
                         }
                         // The repair opportunity for these identities is consumed
                         // now, so the next FAIL reporting one of them stops.

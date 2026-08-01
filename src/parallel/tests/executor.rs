@@ -7134,18 +7134,11 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
     // Repeated findings without semantic progress are a runtime retry judgement,
     // not a reviewer-validated external blocker. The loop stops and requires an
     // explicit retry, without inventing a blocker category or writing anything
-    // into the change directory.
-    let error = result
-        .error
-        .as_deref()
-        .or_fail("repeated findings must stop the retry loop with a diagnostic");
-    assert!(
-        error.contains("repeated_acceptance_finding"),
-        "diagnostic must name the retry judgement: {error}"
-    );
-    assert!(
-        error.contains("retry explicitly"),
-        "diagnostic must state the operator action: {error}"
+    // into the change directory. The stop is a hold, so the change is never
+    // failed: its diagnostic travels on the acceptance-phase hold below.
+    assert_eq!(
+        result.error, None,
+        "a repeated-finding stop must hold the change, not fail it"
     );
     assert!(
         crate::parallel::acceptance_state::parse_blocked_marker(&workspace_path, change_id)
@@ -7168,7 +7161,8 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
 
     let mut acceptance_count = 0;
     let mut apply_count = 0;
-    let mut saw_stalled = false;
+    let mut saw_gated = false;
+    let mut execution_hold = None;
     while let Ok(event) = rx.try_recv() {
         match event {
             ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
@@ -7178,7 +7172,13 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
                 apply_count += 1;
             }
             ExecutionEvent::AcceptanceGated { change_id: id, .. } if id == change_id => {
-                saw_stalled = true;
+                saw_gated = true;
+            }
+            ExecutionEvent::ExecutionBlocked {
+                change_id: id,
+                blocker,
+            } if id == change_id => {
+                execution_hold = Some(blocker);
             }
             _ => {}
         }
@@ -7192,9 +7192,49 @@ async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoi
         "exactly one apply retry precedes the repeated-finding stop"
     );
     assert!(
-        !saw_stalled,
-        "evidence-free retry exhaustion must not emit a stalled lifecycle transition"
+        !saw_gated,
+        "evidence-free retry exhaustion must not emit an external-blocker lifecycle transition"
     );
+
+    let blocker = execution_hold.or_fail("the repeated-finding stop must emit an acceptance hold");
+    assert_eq!(blocker.phase, "acceptance");
+    assert!(
+        blocker
+            .error_summary
+            .contains("repeated_acceptance_finding"),
+        "diagnostic must name the retry judgement: {}",
+        blocker.error_summary
+    );
+    assert!(
+        blocker.error_summary.contains("retry explicitly"),
+        "diagnostic must state the operator action: {}",
+        blocker.error_summary
+    );
+    // No invented external category: the hold classifies as non-terminal
+    // `stalled`, which is what keeps the worktree preserved.
+    assert_eq!(blocker.unblock_condition, None);
+    let mut state = OrchestratorState::new(vec![change_id.to_string()], 0);
+    state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+        change_id: change_id.to_string(),
+        command: "accept".to_string(),
+    });
+    state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+        change_id: change_id.to_string(),
+        blocker,
+    });
+    assert_eq!(state.display_status(change_id), "stalled");
+    let runtime = state
+        .change_runtime(change_id)
+        .or_fail("runtime entry for the held change");
+    assert!(
+        matches!(
+            runtime.terminal,
+            crate::orchestration::state::TerminalState::None
+        ),
+        "a repeated-finding hold must stay non-terminal, got {:?}",
+        runtime.terminal
+    );
+    assert_eq!(runtime.wait_state, WaitState::Stalled);
 }
 
 /// Observations from one dispatch whose acceptance command emits bare
@@ -11477,6 +11517,56 @@ struct ScriptedRepairDispatch {
     acceptance_invocations: u32,
     apply_invocations: u32,
     acceptance_error_logs: Vec<String>,
+    /// The acceptance-phase hold a repair stop emits instead of failing.
+    execution_hold: Option<crate::events::StalledBlocker>,
+}
+
+impl ScriptedRepairDispatch {
+    /// Assert the dispatch held on a repair stop and return the stop summary.
+    ///
+    /// A repair stop is a hold, not a failure: `WorkspaceResult.error` must stay
+    /// `None` so the scheduler never routes it through `mark_failed` +
+    /// `ProcessingError`, and the operator diagnostic travels on the
+    /// acceptance-phase `ExecutionBlocked` hold instead.
+    fn assert_held_and_stop_summary(&self, context: &str) -> String {
+        assert_eq!(
+            self.result.error, None,
+            "{context}: a repair stop must hold the change, not fail it"
+        );
+        let blocker = self
+            .execution_hold
+            .as_ref()
+            .or_fail(&format!("{context}: an ExecutionBlocked hold is required"));
+        assert_eq!(blocker.phase, "acceptance");
+        assert_eq!(blocker.gate, "acceptance_repair_policy");
+        assert!(blocker.resumable, "{context}: a repair stop is resumable");
+        assert!(
+            blocker.worktree_preserved,
+            "{context}: the worktree must be preserved for the explicit retry"
+        );
+        assert_eq!(
+            blocker.unblock_condition, None,
+            "{context}: an execution stop names no verifiable external condition"
+        );
+        blocker.error_summary.clone()
+    }
+
+    /// Replay the hold through the reducer and return the resulting state.
+    fn reduced_state(&self, change_id: &str) -> OrchestratorState {
+        let mut state = OrchestratorState::new(vec![change_id.to_string()], 0);
+        state.apply_execution_event(&ExecutionEvent::AcceptanceStarted {
+            change_id: change_id.to_string(),
+            command: "accept".to_string(),
+        });
+        state.apply_execution_event(&ExecutionEvent::ExecutionBlocked {
+            change_id: change_id.to_string(),
+            blocker: self
+                .execution_hold
+                .clone()
+                .or_fail("an ExecutionBlocked hold is required"),
+        });
+        state
+    }
 }
 
 /// One structured FAIL verdict as the acceptance command would print it.
@@ -11594,6 +11684,7 @@ async fn dispatch_scripted_repair_cycle(
         acceptance_invocations: 0,
         apply_invocations: 0,
         acceptance_error_logs: Vec::new(),
+        execution_hold: None,
     };
 
     while let Ok(event) = rx.try_recv() {
@@ -11603,6 +11694,12 @@ async fn dispatch_scripted_repair_cycle(
             }
             ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
                 observed.apply_invocations += 1;
+            }
+            ExecutionEvent::ExecutionBlocked {
+                change_id: id,
+                blocker,
+            } if id == change_id => {
+                observed.execution_hold = Some(blocker);
             }
             ExecutionEvent::Log(log)
                 if matches!(log.level, crate::events::LogLevel::Error)
@@ -11633,11 +11730,7 @@ async fn parallel_calibration_only_repair_holds_before_a_second_acceptance_invoc
     )
     .await;
 
-    let error = observed
-        .result
-        .error
-        .as_ref()
-        .or_fail("a missing-coverage repair must stop the workspace");
+    let error = observed.assert_held_and_stop_summary("a missing-coverage repair must hold");
     assert!(error.contains("acceptance_remediation_mismatch"), "{error}");
     assert!(error.contains("src/relay.rs"), "{error}");
     assert!(error.contains("tests/relay_test.rs"), "{error}");
@@ -11646,6 +11739,21 @@ async fn parallel_calibration_only_repair_holds_before_a_second_acceptance_invoc
         error.contains("calibration/thresholds.txt"),
         "the unrelated repair must be reported as a diagnostic: {error}"
     );
+    // The hold is non-terminal: it displays `stalled`, never `error`.
+    let state = observed.reduced_state(change_id);
+    assert_eq!(state.display_status(change_id), "stalled");
+    let runtime = state
+        .change_runtime(change_id)
+        .or_fail("runtime entry for the held change");
+    assert!(
+        matches!(
+            runtime.terminal,
+            crate::orchestration::state::TerminalState::None
+        ),
+        "a coverage hold must stay non-terminal, got {:?}",
+        runtime.terminal
+    );
+    assert_eq!(runtime.wait_state, WaitState::Stalled);
     assert_eq!(
         observed.acceptance_invocations, 1,
         "the gate must stop before spending a second acceptance invocation"
@@ -11683,11 +11791,7 @@ async fn parallel_repeated_finding_id_stops_the_dispatch_cycle_before_a_second_r
     )
     .await;
 
-    let error = observed
-        .result
-        .error
-        .as_ref()
-        .or_fail("a repeated finding ID must stop the workspace");
+    let error = observed.assert_held_and_stop_summary("a repeated finding ID must hold");
     assert!(error.contains("repeated_acceptance_finding"), "{error}");
     assert!(error.contains("acceptance-secret-value-scan"), "{error}");
     assert!(error.contains("\"resumable\":true"), "{error}");
@@ -11695,6 +11799,21 @@ async fn parallel_repeated_finding_id_stops_the_dispatch_cycle_before_a_second_r
         error.contains("\"proves_acceptance_pass\":false"),
         "{error}"
     );
+    // The hold is non-terminal: it displays `stalled`, never `error`.
+    let state = observed.reduced_state(change_id);
+    assert_eq!(state.display_status(change_id), "stalled");
+    let runtime = state
+        .change_runtime(change_id)
+        .or_fail("runtime entry for the held change");
+    assert!(
+        matches!(
+            runtime.terminal,
+            crate::orchestration::state::TerminalState::None
+        ),
+        "a repeated-finding hold must stay non-terminal, got {:?}",
+        runtime.terminal
+    );
+    assert_eq!(runtime.wait_state, WaitState::Stalled);
     assert_eq!(
         observed.apply_invocations, 2,
         "the first repair is automatic; the second one is not"
@@ -11742,10 +11861,7 @@ async fn parallel_new_finding_id_receives_its_own_repair_apply_in_the_dispatch_c
     .await;
 
     let error = observed
-        .result
-        .error
-        .as_ref()
-        .or_fail("the new ID's own budget is spent by its second occurrence");
+        .assert_held_and_stop_summary("the new ID's own budget is spent by its second occurrence");
     assert!(error.contains("repeated_acceptance_finding"), "{error}");
     assert!(
         error.contains("acceptance-audit-gap"),
@@ -11873,13 +11989,13 @@ async fn serial_and_parallel_repeated_finding_stops_report_equivalent_diagnostic
         dispatch_scripted_repair_cycle(change_id, std::slice::from_ref(&verdict), apply_extra),
         run_serial_repeated_cycle(change_id, &verdict, apply_extra),
     );
-    let parallel_error = parallel
-        .result
-        .error
-        .as_ref()
-        .or_fail("parallel must stop on the repeated ID");
+    // Serial reports the stop through `ChangeProcessResult::Stalled`; parallel
+    // reports the same evidence through its acceptance-phase hold. Both are
+    // non-error stalls, which is the parity this asserts.
+    let parallel_error =
+        parallel.assert_held_and_stop_summary("parallel must stop on the repeated ID");
 
-    let parallel_json = repair_stop_diagnostics(parallel_error);
+    let parallel_json = repair_stop_diagnostics(&parallel_error);
     let serial_json = repair_stop_diagnostics(&serial_error);
 
     // Revision identifiers and the raw delta are legitimately mode-specific:
