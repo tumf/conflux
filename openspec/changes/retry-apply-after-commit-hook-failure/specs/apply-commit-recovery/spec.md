@@ -14,6 +14,23 @@ When the hook-enabled final Apply commit is rejected by a repository commit hook
 **And**: the next Apply prompt includes the actionable failure context
 **And**: Acceptance is not dispatched
 
+#### Scenario: Clean-tree amend hook rejection is not treated as success
+
+**Given**: a WIP snapshot leaves the Apply workspace clean
+**And**: finalization uses the hook-enabled amend path
+**When**: a repository commit hook rejects the amend
+**Then**: Conflux propagates a typed repository-rejection outcome with captured diagnostics
+**And**: the unchanged WIP commit is not reported as a completed Apply result
+**And**: Acceptance is not dispatched
+
+#### Scenario: Completed tasks do not suppress the repair agent
+
+**Given**: all implementation tasks are marked complete
+**And**: final commit rejection diagnostics are pending
+**When**: Conflux starts the recovery iteration
+**Then**: Conflux bypasses the task-complete short circuit
+**And**: one Apply agent command runs before final commit is retried
+
 #### Scenario: Repair succeeds and final commit is verified
 
 **Given**: Apply was retried with final commit rejection diagnostics
@@ -34,7 +51,7 @@ Conflux MUST NOT bypass repository verification hooks when retrying the final Ap
 
 ### Requirement: Final Apply commit recovery MUST be bounded and structurally classified
 
-Conflux MUST count commit-hook repair iterations against the existing maximum Apply iteration budget. It MUST trigger repair only from structured final-commit command failure evidence and MUST leave unrelated VCS failures terminal. Generic substring matching over rendered error text MUST NOT determine recovery eligibility.
+Conflux MUST count commit-hook repair iterations against the existing maximum Apply iteration budget. It MUST trigger repair only from a typed outcome produced at the final-commit call site, with the actual process exit code preserved, and MUST leave unrelated VCS failures terminal. Failures in pre-commit setup steps and fatal Git failures MUST NOT be classified as repository rejection. Generic substring matching over rendered error text MUST NOT determine recovery eligibility.
 
 #### Scenario: Repeated hook rejection exhausts Apply iterations
 

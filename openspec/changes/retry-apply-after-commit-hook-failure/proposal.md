@@ -31,9 +31,9 @@ verifications:
 
 ## Problem / Context
 
-The shared Apply loop creates WIP snapshots with verification bypassed, then creates the final Apply commit with repository hooks enabled. When that final commit fails because a pre-commit or commit-msg hook rejects the staged result, `create_final_commit` returns a VCS error and parallel dispatch terminates the change as `Apply failed`. The hook command, exit status, stdout, and stderr are visible in the outer error but are not recorded as actionable Apply history, so the Apply agent is not given a chance to repair the repository defect that the hook identified.
+The shared Apply loop creates WIP snapshots with verification bypassed, then creates the final Apply commit with repository hooks enabled. After a WIP snapshot leaves the worktree clean, the dominant finalization path runs `git commit --amend`; `set_commit_message` currently logs an amend failure and still returns success. A hook rejection can therefore leave the `WIP:` commit unchanged while Apply reports completion and dispatches Acceptance. When finalization instead takes the dirty-tree add-and-commit path, the same rejection propagates as a VCS error and parallel dispatch terminates the change as `Apply failed`.
 
-This can leave a reusable workspace in `Created` state with completed tasks and staged changes. A later generic resume routes to Apply, but it does not reliably explain why the commit failed or require the agent to rerun the failing validation. Acceptance must not begin until the verified final commit succeeds.
+Neither path gives the Apply agent a reliable repair opportunity with the hook command, exit status, stdout, and stderr. The workspace may retain completed tasks with staged changes or an unchanged WIP commit, and a later generic resume does not reliably explain the failed validation. Acceptance must not begin until the verified final commit succeeds.
 
 ## Proposed Solution
 
@@ -56,10 +56,11 @@ The retry consumes the existing Apply iteration budget. No new durable state is 
 
 ## Explicit Completion Conditions
 
-- The final-commit boundary returns a typed or otherwise structurally classified outcome that distinguishes repository-fixable hook rejection from terminal VCS failure without matching generic words such as `failed` or `hook` in a rendered error string.
+- The final-commit boundary returns a typed outcome that distinguishes committed, repository-rejected, and terminal VCS results and preserves the actual exit code without matching rendered error text.
+- Both add-and-commit and amend finalization paths propagate repository rejection; amend failure cannot be converted to success.
 - `AgentRunner` can record orchestration-originated Apply feedback and `build_apply_prompt_with_skill` includes it on the next iteration using the existing Apply-history trust boundary.
-- The shared Apply loop performs the repair iteration and final-commit retry within `max_iterations`; no frontend-specific retry is added.
-- Tests prove one hook rejection followed by repair reaches a successful final commit, repeated rejection exhausts the budget, non-hook failure remains terminal, final commit arguments omit `--no-verify`, and no Acceptance dispatch occurs before commit success.
+- Pending commit repair bypasses task-complete short circuit, and the shared Apply loop dispatches an actual repair iteration before final-commit retry within `max_iterations`; no frontend-specific retry is added.
+- Tests use real temporary Git hooks for both finalization paths and prove one rejection followed by repair reaches a successful final commit, repeated rejection exhausts the budget, non-hook failure remains terminal, final commit arguments omit `--no-verify`, and no Acceptance dispatch occurs before commit success.
 - `cargo test --lib apply_commit_recovery` and `cargo clippy -- -D warnings` pass.
 
 ## Out of Scope
@@ -69,3 +70,5 @@ The retry consumes the existing Apply iteration budget. No new durable state is 
 - Changing WIP snapshot `--no-verify` behavior.
 - Adding out-of-worktree durable retry state.
 - Changing cleanup-review marker parsing or recovery.
+- Repairing the obsolete legacy serial squash path outside the shared Apply loop.
+- Replacing amend finalization with a soft-reset and normal commit.
