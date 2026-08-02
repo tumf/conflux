@@ -587,11 +587,12 @@ fn final_commit_rejection_feedback(rejection: &CommitRejection) -> ApplyOrchestr
         exit_code: rejection.exit_code,
         stdout_tail: bounded_output_tail(&rejection.stdout),
         stderr_tail: bounded_output_tail(&rejection.stderr),
-        required_action: "Fix the reported failure in this workspace and rerun the validation that \
+        required_action:
+            "Fix the reported failure in this workspace and rerun the validation that \
                           failed. The final Apply commit must keep running repository hooks: do \
                           not pass --no-verify to it, and do not disable, weaken, or skip the hook \
                           itself. WIP snapshot commits keep their existing --no-verify behavior."
-            .to_string(),
+                .to_string(),
     }
 }
 
@@ -3205,10 +3206,8 @@ mod apply_commit_recovery {
 
     fn prompt_for(rejection: &CommitRejection) -> String {
         let mut history = ApplyHistory::new();
-        history.record_orchestration_feedback(
-            "change-a",
-            final_commit_rejection_feedback(rejection),
-        );
+        history
+            .record_orchestration_feedback("change-a", final_commit_rejection_feedback(rejection));
         crate::agent::build_apply_prompt_with_skill(
             "cflx-apply",
             "change-a",
@@ -3226,12 +3225,18 @@ mod apply_commit_recovery {
             "error: unused variable `x`",
         ));
 
-        assert!(prompt.contains("kind=\"final_commit_rejected\""), "{prompt}");
+        assert!(
+            prompt.contains("kind=\"final_commit_rejected\""),
+            "{prompt}"
+        );
         assert!(prompt.contains("command: git commit -m Apply: change-a"));
         assert!(prompt.contains("exit_code: 1"));
         assert!(prompt.contains("running pre-commit"));
         assert!(prompt.contains("error: unused variable `x`"));
-        assert!(prompt.contains("rerun the validation that failed"), "{prompt}");
+        assert!(
+            prompt.contains("rerun the validation that failed"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -3270,10 +3275,7 @@ mod apply_commit_recovery {
             wrapper < injected,
             "the untrusted-output warning must precede the hook transcript"
         );
-        assert!(
-            prompt.contains("do not pass --no-verify to it"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("do not pass --no-verify to it"), "{prompt}");
     }
 
     #[test]
@@ -3390,7 +3392,10 @@ mod apply_commit_recovery {
     }
 
     impl RecoveryRepo {
-        fn workspace_manager(&self, config: &OrchestratorConfig) -> crate::vcs::git::GitWorkspaceManager {
+        fn workspace_manager(
+            &self,
+            config: &OrchestratorConfig,
+        ) -> crate::vcs::git::GitWorkspaceManager {
             crate::vcs::git::GitWorkspaceManager::new(
                 self.worktrees_dir.clone(),
                 self.workspace.clone(),
@@ -3464,7 +3469,12 @@ mod apply_commit_recovery {
             .output()
             .expect("git add should run");
         std::process::Command::new("git")
-            .args(["commit", "--no-verify", "-m", "WIP: clean-reject (1/1 tasks, apply#1)"])
+            .args([
+                "commit",
+                "--no-verify",
+                "-m",
+                "WIP: clean-reject (1/1 tasks, apply#1)",
+            ])
             .current_dir(&repo.workspace)
             .output()
             .expect("WIP snapshot should run");
@@ -3649,7 +3659,10 @@ mod apply_commit_recovery {
         );
         let failure = caller_visible_failure(&result)
             .expect("a terminal VCS failure must surface to callers as an apply failure");
-        assert!(failure.contains("Refusing suspicious snapshot"), "{failure}");
+        assert!(
+            failure.contains("Refusing suspicious snapshot"),
+            "{failure}"
+        );
         assert!(
             !apply_log.exists(),
             "a terminal VCS failure must not dispatch a repair apply iteration"
@@ -3710,9 +3723,11 @@ mod apply_commit_recovery {
             run_recovery_loop_as(&parallel_repo, "caller-parallel", &parallel_config, true).await;
 
         assert_eq!(caller_visible_failure(&parallel_result), None);
-        assert!(parallel_result
-            .expect("parallel wiring must recover inside the shared loop")
-            .completed);
+        assert!(
+            parallel_result
+                .expect("parallel wiring must recover inside the shared loop")
+                .completed
+        );
         assert_eq!(parallel_repo.head_subject(), "Apply: caller-parallel");
     }
 }
