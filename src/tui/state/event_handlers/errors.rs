@@ -50,7 +50,7 @@ impl AppState {
 
     pub(crate) fn handle_resolve_failed(&mut self, change_id: String, error: String) {
         self.reset_analysis_log_dedupe();
-        self.is_resolving = false;
+        self.clear_resolving();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.display_status_cache == "merged" {
                 self.add_log(
@@ -164,8 +164,8 @@ impl AppState {
     /// before the row could be retried.
     fn apply_manual_merge_deferral(&mut self, change_id: &str, reason: &str) {
         self.remove_from_resolve_queue(change_id);
-        if self.is_resolving && !self.other_change_is_resolving(change_id) {
-            self.is_resolving = false;
+        if self.is_resolving() && !self.other_change_is_resolving(change_id) {
+            self.clear_resolving();
         }
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("merge wait");
@@ -189,7 +189,7 @@ impl AppState {
             return None;
         }
 
-        if self.is_resolving {
+        if self.is_resolving() {
             let is_current_resolving = self
                 .changes
                 .iter()
@@ -236,7 +236,9 @@ impl AppState {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 change.set_display_status_cache("resolve pending");
             }
-            self.add_to_resolve_queue(&change_id);
+            // No reservation here: the emitted command reaches the shared
+            // run-control service, which takes the one reservation this change
+            // is allowed to hold. Reserving first would make that a duplicate.
             self.add_merge_deferred_warning_log(
                 &change_id,
                 &reason,
@@ -267,6 +269,29 @@ mod tests {
             last_modified: "now".to_string(),
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
+        }
+    }
+
+    /// Replay what the shared run-control service does when it accepts a resolve.
+    ///
+    /// These tests exercise `AppState` event handling, not the service, so its
+    /// three effects — reducer retry intent, the single reservation, and the
+    /// adapter's row advance — are applied directly here.
+    fn accept_resolve(
+        app: &mut AppState,
+        shared: &std::sync::Arc<
+            tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>,
+        >,
+        change_id: &str,
+    ) {
+        shared
+            .blocking_write()
+            .apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+                change_id.to_string(),
+            ));
+        app.set_resolving(change_id);
+        if let Some(change) = app.changes.iter_mut().find(|c| c.id == change_id) {
+            change.set_display_status_cache("resolve pending");
         }
     }
 
@@ -422,7 +447,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[1].display_status_cache = "archived".to_string();
 
         app.handle_merge_deferred(
@@ -432,7 +457,7 @@ mod tests {
         );
 
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(app.resolve_queue_set.contains("change-b"));
+        assert!(app.resolve_reservations().is_reserved("change-b"));
     }
 
     #[test]
@@ -441,7 +466,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
 
         app.handle_merge_deferred(
             "change-a".to_string(),
@@ -450,7 +475,7 @@ mod tests {
         );
 
         assert_eq!(app.changes[0].display_status_cache, "resolving");
-        assert!(!app.resolve_queue_set.contains("change-a"));
+        assert!(!app.resolve_reservations().is_reserved("change-a"));
     }
 
     #[test]
@@ -462,7 +487,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[1].display_status_cache = "archived".to_string();
 
         app.handle_merge_deferred(
@@ -472,7 +497,7 @@ mod tests {
         );
 
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(app.resolve_queue_set.contains("change-b"));
+        assert!(app.resolve_reservations().is_reserved("change-b"));
     }
 
     #[test]
@@ -480,7 +505,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.is_resolving = false;
+        app.clear_resolving();
         app.changes[0].display_status_cache = "archived".to_string();
 
         app.handle_merge_deferred(
@@ -490,7 +515,7 @@ mod tests {
         );
 
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
-        assert!(!app.resolve_queue_set.contains("change-a"));
+        assert!(!app.resolve_reservations().is_reserved("change-a"));
     }
 
     #[test]
@@ -498,7 +523,7 @@ mod tests {
         let changes = vec![create_test_change("change-b", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.is_resolving = false;
+        app.clear_resolving();
         app.changes[0].display_status_cache = "archived".to_string();
 
         let cmd = app.handle_merge_deferred(
@@ -508,8 +533,12 @@ mod tests {
         );
 
         assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-        assert!(app.resolve_queue_set.contains("change-b"));
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-b"));
+        assert!(
+            !app.resolve_reservations().is_reserved("change-b"),
+            "an idle deferral emits the command and lets the shared service take \
+             the single reservation; reserving here would make that a duplicate"
+        );
     }
 
     #[test]
@@ -520,7 +549,7 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
 
-        app.is_resolving = false;
+        app.clear_resolving();
         app.changes[0].display_status_cache = "merged".to_string();
         app.changes[1].display_status_cache = "archived".to_string();
 
@@ -532,7 +561,10 @@ mod tests {
 
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-b"));
-        assert!(app.resolve_queue_set.contains("change-b"));
+        assert!(
+            !app.resolve_reservations().is_reserved("change-b"),
+            "the emitted command, not this handler, is what reserves the resolver"
+        );
     }
 
     #[test]
@@ -543,7 +575,7 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
 
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "archived".to_string();
 
@@ -555,7 +587,7 @@ mod tests {
 
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
         assert!(cmd.is_none());
-        assert!(app.resolve_queue_set.contains("change-b"));
+        assert!(app.resolve_reservations().is_reserved("change-b"));
     }
 
     #[test]
@@ -626,7 +658,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = false;
+        app.clear_resolving();
 
         app.handle_merge_deferred(
             "change-a".to_string(),
@@ -643,7 +675,7 @@ mod tests {
         let mut app = AppState::new(changes);
 
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = false;
+        app.clear_resolving();
 
         app.handle_resolve_failed(
             "change-a".to_string(),
@@ -663,12 +695,16 @@ mod tests {
         app.mode = AppMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
-        app.is_resolving = false;
+        app.clear_resolving();
 
         let first_cmd = app.resolve_merge();
         assert!(matches!(first_cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-a"));
-        assert!(app.is_resolving, "M must reserve the local resolve slot");
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+
+        // What the shared service and the adapter do once the command is handled:
+        // the reservation exists, but `ResolveStarted` has not arrived yet.
+        app.set_resolving("change-a");
+        app.changes[0].set_display_status_cache("resolve pending");
+        assert!(app.is_resolving());
 
         app.apply_display_statuses_from_reducer(&HashMap::from([(
             "change-a".to_string(),
@@ -689,11 +725,11 @@ mod tests {
             "manual deferral must preserve the reducer-derived merge wait row"
         );
         assert!(
-            !app.is_resolving,
+            !app.is_resolving(),
             "stale optimistic reservation must be cleared"
         );
-        assert!(!app.resolve_queue_set.contains("change-a"));
-        assert!(app.resolve_queue.is_empty());
+        assert!(!app.resolve_reservations().is_reserved("change-a"));
+        assert!(app.queued_resolves().is_empty());
     }
 
     /// Even if the deferred change was already queued locally (for example by an
@@ -706,7 +742,7 @@ mod tests {
             create_test_change("change-b", 0, 1),
             create_test_change("change-c", 0, 1),
         ]);
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "resolve pending".to_string();
         app.changes[2].display_status_cache = "resolve pending".to_string();
@@ -721,9 +757,9 @@ mod tests {
 
         assert!(cmd.is_none());
         assert_eq!(app.changes[1].display_status_cache, "merge wait");
-        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert!(!app.resolve_reservations().is_reserved("change-b"));
         assert_eq!(
-            app.resolve_queue.iter().cloned().collect::<Vec<_>>(),
+            app.queued_resolves(),
             vec!["change-c".to_string()],
             "unrelated queued resolves must keep FIFO membership"
         );
@@ -737,7 +773,7 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
 
@@ -749,9 +785,9 @@ mod tests {
 
         assert!(cmd.is_none());
         assert_eq!(app.changes[1].display_status_cache, "merge wait");
-        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert!(!app.resolve_reservations().is_reserved("change-b"));
         assert!(
-            app.is_resolving,
+            app.is_resolving(),
             "serialization must remain owned by the actually resolving change"
         );
         assert_eq!(app.changes[0].display_status_cache, "resolving");
@@ -769,8 +805,10 @@ mod tests {
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
-        app.is_resolving = false;
+        app.clear_resolving();
         assert!(app.resolve_merge().is_some());
+        // The shared service took the reservation the emitted command asked for.
+        app.set_resolving("change-a");
 
         let cmd = app.handle_merge_deferred(
             "change-b".to_string(),
@@ -780,8 +818,8 @@ mod tests {
 
         assert!(cmd.is_none(), "queued retry must wait for the active slot");
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(app.resolve_queue_set.contains("change-b"));
-        assert!(app.is_resolving);
+        assert!(app.resolve_reservations().is_reserved("change-b"));
+        assert!(app.is_resolving());
     }
 
     /// Full local lifecycle: reservation, reducer demotion, TUI handling, then a
@@ -805,10 +843,12 @@ mod tests {
         app.mode = AppMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
-        app.is_resolving = false;
+        app.clear_resolving();
 
-        // 1st M press: reducer records retry intent, TUI reserves the local slot.
+        // 1st M press: the emitted command reaches the shared service, which
+        // records the reducer retry intent and takes the single reservation.
         assert!(app.resolve_merge().is_some());
+        accept_resolve(&mut app, &shared, "change-a");
         assert_eq!(
             shared.blocking_read().resolve_wait_change_ids(),
             vec!["change-a".to_string()]
@@ -833,8 +873,8 @@ mod tests {
 
         assert!(deferred_cmd.is_none());
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
-        assert!(!app.is_resolving);
-        assert!(app.resolve_queue.is_empty());
+        assert!(!app.is_resolving());
+        assert!(app.queued_resolves().is_empty());
         assert!(shared.blocking_read().resolve_wait_change_ids().is_empty());
 
         // 2nd M press after the user cleaned the base: fresh retry, same AppState.
@@ -844,13 +884,14 @@ mod tests {
             matches!(second_cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-a"),
             "clean second M must dispatch a fresh retry without a TUI restart"
         );
+        accept_resolve(&mut app, &shared, "change-a");
         assert_eq!(app.changes[0].display_status_cache, "resolve pending");
         assert_eq!(
             shared.blocking_read().resolve_wait_change_ids(),
             vec!["change-a".to_string()],
             "second retry must be scheduler-consumable"
         );
-        assert!(app.resolve_queue.is_empty());
+        assert!(app.queued_resolves().is_empty());
     }
 
     #[test]
@@ -859,7 +900,7 @@ mod tests {
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
 
         app.handle_resolve_failed("change-a".to_string(), "conflict".to_string());
 

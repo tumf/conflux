@@ -21,7 +21,7 @@ use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
 use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use std::path::PathBuf;
 
@@ -168,8 +168,6 @@ pub struct AppState {
     pub previous_mode: Option<AppMode>,
     /// Web UI URL (set when web server is enabled)
     pub web_url: Option<String>,
-    /// Whether resolve is currently executing (blocks M key operations)
-    pub is_resolving: bool,
     /// Map of change_id to worktree path for active worktrees (for progress fallback)
     pub worktree_paths: HashMap<String, PathBuf>,
     /// Process-local UI markers for manually requested worktree deletions.
@@ -181,10 +179,12 @@ pub struct AppState {
     /// TUI can query this for pending/archived status, apply counts, etc.
     pub shared_orchestrator_state:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>>,
-    /// Manual resolve queue (FIFO) for sequential resolve processing
-    pub resolve_queue: VecDeque<String>,
-    /// Set of change IDs in the resolve queue for duplicate prevention
-    pub resolve_queue_set: HashSet<String>,
+    /// Shared single-resolver reservation ledger.
+    ///
+    /// The TUI does not own resolve ordering: the same process-local ledger backs
+    /// `/api/v2`, so an `M` keypress and a remote `resolve_merge` compete for one
+    /// active resolver and share one FIFO queue.
+    resolve_reservations: std::sync::Arc<crate::orchestration::run_control::ResolveReservations>,
     /// Whether the log panel is visible in Changes view
     pub logs_panel_enabled: bool,
     /// Whether the Logs panel is limited to the proposal under the Changes cursor.
@@ -208,13 +208,6 @@ pub struct AppState {
     ///
     /// This state is not workflow-control state.
     diagnostic_dedup: DiagnosticDeduplicationStore<DiagnosticDeduplicationKey>,
-    /// Set when the operator accepted a retry that must start the next run with
-    /// explicit-retry semantics.
-    ///
-    /// Explicit retry is what lets a reconciled acceptance hold be consumed and
-    /// acceptance resume without rerunning apply. It is consumed exactly once by
-    /// the start-processing adapter.
-    pending_explicit_retry: bool,
     /// Process-local execution marks shared with the operator command service.
     ///
     /// `ChangeState::selected` stays the rendering projection; this store is the
@@ -415,32 +408,21 @@ impl AppState {
             orchestration_elapsed: None,
             previous_mode: None,
             web_url: None,
-            is_resolving: false,
             worktree_paths: HashMap::new(),
             deleting_worktree_paths: HashSet::new(),
             shared_orchestrator_state: None,
-            resolve_queue: VecDeque::new(),
-            resolve_queue_set: HashSet::new(),
+            resolve_reservations: std::sync::Arc::new(
+                crate::orchestration::run_control::ResolveReservations::new(),
+            ),
             logs_panel_enabled: true, // Default: logs panel visible
             selected_proposal_log_filter: false, // Default: show logs for every proposal
             tui_config: TuiConfig::default(),
             reducer_display_status_snapshot: HashMap::new(),
             diagnostic_dedup: DiagnosticDeduplicationStore::new(),
-            pending_explicit_retry: false,
             execution_marks: std::sync::Arc::new(
                 crate::orchestration::operator_command::ExecutionMarkStore::new(),
             ),
         }
-    }
-
-    /// Record that the next run must use explicit-retry semantics.
-    pub fn set_pending_explicit_retry(&mut self) {
-        self.pending_explicit_retry = true;
-    }
-
-    /// Consume the pending explicit-retry request, if any.
-    pub fn take_pending_explicit_retry(&mut self) -> bool {
-        std::mem::take(&mut self.pending_explicit_retry)
     }
 
     /// Shared handle to the process-local execution marks.
@@ -451,6 +433,55 @@ impl AppState {
         &self,
     ) -> std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore> {
         self.execution_marks.clone()
+    }
+
+    /// Adopt an externally owned execution-mark store.
+    ///
+    /// Production wires this the other way round — the run-control service is
+    /// built over `execution_marks()` — but a test that builds the service first
+    /// needs the app to join the store the service already reads, or the
+    /// "authoritative marked target set" would exist in two copies.
+    pub fn set_execution_marks(
+        &mut self,
+        marks: std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
+    ) {
+        self.execution_marks = marks;
+    }
+
+    /// Shared handle to the process-local resolve reservation ledger.
+    ///
+    /// The run-control service takes the same handle, which is what makes the
+    /// single-resolver rule hold across the TUI and `/api/v2` instead of once per
+    /// frontend.
+    pub fn resolve_reservations(
+        &self,
+    ) -> std::sync::Arc<crate::orchestration::run_control::ResolveReservations> {
+        self.resolve_reservations.clone()
+    }
+
+    /// Adopt an externally owned reservation ledger.
+    pub fn set_resolve_reservations(
+        &mut self,
+        reservations: std::sync::Arc<crate::orchestration::run_control::ResolveReservations>,
+    ) {
+        self.resolve_reservations = reservations;
+    }
+
+    /// True when a merge resolution currently owns the single resolver slot.
+    pub fn is_resolving(&self) -> bool {
+        self.resolve_reservations.is_active()
+    }
+
+    /// Record that `change_id` owns the resolver (driven by `ResolveStarted`).
+    pub fn set_resolving(&self, change_id: &str) {
+        self.resolve_reservations.mark_active(change_id);
+    }
+
+    /// Clear the active resolver without promoting a waiting change.
+    pub fn clear_resolving(&self) {
+        if let Some(active) = self.resolve_reservations.active() {
+            self.resolve_reservations.cancel(&active);
+        }
     }
 
     /// Publish the current TUI mark projection into the shared store.
@@ -786,49 +817,13 @@ impl AppState {
         selection_logic::toggle_all_marks(self)
     }
 
-    fn reducer_accepts_resolve_merge_intent(&mut self, change_id: &str) -> bool {
-        let Some(shared) = self.shared_orchestrator_state.clone() else {
-            // Tests and standalone UI state can still operate without a shared reducer.
-            return true;
-        };
-
-        let outcome = {
-            let Ok(mut guard) = shared.try_write() else {
-                self.warning_message = Some(format!(
-                    "Could not record merge retry intent for '{}'; scheduler state is busy",
-                    change_id
-                ));
-                self.add_log(LogEntry::warn(format!(
-                    "Manual merge-wait retry for '{}' was ignored because scheduler state is busy",
-                    change_id
-                )));
-                return false;
-            };
-
-            guard.apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
-                change_id.to_string(),
-            ))
-        };
-
-        if matches!(outcome, crate::orchestration::state::ReduceOutcome::NoOp) {
-            self.warning_message = Some(format!(
-                "Manual merge retry for '{}' is no longer valid",
-                change_id
-            ));
-            self.add_log(LogEntry::warn(format!(
-                "Manual merge-wait retry for '{}' was rejected by reducer state",
-                change_id
-            )));
-            return false;
-        }
-
-        true
-    }
-
-    /// Trigger merge resolution for the selected change when applicable.
+    /// Trigger merge resolution for the change under the cursor when applicable.
     ///
-    /// If resolve is already running, the change is added to the resolve queue
-    /// and transitioned to ResolveWait instead of starting immediately.
+    /// This is presentation only. Whether the change becomes the active resolver
+    /// or waits in FIFO order, whether the reducer still accepts the intent, and
+    /// whether the scheduler is started or woken are all decided by the shared
+    /// run-control service when the emitted command is handled, so an `M`
+    /// keypress and a remote `resolve_merge` cannot reach different conclusions.
     pub fn resolve_merge(&mut self) -> Option<TuiCommand> {
         // Must have valid cursor position
         if self.changes.is_empty() || self.cursor_index >= self.changes.len() {
@@ -844,93 +839,47 @@ impl AppState {
         }
 
         // Check current change status and get change_id
-        let change_id = {
-            let change = &self.changes[self.cursor_index];
-            if !matches!(change.display_status_cache.as_str(), "merge wait") {
-                return None;
-            }
-            change.id.clone()
-        };
-
-        if !self.reducer_accepts_resolve_merge_intent(&change_id) {
+        let change = &self.changes[self.cursor_index];
+        if !matches!(change.display_status_cache.as_str(), "merge wait") {
             return None;
         }
 
-        if self.is_resolving {
-            // Resolve is running: add to queue and transition to ResolveWait
-            if self.add_to_resolve_queue(&change_id) {
-                self.changes[self.cursor_index].set_display_status_cache("resolve pending");
-
-                self.add_log(LogEntry::info(format!(
-                    "Queued '{}' for resolve (position: {})",
-                    change_id,
-                    self.resolve_queue.len()
-                )));
-            } else {
-                self.warning_message = Some(format!(
-                    "Change '{}' is already queued for resolve",
-                    change_id
-                ));
-            }
-            None
-        } else {
-            // Resolve is not running: reserve the resolve slot immediately so
-            // consecutive M key presses queue follow-up changes instead of
-            // dispatching multiple immediate resolve commands in parallel.
-            // Actual execution still starts when ResolveStarted event is received.
-            self.is_resolving = true;
-            if matches!(self.mode, AppMode::Select | AppMode::Stopped) {
-                self.mode = AppMode::Running;
-            }
-            self.changes[self.cursor_index].set_display_status_cache("resolve pending");
-
-            Some(TuiCommand::ResolveMerge(change_id))
-        }
+        Some(TuiCommand::ResolveMerge(change.id.clone()))
     }
 
     /// Add a change to the resolve queue (with duplicate prevention).
     ///
-    /// Returns true if the change was added, false if it was already in the queue.
+    /// Returns true if the change was added, false if it was already reserved.
     pub fn add_to_resolve_queue(&mut self, change_id: &str) -> bool {
-        if self.resolve_queue_set.contains(change_id) {
-            false
-        } else {
-            self.resolve_queue.push_back(change_id.to_string());
-            self.resolve_queue_set.insert(change_id.to_string());
-            true
-        }
+        self.resolve_reservations.reserve(change_id).is_some()
     }
 
     /// Remove one specific change from the resolve queue.
     ///
     /// Used when reducer-owned retry intent for that change is gone (for example a
-    /// manual `MergeDeferred(auto_resumable=false)`), so stale TUI-local queue
-    /// membership cannot outlive it. FIFO order of unrelated entries is preserved.
+    /// manual `MergeDeferred(auto_resumable=false)`), so stale queue membership
+    /// cannot outlive it. FIFO order of unrelated entries is preserved.
     ///
     /// Returns true if the change was queued and has been removed.
     pub fn remove_from_resolve_queue(&mut self, change_id: &str) -> bool {
-        let removed_from_set = self.resolve_queue_set.remove(change_id);
-        let len_before = self.resolve_queue.len();
-        self.resolve_queue.retain(|queued| queued != change_id);
-        removed_from_set || self.resolve_queue.len() != len_before
+        self.resolve_reservations.cancel(change_id)
     }
 
-    /// Pop the next change from the resolve queue.
+    /// Release the active resolver and take the next change from the queue.
     ///
-    /// Returns the change ID if the queue is not empty, otherwise None.
+    /// Returns the promoted change ID if one was waiting, otherwise None.
     pub fn pop_from_resolve_queue(&mut self) -> Option<String> {
-        if let Some(change_id) = self.resolve_queue.pop_front() {
-            self.resolve_queue_set.remove(&change_id);
-            Some(change_id)
-        } else {
-            None
-        }
+        self.resolve_reservations.finish_active()
+    }
+
+    /// Changes currently waiting behind the active resolver, in FIFO order.
+    pub fn queued_resolves(&self) -> Vec<String> {
+        self.resolve_reservations.waiting()
     }
 
     /// Check if there are queued resolves waiting.
-    #[cfg(test)]
     pub fn has_queued_resolves(&self) -> bool {
-        !self.resolve_queue.is_empty()
+        self.resolve_reservations.has_waiting()
     }
 
     /// Update parallel eligibility status for changes.
@@ -1105,21 +1054,45 @@ impl AppState {
         });
     }
 
-    /// Start processing selected changes
-    pub fn start_processing(&mut self) -> Option<TuiCommand> {
-        selection_logic::start_processing(self)
+    /// Project this frontend's lifecycle mode onto the shared operator vocabulary.
+    ///
+    /// Modal popups are presentation state, so the mode underneath them is what
+    /// the shared lifecycle matrix must see; a popup must never silently widen or
+    /// narrow what an operator is allowed to do.
+    pub fn operator_mode(&self) -> crate::orchestration::operator_command::OperatorMode {
+        use crate::orchestration::operator_command::OperatorMode;
+        let effective = match &self.mode {
+            AppMode::ConfirmWorktreeDelete
+            | AppMode::QrPopup
+            | AppMode::ConfirmForceKill { .. } => {
+                self.previous_mode.clone().unwrap_or(AppMode::Select)
+            }
+            other => other.clone(),
+        };
+        match effective {
+            AppMode::Running => OperatorMode::Running,
+            AppMode::Stopping => OperatorMode::Stopping,
+            AppMode::Stopped => OperatorMode::Stopped,
+            AppMode::Error => OperatorMode::Error,
+            _ => OperatorMode::Select,
+        }
     }
 
-    /// Resume processing from Stopped mode
-    /// Converts execution-marked (selected) changes to Queued and starts processing
-    pub fn resume_processing(&mut self) -> Option<TuiCommand> {
-        selection_logic::resume_processing(self)
-    }
-
-    /// Retry error changes - resets error changes to queued and returns their IDs
-    /// Returns None if not in Error mode or no error changes found
-    pub fn retry_error_changes(&mut self) -> Option<TuiCommand> {
-        selection_logic::retry_error_changes(self)
+    /// Project an accepted run dispatch onto TUI presentation state.
+    ///
+    /// The shared service already decided the targets and applied the reducer
+    /// intent; this only refreshes the row cache and the run-scoped UI state so
+    /// the screen matches what was actually dispatched.
+    pub fn begin_run(&mut self, change_ids: &[String]) {
+        for change in &mut self.changes {
+            if change_ids.iter().any(|id| id == &change.id) {
+                change.set_display_status_cache("queued");
+                change.selected = true;
+            }
+        }
+        self.reset_for_run();
+        self.mode = AppMode::Running;
+        self.publish_execution_marks();
     }
 }
 
@@ -2172,7 +2145,7 @@ mod tests {
 
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "not queued".to_string();
         app.changes[2].display_status_cache = "merge wait".to_string();
@@ -2651,153 +2624,6 @@ mod tests {
     }
 
     #[test]
-    fn test_start_processing_blocked_while_resolving() {
-        let changes = vec![create_test_change("a", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.changes[0].selected = true;
-        app.is_resolving = true;
-
-        let command = app.start_processing();
-        assert!(
-            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["a".to_string()])
-        );
-        assert_eq!(app.mode, AppMode::Running);
-        assert!(app.warning_message.is_none());
-        assert_eq!(app.changes[0].display_status_cache, "queued");
-    }
-
-    #[test]
-    fn test_resume_processing_blocked_while_resolving() {
-        let changes = vec![create_test_change("a", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
-        app.changes[0].selected = true;
-        app.is_resolving = true;
-
-        let command = app.resume_processing();
-        assert!(
-            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["a".to_string()])
-        );
-        assert_eq!(app.mode, AppMode::Running);
-        assert!(app.warning_message.is_none());
-        assert_eq!(app.changes[0].display_status_cache, "queued");
-    }
-
-    #[test]
-    fn test_retry_error_changes_blocked_while_resolving() {
-        let changes = vec![create_test_change("a", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.mode = AppMode::Error;
-        app.changes[0].set_error_message_cache("boom".to_string());
-        app.changes[0].selected = true;
-        app.is_resolving = true;
-
-        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::new(vec!["a".to_string()], 0),
-        ));
-        shared.blocking_write().apply_execution_event(
-            &crate::events::ExecutionEvent::ProcessingError {
-                id: "a".to_string(),
-                error: "boom".to_string(),
-            },
-        );
-        app.set_shared_state(shared);
-
-        let command = app.retry_error_changes();
-        assert!(
-            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["a".to_string()])
-        );
-        assert_eq!(app.mode, AppMode::Running);
-        assert!(app.warning_message.is_none());
-        assert_eq!(app.changes[0].display_status_cache, "queued");
-    }
-
-    #[test]
-    fn test_retry_error_changes_returns_error_rows_to_queued_status() {
-        let change_a = create_test_change("error-a", 0, 1);
-        let change_b = create_test_change("error-b", 0, 1);
-        let change_ok = create_test_change("ok", 0, 1);
-
-        let mut app = AppState::new(vec![change_a, change_b, change_ok]);
-        app.mode = AppMode::Error;
-        app.changes[0].set_error_message_cache("boom-a".to_string());
-        app.changes[1].set_error_message_cache("boom-b".to_string());
-        app.changes[0].selected = true;
-        app.changes[1].selected = true;
-        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::new(
-                vec!["error-a".to_string(), "error-b".to_string()],
-                0,
-            ),
-        ));
-        {
-            let mut guard = shared.blocking_write();
-            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
-                id: "error-a".to_string(),
-                error: "boom-a".to_string(),
-            });
-            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
-                id: "error-b".to_string(),
-                error: "boom-b".to_string(),
-            });
-        }
-        app.set_shared_state(shared);
-
-        let command = app.retry_error_changes();
-
-        assert!(
-            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string(), "error-b".to_string()])
-        );
-        assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].display_status_cache, "queued");
-        assert_eq!(app.changes[1].display_status_cache, "queued");
-        assert_eq!(app.changes[2].display_status_cache, "not queued");
-    }
-
-    #[test]
-    fn test_retry_error_changes_requeues_only_marked_error_rows_through_reducer() {
-        let change_a = create_test_change("error-a", 0, 1);
-        let change_b = create_test_change("error-b", 0, 1);
-        let mut app = AppState::new(vec![change_a, change_b]);
-        app.mode = AppMode::Error;
-        app.changes[0].set_error_message_cache("boom-a".to_string());
-        app.changes[1].set_error_message_cache("boom-b".to_string());
-        app.changes[0].selected = true;
-        app.changes[1].selected = false;
-
-        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::new(
-                vec!["error-a".to_string(), "error-b".to_string()],
-                0,
-            ),
-        ));
-        {
-            let mut guard = shared.blocking_write();
-            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
-                id: "error-a".to_string(),
-                error: "boom-a".to_string(),
-            });
-            guard.apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
-                id: "error-b".to_string(),
-                error: "boom-b".to_string(),
-            });
-        }
-        app.set_shared_state(shared.clone());
-
-        let command = app.retry_error_changes();
-
-        assert!(
-            matches!(command, Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string()])
-        );
-        assert_eq!(app.changes[0].display_status_cache, "queued");
-        assert_eq!(app.changes[1].display_status_cache, "error");
-        let guard = shared.blocking_read();
-        assert_eq!(guard.display_status("error-a"), "queued");
-        assert_eq!(guard.display_status("error-b"), "error");
-        assert_eq!(guard.queued_change_ids(), vec!["error-a".to_string()]);
-    }
-
-    #[test]
     fn test_selected_count() {
         // Changes start unselected
         let changes = vec![
@@ -3079,101 +2905,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_queue_fifo_order() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-            create_test_change("change-c", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-
-        // Add changes to resolve queue
-        assert!(app.add_to_resolve_queue("change-a"));
-        assert!(app.add_to_resolve_queue("change-b"));
-        assert!(app.add_to_resolve_queue("change-c"));
-
-        // Pop in FIFO order
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-b".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), None);
-    }
-
-    #[test]
-    fn test_resolve_queue_remove_front_preserves_order() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-            create_test_change("change-c", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-        app.add_to_resolve_queue("change-a");
-        app.add_to_resolve_queue("change-b");
-        app.add_to_resolve_queue("change-c");
-
-        assert!(app.remove_from_resolve_queue("change-a"));
-
-        assert!(!app.resolve_queue_set.contains("change-a"));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-b".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), None);
-    }
-
-    #[test]
-    fn test_resolve_queue_remove_middle_preserves_order() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-            create_test_change("change-c", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-        app.add_to_resolve_queue("change-a");
-        app.add_to_resolve_queue("change-b");
-        app.add_to_resolve_queue("change-c");
-
-        assert!(app.remove_from_resolve_queue("change-b"));
-
-        assert!(!app.resolve_queue_set.contains("change-b"));
-        assert!(app.resolve_queue_set.contains("change-a"));
-        assert!(app.resolve_queue_set.contains("change-c"));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-c".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), None);
-    }
-
-    #[test]
-    fn test_resolve_queue_remove_absent_change_is_noop() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-        app.add_to_resolve_queue("change-a");
-
-        assert!(!app.remove_from_resolve_queue("change-b"));
-
-        assert!(app.resolve_queue_set.contains("change-a"));
-        assert_eq!(app.resolve_queue.len(), 1);
-        assert!(!app.remove_from_resolve_queue("change-b"));
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
-    }
-
-    #[test]
-    fn test_resolve_queue_duplicate_prevention() {
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-
-        // Add change-a once
-        assert!(app.add_to_resolve_queue("change-a"));
-        // Try to add change-a again - should be blocked
-        assert!(!app.add_to_resolve_queue("change-a"));
-
-        // Queue should only have one entry
-        assert_eq!(app.pop_from_resolve_queue(), Some("change-a".to_string()));
-        assert_eq!(app.pop_from_resolve_queue(), None);
-    }
-
-    #[test]
     fn test_resolve_queue_auto_start_on_completion() {
         let changes = vec![
             create_test_change("change-a", 0, 1),
@@ -3183,7 +2914,7 @@ mod tests {
 
         // Set change-a to Resolving
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("change-a");
 
         // Queue change-b for resolve
         app.add_to_resolve_queue("change-b");
@@ -3195,7 +2926,7 @@ mod tests {
         // Should return command to start change-b
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
         // is_resolving should be cleared
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
         // Queue should be empty
         assert!(!app.has_queued_resolves());
     }
@@ -3207,7 +2938,7 @@ mod tests {
 
         // Set change-a to Resolving
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("change-a");
 
         // Simulate resolve completion with empty queue
         let cmd = app.handle_resolve_completed("change-a".to_string(), None);
@@ -3215,7 +2946,7 @@ mod tests {
         // Should NOT return a command
         assert!(cmd.is_none());
         // is_resolving should be cleared
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
     }
 
     #[test]
@@ -3233,82 +2964,86 @@ mod tests {
             .any(|log| log.message == "Merge resolved for 'change-a'"));
     }
 
+    // ── `M` is presentation only ────────────────────────────────────────────
+    //
+    // The reservation, FIFO ordering, duplicate rejection, reducer transition,
+    // and scheduler dispatch all belong to the shared run-control service now —
+    // that is what makes an `M` keypress and a remote `resolve_merge` reach one
+    // conclusion instead of two. What `AppState` still owns is which row the
+    // cursor addresses and whether the key offers a command at all, so that is
+    // all these tests pin.
+
     #[test]
-    fn test_resolve_merge_queues_when_resolving() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-
-        // Set up: change-a is currently resolving
-        app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
-
-        // Set up: change-b is in MergeWait
-        app.changes[1].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 1;
+    fn m_emits_a_resolve_command_without_deciding_its_outcome() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.cursor_index = 0;
         app.mode = AppMode::Running;
 
-        // Call resolve_merge on change-b (should queue it)
         let cmd = app.resolve_merge();
 
-        // Should NOT return a command (queued instead)
-        assert!(cmd.is_none());
-        // change-b should transition to ResolveWait
-        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        // change-b should be in the queue
-        assert!(app.has_queued_resolves());
+        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        assert!(
+            !app.is_resolving(),
+            "the key path must not pre-empt the shared single-resolver rule"
+        );
+        assert!(
+            !app.resolve_reservations().is_reserved("change-a"),
+            "reserving here would turn the service's own reservation into a duplicate"
+        );
+        assert_eq!(
+            app.changes[0].display_status_cache, "merge wait",
+            "the row advances when the service accepts, not when the key is pressed"
+        );
     }
 
-    /// Regression test: resolve_merge() in the queued path must sync intent to the shared
-    /// reducer so that the display_status is "resolve pending" (not "merge wait").
     #[test]
-    fn test_resolve_merge_queues_syncs_reducer() {
-        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
-        use std::sync::Arc;
-
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-
-        // Set up shared orchestrator state with both changes.
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
-            vec!["change-a".to_string(), "change-b".to_string()],
-            0,
-        )));
-
-        // Pre-condition: change-b must be in MergeWait in the reducer
-        // (simulates workspace detected as Archived).
-        {
-            let mut guard = shared.blocking_write();
-            guard.apply_observation("change-b", WorkspaceObservation::WorkspaceArchived);
-        }
-
-        app.set_shared_state(shared.clone());
-
-        // change-a is currently resolving
-        app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
-
-        // change-b is in MergeWait
-        app.changes[1].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 1;
+    fn m_is_ignored_for_a_row_that_is_not_waiting_on_a_merge() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.changes[0].display_status_cache = "queued".to_string();
+        app.cursor_index = 0;
         app.mode = AppMode::Running;
 
-        // Queue change-b for resolve via M key
-        let cmd = app.resolve_merge();
-        assert!(cmd.is_none());
-        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        assert!(app.resolve_merge().is_none());
+    }
 
-        // Verify the shared reducer reflects "resolve pending" for change-b
-        let display_map = shared.blocking_read().all_display_statuses();
-        assert_eq!(
-            display_map.get("change-b"),
-            Some(&"resolve pending"),
-            "reducer must reflect 'resolve pending' after queued resolve_merge()"
+    #[test]
+    fn m_offers_the_same_command_in_every_mode_that_allows_it() {
+        for mode in [AppMode::Select, AppMode::Stopped, AppMode::Running] {
+            let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+            app.changes[0].display_status_cache = "merge wait".to_string();
+            app.cursor_index = 0;
+            app.mode = mode.clone();
+
+            assert!(
+                matches!(
+                    app.resolve_merge(),
+                    Some(TuiCommand::ResolveMerge(ref id)) if id == "change-a"
+                ),
+                "{mode:?} must offer resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_m_presses_emit_one_command_per_row() {
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ]);
+        app.changes[0].display_status_cache = "merge wait".to_string();
+        app.changes[1].display_status_cache = "merge wait".to_string();
+        app.mode = AppMode::Running;
+
+        app.cursor_index = 0;
+        let first = app.resolve_merge();
+        app.cursor_index = 1;
+        let second = app.resolve_merge();
+
+        assert!(matches!(first, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
+        assert!(
+            matches!(second, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"),
+            "the second press still reaches the service, which is what decides it queues"
         );
     }
 
@@ -3340,16 +3075,21 @@ mod tests {
 
         // change-a is currently resolving
         app.changes[0].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
 
         // change-b is in MergeWait; user presses M to queue resolve
         app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 1;
         app.mode = AppMode::Running;
 
-        let cmd = app.resolve_merge();
-        assert!(cmd.is_none());
-        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        // What the shared run-control service does when it accepts the resolve:
+        // record the reducer intent, then let the adapter advance the row.
+        shared
+            .blocking_write()
+            .apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+                "change-b".to_string(),
+            ));
+        app.changes[1].set_display_status_cache("resolve pending");
 
         // Simulate a ChangesRefreshed event where workspace still reports change-b
         // as Archived (which would normally set MergeWait in the reducer).
@@ -3390,185 +3130,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_resolve_merge_select_transitions_to_running() {
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 0;
-        app.mode = AppMode::Select;
-        app.is_resolving = false;
-
-        let cmd = app.resolve_merge();
-
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
-        assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-    }
-
-    #[test]
-    fn test_resolve_merge_stopped_transitions_to_running() {
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 0;
-        app.mode = AppMode::Stopped;
-        app.is_resolving = false;
-
-        let cmd = app.resolve_merge();
-
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
-        assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-    }
-
-    #[test]
-    fn test_resolve_merge_running_stays_running() {
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 0;
-        app.mode = AppMode::Running;
-        app.is_resolving = false;
-
-        let cmd = app.resolve_merge();
-
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
-        assert_eq!(app.mode, AppMode::Running);
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-    }
-
-    /// Regression test: resolve_merge() in the immediate path (is_resolving == false) must
-    /// sync intent to the shared reducer so that display_status is "resolve pending".
-    #[test]
-    fn test_resolve_merge_immediate_syncs_reducer() {
-        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
-        use std::sync::Arc;
-
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-
-        // Set up shared orchestrator state.
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
-            vec!["change-a".to_string()],
-            0,
-        )));
-
-        // Pre-condition: change-a must be in MergeWait in the reducer
-        // (simulates workspace detected as Archived).
-        {
-            let mut guard = shared.blocking_write();
-            guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
-        }
-
-        app.set_shared_state(shared.clone());
-
-        // change-a is in MergeWait, no resolve in progress
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 0;
-        app.mode = AppMode::Running;
-        app.is_resolving = false;
-
-        // Trigger immediate resolve via M key
-        let cmd = app.resolve_merge();
-        assert!(
-            matches!(&cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"),
-            "immediate resolve must return TuiCommand::ResolveMerge"
-        );
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-
-        // Verify the shared reducer reflects "resolve pending" for change-a
-        let display_map = shared.blocking_read().all_display_statuses();
-        assert_eq!(
-            display_map.get("change-a"),
-            Some(&"resolve pending"),
-            "reducer must reflect 'resolve pending' after immediate resolve_merge()"
-        );
-    }
-
-    #[test]
-    fn test_resolve_merge_noop_does_not_optimistically_advance_display() {
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
-        use std::sync::Arc;
-
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
-            vec!["change-a".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        )));
-        {
-            let mut guard = shared.blocking_write();
-            guard.apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
-                change_id: "change-a".to_string(),
-                revision: "rev-a".to_string(),
-            });
-        }
-        app.set_shared_state(shared.clone());
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 0;
-        app.mode = AppMode::Running;
-        app.is_resolving = false;
-
-        let cmd = app.resolve_merge();
-
-        assert!(
-            cmd.is_none(),
-            "terminal reducer NoOp must not dispatch retry"
-        );
-        assert_eq!(
-            app.changes[0].display_status_cache, "merge wait",
-            "display must not advance beyond reducer-owned scheduler intent"
-        );
-        assert!(
-            !app.is_resolving,
-            "NoOp retry must not reserve resolve slot"
-        );
-        assert!(shared.blocking_read().resolve_wait_change_ids().is_empty());
-        assert!(app
-            .logs
-            .iter()
-            .any(|entry| entry.message.contains("rejected by reducer state")));
-    }
-
-    #[test]
-    fn test_resolve_merge_queued_noop_does_not_enqueue_local_waiter() {
-        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
-        use std::sync::Arc;
-
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
-            vec!["change-a".to_string()],
-            0,
-            ExecutionMode::Parallel,
-        )));
-        {
-            let mut guard = shared.blocking_write();
-            guard.apply_execution_event(&crate::events::ExecutionEvent::ChangeRejected {
-                change_id: "change-a".to_string(),
-                reason: "terminal rejection".to_string(),
-            });
-        }
-        app.set_shared_state(shared.clone());
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.cursor_index = 0;
-        app.mode = AppMode::Running;
-        app.is_resolving = true;
-
-        let cmd = app.resolve_merge();
-
-        assert!(cmd.is_none());
-        assert!(app.resolve_queue.is_empty());
-        assert!(app.resolve_queue_set.is_empty());
-        assert_eq!(app.changes[0].display_status_cache, "merge wait");
-        assert!(shared.blocking_read().resolve_wait_change_ids().is_empty());
-    }
-
     /// Regression test: after immediate resolve (is_resolving == false), a ChangesRefreshed
     /// event with the change still in merge_wait_ids must NOT regress ResolveWait back to
     /// MergeWait.
@@ -3597,11 +3158,15 @@ mod tests {
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.mode = AppMode::Running;
-        app.is_resolving = false;
+        app.clear_resolving();
 
-        let cmd = app.resolve_merge();
-        assert!(cmd.is_some());
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+        // What the shared run-control service does when it accepts the resolve.
+        shared
+            .blocking_write()
+            .apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
+                "change-a".to_string(),
+            ));
+        app.changes[0].set_display_status_cache("resolve pending");
 
         // Simulate a ChangesRefreshed event where workspace still reports change-a
         // as needing merge (which would normally set MergeWait in the reducer).
@@ -3640,77 +3205,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_merge_consecutive_m_key_presses_queue_second_change() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-
-        // Both changes are merge-wait candidates.
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.changes[1].display_status_cache = "merge wait".to_string();
-        app.mode = AppMode::Running;
-        app.is_resolving = false;
-
-        // 1st M press on change-a: should start immediate resolve and set is_resolving.
-        app.cursor_index = 0;
-        let first_cmd = app.resolve_merge();
-        assert!(matches!(first_cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
-        assert!(
-            app.is_resolving,
-            "first resolve_merge() must set is_resolving=true immediately"
-        );
-        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-
-        // 2nd M press on change-b: must take queue path and not start immediately.
-        app.cursor_index = 1;
-        let second_cmd = app.resolve_merge();
-        assert!(
-            second_cmd.is_none(),
-            "second resolve_merge() must queue while resolve is in progress"
-        );
-        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(
-            app.resolve_queue_set.contains("change-b"),
-            "second change must be queued for resolve"
-        );
-    }
-
-    #[test]
-    fn test_resolve_merge_after_merge_completed_takes_immediate_path() {
-        let changes = vec![
-            create_test_change("change-a", 0, 1),
-            create_test_change("change-b", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        app.changes[1].display_status_cache = "merge wait".to_string();
-
-        app.cursor_index = 0;
-        let first_cmd = app.resolve_merge();
-        assert!(matches!(first_cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-a"));
-        assert!(app.is_resolving);
-
-        let completion_cmd = app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
-            change_id: "change-a".to_string(),
-            revision: "abc123".to_string(),
-        });
-        assert!(completion_cmd.is_none());
-        assert!(!app.is_resolving);
-        assert_eq!(app.changes[0].display_status_cache, "merged");
-
-        app.cursor_index = 1;
-        let second_cmd = app.resolve_merge();
-
-        assert!(matches!(second_cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
-        assert!(app.is_resolving);
-        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(!app.resolve_queue_set.contains("change-b"));
-    }
-
-    #[test]
     fn test_handle_orchestrator_event_merge_completed_returns_queued_resolve() {
         let changes = vec![
             create_test_change("change-a", 0, 1),
@@ -3718,7 +3212,7 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "resolve pending".to_string();
         app.add_to_resolve_queue("change-b");
@@ -3729,7 +3223,7 @@ mod tests {
         });
 
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
     }
@@ -3858,21 +3352,6 @@ mod tests {
     }
 
     #[test]
-    fn test_start_processing_excludes_rejected_rows() {
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.mode = AppMode::Select;
-        app.changes[0].display_status_cache = "rejected".to_string();
-        app.changes[0].selected = true;
-
-        let cmd = app.start_processing();
-
-        assert!(cmd.is_none(), "F5 start must ignore rejected rows");
-        assert_eq!(app.changes[0].display_status_cache, "rejected");
-        assert_eq!(app.mode, AppMode::Select);
-    }
-
-    #[test]
     fn test_toggle_all_marks_ignores_rejected_rows() {
         let changes = vec![
             create_test_change("change-a", 0, 1),
@@ -3926,41 +3405,6 @@ mod tests {
         assert_eq!(
             app.changes[0].display_status_cache, "merged",
             "reducer-driven display must not transition a Merged change away from Merged"
-        );
-    }
-
-    #[test]
-    fn test_start_processing_does_not_queue_blocked_changes() {
-        // Regression: Blocked+selected changes must NOT be transitioned to Queued by F5
-        let changes = vec![
-            create_test_change("applying", 0, 1),
-            create_test_change("blocked-b", 0, 1),
-            create_test_change("blocked-c", 0, 1),
-        ];
-        let mut app = AppState::new(changes);
-
-        // Simulate: A is Applying, B and C are Blocked+selected (execution marks present)
-        app.changes[0].display_status_cache = "applying".to_string();
-        app.changes[0].selected = false;
-        app.changes[1].display_status_cache = "blocked".to_string();
-        app.changes[1].selected = true;
-        app.changes[2].display_status_cache = "blocked".to_string();
-        app.changes[2].selected = true;
-
-        // Press F5 (start_processing) – should return None (no NotQueued changes)
-        let result = app.start_processing();
-
-        assert!(
-            result.is_none(),
-            "start_processing must return None when only Blocked changes are selected"
-        );
-        assert_eq!(
-            app.changes[1].display_status_cache, "blocked",
-            "Blocked change B must remain Blocked after start_processing"
-        );
-        assert_eq!(
-            app.changes[2].display_status_cache, "blocked",
-            "Blocked change C must remain Blocked after start_processing"
         );
     }
 
@@ -4161,60 +3605,6 @@ mod tests {
     // Fix: parallel TUI queued/blocked state regression
     // -----------------------------------------------------------------------
 
-    /// start_processing must sync queue intent into the shared reducer so that a
-    /// subsequent ChangesRefreshed display sync cannot regress the row back to
-    /// "not queued" before the orchestrator processes it.
-    #[test]
-    fn test_start_processing_syncs_reducer_queue_intent() {
-        use crate::orchestration::state::OrchestratorState;
-        use std::sync::Arc;
-
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.changes[0].selected = true;
-        app.changes[0].is_parallel_eligible = true;
-
-        // Attach a real shared reducer.
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
-            vec!["change-a".to_string()],
-            0,
-        )));
-        app.set_shared_state(shared.clone());
-
-        let cmd = app.start_processing();
-        assert!(cmd.is_some(), "start_processing should return a command");
-
-        // Reducer must now know about the queue intent.
-        let guard = shared.blocking_read();
-        assert_eq!(
-            guard.display_status("change-a"),
-            "queued",
-            "reducer queue_intent must be Queued after start_processing"
-        );
-
-        // A subsequent ChangesRefreshed-driven display sync must not overwrite Queued.
-        drop(guard);
-        let mut display_map = std::collections::HashMap::new();
-        display_map.insert("change-a".to_string(), "not queued");
-        app.apply_display_statuses_from_reducer(&display_map);
-        assert_eq!(
-            app.changes[0].display_status_cache,
-            "not queued",
-            "display sync should apply reducer snapshot – but reducer already says queued, so this tests the raw override path"
-        );
-
-        // Verify with the reducer's own snapshot (the correct integration path).
-        let guard2 = shared.blocking_read();
-        let real_map = guard2.all_display_statuses();
-        drop(guard2);
-        app.changes[0].display_status_cache = "queued".to_string(); // restore as start_processing set
-        app.apply_display_statuses_from_reducer(&real_map);
-        assert_eq!(
-            app.changes[0].display_status_cache, "queued",
-            "reducer snapshot must preserve Queued through ChangesRefreshed display sync"
-        );
-    }
-
     #[test]
     fn test_apply_display_statuses_from_reducer_shows_reject_pending() {
         let changes = vec![create_test_change("reject-b", 0, 1)];
@@ -4226,35 +3616,6 @@ mod tests {
         app.apply_display_statuses_from_reducer(&display_map);
 
         assert_eq!(app.changes[0].display_status_cache, "reject pending");
-    }
-
-    /// resume_processing must sync queue intent into the shared reducer.
-    #[test]
-    fn test_resume_processing_syncs_reducer_queue_intent() {
-        use crate::orchestration::state::OrchestratorState;
-        use std::sync::Arc;
-
-        let changes = vec![create_test_change("change-a", 0, 1)];
-        let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
-        app.changes[0].selected = true;
-        app.changes[0].display_status_cache = "not queued".to_string();
-
-        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
-            vec!["change-a".to_string()],
-            0,
-        )));
-        app.set_shared_state(shared.clone());
-
-        let cmd = app.resume_processing();
-        assert!(cmd.is_some(), "resume_processing should return a command");
-
-        let guard = shared.blocking_read();
-        assert_eq!(
-            guard.display_status("change-a"),
-            "queued",
-            "reducer queue_intent must be Queued after resume_processing"
-        );
     }
 
     /// After start_processing, the reducer snapshot must preserve Queued through an
@@ -4277,9 +3638,11 @@ mod tests {
         )));
         app.set_shared_state(shared.clone());
 
-        // F5 – queues the change and syncs the reducer.
-        let cmd = app.start_processing();
-        assert!(cmd.is_some());
+        // The start path queues the change in the reducer and the row cache.
+        shared.blocking_write().apply_command(
+            crate::orchestration::state::ReducerCommand::AddToQueue("change-a".to_string()),
+        );
+        app.begin_run(&["change-a".to_string()]);
         assert_eq!(app.changes[0].display_status_cache, "queued");
 
         // Simulate initial parallel ChangesRefreshed (workspace scan returns nothing special).
@@ -4327,9 +3690,11 @@ mod tests {
         )));
         app.set_shared_state(shared.clone());
 
-        // F5 – queues the change in TUI and syncs the reducer.
-        let cmd = app.start_processing();
-        assert!(cmd.is_some());
+        // The start path queues the change in the reducer and the row cache.
+        shared
+            .blocking_write()
+            .apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
+        app.begin_run(&["change-a".to_string()]);
         assert_eq!(app.changes[0].display_status_cache, "queued");
 
         // Simulate run_orchestrator_parallel replacing shared state (the regression source).
@@ -4385,10 +3750,13 @@ mod tests {
         )));
         app.set_shared_state(shared.clone());
 
-        // Simulate F5 path (queues change in both TUI and reducer).
+        // Simulate the start path (queues change in both TUI and reducer).
         app.changes[0].selected = true;
         app.changes[0].is_parallel_eligible = true;
-        app.start_processing();
+        shared.blocking_write().apply_command(
+            crate::orchestration::state::ReducerCommand::AddToQueue("change-a".to_string()),
+        );
+        app.begin_run(&["change-a".to_string()]);
 
         // Verify reducer has queued intent.
         assert_eq!(shared.blocking_read().display_status("change-a"), "queued");
@@ -4423,7 +3791,10 @@ mod tests {
 
         app.changes[0].selected = true;
         app.changes[0].is_parallel_eligible = true;
-        app.start_processing();
+        shared.blocking_write().apply_command(
+            crate::orchestration::state::ReducerCommand::AddToQueue("change-a".to_string()),
+        );
+        app.begin_run(&["change-a".to_string()]);
 
         // Block then resolve.
         {
@@ -4581,7 +3952,7 @@ mod tests {
         app.mode = AppMode::Running;
         app.changes[0].display_status_cache = "merged".to_string(); // already done
         app.changes[1].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
 
         // Simulate resolve completion
         app.handle_resolve_completed("change-b".to_string(), None);
@@ -4604,7 +3975,7 @@ mod tests {
         app.mode = AppMode::Running;
         app.changes[0].display_status_cache = "applying".to_string(); // still active
         app.changes[1].display_status_cache = "resolving".to_string();
-        app.is_resolving = true;
+        app.set_resolving("__active__");
 
         app.handle_resolve_completed("change-b".to_string(), None);
 

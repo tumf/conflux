@@ -16,6 +16,7 @@ mod orchestrator;
 mod qr;
 pub mod queue;
 mod render;
+pub mod run_supervisor;
 mod runner;
 mod state;
 pub mod stop_classification;

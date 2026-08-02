@@ -1,7 +1,7 @@
 use crate::tui::events::{LogEntry, TuiCommand};
 use crate::tui::types::AppMode;
 
-use super::{guards, processing_logic, AppState, ChangeState};
+use super::{guards, AppState, ChangeState};
 
 /// Why a change is excluded from the bulk execution-mark toggle (`x`).
 ///
@@ -293,94 +293,6 @@ fn dispatch_toggle_result(
         }
         guards::ToggleActionResult::None => None,
     }
-}
-
-pub(super) fn start_processing(state: &mut AppState) -> Option<TuiCommand> {
-    if state.mode != AppMode::Select {
-        return None;
-    }
-
-    match processing_logic::collect_start_processing_targets(&state.changes, state.parallel_mode) {
-        Ok(selected) => {
-            processing_logic::mark_changes_queued(&mut state.changes, &selected);
-            processing_logic::sync_queue_intent(
-                state.shared_orchestrator_state.as_ref(),
-                &selected,
-            );
-            state.reset_for_run();
-            state.mode = AppMode::Running;
-            state.add_log(LogEntry::info(format!(
-                "Starting processing {} change(s)",
-                selected.len()
-            )));
-            Some(processing_logic::build_start_command(selected))
-        }
-        Err(message) => {
-            state.warning_message = Some(message);
-            None
-        }
-    }
-}
-
-pub(super) fn resume_processing(state: &mut AppState) -> Option<TuiCommand> {
-    if state.mode != AppMode::Stopped {
-        return None;
-    }
-
-    match processing_logic::collect_resume_processing_targets(&state.changes) {
-        Ok(marked_ids) => {
-            processing_logic::mark_changes_queued(&mut state.changes, &marked_ids);
-            processing_logic::sync_queue_intent(
-                state.shared_orchestrator_state.as_ref(),
-                &marked_ids,
-            );
-            state.reset_for_run();
-            state.mode = AppMode::Running;
-            state.add_log(LogEntry::info(format!(
-                "Resuming processing {} change(s)...",
-                marked_ids.len()
-            )));
-            Some(processing_logic::build_start_command(marked_ids))
-        }
-        Err(message) => {
-            state.warning_message = Some(message);
-            None
-        }
-    }
-}
-
-pub(super) fn retry_error_changes(state: &mut AppState) -> Option<TuiCommand> {
-    if state.mode != AppMode::Error {
-        return None;
-    }
-
-    let error_ids = processing_logic::collect_retry_error_targets(&state.changes);
-    if error_ids.is_empty() {
-        return None;
-    }
-
-    let retry_ids = processing_logic::sync_retry_error_intent(
-        state.shared_orchestrator_state.as_ref(),
-        &error_ids,
-    );
-    if retry_ids.is_empty() {
-        state.warning_message = Some("No marked error changes are retryable".to_string());
-        return None;
-    }
-
-    processing_logic::mark_changes_queued(&mut state.changes, &retry_ids);
-    for entry in processing_logic::emit_retry_logs(&retry_ids) {
-        state.add_log(entry);
-    }
-
-    // Operator retry must start the run with explicit-retry semantics so a
-    // reconciled acceptance hold is consumed and acceptance resumes instead of
-    // apply being rerun.
-    state.set_pending_explicit_retry();
-    state.reset_for_run();
-    state.mode = AppMode::Running;
-    state.publish_execution_marks();
-    Some(processing_logic::build_start_command(retry_ids))
 }
 
 #[cfg(test)]

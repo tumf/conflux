@@ -78,7 +78,9 @@ impl AppState {
 
     pub(crate) fn handle_resolve_started(&mut self, change_id: String, command: String) {
         self.reset_analysis_log_dedupe();
-        self.is_resolving = true;
+        // The runtime, not the frontend, decides which change owns the resolver:
+        // scheduler-owned resolves never went through a reservation request.
+        self.set_resolving(&change_id);
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             if change.started_at.is_none() {
                 change.started_at = Some(Instant::now());

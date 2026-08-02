@@ -121,7 +121,7 @@ impl AppState {
                 .with_change_id(&change_id),
         );
 
-        if self.is_resolving || !self.resolve_queue.is_empty() {
+        if self.is_resolving() || self.has_queued_resolves() {
             self.complete_resolve_lifecycle()
         } else {
             None
@@ -129,8 +129,8 @@ impl AppState {
     }
 
     fn complete_resolve_lifecycle(&mut self) -> Option<TuiCommand> {
-        self.is_resolving = false;
-
+        // Releasing the active reservation promotes the next waiting change, so
+        // the promoted change can reserve cleanly when its command is handled.
         if let Some(next_change_id) = self.pop_from_resolve_queue() {
             self.add_log(
                 LogEntry::info(format!(
@@ -280,6 +280,7 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
+        app.set_resolving("change-a");
         app.add_to_resolve_queue("change-b");
 
         let _ = app.handle_resolve_completed("change-a".to_string(), None);
@@ -432,13 +433,13 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
 
         let cmd = app.handle_merge_completed("change-a".to_string());
 
         assert!(cmd.is_none());
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert!(app
             .logs
@@ -454,7 +455,7 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
         app.changes[1].set_display_status_cache("resolve pending");
         app.add_to_resolve_queue("change-b");
@@ -462,9 +463,9 @@ mod tests {
         let cmd = app.handle_merge_completed("change-a".to_string());
 
         assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
-        assert!(!app.is_resolving);
-        assert!(app.resolve_queue.is_empty());
-        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert!(!app.is_resolving());
+        assert!(app.queued_resolves().is_empty());
+        assert!(!app.resolve_reservations().is_reserved("change-b"));
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
     }
@@ -479,7 +480,7 @@ mod tests {
         let cmd = app.handle_merge_completed("change-a".to_string());
 
         assert!(cmd.is_none());
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert!(app.changes[0].elapsed_time.is_some());
         assert!(app

@@ -14,7 +14,11 @@ use crate::orchestration::operator_command::{
     MarkRoute, NoOpReason, OperatorCommandError, OperatorCommandService, OperatorMode,
     OperatorOutcome,
 };
-use crate::web::state::{ControlCommand, WebState};
+use crate::orchestration::run_control::{
+    ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
+    SchedulerEffect,
+};
+use crate::web::state::WebState;
 
 use super::dto::{CommandSpec, ErrorCode};
 
@@ -143,6 +147,93 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
     }
 }
 
+/// Map a run-lifecycle refusal onto a v2 error code.
+///
+/// The distinction a client acts on is the same one the TUI shows an operator:
+/// a mode that has to move on, a target that has to change, or a runtime that
+/// could not dispatch at all.
+pub fn map_run_control_error(error: &RunControlError) -> CommandFailure {
+    match error {
+        RunControlError::InvalidMode { .. } => {
+            CommandFailure::new(ErrorCode::LifecycleConflict, error.to_string())
+        }
+        RunControlError::NoEligibleTarget { .. } | RunControlError::TargetIneligible { .. } => {
+            CommandFailure::new(ErrorCode::TargetIneligible, error.to_string())
+        }
+        RunControlError::DispatchFailed { .. } => {
+            CommandFailure::new(ErrorCode::InternalError, error.to_string())
+        }
+        RunControlError::Operator(inner) => map_operator_error(inner),
+    }
+}
+
+/// Map a run-lifecycle success onto a v2 execution summary.
+///
+/// `changed` is set from the effect the service reported, never from the fact
+/// that a command was accepted: a reservation that only queued, or a retry that
+/// found nothing retryable, settles as `no_op`.
+pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
+    match outcome {
+        RunControlOutcome::RunDispatched {
+            change_ids,
+            explicit_retry,
+            scheduler,
+        } => {
+            let how = match scheduler {
+                SchedulerEffect::Started => "started the scheduler",
+                SchedulerEffect::Notified => "woke the running scheduler",
+                SchedulerEffect::None => "dispatched no scheduler work",
+            };
+            let kind = if *explicit_retry { "retry" } else { "run" };
+            ExecutionSummary::changed(format!("{kind} for {change_ids:?} {how}"))
+        }
+        RunControlOutcome::StopRequested => {
+            ExecutionSummary::changed("graceful stop requested; the run stops at its next boundary")
+        }
+        RunControlOutcome::StopCancelled => {
+            ExecutionSummary::changed("pending graceful stop was withdrawn")
+        }
+        RunControlOutcome::ForceStopped {
+            classification,
+            awaiting_safe_boundary,
+        } => {
+            // Only a snapshot that actually saw in-flight execution may be
+            // reported as a force stop; everything else is an ordinary stop.
+            let report = if classification.process_report.is_force_stop() {
+                "force stop applied to active execution"
+            } else {
+                "run cancelled; no agent execution was active"
+            };
+            let boundary = if *awaiting_safe_boundary {
+                "; waiting for in-flight work to reach a safe stop boundary"
+            } else {
+                ""
+            };
+            ExecutionSummary::changed(format!("{report}{boundary}"))
+        }
+        RunControlOutcome::ResolveReserved {
+            change_id,
+            reservation,
+            ..
+        } => match reservation {
+            ResolveReservation::Active => ExecutionSummary::changed(format!(
+                "merge resolution for '{change_id}' is the active resolve"
+            )),
+            ResolveReservation::Queued { position } => ExecutionSummary::changed(format!(
+                "merge resolution for '{change_id}' is queued at position {position}"
+            )),
+        },
+        RunControlOutcome::NoOp { reason } => match reason {
+            RunNoOpReason::ResolveAlreadyReserved { change_id } => ExecutionSummary::no_op(format!(
+                "'{change_id}' already holds a resolve reservation"
+            )),
+            RunNoOpReason::NoRetryableTarget => {
+                ExecutionSummary::no_op("no marked change carried retryable evidence")
+            }
+        },
+    }
+}
+
 /// Map the operator-facing application mode string onto the shared enum.
 ///
 /// Delegates to the enum's own parser: the snapshot projection resolves the same
@@ -152,10 +243,15 @@ pub fn operator_mode(app_mode: &str) -> OperatorMode {
     OperatorMode::from_app_mode(app_mode)
 }
 
-/// Production executor: shared operator command service plus the existing
-/// frontend control channel for run lifecycle commands.
+/// Production executor over the two shared process-local application services.
+///
+/// There is no control channel here on purpose. A run lifecycle command reaches
+/// the same [`RunControlService`] a keypress reaches and returns only after that
+/// service produced a real outcome, so a command record can never settle as
+/// succeeded because a message was enqueued.
 pub struct SharedServiceExecutor {
     service: Arc<OperatorCommandService>,
+    run_control: Arc<RunControlService>,
     web_state: Arc<WebState>,
     projection: Arc<super::projection::Projection>,
     /// The same worktree port the read routes use, so a client cannot be told a
@@ -164,15 +260,17 @@ pub struct SharedServiceExecutor {
 }
 
 impl SharedServiceExecutor {
-    /// Wire the executor to the shared service, the control channel owner, and
-    /// the projection it reads the current mode from.
+    /// Wire the executor to the shared services and the projection it reads the
+    /// current mode from.
     pub fn new(
         service: Arc<OperatorCommandService>,
+        run_control: Arc<RunControlService>,
         web_state: Arc<WebState>,
         projection: Arc<super::projection::Projection>,
     ) -> Self {
         Self {
             service,
+            run_control,
             web_state,
             projection,
             worktrees: Arc::new(super::worktrees::UnboundWorktreeOperations),
@@ -186,20 +284,6 @@ impl SharedServiceExecutor {
     ) -> Self {
         self.worktrees = worktrees;
         self
-    }
-
-    fn lifecycle(
-        &self,
-        command: ControlCommand,
-        detail: &str,
-    ) -> Result<ExecutionSummary, CommandFailure> {
-        self.web_state.send_control_command(command).map_err(|e| {
-            CommandFailure::new(
-                ErrorCode::LifecycleConflict,
-                format!("this instance cannot accept run lifecycle commands: {e}"),
-            )
-        })?;
-        Ok(ExecutionSummary::changed(detail.to_string()))
     }
 }
 
@@ -225,20 +309,26 @@ impl RemoteControlExecutor for SharedServiceExecutor {
 }
 
 impl SharedServiceExecutor {
+    /// Project a run-control result onto the v2 summary/failure vocabulary.
+    fn run(
+        &self,
+        result: Result<RunControlOutcome, RunControlError>,
+    ) -> Result<ExecutionSummary, CommandFailure> {
+        result
+            .map(|outcome| summarize_run_outcome(&outcome))
+            .map_err(|error| map_run_control_error(&error))
+    }
+
     async fn dispatch(
         &self,
         mode: OperatorMode,
         command: &CommandSpec,
     ) -> Result<ExecutionSummary, CommandFailure> {
         match command {
-            CommandSpec::Start => self.lifecycle(ControlCommand::Start, "run start requested"),
-            CommandSpec::Stop => self.lifecycle(ControlCommand::Stop, "graceful stop requested"),
-            CommandSpec::CancelStop => {
-                self.lifecycle(ControlCommand::CancelStop, "pending stop cancelled")
-            }
-            CommandSpec::ForceStop => {
-                self.lifecycle(ControlCommand::ForceStop, "force stop requested")
-            }
+            CommandSpec::Start => self.run(self.run_control.start(mode).await),
+            CommandSpec::Stop => self.run(self.run_control.stop(mode).await),
+            CommandSpec::CancelStop => self.run(self.run_control.cancel_stop(mode).await),
+            CommandSpec::ForceStop => self.run(self.run_control.force_stop(mode).await),
             CommandSpec::SetExecutionMark { change_id, marked } => self
                 .service
                 .set_execution_mark(mode, change_id, *marked)
@@ -255,15 +345,14 @@ impl SharedServiceExecutor {
                     .map(|queue| summarize_outcome(&OperatorOutcome::Queue(queue)))
                     .map_err(|error| map_operator_error(&error))
             }
-            CommandSpec::RetryChange { change_id } => self
-                .service
-                .retry_change(change_id)
-                .await
-                .map(|plan| summarize_outcome(&OperatorOutcome::Retry(plan)))
-                .map_err(|error| map_operator_error(&error)),
+            // Retry routes through run control rather than the per-change
+            // service so the reducer transition and the scheduler dispatch that
+            // makes it real settle together.
+            CommandSpec::RetryChange { change_id } => {
+                self.run(self.run_control.retry_change(change_id).await)
+            }
             CommandSpec::RetryErrors { change_ids } => {
-                let plan = self.service.retry_errors(change_ids).await;
-                Ok(summarize_outcome(&OperatorOutcome::Retry(plan)))
+                self.run(self.run_control.retry_errors(change_ids).await)
             }
             CommandSpec::StopAndDequeue { change_id } => self
                 .service
@@ -272,15 +361,7 @@ impl SharedServiceExecutor {
                 .map(|outcome| summarize_outcome(&outcome))
                 .map_err(|error| map_operator_error(&error)),
             CommandSpec::ResolveMerge { change_id } => {
-                if self.service.resolve_merge(change_id).await {
-                    Ok(ExecutionSummary::changed(format!(
-                        "merge resolution requested for '{change_id}'"
-                    )))
-                } else {
-                    Ok(ExecutionSummary::no_op(format!(
-                        "'{change_id}' is not waiting on a merge"
-                    )))
-                }
+                self.run(self.run_control.resolve_merge(change_id).await)
             }
             // Worktree commands carry no parameters, so there is nothing to
             // translate here: the closed target is passed straight to the shared
