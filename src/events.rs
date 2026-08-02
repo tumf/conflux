@@ -797,7 +797,14 @@ pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) 
 }
 
 /// The stable variant name of one execution event.
-pub fn event_variant_name(event: &ExecutionEvent) -> &'static str {
+///
+/// Lives in the crate (behind `cfg(test)`) rather than in one test file because
+/// the ownership table and the remote projection tests name the *same* variants
+/// from the *same* classifier: a variant renamed here must move in both places
+/// at once. Production code never needs the name — it reads the ownership half
+/// of [`classify_event`] through [`event_ownership`].
+#[cfg(test)]
+pub(crate) fn event_variant_name(event: &ExecutionEvent) -> &'static str {
     classify_event(event).0
 }
 

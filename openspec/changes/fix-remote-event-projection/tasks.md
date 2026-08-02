@@ -43,6 +43,16 @@
   fallback dropped the change ID and every payload field of any unenumerated variant;
   `resolve_output` is added to `NON_ACTIVITY_EVENT_TYPES` so newly published
   streaming output cannot churn `latest_activity` and the state revision per chunk.
+- Two helpers this change left without a production caller are scoped `#[cfg(test)]
+  pub(crate)` rather than deleted, matching the existing repo convention for
+  crate-internal test support (`merge_lock_test_mutex` in `src/parallel/mod.rs`,
+  `change_actions_for_test` in `src/web/remote_control_api/projection.rs`, and eight
+  more). `event_variant_name` stays in `src/events.rs` so the ownership table and the
+  remote projection tests read variant names from the same classifier that decides
+  ownership; splitting it into one test file would let a renamed variant drift between
+  them. `WebState::update` stays in `src/web/state.rs` because the projection tests
+  need a starting change set that keeps the run's existing `app_mode`, which neither
+  `update_with_mode` nor `apply_dispatch` offers.
 
 ## Final Validation
 
@@ -58,6 +68,16 @@ Evidence from this apply:
 - `cargo check --no-default-features --lib --tests` — clean.
 - `cargo fmt --check` — clean.
 
+Evidence from the acceptance repair (attempt 1):
+
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` — clean, finished
+  in 3m 27s with no diagnostics. This is byte-for-byte the `clippy` hook entry in
+  `.pre-commit-config.yaml`, which is the commit-path gate the finding reported failing.
+- `cargo test --features web-monitoring --lib` — 2778 passed, 0 failed, 7 ignored.
+- `cargo check --no-default-features --lib --tests` — clean (confirms the two
+  `#[cfg(test)]` helpers do not break the non-default feature build).
+- `cargo fmt --check` — clean.
+
 ## Future Work
 
 - Removal of retained legacy frontend modules may occur in `modernize-web-monitoring-ui` after consumers migrate.
@@ -66,3 +86,12 @@ Evidence from this apply:
   any transition (the scheduler owns the reducer there and `apply_execution_event`
   routes through `apply_dispatch`), but consolidating it onto the same dispatch owner
   belongs with the wider CLI frontend work rather than this change.
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [x] [acceptance-commit-path-clippy-dead-code] (major) Commit-path clippy gate fails: this change introduces two dead-code errors in the bin target, so the pre-commit hook blocks the archive commit | evidence: cargo clippy --locked --all-targets --all-features -- -D warnings: error: function `event_variant_name` is never used --> src/events.rs:800 (function added by this change; every caller is #[cfg(test)] code, so the bin target sees it as dead); cargo clippy --locked --all-targets --all-features -- -D warnings: error: method `update` is never used --> src/web/state.rs:653 (this change removed the last production caller, web_state.update(changes) at former src/tui/runner.rs:804; only test callers in src/web/remote_control_api/tests/operator_snapshot_tests.rs remain); .pre-commit-config.yaml runs exactly this clippy command with always_run: true via the installed prek pre-commit hook, and the archive commit runs git commit without --no-verify (src/vcs/git/commands/commit.rs:109), so the archive commit fails this hook | required_changes: src/events.rs — Make event_variant_name compile clean in non-test builds: use it from production code, move/scope it to the test modules that call it, or give it an explicit test-only annotation consistent with repo conventions; src/web/state.rs — Resolve the now-unused WebState::update: remove it and migrate its test callers to update_with_mode/dispatch paths, or scope/annotate it as test-only support | verification: src/events.rs — cargo clippy --locked --all-targets --all-features -- -D warnings passes with no dead_code error for event_variant_name; src/web/state.rs — cargo clippy --locked --all-targets --all-features -- -D warnings passes with no dead_code error for WebState::update, and cargo test --features web-monitoring --lib remains green
+  finding: {"evidence":["cargo clippy --locked --all-targets --all-features -- -D warnings: error: function `event_variant_name` is never used --> src/events.rs:800 (function added by this change; every caller is #[cfg(test)] code, so the bin target sees it as dead)","cargo clippy --locked --all-targets --all-features -- -D warnings: error: method `update` is never used --> src/web/state.rs:653 (this change removed the last production caller, web_state.update(changes) at former src/tui/runner.rs:804; only test callers in src/web/remote_control_api/tests/operator_snapshot_tests.rs remain)",".pre-commit-config.yaml runs exactly this clippy command with always_run: true via the installed prek pre-commit hook, and the archive commit runs git commit without --no-verify (src/vcs/git/commands/commit.rs:109), so the archive commit fails this hook"],"id":"acceptance-commit-path-clippy-dead-code","required_changes":[{"description":"Make event_variant_name compile clean in non-test builds: use it from production code, move/scope it to the test modules that call it, or give it an explicit test-only annotation consistent with repo conventions","file":"src/events.rs"},{"description":"Resolve the now-unused WebState::update: remove it and migrate its test callers to update_with_mode/dispatch paths, or scope/annotate it as test-only support","file":"src/web/state.rs"}],"severity":"major","summary":"Commit-path clippy gate fails: this change introduces two dead-code errors in the bin target, so the pre-commit hook blocks the archive commit","verification":[{"description":"cargo clippy --locked --all-targets --all-features -- -D warnings passes with no dead_code error for event_variant_name","file":"src/events.rs"},{"description":"cargo clippy --locked --all-targets --all-features -- -D warnings passes with no dead_code error for WebState::update, and cargo test --features web-monitoring --lib remains green","file":"src/web/state.rs"}]}
+  evidence: src/events.rs required change done: event_variant_name is now `#[cfg(test)] pub(crate)` (src/events.rs:806-809) with a doc comment stating why it stays in the crate next to classify_event, matching the repo's existing crate-internal test-support convention, so the bin target no longer sees it.
+  evidence: src/web/state.rs required change done: WebState::update is now `#[cfg(test)] pub(crate) async fn` (src/web/state.rs:651-660) documenting that production reaches the snapshot via apply_dispatch/ChangesRefreshed and update_with_mode, and that the projection tests need a seed that preserves app_mode; its only callers are the `#[cfg(test)]` modules in src/web/state.rs and src/web/remote_control_api/tests/operator_snapshot_tests.rs.
+  evidence: src/events.rs verification met: `cargo clippy --locked --all-targets --all-features -- -D warnings` finished clean in 3m 27s with zero diagnostics, so no dead_code error for event_variant_name; this is byte-for-byte the `clippy` hook entry in .pre-commit-config.yaml that blocks the archive commit.
+  evidence: src/web/state.rs verification met: the same clean `cargo clippy --locked --all-targets --all-features -- -D warnings` run reports no dead_code error for WebState::update, and `cargo test --features web-monitoring --lib` remains green at 2778 passed, 0 failed, 7 ignored; `cargo check --no-default-features --lib --tests` and `cargo fmt --check` are also clean.

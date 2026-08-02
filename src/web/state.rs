@@ -648,9 +648,16 @@ impl WebState {
         self.state.read().await.clone()
     }
 
-    /// Update state with new changes and broadcast to WebSocket clients.
-    /// Only broadcasts if there are actual changes from the previous state.
-    pub async fn update(&self, changes: &[Change]) {
+    /// Seed the monitoring snapshot from a workspace listing, test-only.
+    ///
+    /// Production has no caller left: a workspace observation reaches the
+    /// snapshot as a dispatched `ChangesRefreshed` (see [`WebState::apply_dispatch`]),
+    /// and Run mode publishes its own execution mode through
+    /// [`WebState::update_with_mode`]. Kept behind `cfg(test)` because the
+    /// projection tests need a starting change set whose `app_mode` is whatever
+    /// the run already had, which neither of those two entry points offers.
+    #[cfg(test)]
+    pub(crate) async fn update(&self, changes: &[Change]) {
         // Query shared state if available for enriched metadata
         let shared_state_opt = self.shared_orchestrator_state.read().await;
         let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
