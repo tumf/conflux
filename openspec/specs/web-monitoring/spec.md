@@ -55,182 +55,26 @@ Provides HTTP-based monitoring capabilities for the orchestrator, including REST
 - **THEN** CLIフラグがなくてもHTTPサーバーはポート9000で起動する
 - **AND** CLIで指定した値は設定ファイルより優先される
 
-### Requirement: REST API - Health Check
-The HTTP server SHALL provide a health check endpoint for monitoring service availability.
-
-#### Scenario: Health check returns OK
-- **WHEN** client sends `GET /api/health`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains `{"status": "ok"}`
-- **AND** response has `Content-Type: application/json` header
-
-### Requirement: REST API - Full State
-The HTTP server SHALL expose complete orchestrator state via REST API.
-The HTTP server SHALL prevent stale responses for `/api/state` by disabling HTTP caching.
-The server SHALL return the latest change state even when updates originate from the TUI auto-refresh loop.
-The server SHALL refresh the state from disk/worktree sources before responding to REST API state requests.
-
-#### Scenario: Get full state
-- **WHEN** client sends `GET /api/state`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains complete JSON state from `.opencode/orchestrator-state.json`
-- **AND** response includes all changes with their progress and task details
-- **AND** response has `Cache-Control: no-store` header
-
-#### Scenario: Updated state is reflected on subsequent requests
-- **WHEN** `.opencode/orchestrator-state.json` changes between two `GET /api/state` requests
-- **THEN** the second response body reflects the updated state
-
-#### Scenario: Manual reload reflects TUI refresh state
-- **GIVEN** TUI の自動更新が変更一覧を更新した
-- **WHEN** user reloads the dashboard page
-- **THEN** the dashboard renders the latest orchestrator state
-- **AND** `/api/state` には TUI の更新結果が反映されている
-
-#### Scenario: REST API refreshes state from disk
-- **GIVEN** タスク進捗が作業ツリーの tasks.md に反映されている
-- **WHEN** client sends `GET /api/state`
-- **THEN** server refreshes the state from disk/worktree sources before responding
-- **AND** response reflects the latest progress
-
-### Requirement: REST API - Changes List
-The HTTP server SHALL provide a summary list of all changes.
-
-#### Scenario: Get changes list
-- **WHEN** client sends `GET /api/changes`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains array of change objects
-- **AND** each change includes id, completed_tasks, total_tasks, and last_modified
-
-#### Scenario: No active changes
-- **WHEN** client sends `GET /api/changes` and no changes exist
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains empty array `[]`
-
-### Requirement: REST API - Single Change Detail
-The HTTP server SHALL provide detailed information for a specific change.
-
-#### Scenario: Get existing change
-- **WHEN** client sends `GET /api/changes/add-web-monitoring`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains complete change object with all tasks
-
-#### Scenario: Get non-existent change
-- **WHEN** client sends `GET /api/changes/invalid-id`
-- **THEN** server responds with HTTP 404 status
-- **AND** response body contains error message with change ID
-
-### Requirement: WebSocket - Real-time Updates
-
-The HTTP server SHALL broadcast state updates to the dashboard via WebSocket for both serial and parallel execution (`--parallel`) modes.
-The HTTP server SHALL ensure that TUI and Web UI states remain consistent by broadcasting real-time state updates that occur in the TUI via WebSocket.
-This broadcast MUST be based on a unified state model that includes not only change list progress but also TUI-visible states (queue status, logs, worktrees, running operations, etc.).
-For dashboard compatibility, the `changes` field in `state_update` messages MUST always be a complete snapshot of the change list (MUST).
-すべての状態で tasks.md から取得できる進捗を state_update に反映し、completed を 0 に上書きしてはならない（MUST NOT）。
-進捗取得に失敗した場合でも completed を 0 に上書きしてはならない（MUST NOT）。取得失敗は 0 件完了とは別の状態として扱う。
-
-#### Scenario: 任意の状態で progress を保持する
-- **GIVEN** Web UI が state_update を受信している
-- **AND** tasks.md から進捗が取得できる
-- **WHEN** state_update が送信される
-- **THEN** completed_tasks/total_tasks は最新の進捗を反映する
-- **AND** completed を 0 に上書きしない
-
-#### Scenario: 任意の状態で進捗取得失敗は直前値を保持する
-- **GIVEN** Web UI が state_update を受信している
-- **AND** tasks.md の読み取りに失敗する
-- **WHEN** state_update が送信される
-- **THEN** completed_tasks/total_tasks は直前の値を維持する
-- **AND** 取得失敗を 0 件完了として扱わない
-
-#### Scenario: Web state uses unified model
-- **GIVEN** WebState が state_update を生成する
-- **WHEN** 変更状態のスナップショットを作成する
-- **THEN** the snapshot derives from the shared orchestration state
-- **AND** Web-specific DTO naming does not conflict with shared state types
-
 ### Requirement: Static File Serving - Dashboard
-The HTTP server SHALL serve a web-based dashboard interface for visualizing orchestration state.
 
-#### Scenario: Access dashboard
-- **WHEN** client navigates to `http://localhost:8080/`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains HTML dashboard page
-- **AND** response has `Content-Type: text/html` header
+The HTTP server SHALL serve the embedded API v2 operator console and its static CSS and JavaScript assets. Static delivery MUST remain available in both retained local TUI and `cflx run --web` modes and MUST NOT depend on the removed standalone dashboard build.
 
-#### Scenario: Access CSS assets
-- **WHEN** client requests `GET /assets/style.css`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains CSS stylesheet
-- **AND** response has `Content-Type: text/css` header
+#### Scenario: Access operator console
 
-#### Scenario: Access JavaScript assets
-- **WHEN** client requests `GET /assets/app.js`
-- **THEN** server responds with HTTP 200 status
-- **AND** response body contains JavaScript code
-- **AND** response has `Content-Type: application/javascript` header
+**When**: A client navigates to `/`
+**Then**: The server responds with HTTP 200
+**And**: The body is the embedded operator-console HTML with `Content-Type: text/html`
+
+#### Scenario: Access retained assets
+
+**When**: A client requests `/style.css` or `/app.js`
+**Then**: The server responds with HTTP 200
+**And**: It returns the matching embedded CSS or JavaScript content type
 
 #### Scenario: Missing asset
-- **WHEN** client requests non-existent asset path
-- **THEN** server responds with HTTP 404 status
 
-### Requirement: Dashboard UI - Change List Display
-
-Webダッシュボードは、TUI の表示語彙と一致するステータス語彙で change 一覧を表示しなければならない（SHALL）。
-
-Rejected row は read-only terminal row として表示してよいが、execution mark を保持した active candidate として表現してはならない（MUST NOT）。
-
-#### Scenario: rejected row is displayed without execution mark
-
-- **GIVEN** Web UI が change 一覧を表示している
-- **AND** ある change の status が `rejected` である
-- **WHEN** dashboard row がレンダリングされる
-- **THEN** その row は `rejected` の visual treatment で表示される
-- **AND** row は `selected = false` として扱われる
-- **AND** active execution candidate と同じ checkbox semantics を保持しない
-
-### Requirement: Dashboard UI - Real-time Updates
-
-The web dashboard SHALL automatically update when orchestrator state changes.
-The web dashboard SHALL render a fresh initial state snapshot on page load.
-The web dashboard SHALL fall back to polling when WebSocket updates are unavailable.
-
-Explicit user-driven selection toggles MUST NOT feel deferred until the next background `full_state` or polling cycle. When the user toggles a change checkbox, the dashboard SHALL reflect the intended selection state immediately and then reconcile against the server-confirmed value.
-
-#### Scenario: live-selection-toggle-does-not-wait-for-full-state
-- **GIVEN** the dashboard is connected and displays a change row with `selected = false`
-- **WHEN** the user toggles the checkbox for that row
-- **THEN** the dashboard immediately updates the row's visible checkbox state
-- **AND** the row does not wait for the next periodic refresh or unrelated `full_state` push before showing the intended selection change
-
-#### Scenario: error-row-reselect-is-visible-immediately
-- **GIVEN** the dashboard displays a change row whose status is `error` and `selected = false`
-- **WHEN** the user re-selects that row for retry
-- **THEN** the checkbox becomes visibly checked immediately
-- **AND** the row continues to display error status treatment rather than changing to a non-error status prematurely
-
-#### Scenario: failed-selection-toggle-rolls-back-ui
-- **GIVEN** the dashboard has optimistically updated a row checkbox after a user toggle
-- **AND** the server rejects or fails the toggle request
-- **WHEN** the failure is observed by the dashboard
-- **THEN** the dashboard restores the prior confirmed checkbox state
-- **AND** the dashboard surfaces an error indication to the user
-
-#### Scenario: bulk-selection-toggle-updates-visible-rows-immediately
-- **GIVEN** the dashboard displays multiple change rows including previously unselected error rows
-- **WHEN** the user invokes a bulk selection toggle
-- **THEN** the visible row checkbox states update immediately to the intended post-toggle values
-- **AND** the dashboard later reconciles to the server-confirmed values without leaving stale pre-toggle selections on screen
-
-### Requirement: Dashboard UI - Task Status Visualization
-
-反復回数がある状態は `status:iteration` 形式で表示しなければならない（SHALL）。
-
-#### Scenario: Applying の iteration 表示
-- **GIVEN** change の queue_status が applying である
-- **AND** iteration_number が 1 である
-- **WHEN** Web UI が change 行を表示する
-- **THEN** ステータス表示は `applying:1` となる
+**When**: A client requests an unknown static asset path
+**Then**: The server responds with HTTP 404
 
 ### Requirement: Error Handling and Logging
 The HTTP server SHALL handle errors gracefully and log all HTTP requests.
@@ -331,23 +175,6 @@ Webダッシュボードのすべてのインタラクティブ要素は、タ�
 - **THEN** 両方の入力方法で同じ機能が利用可能である
 - **AND** ホバー状態はマウス使用時のみ表示される
 
-### Requirement: タッチジェスチャー対応
-Webダッシュボードは一般的なタッチジェスチャーに対応しなければならない（SHALL）。
-
-#### Scenario: スワイプによる詳細展開
-- **WHEN** ユーザーが変更リスト項目を左にスワイプする
-- **THEN** その変更の詳細タスクリストが展開される
-- **AND** スワイプアニメーションがスムーズに表示される
-
-#### Scenario: スワイプによる詳細折りたたみ
-- **WHEN** ユーザーが展開された詳細を右にスワイプする
-- **THEN** 詳細タスクリストが折りたたまれる
-
-#### Scenario: タップと誤操作の区別
-- **WHEN** ユーザーがスワイプを開始する
-- **THEN** 10px以上の水平移動があるまでタップとして扱われる
-- **AND** 意図しない操作を防止する
-
 ### Requirement: モバイル向け進捗表示
 Webダッシュボードの進捗表示は、モバイル画面サイズに最適化されなければならない（SHALL）。
 
@@ -360,19 +187,6 @@ Webダッシュボードの進捗表示は、モバイル画面サイズに最�
 - **WHEN** モバイル画面でタスク数が表示される
 - **THEN** 「5/10」のような簡潔な形式で表示される
 - **AND** スペースが許せば「5/10 tasks completed」と表示される
-
-### Requirement: 接続状態のモバイル最適化表示
-WebSocket接続状態インジケーターは、モバイル画面でも視認しやすく表示されなければならない（SHALL）。
-
-#### Scenario: 接続状態の固定表示
-- **WHEN** モバイル画面でダッシュボードが表示される
-- **THEN** 接続状態インジケーターは画面上部に固定される
-- **AND** スクロールしても常に視認可能である
-
-#### Scenario: 接続状態変更の通知
-- **WHEN** WebSocket接続状態が変化する（接続/切断）
-- **THEN** トースト通知が画面下部に3秒間表示される
-- **AND** 通知は手動で閉じることも可能である
 
 ### Requirement: レスポンシブパフォーマンス
 Webダッシュボードは、モバイルデバイスでも良好なパフォーマンスを維持しなければならない（SHALL）。
@@ -392,29 +206,6 @@ Webダッシュボードは、モバイルデバイスでも良好なパフォ�
 - **THEN** スクロールやスワイプはスロットル処理される
 - **AND** 不要な再レンダリングが防止される
 
-### Requirement: REST API - 変更の承認
-HTTPサーバーは、変更を承認するためのREST APIエンドポイントを提供してはならない（SHALL NOT）。
-
-#### Scenario: 承認エンドポイントは利用できない
-- **WHEN** クライアントが `POST /api/changes/{id}/approve` を送信する
-- **THEN** サーバーはHTTP 404またはメソッド未対応のエラーで応答する
-- **AND** 承認状態は変更されない
-
-### Requirement: REST API - 変更の承認解除
-HTTPサーバーは、変更の承認を解除するためのREST APIエンドポイントを提供してはならない（SHALL NOT）。
-
-#### Scenario: 承認解除エンドポイントは利用できない
-- **WHEN** クライアントが `POST /api/changes/{id}/unapprove` を送信する
-- **THEN** サーバーはHTTP 404またはメソッド未対応のエラーで応答する
-- **AND** 承認状態は変更されない
-
-### Requirement: 承認状態変更のWebSocket通知
-HTTPサーバーは、承認状態変更の通知をWebSocketで配信してはならない（SHALL NOT）。
-
-#### Scenario: 承認状態フィールドは配信されない
-- **WHEN** サーバーが change の状態更新を送信する
-- **THEN** メッセージには `is_approved` フィールドが含まれない
-
 ### Requirement: ダッシュボードUI - 承認ボタン
 Webダッシュボードは、各変更カードに承認/承認解除ボタンを表示してはならない（SHALL NOT）。
 
@@ -431,390 +222,211 @@ Web state_updateは、tasks.mdの読み取りに失敗した場合にcompleted_t
 - **WHEN** state_updateの生成時にtasks.mdの読み取りが失敗し0/0となる
 - **THEN** completed_tasks/total_tasksは直前の値を維持する
 
-### Requirement: Web Dashboard Execution Controls
-WebダッシュボードはTUIと同等の実行制御（開始/再開、停止、停止キャンセル、強制停止、リトライ）を提供しなければならない（SHALL）。
-
-#### Scenario: 未実行状態の開始
-- **GIVEN** Web UI が `app_mode = select` を受信している
-- **WHEN** ユーザーが Run ボタンを押す
-- **THEN** Web UI は制御APIに開始要求を送信する
-- **AND** サーバーはTUIの開始処理と同じ経路で処理を開始する
-
-#### Scenario: 停止状態の再開
-- **GIVEN** Web UI が `app_mode = stopped` を受信している
-- **WHEN** ユーザーが Run (Resume) ボタンを押す
-- **THEN** Web UI は制御APIに再開要求を送信する
-- **AND** サーバーはTUIの再開処理と同じ経路で実行マーク付き change をキューに戻して処理を再開する
-
-#### Scenario: エラーモードの再実行
-- **GIVEN** Web UI が `app_mode = error` を受信している
-- **WHEN** ユーザーが Retry ボタンを押す
-- **THEN** Web UI は制御APIに再実行要求を送信する
-- **AND** サーバーはTUIのF5リトライと同じ経路でエラー change を再キューする
-
-#### Scenario: 実行中の停止
-- **GIVEN** Web UI が `app_mode = running` を受信している
-- **WHEN** ユーザーが Stop ボタンを押す
-- **THEN** サーバーはTUIの停止処理と同じ経路でグレースフル停止を開始する
-- **AND** Web UI は `app_mode = stopping` を表示する
-
-#### Scenario: 停止中の強制停止
-- **GIVEN** Web UI が `app_mode = stopped` を受信している
-- **WHEN** ユーザーが Force Stop を押す
-- **THEN** Web UI は制御APIに強制停止要求を送信する
-- **AND** サーバーは HTTP 409 を返す
-
-#### Scenario: 停止キャンセル
-- **GIVEN** Web UI が `app_mode = stopping` を受信している
-- **WHEN** ユーザーが Cancel Stop を押す
-- **THEN** サーバーはTUIの停止キャンセルと同じ経路で停止要求を取り消し、実行を継続する
-- **AND** Web UI は `app_mode = running` を表示する
-
-#### Scenario: 強制停止
-- **GIVEN** Web UI が `app_mode = stopping` を受信している
-- **WHEN** ユーザーが Force Stop を押す
-- **THEN** サーバーはTUIの強制停止と同じ経路で現在のエージェントプロセスを終了し `Stopped` イベントを発行する
-- **AND** Web UI は `app_mode = stopped` を表示する
-
-### Requirement: Execution Control API
-HTTPサーバーはWeb UIからの実行制御（開始/再開/停止/停止キャンセル/強制停止/リトライ）を受け付けるAPIを提供しなければならない（SHALL）。無効な状態遷移要求はHTTP 409で拒否し、状態を変更してはならない（MUST NOT）。
-
-#### Scenario: 開始要求
-- **WHEN** クライアントが `POST /api/control/start` を送信する
-- **AND** サーバーが `app_mode` の開始可能状態である
-- **THEN** サーバーは処理開始または再開を行う
-- **AND** 成功時は HTTP 200 を返す
-
-#### Scenario: 開始不可の状態
-- **WHEN** `app_mode` が `running` または `stopping` である
-- **AND** クライアントが `POST /api/control/start` を送信する
-- **THEN** サーバーは HTTP 409 を返す
-- **AND** 実行状態を変更しない
-
-#### Scenario: 停止要求
-- **WHEN** クライアントが `POST /api/control/stop` を送信する
-- **AND** `app_mode` が `running` である
-- **THEN** サーバーはグレースフル停止を開始する
-- **AND** 成功時は HTTP 200 を返す
-
-#### Scenario: 停止不可の状態
-- **WHEN** `app_mode` が `select` または `stopped` である
-- **AND** クライアントが `POST /api/control/stop` を送信する
-- **THEN** サーバーは HTTP 409 を返す
-- **AND** 実行状態を変更しない
-
-#### Scenario: 停止キャンセル要求
-- **WHEN** クライアントが `POST /api/control/cancel-stop` を送信する
-- **AND** `app_mode` が `stopping` である
-- **THEN** サーバーは停止要求を取り消し実行を継続する
-- **AND** 成功時は HTTP 200 を返す
-
-#### Scenario: 停止キャンセル不可の状態
-- **WHEN** `app_mode` が `running` または `stopped` である
-- **AND** クライアントが `POST /api/control/cancel-stop` を送信する
-- **THEN** サーバーは HTTP 409 を返す
-- **AND** 実行状態を変更しない
-
-#### Scenario: 強制停止要求
-- **WHEN** クライアントが `POST /api/control/force-stop` を送信する
-- **AND** `app_mode` が `stopping` または `running` である
-- **THEN** サーバーは実行中プロセスを終了し停止状態へ遷移する
-- **AND** 成功時は HTTP 200 を返す
-
-#### Scenario: 強制停止不可の状態
-- **WHEN** `app_mode` が `select` または `stopped` である
-- **AND** クライアントが `POST /api/control/force-stop` を送信する
-- **THEN** サーバーは HTTP 409 を返す
-- **AND** 実行状態を変更しない
-
-#### Scenario: エラー再実行要求
-- **WHEN** クライアントが `POST /api/control/retry` を送信する
-- **AND** `app_mode` が `error` である
-- **THEN** サーバーはエラー change を再キューして処理を再開する
-- **AND** 成功時は HTTP 200 を返す
-
-#### Scenario: リトライ不可の状態
-- **WHEN** `app_mode` が `select` または `running` である
-- **AND** クライアントが `POST /api/control/retry` を送信する
-- **THEN** サーバーは HTTP 409 を返す
-- **AND** 実行状態を変更しない
-
-### Requirement: Web App Mode Vocabulary
-WebSocketの `app_mode` はTUIと同じ語彙で通知されなければならない（SHALL）。`select/running/stopping/stopped/error` を最低限含まなければならない（MUST）。
-
-#### Scenario: 追加されたapp_modeを配信する
-- **WHEN** 実行状態が停止中または停止処理中になる
-- **THEN** `app_mode` は `stopped` または `stopping` を通知する
-- **AND** `select/running/error` と同一の語彙で運用される
-
-#### Scenario: エラーモードの通知
-- **WHEN** 実行中にエラーが発生する
-- **THEN** `app_mode` は `error` を通知する
-
-### Requirement: REST API - Worktrees List
-システムは `GET /api/worktrees` を提供し、TUI Worktrees Viewと同等語彙のworktree一覧スナップショットを返却しなければならない（SHALL）。
-
-#### Scenario: 一覧取得が成功する
-- **WHEN** クライアントが `GET /api/worktrees` を呼び出す
-- **THEN** サーバーは `200` を返し、worktree配列を返す
-- **AND** 各要素はTUIと同等の判定に必要な識別子・状態フィールドを含む
-
-### Requirement: REST API - Worktree Operations
-システムはworktreeの操作APIとして `POST /api/worktrees/refresh`, `POST /api/worktrees/create`, `POST /api/worktrees/delete`, `POST /api/worktrees/merge`, `POST /api/worktrees/command` を提供しなければならない（MUST）。
-
-#### Scenario: refreshが成功する
-- **WHEN** クライアントが `POST /api/worktrees/refresh` を呼び出す
-- **THEN** サーバーは `200` を返し、最新のworktree状態を反映する
-
-#### Scenario: createが成功する
-- **GIVEN** 作成前提条件（Git環境・設定）が満たされている
-- **WHEN** クライアントが `POST /api/worktrees/create` を呼び出す
-- **THEN** サーバーは `200` を返し、新規worktreeを作成する
-
-#### Scenario: 未マージworktreeの削除拒否
-- **WHEN** クライアントが未マージのworktreeに対して削除APIを呼び出す
-- **THEN** サーバーは `409` を返し、削除を実行しない
-
-#### Scenario: コンフリクトworktreeのマージ拒否
-- **WHEN** クライアントが `has_conflicts=true` のworktreeに対してマージAPIを呼び出す
-- **THEN** サーバーは `409` を返し、マージを実行しない
-
-#### Scenario: commandが成功する
-- **GIVEN** `worktree_command` が設定済みである
-- **WHEN** クライアントが `POST /api/worktrees/command` を呼び出す
-- **THEN** サーバーは `200` を返し、対象worktreeでコマンドを実行する
-
-#### Scenario: 対象worktreeが存在しない
-- **WHEN** クライアントが存在しないworktreeを指定して操作APIを呼び出す
-- **THEN** サーバーは `404` を返し、操作を実行しない
-
-### Requirement: WebSocket - Worktree Parity Updates
-システムはWebSocketの `state_update.worktrees` に `/api/state` と同等意味のworktreeスナップショットを含め、RESTとWebSocketの状態語彙を一致させなければならない（SHALL）。
-
-#### Scenario: 状態更新でworktreesが同期される
-- **WHEN** worktree操作後に `state_update` イベントが配信される
-- **THEN** イベントの `worktrees` は同時点の `/api/state` と整合するスナップショットである
-
-#### Scenario: /api/stateにworktreesが反映される
-- **WHEN** クライアントが `GET /api/state` を呼び出す
-- **THEN** レスポンスの `worktrees` は最新の再取得結果を含む
-
-### Requirement: Dashboard UI - Worktrees View
-WebダッシュボードはWorktrees Viewを提供し、一覧表示・操作ガード・削除確認を備えなければならない（SHALL）。
-
-#### Scenario: Worktrees Viewで一覧を表示する
-- **WHEN** ユーザーがWebダッシュボードでWorktrees Viewを開く
-- **THEN** 各worktreeの主要状態を一覧表示する
-
-#### Scenario: 操作ガードが適用される
-- **GIVEN** 選択中worktreeが削除不可またはマージ不可である
-- **WHEN** ユーザーがWorktrees Viewを表示する
-- **THEN** 対応する操作ボタンは無効化される
-
-#### Scenario: 削除時に確認を要求する
-- **WHEN** ユーザーが削除操作を実行する
-- **THEN** UIは確認ダイアログを表示し、確認前に削除リクエストを送信しない
-
-### Requirement: Worktree Operations Logging and Failure Policy
-システムはWorktree操作失敗を隠蔽してはならない（MUST NOT）。各操作で `request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を構造化ログとして記録し、VCS失敗時は `500` を返さなければならない（MUST）。
-
-#### Scenario: VCS失敗時に500と構造化ログを返す
-- **WHEN** create/delete/merge のいずれかでVCS処理が失敗する
-- **THEN** サーバーは `500` を返し、`request_id`, `operation`, `worktree_name`, `error`, `duration_ms` を含むエラーログを出力する
-
-#### Scenario: 想定外内部失敗時に500を返す
-- **WHEN** refresh/create/delete/merge/command のいずれかで内部例外が発生する
-- **THEN** サーバーは `500` を返し、同じ構造化ログ項目を記録する
-
-## Implementation Details
-
-### TUI-Web Parity Architecture
-
-#### Backend Implementation (Completed)
-
-1. **Extended WebState data model** (src/web/state.rs):
-   - Added `logs: Vec<LogEntry>` field to OrchestratorState
-   - Added `worktrees: Vec<WorktreeInfo>` field to OrchestratorState
-   - Added `app_mode: String` field to OrchestratorState (e.g., "select", "running", "stopped")
-   - Added `queue_status: Option<String>` field to ChangeStatus for tracking execution state
-
-2. **Enhanced StateUpdate WebSocket message** (src/web/state.rs):
-   - Added optional `logs` field for real-time log streaming
-   - Added optional `worktrees` field for worktree list updates
-   - Added optional `app_mode` field for application mode changes
-
-3. **Implemented comprehensive ExecutionEvent handlers** (src/web/state.rs):
-   - ProcessingStarted/Completed/Error: Updates change status and queue_status
-   - ArchiveStarted/ChangeArchived: Tracks archiving lifecycle
-   - ProgressUpdated: Syncs task completion progress
-   - MergeCompleted/ResolveStarted/ResolveCompleted/ResolveFailed: Tracks parallel merge flow
-   - Log: Appends log entries (keeps last 1000 entries)
-   - ChangesRefreshed: Updates full change list while preserving queue_status
-   - WorktreesRefreshed: Updates worktree list
-   - Stopped/AllCompleted: Updates app_mode
-
-4. **Added Serialize/Deserialize support**:
-   - LogEntry and LogLevel (src/events.rs): Added serde derives for web serialization
-   - WorktreeInfo and MergeConflictInfo (src/tui/types.rs): Added serde derives for web serialization
-
-5. **Verified existing integration** (src/tui/orchestrator.rs):
-   - WebState event forwarding channel already implemented in parallel execution
-   - All ExecutionEvents are already forwarded to WebState via mpsc channel
-   - WebSocket broadcast already sends initial state on connection
-
-#### Frontend Implementation (Future Work)
-
-The following frontend implementation tasks are deferred to future work as they require JavaScript/TypeScript development and extensive UI testing:
-
-1. Extend web/app.js to handle new message types (logs, worktrees, app_mode)
-2. Implement log panel UI component (similar to TUI)
-3. Implement worktree view UI component (similar to TUI)
-4. Add queue_status badges to change cards (Queued, Processing, Archiving, Merged, etc.)
-5. Add real-time log streaming UI
-6. Add worktree management UI
-
-#### Architecture Benefits
-
-- **Single Source of Truth**: Both TUI and Web UI now receive identical ExecutionEvent stream
-- **Real-time Parity**: WebState broadcasts same events as TUI receives
-- **Type Safety**: Serde serialization ensures consistent data contracts
-- **Extensibility**: Easy to add new event types or state fields
-
-### Design Context
-
-#### Problem Statement
-
-Web UI subscribed only to WebState's changes snapshot and did not match TUI's screen state (queue, logs, worktrees, running state, etc.). Update paths were limited to a subset of TUI's ChangesRefreshed, preventing real-time reproduction of the same information as TUI.
-
-#### Goals
-
-- Web UI receives same information with same update timing as TUI
-- Define single source of monitoring state shared by TUI and Web
-- Maintain compatibility with existing Web monitoring features
-
-#### Decisions
-
-- **Decision**: Introduce a unified state model that integrates TUI's internal state with Web monitoring state
-  - Events consumed by TUI are reflected in the same model, and Web subscribes to that model
-  - WebSocket is the primary channel for state distribution; REST is maintained for snapshot retrieval
-- **Decision**: Distribute required state for Web incrementally, starting with defining a "fully consistent" state model
-  - Includes change list, queue status, logs, worktrees, running status
-
-#### Risks and Mitigations
-
-- **Risk**: State integration increases TUI responsibility and complicates event flow
-  - **Mitigation**: Move state update responsibility to a dedicated module; TUI only sends events
-- **Risk**: Increased data distribution to Web increases bandwidth and rendering cost
-  - **Mitigation**: Consider differential distribution or incremental subscription in future tasks
-
-
-#
-
-
-#
-
-
-#
-
-## Requirements
-
 ### Requirement: Dashboard log panel ANSI escape rendering
 
-The web dashboard log panel SHALL render ANSI escape sequences in log messages as styled HTML instead of displaying raw escape codes as plain text.
+The console log panel SHALL render supported ANSI SGR presentation as styled, sanitized HTML instead of displaying raw escape codes. Unsupported control sequences SHALL be stripped or rendered harmlessly. HTML in log content MUST never execute.
 
 #### Scenario: Log message with ANSI color codes is rendered with color
 
-- **GIVEN** a log entry whose `message` field contains ANSI SGR color escape sequences (e.g. `\x1b[31mERROR\x1b[0m`)
-- **WHEN** the dashboard renders the log entry in the Logs panel
-- **THEN** the escape sequences are converted to styled `<span>` elements with corresponding foreground/background colors
-- **AND** the raw escape code characters (e.g. `[31m`) are not visible to the user
+**Given**: A log entry contains supported ANSI foreground or background color sequences
+**When**: The console renders the entry
+**Then**: Styled spans represent the supported colors
+**And**: Raw escape characters are not visible
 
 #### Scenario: Log message without ANSI codes is rendered normally
 
-- **GIVEN** a log entry whose `message` field contains no ANSI escape sequences
-- **WHEN** the dashboard renders the log entry in the Logs panel
-- **THEN** the message text is displayed as-is without any additional markup beyond the existing layout
+**Given**: A log entry contains no ANSI sequence
+**When**: The console renders the entry
+**Then**: Its text is displayed without unnecessary markup
 
 #### Scenario: Malicious HTML in log message is sanitized
 
-- **GIVEN** a log entry whose `message` field contains HTML tags such as `<script>alert('xss')</script>`
-- **WHEN** the dashboard renders the log entry in the Logs panel
-- **THEN** the HTML special characters are escaped so that no script execution or DOM injection occurs
-- **AND** the literal text of the HTML tag is visible to the user
+**Given**: A log entry contains HTML or script tags
+**When**: The console renders the entry
+**Then**: No DOM injection or script execution occurs
+**And**: The literal content remains inspectable
 
 #### Scenario: ANSI bold and underline decorations are rendered
 
-- **GIVEN** a log entry whose `message` field contains ANSI SGR sequences for bold (`\x1b[1m`) or underline (`\x1b[4m`)
-- **WHEN** the dashboard renders the log entry in the Logs panel
-- **THEN** the corresponding text is rendered with `font-weight: bold` or `text-decoration: underline` respectively
+**Given**: A log entry contains supported bold or underline SGR sequences
+**When**: The console renders the entry
+**Then**: The corresponding text decoration is applied after sanitization
 
-### Requirement: Web ステータスは Reducer から導出される
-Web API が返す `ChangeStatus.queue_status` は `OrchestratorState` 内の `ChangeRuntimeState::display_status()` から導出されなければならない（MUST）。
+### Requirement: API v2 browser operator console
 
-`WebState::apply_execution_event()` メソッドは `queue_status` フィールドを直接書き換えてはならない（SHALL NOT）。ステータスの遷移は `OrchestratorState::apply_execution_event()` で行い、Web 層は Reducer のスナップショットから `queue_status` を読み取る。
+The embedded web-monitoring interface MUST use `/api/v2` as its only production data, observation, error, and mutation contract. It MUST discover capabilities, read one coherent process snapshot, display process identity, and submit only advertised typed commands. Production browser code MUST NOT call legacy `/api/*` or `/ws` routes.
 
-#### Scenario: apply_execution_event がステータスを直接設定しない
-- **WHEN** `ExecutionEvent::ProcessingStarted` が `WebState::apply_execution_event()` に渡される
-- **THEN** `ChangeStatus.queue_status` が `Some("applying".to_string())` のように直接代入されない
-- **AND** `queue_status` は次回の `from_changes_with_shared_state()` 呼び出し時に Reducer の `display_status()` から導出される
+#### Scenario: Console bootstraps from one process
 
-#### Scenario: Web API レスポンスの queue_status が Reducer と一致する
-- **WHEN** Web API が `/api/state` エンドポイントでステータスを返す
-- **THEN** 各 Change の `queue_status` が `ChangeRuntimeState::display_status()` の返す文字列と一致する
+**Given**: A cflx process serves web monitoring
+**When**: A user opens the embedded console
+**Then**: The browser reads `/api/v2/health`, capabilities, and state
+**And**: The rendered mode, changes, totals, and process identity come from the coherent v2 response
 
-### Requirement: Control API State Transitions
-The web monitoring API SHALL enforce execution-mode-aware control transitions.
+#### Scenario: Production assets contain no legacy client route
 
-`POST /api/control/run` MUST only succeed when `app_mode` is `select`, `stopped`, or `error`, and MUST start orchestration on success.
-`POST /api/control/stop` MUST only succeed when `app_mode` is `running`, and MUST initiate graceful stop.
-`POST /api/control/cancel-stop` MUST only succeed when `app_mode` is `stopping`, and MUST resume execution.
-`POST /api/control/force-stop` MUST only succeed when `app_mode` is `running` or `stopping`, and MUST terminate the global execution.
+**Given**: The packaged web assets
+**When**: Their network targets are inspected
+**Then**: They do not reference legacy `/api/*` resources or legacy `/ws`
 
-For single-change stop-and-dequeue requests, the project-scoped API MUST distinguish between queued and active changes. When the target change is active, the server MUST force-kill the in-flight execution associated with that change before completing the request. The server MUST NOT report successful dequeue for an active change until the force-kill has succeeded. If force-kill fails, the server MUST return an error and preserve the active execution state.
+### Requirement: Secure browser authentication experience
 
-The WebUI MUST treat active-change stop as a destructive action. Clicking the stop control for an active change MUST first open a confirmation dialog, and only an explicit confirm action from that dialog MAY invoke the stop-and-dequeue API.
+The console MUST support authenticated and unauthenticated loopback v2 deployments without teaching unsafe credential transport. When authentication is required, it MUST provide a labeled token form, send the token only in the Authorization header, and provide a disconnect action. It MUST NOT put tokens in URLs, logs, correlation IDs, or `localStorage`. A token MAY be retained in tab-scoped `sessionStorage` for reload continuity and MUST be removed on disconnect.
 
-#### Scenario: 強制停止要求
-- **WHEN** クライアントが `POST /api/control/force-stop` を送信する
-- **AND** `app_mode` が `stopping` または `running` である
-- **THEN** サーバーは実行中プロセスを終了し停止状態へ遷移する
-- **AND** 成功時は HTTP 200 を返す
+#### Scenario: Unauthorized bootstrap requests a token
 
-#### Scenario: 強制停止不可の状態
-- **WHEN** `app_mode` が `select` または `stopped` である
-- **AND** クライアントが `POST /api/control/force-stop` を送信する
-- **THEN** サーバーは HTTP 409 を返す
-- **AND** 実行状態を変更しない
+**Given**: The v2 API requires bearer authentication
+**When**: Console bootstrap receives `unauthorized`
+**Then**: The console displays an accessible authentication form
+**And**: It does not repeatedly request protected resources without user action
 
-#### Scenario: WebUI requires confirmation before active change stop
-- **GIVEN** a change is active in project execution
-- **WHEN** the user clicks the Stop control in the WebUI
-- **THEN** the UI SHALL open a confirmation dialog
-- **AND** the stop-and-dequeue API SHALL NOT be called yet
+#### Scenario: Disconnect clears browser credentials
 
-#### Scenario: Active change stop-and-dequeue force-kills execution after confirmation
-- **GIVEN** a change is active in project execution
-- **AND** the user confirmed stop in the WebUI dialog
-- **WHEN** the client sends `POST /api/v1/projects/{project_id}/changes/{change_id}/stop-and-dequeue`
-- **THEN** the server SHALL force-kill the in-flight execution for that change
-- **AND** only after successful kill SHALL the response indicate `status = not queued` and `selected = false`
+**Given**: A user authenticated in the current tab
+**When**: The user disconnects
+**Then**: In-memory and tab-scoped credentials are cleared
+**And**: Protected data and mutation controls are no longer presented as usable
 
-#### Scenario: WebUI cancel leaves active change untouched
-- **GIVEN** a change is active in project execution
-- **AND** the WebUI is showing the stop confirmation dialog
-- **WHEN** the user cancels the dialog
-- **THEN** the stop-and-dequeue API SHALL NOT be called
-- **AND** the change SHALL remain active
+### Requirement: Resilient browser observation and freshness
 
-#### Scenario: Queued change stop-and-dequeue does not require force-kill
-- **GIVEN** a change is queued but has not started execution
-- **WHEN** the client sends `POST /api/v1/projects/{project_id}/changes/{change_id}/stop-and-dequeue`
-- **THEN** the server MAY dequeue the change without a process kill
-- **AND** the response SHALL indicate `status = not queued`
+The console MUST consume authenticated SSE with `fetch()` response streaming, track `instance_id` and `event_sequence`, and process events in order. A replay gap, sequence discontinuity, malformed stream, or changed process incarnation MUST cause a coherent `/api/v2/state` refresh before live observation resumes. When streaming is unavailable the console MAY poll no-store snapshots, but it MUST communicate fresh, reconnecting, stale, and disconnected states and MUST disable mutations whenever displayed state is not trusted.
 
-#### Scenario: Active change stop-and-dequeue surfaces kill failure
-- **GIVEN** a change is active in project execution
-- **WHEN** the client sends `POST /api/v1/projects/{project_id}/changes/{change_id}/stop-and-dequeue`
-- **AND** the backend cannot force-kill the in-flight execution
-- **THEN** the server SHALL return an error response
-- **AND** the change SHALL remain active rather than being reported as dequeued
+#### Scenario: Replay gap recovers through snapshot
+
+**Given**: The console has a prior event cursor
+**When**: The event stream reports a replay gap
+**Then**: The console refreshes `/api/v2/state`
+**And**: It resumes from the returned process identity and event cursor
+
+#### Scenario: Disconnected state prevents mutation
+
+**Given**: Neither event streaming nor snapshot polling can confirm current state
+**When**: The console becomes stale or disconnected
+**Then**: The status and last successful update are visible
+**And**: Mutation controls cannot submit a command
+
+### Requirement: Revision-safe idempotent browser commands
+
+Every console mutation MUST use `/api/v2/commands`, the latest confirmed `state_revision`, and a 1–200 character idempotency key unique to the user's intended side effect. The console MUST prevent duplicate submission while the command is pending. It MUST reuse the same request and key only when retrying an outcome-unknown transport failure. A stale-revision response MUST refresh state and require a new user decision rather than automatically executing the command against new state.
+
+#### Scenario: Pending action cannot be double-submitted
+
+**Given**: A command for one target is pending
+**When**: The user activates the same action again
+**Then**: No second command intent is created
+**And**: The control communicates its pending state
+
+#### Scenario: Stale command requires another decision
+
+**Given**: The console submits a command with an obsolete revision
+**When**: The server returns `stale_revision`
+**Then**: The console refreshes current state
+**And**: It does not automatically resubmit the side effect
+
+### Requirement: Task-oriented operator information architecture
+
+The console MUST prioritize the information needed to understand current operation and choose a safe next action. Its initial viewport MUST communicate connection freshness, process identity, current application mode, active work, attention-required conditions, and the currently valid primary action. Changes MUST be ordered or grouped as attention required, active, waiting, and completed. Details MUST be available through visible disclosures rather than gesture-only interaction.
+
+#### Scenario: Error state exposes recovery before summary statistics
+
+**Given**: One or more changes require operator attention
+**When**: The console renders current state
+**Then**: The attention condition and recovery action appear before completed-work summaries
+**And**: The user does not need to open every change to discover the blocker
+
+#### Scenario: Change details have explicit disclosure
+
+**Given**: A change has dependencies or additional status detail
+**When**: The change row is rendered
+**Then**: A labeled disclosure button exposes the details
+**And**: Tap, swipe, or hover is not the only way to access them
+
+### Requirement: Accessible destructive action confirmation
+
+Force stop, active-change stop-and-dequeue, and worktree deletion MUST require an explicit accessible confirmation before the console submits a command. Confirmation MUST name the target and consequence, use a native dialog or equivalent conforming dialog pattern, provide safe initial focus, support cancellation and Escape before submission, prevent backdrop submission and duplicate confirmation, and restore focus to the invoking control.
+
+#### Scenario: Cancelled destructive action has no side effect
+
+**Given**: A destructive confirmation dialog is open
+**When**: The user cancels or presses Escape
+**Then**: No command is submitted
+**And**: Focus returns to the action that opened the dialog
+
+#### Scenario: Confirm submits once
+
+**Given**: A user reviewed the destructive consequence
+**When**: The user confirms with keyboard or pointer input
+**Then**: Exactly one typed v2 command is submitted
+**And**: Further confirmation is disabled while its outcome is pending
+
+### Requirement: WCAG 2.2 AA operator workflow
+
+The complete console workflow MUST conform to WCAG 2.2 Level AA. It MUST provide semantic landmarks and headings, a skip link, keyboard-operable controls, visible focus, labeled forms, programmatic tab and disclosure state, accessible dialogs, deliberate live-region announcements, and status that is not communicated by color alone. Tabs MUST implement the WAI-ARIA tabs keyboard pattern. Every touch target MUST meet the WCAG 2.2 minimum, and primary actions MUST be at least 44 by 44 CSS pixels.
+
+#### Scenario: Keyboard user completes an operator flow
+
+**Given**: A user operates without a pointer
+**When**: They authenticate, navigate views, inspect a change, invoke and cancel a confirmation, and read an error
+**Then**: Every step is available in logical focus order
+**And**: Focus remains visible and returns predictably after modal interaction
+
+#### Scenario: Dynamic updates are announced without flooding
+
+**Given**: The console receives connection, command, and orchestration updates
+**When**: User-relevant status changes
+**Then**: Routine changes use polite status announcements
+**And**: Failed mutations use an assertive alert while repetitive event traffic is not announced individually
+
+### Requirement: Responsive and perceivable visual system
+
+The console MUST remain usable at 320 CSS pixels, mobile landscape, tablet, desktop, and 200 percent zoom without page-level horizontal scrolling or loss of information or actions. Long identifiers, paths, branches, logs, and errors MUST wrap, truncate with an accessible full-value affordance, or use bounded local scrolling. Normal text contrast MUST be at least 4.5:1 and component, graphical, and focus-indicator contrast at least 3:1. The CSS MUST use defined custom properties, MUST NOT use `transition: all`, and MUST respect reduced-motion and increased-contrast preferences.
+
+#### Scenario: Narrow viewport retains all actions
+
+**Given**: The viewport is 320 CSS pixels wide
+**When**: The console displays long change, path, and error values
+**Then**: The page has no horizontal overflow
+**And**: All values and controls remain discoverable and operable
+
+#### Scenario: Reduced motion preserves state feedback
+
+**Given**: The user prefers reduced motion
+**When**: Loading, connection, disclosure, or notification state changes
+**Then**: Nonessential motion is removed
+**And**: Text, shape, or other non-motion feedback still communicates the state
+
+### Requirement: Actionable logs and typed errors
+
+The console MUST provide a persistent log view and MUST render typed v2 errors with sanitized message, stable error code, correlation ID, current revision when present, and a next recovery action. Success messages MAY expire automatically; failures requiring action MUST remain available until dismissed or resolved. Log content MUST be rendered without DOM injection, and supported ANSI presentation MUST be applied only after sanitization.
+
+#### Scenario: Command failure explains recovery
+
+**Given**: A v2 command returns a typed failure
+**When**: The console presents it
+**Then**: The user sees the message, error code, correlation ID, and relevant next action
+**And**: The failure does not disappear before the user can act on it
+
+#### Scenario: Malicious log content remains text
+
+**Given**: A log message contains HTML or script syntax
+**When**: The console renders the log
+**Then**: No markup or script is executed
+**And**: The message remains inspectable as text
+
+### Requirement: V2 worktree operator experience
+
+The console MUST read v2 worktree resources, address delete and merge only by opaque `worktree_id`, and present server-provided operation eligibility and blocked reasons. It MUST NOT infer mutation safety solely from branch, path, dirty, ahead, or conflict fields. Conflict recovery MUST direct the user to the local or TUI flow when that is the advertised recovery boundary.
+
+#### Scenario: Ineligible operation explains why
+
+**Given**: A worktree operation is ineligible
+**When**: The Worktrees view renders the resource
+**Then**: The corresponding action is unavailable
+**And**: The server-provided blocked reason is visible
+
+#### Scenario: Worktree mutation uses opaque identity
+
+**Given**: A worktree is eligible for a remote operation
+**When**: The user confirms the operation
+**Then**: The command target contains its opaque `worktree_id`
+**And**: No path or branch is sent as mutation identity
