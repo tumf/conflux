@@ -131,6 +131,37 @@ impl VcsError {
 /// Result type for VCS operations.
 pub type VcsResult<T> = std::result::Result<T, VcsError>;
 
+/// Diagnostics captured when the repository itself rejected a verified commit.
+///
+/// This is deliberately a value type rather than a [`VcsError`] variant: a
+/// repository rejection is repository-fixable feedback, not a VCS malfunction,
+/// and callers must be able to read the real exit status without parsing any
+/// rendered error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRejection {
+    /// The commit command line that was rejected.
+    pub command: String,
+    /// Exit code reported by the commit process, if it exited normally.
+    pub exit_code: Option<i32>,
+    /// Captured stdout of the rejected commit (hook output usually lands here).
+    pub stdout: String,
+    /// Captured stderr of the rejected commit.
+    pub stderr: String,
+}
+
+/// Typed outcome of a verified (hook-enabled) commit attempt.
+///
+/// `Err(VcsError)` from the same call stays terminal: spawn failures, staged
+/// snapshot validation, fatal Git failures, and I/O errors are not
+/// repository-fixable and must never be routed back to the apply agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedCommitOutcome {
+    /// The commit was created with repository hooks enabled.
+    Committed,
+    /// A repository hook rejected the commit; the workspace is unchanged.
+    RepositoryRejected(CommitRejection),
+}
+
 /// Warning information emitted by VCS checks.
 #[derive(Debug, Clone)]
 pub struct VcsWarning {
@@ -335,10 +366,20 @@ pub trait WorkspaceManager: Send + Sync {
     /// For Git: No-op (Git doesn't auto-snapshot).
     async fn snapshot_working_copy(&self, workspace_path: &Path) -> VcsResult<()>;
 
-    /// Set the commit message for a workspace.
+    /// Create the verified (hook-enabled) commit for a workspace.
     ///
-    /// For Git: `git commit --amend -m <message>` (if there's a commit)
-    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()>;
+    /// For Git: `git commit -m <message>` after staging when the tree is dirty,
+    /// otherwise `git commit --amend -m <message>`. Neither path may pass
+    /// `--no-verify`: this is the commit that must run repository hooks.
+    ///
+    /// A hook rejection is returned as
+    /// [`VerifiedCommitOutcome::RepositoryRejected`], never as `Ok(())` and
+    /// never as a terminal [`VcsError`].
+    async fn create_verified_commit(
+        &self,
+        workspace_path: &Path,
+        message: &str,
+    ) -> VcsResult<VerifiedCommitOutcome>;
 
     /// Create an iteration snapshot with WIP commit message.
     ///
