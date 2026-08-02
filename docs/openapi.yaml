@@ -313,6 +313,37 @@ paths:
                 $ref: '#/components/schemas/ApiError'
 components:
   schemas:
+    ActionBlockedReason:
+      type: string
+      description: |-
+        Why an operator action is refused right now.
+
+        These are stable tokens, not prose: a client branches on them and never
+        parses a message.
+      enum:
+      - final_status
+      - retry_required
+      - stop_pending
+      - status_immutable
+      - mode_has_no_queue
+      - no_retryable_evidence
+      - hold_not_resumable
+      - change_active
+      - not_merge_waiting
+    ActionEligibility:
+      type: object
+      description: Whether one operator action is currently permitted, and why not.
+      required:
+      - allowed
+      properties:
+        allowed:
+          type: boolean
+          description: True when the command would pass its lifecycle guards right now.
+        blocked_reason:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ActionBlockedReason'
+            description: Stable reason the command is refused; `null` when it is allowed.
     ApiError:
       type: object
       description: Structured error body returned by every non-success v2 response.
@@ -337,6 +368,28 @@ components:
         message:
           type: string
           description: Sanitized human-readable detail.
+    AttentionState:
+      type: string
+      description: |-
+        Operator attention state for a change.
+
+        Process-local and non-durable: a restart re-observes the workspace and
+        nothing carries a prior incarnation's attention forward.
+      enum:
+      - none
+      - new
+    BlockerKind:
+      type: string
+      description: |-
+        Machine-readable reason a change is `blocked`.
+
+        Mirrors [`crate::orchestration::state::BlockerKind`]; `none` is the value a
+        `stalled` execution hold carries, because a stop is not a wait on a named
+        prerequisite.
+      enum:
+      - none
+      - dependency
+      - external
     CapabilitiesResponse:
       type: object
       description: '`GET /api/v2/capabilities` body.'
@@ -415,6 +468,103 @@ components:
           type: integer
           description: Retained logs.
           minimum: 0
+    ChangeActions:
+      type: object
+      description: |-
+        Per-change eligibility for every change-addressed operator command.
+
+        Derived server-side from the one shared lifecycle matrix the TUI uses, so a
+        remote frontend and a keypress can never disagree about what is offered.
+      required:
+      - set_execution_mark
+      - set_queue_intent
+      - retry_change
+      - stop_and_dequeue
+      - resolve_merge
+      properties:
+        resolve_merge:
+          $ref: '#/components/schemas/ActionEligibility'
+          description: '`resolve_merge`.'
+        retry_change:
+          $ref: '#/components/schemas/ActionEligibility'
+          description: '`retry_change`.'
+        set_execution_mark:
+          $ref: '#/components/schemas/ActionEligibility'
+          description: '`set_execution_mark`.'
+        set_queue_intent:
+          $ref: '#/components/schemas/ActionEligibility'
+          description: '`set_queue_intent`.'
+        stop_and_dequeue:
+          $ref: '#/components/schemas/ActionEligibility'
+          description: '`stop_and_dequeue`.'
+    ChangeActivity:
+      type: object
+      description: |-
+        The latest lifecycle-significant activity observed for a change.
+
+        Fed from the state-event projection, never from the log ring: a log must not
+        advance the revision, and a per-chunk output event would churn it.
+      required:
+      - event_type
+      - timestamp
+      properties:
+        detail:
+          type:
+          - string
+          - 'null'
+          description: Sanitized detail, when the event carried one.
+        event_type:
+          type: string
+          description: Wire event type, identical to the stream's `event_type`.
+        timestamp:
+          type: string
+          description: Observation time (RFC 3339).
+    ChangeBlocker:
+      type: object
+      description: |-
+        Reducer-derived detail for a `blocked` or `stalled` change.
+
+        `null` on every other status, so a client can never render a blocker badge on
+        a change that is not actually held.
+      required:
+      - status
+      - kind
+      - resumable
+      properties:
+        category:
+          type:
+          - string
+          - 'null'
+          description: Machine-readable blocker category, when the reporter supplied one.
+        detail:
+          type:
+          - string
+          - 'null'
+          description: One-line operator-facing explanation.
+        kind:
+          $ref: '#/components/schemas/BlockerKind'
+          description: Machine-readable kind; `none` for a stalled execution hold.
+        origin:
+          type:
+          - string
+          - 'null'
+          description: Phase that observed the prerequisite.
+        prerequisite_owner:
+          type:
+          - string
+          - 'null'
+          description: Owning team or role for an external wait.
+        resumable:
+          type: boolean
+          description: Whether work resumes once the prerequisite is satisfied.
+        status:
+          type: string
+          description: 'Reducer display status this blocker belongs to: `blocked` or `stalled`.'
+        unblock_condition:
+          type:
+          - string
+          - 'null'
+          description: Verifiable condition that clears an external wait.
     ChangeResource:
       type: object
       description: One change as projected into the v2 snapshot.
@@ -426,7 +576,24 @@ components:
       - total_tasks
       - progress_percent
       - dependencies
+      - execution_marked
+      - queue_intent
+      - attention
+      - actions
+      - parallel
+      - timing
       properties:
+        actions:
+          $ref: '#/components/schemas/ChangeActions'
+          description: Eligibility for every change-addressed command.
+        attention:
+          $ref: '#/components/schemas/AttentionState'
+          description: Operator attention state.
+        blocker:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ChangeBlocker'
+            description: Blocker detail for a `blocked` or `stalled` change; `null` otherwise.
         completed_tasks:
           type: integer
           format: int32
@@ -440,6 +607,14 @@ components:
         display_status:
           type: string
           description: Reducer-derived display status (canonical taxonomy).
+        error_detail:
+          type:
+          - string
+          - 'null'
+          description: Sanitized change-local error detail; `null` when the change has no error.
+        execution_marked:
+          type: boolean
+          description: Process-local execution mark. Never durable; `false` after a restart.
         id:
           type: string
           description: Change ID.
@@ -450,6 +625,14 @@ components:
           format: int32
           description: Apply/archive iteration number, when a loop is running.
           minimum: 0
+        latest_activity:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ChangeActivity'
+            description: Latest lifecycle-significant activity; `null` when nothing was observed.
+        parallel:
+          $ref: '#/components/schemas/ParallelEligibility'
+          description: Parallel-execution eligibility.
         progress_percent:
           type: number
           format: float
@@ -457,11 +640,22 @@ components:
         progress_status:
           type: string
           description: Task-progress status (`pending`, `in_progress`, `complete`).
+        queue_intent:
+          $ref: '#/components/schemas/QueueIntent'
+          description: Reducer-owned queue intent, distinct from `display_status`.
+        timing:
+          $ref: '#/components/schemas/ChangeTiming'
+          description: Run timing boundaries.
         total_tasks:
           type: integer
           format: int32
           description: Total tasks.
           minimum: 0
+        worktree:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ChangeWorktree'
+            description: Managed worktree relation; `null` when no worktree exists.
     ChangeResponse:
       type: object
       description: '`GET /api/v2/changes/{change_id}` body.'
@@ -496,6 +690,52 @@ components:
           type: string
           description: Managed, non-archived change ID.
       additionalProperties: false
+    ChangeTiming:
+      type: object
+      description: |-
+        Active-run timing for one change.
+
+        Only boundary instants are published. A live elapsed counter in the snapshot
+        would make every projection look changed and advance the revision forever, so
+        a client derives "running for" from `started_at` itself.
+      properties:
+        completed_at:
+          type:
+          - string
+          - 'null'
+          description: When it finished (RFC 3339); `null` while it is still running.
+        elapsed_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Duration of the finished run in milliseconds.
+          minimum: 0
+        started_at:
+          type:
+          - string
+          - 'null'
+          description: When the current or most recent run started (RFC 3339).
+    ChangeWorktree:
+      type: object
+      description: |-
+        Server-stated relation between a change and its managed worktree.
+
+        The path is repository-relative and produced by the same redaction the
+        worktree resources use, so joining a change to `/api/v2/worktrees` is an
+        exact match rather than a client-side guess. Absolute and canonical roots are
+        never serialized.
+      required:
+      - path
+      properties:
+        branch:
+          type:
+          - string
+          - 'null'
+          description: Checked-out branch, when it is known.
+        path:
+          type: string
+          description: Repository-relative worktree path.
     ChangesResponse:
       type: object
       description: '`GET /api/v2/changes` body.'
@@ -946,6 +1186,15 @@ components:
         is_resolving:
           type: boolean
           description: Whether merge resolution is currently running.
+        process_error:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Sanitized detail of a fatal process-level error; `null` when there is none.
+
+            Kept separate from a change's `error_detail` so "this run died" and "this
+            one change failed" stay distinguishable without reading `app_mode` prose.
         totals:
           $ref: '#/components/schemas/SnapshotTotals'
           description: Aggregate counts.
@@ -1028,6 +1277,41 @@ components:
           format: int64
           description: Revision the logs were read at (logs never advance it).
           minimum: 0
+    ParallelBlockedReason:
+      type: string
+      description: Why a change cannot take part in parallel execution.
+      enum:
+      - not_committed
+      - uncommitted_changes
+    ParallelEligibility:
+      type: object
+      description: |-
+        Server-observed parallel-execution eligibility.
+
+        Present so a client never has to run Git itself to decide whether a change
+        can be queued in parallel mode.
+      required:
+      - eligible
+      properties:
+        blocked_reason:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ParallelBlockedReason'
+            description: Stable reason it may not; `null` when it may.
+        eligible:
+          type: boolean
+          description: True when the change may take part in parallel execution.
+    QueueIntent:
+      type: string
+      description: |-
+        Reducer-owned queue membership intent.
+
+        Deliberately separate from `display_status`: a change can be `Queued` while
+        its display status reads `blocked`, and collapsing the two would make a
+        client guess which one the operator actually asked for.
+      enum:
+      - not_queued
+      - queued
     SnapshotTotals:
       type: object
       description: Aggregate counts over the projected changes.

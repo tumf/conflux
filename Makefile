@@ -132,7 +132,8 @@ bump-major:
 openapi:
 	@echo "Generating OpenAPI specification..."
 	@mkdir -p docs
-	cargo run --bin openapi-gen --features web-monitoring > docs/openapi.yaml
+	cargo run --bin openapi-gen --features web-monitoring > /tmp/openapi-gen.yaml
+	@mv /tmp/openapi-gen.yaml docs/openapi.yaml
 	@echo "OpenAPI specification generated at docs/openapi.yaml"
 
 # Publish to crates.io (requires `cargo login` beforehand)

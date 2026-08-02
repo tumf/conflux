@@ -354,10 +354,17 @@ async fn run_tui_loop(
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
-    // Inject shared state into WebState if web monitoring is enabled
+    // Inject shared state into WebState if web monitoring is enabled.
+    //
+    // The execution-mark store and the repository root go with it: without them
+    // the v2 snapshot could report neither operator intent nor a redacted
+    // change-to-worktree relation, and a remote frontend would have to infer
+    // both.
     #[cfg(feature = "web-monitoring")]
     if let Some(ref ws) = web_state {
         ws.set_shared_state(shared_state.clone()).await;
+        ws.set_execution_marks(app.execution_marks()).await;
+        ws.set_repo_root(repo_root.clone()).await;
     }
 
     // Dynamic queue for runtime change additions

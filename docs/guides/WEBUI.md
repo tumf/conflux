@@ -60,6 +60,29 @@ and idempotency.
 
 For complete API details, see [../openapi.yaml](../openapi.yaml).
 
+### The state resource is authoritative
+
+`GET /api/v2/state` is a complete replacement for whatever a client currently
+holds, not a summary of it. Every change carries, in addition to its
+reducer-derived `display_status`:
+
+- `execution_marked` and `queue_intent` as separate fields
+- `attention` (`new` for a change detected after the process started watching)
+- `blocker` with a machine-readable `kind` (`dependency`, `external`, or `none`
+  for a stalled execution hold) and sanitized detail
+- `error_detail` for a change-local failure, kept apart from the snapshot-level
+  `process_error`
+- `actions`, stating for every change-addressed command whether it is allowed
+  and, when it is not, a stable `blocked_reason` token
+- `parallel` eligibility with a stable `blocked_reason`
+- `timing` boundaries, `latest_activity`, and the repository-relative `worktree`
+  relation
+
+Absent values are explicit `null`s rather than omitted keys, so a client that
+replaces its local data from one snapshot can also *clear* a field. Nothing here
+is durable: execution marks, attention, and timing all start empty in a new
+process, and workflow routing is recomputed from the workspace.
+
 ## Event stream
 
 Connect to `/api/v2/events` (SSE) or `ws://localhost:<port>/api/v2/ws` for

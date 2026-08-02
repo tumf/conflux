@@ -60,6 +60,26 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 
 完全な API 仕様は [../openapi.yaml](../openapi.yaml) を参照してください。
 
+### state リソースは権威的なスナップショット
+
+`GET /api/v2/state` は要約ではなく、クライアントが保持している状態を丸ごと
+置き換えるためのレスポンスです。各変更はリデューサー由来の `display_status` に
+加えて次を持ちます。
+
+- `execution_marked` と `queue_intent`（別々のフィールド）
+- `attention`（プロセス開始後に検出された変更は `new`）
+- `blocker`（機械可読な `kind`: `dependency` / `external`、停止ホールドは `none`）
+  とサニタイズ済み詳細
+- `error_detail`（変更固有の失敗。スナップショット単位の `process_error` とは別）
+- `actions`（変更宛コマンドごとの可否と、不可の場合は安定した `blocked_reason`）
+- `parallel`（並列実行可否と安定した `blocked_reason`）
+- `timing`（開始・終了時刻）、`latest_activity`、リポジトリ相対の `worktree` 関係
+
+値が無い場合はキーを省略せず明示的に `null` を返します。これにより 1 回の
+スナップショットでフィールドのクリアも表現できます。これらはいずれも永続化
+されません。実行マーク・attention・timing は新しいプロセスで空から始まり、
+ワークフローのルーティングはワークスペースから再計算されます。
+
 ## イベントストリーム
 
 リアルタイム状態更新のために `/api/v2/events`（SSE）または

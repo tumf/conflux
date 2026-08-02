@@ -144,14 +144,12 @@ pub fn summarize_outcome(outcome: &OperatorOutcome) -> ExecutionSummary {
 }
 
 /// Map the operator-facing application mode string onto the shared enum.
+///
+/// Delegates to the enum's own parser: the snapshot projection resolves the same
+/// token when it decides which actions to advertise, and two copies of that
+/// mapping could disagree about what an instance will accept.
 pub fn operator_mode(app_mode: &str) -> OperatorMode {
-    match app_mode {
-        "running" => OperatorMode::Running,
-        "stopping" => OperatorMode::Stopping,
-        "stopped" => OperatorMode::Stopped,
-        "error" => OperatorMode::Error,
-        _ => OperatorMode::Select,
-    }
+    OperatorMode::from_app_mode(app_mode)
 }
 
 /// Production executor: shared operator command service plus the existing
@@ -210,6 +208,28 @@ impl RemoteControlExecutor for SharedServiceExecutor {
     async fn execute(&self, command: &CommandSpec) -> Result<ExecutionSummary, CommandFailure> {
         let mode = operator_mode(&self.projection.snapshot().0.app_mode);
 
+        let outcome = self.dispatch(mode, command).await;
+
+        // A command that changed an in-scope decision field has to be readable
+        // before its record settles: the record's `result_revision` is taken
+        // after this returns, and a client that reads that revision must find
+        // the mark, queue intent, and eligibility the command produced. Marks
+        // and reducer intent do not emit execution events, so without this
+        // publication they would sit unpublished until unrelated activity
+        // happened to move the snapshot.
+        if matches!(&outcome, Ok(summary) if summary.changed) {
+            self.web_state.sync_remote_control_projection().await;
+        }
+        outcome
+    }
+}
+
+impl SharedServiceExecutor {
+    async fn dispatch(
+        &self,
+        mode: OperatorMode,
+        command: &CommandSpec,
+    ) -> Result<ExecutionSummary, CommandFailure> {
         match command {
             CommandSpec::Start => self.lifecycle(ControlCommand::Start, "run start requested"),
             CommandSpec::Stop => self.lifecycle(ControlCommand::Stop, "graceful stop requested"),
