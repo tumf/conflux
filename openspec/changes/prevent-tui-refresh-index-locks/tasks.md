@@ -1,10 +1,10 @@
 ## Implementation Tasks
 
-- [ ] Change the uncommitted-change monitoring query in `src/vcs/git/commands/commit.rs` to disable Git optional locks while preserving `status --porcelain -u` output and all existing callers. (verification: unit - `cargo test vcs::git::commands::commit::tests` proves the helper still returns the expected change IDs; verification-id: refresh-status-lock-tests)
+- [ ] Define the production monitoring argv in `src/vcs/git/commands/commit.rs` as `--no-optional-locks status --porcelain -u`, with the global option before `status`, and retain all existing helper callers without process-wide environment mutation. (verification: unit - `cargo test vcs::git::commands::commit::tests` asserts the exact production argv and helper behavior; verification-id: refresh-status-lock-tests)
 
-- [ ] Add temporary-Git regression coverage for staged, unstaged, renamed, and untracked files plus archive, hidden-directory, and unrelated-path exclusions. (verification: integration - `cargo test vcs::git::commands::commit::tests` exercises real Git status output and fails on classification drift; verification-id: refresh-status-lock-tests)
+- [ ] Add temporary-Git classification coverage for staged and unstaged add/modify/delete, untracked files, same-change rename, and clean committed exclusion, while preserving archive, hidden-directory, ignored-file, and unrelated-path exclusions. Every Git fixture setup command must be asserted successful. (verification: integration - `cargo test vcs::git::commands::commit::tests` exercises real Git output and fails on classification drift or fixture setup failure; verification-id: refresh-status-lock-tests)
 
-- [ ] Add a temporary-Git lock-safety regression that makes index stat data refreshable, invokes the production monitoring helper, and proves the index identity or metadata remains unchanged while current worktree changes are reported. (verification: integration - `cargo test vcs::git::commands::commit::tests` fails if the monitoring query performs an optional index refresh; verification-id: refresh-status-lock-tests)
+- [ ] Add a non-vacuous index-safety regression: create a fixture where normal status demonstrably changes complete index bytes, then prove the production helper leaves index bytes unchanged while reporting current worktree changes. Do not use inode or mtime alone as the oracle. (verification: integration - `cargo test vcs::git::commands::commit::tests` requires the positive control and byte-for-byte production-helper comparison; verification-id: refresh-status-lock-tests)
 
 ## Final Validation
 
@@ -16,3 +16,4 @@ The implementation must also pass `cargo test vcs::git::commands::commit::tests`
 ## Future Work
 
 - Broader read-only Git command auditing may be proposed separately if repository evidence identifies another command that takes unnecessary optional locks.
+- A minimum supported Git version may be documented separately if Conflux introduces an explicit Git compatibility policy.

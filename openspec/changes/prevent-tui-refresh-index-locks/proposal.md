@@ -13,12 +13,12 @@ references:
   - src/vcs/commands.rs
 verifications:
   - id: refresh-status-lock-tests
-    requirement: "Repository monitoring detects committed, staged, unstaged, and untracked changes without taking an optional Git index lock that can collide with repo-mutating hooks"
+    requirement: "Repository monitoring classifies active OpenSpec worktree changes without requesting Git optional index locks"
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Makefile
-    evidence: "Rust unit and temporary-Git integration output proving refresh status classification remains correct and the root index is not refreshed or locked by the monitoring query"
+    evidence: "Rust unit and temporary-Git test output proving the production argv contract, path classification, and byte-level index non-mutation with a positive control"
     rerun: "cargo test vcs::git::commands::commit::tests"
     prerequisites: []
     execution_class: repository-local
@@ -31,40 +31,43 @@ verifications:
 
 ## Problem / Context
 
-The TUI periodically calls `list_changes_with_uncommitted_files` while an `on_merged` hook may mutate and commit the root repository. The monitoring query currently executes `git status --porcelain -u` with Git's default optional-lock behavior.
+The TUI periodically calls `list_changes_with_uncommitted_files` while an `on_merged` hook may mutate and commit the same root repository. The monitoring helper currently executes `git status --porcelain -u` with Git's default optional-lock behavior, which may refresh index stat information through `.git/index.lock` even though Conflux uses the command as a read-oriented poll.
 
-A production run showed the hook's root `.git/index.lock` preflight reporting no lock, followed roughly three seconds later by `git add -A` failing because the TUI refresh had started `git status --porcelain -u`. Git status may refresh stat information and briefly take `index.lock`, so a read-oriented monitoring poll can invalidate the earlier hook preflight and block a release hook after the merge and push already succeeded.
+In the observed incident, the hook preflight reported no root index lock, the TUI status query was the only logged root-index-locking candidate, and the later release `git add -A` failed on `.git/index.lock`. The timing is consistent with contention from that status query, but the available logs do not record command PIDs or lock acquisition and therefore do not prove a unique lock owner or exclude external Git processes.
 
-The repository paths in the preflight and failure message resolve to the same repository; path aliases were not separate lock domains. Process-local merge guards cannot prevent this race because the refresh runs independently and other `cflx` processes may monitor the same repository.
+The repository paths in the preflight and failure message resolve to the same repository. Process-local merge guards cannot serialize the independent refresh loop or another `cflx` process monitoring the same root.
 
 ## Proposed Solution
 
-Run the repository-monitoring status query with Git optional locks disabled while preserving its porcelain and untracked-file semantics. Keep this narrow: only the polling/query path that classifies uncommitted OpenSpec changes should opt out of index refresh writes. Repo-mutating commands and commands whose correctness requires an index update remain unchanged.
+Run only the uncommitted-change monitoring query as `git --no-optional-locks status --porcelain -u`. The global option must precede the `status` subcommand and must be scoped to this child command; process-wide environment mutation is not permitted. Repo-mutating commands and other Git helpers retain their existing locking and failure behavior.
 
-Add temporary-Git regression coverage that proves staged, unstaged, and untracked OpenSpec changes are still classified correctly. Add lock-safety coverage that makes the index stale, runs the monitoring query, and verifies the query does not replace or update the index while still returning current working-tree state.
+Keep all current path classification behavior while making the command contract explicit and testable. Add an exact argv unit test plus temporary-Git regression coverage for staged and unstaged additions, modifications, deletions, untracked files, same-change renames, clean committed paths, and existing exclusions. A byte-level index non-mutation test must first prove with a control command that the fixture can cause a normal status refresh, avoiding vacuous inode or timestamp assertions.
 
-This proposal is independent of release commit scoping. It prevents the observed read/write lock collision, while `scope-release-bump-commit` separately prevents unrelated files from entering a release commit.
+This proposal is independent of `scope-release-bump-commit`: each can be implemented and verified without consuming repository output from the other.
 
 ## Acceptance Criteria
 
-1. Periodic TUI and parallel-start refreshes detect uncommitted OpenSpec changes without allowing the status query to acquire an optional root index lock.
-2. Staged, unstaged, renamed, and untracked files under `openspec/changes/<change-id>/` retain their existing classification behavior.
-3. Files under `openspec/changes/archive/`, hidden change directories, and unrelated repository paths remain excluded.
-4. The monitoring query remains read-only with respect to the Git index even when worktree metadata would otherwise permit Git to refresh index stat data.
-5. Repo-mutating Git commands, merge serialization, hook failure semantics, and `on_merged` lock diagnostics are unchanged.
-6. No cross-process durable lock or out-of-worktree workflow-control state is introduced.
+1. TUI refresh, parallel startup, and queue filtering use `git --no-optional-locks status --porcelain -u` through the existing shared helper.
+2. Optional-lock suppression is child-command-local and does not alter repo-mutating Git commands or process-wide environment state.
+3. Staged and unstaged additions, modifications, and deletions plus untracked files and same-change renames retain their existing active change classification.
+4. Clean committed paths are not reported as uncommitted changes.
+5. Archive entries, hidden change directories, ignored files, and unrelated repository paths remain excluded.
+6. A refresh-capable fixture proves normal status can change index bytes while the production monitoring helper leaves the same class of index bytes unchanged and still reports current worktree state.
+7. Hook diagnostics, retry behavior, merge serialization, and workflow-control state remain unchanged.
 
 ## Explicit Completion Conditions
 
-- `src/vcs/git/commands/commit.rs` invokes the monitoring status query with Git optional locking disabled while retaining porcelain output with individual untracked files.
-- Existing callers in `src/tui/runner.rs`, `src/tui/orchestrator.rs`, and `src/parallel_run_service.rs` continue through the same helper without separate locking logic.
-- Temporary-Git tests fail if the query stops detecting staged, unstaged, or untracked changes, or if it refreshes/replaces the repository index.
+- `src/vcs/git/commands/commit.rs` constructs the monitoring command with the exact argv `--no-optional-locks status --porcelain -u` and all existing callers continue through that helper.
+- A unit assertion fails if the global option is omitted, moved after `status`, or replaced by process-wide environment mutation.
+- Temporary-Git tests cover staged and unstaged add/modify/delete, untracked paths, same-change rename, clean committed exclusion, and archive/hidden/ignored/unrelated exclusions without ignoring Git setup failures.
+- The index test compares complete index bytes and includes a positive control proving the fixture would detect a normal optional refresh.
 - `cargo test vcs::git::commands::commit::tests`, `cargo fmt -- --check`, and `cargo clippy -- -D warnings` pass.
 
 ## Out of Scope
 
-- Retrying arbitrary failed Git commands.
-- Removing an existing `.git/index.lock`.
-- Changing `on_merged` retry counts, timeout policy, or failure-to-state-transition behavior.
-- Adding a repository-wide cross-process mutex.
-- Changing release bump staging or commit contents; that belongs to `scope-release-bump-commit`.
+- Proving the historical lock owner beyond the available logs.
+- Preventing `.git/index.lock` contention caused by IDEs, shell integrations, unrelated Git commands, or other monitoring helpers.
+- Providing a linearizable repository snapshot while another process mutates the index; later polling may converge on concurrent changes.
+- Removing an existing lock, retrying arbitrary Git failures, or adding a cross-process repository mutex.
+- Preserving index-refresh performance in very large repositories; disabling the optional write may repeat stat work.
+- Auditing every read-oriented Git command or changing release bump commit contents.
