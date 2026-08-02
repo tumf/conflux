@@ -30,7 +30,6 @@ pub const OWNER_FILE_NAME: &str = "cflx-orchestration-owner.json";
 pub enum InvocationMode {
     Tui,
     Run,
-    Server,
 }
 
 impl InvocationMode {
@@ -38,12 +37,11 @@ impl InvocationMode {
         match self {
             InvocationMode::Tui => "tui",
             InvocationMode::Run => "run",
-            InvocationMode::Server => "server",
         }
     }
 }
 
-/// The CLI entrypoint being started, before remote/local mode is considered.
+/// The CLI entrypoint being started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvocationKind {
     /// `cflx` with no subcommand (default TUI).
@@ -52,8 +50,6 @@ pub enum InvocationKind {
     Tui,
     /// `cflx run`.
     Run,
-    /// `cflx server`.
-    Server,
     /// Any command that does not own local orchestration.
     Other,
 }
@@ -66,21 +62,12 @@ pub enum LockDecision {
 }
 
 /// Decide whether an invocation owns local orchestration for this repository.
-///
-/// `remote_client` is true when a TUI invocation is connected to a remote
-/// server (`--server`). Such a process drives another host's orchestration, so
-/// it owns no local repository work and must not exclude a local owner.
-pub fn classify_invocation(kind: InvocationKind, remote_client: bool) -> LockDecision {
+pub fn classify_invocation(kind: InvocationKind) -> LockDecision {
     match kind {
         InvocationKind::DefaultTui | InvocationKind::Tui => {
-            if remote_client {
-                LockDecision::Bypass
-            } else {
-                LockDecision::Acquire(InvocationMode::Tui)
-            }
+            LockDecision::Acquire(InvocationMode::Tui)
         }
         InvocationKind::Run => LockDecision::Acquire(InvocationMode::Run),
-        InvocationKind::Server => LockDecision::Acquire(InvocationMode::Server),
         InvocationKind::Other => LockDecision::Bypass,
     }
 }
@@ -496,35 +483,19 @@ mod tests {
     #[test]
     fn local_orchestration_entrypoints_acquire_and_others_bypass() {
         assert_eq!(
-            classify_invocation(InvocationKind::DefaultTui, false),
+            classify_invocation(InvocationKind::DefaultTui),
             LockDecision::Acquire(InvocationMode::Tui)
         );
         assert_eq!(
-            classify_invocation(InvocationKind::Tui, false),
+            classify_invocation(InvocationKind::Tui),
             LockDecision::Acquire(InvocationMode::Tui)
         );
         assert_eq!(
-            classify_invocation(InvocationKind::Run, false),
+            classify_invocation(InvocationKind::Run),
             LockDecision::Acquire(InvocationMode::Run)
         );
         assert_eq!(
-            classify_invocation(InvocationKind::Server, false),
-            LockDecision::Acquire(InvocationMode::Server)
-        );
-        assert_eq!(
-            classify_invocation(InvocationKind::Other, false),
-            LockDecision::Bypass
-        );
-    }
-
-    #[test]
-    fn remote_client_tui_bypasses_the_local_lock() {
-        assert_eq!(
-            classify_invocation(InvocationKind::DefaultTui, true),
-            LockDecision::Bypass
-        );
-        assert_eq!(
-            classify_invocation(InvocationKind::Tui, true),
+            classify_invocation(InvocationKind::Other),
             LockDecision::Bypass
         );
     }

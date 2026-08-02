@@ -13,11 +13,6 @@ Both files use JSONC, so line comments, block comments, and trailing commas are 
 - Use `~/.config/cflx/config.jsonc` for user-wide defaults shared across repositories.
 - Use `cflx run --config /path/to/config.jsonc` when you want a one-off override file.
 
-`cflx server` is special:
-
-- Server mode reads global config plus CLI overrides.
-- Server mode does not use project `.cflx.jsonc`.
-
 ## Merge Priority
 
 Configuration files are loaded and merged per key in this order, lowest to highest priority:
@@ -61,11 +56,7 @@ Global defaults in `~/.config/cflx/config.jsonc`:
   "archive_command": "my-agent archive '{prompt}'",
   "analyze_command": "my-agent analyze --prompt '{prompt}'",
   "acceptance_command": "my-agent accept '{prompt}'",
-  "resolve_command": "my-agent resolve --prompt '{prompt}'",
-  "server": {
-    "bind": "127.0.0.1",
-    "port": 39876
-  }
+  "resolve_command": "my-agent resolve --prompt '{prompt}'"
 }
 ```
 
@@ -145,9 +136,7 @@ Command templates support these placeholders:
 | `command_inactivity_timeout_max_retries` | integer | No | `3` | `0` disables inactivity retries |
 | `stream_json_textify` | boolean | No | `true` | Converts Claude Code NDJSON to readable text |
 | `command_strict_process_cleanup` | boolean | No | `true` | Sweeps the full process group after completion |
-| `proposal_session` | object | No | see below | ACP transport for proposal sessions |
 | `lifecycle_integration` | object | No | unset | External lifecycle adapter (observability only) |
-| `server` | object | No | see below | Used by `cflx server` and `cflx service` |
 
 ## `hooks`
 
@@ -286,40 +275,9 @@ Scope: `apply_command`, `apply_escalation_command`, `apply_stall_diagnose_comman
 
 Values expand at command-spawn time from the Conflux parent process environment. Supported forms are `$VAR` and `${VAR}`. Unset variables expand to an empty string. Conflux does not run a shell while expanding `envs`; command substitution, backticks, globbing, and shell parameter operators such as `${VAR:-default}` are not supported.
 
-`envs` is not passed to hooks solely because it is configured. Proposal sessions use `proposal_session.transport_env` instead; keep ACP-only transport variables there.
+`envs` is not passed to hooks solely because it is configured.
 
 Configured and expanded values are not included in command strings or routine logs. Use parent-env references for secrets, for example `"ANTHROPIC_API_KEY": "$ANTHROPIC_API_KEY"`.
-
-## `proposal_session`
-
-This section controls ACP subprocesses used for proposal sessions, especially in server mode.
-Normal orchestration commands above are agent-agnostic; this section documents the current ACP transport defaults implemented by Conflux.
-
-```jsonc
-{
-  "proposal_session": {
-    "transport_command": "your-acp-client",
-    "transport_args": ["acp"],
-    "transport_env": {
-      "SOME_TRANSPORT_CONFIG": "/absolute/path/to/client-config.json"
-    },
-    "session_inactivity_timeout_secs": 1800
-  }
-}
-```
-
-Legacy aliases are accepted:
-
-- `acp_command` -> `transport_command`
-- `acp_args` -> `transport_args`
-- `acp_env` -> `transport_env`
-
-| Key | Type | Default | Notes |
-|---|---|---|---|
-| `transport_command` | string | `opencode` | ACP subprocess executable |
-| `transport_args` | string[] | `["acp"]` | ACP subprocess args |
-| `transport_env` | object | `{}` | Extra environment variables |
-| `session_inactivity_timeout_secs` | integer | `1800` | ACP inactivity timeout |
 
 ## `lifecycle_integration`
 
@@ -425,44 +383,6 @@ Because the adapter no-ops outside Herdr, the same configuration is safe in ever
 
 Herdr process detection is a **separate dependency** and is out of scope for Conflux: Herdr must recognize the foreground `cflx` process in order to create and remove the Agent entry. Until it does, the lifecycle stream reports state for an Agent entry that Herdr still has to own. The field names in the reference adapter are the integration *shape*, not a certified Herdr wire format — match them to the Herdr version you run.
 
-## `server`
-
-This section is for `cflx server` and `cflx service`.
-
-```jsonc
-{
-  "server": {
-    "bind": "127.0.0.1",
-    "port": 39876,
-    "max_concurrent_total": 4,
-    "data_dir": "/absolute/path/to/server-data",
-    "auth": {
-      "mode": "bearer_token",
-      "token_env": "CFLX_SERVER_TOKEN"
-    }
-  }
-}
-```
-
-| Key | Type | Default | Notes |
-|---|---|---|---|
-| `bind` | string | `127.0.0.1` | Non-loopback binds require bearer token auth |
-| `port` | integer | `39876` | Server port |
-| `max_concurrent_total` | integer | `4` | Total concurrent project runs |
-| `data_dir` | string | OS-specific data dir | Persistent registry and state path |
-| `auth` | object | see below | Server auth settings |
-| `resolve_command` | string | unsupported | Deprecated and rejected at startup |
-
-### `server.auth`
-
-| Key | Type | Default | Notes |
-|---|---|---|---|
-| `mode` | `none` or `bearer_token` | `none` | Non-loopback binds should use `bearer_token` |
-| `token` | string | unset | Inline bearer token |
-| `token_env` | string | unset | Environment variable name containing the token |
-
-If both `token` and `token_env` are set, `token_env` wins.
-
 ## Complete Example
 
 ```jsonc
@@ -493,14 +413,6 @@ If both `token` and `token_env` are set, `token_env` wins.
       "continue_on_failure": false,
       "timeout": 120
     }
-  },
-  "server": {
-    "bind": "127.0.0.1",
-    "port": 39876,
-    "auth": {
-      "mode": "bearer_token",
-      "token_env": "CFLX_SERVER_TOKEN"
-    }
   }
 }
 ```
@@ -508,5 +420,5 @@ If both `token` and `token_env` are set, `token_env` wins.
 ## Related Guides
 
 - [USAGE.md](./USAGE.md)
-- [SERVER.md](./SERVER.md)
+- [WEBUI.md](./WEBUI.md)
 - [DEVELOPMENT.md](./DEVELOPMENT.md)

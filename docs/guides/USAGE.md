@@ -171,21 +171,6 @@ Notes for client authors:
 
 The full schema is generated into [`docs/openapi.yaml`](../openapi.yaml).
 
-## Remote TUI (Server Mode)
-
-If you're running the multi-project server daemon, you can point the TUI at it:
-
-```bash
-# Connect the TUI to a remote Conflux server
-cflx --server http://host:39876
-
-# With bearer-token auth
-cflx --server http://host:39876 --server-token "$TOKEN"
-
-# Or read token from environment variable
-cflx --server http://host:39876 --server-token-env CFLX_SERVER_TOKEN
-```
-
 ## Workflow Examples
 
 ### Example 1: Automated Full Run (Headless)

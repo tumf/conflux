@@ -1,12 +1,18 @@
 ### Requirement: Versioned single-instance remote-control resources
 
-Single-instance web monitoring MUST expose `/api/v2` health, capabilities, instance, state, changes, logs, command, event, and WebSocket resources. It MUST NOT merge this contract into the multi-project server `/api/v1` namespace.
+Single-instance web monitoring MUST expose `/api/v2` health, capabilities, instance, state, changes, logs, command, event, and WebSocket resources. `/api/v2` is the only versioned remote-control namespace; the removed multi-project `/api/v1` namespace MUST NOT be reintroduced.
 
 #### Scenario: Client discovers and snapshots one process
 
 **Given**: A single cflx process has web monitoring enabled
 **When**: A client reads capabilities, instance, and state
 **Then**: The client receives supported commands/transports, a process-incarnation ID, and a coherent reducer-derived snapshot
+
+#### Scenario: Removed multi-project namespace is not served
+
+**Given**: A single cflx process has web monitoring enabled
+**When**: A client requests a `/api/v1` resource
+**Then**: The request is not served
 
 ### Requirement: Closed shared command delegation
 
@@ -164,7 +170,7 @@ Every v2 error MUST include `error_code`, sanitized `message`, `correlation_id`,
 
 ### Requirement: Legacy web contract compatibility
 
-The single-instance web server MUST serve the embedded static operator console and the `/api/v2` contract. The legacy single-instance `/api/*` and `/ws` compatibility surface MUST be removed after the console migrates to v2. Removal MUST NOT affect `/api/v2`, OpenAPI resources, or static asset delivery, and requests to removed mutation routes MUST have no side effect.
+The single-instance web server MUST serve the embedded static operator console and the `/api/v2` contract. The legacy single-instance `/api/*` and `/ws` compatibility surface MUST be removed after the console migrates to v2. Removal MUST NOT affect `/api/v2`, OpenAPI resources, or static asset delivery, and requests to removed mutation routes MUST have no side effect. The retained surface MUST NOT depend on the removed multi-project `/api/v1` namespace.
 
 #### Scenario: Legacy monitoring route is absent
 

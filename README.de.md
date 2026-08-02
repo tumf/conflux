@@ -52,7 +52,7 @@ Nützliche TUI-Tasten:
 | `F5` | Verarbeitung starten, fortsetzen, erneut versuchen oder weiterführen |
 | `x` | Geeignete `not queued` changes während laufender Verarbeitung in die Queue legen |
 
-Für Servermodus, Remote-TUI, REST API und `cflx service` siehe den [Leitfaden zum Servermodus (Englisch)](docs/guides/SERVER.md).
+Für die Web-Monitoring-UI, die REST API und `/api/v2` siehe den [Web-UI-Leitfaden (Englisch)](docs/guides/WEBUI.md).
 
 ## Schnellstart
 
@@ -123,7 +123,7 @@ cargo install cflx
 | Dokument | Beschreibung |
 |----------|-------------|
 | [QUICKSTART.de.md](QUICKSTART.de.md) | Ersteinrichtung |
-| [Leitfaden zum Servermodus (Englisch)](docs/guides/SERVER.md) | Servermodus, Remote-TUI, Web UI, REST API, Hintergrunddienst |
+| [Web-UI-Leitfaden (Englisch)](docs/guides/WEBUI.md) | Web UI, REST API, `/api/v2`, Migration vom Servermodus |
 | [README.md](README.md) | Vollständige Dokumentation (Englisch) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Anwendungsbeispiele |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Leitfaden für Beiträge |

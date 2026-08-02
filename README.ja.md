@@ -52,7 +52,7 @@ Conflux は、仕様駆動開発に基づく AI コーディングエージェ�
 | `F5` | 処理の開始、再開、リトライ、継続 |
 | `x` | 処理中に対象の `not queued` change をキューへ追加 |
 
-サーバーモード、リモート TUI、REST API、`cflx service` は [サーバーモードガイド](docs/guides/SERVER.ja.md) を参照してください。
+Web 監視 UI、REST API、`/api/v2` は [Web UI ガイド](docs/guides/WEBUI.ja.md) を参照してください。
 
 ## クイックスタート
 
@@ -123,7 +123,7 @@ cargo install cflx
 | ドキュメント | 説明 |
 |----------|-------------|
 | [QUICKSTART.ja.md](QUICKSTART.ja.md) | 初回セットアップ |
-| [サーバーモードガイド](docs/guides/SERVER.ja.md) | サーバーモード、リモート TUI、Web UI、REST API、バックグラウンドサービス |
+| [Web UI ガイド](docs/guides/WEBUI.ja.md) | Web UI、REST API、`/api/v2`、サーバーモードからの移行 |
 | [README.md](README.md) | 完全なドキュメント（英語） |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | 使用例 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | コントリビューションガイド |

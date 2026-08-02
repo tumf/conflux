@@ -52,7 +52,7 @@ Teclas útiles del TUI:
 | `F5` | Iniciar, reanudar, reintentar o continuar el procesamiento |
 | `x` | Poner en cola los changes `not queued` elegibles mientras el procesamiento está en marcha |
 
-Para el modo servidor, la TUI remota, la API REST y `cflx service`, consulta la [guía del modo servidor (en inglés)](docs/guides/SERVER.md).
+Para la interfaz web de monitoreo, la API REST y `/api/v2`, consulta la [guía de la Web UI (en inglés)](docs/guides/WEBUI.md).
 
 ## Inicio rápido
 
@@ -123,7 +123,7 @@ cargo install cflx
 | Documento | Descripción |
 |----------|-------------|
 | [QUICKSTART.es.md](QUICKSTART.es.md) | Configuración inicial |
-| [Guía del modo servidor (en inglés)](docs/guides/SERVER.md) | Modo servidor, TUI remota, Web UI, API REST, servicio en segundo plano |
+| [Guía de la Web UI (en inglés)](docs/guides/WEBUI.md) | Web UI, API REST, `/api/v2`, migración desde el modo servidor |
 | [README.md](README.md) | Documentación completa (inglés) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Ejemplos de uso |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Guía de contribución |

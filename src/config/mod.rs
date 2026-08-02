@@ -1907,259 +1907,34 @@ mod tests {
         );
     }
 
-    // ── ServerConfig validation tests ──
-
+    // Server-only configuration is no longer a supported section.
+    //
+    // Unknown top-level keys stay tolerated (forward/backward compatibility), so
+    // the contract is that a legacy `server` block parses without error and
+    // contributes nothing — not that it is rejected.
     #[test]
-    fn test_server_config_validate_loopback_no_auth_ok() {
-        // Loopback bind without auth is allowed
-        let config = ServerConfig {
-            bind: "127.0.0.1".to_string(),
-            auth: ServerAuthConfig {
-                mode: ServerAuthMode::None,
-                token: None,
-                token_env: None,
-            },
-            ..ServerConfig::default()
-        };
-        assert!(
-            config.validate().is_ok(),
-            "Loopback bind without auth should be allowed"
-        );
-    }
-
-    #[test]
-    fn test_server_config_validate_loopback_with_auth_ok() {
-        // Loopback bind with auth is also allowed
-        let config = ServerConfig {
-            bind: "127.0.0.1".to_string(),
-            auth: ServerAuthConfig {
-                mode: ServerAuthMode::BearerToken,
-                token: Some("secret".to_string()),
-                token_env: None,
-            },
-            ..ServerConfig::default()
-        };
-        assert!(
-            config.validate().is_ok(),
-            "Loopback bind with auth should be allowed"
-        );
-    }
-
-    #[test]
-    fn test_server_config_validate_non_loopback_no_auth_fails() {
-        // Non-loopback bind without auth must fail
-        let config = ServerConfig {
-            bind: "0.0.0.0".to_string(),
-            auth: ServerAuthConfig {
-                mode: ServerAuthMode::None,
-                token: None,
-                token_env: None,
-            },
-            ..ServerConfig::default()
-        };
-        let result = config.validate();
-        assert!(
-            result.is_err(),
-            "Non-loopback bind without auth should be rejected"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("bearer_token"),
-            "Error message should mention bearer_token requirement"
-        );
-    }
-
-    #[test]
-    fn test_server_config_validate_non_loopback_bearer_token_ok() {
-        // Non-loopback bind with valid bearer token is allowed
-        let config = ServerConfig {
-            bind: "0.0.0.0".to_string(),
-            auth: ServerAuthConfig {
-                mode: ServerAuthMode::BearerToken,
-                token: Some("my-secret-token".to_string()),
-                token_env: None,
-            },
-            ..ServerConfig::default()
-        };
-        assert!(
-            config.validate().is_ok(),
-            "Non-loopback bind with valid bearer token should be allowed"
-        );
-    }
-
-    #[test]
-    fn test_server_config_validate_non_loopback_bearer_token_empty_fails() {
-        // Non-loopback bind with empty bearer token must fail
-        let config = ServerConfig {
-            bind: "0.0.0.0".to_string(),
-            auth: ServerAuthConfig {
-                mode: ServerAuthMode::BearerToken,
-                token: Some("".to_string()),
-                token_env: None,
-            },
-            ..ServerConfig::default()
-        };
-        let result = config.validate();
-        assert!(
-            result.is_err(),
-            "Non-loopback bind with empty token should be rejected"
-        );
-    }
-
-    #[test]
-    fn test_server_config_is_loopback_bind() {
-        // Test various loopback and non-loopback addresses
-        let loopback_cases = ["127.0.0.1", "127.0.0.2", "127.1.2.3", "localhost", "::1"];
-        for addr in &loopback_cases {
-            let config = ServerConfig {
-                bind: addr.to_string(),
-                ..ServerConfig::default()
-            };
-            assert!(config.is_loopback_bind(), "'{}' should be loopback", addr);
-        }
-
-        let non_loopback_cases = ["0.0.0.0", "192.168.1.1", "10.0.0.1", "::"];
-        for addr in &non_loopback_cases {
-            let config = ServerConfig {
-                bind: addr.to_string(),
-                ..ServerConfig::default()
-            };
-            assert!(
-                !config.is_loopback_bind(),
-                "'{}' should not be loopback",
-                addr
-            );
-        }
-    }
-
-    // ── ServerConfig::apply_cli_overrides data_dir tests ──
-
-    #[test]
-    fn test_server_config_apply_cli_overrides_data_dir() {
-        // Verify that --data-dir CLI override sets data_dir on ServerConfig
-        let mut config = ServerConfig::default();
-        let custom_dir = std::path::Path::new("/var/lib/cflx");
-
-        config.apply_cli_overrides(None, None, None, None, Some(custom_dir));
-
-        assert_eq!(
-            config.data_dir,
-            std::path::PathBuf::from("/var/lib/cflx"),
-            "data_dir should be overridden by CLI --data-dir option"
-        );
-    }
-
-    #[test]
-    fn test_server_config_apply_cli_overrides_data_dir_not_set_uses_default() {
-        // When --data-dir is not provided, data_dir remains the default value
-        let mut config = ServerConfig::default();
-        let default_data_dir = config.data_dir.clone();
-
-        config.apply_cli_overrides(None, None, None, None, None);
-
-        assert_eq!(
-            config.data_dir, default_data_dir,
-            "data_dir should remain the default when CLI --data-dir is not specified"
-        );
-    }
-
-    #[test]
-    fn test_server_config_apply_cli_overrides_data_dir_with_other_overrides() {
-        // Verify that data_dir override works correctly alongside other CLI overrides
-        let mut config = ServerConfig::default();
-        let custom_dir = std::path::Path::new("/tmp/cflx-server");
-
-        config.apply_cli_overrides(
-            Some("0.0.0.0"),
-            Some(8080),
-            Some("my-token"),
-            Some(10),
-            Some(custom_dir),
-        );
-
-        assert_eq!(config.bind, "0.0.0.0");
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.auth.mode, ServerAuthMode::BearerToken);
-        assert_eq!(config.auth.token, Some("my-token".to_string()));
-        assert_eq!(config.max_concurrent_total, 10);
-        assert_eq!(
-            config.data_dir,
-            std::path::PathBuf::from("/tmp/cflx-server"),
-            "data_dir should be overridden when provided alongside other CLI overrides"
-        );
-    }
-
-    // ── server.resolve_command deprecation tests ──
-
-    #[test]
-    fn test_server_config_validate_rejects_deprecated_resolve_command() {
-        // Verify that setting server.resolve_command causes a configuration error
-        let config = ServerConfig {
-            resolve_command: Some("echo resolve".to_string()),
-            ..Default::default()
-        };
-
-        let result = config.validate();
-        assert!(
-            result.is_err(),
-            "validate() should return Err when server.resolve_command is set"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("server.resolve_command"),
-            "Error message should mention 'server.resolve_command', got: {}",
-            err_msg
-        );
-        assert!(
-            err_msg.contains("top-level `resolve_command`"),
-            "Error message should mention the top-level resolve_command as alternative, got: {}",
-            err_msg
-        );
-    }
-
-    #[test]
-    fn test_server_config_validate_accepts_config_without_resolve_command() {
-        // Verify that server.resolve_command = None passes validation (loopback bind)
-        let config = ServerConfig::default();
-        assert!(
-            config.resolve_command.is_none(),
-            "Default ServerConfig should not have resolve_command set"
-        );
-        let result = config.validate();
-        assert!(
-            result.is_ok(),
-            "validate() should succeed when server.resolve_command is not set"
-        );
-    }
-
-    #[test]
-    fn test_parse_server_config_with_resolve_command_is_parsed_but_rejected_at_validate() {
-        // Verify that server.resolve_command in config JSON is deserialized
-        // but then rejected by validate()
+    fn legacy_server_section_is_ignored_and_unrelated_config_still_parses() {
         let jsonc = r#"{
             "server": {
-                "resolve_command": "echo resolve"
-            }
+                "bind": "0.0.0.0",
+                "port": 41234,
+                "auth": { "mode": "bearer_token", "token": "secret" }
+            },
+            "proposal_session": {
+                "transport_command": "custom-opencode"
+            },
+            "apply_command": "agent apply {change_id}",
+            "max_iterations": 7
         }"#;
-        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
-        let server_config = config.server.unwrap_or_default();
+
+        let config = OrchestratorConfig::parse_jsonc(jsonc)
+            .expect("a legacy server section must not break configuration parsing");
+
         assert_eq!(
-            server_config.resolve_command,
-            Some("echo resolve".to_string()),
-            "server.resolve_command should be deserialized from JSON"
+            config.apply_command.as_deref(),
+            Some("agent apply {change_id}")
         );
-        // But validate() should reject it
-        let result = server_config.validate();
-        assert!(
-            result.is_err(),
-            "validate() should reject server.resolve_command"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("server.resolve_command"),
-            "Error should mention server.resolve_command, got: {}",
-            err_msg
-        );
+        assert_eq!(config.get_max_iterations(), 7);
     }
 
     // === Characterization tests: config loading priority (task 1.1) ===
@@ -2273,14 +2048,6 @@ mod tests {
             parallel_mode: Some(false),
             max_concurrent_workspaces: Some(2),
             vcs_backend: Some(VcsBackend::Auto),
-            server: Some(ServerConfig {
-                port: 3000,
-                ..Default::default()
-            }),
-            proposal_session: Some(ProposalSessionConfig {
-                transport_command: "base-opencode".to_string(),
-                ..Default::default()
-            }),
             ..Default::default()
         };
 
@@ -2290,14 +2057,6 @@ mod tests {
             parallel_mode: Some(true),
             max_concurrent_workspaces: Some(4),
             vcs_backend: Some(VcsBackend::Git),
-            server: Some(ServerConfig {
-                port: 4000,
-                ..Default::default()
-            }),
-            proposal_session: Some(ProposalSessionConfig {
-                transport_command: "override-opencode".to_string(),
-                ..Default::default()
-            }),
             ..Default::default()
         });
 
@@ -2306,13 +2065,6 @@ mod tests {
         assert_eq!(base.parallel_mode, Some(true));
         assert_eq!(base.max_concurrent_workspaces, Some(4));
         assert_eq!(base.vcs_backend, Some(VcsBackend::Git));
-        assert_eq!(base.server.as_ref().map(|server| server.port), Some(4000));
-        assert_eq!(
-            base.proposal_session
-                .as_ref()
-                .map(|session| session.transport_command.as_str()),
-            Some("override-opencode")
-        );
     }
 
     #[test]
@@ -2356,45 +2108,6 @@ mod tests {
             "echo higher pre_apply",
             "hooks merge must let higher-priority hook fields override matching lower-priority fields"
         );
-    }
-
-    #[test]
-    fn test_characterize_server_and_proposal_session_are_overwritten_not_deep_merged() {
-        let mut base = OrchestratorConfig {
-            server: Some(ServerConfig {
-                bind: "127.0.0.1".to_string(),
-                port: 3000,
-                ..Default::default()
-            }),
-            proposal_session: Some(ProposalSessionConfig {
-                transport_command: "base-opencode".to_string(),
-                transport_args: vec!["base".to_string()],
-                session_inactivity_timeout_secs: 10,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        base.merge(OrchestratorConfig {
-            server: Some(ServerConfig {
-                port: 4000,
-                ..Default::default()
-            }),
-            proposal_session: Some(ProposalSessionConfig {
-                session_inactivity_timeout_secs: 20,
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-
-        let server = base.server.unwrap();
-        assert_eq!(server.bind, "127.0.0.1");
-        assert_eq!(server.port, 4000);
-
-        let proposal_session = base.proposal_session.unwrap();
-        assert_eq!(proposal_session.transport_command, "opencode");
-        assert_eq!(proposal_session.transport_args, vec!["acp"]);
-        assert_eq!(proposal_session.session_inactivity_timeout_secs, 20);
     }
 
     // === Characterization tests: JSONC deserialization and defaults (task 1.2) ===
@@ -2470,42 +2183,5 @@ mod tests {
         // But getters resolve to their defaults
         assert_eq!(config.get_max_iterations(), 50);
         assert!(!config.get_parallel_mode());
-    }
-
-    #[test]
-    fn test_load_server_config_and_resolve_command_includes_proposal_session_config() {
-        let jsonc = r#"{
-            "server": {
-                "bind": "127.0.0.1",
-                "port": 41234
-            },
-            "resolve_command": "echo resolve",
-            "proposal_session": {
-                "transport_command": "custom-opencode",
-                "transport_args": ["--foo", "bar"],
-                "transport_env": {
-                    "FOO": "bar"
-                },
-                "session_inactivity_timeout_secs": 42
-            }
-        }"#;
-
-        let config = OrchestratorConfig::parse_jsonc(jsonc).unwrap();
-        let server_config = config.server.clone().unwrap();
-        let resolve_command = config.resolve_command.clone();
-        let proposal_session = config.proposal_session.clone().unwrap();
-
-        assert_eq!(server_config.port, 41234);
-        assert_eq!(resolve_command.as_deref(), Some("echo resolve"));
-        assert_eq!(proposal_session.transport_command, "custom-opencode");
-        assert_eq!(proposal_session.transport_args, vec!["--foo", "bar"]);
-        assert_eq!(
-            proposal_session
-                .transport_env
-                .get("FOO")
-                .map(String::as_str),
-            Some("bar")
-        );
-        assert_eq!(proposal_session.session_inactivity_timeout_secs, 42);
     }
 }

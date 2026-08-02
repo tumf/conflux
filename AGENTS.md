@@ -14,27 +14,26 @@ Conflux(cflx) automates the OpenSpec change workflow (list → dependency analys
 Conflux has the following frontends:
 
 * TUI
-* WebUI (server mode)
+* WebUI (local `--web` monitoring)
 
 ## Web UI
 
-Two distinct browser surfaces exist; do not confuse them.
+The WebUI is an optional local monitoring dashboard enabled with `--web` on
+`cflx`, `cflx tui`, or `cflx run`. There is no standalone server daemon and no
+multi-project mode.
 
-* **Operator console (`--web` / web-monitoring)**: `web/index.html`, `web/style.css`, and
-  `web/app.js`, embedded via `include_str!` in `src/web/mod.rs`. No build step and no
-  frontend framework: it is dependency-free HTML/CSS/JS and a first-class `/api/v2`
-  client. There is no legacy unversioned `/api/*` or `/ws` surface any more.
-  Browser tests live in `tests/web/` and run with `make web-test`; that tooling is
-  dev-only and must never become a production dependency.
-* **Server-mode dashboard**: source in `dashboard/`, build output `dashboard/dist/`,
-  embedded by `src/server/api/dashboard.rs`. Built with `make dashboard-build`.
+The operator console consists of `web/index.html`, `web/style.css`, and
+`web/app.js`, embedded via `include_str!` in `src/web/mod.rs`. No build step and
+no frontend framework: it is dependency-free HTML/CSS/JS and a first-class
+`/api/v2` client. There is no legacy unversioned `/api/*` or `/ws` surface any
+more. Browser tests live in `tests/web/` and run with `make web-test`; that
+tooling is dev-only and must never become a production dependency.
 
 ## Directories
 
 * `src/`: Main Rust source code
 * `tests/`: Rust test code
-* `dashboard/`: WebUI dashboard source files
-* `web/`: Embedded static web assets used by the Rust application
+* `web/`: Embedded static web assets used by the WebUI
 * `skills/`: Source files for `cflx-*` skills that are embedded into the Rust binary
 * `openspec/`: OpenSpec changes and specs
 * `docs/`: Project documentation
