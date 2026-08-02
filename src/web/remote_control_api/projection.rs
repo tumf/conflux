@@ -252,6 +252,35 @@ impl Projection {
         Some(self.apply_state(event_type, None, json!({}), candidate))
     }
 
+    /// Apply a presentation-only input.
+    ///
+    /// Allocates one ordered sequence at the *current* revision and stores it
+    /// like any other event, but never compares or replaces the snapshot: the
+    /// event carries no field the snapshot is built from, so recomputing a
+    /// candidate could only produce a revision bump nothing asked for.
+    pub fn apply_presentation(
+        &self,
+        event_type: &str,
+        change_id: Option<String>,
+        payload: serde_json::Value,
+    ) -> EventEnvelope {
+        let mut inner = self.lock();
+        inner.event_sequence += 1;
+
+        let envelope = EventEnvelope {
+            instance_id: self.instance_id.clone(),
+            event_sequence: inner.event_sequence,
+            state_revision: inner.state_revision,
+            category: EventCategory::State,
+            event_type: event_type.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            change_id,
+            payload,
+        };
+        self.store_and_publish(&mut inner, envelope.clone());
+        envelope
+    }
+
     /// Apply an observational log input.
     ///
     /// A log allocates a sequence and carries the *current* revision. It never
@@ -569,112 +598,460 @@ fn classify_retry_action(
 /// Wire event type, target change, and sanitized payload for an execution event.
 ///
 /// `ExecutionEvent` is an internal enum, so this is a deliberate projection
-/// rather than a serialization of it: only the fields a remote controller needs
-/// cross the boundary, and unenumerated variants degrade to a generic
-/// `orchestration_event` instead of leaking internal shape.
+/// rather than a serialization of it. The match is exhaustive with no `_` arm:
+/// a new variant must be projected explicitly instead of silently degrading to
+/// a generic `orchestration_event` that drops its change ID and every field
+/// with it.
+///
+/// Raw agent command lines are the one thing deliberately not published. They
+/// routinely carry prompts and credentials, and the operator-facing substitute
+/// (`command_bytes`/`command_hash`) identifies a command without reproducing
+/// it.
 pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, serde_json::Value) {
     use ExecutionEvent as E;
-    let (event_type, change_id, detail) = match event {
-        E::ProcessingStarted(id) => ("processing_started", Some(id.clone()), None),
-        E::ProcessingCompleted(id) => ("processing_completed", Some(id.clone()), None),
-        E::ProcessingError { id, error } => {
-            ("processing_error", Some(id.clone()), Some(error.clone()))
+
+    /// Sanitize operator-facing free text exactly like a retained log message.
+    fn detail(text: &str) -> serde_json::Value {
+        json!(crate::events::sanitize_detail(text))
+    }
+
+    fn optional_detail(text: &Option<String>) -> serde_json::Value {
+        match text {
+            Some(text) => detail(text),
+            None => serde_json::Value::Null,
         }
-        E::ApplyStarted { change_id, .. } => ("apply_started", Some(change_id.clone()), None),
-        E::ApplyCompleted { change_id, .. } => ("apply_completed", Some(change_id.clone()), None),
-        E::ApplyFailed { change_id, error } => {
-            ("apply_failed", Some(change_id.clone()), Some(error.clone()))
-        }
-        E::ApplyOutput { change_id, .. } => ("apply_output", Some(change_id.clone()), None),
-        E::ArchiveStarted { change_id, .. } => ("archive_started", Some(change_id.clone()), None),
+    }
+
+    fn command_facts(command: &str) -> serde_json::Value {
+        json!(crate::events::command_log_summary(command))
+    }
+
+    match event {
+        E::ProcessingStarted(id) => ("processing_started", Some(id.clone()), json!({})),
+        E::ProcessingCompleted(id) => ("processing_completed", Some(id.clone()), json!({})),
+        E::ProcessingError { id, error } => (
+            "processing_error",
+            Some(id.clone()),
+            json!({ "detail": detail(error) }),
+        ),
+        E::ApplyStarted { change_id, command } => (
+            "apply_started",
+            Some(change_id.clone()),
+            json!({ "command_summary": command_facts(command) }),
+        ),
+        E::ApplyCompleted {
+            change_id,
+            revision,
+        } => (
+            "apply_completed",
+            Some(change_id.clone()),
+            json!({ "revision": revision }),
+        ),
+        E::ApplyFailed { change_id, error } => (
+            "apply_failed",
+            Some(change_id.clone()),
+            json!({ "detail": detail(error) }),
+        ),
+        E::ApplyOutput {
+            change_id,
+            iteration,
+            ..
+        } => (
+            "apply_output",
+            Some(change_id.clone()),
+            json!({ "iteration": iteration }),
+        ),
+        E::ArchiveStarted { change_id, command } => (
+            "archive_started",
+            Some(change_id.clone()),
+            json!({ "command_summary": command_facts(command) }),
+        ),
         E::ArchiveResumed {
-            change_id, reason, ..
-        } => ("archive_resumed", Some(change_id.clone()), reason.clone()),
+            change_id,
+            reason,
+            summary,
+        } => (
+            "archive_resumed",
+            Some(change_id.clone()),
+            json!({ "detail": optional_detail(reason), "summary": optional_detail(summary) }),
+        ),
         E::ArchiveRetryScheduled {
-            change_id, reason, ..
+            change_id,
+            attempt,
+            max_attempts,
+            reason,
+            summary,
         } => (
             "archive_retry_scheduled",
             Some(change_id.clone()),
-            reason.clone(),
+            json!({
+                "detail": optional_detail(reason),
+                "summary": optional_detail(summary),
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+            }),
         ),
-        E::ChangeArchived(id) => ("change_archived", Some(id.clone()), None),
+        E::ChangeArchived(id) => ("change_archived", Some(id.clone()), json!({})),
         E::ArchiveFailed {
-            change_id, error, ..
+            change_id,
+            error,
+            reason,
+            summary,
         } => (
             "archive_failed",
             Some(change_id.clone()),
-            Some(error.clone()),
+            json!({
+                "detail": detail(error),
+                "reason": optional_detail(reason),
+                "summary": optional_detail(summary),
+            }),
         ),
-        E::ArchiveOutput { change_id, .. } => ("archive_output", Some(change_id.clone()), None),
-        E::AcceptanceStarted { change_id, .. } => {
-            ("acceptance_started", Some(change_id.clone()), None)
-        }
+        E::ArchiveOutput {
+            change_id,
+            iteration,
+            ..
+        } => (
+            "archive_output",
+            Some(change_id.clone()),
+            json!({ "iteration": iteration }),
+        ),
+        E::AcceptanceStarted { change_id, command } => (
+            "acceptance_started",
+            Some(change_id.clone()),
+            json!({ "command_summary": command_facts(command) }),
+        ),
         E::AcceptanceCompleted { change_id } => {
-            ("acceptance_completed", Some(change_id.clone()), None)
+            ("acceptance_completed", Some(change_id.clone()), json!({}))
         }
         E::AcceptanceFailed { change_id, error } => (
             "acceptance_failed",
             Some(change_id.clone()),
-            Some(error.clone()),
+            json!({ "detail": detail(error) }),
         ),
         E::ChangeRejected { change_id, reason } => (
             "change_rejected",
             Some(change_id.clone()),
-            Some(reason.clone()),
+            json!({ "detail": detail(reason) }),
         ),
-        E::RejectionReviewCompleted { change_id, .. } => {
-            ("rejection_review_completed", Some(change_id.clone()), None)
-        }
+        E::RejectionReviewCompleted { change_id, outcome } => (
+            "rejection_review_completed",
+            Some(change_id.clone()),
+            json!({ "outcome": rejection_outcome_name(*outcome) }),
+        ),
         E::RejectionReviewFailed { change_id, error } => (
             "rejection_review_failed",
             Some(change_id.clone()),
-            Some(error.clone()),
+            json!({ "detail": detail(error) }),
         ),
-        E::AcceptanceOutput { change_id, .. } => {
-            ("acceptance_output", Some(change_id.clone()), None)
-        }
-        E::ProgressUpdated { change_id, .. } => ("progress_updated", Some(change_id.clone()), None),
+        E::AcceptanceOutput {
+            change_id,
+            iteration,
+            ..
+        } => (
+            "acceptance_output",
+            Some(change_id.clone()),
+            json!({ "iteration": iteration }),
+        ),
+        E::ProgressUpdated {
+            change_id,
+            completed,
+            total,
+        } => (
+            "progress_updated",
+            Some(change_id.clone()),
+            json!({ "completed": completed, "total": total }),
+        ),
+
+        // Workspace lane.
+        E::WorkspaceCreated {
+            change_id,
+            workspace,
+        } => (
+            "workspace_created",
+            Some(change_id.clone()),
+            json!({ "workspace": detail(workspace) }),
+        ),
+        E::WorkspaceResumed {
+            change_id,
+            workspace,
+        } => (
+            "workspace_resumed",
+            Some(change_id.clone()),
+            json!({ "workspace": detail(workspace) }),
+        ),
+        E::WorkspacePreserved {
+            change_id,
+            workspace_name,
+        } => (
+            "workspace_preserved",
+            Some(change_id.clone()),
+            json!({ "workspace": detail(workspace_name) }),
+        ),
+        E::WorkspaceStatusUpdated {
+            change_id,
+            workspace_name,
+            status,
+        } => (
+            "workspace_status_updated",
+            Some(change_id.clone()),
+            json!({
+                "workspace": detail(workspace_name),
+                "status": format!("{status:?}"),
+            }),
+        ),
+
         // Post-archive and merge-lane transitions. They are the difference
         // between "archived" and "actually landed", so a controller that cannot
         // see them cannot tell a finished change from a waiting one.
-        E::ResolveStarted { change_id, .. } => ("resolve_started", Some(change_id.clone()), None),
+        E::ResolveStarted { change_id, command } => (
+            "resolve_started",
+            Some(change_id.clone()),
+            json!({ "command_summary": command_facts(command) }),
+        ),
         E::ResolveCompleted { change_id, .. } => {
-            ("resolve_completed", Some(change_id.clone()), None)
+            ("resolve_completed", Some(change_id.clone()), json!({}))
         }
         E::ResolveFailed { change_id, error } => (
             "resolve_failed",
             Some(change_id.clone()),
-            Some(error.clone()),
+            json!({ "detail": detail(error) }),
         ),
-        E::MergeCompleted { change_id, .. } => ("merge_completed", Some(change_id.clone()), None),
+        E::ResolveOutput {
+            change_id,
+            iteration,
+            ..
+        } => (
+            "resolve_output",
+            Some(change_id.clone()),
+            json!({ "iteration": iteration }),
+        ),
+        E::MergeCompleted {
+            change_id,
+            revision,
+        } => (
+            "merge_completed",
+            Some(change_id.clone()),
+            json!({ "revision": revision }),
+        ),
         E::MergeDeferred {
-            change_id, reason, ..
+            change_id,
+            reason,
+            auto_resumable,
         } => (
             "merge_deferred",
             Some(change_id.clone()),
-            Some(reason.clone()),
+            json!({ "detail": detail(reason), "auto_resumable": auto_resumable }),
         ),
-        E::PushStarted { change_id, .. } => ("push_started", Some(change_id.clone()), None),
-        E::PushCompleted { change_id, .. } => ("push_completed", Some(change_id.clone()), None),
+        E::PushStarted {
+            change_id,
+            remote,
+            branch,
+        } => (
+            "push_started",
+            Some(change_id.clone()),
+            json!({ "remote": detail(remote), "branch": detail(branch) }),
+        ),
+        E::PushCompleted {
+            change_id,
+            remote,
+            branch,
+        } => (
+            "push_completed",
+            Some(change_id.clone()),
+            json!({ "remote": detail(remote), "branch": detail(branch) }),
+        ),
         E::PushFailed {
-            change_id, error, ..
-        } => ("push_failed", Some(change_id.clone()), Some(error.clone())),
-        E::DependencyBlocked { change_id, .. } => {
-            ("dependency_blocked", Some(change_id.clone()), None)
-        }
-        E::DependencyResolved { change_id } => {
-            ("dependency_resolved", Some(change_id.clone()), None)
-        }
-        E::ChangeDequeued { change_id } => ("change_dequeued", Some(change_id.clone()), None),
-        // Process-level, not change-level.
-        E::Error { message } => ("process_error", None, Some(message.clone())),
-        E::Log(entry) => ("log", entry.change_id.clone(), None),
-        _ => ("orchestration_event", None, None),
-    };
+            change_id,
+            remote,
+            branch,
+            error,
+        } => (
+            "push_failed",
+            Some(change_id.clone()),
+            json!({
+                "detail": detail(error),
+                "remote": detail(remote),
+                "branch": detail(branch),
+            }),
+        ),
 
-    let payload = match &detail {
-        Some(detail) => json!({ "detail": detail }),
-        None => json!({}),
-    };
-    (event_type, change_id, payload)
+        // Scheduling and hold lane.
+        E::ChangeSkipped { change_id, reason } => (
+            "change_skipped",
+            Some(change_id.clone()),
+            json!({ "detail": detail(reason) }),
+        ),
+        E::DependencyBlocked {
+            change_id,
+            dependency_ids,
+        } => (
+            "dependency_blocked",
+            Some(change_id.clone()),
+            json!({ "dependency_ids": dependency_ids }),
+        ),
+        E::DependencyResolved { change_id } => {
+            ("dependency_resolved", Some(change_id.clone()), json!({}))
+        }
+        E::AcceptanceGated { change_id, blocker } => (
+            "acceptance_gated",
+            Some(change_id.clone()),
+            describe_blocker(blocker),
+        ),
+        E::ExecutionBlocked { change_id, blocker } => (
+            "execution_blocked",
+            Some(change_id.clone()),
+            describe_blocker(blocker),
+        ),
+
+        // Hook lane.
+        E::HookStarted {
+            change_id,
+            hook_type,
+        } => (
+            "hook_started",
+            Some(change_id.clone()),
+            json!({ "hook_type": detail(hook_type) }),
+        ),
+        E::HookCompleted {
+            change_id,
+            hook_type,
+        } => (
+            "hook_completed",
+            Some(change_id.clone()),
+            json!({ "hook_type": detail(hook_type) }),
+        ),
+        E::HookFailed {
+            change_id,
+            hook_type,
+            error,
+        } => (
+            "hook_failed",
+            Some(change_id.clone()),
+            json!({ "hook_type": detail(hook_type), "detail": detail(error) }),
+        ),
+
+        // Single-change stop lane.
+        E::ChangeDequeued { change_id } => ("change_dequeued", Some(change_id.clone()), json!({})),
+        E::ChangeStopped { change_id } => ("change_stopped", Some(change_id.clone()), json!({})),
+        E::ChangeStopFailed { change_id, error } => (
+            "change_stop_failed",
+            Some(change_id.clone()),
+            json!({ "detail": detail(error) }),
+        ),
+
+        // Process-level, not change-level.
+        E::Stopping => ("stopping", None, json!({})),
+        E::Stopped => ("stopped", None, json!({})),
+        E::AllCompleted => ("all_completed", None, json!({})),
+        E::Error { message } => ("process_error", None, json!({ "detail": detail(message) })),
+        E::Log(entry) => ("log", entry.change_id.clone(), json!({})),
+        E::ChangesRefreshed {
+            changes,
+            rejected_changes,
+            ..
+        } => (
+            "changes_refreshed",
+            None,
+            json!({ "changes": changes.len(), "rejected_changes": rejected_changes.len() }),
+        ),
+        E::WorktreesRefreshed { worktrees } => (
+            "worktrees_refreshed",
+            None,
+            json!({ "worktrees": worktrees.len() }),
+        ),
+
+        // Presentation-only detail. Ordered on the stream, never snapshot input.
+        E::CleanupStarted { workspace } => (
+            "cleanup_started",
+            None,
+            json!({ "workspace": detail(workspace) }),
+        ),
+        E::CleanupCompleted { workspace } => (
+            "cleanup_completed",
+            None,
+            json!({ "workspace": detail(workspace) }),
+        ),
+        E::MergeStarted { revisions } => ("merge_started", None, json!({ "revisions": revisions })),
+        E::MergeConflict { files } => ("merge_conflict", None, json!({ "files": files })),
+        E::ConflictResolutionStarted => ("conflict_resolution_started", None, json!({})),
+        E::ConflictResolutionCompleted => ("conflict_resolution_completed", None, json!({})),
+        E::ConflictResolutionFailed { error } => (
+            "conflict_resolution_failed",
+            None,
+            json!({ "detail": detail(error) }),
+        ),
+        E::AnalysisStarted {
+            remaining_changes,
+            attempt_id,
+        } => (
+            "analysis_started",
+            None,
+            json!({ "remaining_changes": remaining_changes, "attempt_id": attempt_id }),
+        ),
+        E::AnalysisOutput { iteration, .. } => {
+            ("analysis_output", None, json!({ "iteration": iteration }))
+        }
+        E::AnalysisCompleted { groups_found } => (
+            "analysis_completed",
+            None,
+            json!({ "groups_found": groups_found }),
+        ),
+        E::Warning { title, message } => (
+            "warning",
+            None,
+            json!({ "title": detail(title), "detail": detail(message) }),
+        ),
+        E::ParallelStartRejected { change_ids, reason } => (
+            "parallel_start_rejected",
+            None,
+            json!({ "change_ids": change_ids, "detail": detail(reason) }),
+        ),
+        E::BranchMergeStarted { branch_name } => (
+            "branch_merge_started",
+            None,
+            json!({ "branch": detail(branch_name) }),
+        ),
+        E::BranchMergeCompleted { branch_name } => (
+            "branch_merge_completed",
+            None,
+            json!({ "branch": detail(branch_name) }),
+        ),
+        E::BranchMergeFailed { branch_name, error } => (
+            "branch_merge_failed",
+            None,
+            json!({ "branch": detail(branch_name), "detail": detail(error) }),
+        ),
+    }
+}
+
+fn rejection_outcome_name(outcome: crate::events::RejectionOutcome) -> &'static str {
+    match outcome {
+        crate::events::RejectionOutcome::Confirm => "confirm",
+        crate::events::RejectionOutcome::Resume => "resume",
+        crate::events::RejectionOutcome::Block => "block",
+    }
+}
+
+/// Publish the reported blocker facts a hold carries.
+///
+/// The reducer classifies these facts into a lifecycle status; the stream
+/// publishes the facts themselves so a controller can explain the hold without
+/// re-reading a snapshot.
+fn describe_blocker(blocker: &crate::events::StalledBlocker) -> serde_json::Value {
+    let sanitize = crate::events::sanitize_detail;
+    json!({
+        "category": sanitize(&blocker.category),
+        "phase": sanitize(&blocker.phase),
+        "gate": sanitize(&blocker.gate),
+        "detail": sanitize(&blocker.error_summary),
+        "evidence": blocker
+            .evidence
+            .iter()
+            .map(|item| sanitize(item))
+            .collect::<Vec<_>>(),
+        "unblock_condition": blocker.unblock_condition.as_deref().map(sanitize),
+        "prerequisite_owner": blocker.prerequisite_owner.as_deref().map(sanitize),
+        "next_action": sanitize(&blocker.next_action),
+        "resumable": blocker.resumable,
+    })
 }

@@ -36,8 +36,8 @@ const NON_ACTIVITY_EVENT_TYPES: [&str; 6] = [
     "apply_output",
     "archive_output",
     "acceptance_output",
+    "resolve_output",
     "progress_updated",
-    "orchestration_event",
 ];
 
 /// Wire event types that begin a timed run for a change.
