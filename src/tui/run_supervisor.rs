@@ -32,6 +32,13 @@ use crate::tui::stop_classification::{collect_stop_activity_snapshot, StopActivi
 struct LaunchContext {
     repo_root: PathBuf,
     config: OrchestratorConfig,
+    /// The frontend *delivery* channel a spawned run publishes to.
+    ///
+    /// A run owns its own dispatch: it applies each event to the reducer and
+    /// projects it to `/api/v2` before handing it to this sink. Wiring the TUI's
+    /// producer channel here instead would route every one of those events back
+    /// through the TUI's producer boundary and apply it to the reducer a second
+    /// time — a doubled apply count, a doubled event sequence.
     tx: mpsc::Sender<OrchestratorEvent>,
     dynamic_queue: DynamicQueue,
     shared_state: Arc<tokio::sync::RwLock<OrchestratorState>>,

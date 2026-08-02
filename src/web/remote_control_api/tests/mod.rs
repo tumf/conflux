@@ -7,6 +7,7 @@ mod auth_tests;
 mod command_tests;
 mod compatibility_tests;
 mod dto_tests;
+mod event_ownership_tests;
 mod operator_snapshot_tests;
 mod projection_tests;
 mod read_tests;

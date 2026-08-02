@@ -71,6 +71,71 @@ pub async fn run_vcs_command<P: AsRef<Path>>(
     }
 }
 
+/// Result of a VCS command invocation that spawned successfully.
+///
+/// Unlike [`run_vcs_command`], a non-zero exit is not an error here. The caller
+/// classifies the failure itself, so the actual process exit code survives
+/// instead of being folded into a rendered error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VcsCommandOutput {
+    /// Rendered command line, for diagnostics.
+    pub command: String,
+    /// Process exit code, or `None` when the process was killed by a signal.
+    pub exit_code: Option<i32>,
+    /// Whether the process exited successfully.
+    pub success: bool,
+    /// Captured stdout.
+    pub stdout: String,
+    /// Captured stderr.
+    pub stderr: String,
+}
+
+/// Execute a VCS command and return its captured result without treating a
+/// non-zero exit as an error.
+///
+/// Only a spawn failure yields `Err`; every process that actually ran is
+/// reported through [`VcsCommandOutput`] so callers can distinguish a
+/// repository-level rejection from a fatal VCS failure by exit code.
+pub async fn run_vcs_command_captured<P: AsRef<Path>>(
+    program: &str,
+    args: &[&str],
+    cwd: P,
+    backend: VcsBackend,
+) -> VcsResult<VcsCommandOutput> {
+    let cwd_path = cwd.as_ref();
+    let command_str = format!("{} {}", program, args.join(" "));
+
+    debug!(
+        module = module_path!(),
+        "Executing {} command (captured): {} (cwd: {:?})",
+        program,
+        args.join(" "),
+        cwd_path
+    );
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(cwd_path)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::Command {
+            backend,
+            message: format!("Failed to execute {}: {}", program, e),
+            command: Some(command_str.clone()),
+            working_dir: Some(cwd_path.to_path_buf()),
+            stderr: None,
+            stdout: None,
+        })?;
+
+    Ok(VcsCommandOutput {
+        command: command_str,
+        exit_code: output.status.code(),
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
 /// Execute a VCS command without capturing output (fire-and-forget).
 ///
 /// Returns Ok(()) on success, error on failure.

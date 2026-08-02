@@ -9,7 +9,7 @@ use crate::error::Result;
 use crate::openspec::Change;
 // Note: acceptance_test_streaming and related types are no longer imported here
 // as they are handled by SerialRunService internally.
-use crate::events::EventSink;
+use crate::events::{EventDispatcher, EventSink};
 use crate::orchestration::output::{ChannelOutputHandler, ContextualOutputHandler, OutputMessage};
 use crate::parallel::PostArchiveAction;
 use crate::serial_run_service::SerialRunService;
@@ -149,21 +149,34 @@ fn post_archive_dispatch_event(
     None
 }
 
-async fn dispatch_event(
+/// Buffer for the dispatch bridge handed to `mpsc`-only producers.
+///
+/// Matches the TUI event channel it ultimately feeds, so bridging cannot make a
+/// producer block earlier than emitting straight to the frontend would have.
+const EVENT_BRIDGE_BUFFER: usize = 100;
+
+/// How long a boundary run waits for bridged producers to drain before it
+/// publishes its terminal event.
+const EVENT_BRIDGE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Build the frontend sinks attached to one orchestration boundary run.
+///
+/// The TUI channel and the web monitoring state are peers here: both are
+/// frontends of the same dispatch owner, neither reapplies the event to the
+/// reducer, and adding or removing one cannot change how many times a counter
+/// advances.
+fn boundary_event_sinks(
     tx: &mpsc::Sender<OrchestratorEvent>,
-    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
     #[cfg(feature = "web-monitoring")] web_state: Option<&Arc<crate::web::WebState>>,
-    event: OrchestratorEvent,
-) {
-    let _ = tx.send(event.clone()).await;
-    {
-        let mut state = shared_state.write().await;
-        crate::orchestration::state::OrchestratorState::apply_execution_event(&mut state, &event);
-    }
+) -> Vec<Arc<dyn EventSink>> {
+    // Without `web-monitoring` the TUI is the only frontend, so nothing pushes.
+    #[allow(unused_mut)]
+    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(TuiEventSink::new(tx.clone()))];
     #[cfg(feature = "web-monitoring")]
     if let Some(ws) = web_state {
-        crate::web::WebState::apply_execution_event(ws, &event).await;
+        sinks.push(Arc::new(crate::web::state::WebEventSink::new(ws.clone())));
     }
+    sinks
 }
 
 async fn initialize_parallel_shared_state(
@@ -224,7 +237,22 @@ pub async fn run_orchestrator(
     use crate::openspec;
 
     let repo_root = std::env::current_dir()?;
-    let hooks = HookRunner::with_event_tx(config.get_hooks(), &repo_root, tx.clone());
+
+    // One dispatch owner for the whole boundary run. Every producer below emits
+    // through it — directly, or through `event_bridge` when it can only speak
+    // `mpsc::Sender` — so no producer can reach one frontend while bypassing
+    // another.
+    let dispatcher = Arc::new(EventDispatcher::new(
+        shared_state.clone(),
+        boundary_event_sinks(
+            &tx,
+            #[cfg(feature = "web-monitoring")]
+            web_state.as_ref(),
+        ),
+    ));
+    let (event_bridge, event_bridge_handle) = dispatcher.bridge(EVENT_BRIDGE_BUFFER);
+
+    let hooks = HookRunner::with_event_tx(config.get_hooks(), &repo_root, event_bridge.clone());
     let max_iterations = config.get_max_iterations();
     // Note: acceptance_max_continues is now handled by SerialRunService
     let mut agent = AgentRunner::new(config.clone());
@@ -244,12 +272,6 @@ pub async fn run_orchestrator(
         }
     }
 
-    let mut sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(TuiEventSink::new(tx.clone()))];
-    #[cfg(feature = "web-monitoring")]
-    if let Some(ws) = &web_state {
-        sinks.push(Arc::new(crate::web::state::WebEventSink::new(ws.clone())));
-    }
-
     {
         let mut state = shared_state.write().await;
         *state = crate::orchestration::state::OrchestratorState::new(change_ids, max_iterations);
@@ -259,8 +281,8 @@ pub async fn run_orchestrator(
     let total_changes = shared_state.read().await.total_changes();
     let start_context = HookContext::new(0, total_changes, total_changes, false);
     if let Err(e) = hooks.run_hook(HookType::OnStart, &start_context).await {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+        dispatcher
+            .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                 "on_start hook failed: {}",
                 e
             ))))
@@ -271,8 +293,8 @@ pub async fn run_orchestrator(
     loop {
         // Check for cancellation before each iteration
         if cancel_token.is_cancelled() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::warn(
                     "Processing cancelled".to_string(),
                 )))
                 .await;
@@ -281,26 +303,26 @@ pub async fn run_orchestrator(
 
         // Check for graceful stop flag (stop after current change completes)
         if _graceful_stop_flag.load(Ordering::SeqCst) {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::info(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::info(
                     "Graceful stop: stopping after current change".to_string(),
                 )))
                 .await;
-            let _ = tx.send(OrchestratorEvent::Stopped).await;
+            dispatcher.dispatch(OrchestratorEvent::Stopped).await;
             break;
         }
 
         // Check max iterations limit (0 = no limit)
         let current_iteration = serial_service.iteration();
         if max_iterations > 0 && current_iteration >= max_iterations {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                     "Max iterations ({}) reached, stopping orchestration",
                     max_iterations
                 ))))
                 .await;
             // Send completion event
-            let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+            dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
             break;
         }
 
@@ -308,8 +330,8 @@ pub async fn run_orchestrator(
         if max_iterations > 0 {
             let warning_threshold = (max_iterations as f32 * 0.8) as u32;
             if current_iteration == warning_threshold {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                         "Approaching max iterations: {}/{}",
                         current_iteration, max_iterations
                     ))))
@@ -325,8 +347,8 @@ pub async fn run_orchestrator(
                 !state.is_archived(&dynamic_id) && !state.is_pending(&dynamic_id)
             };
             if should_add {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
                         "Processing dynamically added: {}",
                         dynamic_id
                     ))))
@@ -351,8 +373,8 @@ pub async fn run_orchestrator(
             }
 
             for id in removed_pending {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
                         "Removed from pending queue: {}",
                         id
                     ))))
@@ -371,8 +393,8 @@ pub async fn run_orchestrator(
 
         // Check for cancellation
         if cancel_token.is_cancelled() {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::warn(
                     "Processing cancelled".to_string(),
                 )))
                 .await;
@@ -412,16 +434,9 @@ pub async fn run_orchestrator(
             let change_stopped_event = OrchestratorEvent::ChangeDequeued {
                 change_id: change_id.clone(),
             };
-            dispatch_event(
-                &tx,
-                &shared_state,
-                #[cfg(feature = "web-monitoring")]
-                web_state.as_ref(),
-                change_stopped_event,
-            )
-            .await;
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::info(format!(
+            dispatcher.dispatch(change_stopped_event).await;
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
                     "Change stopped: {}",
                     change_id
                 ))))
@@ -431,23 +446,16 @@ pub async fn run_orchestrator(
 
         // Notify processing started
         let processing_started_event = OrchestratorEvent::ProcessingStarted(change_id.clone());
-        dispatch_event(
-            &tx,
-            &shared_state,
-            #[cfg(feature = "web-monitoring")]
-            web_state.as_ref(),
-            processing_started_event,
-        )
-        .await;
+        dispatcher.dispatch(processing_started_event).await;
 
         let remaining_changes = shared_state.read().await.remaining_changes();
 
         // Get current apply count for this change (before processing)
         let apply_count_before = shared_state.read().await.apply_count(&change_id);
 
-        // Create output handler that forwards to TUI events
+        // Create output handler that forwards through the dispatch owner.
         // Use Arc<RwLock<String>> to track current operation (apply/acceptance/archive/resolve)
-        let tx_clone = tx.clone();
+        let tx_clone = event_bridge.clone();
         let change_id_clone = change_id.clone();
         let apply_count_for_output = apply_count_before + 1; // Will be incremented in process_change
         let current_operation = std::sync::Arc::new(std::sync::RwLock::new("apply".to_string()));
@@ -567,14 +575,7 @@ pub async fn run_orchestrator(
             change_id: change_id.to_string(),
             command: apply_expanded_command,
         };
-        dispatch_event(
-            &tx,
-            &shared_state,
-            #[cfg(feature = "web-monitoring")]
-            web_state.as_ref(),
-            apply_started_event,
-        )
-        .await;
+        dispatcher.dispatch(apply_started_event).await;
 
         // Process the change using SerialRunService
         use crate::serial_run_service::ChangeProcessResult;
@@ -623,19 +624,12 @@ pub async fn run_orchestrator(
             output: String::new(),
             iteration: Some(apply_count),
         };
-        dispatch_event(
-            &tx,
-            &shared_state,
-            #[cfg(feature = "web-monitoring")]
-            web_state.as_ref(),
-            apply_output_event,
-        )
-        .await;
+        dispatcher.dispatch(apply_output_event).await;
 
         match result {
             Ok(ChangeProcessResult::Cancelled) => {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(
                         "Processing cancelled".to_string(),
                     )))
                     .await;
@@ -649,17 +643,10 @@ pub async fn run_orchestrator(
                 let change_stopped_event = OrchestratorEvent::ChangeDequeued {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    change_stopped_event,
-                )
-                .await;
+                dispatcher.dispatch(change_stopped_event).await;
 
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
                         "Change {} stopped, continuing with other queued changes",
                         change_id
                     ))))
@@ -674,53 +661,25 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
 
                 // Send AcceptanceStarted event
                 let acceptance_started_event = OrchestratorEvent::AcceptanceStarted {
                     change_id: change_id.clone(),
                     command: format!("opencode acceptance {}", change_id),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_started_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_started_event).await;
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_completed_event).await;
 
                 // Send ProcessingCompleted event
                 let processing_completed_event =
                     OrchestratorEvent::ProcessingCompleted(change_id.clone());
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    processing_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(processing_completed_event).await;
             }
             Ok(ChangeProcessResult::ApplySuccessIncomplete) => {
                 // Send ApplyCompleted event
@@ -728,14 +687,7 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
             }
             Ok(ChangeProcessResult::AcceptanceContinue) => {
                 // Send ApplyCompleted event
@@ -743,14 +695,7 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
 
                 // Note: AcceptanceStarted event is sent from acceptance_test_streaming
                 // with the actual command string (including diff context and last output)
@@ -759,14 +704,7 @@ pub async fn run_orchestrator(
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_completed_event).await;
             }
             Ok(ChangeProcessResult::AcceptanceContinueExceeded) => {
                 // Send ApplyCompleted event
@@ -774,27 +712,13 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_completed_event).await;
             }
             Ok(ChangeProcessResult::Rejected { reason }) => {
                 // Send ApplyCompleted event
@@ -802,46 +726,27 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
 
                 // Send AcceptanceCompleted event
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_completed_event).await;
 
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                         "Acceptance gated - rejection flow completed: {}",
                         reason
                     ))))
                     .await;
 
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    OrchestratorEvent::ChangeRejected {
+                dispatcher
+                    .dispatch(OrchestratorEvent::ChangeRejected {
                         change_id: change_id.clone(),
                         reason,
-                    },
-                )
-                .await;
+                    })
+                    .await;
             }
             Ok(ChangeProcessResult::AcceptanceFailed { .. }) => {
                 // Send ApplyCompleted event
@@ -849,14 +754,7 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
 
                 // Note: AcceptanceStarted event is sent from acceptance_test_streaming
                 // with the actual command string (including diff context and last output)
@@ -865,14 +763,7 @@ pub async fn run_orchestrator(
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_completed_event).await;
             }
             Ok(ChangeProcessResult::AcceptanceCommandFailed { error }) => {
                 // Send ApplyCompleted event
@@ -880,14 +771,7 @@ pub async fn run_orchestrator(
                     change_id: change_id.clone(),
                     revision: String::new(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    apply_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(apply_completed_event).await;
 
                 // Note: AcceptanceStarted event is sent from acceptance_test_streaming
                 // with the actual command string (including diff context and last output)
@@ -896,17 +780,10 @@ pub async fn run_orchestrator(
                 let acceptance_completed_event = OrchestratorEvent::AcceptanceCompleted {
                     change_id: change_id.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    acceptance_completed_event,
-                )
-                .await;
+                dispatcher.dispatch(acceptance_completed_event).await;
 
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::error(format!(
                         "Acceptance command failed: {}",
                         error
                     ))))
@@ -917,19 +794,12 @@ pub async fn run_orchestrator(
                     id: change_id.clone(),
                     error: error.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    processing_error_event,
-                )
-                .await;
+                dispatcher.dispatch(processing_error_event).await;
             }
             Ok(ChangeProcessResult::Archived) => {
                 // Change was complete and successfully archived
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::success(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::success(format!(
                         "Change {} archived successfully",
                         change_id
                     ))))
@@ -937,27 +807,13 @@ pub async fn run_orchestrator(
 
                 // Send ChangeArchived event
                 let change_archived_event = OrchestratorEvent::ChangeArchived(change_id.clone());
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    change_archived_event,
-                )
-                .await;
+                dispatcher.dispatch(change_archived_event).await;
                 let post_archive_event = {
                     let state = shared_state.read().await;
                     post_archive_dispatch_event(&state, &change_id)
                 };
                 if let Some(post_event) = post_archive_event {
-                    dispatch_event(
-                        &tx,
-                        &shared_state,
-                        #[cfg(feature = "web-monitoring")]
-                        web_state.as_ref(),
-                        post_event,
-                    )
-                    .await;
+                    dispatcher.dispatch(post_event).await;
                 }
             }
             // A validated acceptance stall carries structured blocker evidence,
@@ -966,14 +822,7 @@ pub async fn run_orchestrator(
             // opaque processing error.
             Ok(ref stalled @ ChangeProcessResult::AcceptanceStalled { ref error, .. }) => {
                 for event in stalled.stalled_lifecycle_events(&change_id) {
-                    dispatch_event(
-                        &tx,
-                        &shared_state,
-                        #[cfg(feature = "web-monitoring")]
-                        web_state.as_ref(),
-                        event,
-                    )
-                    .await;
+                    dispatcher.dispatch(event).await;
                 }
                 tracing::warn!(
                     change_id = %change_id,
@@ -988,14 +837,7 @@ pub async fn run_orchestrator(
                     id: change_id.clone(),
                     error: error.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    processing_error_event,
-                )
-                .await;
+                dispatcher.dispatch(processing_error_event).await;
 
                 // Remove stalled change from pending
                 shared_state.write().await.remove_from_pending(&change_id);
@@ -1005,14 +847,7 @@ pub async fn run_orchestrator(
                     id: change_id.clone(),
                     error: error.clone(),
                 };
-                dispatch_event(
-                    &tx,
-                    &shared_state,
-                    #[cfg(feature = "web-monitoring")]
-                    web_state.as_ref(),
-                    processing_error_event,
-                )
-                .await;
+                dispatcher.dispatch(processing_error_event).await;
             }
             Err(e) => {
                 // Check if this was a single-change stop (error message contains "Cancelled")
@@ -1024,16 +859,9 @@ pub async fn run_orchestrator(
                     let change_stopped_event2 = OrchestratorEvent::ChangeDequeued {
                         change_id: change_id.clone(),
                     };
-                    dispatch_event(
-                        &tx,
-                        &shared_state,
-                        #[cfg(feature = "web-monitoring")]
-                        web_state.as_ref(),
-                        change_stopped_event2,
-                    )
-                    .await;
-                    let _ = tx
-                        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+                    dispatcher.dispatch(change_stopped_event2).await;
+                    dispatcher
+                        .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
                             "Change stopped during execution: {}",
                             change_id
                         ))))
@@ -1046,14 +874,7 @@ pub async fn run_orchestrator(
                         id: change_id.clone(),
                         error: error_msg,
                     };
-                    dispatch_event(
-                        &tx,
-                        &shared_state,
-                        #[cfg(feature = "web-monitoring")]
-                        web_state.as_ref(),
-                        processing_error_event,
-                    )
-                    .await;
+                    dispatcher.dispatch(processing_error_event).await;
                     break;
                 }
             }
@@ -1065,16 +886,23 @@ pub async fn run_orchestrator(
     let complete_context =
         HookContext::new(state.changes_processed(), state.total_changes(), 0, false);
     if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+        dispatcher
+            .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                 "on_finish hook failed: {}",
                 e
             ))))
             .await;
     }
 
+    // Flush the bridged producers before the terminal event so a hook or output
+    // line cannot be ordered after completion. Bounded: a producer that somehow
+    // outlives the run must not be able to hold the boundary open.
+    drop(hooks);
+    drop(event_bridge);
+    let _ = tokio::time::timeout(EVENT_BRIDGE_DRAIN_TIMEOUT, event_bridge_handle).await;
+
     // Send completion event
-    let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+    dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
 
     Ok(())
 }
@@ -1106,8 +934,22 @@ pub async fn run_orchestrator_parallel(
     use crate::parallel::ParallelEvent;
     use crate::parallel_run_service::ParallelRunService;
 
-    let _ = tx
-        .send(OrchestratorEvent::Log(LogEntry::info(format!(
+    // The same dispatch owner serial mode uses. Parallel used to reach the TUI,
+    // the reducer, and the web state through three hand-written paths with
+    // different membership per event; routing the scheduler's event stream and
+    // the boundary's own events through one owner is what makes both modes
+    // deliver the same events to the same frontends.
+    let dispatcher = Arc::new(EventDispatcher::new(
+        shared_state.clone(),
+        boundary_event_sinks(
+            &tx,
+            #[cfg(feature = "web-monitoring")]
+            web_state.as_ref(),
+        ),
+    ));
+
+    dispatcher
+        .dispatch(OrchestratorEvent::Log(LogEntry::info(format!(
             "Starting parallel processing of {} change(s)",
             change_ids.len()
         ))))
@@ -1168,8 +1010,8 @@ pub async fn run_orchestrator_parallel(
 
     // Send initial ChangesRefreshed event with empty worktree data
     // (Worktree data will be populated during parallel execution)
-    let _ = tx
-        .send(OrchestratorEvent::ChangesRefreshed {
+    dispatcher
+        .dispatch(OrchestratorEvent::ChangesRefreshed {
             changes: all_changes,
             rejected_changes: crate::openspec::list_rejected_changes_native_from(&repo_root)
                 .unwrap_or_default(),
@@ -1182,27 +1024,6 @@ pub async fn run_orchestrator_parallel(
         })
         .await;
 
-    // Create WebState event forwarding channel and task
-    #[cfg(feature = "web-monitoring")]
-    let (web_event_tx, web_event_handle) = if let Some(web_state) = web_state.clone() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let handle = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                crate::web::WebState::apply_execution_event(&web_state, &event).await;
-                if matches!(
-                    event,
-                    crate::events::ExecutionEvent::AllCompleted
-                        | crate::events::ExecutionEvent::Stopped
-                ) {
-                    break;
-                }
-            }
-        });
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
-
     // Create event channel for forwarding to TUI
     let (parallel_tx, mut parallel_rx) = mpsc::channel::<ParallelEvent>(100);
 
@@ -1214,49 +1035,27 @@ pub async fn run_orchestrator_parallel(
     // those events and let a full channel block the very cleanup the outer
     // boundary is waiting for. It ends when the scheduler future is dropped and
     // closes the channel, or on a terminal event.
-    let forward_tx = tx.clone();
     let merge_deferred_stop = Arc::new(AtomicBool::new(false));
     let forward_merge_stop = merge_deferred_stop.clone();
-    let forward_shared_state = shared_state.clone();
-    #[cfg(feature = "web-monitoring")]
-    let forward_web_tx = web_event_tx.clone();
+    let forward_dispatcher = dispatcher.clone();
     let forward_handle = tokio::spawn(async move {
         while let Some(event) = parallel_rx.recv().await {
             match event {
                 ParallelEvent::AllCompleted => {
-                    // AllCompleted signals execution completion
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(tx) = &forward_web_tx {
-                        let _ = tx.send(ParallelEvent::AllCompleted);
-                    }
+                    // Execution is over, but whether it *completed* is the outer
+                    // boundary's call: it decides between completion and a stop
+                    // and publishes exactly one terminal event for both
+                    // frontends. Publishing one here too would give the remote
+                    // projection a completion the TUI never saw.
                     break;
                 }
                 ParallelEvent::Stopped => {
                     forward_merge_stop.store(true, Ordering::SeqCst);
-                    let _ = forward_tx.send(ParallelEvent::Stopped).await;
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(tx) = &forward_web_tx {
-                        let _ = tx.send(ParallelEvent::Stopped);
-                    }
+                    forward_dispatcher.dispatch(ParallelEvent::Stopped).await;
                     break;
                 }
                 parallel_event => {
-                    // Forward to TUI first (before acquiring write lock)
-                    // This prevents TUI updates from being blocked when acceptance tests run for a long time
-                    let _ = forward_tx.send(parallel_event.clone()).await;
-                    // Apply to shared orchestration state
-                    {
-                        let mut state = forward_shared_state.write().await;
-                        crate::orchestration::state::OrchestratorState::apply_execution_event(
-                            &mut state,
-                            &parallel_event,
-                        );
-                    }
-                    // Forward to WebState
-                    #[cfg(feature = "web-monitoring")]
-                    if let Some(tx) = &forward_web_tx {
-                        let _ = tx.send(parallel_event);
-                    }
+                    forward_dispatcher.dispatch(parallel_event).await;
                 }
             }
         }
@@ -1284,13 +1083,11 @@ pub async fn run_orchestrator_parallel(
         result = &mut scheduler => (ParallelTermination::SchedulerReturned, Some(result)),
         _ = cancel_token.cancelled() => {
             let change_ids: Vec<String> = changes_to_process.iter().map(|c| c.id.clone()).collect();
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+            dispatcher.dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                     "Cancelled parallel execution ({} changes: {})",
                     change_ids.len(),
                     change_ids.join(", ")
-                ))))
-                .await;
+                )))).await;
             drain_cancelled_scheduler(&mut scheduler, PARALLEL_CANCELLATION_CLEANUP_DEADLINE).await
         }
     };
@@ -1299,8 +1096,8 @@ pub async fn run_orchestrator_parallel(
         // Escalate to managed cleanup by dropping the scheduler, which aborts the
         // remaining work and releases its resources. This stays an operator
         // cancellation and is never reported as an execution failure.
-        let _ = tx
-            .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+        dispatcher
+            .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                 "Stop cleanup exceeded {}s; escalating to managed cleanup",
                 PARALLEL_CANCELLATION_CLEANUP_DEADLINE.as_secs()
             ))))
@@ -1338,27 +1135,25 @@ pub async fn run_orchestrator_parallel(
                 // The frontend may already have applied `Stopped`; that handler is
                 // idempotent, so a late delivery reconciles state without adding a
                 // duplicate terminal message.
-                let _ = tx.send(OrchestratorEvent::Stopped).await;
+                dispatcher.dispatch(OrchestratorEvent::Stopped).await;
             } else if scheduler_reported_stop {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                         "Execution stopped with deferred merges ({} changes processed)",
                         changes_to_process.len()
                     ))))
                     .await;
             } else {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::warn(format!(
+                dispatcher.dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
                         "Execution paused with reducer-owned lane retry work still pending or active ({} changes processed)",
                         changes_to_process.len()
-                    ))))
-                    .await;
+                    )))).await;
             }
         }
         ParallelTerminalReport::Failed => {
             if let Some(Err(e)) = &result {
-                let _ = tx
-                    .send(OrchestratorEvent::Log(LogEntry::error(format!(
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::error(format!(
                         "Execution failed: {}",
                         e
                     ))))
@@ -1366,8 +1161,8 @@ pub async fn run_orchestrator_parallel(
             }
         }
         ParallelTerminalReport::Completed => {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::success(format!(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::success(format!(
                     "Execution completed ({} changes processed)",
                     changes_to_process.len()
                 ))))
@@ -1375,31 +1170,24 @@ pub async fn run_orchestrator_parallel(
         }
     }
 
-    // Cleanup WebState event forwarding task
-    #[cfg(feature = "web-monitoring")]
-    if let Some(handle) = web_event_handle {
-        drop(web_event_tx);
-        let _ = handle.await;
-    }
-
     // Only send completion message and AllCompleted event if not stopped/cancelled
     match report {
         ParallelTerminalReport::Stopped => {}
         ParallelTerminalReport::Failed => {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::warn(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::warn(
                     "Processing completed with errors".to_string(),
                 )))
                 .await;
-            let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+            dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
         }
         ParallelTerminalReport::Completed => {
-            let _ = tx
-                .send(OrchestratorEvent::Log(LogEntry::success(
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::success(
                     "All parallel changes completed".to_string(),
                 )))
                 .await;
-            let _ = tx.send(OrchestratorEvent::AllCompleted).await;
+            dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
         }
     }
     Ok(())
