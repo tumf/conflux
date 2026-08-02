@@ -713,6 +713,202 @@ pub async fn list_worktrees<P: AsRef<Path>>(
     Ok(worktrees)
 }
 
+/// One registered worktree, reduced to the facts branch-identity validation needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRecord {
+    /// Absolute path as reported by `git worktree list --porcelain`.
+    pub path: PathBuf,
+    /// Commit currently checked out.
+    pub head: String,
+    /// Checked-out branch name, empty when detached.
+    pub branch: String,
+    /// Whether the worktree is in detached-HEAD state.
+    pub detached: bool,
+}
+
+/// Outcome of validating a supplied archive worktree path against Git metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeIdentity {
+    /// The supplied path is registered in this repository on the expected branch.
+    Supplied {
+        /// Registered worktree path.
+        path: PathBuf,
+        /// Branch tip commit.
+        tip: String,
+    },
+    /// The supplied path is gone and exactly one registered worktree holds the branch.
+    Rediscovered {
+        /// Registered worktree path.
+        path: PathBuf,
+        /// Branch tip commit.
+        tip: String,
+    },
+    /// Identity could not be proven; no worktree evidence may be used.
+    Unsafe {
+        /// Human-readable reason, suitable for resolve continuation guidance.
+        reason: String,
+    },
+}
+
+impl WorktreeIdentity {
+    /// Validated path and branch tip, or `None` when identity is unsafe.
+    pub fn resolved(&self) -> Option<(&Path, &str)> {
+        match self {
+            Self::Supplied { path, tip } | Self::Rediscovered { path, tip } => {
+                Some((path.as_path(), tip.as_str()))
+            }
+            Self::Unsafe { .. } => None,
+        }
+    }
+}
+
+/// Classify worktree identity from already-collected repository metadata.
+///
+/// Kept free of process and filesystem access so the fail-closed decision table
+/// is directly unit-testable: rediscovery is allowed only for a path that no
+/// longer exists, and never resolves a registered-but-mismatched path.
+pub fn classify_worktree_identity(
+    records: &[WorktreeRecord],
+    supplied_path: &Path,
+    supplied_exists: bool,
+    expected_branch: &str,
+) -> WorktreeIdentity {
+    let supplied_canonical = canonicalize_if_possible(supplied_path);
+    let registered: Vec<&WorktreeRecord> = records
+        .iter()
+        .filter(|record| canonicalize_if_possible(&record.path) == supplied_canonical)
+        .collect();
+
+    if registered.len() > 1 {
+        return WorktreeIdentity::Unsafe {
+            reason: format!(
+                "Worktree path '{}' is registered more than once; refusing ambiguous evidence",
+                supplied_path.display()
+            ),
+        };
+    }
+
+    if let Some(record) = registered.first() {
+        if record.detached {
+            return WorktreeIdentity::Unsafe {
+                reason: format!(
+                    "Worktree '{}' has a detached HEAD; expected branch '{}'",
+                    supplied_path.display(),
+                    expected_branch
+                ),
+            };
+        }
+        if record.branch != expected_branch {
+            return WorktreeIdentity::Unsafe {
+                reason: format!(
+                    "Worktree '{}' has branch '{}' checked out; expected '{}'",
+                    supplied_path.display(),
+                    record.branch,
+                    expected_branch
+                ),
+            };
+        }
+        if record.head.trim().is_empty() {
+            return WorktreeIdentity::Unsafe {
+                reason: format!(
+                    "Worktree '{}' reported no HEAD commit for branch '{}'",
+                    supplied_path.display(),
+                    expected_branch
+                ),
+            };
+        }
+        return WorktreeIdentity::Supplied {
+            path: record.path.clone(),
+            tip: record.head.trim().to_string(),
+        };
+    }
+
+    if supplied_exists {
+        return WorktreeIdentity::Unsafe {
+            reason: format!(
+                "Worktree path '{}' exists but is not registered in this repository; expected branch '{}'",
+                supplied_path.display(),
+                expected_branch
+            ),
+        };
+    }
+
+    let candidates: Vec<&WorktreeRecord> = records
+        .iter()
+        .filter(|record| !record.detached && record.branch == expected_branch)
+        .collect();
+
+    match candidates.as_slice() {
+        [record] if !record.head.trim().is_empty() => WorktreeIdentity::Rediscovered {
+            path: record.path.clone(),
+            tip: record.head.trim().to_string(),
+        },
+        [_] => WorktreeIdentity::Unsafe {
+            reason: format!(
+                "Rediscovered worktree for branch '{}' reported no HEAD commit",
+                expected_branch
+            ),
+        },
+        [] => WorktreeIdentity::Unsafe {
+            reason: format!(
+                "No registered worktree for branch '{}' (supplied path '{}' is gone)",
+                expected_branch,
+                supplied_path.display()
+            ),
+        },
+        _ => WorktreeIdentity::Unsafe {
+            reason: format!(
+                "Multiple registered worktrees hold branch '{}'; refusing ambiguous evidence",
+                expected_branch
+            ),
+        },
+    }
+}
+
+/// Collect registered worktrees as [`WorktreeRecord`]s.
+pub async fn worktree_records<P: AsRef<Path>>(repo_root: P) -> VcsResult<Vec<WorktreeRecord>> {
+    let worktrees = list_worktrees(repo_root).await?;
+    Ok(worktrees
+        .into_iter()
+        .map(|(path, head, branch, detached, _is_main)| WorktreeRecord {
+            path: PathBuf::from(path),
+            head,
+            branch,
+            detached,
+        })
+        .collect())
+}
+
+/// Validate a supplied archive worktree path against repository Git metadata.
+///
+/// Fails closed: a Git error, a missing registration, a detached HEAD, a
+/// different branch, or an ambiguous match all produce
+/// [`WorktreeIdentity::Unsafe`] rather than a usable path.
+pub async fn validate_worktree_identity<P: AsRef<Path>>(
+    repo_root: P,
+    supplied_path: &Path,
+    expected_branch: &str,
+) -> WorktreeIdentity {
+    let records = match worktree_records(repo_root).await {
+        Ok(records) => records,
+        Err(error) => {
+            return WorktreeIdentity::Unsafe {
+                reason: format!(
+                    "Failed to read worktree metadata for branch '{}': {}",
+                    expected_branch, error
+                ),
+            }
+        }
+    };
+
+    classify_worktree_identity(
+        &records,
+        supplied_path,
+        supplied_path.exists(),
+        expected_branch,
+    )
+}
+
 /// Check if a path is a git worktree (not the main repository).
 ///
 /// A worktree is considered valid if:
@@ -2056,5 +2252,197 @@ mod tests {
             .unwrap();
 
         assert!(!worktree_path.exists(), "worktree should be removed");
+    }
+
+    fn record(path: &str, head: &str, branch: &str, detached: bool) -> WorktreeRecord {
+        WorktreeRecord {
+            path: PathBuf::from(path),
+            head: head.to_string(),
+            branch: branch.to_string(),
+            detached,
+        }
+    }
+
+    /// Paths used here do not exist on disk, so `canonicalize_if_possible`
+    /// returns them unchanged and the decision table stays deterministic.
+    const MISSING: bool = false;
+    const PRESENT: bool = true;
+
+    #[test]
+    fn registered_supplied_path_on_the_expected_branch_is_used() {
+        let records = vec![
+            record("/repo", "aaa", "main", false),
+            record("/wt/change-a", "bbb", "ws-change-a", false),
+        ];
+
+        let identity =
+            classify_worktree_identity(&records, Path::new("/wt/change-a"), PRESENT, "ws-change-a");
+
+        assert_eq!(
+            identity,
+            WorktreeIdentity::Supplied {
+                path: PathBuf::from("/wt/change-a"),
+                tip: "bbb".to_string(),
+            }
+        );
+        assert_eq!(
+            identity.resolved().map(|(_, tip)| tip.to_string()),
+            Some("bbb".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_path_with_one_exact_branch_match_is_rediscovered() {
+        let records = vec![
+            record("/repo", "aaa", "main", false),
+            record("/wt/moved-change-a", "bbb", "ws-change-a", false),
+        ];
+
+        let identity =
+            classify_worktree_identity(&records, Path::new("/wt/change-a"), MISSING, "ws-change-a");
+
+        assert_eq!(
+            identity,
+            WorktreeIdentity::Rediscovered {
+                path: PathBuf::from("/wt/moved-change-a"),
+                tip: "bbb".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_and_ambiguous_branch_matches_fail_closed() {
+        let none = classify_worktree_identity(
+            &[record("/repo", "aaa", "main", false)],
+            Path::new("/wt/change-a"),
+            MISSING,
+            "ws-change-a",
+        );
+        assert!(matches!(none, WorktreeIdentity::Unsafe { .. }));
+
+        let ambiguous = classify_worktree_identity(
+            &[
+                record("/wt/one", "bbb", "ws-change-a", false),
+                record("/wt/two", "ccc", "ws-change-a", false),
+            ],
+            Path::new("/wt/change-a"),
+            MISSING,
+            "ws-change-a",
+        );
+        match ambiguous {
+            WorktreeIdentity::Unsafe { reason } => {
+                assert!(
+                    reason.contains("Multiple registered worktrees"),
+                    "{}",
+                    reason
+                )
+            }
+            other => panic!("expected unsafe identity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn wrong_branch_and_detached_head_are_never_rediscovered() {
+        let wrong_branch = classify_worktree_identity(
+            &[
+                record("/wt/change-a", "bbb", "ws-other", false),
+                record("/wt/elsewhere", "ccc", "ws-change-a", false),
+            ],
+            Path::new("/wt/change-a"),
+            PRESENT,
+            "ws-change-a",
+        );
+        match wrong_branch {
+            WorktreeIdentity::Unsafe { reason } => {
+                assert!(reason.contains("has branch 'ws-other'"), "{}", reason)
+            }
+            other => panic!(
+                "a registered path on the wrong branch must not silently resolve elsewhere, got {:?}",
+                other
+            ),
+        }
+
+        let detached = classify_worktree_identity(
+            &[record("/wt/change-a", "bbb", "", true)],
+            Path::new("/wt/change-a"),
+            PRESENT,
+            "ws-change-a",
+        );
+        match detached {
+            WorktreeIdentity::Unsafe { reason } => {
+                assert!(reason.contains("detached HEAD"), "{}", reason)
+            }
+            other => panic!("expected unsafe identity, got {:?}", other),
+        }
+
+        // A detached worktree also cannot satisfy rediscovery.
+        let detached_rediscovery = classify_worktree_identity(
+            &[record("/wt/elsewhere", "bbb", "ws-change-a", true)],
+            Path::new("/wt/change-a"),
+            MISSING,
+            "ws-change-a",
+        );
+        assert!(matches!(
+            detached_rediscovery,
+            WorktreeIdentity::Unsafe { .. }
+        ));
+    }
+
+    #[test]
+    fn existing_but_unregistered_path_is_unsafe_rather_than_rediscovered() {
+        // The path exists on disk but belongs to another repository, so
+        // rediscovery must not quietly substitute a different worktree.
+        let identity = classify_worktree_identity(
+            &[record("/wt/elsewhere", "bbb", "ws-change-a", false)],
+            Path::new("/wt/change-a"),
+            PRESENT,
+            "ws-change-a",
+        );
+
+        match identity {
+            WorktreeIdentity::Unsafe { reason } => {
+                assert!(
+                    reason.contains("not registered in this repository"),
+                    "{}",
+                    reason
+                )
+            }
+            other => panic!("expected unsafe identity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn duplicate_registration_of_the_supplied_path_is_unsafe() {
+        let identity = classify_worktree_identity(
+            &[
+                record("/wt/change-a", "bbb", "ws-change-a", false),
+                record("/wt/change-a", "ccc", "ws-change-a", false),
+            ],
+            Path::new("/wt/change-a"),
+            PRESENT,
+            "ws-change-a",
+        );
+        assert!(matches!(identity, WorktreeIdentity::Unsafe { .. }));
+    }
+
+    #[tokio::test]
+    async fn git_errors_surface_as_unsafe_identity() {
+        // Not a git repository: `git worktree list` fails and the failure must
+        // never be mistaken for "no worktrees registered".
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let identity =
+            validate_worktree_identity(temp.path(), &temp.path().join("missing"), "ws-change-a")
+                .await;
+
+        match identity {
+            WorktreeIdentity::Unsafe { reason } => {
+                assert!(
+                    reason.contains("Failed to read worktree metadata"),
+                    "{}",
+                    reason
+                )
+            }
+            other => panic!("expected unsafe identity, got {:?}", other),
+        }
     }
 }

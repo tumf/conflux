@@ -13,10 +13,101 @@ use std::path::PathBuf;
 
 use super::conflict;
 use super::events::send_event;
+use super::resolve_state::{self, GitResolveEvidence};
 use super::MergeTaskOutcome;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 use super::PostArchiveAction;
+
+/// One admitted change carried through the merge/resolve chain in declared order.
+///
+/// The archive worktree path is known only here, at merge admission. Dropping
+/// it and reconstructing paths later from `workspace_manager.workspaces()` is
+/// exactly the failure this type exists to prevent: a preserved archived
+/// worktree can be absent from that process-local list even though its path and
+/// Git state still exist, and resolve would then silently skip every piece of
+/// worktree evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequentialMergeItem {
+    /// Workspace branch name integrated into the target.
+    pub revision: String,
+    /// OpenSpec change identifier.
+    pub change_id: String,
+    /// Archive worktree path supplied at merge admission.
+    pub archive_path: PathBuf,
+    /// Branch base recorded at admission, when it was available there.
+    pub branch_base: Option<String>,
+}
+
+impl SequentialMergeItem {
+    /// Build an ordered batch from the parallel merge inputs.
+    ///
+    /// Cardinality or order loss is rejected here, before any agent runs, so a
+    /// truncated batch can never be silently resolved as if it were complete.
+    pub fn batch(
+        revisions: &[String],
+        change_ids: &[String],
+        archive_paths: &[PathBuf],
+    ) -> std::result::Result<Vec<Self>, String> {
+        if revisions.is_empty() {
+            return Err("Sequential merge batch has no revisions".to_string());
+        }
+        if revisions.len() != change_ids.len() {
+            return Err(format!(
+                "Expected {} change_ids for {} revisions",
+                revisions.len(),
+                change_ids.len()
+            ));
+        }
+        if revisions.len() != archive_paths.len() {
+            return Err(format!(
+                "Expected {} archive paths for {} revisions",
+                revisions.len(),
+                archive_paths.len()
+            ));
+        }
+
+        let mut items = Vec::with_capacity(revisions.len());
+        for ((revision, change_id), archive_path) in revisions
+            .iter()
+            .zip(change_ids.iter())
+            .zip(archive_paths.iter())
+        {
+            if revision.trim().is_empty() {
+                return Err("Sequential merge batch has an empty revision".to_string());
+            }
+            if change_id.trim().is_empty() {
+                return Err(format!(
+                    "Sequential merge batch has an empty change_id for revision '{}'",
+                    revision
+                ));
+            }
+            if archive_path.as_os_str().is_empty() {
+                return Err(format!(
+                    "Sequential merge batch has an empty archive path for change '{}'",
+                    change_id
+                ));
+            }
+            items.push(Self {
+                revision: revision.clone(),
+                change_id: change_id.clone(),
+                archive_path: archive_path.clone(),
+                branch_base: None,
+            });
+        }
+        Ok(items)
+    }
+
+    /// Branch names in declared order.
+    pub fn revisions(items: &[Self]) -> Vec<String> {
+        items.iter().map(|item| item.revision.clone()).collect()
+    }
+
+    /// Change identifiers in declared order.
+    pub fn change_ids(items: &[Self]) -> Vec<String> {
+        items.iter().map(|item| item.change_id.clone()).collect()
+    }
+}
 
 fn on_merged_failure_message(change_id: &str, error: &OrchestratorError) -> String {
     format!(
@@ -669,13 +760,11 @@ impl ParallelExecutor {
             return Ok(MergeAttempt::Deferred(DeferredMerge::manual(reason)));
         }
 
-        if change_ids.len() != archive_paths.len() {
-            return Err(OrchestratorError::GitCommand(format!(
-                "Expected {} archive paths for {} changes",
-                change_ids.len(),
-                archive_paths.len()
-            )));
-        }
+        // The ordered batch is built before any agent runs so cardinality or
+        // order loss fails here rather than surfacing later as skipped
+        // worktree evidence.
+        let batch = SequentialMergeItem::batch(revisions, change_ids, archive_paths)
+            .map_err(OrchestratorError::GitCommand)?;
 
         let primary_change_id = change_ids
             .first()
@@ -791,7 +880,7 @@ impl ParallelExecutor {
                 .await;
             }
 
-            self.merge_and_resolve(revisions, change_ids).await?
+            self.merge_and_resolve(&batch).await?
         };
 
         // The base lane is still owned here. Publication runs inside it so the
@@ -1160,16 +1249,12 @@ impl ParallelExecutor {
         }
     }
 
-    /// Merge revisions and resolve any conflicts
-    pub(super) async fn merge_and_resolve(
-        &self,
-        revisions: &[String],
-        change_ids: &[String],
-    ) -> Result<String> {
-        let change_ids_vec = change_ids.to_vec();
+    /// Merge the ordered batch and resolve any conflicts.
+    pub(super) async fn merge_and_resolve(&self, items: &[SequentialMergeItem]) -> Result<String> {
+        let change_ids_vec = SequentialMergeItem::change_ids(items);
         let shared_stagger_state = self.shared_stagger_state.clone();
         let auto_resolve_count = self.auto_resolve_count.clone();
-        self.merge_and_resolve_with(revisions, change_ids, |revisions, details| {
+        self.merge_and_resolve_with(items, |revisions, details| {
             let change_ids_clone = change_ids_vec.clone();
             let shared_stagger_state_clone = shared_stagger_state.clone();
             let auto_resolve_count_clone = auto_resolve_count.clone();
@@ -1193,8 +1278,7 @@ impl ParallelExecutor {
 
     pub(super) async fn merge_and_resolve_with<'a, F, Fut>(
         &'a self,
-        revisions: &'a [String],
-        change_ids: &'a [String],
+        items: &'a [SequentialMergeItem],
         mut resolve_conflicts: F,
     ) -> Result<String>
     where
@@ -1202,6 +1286,10 @@ impl ParallelExecutor {
         Fut: std::future::Future<Output = Result<()>> + Send + 'a,
     {
         let max_attempts = self.max_conflict_retries.max(1);
+        let revisions = SequentialMergeItem::revisions(items);
+        let revisions = revisions.as_slice();
+        let change_ids = SequentialMergeItem::change_ids(items);
+        let change_ids = change_ids.as_slice();
 
         send_event(
             &self.event_tx,
@@ -1222,20 +1310,11 @@ impl ParallelExecutor {
                 .await
                 .map_err(OrchestratorError::from_vcs_error)?;
 
-            if change_ids.len() != revisions.len() {
-                return Err(OrchestratorError::GitCommand(format!(
-                    "Expected {} change_ids for {} revisions",
-                    revisions.len(),
-                    change_ids.len()
-                )));
-            }
-
             conflict::resolve_merges_with_retry(conflict::ResolveMergesWithRetryArgs {
                 workspace_manager: self.workspace_manager.as_ref(),
                 config: &self.config,
                 event_tx: &self.event_tx,
-                revisions,
-                change_ids,
+                items,
                 target_branch: target_branch.as_str(),
                 base_revision: base_revision.as_str(),
                 max_retries: max_attempts,
@@ -1249,8 +1328,7 @@ impl ParallelExecutor {
             })
             .await?;
 
-            self.verify_merge_commits(&base_revision, &target_branch, change_ids, revisions)
-                .await?;
+            self.verify_merge_commits(&base_revision, items).await?;
 
             let merge_revision = self.workspace_manager.get_current_revision().await?;
 
@@ -1370,66 +1448,26 @@ impl ParallelExecutor {
         ))
     }
 
+    /// Verify final integration of every batch item.
+    ///
+    /// Delegates to the same verifier the resolve retry classifier uses, so the
+    /// two callers cannot drift into different notions of "integrated".
     pub(super) async fn verify_merge_commits(
         &self,
         base_revision: &str,
-        _target_branch: &str,
-        change_ids: &[String],
-        revisions: &[String],
+        items: &[SequentialMergeItem],
     ) -> Result<()> {
-        if matches!(
+        if !matches!(
             self.workspace_manager.backend_type(),
             VcsBackend::Git | VcsBackend::Auto
         ) {
-            let repo_root = self.workspace_manager.repo_root();
-            let missing =
-                git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
-                    .await
-                    .map_err(OrchestratorError::from_vcs_error)?;
-
-            if !missing.is_empty() {
-                // Filter out changes integrated via fast-forward.
-                // A fast-forward merge does not create a merge commit, so
-                // missing_merge_commits_since reports it as missing. Check if the
-                // worktree branch tip is an ancestor of HEAD (i.e. content is
-                // already on the target branch).
-                let mut truly_missing: Vec<String> = Vec::new();
-                for missing_id in &missing {
-                    let revision = revisions
-                        .iter()
-                        .zip(change_ids.iter())
-                        .find(|(_, cid)| *cid == missing_id)
-                        .map(|(rev, _)| rev.as_str());
-
-                    if let Some(rev) = revision {
-                        let is_integrated = git_commands::is_ancestor(repo_root, rev, "HEAD")
-                            .await
-                            .unwrap_or(false);
-                        if is_integrated {
-                            tracing::info!(
-                                "Change '{}' (branch '{}') integrated via fast-forward; \
-                                 skipping merge commit check",
-                                missing_id,
-                                rev
-                            );
-                        } else {
-                            truly_missing.push(missing_id.clone());
-                        }
-                    } else {
-                        truly_missing.push(missing_id.clone());
-                    }
-                }
-
-                if !truly_missing.is_empty() {
-                    return Err(OrchestratorError::GitCommand(format!(
-                        "Missing merge commit message containing change_id(s): {}",
-                        truly_missing.join(", ")
-                    )));
-                }
-            }
+            return Ok(());
         }
 
-        Ok(())
+        let evidence = GitResolveEvidence::new(self.workspace_manager.repo_root());
+        resolve_state::verify_final_integration(&evidence, items, base_revision)
+            .await
+            .map_err(OrchestratorError::GitCommand)
     }
 }
 
