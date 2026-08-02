@@ -1,24 +1,51 @@
-//! Legacy compatibility tests.
+//! Route-surface tests for the single-instance web server.
 //!
-//! Adding `/api/v2` must be additive. These tests fail if the legacy surface
-//! loses a route, changes shape, or starts demanding v2's credentials — which is
-//! exactly what would break the dashboard shipped in this binary.
+//! The legacy unversioned `/api/*` and `/ws` surface is gone: the embedded
+//! console is a `/api/v2` client now, so a second, unauthenticated contract
+//! would only be a way around v2's bearer policy, revision checks, and typed
+//! errors. These tests assert both halves of that removal — the legacy paths are
+//! absent and cannot cause a side effect, and everything the console actually
+//! needs is still served.
 
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use tokio::sync::mpsc;
 use tower::ServiceExt;
 
-use crate::web::state::WebState;
+use crate::web::state::{ControlCommand, WebState};
 use crate::web::WebConfig;
 
 use super::{json_body, send};
 
-/// The full single-instance app: legacy routes plus `/api/v2`.
-fn full_app(config: &WebConfig) -> axum::Router {
-    let state = Arc::new(WebState::new(&[]));
+/// Every legacy single-instance route, including the mutating ones.
+const REMOVED_LEGACY_ROUTES: [(Method, &str); 17] = [
+    (Method::GET, "/api/health"),
+    (Method::GET, "/api/state"),
+    (Method::GET, "/api/changes"),
+    (Method::GET, "/api/changes/some-change"),
+    (Method::POST, "/api/control/start"),
+    (Method::POST, "/api/control/stop"),
+    (Method::POST, "/api/control/cancel-stop"),
+    (Method::POST, "/api/control/force-stop"),
+    (Method::POST, "/api/control/retry"),
+    (Method::GET, "/api/worktrees"),
+    (Method::POST, "/api/worktrees/refresh"),
+    (Method::POST, "/api/worktrees/create"),
+    (Method::POST, "/api/worktrees/delete"),
+    (Method::POST, "/api/worktrees/merge"),
+    (Method::POST, "/api/worktrees/command"),
+    (Method::GET, "/ws"),
+    (Method::GET, "/api/v1/projects"),
+];
+
+fn app_with(state: Arc<WebState>, config: &WebConfig) -> axum::Router {
     crate::web::build_app_for_test(config, state)
+}
+
+fn app(config: &WebConfig) -> axum::Router {
+    app_with(Arc::new(WebState::new(&[])), config)
 }
 
 fn request(method: Method, uri: &str) -> Request<Body> {
@@ -31,98 +58,159 @@ fn request(method: Method, uri: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn legacy_monitoring_routes_stay_available_and_unauthenticated() {
-    // v2 requires a token here; the legacy surface must be unaffected by that.
-    let config = WebConfig::enabled(0, "127.0.0.1".to_string()).with_auth(
-        Some("v2-token".to_string()),
-        None,
-        Vec::new(),
-    );
-    let app = full_app(&config);
-
-    let response = app
-        .clone()
-        .oneshot(request(Method::GET, "/api/health"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert_eq!(body["status"], "ok", "legacy health keeps its own shape");
-
-    let response = app
-        .clone()
-        .oneshot(request(Method::GET, "/api/state"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert!(
-        body.get("changes").is_some() && body.get("app_mode").is_some(),
-        "legacy state keeps its own snapshot shape, not the v2 one"
-    );
-
-    let response = app
-        .oneshot(request(Method::GET, "/api/changes"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn legacy_control_and_worktree_routes_remain_mounted() {
+async fn every_legacy_single_instance_route_is_absent() {
     let config = WebConfig::enabled(0, "127.0.0.1".to_string());
-    let app = full_app(&config);
+    let app = app(&config);
 
-    for (method, path) in [
-        (Method::POST, "/api/control/start"),
-        (Method::POST, "/api/control/stop"),
-        (Method::POST, "/api/control/cancel-stop"),
-        (Method::POST, "/api/control/force-stop"),
-        (Method::POST, "/api/control/retry"),
-        (Method::GET, "/api/worktrees"),
-    ] {
+    for (method, path) in REMOVED_LEGACY_ROUTES {
         let response = app
             .clone()
             .oneshot(request(method.clone(), path))
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             response.status(),
             StatusCode::NOT_FOUND,
-            "{path} must stay mounted"
-        );
-        assert_ne!(
-            response.status(),
-            StatusCode::METHOD_NOT_ALLOWED,
-            "{path} must keep accepting {method}"
+            "{method} {path} must be removed, not merely unauthenticated"
         );
     }
 }
 
 #[tokio::test]
-async fn the_legacy_browser_websocket_and_dashboard_files_remain_available() {
+async fn removed_legacy_routes_are_absent_even_when_v2_requires_a_token() {
+    // A 401 here would mean the route still exists behind auth. It must not.
     let config = WebConfig::enabled(0, "127.0.0.1".to_string()).with_auth(
         Some("v2-token".to_string()),
         None,
         Vec::new(),
     );
-    let app = full_app(&config);
+    let app = app(&config);
 
-    // The dashboard is a browser client and cannot set an Authorization header,
-    // which is precisely why it stays on `/ws` instead of migrating to v2.
+    for (method, path) in REMOVED_LEGACY_ROUTES {
+        let response = app
+            .clone()
+            .oneshot(request(method.clone(), path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_to_a_removed_mutation_route_has_no_side_effect() {
+    let state = Arc::new(WebState::new(&[]));
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
+    state.set_control_channel(control_tx).await;
+
+    let config = WebConfig::enabled(0, "127.0.0.1".to_string());
+    let app = app_with(state, &config);
+
+    for (method, path) in REMOVED_LEGACY_ROUTES {
+        if method != Method::POST {
+            continue;
+        }
+        let response = app.clone().oneshot(request(method, path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    assert!(
+        control_rx.try_recv().is_err(),
+        "no removed route may reach the orchestration control channel"
+    );
+}
+
+#[tokio::test]
+async fn the_embedded_console_assets_are_served_with_their_own_content_types() {
+    let config = WebConfig::enabled(0, "127.0.0.1".to_string()).with_auth(
+        Some("v2-token".to_string()),
+        None,
+        Vec::new(),
+    );
+    let app = app(&config);
+
+    // Static delivery is never gated by the v2 bearer policy: the browser has to
+    // load the console before it can ask the user for a token.
+    for (path, content_type) in [
+        ("/", "text/html"),
+        ("/style.css", "text/css"),
+        ("/app.js", "application/javascript"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(Method::GET, path))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let header = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            header.starts_with(content_type),
+            "{path} served as '{header}', expected {content_type}"
+        );
+    }
+
     let response = app
-        .clone()
-        .oneshot(request(Method::GET, "/ws"))
+        .oneshot(request(Method::GET, "/not-a-real-asset.png"))
         .await
         .unwrap();
-    assert_ne!(response.status(), StatusCode::NOT_FOUND);
-    assert_ne!(
-        response.status(),
-        StatusCode::UNAUTHORIZED,
-        "v2 credentials must not be imposed on the legacy WebSocket"
-    );
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
 
-    for path in ["/", "/style.css", "/app.js"] {
+#[tokio::test]
+async fn the_console_html_references_only_the_retained_assets() {
+    let config = WebConfig::enabled(0, "127.0.0.1".to_string());
+    let app = app(&config);
+
+    let response = app.oneshot(request(Method::GET, "/")).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(html.contains("/style.css"));
+    assert!(html.contains("/app.js"));
+}
+
+#[tokio::test]
+async fn the_shipped_client_targets_no_legacy_route() {
+    // The assertion is over the embedded bytes rather than the working tree, so
+    // it also covers a stale build of the console.
+    let client = crate::web::static_files::APP_JS;
+    for legacy in [
+        "/api/health",
+        "/api/state",
+        "/api/changes",
+        "/api/control/",
+        "/api/worktrees",
+        "'/ws'",
+        "\"/ws\"",
+    ] {
+        assert!(
+            !client.contains(legacy),
+            "the console must not reference the removed route {legacy}"
+        );
+    }
+    assert!(client.contains("/api/v2/state"));
+    assert!(client.contains("/api/v2/commands"));
+}
+
+#[tokio::test]
+async fn the_versioned_surface_and_its_documents_remain_available() {
+    let config = WebConfig::enabled(0, "127.0.0.1".to_string());
+    let app = app(&config);
+
+    for path in [
+        "/api/v2/health",
+        "/api/v2/capabilities",
+        "/api/v2/instance",
+        "/api/v2/state",
+        "/api/v2/changes",
+        "/api/v2/logs",
+    ] {
         let response = app
             .clone()
             .oneshot(request(Method::GET, path))
@@ -130,16 +218,6 @@ async fn the_legacy_browser_websocket_and_dashboard_files_remain_available() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
-}
-
-#[tokio::test]
-async fn openapi_documents_and_swagger_ui_are_available() {
-    let config = WebConfig::enabled(0, "127.0.0.1".to_string()).with_auth(
-        Some("v2-token".to_string()),
-        None,
-        Vec::new(),
-    );
-    let app = full_app(&config);
 
     let response = app
         .clone()
@@ -149,6 +227,10 @@ async fn openapi_documents_and_swagger_ui_are_available() {
     assert_eq!(response.status(), StatusCode::OK);
     let document = json_body(response).await;
     assert!(document["paths"].get("/api/v2/commands").is_some());
+    assert!(
+        document["paths"].get("/api/state").is_none(),
+        "the generated document must not describe a removed route"
+    );
 
     let response = app
         .clone()
@@ -161,45 +243,34 @@ async fn openapi_documents_and_swagger_ui_are_available() {
         "application/yaml"
     );
 
-    let response = app
-        .oneshot(request(Method::GET, "/api/v2/docs/"))
-        .await
-        .unwrap();
+    let response = send(&app, request(Method::GET, "/api/v2/docs/")).await;
     assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn v2_is_mounted_next_to_the_legacy_surface_not_inside_it() {
+async fn static_delivery_carries_no_permissive_cors_header() {
     let config = WebConfig::enabled(0, "127.0.0.1".to_string());
-    let app = full_app(&config);
+    let app = app(&config);
 
-    let legacy = json_body(
-        app.clone()
-            .oneshot(request(Method::GET, "/api/health"))
-            .await
-            .unwrap(),
-    )
-    .await;
-    let v2 = json_body(
-        app.clone()
-            .oneshot(request(Method::GET, "/api/v2/health"))
-            .await
-            .unwrap(),
-    )
-    .await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
+    assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        legacy.get("api_version").is_none(),
-        "legacy health is unversioned"
-    );
-    assert_eq!(v2["api_version"], "v2");
-
-    // `/api/v1` was the removed multi-project namespace. Nothing may answer for
-    // it, so a reintroduced multi-project surface fails here.
-    let response = send(&app, request(Method::GET, "/api/v1/projects")).await;
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "the removed multi-project namespace must not be served"
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "the permissive legacy CORS layer must be gone"
     );
 }

@@ -36,28 +36,34 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 
 ## ダッシュボード機能
 
-- **ダッシュボード UI**: `http://localhost:<port>/` で進捗を確認
-- **リアルタイム更新**: WebSocket 接続で進捗をライブ更新
-- **REST API**: 状態をプログラムから取得可能
+- **オペレーターコンソール**: `http://localhost:<port>/` で進捗を確認
+- **リアルタイム更新**: `/api/v2` イベントストリームで進捗をライブ更新
+- **バージョン付き REST API**: 状態取得とコマンド送信をプログラムから実行可能
 - **QR コードポップアップ**: TUI で `w` を押すとモバイル向けの QR コードを表示
 
 ## REST API エンドポイント
 
+コンソールは純粋な `/api/v2` クライアントです。読み取り・イベント・変更操作の
+すべてがバージョン付きリモートコントロール契約を通ります。バージョンなしの
+`/api/*` や `/ws` サーフェスは存在しません。
+
 | エンドポイント | メソッド | 説明 |
 |----------|--------|-------------|
-| `/api/health` | GET | ヘルスチェック |
-| `/api/state` | GET | オーケストレーター全状態 |
-| `/api/changes` | GET | 進捗付きの変更一覧 |
-| `/api/changes/{id}` | GET | 特定変更の詳細 |
+| `/api/v2/health` | GET | ヘルスチェック |
+| `/api/v2/state` | GET | オーケストレーター全状態 |
+| `/api/v2/changes` | GET | 進捗付きの変更一覧 |
+| `/api/v2/changes/{id}` | GET | 特定変更の詳細 |
+| `/api/v2/commands` | POST | 制御コマンドの送信 |
 
-バージョン付きリモート制御 API は `/api/v2` にあります。詳細は
+認証・リビジョン・冪等性の詳細は
 [USAGE.md](USAGE.md#remote-control-api-apiv2) を参照してください。
 
 完全な API 仕様は [../openapi.yaml](../openapi.yaml) を参照してください。
 
-## WebSocket
+## イベントストリーム
 
-リアルタイム状態更新のために `ws://localhost:<port>/ws` へ接続します。メッセージは以下形式の JSON です:
+リアルタイム状態更新のために `/api/v2/events`（SSE）または
+`ws://localhost:<port>/api/v2/ws` へ接続します。メッセージは以下形式の JSON です:
 
 ```json
 {

@@ -8,7 +8,7 @@ use crate::tui::types::WorktreeInfo;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 #[cfg(feature = "web-monitoring")]
 use utoipa::ToSchema;
@@ -24,33 +24,16 @@ pub enum ControlCommand {
     CancelStop,
     /// Force stop immediately
     ForceStop,
-    /// Retry error changes
+    /// Retry error changes.
+    ///
+    /// Retained because both frontend bridges implement it, but nothing produces
+    /// it today: `/api/v2` routes retry through the shared operator command
+    /// service instead of this channel.
+    #[allow(dead_code)]
     Retry,
 }
 
-/// State update message sent to WebSocket clients
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
-pub struct StateUpdate {
-    /// Type of update message
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    /// ISO 8601 timestamp
-    pub timestamp: String,
-    /// List of changes with current status
-    pub changes: Vec<ChangeStatus>,
-    /// Log entries (optional, sent with log events)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logs: Option<Vec<LogEntry>>,
-    /// Worktree list (optional, sent with worktree refresh events)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worktrees: Option<Vec<WorktreeInfo>>,
-    /// Application mode (optional, sent with mode change events)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_mode: Option<String>,
-}
-
-/// Change status for WebSocket updates
+/// Change status projected into the `/api/v2` snapshot
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct ChangeStatus {
@@ -284,12 +267,10 @@ impl EventSink for WebEventSink {
     async fn on_state_changed(&self, _state: &crate::orchestration::state::OrchestratorState) {}
 }
 
-/// Shared web state with broadcast channel for updates
+/// Shared web state behind the `/api/v2` projection.
 pub struct WebState {
     /// Current orchestrator state snapshot (thread-safe)
     state: RwLock<OrchestratorStateSnapshot>,
-    /// Broadcast channel for state updates
-    tx: broadcast::Sender<StateUpdate>,
     /// Control command channel (optional, only used when web control is enabled)
     /// Uses Mutex for interior mutability to allow setting after Arc creation
     control_tx: Mutex<Option<mpsc::UnboundedSender<ControlCommand>>>,
@@ -308,12 +289,10 @@ pub struct WebState {
 impl WebState {
     /// Create a new WebState with initial changes
     pub fn new(initial_changes: &[Change]) -> Self {
-        let (tx, _) = broadcast::channel(100);
         let state = OrchestratorStateSnapshot::from_changes(initial_changes);
 
         Self {
             state: RwLock::new(state),
-            tx,
             control_tx: Mutex::new(None),
             shared_orchestrator_state: tokio::sync::RwLock::new(None),
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
@@ -454,20 +433,9 @@ impl WebState {
             }
         }
 
-        // Check if state has actually changed
-        let has_changes = !self
-            .compute_diff(&old_changes, &new_state.changes)
-            .is_empty();
-
-        // Update internal state
         {
             let mut state = self.state.write().await;
-            *state = new_state.clone();
-        }
-
-        // Only broadcast if there were changes
-        if has_changes {
-            self.broadcast_snapshot(new_state.changes).await;
+            *state = new_state;
         }
 
         self.sync_remote_control_projection().await;
@@ -494,13 +462,9 @@ impl WebState {
         new_state.app_mode = app_mode.to_string();
 
         // Preserve progress, queue_status, and is_resolving from existing state
-        let (old_changes, old_app_mode, old_is_resolving) = {
+        let (old_changes, old_is_resolving) = {
             let old_state = self.state.read().await;
-            (
-                old_state.changes.clone(),
-                old_state.app_mode.clone(),
-                old_state.is_resolving,
-            )
+            (old_state.changes.clone(), old_state.is_resolving)
         };
 
         // Preserve is_resolving to prevent overwriting runtime state
@@ -529,21 +493,9 @@ impl WebState {
             }
         }
 
-        // Check if state has actually changed (changes OR app_mode)
-        let has_changes = !self
-            .compute_diff(&old_changes, &new_state.changes)
-            .is_empty();
-        let app_mode_changed = new_state.app_mode != old_app_mode;
-
-        // Update internal state
         {
             let mut state = self.state.write().await;
-            *state = new_state.clone();
-        }
-
-        // Broadcast if there were changes OR if app_mode changed
-        if has_changes || app_mode_changed {
-            self.broadcast_snapshot(new_state.changes).await;
+            *state = new_state;
         }
 
         self.sync_remote_control_projection().await;
@@ -551,14 +503,9 @@ impl WebState {
 
     /// Apply an execution event to the web state and broadcast updates.
     pub async fn apply_execution_event(&self, event: &ExecutionEvent) {
-        let mut broadcast_update = None;
-
         {
             let mut state = self.state.write().await;
             let mut updated = false;
-            let mut log_broadcast = None;
-            let mut worktree_broadcast = None;
-            let mut mode_broadcast = None;
 
             match event {
                 // Lifecycle events
@@ -570,7 +517,6 @@ impl WebState {
                         updated = true;
                     }
                     state.app_mode = "running".to_string();
-                    mode_broadcast = Some("running".to_string());
                 }
                 ExecutionEvent::ProcessingCompleted(change_id) => {
                     if let Some(change) = state.changes.iter_mut().find(|c| c.id == *change_id) {
@@ -589,7 +535,6 @@ impl WebState {
                         updated = true;
                     }
                     state.app_mode = "error".to_string();
-                    mode_broadcast = Some("error".to_string());
                 }
 
                 // Apply output with iteration tracking
@@ -744,7 +689,6 @@ impl WebState {
                     if logs_len > 1000 {
                         state.logs.drain(0..(logs_len - 1000));
                     }
-                    log_broadcast = Some(vec![log_entry.clone()]);
                 }
 
                 // Changes refresh events
@@ -790,7 +734,6 @@ impl WebState {
                 // Worktree refresh events
                 ExecutionEvent::WorktreesRefreshed { worktrees } => {
                     state.worktrees = worktrees.clone();
-                    worktree_broadcast = Some(worktrees.clone());
                 }
 
                 // Dependency blocking events
@@ -814,20 +757,15 @@ impl WebState {
                 // Completion events
                 ExecutionEvent::Stopping => {
                     state.app_mode = "stopping".to_string();
-                    mode_broadcast = Some("stopping".to_string());
                 }
                 ExecutionEvent::Stopped => {
                     state.app_mode = "stopped".to_string();
-                    mode_broadcast = Some("stopped".to_string());
                 }
                 ExecutionEvent::AllCompleted => {
                     state.app_mode = "select".to_string();
-                    mode_broadcast = Some("select".to_string());
                 }
-                ExecutionEvent::Error { message } => {
+                ExecutionEvent::Error { .. } => {
                     state.app_mode = "error".to_string();
-                    mode_broadcast = Some("error".to_string());
-                    log_broadcast = Some(vec![LogEntry::error(message.clone())]);
                 }
 
                 _ => {}
@@ -843,27 +781,6 @@ impl WebState {
                 }
                 refresh_summary(&mut state);
             }
-
-            // Prepare broadcast message
-            if updated
-                || log_broadcast.is_some()
-                || worktree_broadcast.is_some()
-                || mode_broadcast.is_some()
-            {
-                broadcast_update = Some(StateUpdate {
-                    msg_type: "state_update".to_string(),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    changes: state.changes.clone(),
-                    logs: log_broadcast,
-                    worktrees: worktree_broadcast,
-                    app_mode: mode_broadcast,
-                });
-            }
-        }
-
-        // Broadcast outside the lock
-        if let Some(update) = broadcast_update {
-            let _ = self.tx.send(update);
         }
 
         // Project into `/api/v2` last, so the candidate snapshot it compares
@@ -871,65 +788,6 @@ impl WebState {
         self.project_execution_event(event).await;
     }
 
-    async fn broadcast_snapshot(&self, changes: Vec<ChangeStatus>) {
-        // Read current app_mode and worktrees from state
-        let (current_app_mode, current_worktrees) = {
-            let state = self.state.read().await;
-            (state.app_mode.clone(), state.worktrees.clone())
-        };
-
-        let update = StateUpdate {
-            msg_type: "state_update".to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            changes,
-            logs: None,
-            worktrees: Some(current_worktrees),
-            app_mode: Some(current_app_mode),
-        };
-
-        let _ = self.tx.send(update);
-    }
-
-    /// Compute the diff between old and new change lists.
-    /// Returns only changes that are new or modified.
-    fn compute_diff(&self, old: &[ChangeStatus], new: &[ChangeStatus]) -> Vec<ChangeStatus> {
-        let mut diff = Vec::new();
-
-        for new_change in new {
-            // Check if this change existed before
-            let old_change = old.iter().find(|c| c.id == new_change.id);
-
-            match old_change {
-                Some(old) if old != new_change => {
-                    // Change was modified
-                    diff.push(new_change.clone());
-                }
-                None => {
-                    // New change
-                    diff.push(new_change.clone());
-                }
-                _ => {
-                    // No change
-                }
-            }
-        }
-
-        // Also detect removed changes (archived)
-        for old_change in old {
-            if !new.iter().any(|c| c.id == old_change.id) {
-                // Mark as completed/archived by sending final status
-                let mut archived = old_change.clone();
-                archived.status = "archived".to_string();
-                diff.push(archived);
-            }
-        }
-
-        diff
-    }
-
-    /// Refresh state from disk by re-reading changes using native parser.
-    /// This ensures the web state reflects the latest task progress from worktree.
-    /// Preserves the existing app_mode to avoid overwriting runtime execution state.
     pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::openspec;
 
@@ -985,44 +843,12 @@ impl WebState {
         // Update state with refreshed changes, preserving app_mode
         self.update_with_mode(&changes, &current_app_mode).await;
 
-        // Update worktrees in state and broadcast
-        let worktrees_changed = {
+        {
             let mut state = self.state.write().await;
-            let changed = state.worktrees != worktrees;
-            state.worktrees = worktrees.clone();
-            changed
-        };
-
-        // Broadcast worktrees update if changed
-        if worktrees_changed {
-            let update = StateUpdate {
-                msg_type: "state_update".to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                changes: self.state.read().await.changes.clone(),
-                logs: None,
-                worktrees: Some(worktrees),
-                app_mode: None,
-            };
-            let _ = self.tx.send(update);
+            state.worktrees = worktrees;
         }
 
         Ok(())
-    }
-
-    /// Subscribe to state updates
-    pub fn subscribe(&self) -> broadcast::Receiver<StateUpdate> {
-        self.tx.subscribe()
-    }
-
-    /// Get a specific change by ID
-    pub async fn get_change(&self, id: &str) -> Option<ChangeStatus> {
-        let state = self.state.read().await;
-        state.changes.iter().find(|c| c.id == id).cloned()
-    }
-
-    /// Get list of all changes
-    pub async fn list_changes(&self) -> Vec<ChangeStatus> {
-        self.state.read().await.changes.clone()
     }
 }
 
@@ -1118,22 +944,12 @@ mod tests {
     async fn test_web_state_update() {
         let web_state = WebState::new(&[]);
 
-        // Subscribe before update
-        let mut rx = web_state.subscribe();
-
-        // Update with new changes
         let changes = vec![create_test_change("new-change", 2, 4)];
         web_state.update(&changes).await;
 
-        // Verify state was updated
         let state = web_state.get_state().await;
         assert_eq!(state.total_changes, 1);
         assert_eq!(state.changes[0].id, "new-change");
-
-        // Verify broadcast was sent
-        let update = rx.try_recv().unwrap();
-        assert_eq!(update.msg_type, "state_update");
-        assert_eq!(update.changes[0].id, "new-change");
     }
 
     #[tokio::test]
@@ -1203,58 +1019,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_web_state_get_change() {
+    async fn test_web_state_snapshot_contains_every_change() {
         let changes = vec![
             create_test_change("change-a", 1, 3),
             create_test_change("change-b", 2, 5),
         ];
         let web_state = WebState::new(&changes);
 
-        let change = web_state.get_change("change-b").await;
-        assert!(change.is_some());
-        assert_eq!(change.unwrap().id, "change-b");
-
-        let missing = web_state.get_change("nonexistent").await;
-        assert!(missing.is_none());
+        let state = web_state.get_state().await;
+        assert!(state.changes.iter().any(|change| change.id == "change-b"));
+        assert!(!state
+            .changes
+            .iter()
+            .any(|change| change.id == "nonexistent"));
     }
 
     #[tokio::test]
-    async fn test_compute_diff_no_changes() {
+    async fn test_update_with_identical_changes_keeps_the_snapshot() {
         let changes = vec![create_test_change("change-a", 2, 5)];
         let web_state = WebState::new(&changes);
+        let before = web_state.get_state().await;
 
-        let mut rx = web_state.subscribe();
-
-        // Update with identical changes
         web_state.update(&changes).await;
 
-        // No broadcast should be sent
-        assert!(rx.try_recv().is_err());
+        let after = web_state.get_state().await;
+        assert_eq!(before.changes, after.changes);
     }
 
     #[tokio::test]
-    async fn test_compute_diff_progress_update() {
+    async fn test_update_reflects_progress() {
         let initial = vec![
             create_test_change("change-a", 2, 5),
             create_test_change("change-b", 1, 5),
         ];
         let web_state = WebState::new(&initial);
 
-        let mut rx = web_state.subscribe();
-
-        // Update with progress change
         let updated = vec![
             create_test_change("change-a", 3, 5),
             create_test_change("change-b", 1, 5),
         ];
         web_state.update(&updated).await;
 
-        // Broadcast should include full snapshot
-        let update = rx.try_recv().unwrap();
-        assert_eq!(update.changes.len(), 2);
-        assert!(update.changes.iter().any(|change| change.id == "change-a"));
-        assert!(update.changes.iter().any(|change| change.id == "change-b"));
-        let updated_change = update
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes.len(), 2);
+        let updated_change = state
             .changes
             .iter()
             .find(|change| change.id == "change-a")
@@ -1263,45 +1071,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compute_diff_archived_change() {
+    async fn test_update_drops_an_archived_change() {
         let initial = vec![
             create_test_change("change-a", 2, 5),
             create_test_change("change-b", 3, 5),
         ];
         let web_state = WebState::new(&initial);
 
-        let mut rx = web_state.subscribe();
-
-        // Update with one change removed (archived)
         let updated = vec![create_test_change("change-a", 2, 5)];
         web_state.update(&updated).await;
 
-        // Broadcast should include the latest full list
-        let update = rx.try_recv().unwrap();
-        assert_eq!(update.changes.len(), 1);
-        assert_eq!(update.changes[0].id, "change-a");
-        assert_eq!(update.changes[0].status, "in_progress");
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes.len(), 1);
+        assert_eq!(state.changes[0].id, "change-a");
+        assert_eq!(state.changes[0].status, "in_progress");
     }
 
     #[tokio::test]
-    async fn test_compute_diff_new_change() {
+    async fn test_update_adds_a_new_change() {
         let initial = vec![create_test_change("change-a", 2, 5)];
         let web_state = WebState::new(&initial);
 
-        let mut rx = web_state.subscribe();
-
-        // Update with new change added
         let updated = vec![
             create_test_change("change-a", 2, 5),
             create_test_change("change-b", 0, 3),
         ];
         web_state.update(&updated).await;
 
-        // Broadcast should include the latest full list
-        let update = rx.try_recv().unwrap();
-        assert_eq!(update.changes.len(), 2);
-        assert!(update.changes.iter().any(|change| change.id == "change-a"));
-        assert!(update.changes.iter().any(|change| change.id == "change-b"));
+        let state = web_state.get_state().await;
+        assert_eq!(state.changes.len(), 2);
+        assert!(state.changes.iter().any(|change| change.id == "change-a"));
+        assert!(state.changes.iter().any(|change| change.id == "change-b"));
     }
 
     // === Tests for update-progress-archive-resolve ===

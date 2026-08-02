@@ -19,9 +19,15 @@ Conflux has the following frontends:
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on
-`cflx`, `cflx tui`, or `cflx run`. Its static assets live in `web/` and are
-embedded into the Rust binary via `include_str!` at compile time. There is no
-standalone server daemon and no multi-project mode.
+`cflx`, `cflx tui`, or `cflx run`. There is no standalone server daemon and no
+multi-project mode.
+
+The operator console consists of `web/index.html`, `web/style.css`, and
+`web/app.js`, embedded via `include_str!` in `src/web/mod.rs`. No build step and
+no frontend framework: it is dependency-free HTML/CSS/JS and a first-class
+`/api/v2` client. There is no legacy unversioned `/api/*` or `/ws` surface any
+more. Browser tests live in `tests/web/` and run with `make web-test`; that
+tooling is dev-only and must never become a production dependency.
 
 ## Directories
 

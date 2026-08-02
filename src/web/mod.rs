@@ -1,20 +1,19 @@
 //! Web monitoring module for Conflux.
 //!
-//! Provides an optional HTTP server with REST API and WebSocket support
-//! for monitoring orchestration state remotely via web browser.
+//! Serves the embedded `/api/v2` operator console and the versioned
+//! remote-control API for one running process. There is no second, unversioned
+//! browser contract: the console is a first-class v2 client, so bearer
+//! authentication, exact-origin policy, optimistic revisions, idempotency, and
+//! typed errors apply to the browser exactly as they do to any other controller.
 
 mod url;
 
-#[cfg(feature = "web-monitoring")]
-pub mod api;
 #[cfg(feature = "web-monitoring")]
 pub mod openapi;
 #[cfg(feature = "web-monitoring")]
 pub mod remote_control_api;
 #[cfg(feature = "web-monitoring")]
 pub mod state;
-#[cfg(feature = "web-monitoring")]
-pub mod websocket;
 
 #[cfg(feature = "web-monitoring")]
 use axum::{
@@ -27,8 +26,6 @@ use axum::{
 use std::net::SocketAddr;
 #[cfg(feature = "web-monitoring")]
 use std::sync::Arc;
-#[cfg(feature = "web-monitoring")]
-use tower_http::cors::{Any, CorsLayer};
 #[cfg(feature = "web-monitoring")]
 use tower_http::trace::TraceLayer;
 #[cfg(feature = "web-monitoring")]
@@ -208,74 +205,17 @@ async fn serve_js() -> Response {
         .into_response()
 }
 
-/// Build the legacy single-instance monitoring router.
+/// Serve the embedded console assets.
 ///
-/// Kept as one function so both entry points serve exactly the same legacy
-/// surface: `/api/*`, `/ws`, and the dashboard files must keep behaving as they
-/// always have once `/api/v2` is mounted next to them.
+/// Static delivery carries no CORS layer of its own: these three files are the
+/// whole browser surface, and everything they talk to is `/api/v2`, which
+/// applies its own exact-origin policy.
 #[cfg(feature = "web-monitoring")]
-fn legacy_router(state: Arc<WebState>) -> Router {
-    // Permissive CORS on the legacy surface, unchanged: the dashboard depends on
-    // it. The v2 router applies its own exact-origin policy instead.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
+fn static_router() -> Router {
     Router::new()
-        // Static file routes
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
         .route("/app.js", get(serve_js))
-        // API routes
-        .route("/api/health", get(api::health))
-        .route("/api/state", get(api::get_state))
-        .route("/api/changes", get(api::list_changes))
-        .route("/api/changes/{id}", get(api::get_change))
-        // Control API routes
-        .route(
-            "/api/control/start",
-            axum::routing::post(api::control_start),
-        )
-        .route("/api/control/stop", axum::routing::post(api::control_stop))
-        .route(
-            "/api/control/cancel-stop",
-            axum::routing::post(api::control_cancel_stop),
-        )
-        .route(
-            "/api/control/force-stop",
-            axum::routing::post(api::control_force_stop),
-        )
-        .route(
-            "/api/control/retry",
-            axum::routing::post(api::control_retry),
-        )
-        // Worktree API routes
-        .route("/api/worktrees", get(api::list_worktrees))
-        .route(
-            "/api/worktrees/refresh",
-            axum::routing::post(api::refresh_worktrees),
-        )
-        .route(
-            "/api/worktrees/create",
-            axum::routing::post(api::create_worktree),
-        )
-        .route(
-            "/api/worktrees/delete",
-            axum::routing::post(api::delete_worktree),
-        )
-        .route(
-            "/api/worktrees/merge",
-            axum::routing::post(api::merge_worktree),
-        )
-        .route(
-            "/api/worktrees/command",
-            axum::routing::post(api::execute_worktree_command),
-        )
-        // WebSocket route
-        .route("/ws", get(websocket::ws_handler))
-        .layer(cors)
-        .with_state(state)
 }
 
 /// Build the `/api/v2` router for a single-instance web server.
@@ -304,18 +244,18 @@ pub fn remote_control_router(
     ))
 }
 
-/// Assemble the full single-instance app: legacy surface plus `/api/v2`.
+/// Assemble the single-instance app: embedded console assets plus `/api/v2`.
 #[cfg(feature = "web-monitoring")]
 fn build_app(
     config: &WebConfig,
     state: Arc<WebState>,
 ) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(legacy_router(state.clone())
+    Ok(static_router()
         .merge(remote_control_router(config, state)?)
         .layer(TraceLayer::new_for_http()))
 }
 
-/// The full single-instance app, for compatibility tests.
+/// The full single-instance app, for route-surface tests.
 #[cfg(all(test, feature = "web-monitoring"))]
 pub(crate) fn build_app_for_test(config: &WebConfig, state: Arc<WebState>) -> Router {
     build_app(config, state).expect("test configuration must be valid")

@@ -36,28 +36,34 @@ mutually exclusive. See [USAGE.md](USAGE.md#remote-control-api-apiv2).
 
 ## Dashboard Features
 
-- Dashboard UI at `http://localhost:<port>/`
-- Real-time updates over WebSocket
-- REST API for querying state
+- Operator console at `http://localhost:<port>/`
+- Real-time updates over the `/api/v2` event stream
+- Versioned REST API for querying state and submitting commands
 - QR code popup in the TUI via `w`
 
 ## REST API Endpoints
 
+The console is a pure `/api/v2` client: every read, event, and mutation goes
+through the versioned remote-control contract. There is no unversioned `/api/*`
+or `/ws` surface.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/health` | GET | Health check |
-| `/api/state` | GET | Full orchestrator state |
-| `/api/changes` | GET | List all changes with progress |
-| `/api/changes/{id}` | GET | Details for a specific change |
+| `/api/v2/health` | GET | Health check |
+| `/api/v2/state` | GET | Full orchestrator state |
+| `/api/v2/changes` | GET | List all changes with progress |
+| `/api/v2/changes/{id}` | GET | Details for a specific change |
+| `/api/v2/commands` | POST | Submit a control command |
 
-The versioned remote-control API lives under `/api/v2`; see
-[USAGE.md](USAGE.md#remote-control-api-apiv2).
+See [USAGE.md](USAGE.md#remote-control-api-apiv2) for authentication, revisions,
+and idempotency.
 
 For complete API details, see [../openapi.yaml](../openapi.yaml).
 
-## WebSocket
+## Event stream
 
-Connect to `ws://localhost:<port>/ws` for real-time state updates.
+Connect to `/api/v2/events` (SSE) or `ws://localhost:<port>/api/v2/ws` for
+real-time state updates.
 
 ```json
 {

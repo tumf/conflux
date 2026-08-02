@@ -2,112 +2,150 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <meta name="theme-color" content="#1a1a2e">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>Conflux - Web Monitor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="dark light">
+    <meta name="theme-color" content="#10131a">
+    <title>Conflux operator console</title>
     <link rel="stylesheet" href="/style.css">
+    <script type="module" src="/app.js"></script>
 </head>
 <body>
-    <div class="pull-to-refresh-indicator" id="ptr-indicator" aria-live="polite">
-        <div class="ptr-icon" aria-hidden="true"></div>
-        <span class="ptr-text">Pull to refresh</span>
-    </div>
-    <div class="container">
-        <header>
+    <a class="skip-link" href="#main">Skip to main content</a>
+
+    <header class="app-header">
+        <div class="brand">
             <h1>Conflux</h1>
-            <div class="connection-status" id="connection-status" role="status" aria-live="polite">
-                <span class="status-dot" aria-hidden="true"></span>
-                <span class="status-text">Connecting...</span>
+            <p class="brand-sub" id="instance-summary" translate="no">Not connected</p>
+        </div>
+        <div class="header-status">
+            <p class="connection" id="connection-state" role="status" aria-live="polite">
+                <span class="connection-mark connection-mark-unknown" id="connection-mark" aria-hidden="true"></span>
+                <span id="connection-text">Connecting&#8230;</span>
+            </p>
+            <p class="connection-detail" id="connection-detail">Last confirmed update: never</p>
+            <div class="header-actions">
+                <button type="button" class="btn btn-secondary" id="btn-refresh">Refresh now</button>
+                <button type="button" class="btn btn-secondary" id="btn-disconnect" hidden>Disconnect</button>
             </div>
-        </header>
+        </div>
+    </header>
 
-        <div id="toast-container" class="toast-container" aria-live="assertive"></div>
+    <main id="main" tabindex="-1">
+        <h2 class="visually-hidden">Operator console</h2>
 
-        <section class="overall-progress" id="overall-progress" aria-label="Overall Progress">
-            <h2 class="overall-progress-title">Overall Progress</h2>
-            <div class="overall-progress-bar-container">
-                <div class="overall-progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
-                    <div class="overall-progress-fill" id="overall-progress-fill" style="width: 0%"></div>
+        <section class="card auth-card" id="auth-section" aria-labelledby="auth-heading" hidden>
+            <h3 id="auth-heading">Authentication required</h3>
+            <p id="auth-message">This instance requires an API token before it will return state or accept commands.</p>
+            <form id="auth-form" class="auth-form" novalidate>
+                <div class="field">
+                    <label for="auth-token">API token</label>
+                    <div class="field-row">
+                        <input type="password" id="auth-token" name="auth-token" autocomplete="off"
+                               autocapitalize="off" spellcheck="false" required
+                               aria-describedby="auth-token-hint">
+                        <button type="button" class="btn btn-secondary" id="auth-token-toggle"
+                                aria-pressed="false" aria-controls="auth-token">Show</button>
+                    </div>
+                    <p class="hint" id="auth-token-hint">The token is sent only in the Authorization header and is
+                        never written to the address bar, the log view, or persistent browser storage.</p>
                 </div>
-                <div class="overall-progress-text">
-                    <span id="overall-progress-tasks">0 / 0 tasks</span>
-                    <span id="overall-progress-percent">0%</span>
+                <button type="submit" class="btn btn-primary" id="auth-submit">Connect</button>
+            </form>
+            <p class="form-error" id="auth-error" role="alert"></p>
+        </section>
+
+        <section class="card status-card" id="status-section" aria-labelledby="status-heading">
+            <h3 id="status-heading">Current status</h3>
+
+            <p class="attention" id="attention-summary" hidden>
+                <span class="attention-mark" aria-hidden="true">!</span>
+                <span id="attention-text"></span>
+            </p>
+
+            <dl class="status-grid">
+                <div class="status-item">
+                    <dt>Mode</dt>
+                    <dd id="status-mode">Unknown</dd>
                 </div>
-            </div>
+                <div class="status-item">
+                    <dt>Active work</dt>
+                    <dd id="status-active">Unknown</dd>
+                </div>
+                <div class="status-item">
+                    <dt>Needs attention</dt>
+                    <dd id="status-attention">Unknown</dd>
+                </div>
+                <div class="status-item">
+                    <dt>Progress</dt>
+                    <dd id="status-progress">Unknown</dd>
+                </div>
+            </dl>
+
+            <div class="actions" id="lifecycle-actions" role="group" aria-label="Lifecycle actions"></div>
+            <p class="hint" id="lifecycle-hint" hidden></p>
         </section>
 
-        <section class="stats-bar" id="stats-bar" aria-label="Statistics">
-            <div class="stat">
-                <span class="stat-value" id="total-changes" aria-label="Total changes">-</span>
-                <span class="stat-label">Total</span>
+        <div class="tabs">
+            <div role="tablist" aria-label="Console views" id="tablist" class="tablist">
+                <button type="button" role="tab" id="tab-changes" class="tab" aria-controls="panel-changes"
+                        aria-selected="true" tabindex="0">Changes</button>
+                <button type="button" role="tab" id="tab-worktrees" class="tab" aria-controls="panel-worktrees"
+                        aria-selected="false" tabindex="-1">Worktrees</button>
+                <button type="button" role="tab" id="tab-logs" class="tab" aria-controls="panel-logs"
+                        aria-selected="false" tabindex="-1">Logs</button>
             </div>
-            <div class="stat">
-                <span class="stat-value" id="completed-changes" aria-label="Completed changes">-</span>
-                <span class="stat-label">Completed</span>
-            </div>
-            <div class="stat">
-                <span class="stat-value" id="in-progress-changes" aria-label="In progress changes">-</span>
-                <span class="stat-label">In Progress</span>
-            </div>
-            <div class="stat">
-                <span class="stat-value" id="pending-changes" aria-label="Pending changes">-</span>
-                <span class="stat-label">Pending</span>
-            </div>
+
+            <section role="tabpanel" id="panel-changes" class="tabpanel" aria-labelledby="tab-changes" tabindex="0">
+                <h3 class="visually-hidden">Changes</h3>
+                <p class="placeholder" id="changes-placeholder">Loading changes&#8230;</p>
+                <div id="changes-groups"></div>
+            </section>
+
+            <section role="tabpanel" id="panel-worktrees" class="tabpanel" aria-labelledby="tab-worktrees" tabindex="0" hidden>
+                <h3 class="visually-hidden">Worktrees</h3>
+                <p class="placeholder" id="worktrees-placeholder">Loading worktrees&#8230;</p>
+                <ul class="resource-list" id="worktrees-list"></ul>
+            </section>
+
+            <section role="tabpanel" id="panel-logs" class="tabpanel" aria-labelledby="tab-logs" tabindex="0" hidden>
+                <h3 class="visually-hidden">Logs</h3>
+                <div class="log-toolbar">
+                    <div class="field field-inline">
+                        <label for="log-level">Minimum level</label>
+                        <select id="log-level">
+                            <option value="all" selected>All</option>
+                            <option value="info">Info and above</option>
+                            <option value="warn">Warnings and errors</option>
+                            <option value="error">Errors only</option>
+                        </select>
+                    </div>
+                    <p class="hint" id="log-count">0 entries</p>
+                </div>
+                <ol class="log-list" id="log-list" translate="no"></ol>
+                <p class="placeholder" id="logs-placeholder">No log entries yet.</p>
+            </section>
+        </div>
+
+        <section class="card" id="notifications-section" aria-labelledby="notifications-heading">
+            <h3 id="notifications-heading">Notifications</h3>
+            <p class="placeholder" id="notifications-placeholder">No notifications.</p>
+            <ul class="notification-list" id="notification-list"></ul>
         </section>
+    </main>
 
-        <section class="tabs" id="tabs" aria-label="View Tabs">
-            <button class="tab-btn active" id="tab-changes" data-tab="changes" aria-label="View changes">Changes</button>
-            <button class="tab-btn" id="tab-worktrees" data-tab="worktrees" aria-label="View worktrees">Worktrees</button>
-        </section>
+    <p class="visually-hidden" id="live-polite" role="status" aria-live="polite"></p>
+    <p class="visually-hidden" id="live-assertive" role="alert" aria-live="assertive"></p>
 
-        <section class="control-bar" id="control-bar" aria-label="Execution Controls">
-            <button id="btn-run" class="control-btn control-btn-primary" aria-label="Start or resume processing">
-                <span class="btn-icon">▶</span>
-                <span class="btn-text">Run</span>
-            </button>
-            <button id="btn-stop" class="control-btn control-btn-warning" aria-label="Stop processing gracefully" disabled>
-                <span class="btn-icon">⏸</span>
-                <span class="btn-text">Stop</span>
-            </button>
-            <button id="btn-cancel-stop" class="control-btn control-btn-info" aria-label="Cancel stop request" disabled>
-                <span class="btn-icon">↩</span>
-                <span class="btn-text">Cancel Stop</span>
-            </button>
-            <button id="btn-force-stop" class="control-btn control-btn-danger" aria-label="Force stop immediately" disabled>
-                <span class="btn-icon">⏹</span>
-                <span class="btn-text">Force Stop</span>
-            </button>
-            <button id="btn-retry" class="control-btn control-btn-success" aria-label="Retry error changes" disabled>
-                <span class="btn-icon">🔄</span>
-                <span class="btn-text">Retry</span>
-            </button>
-        </section>
-
-        <main id="changes-container" role="main" class="tab-content">
-            <div class="loading" id="loading" aria-busy="true">
-                <div class="spinner" aria-hidden="true"></div>
-                <p>Loading changes...</p>
+    <dialog id="confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+        <form method="dialog" id="confirm-form">
+            <h2 id="confirm-title">Confirm action</h2>
+            <p id="confirm-body"></p>
+            <p class="confirm-target" id="confirm-target" translate="no"></p>
+            <div class="dialog-actions">
+                <button type="button" class="btn btn-secondary" id="confirm-cancel" value="cancel">Cancel</button>
+                <button type="button" class="btn btn-danger" id="confirm-accept" value="confirm">Confirm</button>
             </div>
-            <div class="changes-list" id="changes-list" role="list"></div>
-            <div class="empty-state" id="empty-state" style="display: none;">
-                <p>No changes found.</p>
-            </div>
-        </main>
-
-        <main id="worktrees-container" role="main" class="tab-content" style="display: none;">
-            <div class="worktrees-list" id="worktrees-list" role="list"></div>
-            <div class="empty-state" id="worktrees-empty-state" style="display: none;">
-                <p>No worktrees found.</p>
-            </div>
-        </main>
-
-        <footer>
-            <span id="last-updated">Last updated: -</span>
-        </footer>
-    </div>
-
-    <script src="/app.js"></script>
+        </form>
+    </dialog>
 </body>
 </html>
