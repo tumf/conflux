@@ -2,7 +2,7 @@
 //!
 //! Provides thread-safe state access and broadcasting for WebSocket clients.
 
-use crate::events::{EventSink, ExecutionEvent, LogEntry};
+use crate::events::{EventDispatch, EventOwnership, EventSink, ExecutionEvent, LogEntry};
 use crate::openspec::Change;
 use crate::tui::types::WorktreeInfo;
 use crate::web::operator_facts::OperatorFactsStore;
@@ -369,6 +369,16 @@ impl EventSink for WebEventSink {
     }
 
     async fn on_state_changed(&self, _state: &crate::orchestration::state::OrchestratorState) {}
+
+    /// Absorb the event and the reducer state it produced in one transaction.
+    ///
+    /// Overriding the whole dispatch — rather than reacting to `on_event` and
+    /// `on_state_changed` separately — is what lets the published candidate
+    /// snapshot be built from the authoritative reducer output instead of from
+    /// a read-back that may observe a different instant.
+    async fn on_dispatch(&self, dispatch: &EventDispatch<'_>) {
+        self.web_state.apply_dispatch(dispatch).await;
+    }
 }
 
 /// Shared web state behind the `/api/v2` projection.
@@ -400,6 +410,42 @@ pub struct WebState {
     /// Timing, latest activity, attention, parallel eligibility, and worktree
     /// relation for this process incarnation.
     operator_facts: tokio::sync::RwLock<OperatorFactsStore>,
+    /// Dispatch identities this frontend has already projected.
+    ///
+    /// The dispatch owner delivers each event once, but a frontend boundary is
+    /// exactly where an accidental second delivery would show up as a doubled
+    /// sequence, a doubled revision, and a doubled retained log. Remembering the
+    /// identity makes that repeat a no-op instead.
+    projected_dispatches: Mutex<RecentDispatchIds>,
+}
+
+/// Bounded set of recently projected dispatch identities.
+///
+/// Bounded because dispatch identities are unbounded and a monitoring process
+/// runs for as long as an orchestration does; the window only has to be wider
+/// than any plausible duplicate-delivery skew.
+#[derive(Default)]
+struct RecentDispatchIds {
+    order: std::collections::VecDeque<u64>,
+    seen: std::collections::HashSet<u64>,
+}
+
+impl RecentDispatchIds {
+    const CAPACITY: usize = 1024;
+
+    /// Record `id`, reporting whether it is the first time it was seen.
+    fn admit(&mut self, id: u64) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > Self::CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        true
+    }
 }
 
 impl WebState {
@@ -414,6 +460,7 @@ impl WebState {
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
             execution_marks: tokio::sync::RwLock::new(None),
             operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
+            projected_dispatches: Mutex::new(RecentDispatchIds::default()),
         }
     }
 
@@ -454,6 +501,19 @@ impl WebState {
     /// state, the execution marks, and the process-local facts are read at one
     /// instant and published at one revision rather than trickling in.
     async fn operator_snapshot(&self) -> OrchestratorStateSnapshot {
+        self.operator_snapshot_with(None).await
+    }
+
+    /// The monitoring snapshot, preferring an authoritative reducer state.
+    ///
+    /// When the dispatch owner supplies the state its transition produced, that
+    /// state is used verbatim: the projection then describes exactly the instant
+    /// the event created. Without one (a periodic refresh, an HTTP read) the
+    /// shared reducer is read back instead.
+    async fn operator_snapshot_with(
+        &self,
+        authoritative: Option<&crate::orchestration::state::OrchestratorState>,
+    ) -> OrchestratorStateSnapshot {
         let mut snapshot = self.get_state().await;
 
         // The reducer is the authority for display status, queue intent,
@@ -462,7 +522,10 @@ impl WebState {
         // reducer-only transition such as an acceptance hold visible at the
         // revision it happened. `try_read` matches the rest of this file: a
         // contended reducer must not stall event projection.
-        if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
+        if let Some(shared) = authoritative {
+            apply_reducer_derived_queue_statuses(&mut snapshot, shared);
+            refresh_summary(&mut snapshot);
+        } else if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
             if let Some(shared_arc) = shared_state_opt.as_ref() {
                 if let Ok(shared) = shared_arc.try_read() {
                     apply_reducer_derived_queue_statuses(&mut snapshot, &shared);
@@ -508,19 +571,40 @@ impl WebState {
     /// Project one execution event into the v2 projection.
     ///
     /// Called after the monitoring snapshot has already absorbed the event, so
-    /// the candidate snapshot and the event describe the same instant.
-    async fn project_execution_event(&self, event: &ExecutionEvent) {
+    /// the candidate snapshot and the event describe the same instant. The
+    /// event's ownership class — not its variant, read a second time here —
+    /// decides whether a revision, a retained log, or only a sequence is
+    /// allocated, so every internal event produces exactly one ordered v2 event.
+    async fn project_execution_event(
+        &self,
+        event: &ExecutionEvent,
+        ownership: EventOwnership,
+        authoritative: Option<&crate::orchestration::state::OrchestratorState>,
+    ) {
         use crate::web::remote_control_api::projection as v2;
 
         let projection = self.remote_control.projection();
-        if let ExecutionEvent::Log(entry) = event {
-            // Observational only: a new sequence, the same revision.
-            projection.apply_log(entry.clone());
-            return;
+        match ownership {
+            EventOwnership::Log => {
+                // Observational only: a new sequence, the same revision, and
+                // exactly one retained entry.
+                let ExecutionEvent::Log(entry) = event else {
+                    debug_assert!(false, "log ownership without a log payload: {event:?}");
+                    return;
+                };
+                projection.apply_log(entry.clone());
+            }
+            EventOwnership::Presentation => {
+                let (event_type, change_id, payload) = v2::describe_event(event);
+                projection.apply_presentation(event_type, change_id, payload);
+            }
+            EventOwnership::State => {
+                let (event_type, change_id, payload) = v2::describe_event(event);
+                let candidate =
+                    v2::project_snapshot(&self.operator_snapshot_with(authoritative).await);
+                projection.apply_state(event_type, change_id, payload, candidate);
+            }
         }
-        let (event_type, change_id, payload) = v2::describe_event(event);
-        let candidate = v2::project_snapshot(&self.operator_snapshot().await);
-        projection.apply_state(event_type, change_id, payload, candidate);
     }
 
     /// Set the control command channel for web-based execution control
@@ -564,9 +648,16 @@ impl WebState {
         self.state.read().await.clone()
     }
 
-    /// Update state with new changes and broadcast to WebSocket clients.
-    /// Only broadcasts if there are actual changes from the previous state.
-    pub async fn update(&self, changes: &[Change]) {
+    /// Seed the monitoring snapshot from a workspace listing, test-only.
+    ///
+    /// Production has no caller left: a workspace observation reaches the
+    /// snapshot as a dispatched `ChangesRefreshed` (see [`WebState::apply_dispatch`]),
+    /// and Run mode publishes its own execution mode through
+    /// [`WebState::update_with_mode`]. Kept behind `cfg(test)` because the
+    /// projection tests need a starting change set whose `app_mode` is whatever
+    /// the run already had, which neither of those two entry points offers.
+    #[cfg(test)]
+    pub(crate) async fn update(&self, changes: &[Change]) {
         // Query shared state if available for enriched metadata
         let shared_state_opt = self.shared_orchestrator_state.read().await;
         let shared_state_data = if let Some(ref shared_arc) = *shared_state_opt {
@@ -691,8 +782,34 @@ impl WebState {
         self.sync_remote_control_projection().await;
     }
 
-    /// Apply an execution event to the web state and broadcast updates.
+    /// Absorb one execution event outside a dispatch, and broadcast updates.
+    ///
+    /// Used where no dispatch owner is in play: disk refreshes, the headless
+    /// CLI's event forwarder, and tests. Frontend delivery from an orchestration
+    /// boundary goes through [`WebState::apply_dispatch`] instead, so the
+    /// projection sees the reducer state the event actually produced rather than
+    /// a read-back taken at some later instant.
     pub async fn apply_execution_event(&self, event: &ExecutionEvent) {
+        let dispatch = EventDispatch {
+            id: crate::events::next_dispatch_id(),
+            event,
+            ownership: crate::events::event_ownership(event),
+            state: None,
+        };
+        self.apply_dispatch(&dispatch).await;
+    }
+
+    /// Absorb one authoritative dispatch.
+    ///
+    /// A repeated delivery of the same dispatch identity returns without
+    /// touching the monitoring snapshot, the operator facts, or the v2
+    /// projection, so a duplicate at this boundary cannot double a sequence, a
+    /// revision, or a retained log.
+    pub async fn apply_dispatch(&self, dispatch: &EventDispatch<'_>) {
+        if !self.projected_dispatches.lock().await.admit(dispatch.id) {
+            return;
+        }
+        let event = dispatch.event;
         {
             let mut state = self.state.write().await;
             let mut updated = false;
@@ -952,7 +1069,13 @@ impl WebState {
                     state.app_mode = "stopped".to_string();
                 }
                 ExecutionEvent::AllCompleted => {
-                    state.app_mode = "select".to_string();
+                    // Same rule the TUI applies: a late or duplicate completion
+                    // event must not overwrite a retained Error or Stopped mode,
+                    // or the two frontends would report different terminal
+                    // states for the same run.
+                    if crate::events::all_completed_may_overwrite_mode(&state.app_mode) {
+                        state.app_mode = "select".to_string();
+                    }
                 }
                 ExecutionEvent::Error { .. } => {
                     state.app_mode = "error".to_string();
@@ -962,7 +1085,11 @@ impl WebState {
             }
 
             if updated {
-                if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
+                // Prefer the reducer state this dispatch produced; fall back to
+                // a read-back only when the caller had none to give.
+                if let Some(shared) = dispatch.state {
+                    apply_reducer_derived_queue_statuses(&mut state, shared);
+                } else if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
                     if let Some(shared_arc) = shared_state_opt.as_ref() {
                         if let Ok(shared) = shared_arc.try_read() {
                             apply_reducer_derived_queue_statuses(&mut state, &shared);
@@ -981,7 +1108,8 @@ impl WebState {
 
         // Project into `/api/v2` last, so the candidate snapshot it compares
         // against is the one this event just produced.
-        self.project_execution_event(event).await;
+        self.project_execution_event(event, dispatch.ownership, dispatch.state)
+            .await;
     }
 
     /// Update the process-local operator facts from one execution event.

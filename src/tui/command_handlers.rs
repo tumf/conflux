@@ -152,6 +152,13 @@ pub struct TuiCommandContext<'a> {
     pub repo_root: &'a Path,
     pub config: &'a OrchestratorConfig,
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
+    /// The frontend delivery channel an orchestration boundary publishes to.
+    ///
+    /// Distinct from `tx` on purpose: a boundary run owns its own dispatch, so
+    /// it must reach this frontend through the sink side. Handing it `tx` would
+    /// route its events back through the TUI's producer boundary and apply
+    /// every one of them to the reducer a second time.
+    pub frontend_tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub dynamic_queue: &'a DynamicQueue,
     pub post_archive_action: PostArchiveAction,
     /// Invocation-scoped upstream publication runtime for local parallel TUI.
@@ -237,7 +244,7 @@ pub async fn handle_start_processing_command(
             }
 
             graceful_stop_flag.store(false, Ordering::SeqCst);
-            let orch_tx = ctx.tx.clone();
+            let orch_tx = ctx.frontend_tx.clone();
             let orch_config = ctx.config.clone();
             let orch_cancel = CancellationToken::new();
             let orch_dynamic_queue = ctx.dynamic_queue.clone();
@@ -664,7 +671,7 @@ pub async fn handle_tui_command(
             } else {
                 // Scheduler not alive: spawn a scheduler-owned run to consume reducer-owned ResolveWait.
                 graceful_stop_flag.store(false, Ordering::SeqCst);
-                let orch_tx = ctx.tx.clone();
+                let orch_tx = ctx.frontend_tx.clone();
                 let orch_config = ctx.config.clone();
                 let orch_cancel = CancellationToken::new();
                 let orch_dynamic_queue = ctx.dynamic_queue.clone();
@@ -857,6 +864,7 @@ mod tests {
             repo_root: Path::new("."),
             config,
             tx,
+            frontend_tx: tx,
             dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -968,6 +976,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1039,6 +1048,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1094,6 +1104,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1128,6 +1139,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1182,6 +1194,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1249,6 +1262,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1312,6 +1326,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1365,6 +1380,7 @@ mod tests {
                 repo_root: Path::new("."),
                 config: &config,
                 tx: &tx,
+                frontend_tx: &tx,
                 dynamic_queue: &dynamic_queue,
                 post_archive_action: PostArchiveAction::MergeToBase,
                 upstream_runtime: None,
@@ -1401,6 +1417,7 @@ mod tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -1547,6 +1564,7 @@ mod tests {
             repo_root: &root,
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: Some(crate::upstream::UpstreamRuntime {
@@ -1658,6 +1676,7 @@ mod tests {
             repo_root: &root,
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: &dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: Some(crate::upstream::UpstreamRuntime {
@@ -1776,6 +1795,7 @@ mod operator_command_parity_tests {
             repo_root: Path::new("."),
             config: &config,
             tx: &tx,
+            frontend_tx: &tx,
             dynamic_queue: queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
@@ -2211,6 +2231,7 @@ mod operator_command_parity_tests {
             repo_root: Path::new("."),
             config,
             tx,
+            frontend_tx: tx,
             dynamic_queue,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,

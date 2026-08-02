@@ -59,6 +59,13 @@ fn refresh_local_changes(repo_root: &Path) -> Result<(Vec<Change>, Vec<Change>)>
     Ok((active_changes, rejected_changes))
 }
 
+/// Whether this event can change the reducer-derived display caches the TUI
+/// renders from.
+///
+/// It no longer decides whether the reducer is *written* — the dispatch owner
+/// does that, exactly once, before the event reaches this frontend. It only
+/// decides whether re-reading the reducer afterwards could show anything new,
+/// so a chatty output event does not cost a lock and two map rebuilds per chunk.
 fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> bool {
     use crate::events::ExecutionEvent;
 
@@ -135,6 +142,31 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::BranchMergeFailed { .. }
         | ExecutionEvent::ChangeStopFailed { .. } => false,
     }
+}
+
+/// Refresh the TUI's reducer-derived display caches after one event.
+///
+/// The reducer is **read**, never written. By the time an event reaches this
+/// frontend its dispatch owner has already applied it, so a write here would be
+/// the second transition for one internal event: an apply count that advances
+/// twice, a change that leaves the queue twice, a terminal state reached twice.
+///
+/// Status and blocker view come from the same snapshot so a row's
+/// `blocked`/`stalled` word and its blocker kind can never disagree.
+async fn sync_reducer_display_caches(
+    app: &mut AppState,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+    event: &crate::events::ExecutionEvent,
+) {
+    if !should_apply_event_to_tui_reducer(event) {
+        return;
+    }
+    let (display_map, blocker_views) = {
+        let state = shared_state.read().await;
+        (state.all_display_statuses(), state.all_blocker_views())
+    };
+    app.apply_display_statuses_from_reducer(&display_map);
+    app.apply_blocker_views_from_reducer(&blocker_views);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,7 +383,19 @@ async fn run_tui_loop(
     let ai_runner =
         AiCommandRunner::from_orchestrator_config(&config, shared_stagger_state.clone());
 
+    // Two directions, deliberately not one channel.
+    //
+    // `tx` is the producer side every TUI-local emitter already holds. `rx` is
+    // therefore a *producer* boundary: this loop is the dispatch owner for what
+    // arrives there, and applies it to the reducer once before rendering it.
+    //
+    // `frontend_rx` is the delivery side of the orchestration boundary's own
+    // dispatch owner. Those events were already applied to the reducer and
+    // already projected to `/api/v2`; re-applying them here is exactly the
+    // double transition — a doubled apply count, a doubled event sequence —
+    // that this frontend must not cause.
     let (tx, mut rx) = mpsc::channel::<OrchestratorEvent>(100);
+    let (frontend_tx, mut frontend_rx) = mpsc::channel::<OrchestratorEvent>(100);
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<TuiCommand>(100);
 
     // Inject shared state into WebState if web monitoring is enabled.
@@ -365,6 +409,18 @@ async fn run_tui_loop(
         ws.set_shared_state(shared_state.clone()).await;
         ws.set_execution_marks(app.execution_marks()).await;
         ws.set_repo_root(repo_root.clone()).await;
+    }
+
+    // The other frontends of the TUI-local producer boundary.
+    //
+    // This frontend is not in the list: the event is already in hand when this
+    // loop dispatches it, so adding a `TuiEventSink` here would only route it
+    // back into the same loop.
+    #[allow(unused_mut)]
+    let mut local_event_sinks: Vec<Arc<dyn crate::events::EventSink>> = Vec::new();
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ref ws) = web_state {
+        local_event_sinks.push(Arc::new(crate::web::state::WebEventSink::new(ws.clone())));
     }
 
     // Dynamic queue for runtime change additions
@@ -773,61 +829,28 @@ async fn run_tui_loop(
             }
         }
 
-        // Handle orchestrator events
+        // Events raised by TUI-local producers (key handlers, hooks, worktree
+        // operations, the auto-refresh). This loop is their dispatch owner: one
+        // reducer transition, one delivery to every other frontend, then this
+        // frontend's own state — not a second reducer write per frontend and not
+        // a hand-picked subset forwarded to the web projection.
         while let Ok(event) = rx.try_recv() {
-            // Apply reducer-visible events to shared state before syncing display caches.
-            //
-            // Phase 5.1: workspace observations drive the shared reducer (ChangesRefreshed).
-            // Phase 5.2: lifecycle events must also update shared reducer so active, wait,
-            //   terminal, and queue states cannot be regressed by the next display snapshot.
-            // Phase 6.1: TUI derives queue_status from the reducer display snapshot.
-            if should_apply_event_to_tui_reducer(&event) {
-                // Status and blocker view are read from the same reducer
-                // snapshot so a row's `blocked`/`stalled` word and its blocker
-                // kind can never disagree.
-                let (display_map, blocker_views) = {
-                    let mut state = shared_state.write().await;
-                    state.apply_execution_event(&event);
-                    (state.all_display_statuses(), state.all_blocker_views())
-                };
-                app.apply_display_statuses_from_reducer(&display_map);
-                app.apply_blocker_views_from_reducer(&blocker_views);
-            }
-
-            // Forward execution events to web state (web-monitoring feature only)
-            #[cfg(feature = "web-monitoring")]
-            if let Some(ref web_state) = web_state {
-                use crate::events::ExecutionEvent;
-                match &event {
-                    // Changes refreshed - use update method to preserve state
-                    ExecutionEvent::ChangesRefreshed { changes, .. } => {
-                        web_state.update(changes).await;
-                    }
-                    // Execution lifecycle events - forward to apply_execution_event
-                    ExecutionEvent::ProcessingStarted(_)
-                    | ExecutionEvent::ProcessingError { .. }
-                    | ExecutionEvent::ChangeArchived(_)
-                    | ExecutionEvent::MergeCompleted { .. }
-                    | ExecutionEvent::ResolveStarted { .. }
-                    | ExecutionEvent::ResolveCompleted { .. }
-                    | ExecutionEvent::ResolveFailed { .. }
-                    | ExecutionEvent::MergeDeferred { .. }
-                    | ExecutionEvent::WorkspaceStatusUpdated { .. }
-                    | ExecutionEvent::RejectionReviewCompleted { .. }
-                    | ExecutionEvent::RejectionReviewFailed { .. }
-                    | ExecutionEvent::Stopping
-                    | ExecutionEvent::Stopped
-                    | ExecutionEvent::AllCompleted => {
-                        web_state.apply_execution_event(&event).await;
-                    }
-                    _ => {
-                        // Other events are not needed for web state updates
-                    }
-                }
-            }
+            crate::events::dispatch_event(&shared_state, &local_event_sinks, event.clone()).await;
+            sync_reducer_display_caches(&mut app, &shared_state, &event).await;
 
             if let Some(cmd) = app.handle_orchestrator_event(event) {
                 // Event triggered a command (e.g., auto-start next resolve)
+                let _ = cmd_tx.send(cmd).await;
+            }
+        }
+
+        // Authoritative deliveries from the orchestration boundary's dispatch
+        // owner. The reducer transition and the `/api/v2` projection already
+        // happened; this frontend only reads the result and renders it.
+        while let Ok(event) = frontend_rx.try_recv() {
+            sync_reducer_display_caches(&mut app, &shared_state, &event).await;
+
+            if let Some(cmd) = app.handle_orchestrator_event(event) {
                 let _ = cmd_tx.send(cmd).await;
             }
         }
@@ -840,6 +863,7 @@ async fn run_tui_loop(
                 repo_root: &repo_root,
                 config: &config,
                 tx: &tx,
+                frontend_tx: &frontend_tx,
                 dynamic_queue: &dynamic_queue,
                 post_archive_action: post_archive_action.clone(),
                 // Invocation-scoped; every orchestrator start in this persistent
@@ -904,12 +928,15 @@ mod tests {
         is_refresh_root_usable, refresh_local_changes, should_apply_event_to_tui_reducer,
         shutdown_local_orchestrator_task, LocalOrchestratorShutdownOutcome,
     };
+    use super::{AppState, OrchestratorEvent};
     use crate::events::{ExecutionEvent, RejectionOutcome, StalledBlocker};
     use crate::openspec::{Change, ProposalMetadata};
     use crate::vcs::WorkspaceStatus;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     fn sample_change() -> Change {
@@ -941,6 +968,94 @@ mod tests {
             "pending_verification",
             "managed verification job still running",
         )
+    }
+
+    /// A boundary run's events reach this frontend already applied.
+    ///
+    /// The regression this pins: the loop used to write the reducer for every
+    /// event it received, including the ones the orchestration boundary had
+    /// already applied. One `ApplyCompleted` then advanced the apply count
+    /// twice — once per frontend path — which is exactly what an authoritative
+    /// remote snapshot cannot survive.
+    #[tokio::test]
+    async fn frontend_delivery_does_not_reapply_the_reducer() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+        use crate::tui::events::TuiEventSink;
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let (frontend_tx, mut frontend_rx) = mpsc::channel::<OrchestratorEvent>(16);
+        let sinks: Vec<Arc<dyn EventSink>> = vec![Arc::new(TuiEventSink::new(frontend_tx))];
+
+        for event in [
+            ExecutionEvent::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply".to_string(),
+            },
+            ExecutionEvent::ApplyCompleted {
+                change_id: "change-a".to_string(),
+                revision: String::new(),
+            },
+        ] {
+            crate::events::dispatch_event(&shared_state, &sinks, event).await;
+        }
+        assert_eq!(shared_state.read().await.apply_count("change-a"), 1);
+
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+        while let Ok(event) = frontend_rx.try_recv() {
+            super::sync_reducer_display_caches(&mut app, &shared_state, &event).await;
+        }
+
+        assert_eq!(
+            shared_state.read().await.apply_count("change-a"),
+            1,
+            "the frontend applied a delivered event a second time"
+        );
+    }
+
+    /// A TUI-local producer's event is applied once, by this loop, and reaches
+    /// the other frontends through the same authoritative dispatch.
+    #[cfg(feature = "web-monitoring")]
+    #[tokio::test]
+    async fn tui_local_producer_events_are_dispatched_once_to_every_frontend() {
+        use crate::events::EventSink;
+        use crate::orchestration::state::OrchestratorState;
+        use crate::web::state::{WebEventSink, WebState};
+
+        let shared_state = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            10,
+        )));
+        let web_state = Arc::new(WebState::new(&[]));
+        web_state.set_shared_state(shared_state.clone()).await;
+        let projection = web_state.remote_control().projection();
+        let local_sinks: Vec<Arc<dyn EventSink>> =
+            vec![Arc::new(WebEventSink::new(web_state.clone()))];
+
+        let event = ExecutionEvent::ApplyCompleted {
+            change_id: "change-a".to_string(),
+            revision: String::new(),
+        };
+        crate::events::dispatch_event(&shared_state, &local_sinks, event.clone()).await;
+
+        let mut app = AppState::new(vec![sample_change()]);
+        app.set_shared_state(shared_state.clone());
+        super::sync_reducer_display_caches(&mut app, &shared_state, &event).await;
+
+        assert_eq!(
+            shared_state.read().await.apply_count("change-a"),
+            1,
+            "a locally produced event must be applied exactly once"
+        );
+        let (_, _, sequence) = projection.snapshot();
+        assert_eq!(
+            sequence, 1,
+            "a locally produced event must reach the v2 stream exactly once"
+        );
     }
 
     #[test]

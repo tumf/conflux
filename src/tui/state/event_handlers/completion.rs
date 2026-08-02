@@ -19,9 +19,24 @@ impl AppState {
         self.add_log(LogEntry::success(format!("Completed: {}", id)).with_change_id(&id));
     }
 
+    /// The app mode name this frontend reports to the shared terminal-mode rule.
+    ///
+    /// Only the retained terminal modes need to be named exactly; every other
+    /// mode is non-terminal as far as completion handling is concerned.
+    fn terminal_mode_name(&self) -> &'static str {
+        match self.mode {
+            AppMode::Stopped => "stopped",
+            AppMode::Error => "error",
+            _ => "running",
+        }
+    }
+
     pub(crate) fn handle_all_completed(&mut self) {
         self.reset_analysis_log_dedupe();
-        if matches!(self.mode, AppMode::Stopped | AppMode::Error) {
+        // Shared with the `/api/v2` projection so a late or duplicate
+        // `AllCompleted` cannot leave the two frontends reporting different
+        // terminal states for the same run.
+        if !crate::events::all_completed_may_overwrite_mode(self.terminal_mode_name()) {
             if let Some(started) = self.orchestration_started_at {
                 self.orchestration_elapsed = Some(started.elapsed());
             }
@@ -245,6 +260,43 @@ mod tests {
             .filter(|entry| entry.message.contains(needle))
             .map(|entry| entry.change_id.clone())
             .collect()
+    }
+
+    /// A late or duplicate `AllCompleted` must not overwrite a retained
+    /// terminal mode, and the mode name this frontend reports must be the one
+    /// the shared rule recognises — otherwise the TUI and the `/api/v2`
+    /// projection would describe the same run differently.
+    #[test]
+    fn late_all_completed_preserves_retained_terminal_modes() {
+        for (mode, expected_name) in [(AppMode::Stopped, "stopped"), (AppMode::Error, "error")] {
+            let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+            app.mode = mode.clone();
+            assert_eq!(app.terminal_mode_name(), expected_name);
+            assert!(!crate::events::all_completed_may_overwrite_mode(
+                expected_name
+            ));
+
+            app.handle_all_completed();
+
+            assert_eq!(
+                app.mode, mode,
+                "a late completion overwrote the authoritative terminal mode"
+            );
+        }
+    }
+
+    /// A healthy run still completes.
+    #[test]
+    fn all_completed_still_completes_a_running_frontend() {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.mode = AppMode::Running;
+        assert!(crate::events::all_completed_may_overwrite_mode(
+            app.terminal_mode_name()
+        ));
+
+        app.handle_all_completed();
+
+        assert_eq!(app.mode, AppMode::Select);
     }
 
     #[test]

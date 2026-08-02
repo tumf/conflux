@@ -687,6 +687,176 @@ pub enum ExecutionEvent {
     ChangeStopFailed { change_id: String, error: String },
 }
 
+/// Which projection owner is responsible for one internal execution event.
+///
+/// The classification is what keeps "one internal event, one reducer
+/// transition, one ordered remote event" checkable: it is decided once, by
+/// [`classify_event`], and every frontend reads it from there instead of
+/// re-deriving its own opinion from the variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventOwnership {
+    /// May change reducer state and the published operator snapshot.
+    ///
+    /// Dispatch clones the post-transition reducer state for these so a
+    /// frontend projects from the authoritative output rather than from its own
+    /// copy.
+    State,
+    /// Observational log output. Never advances a state revision.
+    Log,
+    /// Progress detail that cannot change the published operator snapshot.
+    ///
+    /// A presentation event still gets one ordered remote event, but no
+    /// candidate snapshot is computed for it — it carries no field the snapshot
+    /// is built from.
+    Presentation,
+}
+
+/// The stable variant name and projection ownership of one execution event.
+///
+/// This match is deliberately exhaustive with no `_` arm: adding an
+/// `ExecutionEvent` variant without classifying it fails to compile, which is
+/// what makes the ownership table in the tests impossible to leave stale.
+pub fn classify_event(event: &ExecutionEvent) -> (&'static str, EventOwnership) {
+    use EventOwnership::{Log, Presentation, State};
+    use ExecutionEvent as E;
+
+    match event {
+        E::ProcessingStarted(_) => ("ProcessingStarted", State),
+        E::ProcessingCompleted(_) => ("ProcessingCompleted", State),
+        E::ProcessingError { .. } => ("ProcessingError", State),
+        E::ApplyStarted { .. } => ("ApplyStarted", State),
+        E::ApplyCompleted { .. } => ("ApplyCompleted", State),
+        E::ApplyFailed { .. } => ("ApplyFailed", State),
+        E::ApplyOutput { .. } => ("ApplyOutput", State),
+        E::ArchiveStarted { .. } => ("ArchiveStarted", State),
+        E::ArchiveResumed { .. } => ("ArchiveResumed", State),
+        E::ArchiveRetryScheduled { .. } => ("ArchiveRetryScheduled", State),
+        E::ChangeArchived(_) => ("ChangeArchived", State),
+        E::ArchiveFailed { .. } => ("ArchiveFailed", State),
+        E::ArchiveOutput { .. } => ("ArchiveOutput", State),
+        E::AcceptanceStarted { .. } => ("AcceptanceStarted", State),
+        E::AcceptanceCompleted { .. } => ("AcceptanceCompleted", State),
+        E::AcceptanceFailed { .. } => ("AcceptanceFailed", State),
+        E::ChangeRejected { .. } => ("ChangeRejected", State),
+        E::RejectionReviewCompleted { .. } => ("RejectionReviewCompleted", State),
+        E::RejectionReviewFailed { .. } => ("RejectionReviewFailed", State),
+        E::AcceptanceOutput { .. } => ("AcceptanceOutput", State),
+        E::ProgressUpdated { .. } => ("ProgressUpdated", State),
+        E::WorkspaceCreated { .. } => ("WorkspaceCreated", State),
+        E::WorkspaceStatusUpdated { .. } => ("WorkspaceStatusUpdated", State),
+        E::WorkspaceResumed { .. } => ("WorkspaceResumed", State),
+        E::WorkspacePreserved { .. } => ("WorkspacePreserved", State),
+        E::MergeCompleted { .. } => ("MergeCompleted", State),
+        E::PushStarted { .. } => ("PushStarted", State),
+        E::PushCompleted { .. } => ("PushCompleted", State),
+        E::PushFailed { .. } => ("PushFailed", State),
+        E::MergeDeferred { .. } => ("MergeDeferred", State),
+        E::ResolveStarted { .. } => ("ResolveStarted", State),
+        E::ResolveCompleted { .. } => ("ResolveCompleted", State),
+        E::ResolveFailed { .. } => ("ResolveFailed", State),
+        E::ResolveOutput { .. } => ("ResolveOutput", State),
+        E::ChangeSkipped { .. } => ("ChangeSkipped", State),
+        E::DependencyBlocked { .. } => ("DependencyBlocked", State),
+        E::DependencyResolved { .. } => ("DependencyResolved", State),
+        E::AcceptanceGated { .. } => ("AcceptanceGated", State),
+        E::ExecutionBlocked { .. } => ("ExecutionBlocked", State),
+        E::HookStarted { .. } => ("HookStarted", State),
+        E::HookCompleted { .. } => ("HookCompleted", State),
+        E::HookFailed { .. } => ("HookFailed", State),
+        E::Stopping => ("Stopping", State),
+        E::Stopped => ("Stopped", State),
+        E::AllCompleted => ("AllCompleted", State),
+        E::Error { .. } => ("Error", State),
+        E::ChangesRefreshed { .. } => ("ChangesRefreshed", State),
+        E::WorktreesRefreshed { .. } => ("WorktreesRefreshed", State),
+        E::ChangeDequeued { .. } => ("ChangeDequeued", State),
+        E::ChangeStopped { .. } => ("ChangeStopped", State),
+        E::ChangeStopFailed { .. } => ("ChangeStopFailed", State),
+
+        E::Log(_) => ("Log", Log),
+
+        // Presentation-only exceptions. Each carries no change-addressed or
+        // process-level field the operator snapshot is built from, so it can be
+        // ordered on the remote stream without recomputing a candidate.
+        E::CleanupStarted { .. } => ("CleanupStarted", Presentation),
+        E::CleanupCompleted { .. } => ("CleanupCompleted", Presentation),
+        E::MergeStarted { .. } => ("MergeStarted", Presentation),
+        E::MergeConflict { .. } => ("MergeConflict", Presentation),
+        E::ConflictResolutionStarted => ("ConflictResolutionStarted", Presentation),
+        E::ConflictResolutionCompleted => ("ConflictResolutionCompleted", Presentation),
+        E::ConflictResolutionFailed { .. } => ("ConflictResolutionFailed", Presentation),
+        E::AnalysisStarted { .. } => ("AnalysisStarted", Presentation),
+        E::AnalysisOutput { .. } => ("AnalysisOutput", Presentation),
+        E::AnalysisCompleted { .. } => ("AnalysisCompleted", Presentation),
+        E::Warning { .. } => ("Warning", Presentation),
+        E::ParallelStartRejected { .. } => ("ParallelStartRejected", Presentation),
+        E::BranchMergeStarted { .. } => ("BranchMergeStarted", Presentation),
+        E::BranchMergeCompleted { .. } => ("BranchMergeCompleted", Presentation),
+        E::BranchMergeFailed { .. } => ("BranchMergeFailed", Presentation),
+    }
+}
+
+/// The stable variant name of one execution event.
+///
+/// Lives in the crate (behind `cfg(test)`) rather than in one test file because
+/// the ownership table and the remote projection tests name the *same* variants
+/// from the *same* classifier: a variant renamed here must move in both places
+/// at once. Production code never needs the name — it reads the ownership half
+/// of [`classify_event`] through [`event_ownership`].
+#[cfg(test)]
+pub(crate) fn event_variant_name(event: &ExecutionEvent) -> &'static str {
+    classify_event(event).0
+}
+
+/// Projection ownership of one execution event.
+pub fn event_ownership(event: &ExecutionEvent) -> EventOwnership {
+    classify_event(event).1
+}
+
+/// Terminal app modes a late or duplicate `AllCompleted` must not overwrite.
+pub const RETAINED_TERMINAL_MODES: [&str; 2] = ["error", "stopped"];
+
+/// Whether `AllCompleted` may overwrite `current_mode`.
+///
+/// `Error` and `Stopped` are authoritative terminal modes: the scheduler's own
+/// completion event routinely arrives after an operator stop or a fatal error,
+/// and a frontend that let it win would report "all done" for a run that
+/// actually failed. TUI and the `/api/v2` projection both route the decision
+/// through here so they cannot disagree about the same run.
+pub fn all_completed_may_overwrite_mode(current_mode: &str) -> bool {
+    !RETAINED_TERMINAL_MODES.contains(&current_mode)
+}
+
+/// One authoritative dispatch of an execution event.
+///
+/// Produced by [`dispatch_event`] after the reducer transition has already
+/// happened, so a sink receives the event and the state it produced together
+/// rather than reading the reducer back out on its own schedule.
+pub struct EventDispatch<'a> {
+    /// Process-unique dispatch identity.
+    ///
+    /// A frontend uses it to make a repeated delivery of the same dispatch a
+    /// no-op; it is not a wire sequence and never leaves the process.
+    pub id: u64,
+    /// The event being dispatched.
+    pub event: &'a ExecutionEvent,
+    /// Projection ownership decided by [`classify_event`].
+    pub ownership: EventOwnership,
+    /// Authoritative reducer state after the transition.
+    ///
+    /// `None` for [`EventOwnership::Log`] and [`EventOwnership::Presentation`],
+    /// whose events cannot change it.
+    pub state: Option<&'a OrchestratorState>,
+}
+
+/// Process-local dispatch counter backing [`EventDispatch::id`].
+static DISPATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Allocate the next process-unique dispatch identity.
+pub fn next_dispatch_id() -> u64 {
+    DISPATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// Frontend-agnostic sink for execution events and state transitions.
 #[async_trait]
 pub trait EventSink: Send + Sync {
@@ -695,6 +865,17 @@ pub trait EventSink: Send + Sync {
 
     /// Handle reducer state transition notifications.
     async fn on_state_changed(&self, state: &OrchestratorState);
+
+    /// Handle one authoritative dispatch.
+    ///
+    /// Override this when a frontend needs the event and the state it produced
+    /// in the same transaction; the default keeps the two-callback shape.
+    async fn on_dispatch(&self, dispatch: &EventDispatch<'_>) {
+        self.on_event(dispatch.event).await;
+        if let Some(state) = dispatch.state {
+            self.on_state_changed(state).await;
+        }
+    }
 }
 
 /// No-op sink used for state-only update notifications.
@@ -718,24 +899,87 @@ pub async fn send_event(tx: &Option<mpsc::Sender<ExecutionEvent>>, event: Execut
     }
 }
 
-/// Dispatches an event to reducer and all frontend sinks.
+/// The single authoritative dispatch owner.
+///
+/// Applies the event to reducer state exactly once, then fans the resulting
+/// event/state output to every frontend sink. Frontends never reapply the
+/// event to the reducer, which is what keeps one internal event to one
+/// transition no matter how many frontends are attached.
+///
+/// The reducer write lock is released before any sink runs, so a sink is free
+/// to read shared state without deadlocking against this dispatch.
 pub async fn dispatch_event(
     state: &tokio::sync::RwLock<OrchestratorState>,
     sinks: &[std::sync::Arc<dyn EventSink>],
     event: ExecutionEvent,
 ) {
+    let ownership = event_ownership(&event);
+    let id = next_dispatch_id();
+
     let state_snapshot = {
         let mut guard = state.write().await;
         guard.apply_execution_event(&event);
-        guard.clone()
+        // Only a state-owning event can change what a frontend publishes;
+        // cloning the reducer for every log line would be pure waste.
+        matches!(ownership, EventOwnership::State).then(|| guard.clone())
+    };
+
+    let dispatch = EventDispatch {
+        id,
+        event: &event,
+        ownership,
+        state: state_snapshot.as_ref(),
     };
 
     for sink in sinks {
-        sink.on_event(&event).await;
+        sink.on_dispatch(&dispatch).await;
+    }
+}
+
+/// The dispatch owner for one orchestration boundary run.
+///
+/// Bundles the reducer state and the frontend sinks so every producer in a run
+/// emits through the same path, including producers that can only speak
+/// `mpsc::Sender` (see [`EventDispatcher::bridge`]).
+pub struct EventDispatcher {
+    state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
+    sinks: Vec<std::sync::Arc<dyn EventSink>>,
+}
+
+impl EventDispatcher {
+    /// Own `state` and fan out to `sinks`.
+    pub fn new(
+        state: std::sync::Arc<tokio::sync::RwLock<OrchestratorState>>,
+        sinks: Vec<std::sync::Arc<dyn EventSink>>,
+    ) -> Self {
+        Self { state, sinks }
     }
 
-    for sink in sinks {
-        sink.on_state_changed(&state_snapshot).await;
+    /// Apply one event and fan it out.
+    pub async fn dispatch(&self, event: ExecutionEvent) {
+        dispatch_event(&self.state, &self.sinks, event).await;
+    }
+
+    /// A channel whose receiver forwards into this dispatch owner.
+    ///
+    /// Hook runners, output handlers, and the parallel scheduler can only emit
+    /// through an `mpsc::Sender`. Handing them a bridge instead of a raw
+    /// frontend channel is what stops serial-mode logs from reaching the TUI
+    /// while never reaching the remote projection.
+    ///
+    /// The forwarding task ends when every sender is dropped.
+    pub fn bridge(
+        self: &std::sync::Arc<Self>,
+        buffer: usize,
+    ) -> (mpsc::Sender<ExecutionEvent>, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel(buffer);
+        let owner = self.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                owner.dispatch(event).await;
+            }
+        });
+        (tx, handle)
     }
 }
 
@@ -856,6 +1100,643 @@ impl EventSink for MockEventSink {
     }
 
     async fn on_state_changed(&self, _state: &OrchestratorState) {}
+}
+
+/// One sample of every `ExecutionEvent` variant, and the ownership contract
+/// they are held to.
+///
+/// Lives in the crate (behind `cfg(test)`) rather than in one test file because
+/// the projection tests hold the *same* table to the *same* variants: a variant
+/// that is state-owning here must not become a presentation event at the remote
+/// boundary.
+#[cfg(test)]
+pub(crate) mod ownership_fixtures {
+    use super::*;
+
+    fn change(id: &str) -> crate::openspec::Change {
+        crate::openspec::Change {
+            id: id.to_string(),
+            completed_tasks: 1,
+            total_tasks: 2,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
+        }
+    }
+
+    fn worktree() -> crate::tui::types::WorktreeInfo {
+        crate::tui::types::WorktreeInfo {
+            path: std::path::PathBuf::from("/tmp/ws"),
+            head: "abc1234".to_string(),
+            branch: "change-a".to_string(),
+            is_detached: false,
+            is_main: false,
+            merge_conflict: None,
+            has_commits_ahead: true,
+            is_merging: false,
+        }
+    }
+
+    pub(crate) fn blocker() -> StalledBlocker {
+        StalledBlocker {
+            category: "external_service".to_string(),
+            phase: "acceptance".to_string(),
+            gate: "acceptance".to_string(),
+            error_summary: "registry returned 503".to_string(),
+            evidence: vec!["curl: 503".to_string()],
+            unblock_condition: Some("the registry answers 200".to_string()),
+            prerequisite_owner: Some("platform".to_string()),
+            next_action: "retry acceptance".to_string(),
+            resumable: true,
+            worktree_preserved: true,
+        }
+    }
+
+    /// Every `ExecutionEvent` variant, once.
+    ///
+    /// The list is checked against [`classify_event`] rather than trusted: a
+    /// missing or duplicated entry fails
+    /// `ownership_table_names_every_variant_exactly_once`.
+    pub(crate) fn all_execution_events() -> Vec<ExecutionEvent> {
+        use ExecutionEvent as E;
+        vec![
+            E::ProcessingStarted("change-a".to_string()),
+            E::ProcessingCompleted("change-a".to_string()),
+            E::ProcessingError {
+                id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+            E::ApplyStarted {
+                change_id: "change-a".to_string(),
+                command: "apply --token secret".to_string(),
+            },
+            E::ApplyCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-1".to_string(),
+            },
+            E::ApplyFailed {
+                change_id: "change-a".to_string(),
+                error: "apply boom".to_string(),
+            },
+            E::ApplyOutput {
+                change_id: "change-a".to_string(),
+                output: "chunk".to_string(),
+                iteration: Some(2),
+            },
+            E::ArchiveStarted {
+                change_id: "change-a".to_string(),
+                command: "archive".to_string(),
+            },
+            E::ArchiveResumed {
+                change_id: "change-a".to_string(),
+                reason: Some("resume reason".to_string()),
+                summary: Some("resume summary".to_string()),
+            },
+            E::ArchiveRetryScheduled {
+                change_id: "change-a".to_string(),
+                attempt: 1,
+                max_attempts: 3,
+                reason: Some("retry reason".to_string()),
+                summary: Some("retry summary".to_string()),
+            },
+            E::ChangeArchived("change-a".to_string()),
+            E::ArchiveFailed {
+                change_id: "change-a".to_string(),
+                error: "archive boom".to_string(),
+                reason: Some("archive reason".to_string()),
+                summary: Some("archive summary".to_string()),
+            },
+            E::ArchiveOutput {
+                change_id: "change-a".to_string(),
+                output: "chunk".to_string(),
+                iteration: 3,
+            },
+            E::AcceptanceStarted {
+                change_id: "change-a".to_string(),
+                command: "accept".to_string(),
+            },
+            E::AcceptanceCompleted {
+                change_id: "change-a".to_string(),
+            },
+            E::AcceptanceFailed {
+                change_id: "change-a".to_string(),
+                error: "acceptance boom".to_string(),
+            },
+            E::ChangeRejected {
+                change_id: "change-a".to_string(),
+                reason: "rejected reason".to_string(),
+            },
+            E::RejectionReviewCompleted {
+                change_id: "change-a".to_string(),
+                outcome: RejectionOutcome::Confirm,
+            },
+            E::RejectionReviewFailed {
+                change_id: "change-a".to_string(),
+                error: "review boom".to_string(),
+            },
+            E::AcceptanceOutput {
+                change_id: "change-a".to_string(),
+                output: "chunk".to_string(),
+                iteration: Some(4),
+            },
+            E::ProgressUpdated {
+                change_id: "change-a".to_string(),
+                completed: 3,
+                total: 7,
+            },
+            E::WorkspaceCreated {
+                change_id: "change-a".to_string(),
+                workspace: "ws-a".to_string(),
+            },
+            E::WorkspaceStatusUpdated {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-a".to_string(),
+                status: crate::vcs::WorkspaceStatus::Applying,
+            },
+            E::WorkspaceResumed {
+                change_id: "change-a".to_string(),
+                workspace: "ws-a".to_string(),
+            },
+            E::WorkspacePreserved {
+                change_id: "change-a".to_string(),
+                workspace_name: "ws-a".to_string(),
+            },
+            E::CleanupStarted {
+                workspace: "ws-a".to_string(),
+            },
+            E::CleanupCompleted {
+                workspace: "ws-a".to_string(),
+            },
+            E::MergeStarted {
+                revisions: vec!["rev-1".to_string()],
+            },
+            E::MergeCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-2".to_string(),
+            },
+            E::PushStarted {
+                change_id: "change-a".to_string(),
+                remote: "origin".to_string(),
+                branch: "change-a".to_string(),
+            },
+            E::PushCompleted {
+                change_id: "change-a".to_string(),
+                remote: "origin".to_string(),
+                branch: "change-a".to_string(),
+            },
+            E::PushFailed {
+                change_id: "change-a".to_string(),
+                remote: "origin".to_string(),
+                branch: "change-a".to_string(),
+                error: "push boom".to_string(),
+            },
+            E::MergeDeferred {
+                change_id: "change-a".to_string(),
+                reason: "base dirty".to_string(),
+                auto_resumable: true,
+            },
+            E::ResolveStarted {
+                change_id: "change-a".to_string(),
+                command: "resolve".to_string(),
+            },
+            E::ResolveCompleted {
+                change_id: "change-a".to_string(),
+                worktree_change_ids: None,
+            },
+            E::ResolveFailed {
+                change_id: "change-a".to_string(),
+                error: "resolve boom".to_string(),
+            },
+            E::ResolveOutput {
+                change_id: "change-a".to_string(),
+                output: "chunk".to_string(),
+                iteration: Some(5),
+            },
+            E::MergeConflict {
+                files: vec!["src/lib.rs".to_string()],
+            },
+            E::ConflictResolutionStarted,
+            E::ConflictResolutionCompleted,
+            E::ConflictResolutionFailed {
+                error: "conflict boom".to_string(),
+            },
+            E::ChangeSkipped {
+                change_id: "change-a".to_string(),
+                reason: "dependency failed".to_string(),
+            },
+            E::DependencyBlocked {
+                change_id: "change-a".to_string(),
+                dependency_ids: vec!["dep-a".to_string()],
+            },
+            E::DependencyResolved {
+                change_id: "change-a".to_string(),
+            },
+            E::AcceptanceGated {
+                change_id: "change-a".to_string(),
+                blocker: blocker(),
+            },
+            E::ExecutionBlocked {
+                change_id: "change-a".to_string(),
+                blocker: blocker(),
+            },
+            E::AnalysisStarted {
+                remaining_changes: 2,
+                attempt_id: "attempt-1".to_string(),
+            },
+            E::AnalysisOutput {
+                output: "chunk".to_string(),
+                iteration: 1,
+            },
+            E::AnalysisCompleted { groups_found: 2 },
+            E::HookStarted {
+                change_id: "change-a".to_string(),
+                hook_type: "pre_apply".to_string(),
+            },
+            E::HookCompleted {
+                change_id: "change-a".to_string(),
+                hook_type: "post_apply".to_string(),
+            },
+            E::HookFailed {
+                change_id: "change-a".to_string(),
+                hook_type: "pre_archive".to_string(),
+                error: "hook boom".to_string(),
+            },
+            E::Warning {
+                title: "warning title".to_string(),
+                message: "warning message".to_string(),
+            },
+            E::ParallelStartRejected {
+                change_ids: vec!["change-a".to_string()],
+                reason: "not eligible".to_string(),
+            },
+            E::Log(LogEntry::info("log line")),
+            E::Stopping,
+            E::Stopped,
+            E::AllCompleted,
+            E::Error {
+                message: "process boom".to_string(),
+            },
+            E::ChangesRefreshed {
+                changes: vec![change("change-a")],
+                rejected_changes: vec![change("change-b")],
+                committed_change_ids: std::collections::HashSet::new(),
+                uncommitted_file_change_ids: std::collections::HashSet::new(),
+                worktree_change_ids: std::collections::HashSet::new(),
+                worktree_paths: std::collections::HashMap::new(),
+                worktree_not_ahead_ids: std::collections::HashSet::new(),
+                merge_wait_ids: std::collections::HashSet::new(),
+            },
+            E::WorktreesRefreshed {
+                worktrees: vec![worktree()],
+            },
+            E::BranchMergeStarted {
+                branch_name: "change-a".to_string(),
+            },
+            E::BranchMergeCompleted {
+                branch_name: "change-a".to_string(),
+            },
+            E::BranchMergeFailed {
+                branch_name: "change-a".to_string(),
+                error: "branch boom".to_string(),
+            },
+            E::ChangeDequeued {
+                change_id: "change-a".to_string(),
+            },
+            E::ChangeStopped {
+                change_id: "change-a".to_string(),
+            },
+            E::ChangeStopFailed {
+                change_id: "change-a".to_string(),
+                error: "stop boom".to_string(),
+            },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::ownership_fixtures::all_execution_events;
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// The variant count `classify_event` covers.
+    ///
+    /// Adding an `ExecutionEvent` variant breaks the exhaustive match in
+    /// `classify_event` at compile time; this constant then forces the fixture
+    /// table — and therefore every ownership and projection assertion below —
+    /// to grow with it instead of silently skipping the new variant.
+    const EXECUTION_EVENT_VARIANTS: usize = 67;
+
+    #[test]
+    fn ownership_table_names_every_variant_exactly_once() {
+        let events = all_execution_events();
+        let names: BTreeSet<&'static str> = events.iter().map(event_variant_name).collect();
+
+        assert_eq!(
+            names.len(),
+            events.len(),
+            "the fixture table repeats a variant: {:?}",
+            events.iter().map(event_variant_name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            names.len(),
+            EXECUTION_EVENT_VARIANTS,
+            "a variant was added or removed without updating the ownership fixtures"
+        );
+    }
+
+    #[test]
+    fn only_the_log_variant_is_log_owned() {
+        for event in all_execution_events() {
+            let (name, ownership) = classify_event(&event);
+            let is_log = matches!(ownership, EventOwnership::Log);
+            assert_eq!(
+                is_log,
+                name == "Log",
+                "{name} must not claim log ownership without a log payload"
+            );
+        }
+    }
+
+    /// A presentation event promises the operator snapshot cannot change, so it
+    /// must not be change-addressed: a change-addressed event feeds timing,
+    /// activity, and attention, all of which the snapshot publishes.
+    #[cfg(feature = "web-monitoring")]
+    #[test]
+    fn presentation_events_are_never_change_addressed() {
+        for event in all_execution_events() {
+            let (name, ownership) = classify_event(&event);
+            if !matches!(ownership, EventOwnership::Presentation) {
+                continue;
+            }
+            let (_, change_id, _) =
+                crate::web::remote_control_api::projection::describe_event(&event);
+            assert!(
+                change_id.is_none(),
+                "{name} is presentation-only but addresses change {change_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_completed_never_overwrites_a_retained_terminal_mode() {
+        assert!(!all_completed_may_overwrite_mode("error"));
+        assert!(!all_completed_may_overwrite_mode("stopped"));
+        for non_terminal in ["select", "running", "stopping"] {
+            assert!(
+                all_completed_may_overwrite_mode(non_terminal),
+                "{non_terminal} is not a retained terminal mode"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::ownership_fixtures::all_execution_events;
+    use super::*;
+    use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Counts deliveries and remembers the dispatch identities it saw.
+    #[derive(Default)]
+    struct CountingSink {
+        events: AtomicUsize,
+        state_notifications: AtomicUsize,
+        dispatch_ids: tokio::sync::Mutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl EventSink for CountingSink {
+        async fn on_event(&self, _event: &ExecutionEvent) {
+            self.events.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn on_state_changed(&self, _state: &OrchestratorState) {
+            self.state_notifications.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn on_dispatch(&self, dispatch: &EventDispatch<'_>) {
+            self.dispatch_ids.lock().await.push(dispatch.id);
+            self.on_event(dispatch.event).await;
+            if let Some(state) = dispatch.state {
+                self.on_state_changed(state).await;
+            }
+        }
+    }
+
+    fn parallel_state(ids: &[&str]) -> tokio::sync::RwLock<OrchestratorState> {
+        tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            ids.iter().map(|id| id.to_string()).collect(),
+            10,
+            ExecutionMode::Parallel,
+        ))
+    }
+
+    fn serial_state(ids: &[&str]) -> tokio::sync::RwLock<OrchestratorState> {
+        tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            ids.iter().map(|id| id.to_string()).collect(),
+            10,
+            ExecutionMode::Serial,
+        ))
+    }
+
+    /// One emitted event is one reducer transition and one delivery per sink,
+    /// however many frontends are attached.
+    #[tokio::test]
+    async fn one_event_is_one_transition_and_one_delivery_per_frontend() {
+        for state in [serial_state(&["change-a"]), parallel_state(&["change-a"])] {
+            let first = Arc::new(CountingSink::default());
+            let second = Arc::new(CountingSink::default());
+            let sinks: Vec<Arc<dyn EventSink>> = vec![first.clone(), second.clone()];
+
+            dispatch_event(
+                &state,
+                &sinks,
+                ExecutionEvent::ApplyStarted {
+                    change_id: "change-a".to_string(),
+                    command: "apply".to_string(),
+                },
+            )
+            .await;
+            dispatch_event(
+                &state,
+                &sinks,
+                ExecutionEvent::ApplyCompleted {
+                    change_id: "change-a".to_string(),
+                    revision: "rev-1".to_string(),
+                },
+            )
+            .await;
+
+            assert_eq!(
+                state.read().await.apply_count("change-a"),
+                1,
+                "a counter must advance once, not once per attached frontend"
+            );
+            for sink in [&first, &second] {
+                assert_eq!(sink.events.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    sink.state_notifications.load(Ordering::SeqCst),
+                    2,
+                    "a state-owning event carries the reducer output it produced"
+                );
+            }
+        }
+    }
+
+    /// Every dispatch carries a distinct identity, which is what lets a frontend
+    /// recognise a repeated delivery instead of guessing from event content.
+    #[tokio::test]
+    async fn every_dispatch_carries_a_distinct_identity() {
+        let state = serial_state(&["change-a"]);
+        let sink = Arc::new(CountingSink::default());
+        let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
+
+        for _ in 0..3 {
+            dispatch_event(&state, &sinks, ExecutionEvent::Log(LogEntry::info("same"))).await;
+        }
+
+        let ids = sink.dispatch_ids.lock().await.clone();
+        assert_eq!(ids.len(), 3);
+        let unique: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "two identical log events are still two dispatches"
+        );
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids must be ordered");
+    }
+
+    /// Log and presentation events cannot change the snapshot, so dispatch does
+    /// not pay to clone the reducer for them.
+    #[tokio::test]
+    async fn only_state_owned_events_carry_reducer_output() {
+        let state = serial_state(&["change-a"]);
+        let sink = Arc::new(CountingSink::default());
+        let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
+
+        for event in all_execution_events() {
+            let expected_state = matches!(event_ownership(&event), EventOwnership::State);
+            let before = sink.state_notifications.load(Ordering::SeqCst);
+            dispatch_event(&state, &sinks, event.clone()).await;
+            let after = sink.state_notifications.load(Ordering::SeqCst);
+            assert_eq!(
+                after - before,
+                usize::from(expected_state),
+                "{} carried the wrong state ownership",
+                event_variant_name(&event)
+            );
+        }
+    }
+
+    /// The bridge is the path a producer that can only speak `mpsc::Sender`
+    /// takes into the single dispatch owner.
+    #[tokio::test]
+    async fn bridged_producers_reach_the_reducer_and_every_sink() {
+        let sink = Arc::new(CountingSink::default());
+        let dispatcher = Arc::new(EventDispatcher::new(
+            Arc::new(serial_state(&["change-a"])),
+            vec![sink.clone()],
+        ));
+        let (bridge, handle) = dispatcher.bridge(8);
+
+        bridge
+            .send(ExecutionEvent::ProcessingStarted("change-a".to_string()))
+            .await
+            .expect("bridge accepts events");
+        bridge
+            .send(ExecutionEvent::Log(LogEntry::info("hook output")))
+            .await
+            .expect("bridge accepts logs");
+        drop(bridge);
+        handle.await.expect("bridge task ends when senders drop");
+
+        assert_eq!(sink.events.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            sink.state_notifications.load(Ordering::SeqCst),
+            1,
+            "the log is observational; the lifecycle event is not"
+        );
+    }
+
+    /// Producers that must record a hold in the reducer synchronously — parallel
+    /// dispatch suppression cannot wait for a channel round trip — apply the
+    /// event themselves *and* publish it, so the dispatch owner applies it a
+    /// second time. That is the documented exception, and it is only safe
+    /// because those reducer transitions are idempotent.
+    #[tokio::test]
+    async fn producer_preapplied_events_are_idempotent_in_the_reducer() {
+        use crate::orchestration::state::OrchestratorState;
+        let preapplied = [
+            ExecutionEvent::ChangeArchived("change-a".to_string()),
+            ExecutionEvent::AcceptanceGated {
+                change_id: "change-a".to_string(),
+                blocker: super::ownership_fixtures::blocker(),
+            },
+            ExecutionEvent::ExecutionBlocked {
+                change_id: "change-a".to_string(),
+                blocker: super::ownership_fixtures::blocker(),
+            },
+            ExecutionEvent::MergeCompleted {
+                change_id: "change-a".to_string(),
+                revision: "rev-1".to_string(),
+            },
+            ExecutionEvent::HookFailed {
+                change_id: "change-a".to_string(),
+                hook_type: "on_merged".to_string(),
+                error: "boom".to_string(),
+            },
+            ExecutionEvent::RejectionReviewCompleted {
+                change_id: "change-a".to_string(),
+                outcome: RejectionOutcome::Confirm,
+            },
+            ExecutionEvent::RejectionReviewFailed {
+                change_id: "change-a".to_string(),
+                error: "boom".to_string(),
+            },
+        ];
+
+        for event in preapplied {
+            let mut once = OrchestratorState::with_mode(
+                vec!["change-a".to_string()],
+                10,
+                ExecutionMode::Parallel,
+            );
+            let mut twice = OrchestratorState::with_mode(
+                vec!["change-a".to_string()],
+                10,
+                ExecutionMode::Parallel,
+            );
+
+            once.apply_execution_event(&event);
+            twice.apply_execution_event(&event);
+            twice.apply_execution_event(&event);
+
+            let name = event_variant_name(&event);
+            assert_eq!(
+                once.all_display_statuses(),
+                twice.all_display_statuses(),
+                "{name} changed display status on the second application"
+            );
+            assert_eq!(
+                once.changes_processed(),
+                twice.changes_processed(),
+                "{name} double-counted processed changes"
+            );
+            assert_eq!(
+                once.apply_count("change-a"),
+                twice.apply_count("change-a"),
+                "{name} double-counted applies"
+            );
+            assert_eq!(
+                once.remaining_changes(),
+                twice.remaining_changes(),
+                "{name} double-counted remaining changes"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
