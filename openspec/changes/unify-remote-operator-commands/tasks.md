@@ -65,7 +65,7 @@
 
 ## Acceptance Repair Notes (attempt 2)
 
-### acceptance-bin-dead-code-clippy-gate
+**acceptance-bin-dead-code-clippy-gate**
 
 - Every symbol the finding named is gone from the crate rather than silenced with an `allow`, except
   the three `AppState` accessors whose only real callers are tests; those are `#[cfg(test)]` now.
@@ -95,7 +95,7 @@
   `cflx run` waits for SIGINT/SIGTERM. That hang predates this repair and is unchanged by it; it is
   not one of the open findings, and rewriting `cflx run`'s restart semantics is out of scope here.
 
-### acceptance-auto-deferral-resolve-false-refusal
+**acceptance-auto-deferral-resolve-false-refusal**
 
 - The auto-resumable idle branch of `handle_merge_deferred` no longer emits
   `TuiCommand::ResolveMerge`; it paints `resolve pending` and returns. The reducer has already
