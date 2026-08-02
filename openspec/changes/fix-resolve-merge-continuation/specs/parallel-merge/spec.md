@@ -1,55 +1,134 @@
 ## ADDED Requirements
 
+### Requirement: Sequential resolve retains worktree evidence
+
+Sequential merge resolution MUST retain the ordered worktree path for every `(revision, change_id)` from merge admission through retry and terminal verification. A process-local workspace list MAY optimize path lookup but MUST NOT be the authoritative source. A stale path MAY be replaced only by repository-local Git worktree rediscovery that proves exact repository and branch identity. Missing, ambiguous, detached, mismatched, or unreadable evidence MUST fail closed and MUST NOT skip worktree verification.
+
+#### Scenario: Archived worktree is absent from process memory
+
+**Given**: Merge admission supplies a valid archived worktree path for a change
+**And**: The process-local workspace list does not contain that worktree
+**When**: Sequential resolve builds and verifies an attempt
+**Then**: It uses the supplied validated path
+**And**: It checks that worktree's branch, `MERGE_HEAD`, conflicts, pre-sync subject, and ancestry as applicable
+**And**: It does not display `(unknown)` or fall through because process memory omitted the workspace
+
+#### Scenario: Stale path is safely rediscovered
+
+**Given**: A supplied archived worktree path no longer exists
+**And**: Repository-local Git worktree metadata contains exactly one worktree checked out on the expected branch
+**When**: Sequential resolve validates path identity
+**Then**: It uses the rediscovered path
+**And**: The decision remains derivable from repository-local evidence
+
+#### Scenario: Worktree identity cannot be proven
+
+**Given**: A path is missing, ambiguous, in another repository, on the wrong branch, detached, or fails a Git query
+**When**: Sequential resolve validates evidence
+**Then**: The attempt is classified as unsafe evidence
+**And**: No worktree check is skipped
+**And**: No blind commit or resolve-completed event occurs
+
 ### Requirement: Sequential resolve phase-specific continuation
 
-Sequential merge resolution MUST derive retry continuation from current repository and worktree evidence and MUST identify the earliest unfinished protocol phase for each change. Continuation MUST distinguish target-repository merge completion, worktree pre-sync completion, pre-sync evidence validation, final merge completion, and archive resurrection cleanup. Agent exit status, narrative claims, external logs, and out-of-worktree durable state MUST NOT establish completion or choose the next phase.
+Sequential merge resolution MUST classify the earliest incomplete or unsafe state for each change in declared merge order. The closed states MUST cover unsafe evidence, identity-verified target merge in progress, identity-verified worktree pre-sync in progress, invalid or missing pre-sync, missing final integration, archive resurrection cleanup, and complete integration. Agent exit status, narrative claims, external logs, and out-of-worktree durable state MUST NOT establish completion or choose the next phase.
 
 #### Scenario: Pre-sync complete and final merge missing
 
-**Given**: A change worktree has completed the required pre-sync with the target branch
-**And**: The target branch does not contain the change branch or an exact `Merge change: <change_id>` commit
+**Given**: A validated change worktree contains required pre-sync evidence
+**And**: The expected revision is not integrated into target `HEAD`
 **When**: Conflux verifies a resolve attempt
 **Then**: The attempt remains incomplete
 **And**: Continuation identifies final merge as the next phase
-**And**: Continuation names the change ID, branch, worktree path, target branch, and exact final merge subject
-**And**: Continuation does not instruct the agent to repeat the completed pre-sync
+**And**: Continuation names the change, branch, validated worktree path, target branch, exact `Merge change: <change_id>` subject, and cleanup requirement
+**And**: Continuation does not instruct the agent to repeat pre-sync
 
-#### Scenario: Worktree pre-sync merge remains unfinished
+#### Scenario: Expected worktree pre-sync remains unfinished
 
-**Given**: The change worktree contains `MERGE_HEAD` or unresolved conflicts from pre-sync
+**Given**: The validated change worktree is on the expected branch
+**And**: Its `MERGE_HEAD` is proven to contain the expected target state
 **When**: Conflux verifies a resolve attempt
-**Then**: The attempt remains incomplete
-**And**: Continuation identifies the worktree path and pre-sync completion as the next phase
-**And**: Continuation includes the exact `Pre-sync base into <change_id>` subject
+**Then**: Continuation identifies pre-sync completion at that worktree path
+**And**: Continuation includes exact subject `Pre-sync base into <change_id>`
 **And**: No resolve-completed event is emitted
 
-#### Scenario: Resurrection cleanup is required before final commit
+#### Scenario: Merge in progress has unexpected identity
 
-**Given**: The target tree contains `openspec/changes/<change_id>`
-**And**: `openspec/changes/archive` contains a valid exact or date-prefixed archive entry for the same change
-**And**: The final merge is not complete
-**When**: Conflux builds continuation for the final merge phase
-**Then**: Continuation requires removal of the resurrected live change directory before the final merge commit
-**And**: An unrelated or invalid archive entry does not authorize removal
+**Given**: The target repository or change worktree contains `MERGE_HEAD`
+**And**: Its parent identity does not match the expected change revision or target state for the current ordered phase
+**When**: Conflux classifies the state
+**Then**: It reports unsafe evidence
+**And**: It does not instruct the agent to commit that merge
 
-#### Scenario: Final integration is repository-verifiable
+#### Scenario: Multiple changes retain merge order
 
-**Given**: No target-repository or worktree merge is unfinished
-**And**: No unresolved conflict remains
-**And**: Required pre-sync subject and ancestry checks pass
-**And**: The target branch contains the integrated revision with the required final merge evidence
-**When**: Conflux verifies the resolve attempt
-**Then**: The resolve may complete
-**And**: Completion does not depend on the resolve command's narrative output
+**Given**: Sequential resolve receives multiple ordered changes
+**When**: More than one change is incomplete
+**Then**: Classification reports the first incomplete or unsafe change in declared merge order
+**And**: A target merge is never completed with a combined unauditable per-change subject
+
+### Requirement: Sequential final integration has one identity policy
+
+Retry verification and terminal merge verification MUST apply the same integration identity policy. A protocol-created final merge commit MUST use exact subject `Merge change: <change_id>` and integrate the expected revision. An expected revision already ancestral to target `HEAD` MUST remain an accepted idempotent already-integrated state without requiring an artificial merge commit. An exact-subject commit that does not integrate the expected revision MUST NOT prove completion.
+
+#### Scenario: Exact final commit integrates expected revision
+
+**Given**: Target history since the merge base contains exact subject `Merge change: <change_id>`
+**And**: That commit integrates the expected revision
+**When**: Retry or terminal verification runs
+**Then**: Final merge identity passes
+
+#### Scenario: Exact subject has wrong parentage
+
+**Given**: Target history contains exact subject `Merge change: <change_id>`
+**But**: That commit does not integrate the expected revision
+**When**: Retry or terminal verification runs
+**Then**: The evidence is rejected
+**And**: The change is not reported complete
+
+#### Scenario: Revision is already integrated without exact subject
+
+**Given**: No exact final subject exists since the merge base
+**And**: The expected revision is already an ancestor of target `HEAD`
+**When**: Retry or terminal verification runs
+**Then**: The change is accepted as already integrated
+**And**: Conflux does not manufacture an empty merge commit
+
+### Requirement: Archive resurrection is a terminal invariant
+
+Sequential resolve MUST validate archive identity with the shared OpenSpec archive layout helpers and MUST prevent successful completion while the active live change and a valid archived form coexist. Before final merge, cleanup prediction MAY use valid archive evidence from the validated change worktree or branch plus target live evidence. During and after final merge, the target worktree/index-visible tree is authoritative. Invalid, nested, unrelated, or suffix-collision archive entries MUST NOT authorize removal.
+
+#### Scenario: Final merge will resurrect a live change
+
+**Given**: The target tree contains the active `openspec/changes/<change_id>` identity
+**And**: The validated change worktree or branch contains a valid exact or date-prefixed archive entry for the same change
+**When**: Continuation identifies final merge as next
+**Then**: It requires removal of the resurrected active change before the final commit
+
+#### Scenario: Final integration retains live and archive forms
+
+**Given**: The expected revision is integrated into target `HEAD`
+**And**: The target-visible tree still contains both the active change and a valid archived entry
+**When**: Terminal verification runs
+**Then**: Resolve remains incomplete
+**And**: Continuation identifies resurrection cleanup rather than reporting success
+
+#### Scenario: Archive layout is invalid or unrelated
+
+**Given**: The only archive-like path is nested, unrelated, or merely suffix-similar
+**When**: Sequential resolve evaluates cleanup authority
+**Then**: It does not authorize live-directory removal
+**And**: An invalid layout is reported as unsafe evidence
 
 ### Requirement: Sequential resolve continuation is bounded and observable
 
-Phase-specific continuation diagnostics MUST be bounded, stable for equivalent repository state, and emitted through the existing resolve output and retry-history surfaces. They MUST NOT create a second workflow state machine or persist authoritative continuation outside the workspace.
+Phase diagnostics MUST be emitted through existing resolve output and retry-history surfaces without creating a second workflow state machine. Recorded attempts MUST NOT exceed configured retries. Each stdout and stderr tail MUST be capped at 2 KiB, and the complete injected resolve context MUST be capped at 8 KiB on UTF-8 boundaries while retaining the newest actionable phase diagnosis.
 
-#### Scenario: Equivalent retries receive stable bounded guidance
+#### Scenario: Repeated oversized output remains bounded
 
-**Given**: Two consecutive resolve attempts leave equivalent Git and OpenSpec tree state
-**When**: Conflux records their continuation diagnostics
-**Then**: Both diagnostics identify the same unfinished phase and required action
-**And**: Diagnostic size remains bounded rather than recursively embedding unbounded prior history
+**Given**: Resolve attempts emit oversized lines or echo prior prompts
+**When**: Conflux records and injects continuation history
+**Then**: Each stream tail is at most 2 KiB
+**And**: Complete injected context is at most 8 KiB
+**And**: Truncation preserves valid UTF-8 and the newest actionable phase diagnosis
 **And**: Queue and resume decisions remain derived from workspace-local evidence

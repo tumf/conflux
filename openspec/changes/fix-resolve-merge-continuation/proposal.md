@@ -5,19 +5,23 @@ dependencies: []
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/parallel-merge/spec.md
+  - src/archive_layout.rs
+  - src/history.rs
   - src/parallel/conflict.rs
+  - src/parallel/merge.rs
   - src/parallel/tests/conflict.rs
   - src/vcs/git/commands/merge.rs
+  - src/embedded_skills.rs
   - skills/cflx-resolve/SKILL.md
 verifications:
   - id: resolve-continuation-tests
-    requirement: Sequential resolve retries identify and communicate the exact unfinished merge phase from repository state until the final merge is verifiably complete
+    requirement: "Sequential resolve retains and validates every worktree path, diagnoses the exact unfinished phase from repository evidence, and accepts only safe terminal integration states"
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Makefile
-    evidence: Rust unit and temporary-Git integration test output for pre-sync, final-merge, resurrection-cleanup, and completed states
-    rerun: cargo test parallel::tests::conflict
+    evidence: "Rust unit and temporary-Git integration output covering path plumbing, identity failures, pre-sync, final merge, fast-forward compatibility, resurrection cleanup, bounded history, and embedded skill guidance"
+    rerun: "cargo test parallel:: && cargo test history:: && cargo test embedded_skills"
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -29,38 +33,48 @@ verifications:
 
 ## Problem / Context
 
-A sequential resolve can complete the worktree pre-sync but stop before the final merge into the target branch. Conflux currently reduces that state to the generic continuation reason `Missing merge commits for change_ids (...); retrying resolve`. The next resolve attempt receives history, but not an explicit repository-state diagnosis naming the unfinished phase, worktree, required final merge subject, or archive resurrection cleanup. An agent can therefore repeat or merely describe Step 2 until the retry limit is exhausted, after which queue reconciliation falls back to manual merge wait.
+`attempt_merge` receives one archived worktree path per `(revision, change_id)` but drops those paths when it calls `merge_and_resolve`. `resolve_merges_with_retry` then reconstructs paths from `workspace_manager.workspaces()`. A preserved or archived worktree can be absent from that process-local list even though its path and Git state still exist. The prompt displays `(unknown)`, and worktree `MERGE_HEAD`, conflicts, branch identity, pre-sync subject, and ancestry checks are silently skipped. Verification falls through to the generic `Missing merge commits for change_ids (...); retrying resolve` reason.
 
-The repository state already contains the authoritative evidence needed to diagnose the unfinished protocol: `MERGE_HEAD`, conflict files, branch ancestry, exact merge subjects, live change paths, and valid exact/date-prefixed archive entries. The fix must derive continuation solely from that workspace-local evidence and must not treat agent exit status or narrative output as completion.
+In the observed failure, the change worktree held the incomplete pre-sync while the target branch still held the live OpenSpec change. Because the actual worktree path was lost, three retries could not diagnose the unfinished pre-sync or direct the agent safely to final merge. Queue reconciliation then correctly deferred to manual merge wait after retries were exhausted.
+
+The existing pre-loop target-root shortcut also commits any conflict-free `MERGE_HEAD` before full phase diagnosis. That path can bypass archive resurrection cleanup and pre-sync verification. Finally, current code intentionally accepts an already integrated revision by ancestry when no exact final merge subject exists, while the initial proposal incorrectly implied that an exact subject is always mandatory.
 
 ## Proposed Solution
 
-Introduce a repository-state-based sequential merge continuation diagnosis used after every resolve attempt. The diagnosis will classify the earliest unfinished phase for each `(revision, change_id)` and produce bounded, actionable continuation context containing the affected repository/worktree path, current evidence, required next phase, exact commit subject, and archive resurrection cleanup requirement when both live and archived forms exist.
+Carry the ordered archived worktree paths through `attempt_merge`, `merge_and_resolve`, `merge_and_resolve_with`, `ResolveMergesWithRetryArgs`, and `resolve_merges_with_retry`. Validate each path against current Git worktree and branch evidence. If a supplied path is stale, rediscover the expected branch through repository-local Git worktree metadata; if evidence remains unavailable, mismatched, detached, or unreadable, classify it explicitly and fail closed instead of skipping checks.
 
-Keep the resolve agent responsible for conflict decisions and Git mutations. Strengthen the embedded `cflx-resolve` retry contract so an agent receiving phase-specific continuation must resume at the named incomplete phase, complete all remaining sequential protocol steps in the same attempt when possible, and avoid repeating an already completed pre-sync. Existing repository-verifiable success checks remain authoritative.
+Add a side-effect-free sequential merge state classifier that evaluates each ordered `(revision, change_id, worktree_path)` and the target repository. It will identify the earliest incomplete or unsafe phase, emit bounded actionable continuation, and place the existing target-root conflict-free auto-commit shortcut under the same classification, archive-cleanup, and terminal-verification rules. Git mutations and conflict decisions remain owned by the resolve agent.
 
-This remains one change because the state classifier, retry prompt contract, embedded skill guidance, and Git-backed regression tests must ship together to prove convergence behavior.
+Preserve existing idempotent compatibility: an exact `Merge change: <change_id>` commit is valid only when it integrates the expected revision, while a revision already ancestral to target `HEAD` remains accepted without manufacturing a new merge commit. New protocol-driven final merges continue to require the exact subject.
+
+This remains one change because path plumbing, closed-state diagnosis, terminal predicates, embedded skill guidance, and Git-backed regression tests must ship together; any subset would retain the fail-open behavior.
 
 ## Acceptance Criteria
 
-1. After each resolve attempt, Conflux distinguishes an unfinished target-branch merge, unfinished worktree pre-sync, invalid or missing pre-sync evidence, missing final merge, required archive resurrection cleanup, and fully integrated completion using current repository state.
-2. A pre-sync-complete/final-merge-missing state produces continuation context naming the change, branch, worktree path, target branch, exact `Merge change: <change_id>` subject, and the instruction to proceed to final merge rather than repeat pre-sync.
-3. If a live `openspec/changes/<change_id>` exists while a valid exact or date-prefixed archive entry exists, final-merge continuation explicitly requires removal of the resurrected live directory before the final commit.
-4. An unfinished merge or remaining conflict reports the exact repository/worktree location and required phase-specific completion action without claiming success.
-5. Resolve succeeds only when existing merge-subject, ancestry, pre-sync, clean-merge-state, and conflict checks pass; agent exit status and prose remain non-authoritative.
-6. Retry diagnostics are bounded, stable, and emitted through the existing resolve output/history path without introducing durable workflow state.
+1. Every change passed to sequential resolve has an ordered worktree path sourced from `archive_paths` or repository-local Git rediscovery; process-local workspace membership is not required.
+2. Missing, stale, unreadable, wrong-branch, detached-HEAD, unexpected-merge-parent, or Git-query-failed evidence is classified explicitly and never skipped or treated as completion.
+3. The classifier distinguishes unsafe evidence, unfinished target merge, unfinished worktree pre-sync, missing/invalid pre-sync, missing final merge, resurrection cleanup required, and complete integration, and evaluates multiple changes in declared merge order.
+4. `MERGE_HEAD` guidance is emitted only after its identity is proven: target-root merge identity must include the expected change revision, and worktree pre-sync identity must include the expected target state. Unknown merge identity never receives a blind commit instruction.
+5. A pre-sync-complete/final-merge-missing state names the change, branch, validated worktree path, target branch, exact `Merge change: <change_id>` subject, and whether resurrection cleanup will be required, without instructing the agent to repeat pre-sync.
+6. Archive identity uses `archive_layout::find_valid_archive_entry` and `invalid_layout_error`. Before final merge it considers the validated change worktree/branch archive evidence plus target live evidence; during or after final merge it uses the target worktree/index-visible tree. Invalid or unrelated archive entries never authorize live-directory removal.
+7. Final success requires no unfinished merge or conflict, valid pre-sync evidence when required, expected revision integration, and no live/archive coexistence. An exact final subject must integrate the expected revision; alternatively, an already ancestral revision remains an idempotent fast-forward/already-integrated success.
+8. The target-root conflict-free `MERGE_HEAD` shortcut cannot bypass phase identity, resurrection cleanup, or terminal verification, and multi-change processing preserves per-change ordered evidence.
+9. Retry diagnostics use the existing output/history surfaces, retain no more than the configured retry count, cap each captured stream tail at 2 KiB, and cap the complete injected resolve context at 8 KiB on UTF-8 boundaries.
+10. Agent exit status and prose remain non-authoritative; all routing and completion decisions remain derivable from workspace file state, Git state, and base comparison.
 
 ## Explicit Completion Conditions
 
-- `src/parallel/conflict.rs` derives phase-specific continuation from Git and OpenSpec tree evidence and uses it in retry history instead of the generic missing-merge reason where a more precise state is available.
-- Archive detection accepts the repository's valid exact and date-prefixed archive layouts and rejects unrelated or invalid entries.
-- `skills/cflx-resolve/SKILL.md` tells retrying agents to resume from the diagnosed phase and complete every remaining sequential merge step, including resurrection cleanup, before returning.
-- Rust tests create representative temporary Git repositories/worktrees and fail if pre-sync-only state is accepted, if continuation recommends repeating completed work, if resurrection cleanup is omitted, or if completed final integration is rejected.
-- `cargo test parallel::tests::conflict` passes.
+- `src/parallel/merge.rs` passes ordered worktree paths through the full merge/resolve call chain and applies one documented terminal integration policy in both retry verification and `verify_merge_commits`.
+- `src/parallel/conflict.rs` uses a closed side-effect-free state classifier, removes fail-open `Option` path skips, and routes the pre-loop target merge shortcut through the same safety predicates.
+- `src/archive_layout.rs` helpers are reused for exact/date-prefixed archive validation; nested/invalid layouts fail closed.
+- `src/history.rs` enforces the 2 KiB per-stream and 8 KiB complete-context limits without splitting UTF-8.
+- `skills/cflx-resolve/SKILL.md` aligns its live/archive predicate with runtime validation and requires resumption from the diagnosed phase without blind commits.
+- Tests cover empty manager workspace lists with valid passed paths, stale-path rediscovery, missing paths, wrong branch, detached HEAD, wrong `MERGE_HEAD`, Git errors, wrong-parent exact subjects, fast-forward/already-integrated success, multi-change order, target auto-commit bypass prevention, pre/post-final resurrection, bounded history, and actual embedded skill content.
+- `cargo test parallel:: && cargo test history:: && cargo test embedded_skills` passes.
 
 ## Out of Scope
 
-- Automatically committing or merging on behalf of the resolve agent.
-- Bypassing Git hooks, rewriting branch history, changing merge commit subject conventions, or weakening existing verification.
-- Changing queue reconciliation or manual merge-wait classification after retries are genuinely exhausted.
-- Repairing the currently preserved `unify-remote-operator-commands` worktree as part of this proposal.
+- Making Conflux automatically complete conflict-free pre-sync or final merges.
+- Guaranteeing that an external resolve agent will always converge; this change guarantees correct fail-closed diagnosis, continuation, and terminal verification.
+- Bypassing Git hooks, rewriting branch history, changing queue reconciliation after genuine retry exhaustion, or repairing the currently preserved failed worktree.
+- Cleaning up duplicate canonical `merge-attempt-resolve-priority` blocks; that pre-existing spec hygiene issue is unrelated.

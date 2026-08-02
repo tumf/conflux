@@ -2,53 +2,112 @@
 
 ## Context
 
-Sequential merge resolution spans two repositories of action: the change worktree is pre-synced with the target branch, then the change branch is merged into the target repository. The current verifier checks individual invariants but reports a generic missing-final-commit reason after the agent exits. That reason does not identify which protocol phase is complete or what exact action remains.
+Sequential integration has two mutation locations: the change worktree is pre-synced with target state, then the change revision is integrated into the target repository. `attempt_merge` already owns ordered `archive_paths`, but `merge_and_resolve` drops them. `resolve_merges_with_retry` reconstructs paths from `workspace_manager.workspaces()`, an optional process-local view that may omit a preserved archived worktree. Missing map entries produce `(unknown)` prompt locations and skip worktree verification.
 
-The reported failure demonstrates a recoverable state: the worktree branch contains the archived change and an in-progress pre-sync from the target, while the target branch still contains the live change and has no final merge commit. Re-running an undifferentiated prompt can repeat inspection without advancing the repository.
+This is the primary defect. Generic continuation text is a downstream symptom: without the actual path, Conflux cannot observe the worktree `MERGE_HEAD`, conflicts, branch identity, or pre-sync evidence.
 
-## Decision
+## Decisions
 
-Add a side-effect-free continuation classifier over current repository evidence. It returns either complete or one bounded diagnosis for the earliest unfinished phase.
+### Preserve ordered worktree identity end to end
 
-The classifier evaluates in protocol order:
+Introduce an ordered input record containing `revision`, `change_id`, and `archive_path`, or pass equivalent parallel slices with enforced equal lengths. The record flows through:
 
-1. Target repository unfinished merge and conflicts.
-2. Worktree unfinished pre-sync merge and conflicts.
-3. Pre-sync subject and ancestry evidence when pre-sync is required.
-4. Final branch integration and exact `Merge change: <change_id>` evidence.
-5. Live/archive coexistence that requires resurrection cleanup before final commit.
-6. Existing terminal verification.
+1. `ParallelExecutor::attempt_merge`
+2. `ParallelExecutor::merge_and_resolve`
+3. `ParallelExecutor::merge_and_resolve_with`
+4. `ResolveMergesWithRetryArgs`
+5. `resolve_merges_with_retry`
 
-A diagnosis contains only data needed for the next attempt: change ID, revision, affected path, target branch, observed evidence, required next phase, exact commit subject, and whether resurrection cleanup applies. Formatting remains bounded so repeated attempts cannot grow prompts without limit.
+The passed path is primary. If it no longer exists, Git worktree metadata may rediscover the path by exact branch ref. Rediscovery must prove repository membership and branch identity. Missing or ambiguous evidence becomes `UnsafeEvidence`; it never falls back to skipping worktree checks.
+
+### Closed state model
+
+For each change in declared merge order, classification returns exactly one state:
+
+- `UnsafeEvidence`: missing/ambiguous path, wrong repository, wrong branch, detached HEAD, Git query failure, invalid archive layout, or merge identity mismatch.
+- `TargetMergeUnfinished`: target root has an expected, identity-verified merge in progress; conflicts and cleanup needs are attached.
+- `PreSyncUnfinished`: validated worktree has an expected target merge in progress; conflicts and exact pre-sync subject are attached.
+- `PreSyncInvalid`: pre-sync is required but subject, parentage, or ancestry evidence is missing or invalid.
+- `FinalMergeMissing`: pre-sync is valid but the expected revision is not integrated into target `HEAD`; final subject and cleanup evidence are attached.
+- `ResurrectionCleanupRequired`: expected revision is integrated or a final merge is in progress, but target-visible live and valid archived forms coexist.
+- `Complete`: terminal predicate passes.
+
+Classification stops at the first non-complete change in input order. Within a change, safety/identity checks run first, then target in-progress merge, worktree pre-sync, pre-sync validity, target integration, resurrection invariant, and terminal completion.
+
+### Merge identity
+
+`MERGE_HEAD` existence alone never authorizes a commit instruction.
+
+- In the target repository, the merge parents/`MERGE_HEAD` must contain the expected change revision for the current ordered item. An unrelated or ambiguous merge is `UnsafeEvidence`.
+- In a change worktree, `MERGE_HEAD` must contain the target revision that pre-sync is expected to include, and the checked-out branch must be the expected revision branch. Otherwise classification is `UnsafeEvidence`.
+- For multiple changes, only the current ordered item may own an in-progress target merge; combined unauditable merge state is rejected rather than committed with `Merge changes: ...`.
+
+### Final integration policy
+
+Preserve current idempotent ancestry compatibility while making identity explicit:
+
+- A newly executed protocol final merge must use exact subject `Merge change: <change_id>` and the commit must integrate the expected revision.
+- If the expected revision is already an ancestor of target `HEAD`, it is accepted as already integrated even when no exact final subject exists. Conflux does not manufacture an empty merge commit.
+- An exact-subject commit that does not integrate the expected revision is invalid evidence, not success.
+- `resolve_merges_with_retry` and `verify_merge_commits` use the same helper/policy so retry and terminal checks cannot disagree.
+
+### Archive resurrection evidence
+
+Use `archive_layout::invalid_layout_error` before `archive_layout::find_valid_archive_entry`.
+
+Evidence sources are phase-specific:
+
+- Before final merge begins, archive identity may exist only in the validated change worktree/branch tree, while the target working tree still contains `openspec/changes/<change_id>`.
+- During final merge, cleanup need is evaluated from the target worktree/index-visible tree after merge content is applied.
+- After final integration, terminal verification evaluates the target worktree/index-visible tree and rejects valid archive plus live directory coexistence.
+
+The runtime and `cflx-resolve` skill use the same live-path predicate: the live directory is considered present only when it is the active change identity recognized by the OpenSpec layout, including its `proposal.md`. Invalid, nested, unrelated, or merely similarly suffixed archive directories never authorize deletion.
+
+### Existing target auto-commit shortcut
+
+The pre-loop conflict-free target `MERGE_HEAD` shortcut no longer directly commits and returns. It first enters classification, verifies merge identity, determines resurrection cleanup, and delegates the required action through the same resolve attempt/verification cycle. This preserves agent ownership of Git mutation and prevents multi-change `Merge changes: ...` commits from bypassing per-change evidence.
+
+### Bounded continuation
+
+`ResolveContext` already limits attempt count through orchestration but stream tails are line-bounded only. Add byte bounds:
+
+- stdout tail: at most 2 KiB per attempt;
+- stderr tail: at most 2 KiB per attempt;
+- complete `<resolve_context>`: at most 8 KiB, retaining newest actionable state and trimming on UTF-8 boundaries;
+- recorded attempts: never exceed configured `max_retries`.
+
+Phase diagnosis is formatted separately from agent output and preserved when old stream details must be trimmed.
 
 ## Retry Contract
 
-The variable prompt continues to supply repository-specific facts and prior attempt history. Fixed behavioral rules remain in the embedded `cflx-resolve` skill. On retry, the skill requires the agent to:
+The embedded `cflx-resolve` skill requires the agent to:
 
-- trust the current diagnosed phase over prior narrative output;
-- resume from that phase rather than restart Step 1;
-- complete all subsequent protocol phases in order during the same attempt when no blocker remains;
-- remove a resurrected live change only when a valid archive entry for the same change exists;
-- return without claiming completion if Git still reports an unfinished merge or conflict.
+- act only on identity-validated phase guidance;
+- stop and leave repository evidence intact when guidance reports `UnsafeEvidence`;
+- resume from the named incomplete phase instead of repeating verified work;
+- complete all subsequent sequential phases in order when no blocker remains;
+- apply resurrection cleanup only under the validated runtime predicate;
+- re-stage hook-modified files and retry the same exact commit subject;
+- never claim success while Git reports conflicts, unfinished merges, or live/archive coexistence.
 
-## Safety and Constitution
+## Constitution and Safety
 
-The classifier is read-only. Git mutations remain in the resolve agent's existing constrained protocol, including hooks and prohibition of destructive history rewriting. Workflow routing remains derivable from workspace file state, Git state, and base comparison. No log, cache, or out-of-worktree state becomes authoritative. Terminal completion remains repository-verifiable.
+All classification inputs are workspace paths, file state, Git worktree metadata, refs, index/working-tree state, and base comparison. Process-local workspace lists may optimize discovery but never determine truth. No durable external state is introduced. Unknown evidence fails closed. Completion remains repository-verifiable.
 
-## Alternatives Considered
+## Alternatives
 
-### Let retries rely on generic history
+### Improve only the generic retry sentence
 
-Rejected because the observed attempts already received continuation history but lacked the phase and required action necessary to converge.
+Rejected. The actual worktree path and evidence are unavailable, so better wording cannot diagnose the phase.
 
-### Make Conflux automatically finish all conflict-free merges
+### Make Conflux automatically finish conflict-free merges
 
-Deferred. This could reduce agent dependence but expands the mutation boundary, hook/error handling, and ownership model. Phase-specific diagnosis is the smallest change that preserves current architecture.
+Deferred. It broadens mutation ownership and hook recovery. Correct path plumbing and fail-closed diagnosis are sufficient for this change; convergence of an external agent is not promised.
 
-### Accept branch ancestry without the final merge subject
+### Require exact final subjects for historical fast-forward states
 
-Rejected because it weakens the established auditable merge convention and could conceal an incomplete or incorrectly ordered sequential merge.
+Rejected. Existing idempotent integration may already be ancestral with no opportunity to create a meaningful merge commit. The policy instead validates exact subjects when present and accepts proven ancestry as already integrated.
 
 ## Verification Strategy
 
-Use unit tests for classification and prompt formatting. Use temporary Git repositories and worktrees for protocol integration because ancestry, `MERGE_HEAD`, merge subjects, and archive resurrection are the behavior under test. Tests must remain under one second by using tiny repositories and no external commands beyond local Git; otherwise they must be marked heavy per repository policy.
+Use small temporary Git repositories/worktrees. Tests must exercise actual refs, parentage, `MERGE_HEAD`, worktree discovery, index-visible OpenSpec trees, and embedded skill bytes. Unit tests cover state ordering and bounded UTF-8 formatting. Tests exceeding one second must be optimized or marked heavy under repository policy.
