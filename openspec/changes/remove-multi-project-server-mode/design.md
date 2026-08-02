@@ -37,10 +37,10 @@ Absence checks alone cannot prove correct separation. Verification must positive
 
 ### Prune dependencies last
 
-`axum`, `tower`, `tower-http`, `utoipa`, and related feature wiring may serve retained API v2. `reqwest`, WebSocket, SQLite, PTY, QR, and local-address crates are removed only after caller analysis and feature-matrix compilation establish they are server-only.
+`axum`, `tower`, `tower-http`, and `utoipa` serve retained API v2. `qrcode` remains used by `src/tui/qr.rs`, `local-ip-address` by `src/web/url.rs`, and `tokio-tungstenite` by retained `/api/v2` stream tests. `rusqlite`, `portable-pty`, and `reqwest` may be removed only after caller analysis confirms their current server DB, server terminal, and remote-client ownership respectively. The retained `web-monitoring` feature remains, but its server-only module and dependency entries are removed.
 
 ## Spec Promotion
 
-The delta removes obsolete canonical capabilities and modifies the web-monitoring contract to define the retained dashboard/API boundary without the deleted standalone React dashboard. `remote-control-api` remains unchanged because it is explicitly retained.
+The delta removes every canonical requirement owned by the obsolete multi-project server, including its dashboard, persistence, proposal-session, Git-sync, configuration, observability, and release-build contracts. It modifies the web-monitoring contract by preserving every existing local lifecycle/configuration scenario and adding the standalone-daemon exclusion. `remote-control-api` remains unchanged because it is explicitly retained.
 
-Archived changes are historical evidence and are not rewritten.
+Promotion removes requirement blocks but leaves a preamble-only canonical file when every requirement in a capability is removed. Archive cleanup must delete those empty canonical capability directories after promotion while retaining partially modified capabilities. Archived changes are historical evidence and are not rewritten.
