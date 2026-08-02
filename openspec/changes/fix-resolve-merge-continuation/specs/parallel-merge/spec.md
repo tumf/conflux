@@ -1,134 +1,196 @@
 ## ADDED Requirements
 
-### Requirement: Sequential resolve retains worktree evidence
+### Requirement: Sequential resolve retains ordered worktree evidence
 
-Sequential merge resolution MUST retain the ordered worktree path for every `(revision, change_id)` from merge admission through retry and terminal verification. A process-local workspace list MAY optimize path lookup but MUST NOT be the authoritative source. A stale path MAY be replaced only by repository-local Git worktree rediscovery that proves exact repository and branch identity. Missing, ambiguous, detached, mismatched, or unreadable evidence MUST fail closed and MUST NOT skip worktree verification.
+Sequential resolve MUST retain an ordered record for every admitted change containing its expected revision, change ID, archive worktree path, and any available admission-time branch base. Process-local workspace membership and workspace metadata MUST NOT be authoritative. A stale path MAY be replaced only by exactly one repository-local Git worktree match for the expected branch. Missing, ambiguous, detached, mismatched, or unreadable identity MUST fail closed.
 
-#### Scenario: Archived worktree is absent from process memory
+#### Scenario: Process memory omits a valid archived worktree
 
-**Given**: Merge admission supplies a valid archived worktree path for a change
-**And**: The process-local workspace list does not contain that worktree
-**When**: Sequential resolve builds and verifies an attempt
-**Then**: It uses the supplied validated path
-**And**: It checks that worktree's branch, `MERGE_HEAD`, conflicts, pre-sync subject, and ancestry as applicable
-**And**: It does not display `(unknown)` or fall through because process memory omitted the workspace
+**Given**: Merge admission supplied a valid registered worktree path and expected branch
+**And**: The process-local workspace list omits it
+**When**: Resolve classifies the batch
+**Then**: It validates and uses the supplied path
+**And**: It does not display `(unknown)` or skip worktree evidence
 
-#### Scenario: Stale path is safely rediscovered
+#### Scenario: Stale path has one exact repository-local match
 
-**Given**: A supplied archived worktree path no longer exists
-**And**: Repository-local Git worktree metadata contains exactly one worktree checked out on the expected branch
-**When**: Sequential resolve validates path identity
+**Given**: The supplied path is stale
+**And**: Git worktree metadata has exactly one non-detached worktree on the expected branch
+**When**: Resolve validates worktree identity
 **Then**: It uses the rediscovered path
-**And**: The decision remains derivable from repository-local evidence
 
-#### Scenario: Worktree identity cannot be proven
+#### Scenario: Worktree identity is unsafe
 
-**Given**: A path is missing, ambiguous, in another repository, on the wrong branch, detached, or fails a Git query
-**When**: Sequential resolve validates evidence
-**Then**: The attempt is classified as unsafe evidence
-**And**: No worktree check is skipped
-**And**: No blind commit or resolve-completed event occurs
-
-### Requirement: Sequential resolve phase-specific continuation
-
-Sequential merge resolution MUST classify the earliest incomplete or unsafe state for each change in declared merge order. The closed states MUST cover unsafe evidence, identity-verified target merge in progress, identity-verified worktree pre-sync in progress, invalid or missing pre-sync, missing final integration, archive resurrection cleanup, and complete integration. Agent exit status, narrative claims, external logs, and out-of-worktree durable state MUST NOT establish completion or choose the next phase.
-
-#### Scenario: Pre-sync complete and final merge missing
-
-**Given**: A validated change worktree contains required pre-sync evidence
-**And**: The expected revision is not integrated into target `HEAD`
-**When**: Conflux verifies a resolve attempt
-**Then**: The attempt remains incomplete
-**And**: Continuation identifies final merge as the next phase
-**And**: Continuation names the change, branch, validated worktree path, target branch, exact `Merge change: <change_id>` subject, and cleanup requirement
-**And**: Continuation does not instruct the agent to repeat pre-sync
-
-#### Scenario: Expected worktree pre-sync remains unfinished
-
-**Given**: The validated change worktree is on the expected branch
-**And**: Its `MERGE_HEAD` is proven to contain the expected target state
-**When**: Conflux verifies a resolve attempt
-**Then**: Continuation identifies pre-sync completion at that worktree path
-**And**: Continuation includes exact subject `Pre-sync base into <change_id>`
-**And**: No resolve-completed event is emitted
-
-#### Scenario: Merge in progress has unexpected identity
-
-**Given**: The target repository or change worktree contains `MERGE_HEAD`
-**And**: Its parent identity does not match the expected change revision or target state for the current ordered phase
-**When**: Conflux classifies the state
+**Given**: Worktree identity is missing, ambiguous, detached, in another repository, on another branch, or unreadable
+**When**: Resolve validates the batch
 **Then**: It reports unsafe evidence
-**And**: It does not instruct the agent to commit that merge
+**And**: It performs no blind commit and emits no completion
 
-#### Scenario: Multiple changes retain merge order
+### Requirement: Sequential pre-sync is repository-verifiable
 
-**Given**: Sequential resolve receives multiple ordered changes
-**When**: More than one change is incomplete
-**Then**: Classification reports the first incomplete or unsafe change in declared merge order
-**And**: A target merge is never completed with a combined unauditable per-change subject
+For each non-historical batch item, resolve MUST derive required target state `T` from repository evidence. `T` MUST be the target pre-merge first parent for an in-progress or committed exact final merge, or current cumulative target `HEAD` after every prior item is committed complete when final merge has not started. Pre-sync is valid without a merge commit only when `T` is on the validated worktree tip's first-parent lineage. Otherwise exactly one reachable `Pre-sync base into <change_id>` commit MUST have exactly two parents and non-first parent exactly `T`.
 
-### Requirement: Sequential final integration has one identity policy
+#### Scenario: Target state is already on first-parent lineage
 
-Retry verification and terminal merge verification MUST apply the same integration identity policy. A protocol-created final merge commit MUST use exact subject `Merge change: <change_id>` and integrate the expected revision. An expected revision already ancestral to target `HEAD` MUST remain an accepted idempotent already-integrated state without requiring an artificial merge commit. An exact-subject commit that does not integrate the expected revision MUST NOT prove completion.
+**Given**: Required target state `T` is on the validated worktree tip's first-parent lineage
+**When**: Resolve validates pre-sync
+**Then**: No pre-sync merge commit is required
 
-#### Scenario: Exact final commit integrates expected revision
+#### Scenario: Valid pre-sync merge includes target state
 
-**Given**: Target history since the merge base contains exact subject `Merge change: <change_id>`
-**And**: That commit integrates the expected revision
-**When**: Retry or terminal verification runs
-**Then**: Final merge identity passes
+**Given**: `T` is not on the worktree tip's first-parent lineage
+**And**: Exactly one reachable `Pre-sync base into <change_id>` commit has two parents and non-first parent exactly `T`
+**When**: Resolve validates pre-sync
+**Then**: Pre-sync is valid
 
-#### Scenario: Exact subject has wrong parentage
+#### Scenario: Pre-sync topology is invalid
 
-**Given**: Target history contains exact subject `Merge change: <change_id>`
-**But**: That commit does not integrate the expected revision
-**When**: Retry or terminal verification runs
-**Then**: The evidence is rejected
-**And**: The change is not reported complete
+**Given**: Required pre-sync evidence is missing, duplicated, has a wrong parent count, has a wrong non-first parent, or is not contained by the worktree tip
+**When**: Resolve validates pre-sync
+**Then**: It reports invalid pre-sync
+**And**: Final merge guidance is withheld
 
-#### Scenario: Revision is already integrated without exact subject
+#### Scenario: Historical integration has no reconstructable target state
 
-**Given**: No exact final subject exists since the merge base
-**And**: The expected revision is already an ancestor of target `HEAD`
-**When**: Retry or terminal verification runs
-**Then**: The change is accepted as already integrated
-**And**: Conflux does not manufacture an empty merge commit
+**Given**: No exact final-subject candidate exists
+**And**: The expected branch tip is already ancestral to target `HEAD`
+**When**: Resolve validates historical integration
+**Then**: It does not require reconstruction of pre-sync topology
+**And**: Clean target and archive/live terminal invariants still apply
 
-### Requirement: Archive resurrection is a terminal invariant
+### Requirement: Sequential resolve is batch-aware
 
-Sequential resolve MUST validate archive identity with the shared OpenSpec archive layout helpers and MUST prevent successful completion while the active live change and a valid archived form coexist. Before final merge, cleanup prediction MAY use valid archive evidence from the validated change worktree or branch plus target live evidence. During and after final merge, the target worktree/index-visible tree is authoritative. Invalid, nested, unrelated, or suffix-collision archive entries MUST NOT authorize removal.
+Resolve MUST uniquely determine any global target `MERGE_HEAD` owner before per-item classification. The owner MUST match exactly one validated batch branch tip, every prior item MUST have committed completion evidence, and the owner MUST be the first incomplete item. Items MUST otherwise be evaluated in declared order. Batch completion MUST require every item complete, no merge in progress, no conflict, and a clean target index and worktree including no untracked files.
 
-#### Scenario: Final merge will resurrect a live change
+#### Scenario: Later item owns target merge after prior completion
 
-**Given**: The target tree contains the active `openspec/changes/<change_id>` identity
-**And**: The validated change worktree or branch contains a valid exact or date-prefixed archive entry for the same change
-**When**: Continuation identifies final merge as next
-**Then**: It requires removal of the resurrected active change before the final commit
+**Given**: Item A has committed completion evidence
+**And**: Target `MERGE_HEAD` exactly matches item B's validated branch tip
+**And**: B is the first incomplete item
+**When**: Resolve classifies the batch
+**Then**: B is the unique target merge owner
+**And**: B's pre-sync is validated against target `HEAD` before commit guidance
 
-#### Scenario: Final integration retains live and archive forms
+#### Scenario: Target merge owner is unsafe
 
-**Given**: The expected revision is integrated into target `HEAD`
-**And**: The target-visible tree still contains both the active change and a valid archived entry
-**When**: Terminal verification runs
-**Then**: Resolve remains incomplete
-**And**: Continuation identifies resurrection cleanup rather than reporting success
+**Given**: Target `MERGE_HEAD` matches zero or multiple batch items, has an incomplete prior item, or does not own the first incomplete item
+**When**: Resolve classifies the batch
+**Then**: It reports unsafe evidence
+**And**: It does not commit the target merge
 
-#### Scenario: Archive layout is invalid or unrelated
+#### Scenario: Batch repository is dirty
 
-**Given**: The only archive-like path is nested, unrelated, or merely suffix-similar
-**When**: Sequential resolve evaluates cleanup authority
-**Then**: It does not authorize live-directory removal
-**And**: An invalid layout is reported as unsafe evidence
+**Given**: Every item has integration evidence
+**But**: Target has `MERGE_HEAD`, conflicts, staged, unstaged, or untracked changes
+**When**: Resolve evaluates batch completion
+**Then**: The batch is not complete
 
-### Requirement: Sequential resolve continuation is bounded and observable
+### Requirement: Final merge identity is exact or historical
 
-Phase diagnostics MUST be emitted through existing resolve output and retry-history surfaces without creating a second workflow state machine. Recorded attempts MUST NOT exceed configured retries. Each stdout and stderr tail MUST be capped at 2 KiB, and the complete injected resolve context MUST be capped at 8 KiB on UTF-8 boundaries while retaining the newest actionable phase diagnosis.
+Retry and terminal verification MUST share one final integration policy. An exact `Merge change: <change_id>` candidate since `base_revision` is valid only when it is unique, has exactly two parents, has first parent exactly required target state `T`, has non-first parent exactly the validated worktree branch tip, and is contained by target `HEAD`. If any exact candidate exists but is ambiguous or invalid, verification MUST fail closed. Ancestry-only historical success is allowed only when no exact candidate exists.
 
-#### Scenario: Repeated oversized output remains bounded
+#### Scenario: Exact final merge has valid topology
 
-**Given**: Resolve attempts emit oversized lines or echo prior prompts
-**When**: Conflux records and injects continuation history
+**Given**: Exactly one exact final candidate exists
+**And**: Its two parents are `T` followed by the validated worktree branch tip
+**And**: Target `HEAD` contains it
+**When**: Final integration is verified
+**Then**: Final merge identity is valid
+
+#### Scenario: Exact subject hides unrelated merge
+
+**Given**: An exact final candidate has the expected revision only on its first-parent side, has a wrong non-first parent, wrong parent count, or duplicate exact candidate
+**When**: Final integration is verified
+**Then**: Verification fails closed
+**And**: Ancestry fallback is not used
+
+#### Scenario: No exact candidate but revision is already integrated
+
+**Given**: No exact final candidate exists
+**And**: The expected branch tip is ancestral to target `HEAD`
+**When**: Final integration is verified
+**Then**: It is accepted as historical already-integrated evidence
+**And**: No artificial merge commit is required
+
+### Requirement: Archive resurrection uses phase-specific Git evidence
+
+Archive identity MUST apply shared exact/date-prefixed and invalid nested-layout rules to the appropriate Git view. Pre-final evidence MUST use committed validated worktree `HEAD` plus committed target `HEAD`; in-progress final evidence MUST use target stage-0 index and reject any conflict stage; post-final evidence MUST use committed target `HEAD`. Active and archived identities require `proposal.md`. Filesystem state MUST NOT substitute for index or committed-tree evidence.
+
+#### Scenario: Final merge index predicts resurrection
+
+**Given**: Target has an identity-verified final merge in progress
+**And**: Its stage-0 index contains active and valid archived identities for the change
+**And**: No conflict stages exist
+**When**: Resolve classifies the merge
+**Then**: Continuation requires live-directory removal before final commit
+
+#### Scenario: Conflict stages prevent cleanup guidance
+
+**Given**: Target index contains stage 1, 2, or 3 entries for relevant paths
+**When**: Resolve evaluates resurrection
+**Then**: It reports unsafe or unresolved conflict evidence
+**And**: It does not authorize deletion
+
+#### Scenario: Invalid archive shape cannot authorize deletion
+
+**Given**: Archive-like evidence is nested, unrelated, suffix-similar, or lacks the archived proposal identity
+**When**: Resolve evaluates cleanup authority
+**Then**: It does not authorize active live removal
+
+### Requirement: Post-final resurrection cleanup is durable
+
+If committed final integration retains active and valid archived identities, resolve MUST require a forward commit with exact subject `Cleanup resurrected change: <change_id>`. The commit MUST have one parent equal to the preceding target `HEAD`, and its complete tree diff MUST only delete the active live change subtree while preserving archived content. Staged-only, unstaged, mixed, unrelated, amend-based, or dirty cleanup MUST remain incomplete.
+
+#### Scenario: Cleanup is only staged
+
+**Given**: Final integration is committed with live/archive coexistence
+**And**: The active live subtree is removed only from the target index or worktree
+**When**: Resolve verifies completion
+**Then**: Cleanup remains incomplete
+
+#### Scenario: Valid forward cleanup is committed
+
+**Given**: A one-parent `Cleanup resurrected change: <change_id>` commit follows target `HEAD`
+**And**: Its only tree change deletes the active live subtree
+**And**: The valid archive is unchanged
+**And**: Target index and worktree are clean
+**When**: Resolve reruns terminal verification
+**Then**: Resurrection cleanup is complete
+
+#### Scenario: Cleanup commit changes unrelated content
+
+**Given**: A cleanup-subject commit changes archive or unrelated paths, has wrong parentage, or is one of multiple ambiguous candidates
+**When**: Resolve verifies cleanup
+**Then**: It fails closed
+
+### Requirement: Target merge shortcuts obey full verification
+
+A conflict-free target `MERGE_HEAD` MUST NOT be committed before batch ownership, required target state, pre-sync topology, index conflict stages, resurrection cleanup, and terminal predicates are evaluated. Resolve MUST NOT generate a combined `Merge changes: ...` commit for per-change sequential integration.
+
+#### Scenario: Conflict-free target merge is valid
+
+**Given**: Target `MERGE_HEAD` uniquely owns the first incomplete item
+**And**: Pre-sync, index, and cleanup evidence are valid
+**When**: Resolve continues the phase
+**Then**: The agent receives the exact per-change final subject and required actions
+**And**: Completion is reverified after commit
+
+### Requirement: Resolve continuation history is byte-bounded
+
+Resolve continuation construction MUST cap each stdout/stderr tail at 2 KiB and the complete wrapper-inclusive `<resolve_context>` at 8 KiB on UTF-8 boundaries without changing shared collector defaults for other workflows. It MUST retain at most configured retries and MUST always retain the newest structured phase diagnosis. Deterministic trimming MUST remove oldest attempts, then older stream tails, then newest stream detail.
+
+#### Scenario: Repeated output exceeds resolve limits
+
+**Given**: Attempts emit oversized ASCII or multibyte output and echo prior prompts
+**When**: Resolve constructs continuation context
 **Then**: Each stream tail is at most 2 KiB
-**And**: Complete injected context is at most 8 KiB
-**And**: Truncation preserves valid UTF-8 and the newest actionable phase diagnosis
-**And**: Queue and resume decisions remain derived from workspace-local evidence
+**And**: Complete wrapper-inclusive context is at most 8 KiB
+**And**: UTF-8 remains valid
+**And**: The newest structured phase diagnosis remains present
+
+#### Scenario: Diagnosis alone approaches the context limit
+
+**Given**: Structured diagnostic fields are oversized
+**When**: Resolve constructs the newest diagnosis
+**Then**: Individual fields are bounded before assembly
+**And**: Wrapper-inclusive context still satisfies the 8 KiB limit
