@@ -5,7 +5,7 @@ info:
   license:
     name: MIT
     identifier: MIT
-  version: 0.6.214
+  version: 0.6.215
 paths:
   /api/v2/capabilities:
     get:
