@@ -1842,22 +1842,14 @@ async fn per_change_upstream_e2e_run_and_local_tui_construct_one_runtime() {
 
     // Both frontends normalize the same raw option values, then run the same
     // startup validation against the same repository.
-    let from_run = conflux::upstream::resolve_frontend_upstream_config(
-        Some("origin"),
-        Some("exit 0"),
-        None,
-        false,
-    )
-    .expect("run options")
-    .expect("enabled");
-    let from_tui = conflux::upstream::resolve_frontend_upstream_config(
-        Some("origin"),
-        Some("exit 0"),
-        None,
-        false,
-    )
-    .expect("tui options")
-    .expect("enabled");
+    let from_run =
+        conflux::upstream::resolve_frontend_upstream_config(Some("origin"), Some("exit 0"), None)
+            .expect("run options")
+            .expect("enabled");
+    let from_tui =
+        conflux::upstream::resolve_frontend_upstream_config(Some("origin"), Some("exit 0"), None)
+            .expect("tui options")
+            .expect("enabled");
     assert_eq!(from_run, from_tui);
 
     let run_runtime = conflux::upstream::prepare_upstream_integration(
@@ -1873,15 +1865,6 @@ async fn per_change_upstream_e2e_run_and_local_tui_construct_one_runtime() {
 
     assert_eq!(run_runtime, tui_runtime);
     assert_eq!(run_runtime.branch, "main");
-
-    // A remote-client TUI cannot own the local cumulative base.
-    assert!(conflux::upstream::resolve_frontend_upstream_config(
-        Some("origin"),
-        Some("exit 0"),
-        None,
-        true,
-    )
-    .is_err());
 }
 
 /// Real-repository fixtures for explicit-target resume classification.
