@@ -748,7 +748,7 @@ fn render_changes_list_select(frame: &mut Frame, app: &mut AppState, area: Rect)
                 AppMode::Select | AppMode::Running | AppMode::Stopped
             )
         {
-            if app.is_resolving {
+            if app.is_resolving() {
                 keys.push("M: queue resolve".to_string());
             } else {
                 keys.push("M: resolve".to_string());
@@ -1107,7 +1107,7 @@ fn render_changes_list_running(frame: &mut Frame, app: &mut AppState, area: Rect
                 AppMode::Select | AppMode::Running | AppMode::Stopped
             )
         {
-            if app.is_resolving {
+            if app.is_resolving() {
                 keys.push("M: queue resolve".to_string());
             } else {
                 keys.push("M: resolve".to_string());
@@ -1775,7 +1775,7 @@ fn render_footer_worktree(frame: &mut Frame, app: &AppState, area: Rect) {
             && !wt.has_merge_conflict()
             && !wt.branch.is_empty()
             && wt.has_commits_ahead
-            && !app.is_resolving
+            && !app.is_resolving()
             && !wt.is_merging
         {
             key_hints.push(("M", "merge"));
@@ -2387,7 +2387,7 @@ mod tests {
     fn test_render_merge_wait_shows_resolve_key_hint() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = false; // Not currently resolving
+        app.clear_resolving(); // Not currently resolving
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -2401,7 +2401,7 @@ mod tests {
     fn test_render_merge_wait_shows_queue_resolve_key_hint_when_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = true; // Currently resolving
+        app.set_resolving("__active__"); // Currently resolving
 
         let buffer = render_buffer(&mut app, 100, 24);
         let content = buffer_to_string(&buffer);
@@ -2415,7 +2415,7 @@ mod tests {
     fn test_render_keeps_start_run_hint_while_resolving() {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.cursor_index = 0;
         app.changes[0].selected = true;
 
@@ -2432,7 +2432,7 @@ mod tests {
             .unwrap(),
         );
         configured_app.mode = AppMode::Select;
-        configured_app.is_resolving = true;
+        configured_app.set_resolving("__active__");
         configured_app.cursor_index = 0;
         configured_app.changes[0].selected = true;
 
@@ -2449,7 +2449,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Select;
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = false;
+        app.clear_resolving();
         app.cursor_index = 0;
 
         // Render should show M: resolve
@@ -2467,7 +2467,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Error; // Error mode
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = false;
+        app.clear_resolving();
         app.cursor_index = 0;
         app.add_log(LogEntry::info("log")); // Add log to show render_running_mode
 
@@ -2486,7 +2486,7 @@ mod tests {
         let mut app = create_test_app(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
-        app.is_resolving = false;
+        app.clear_resolving();
         app.cursor_index = 0;
         app.add_log(LogEntry::info("log")); // Add log to trigger render_running_mode
 
@@ -2549,7 +2549,9 @@ mod tests {
             let mut app = create_test_app(vec![create_test_change("change-a")]);
             app.mode = mode.clone();
             app.changes[0].display_status_cache = display_status_cache.clone();
-            app.is_resolving = is_resolving;
+            if is_resolving {
+                app.set_resolving("__active__");
+            }
             app.cursor_index = 0;
             if mode != AppMode::Select {
                 app.add_log(LogEntry::info("log")); // Ensure logs exist for running mode

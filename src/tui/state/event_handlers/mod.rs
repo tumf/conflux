@@ -1,5 +1,5 @@
 use super::AppState;
-use crate::tui::events::{OrchestratorEvent, TuiCommand};
+use crate::tui::events::OrchestratorEvent;
 
 mod completion;
 mod errors;
@@ -11,8 +11,14 @@ impl AppState {
     /// Handle an event from the orchestrator
     ///
     /// This is the main entry point for event handling, dispatching to specialized handlers.
-    /// Returns an optional TuiCommand that should be executed (e.g., for auto-starting next resolve).
-    pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) -> Option<TuiCommand> {
+    ///
+    /// Event handling never emits a `TuiCommand`. Every lifecycle transition an
+    /// orchestrator event implies — including promoting the next resolve — is
+    /// dispatched by the scheduler from reducer-owned intent, so the frontend
+    /// only paints. Re-submitting one of those intents from here could only be
+    /// refused as no longer eligible, and would reach the operator as a warning
+    /// for work that is in fact proceeding.
+    pub fn handle_orchestrator_event(&mut self, event: OrchestratorEvent) {
         match event {
             OrchestratorEvent::ProcessingStarted(id) => self.handle_processing_started(id),
             OrchestratorEvent::ProcessingCompleted(id) => self.handle_processing_completed(id),
@@ -39,11 +45,11 @@ impl AppState {
             OrchestratorEvent::ResolveCompleted {
                 change_id,
                 worktree_change_ids,
-            } => return self.handle_resolve_completed(change_id, worktree_change_ids),
+            } => self.handle_resolve_completed(change_id, worktree_change_ids),
             OrchestratorEvent::MergeCompleted {
                 change_id,
                 revision: _,
-            } => return self.handle_merge_completed(change_id),
+            } => self.handle_merge_completed(change_id),
             OrchestratorEvent::BranchMergeStarted { branch_name } => {
                 self.handle_branch_merge_started(branch_name)
             }
@@ -63,7 +69,7 @@ impl AppState {
                 change_id,
                 reason,
                 auto_resumable,
-            } => return self.handle_merge_deferred(change_id, reason, auto_resumable),
+            } => self.handle_merge_deferred(change_id, reason, auto_resumable),
             OrchestratorEvent::AcceptanceStarted { change_id, command } => {
                 self.handle_acceptance_started(change_id, command)
             }
@@ -155,6 +161,5 @@ impl AppState {
             OrchestratorEvent::Error { message } => self.handle_error(message),
             _ => {}
         }
-        None
     }
 }

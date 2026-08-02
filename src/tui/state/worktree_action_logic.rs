@@ -78,7 +78,7 @@ pub(super) fn request_merge_worktree_branch(state: &mut AppState) -> Option<TuiC
     }
 
     if let guards::MergeGuardResult::Blocked(msg) =
-        guards::validate_not_resolving(state.is_resolving)
+        guards::validate_not_resolving(state.is_resolving())
     {
         debug!("Merge blocked: resolve operation in progress");
         state.warning_message = Some(msg);
