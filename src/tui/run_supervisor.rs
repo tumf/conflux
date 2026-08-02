@@ -88,11 +88,6 @@ impl TuiRunSupervisor {
         }
     }
 
-    /// Shared parallel-mode toggle the TUI keeps in sync with its own state.
-    pub fn parallel_mode(&self) -> Arc<AtomicBool> {
-        self.parallel_mode.clone()
-    }
-
     /// Take the current run task and cancellation token for shutdown.
     pub fn take_run(
         &self,

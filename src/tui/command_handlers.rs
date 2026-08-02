@@ -9,8 +9,10 @@ use crate::orchestration::run_control::{
     ResolveReservation, RunControlError, RunControlOutcome, RunControlService, RunNoOpReason,
     SchedulerEffect,
 };
+#[cfg(test)]
 use crate::parallel::PostArchiveAction;
 use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
+#[cfg(test)]
 use crate::tui::queue::DynamicQueue;
 use crate::tui::state::AppState;
 use crate::tui::types::{AppMode, StopMode};
@@ -154,14 +156,6 @@ pub struct TuiCommandContext<'a> {
     pub repo_root: &'a Path,
     pub config: &'a OrchestratorConfig,
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
-    pub dynamic_queue: &'a DynamicQueue,
-    pub post_archive_action: PostArchiveAction,
-    /// Invocation-scoped upstream publication runtime for local parallel TUI.
-    ///
-    /// `None` is the default-off boundary: the parallel service installs no
-    /// coordinator, so no fetch, verification, push, or confirmation happens and
-    /// cumulative base integration keeps its existing terminal `merged` meaning.
-    pub upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     /// The single process-local run-lifecycle service shared with `/api/v2`.
     ///
     /// Every start, stop, retry, and resolve in this module goes through it, so a
@@ -425,10 +419,6 @@ pub async fn handle_tui_command(
                 Ok(other) => debug!("Force stop produced an unexpected outcome: {:?}", other),
                 Err(error) => report_run_error(ctx.app, &error),
             }
-        }
-        TuiCommand::Retry => {
-            // Retry is start in Error mode: one implementation, one routing table.
-            handle_start_processing_command(Vec::new(), ctx).await;
         }
         TuiCommand::MergeWorktreeBranch {
             worktree_path,
@@ -763,9 +753,6 @@ mod tests {
                 repo_root: Path::new("."),
                 config: &self.config,
                 tx: &self.tx,
-                dynamic_queue: &self.queue,
-                post_archive_action: PostArchiveAction::MergeToBase,
-                upstream_runtime: None,
                 run_control: &self.run_control,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &None,
@@ -1123,7 +1110,10 @@ mod tests {
         app.changes[0].selected = true;
         app.publish_execution_marks();
 
-        harness.run(&mut app, TuiCommand::Retry).await;
+        // Retry is start in Error mode: the same command variant a keypress sends.
+        harness
+            .run(&mut app, TuiCommand::StartProcessing(Vec::new()))
+            .await;
 
         assert_eq!(
             harness.scheduler.calls(),
@@ -1169,7 +1159,9 @@ mod tests {
         app.changes[0].selected = true;
         app.publish_execution_marks();
 
-        harness.run(&mut app, TuiCommand::Retry).await;
+        harness
+            .run(&mut app, TuiCommand::StartProcessing(Vec::new()))
+            .await;
 
         assert_eq!(harness.status("change-a").await, "queued");
         assert!(harness.scheduler.calls().contains(&SchedulerCall::Started {
@@ -1735,9 +1727,6 @@ mod run_supervisor_tests {
                 repo_root: &root,
                 config: &config,
                 tx: &tx,
-                dynamic_queue: &queue,
-                post_archive_action: PostArchiveAction::MergeToBase,
-                upstream_runtime: Some(upstream_runtime()),
                 run_control: &run_control,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &None,

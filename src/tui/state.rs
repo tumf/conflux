@@ -437,10 +437,12 @@ impl AppState {
 
     /// Adopt an externally owned execution-mark store.
     ///
-    /// Production wires this the other way round — the run-control service is
-    /// built over `execution_marks()` — but a test that builds the service first
-    /// needs the app to join the store the service already reads, or the
-    /// "authoritative marked target set" would exist in two copies.
+    /// Test-only by construction: production wires this the other way round — the
+    /// run-control service is built over `execution_marks()` — but a test that
+    /// builds the service first needs the app to join the store the service
+    /// already reads, or the "authoritative marked target set" would exist in two
+    /// copies.
+    #[cfg(test)]
     pub fn set_execution_marks(
         &mut self,
         marks: std::sync::Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
@@ -460,6 +462,10 @@ impl AppState {
     }
 
     /// Adopt an externally owned reservation ledger.
+    ///
+    /// Test-only for the same reason as [`AppState::set_execution_marks`]:
+    /// production builds the run-control service over `resolve_reservations()`.
+    #[cfg(test)]
     pub fn set_resolve_reservations(
         &mut self,
         reservations: std::sync::Arc<crate::orchestration::run_control::ResolveReservations>,
@@ -873,6 +879,10 @@ impl AppState {
     }
 
     /// Changes currently waiting behind the active resolver, in FIFO order.
+    ///
+    /// Assertion helper only: production reads the ledger through
+    /// [`AppState::has_queued_resolves`] or the shared run-control service.
+    #[cfg(test)]
     pub fn queued_resolves(&self) -> Vec<String> {
         self.resolve_reservations.waiting()
     }
@@ -3212,15 +3222,14 @@ mod tests {
         app.changes[1].display_status_cache = "resolve pending".to_string();
         app.add_to_resolve_queue("change-b");
 
-        let cmd = app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
+        // The promoted change is dispatched from the reducer-owned ResolveWait it
+        // already holds, so the event path emits no command for it: a
+        // re-submission could only be refused as no longer `merge wait`.
+        app.handle_orchestrator_event(OrchestratorEvent::MergeCompleted {
             change_id: "change-a".to_string(),
             revision: "abc123".to_string(),
         });
 
-        // The promoted change is dispatched from the reducer-owned ResolveWait it
-        // already holds, so the event path emits no command for it: a
-        // re-submission could only be refused as no longer `merge wait`.
-        assert!(cmd.is_none());
         assert!(!app.is_resolving());
         assert!(app.queued_resolves().is_empty());
         assert!(app.warning_message.is_none());

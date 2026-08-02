@@ -305,11 +305,13 @@ fn rows() -> Vec<Row> {
             expect: Settlement::Failed(ErrorCode::InternalError),
         },
         // ── retry ───────────────────────────────────────────────────────────
+        // Retry has no command variant of its own on either side: `Error` mode is
+        // what turns the shared start intent into an explicit retry.
         Row {
             name: "retry routes a marked error row and dispatches the scheduler",
             setup: Setup::MarkedError,
             mode: AppMode::Error,
-            tui: TuiCommand::Retry,
+            tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
         },
@@ -317,7 +319,7 @@ fn rows() -> Vec<Row> {
             name: "retry without retryable evidence changes nothing",
             setup: Setup::Marked,
             mode: AppMode::Error,
-            tui: TuiCommand::Retry,
+            tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::NoOp,
         },

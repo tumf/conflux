@@ -1,5 +1,7 @@
 use crate::parallel::dedup::DiagnosticDeduplicationKey;
-use crate::tui::events::{LogEntry, TuiCommand};
+use crate::tui::events::LogEntry;
+#[cfg(test)]
+use crate::tui::events::TuiCommand;
 
 use crate::tui::state::AppState;
 
@@ -178,15 +180,17 @@ impl AppState {
         );
     }
 
+    /// Paint a deferred merge. Never dispatches: see
+    /// [`AppState::handle_orchestrator_event`].
     pub(crate) fn handle_merge_deferred(
         &mut self,
         change_id: String,
         reason: String,
         auto_resumable: bool,
-    ) -> Option<TuiCommand> {
+    ) {
         if !auto_resumable {
             self.apply_manual_merge_deferral(&change_id, &reason);
-            return None;
+            return;
         }
 
         if self.is_resolving() {
@@ -231,24 +235,26 @@ impl AppState {
                     );
                 }
             }
-            None
         } else {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
                 change.set_display_status_cache("resolve pending");
             }
-            // No reservation here: the emitted command reaches the shared
-            // run-control service, which takes the one reservation this change
-            // is allowed to hold. Reserving first would make that a duplicate.
+            // Presentation only, and no command: the reducer already turned this
+            // deferral into reducer-owned `ResolveWait` before the TUI saw the
+            // event, and the emitting scheduler cannot exit while that intent
+            // stands, so the resolve is dispatched on the reducer lane. Re-
+            // submitting it here could only be refused — the row is no longer
+            // `merge wait` — which reached the operator as a red warning for a
+            // resolve that was in fact proceeding.
             self.add_merge_deferred_warning_log(
                 &change_id,
                 &reason,
                 auto_resumable,
                 format!(
-                    "Merge deferred for '{}' (auto-resumable, queued scheduler retry intent): {}",
+                    "Merge deferred for '{}' (auto-resumable, awaiting scheduler retry): {}",
                     change_id, reason
                 ),
             );
-            Some(TuiCommand::ResolveMerge(change_id))
         }
     }
 }
@@ -341,7 +347,7 @@ mod tests {
             "on_merged".to_string(),
             "boom".to_string(),
         );
-        let _ = app.handle_merge_deferred("change-a".to_string(), "conflict".to_string(), false);
+        app.handle_merge_deferred("change-a".to_string(), "conflict".to_string(), false);
 
         assert_eq!(
             change_ids_for_message(&app, "on_merged hook failed for 'change-a'"),
@@ -524,23 +530,26 @@ mod tests {
         app.clear_resolving();
         app.changes[0].display_status_cache = "archived".to_string();
 
-        let cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-b".to_string(),
             "Merge in progress (MERGE_HEAD exists)".to_string(),
             true,
         );
 
         assert_eq!(app.changes[0].display_status_cache, "resolve pending");
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-b"));
+        assert!(
+            app.warning_message.is_none(),
+            "an auto-resumable deferral is not an operator-facing refusal"
+        );
         assert!(
             !app.resolve_reservations().is_reserved("change-b"),
-            "an idle deferral emits the command and lets the shared service take \
-             the single reservation; reserving here would make that a duplicate"
+            "an idle deferral is painted only; the scheduler consumes the \
+             reducer-owned ResolveWait the same event already recorded"
         );
     }
 
     #[test]
-    fn auto_resumable_merge_deferred_starts_resolve_when_idle() {
+    fn auto_resumable_merge_deferred_paints_resolve_pending_when_idle() {
         let changes = vec![
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
@@ -551,18 +560,78 @@ mod tests {
         app.changes[0].display_status_cache = "merged".to_string();
         app.changes[1].display_status_cache = "archived".to_string();
 
-        let cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-b".to_string(),
             "Base is dirty: Merge in progress (MERGE_HEAD exists)".to_string(),
             true,
         );
 
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(ref id)) if id == "change-b"));
+        assert!(app.warning_message.is_none());
         assert!(
             !app.resolve_reservations().is_reserved("change-b"),
-            "the emitted command, not this handler, is what reserves the resolver"
+            "the scheduler, not this handler, drives the idle resolve"
         );
+    }
+
+    /// Reducer-first production ordering, which is what makes the idle branch
+    /// silent rather than merely quiet: `src/tui/runner.rs` applies
+    /// `MergeDeferred(auto_resumable = true)` to the shared reducer — recording
+    /// reducer-owned `ResolveWait` and demoting the row to `resolve pending` —
+    /// and syncs display caches *before* the TUI handles the event. Any command
+    /// emitted from here would therefore carry a target that is no longer
+    /// `merge wait`, and the shared run-control service refuses exactly that with
+    /// `TargetIneligible`, which the adapter paints as a red status-bar warning
+    /// for a resolve the scheduler is in fact about to run.
+    #[test]
+    fn auto_resumable_deferral_through_the_reducer_neither_commands_nor_warns() {
+        use crate::orchestration::state::{OrchestratorState, WorkspaceObservation};
+        use std::sync::Arc;
+
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::new(
+            vec!["change-a".to_string()],
+            0,
+        )));
+        {
+            let mut guard = shared.blocking_write();
+            guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
+        }
+        app.set_shared_state(shared.clone());
+        app.mode = AppMode::Running;
+        app.clear_resolving();
+
+        let deferred = crate::events::ExecutionEvent::MergeDeferred {
+            change_id: "change-a".to_string(),
+            reason: "Base is dirty: Merge in progress (MERGE_HEAD exists)".to_string(),
+            auto_resumable: true,
+        };
+        let display_map = {
+            let mut guard = shared.blocking_write();
+            guard.apply_execution_event(&deferred);
+            guard.all_display_statuses()
+        };
+        app.apply_display_statuses_from_reducer(&display_map);
+        assert_eq!(
+            app.changes[0].display_status_cache, "resolve pending",
+            "the reducer, not the TUI, has already demoted the row"
+        );
+        assert!(!app.is_resolving(), "the resolver ledger is idle");
+
+        // Returns `()`: no command can leave this path for the service to refuse.
+        app.handle_orchestrator_event(deferred);
+
+        assert_eq!(
+            app.warning_message, None,
+            "an auto-resumable deferral must never reach the operator as a refusal"
+        );
+        assert_eq!(app.changes[0].display_status_cache, "resolve pending");
+        assert_eq!(
+            shared.blocking_read().resolve_wait_change_ids(),
+            vec!["change-a".to_string()],
+            "the reducer keeps the intent the scheduler dispatches from"
+        );
+        assert!(!app.resolve_reservations().is_reserved("change-a"));
     }
 
     #[test]
@@ -577,14 +646,13 @@ mod tests {
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "archived".to_string();
 
-        let cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-b".to_string(),
             "Merge in progress (MERGE_HEAD exists)".to_string(),
             true,
         );
 
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
-        assert!(cmd.is_none());
         assert!(app.resolve_reservations().is_reserved("change-b"));
     }
 
@@ -708,16 +776,12 @@ mod tests {
             "change-a".to_string(),
             "merge wait",
         )]));
-        let deferred_cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-a".to_string(),
             "Base is dirty: Working tree has uncommitted changes".to_string(),
             false,
         );
 
-        assert!(
-            deferred_cmd.is_none(),
-            "manual deferral must not dispatch another resolve"
-        );
         assert_eq!(
             app.changes[0].display_status_cache, "merge wait",
             "manual deferral must preserve the reducer-derived merge wait row"
@@ -747,13 +811,12 @@ mod tests {
         app.add_to_resolve_queue("change-b");
         app.add_to_resolve_queue("change-c");
 
-        let cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-b".to_string(),
             "Base is dirty: Working tree has uncommitted changes".to_string(),
             false,
         );
 
-        assert!(cmd.is_none());
         assert_eq!(app.changes[1].display_status_cache, "merge wait");
         assert!(!app.resolve_reservations().is_reserved("change-b"));
         assert_eq!(
@@ -775,13 +838,12 @@ mod tests {
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
 
-        let cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-b".to_string(),
             "Base is dirty: Working tree has uncommitted changes".to_string(),
             false,
         );
 
-        assert!(cmd.is_none());
         assert_eq!(app.changes[1].display_status_cache, "merge wait");
         assert!(!app.resolve_reservations().is_reserved("change-b"));
         assert!(
@@ -808,14 +870,16 @@ mod tests {
         // The shared service took the reservation the emitted command asked for.
         app.set_resolving("change-a");
 
-        let cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-b".to_string(),
             "Merge in progress (MERGE_HEAD exists)".to_string(),
             true,
         );
 
-        assert!(cmd.is_none(), "queued retry must wait for the active slot");
-        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        assert_eq!(
+            app.changes[1].display_status_cache, "resolve pending",
+            "queued retry must wait for the active slot"
+        );
         assert!(app.resolve_reservations().is_reserved("change-b"));
         assert!(app.is_resolving());
     }
@@ -863,13 +927,12 @@ mod tests {
             guard.all_display_statuses()
         };
         app.apply_display_statuses_from_reducer(&display_map);
-        let deferred_cmd = app.handle_merge_deferred(
+        app.handle_merge_deferred(
             "change-a".to_string(),
             "Base is dirty: Working tree has uncommitted changes".to_string(),
             false,
         );
 
-        assert!(deferred_cmd.is_none());
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
         assert!(!app.is_resolving());
         assert!(app.queued_resolves().is_empty());

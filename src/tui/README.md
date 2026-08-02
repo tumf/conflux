@@ -35,7 +35,7 @@ Handles all keyboard input:
 Handles all TuiCommand variants:
 - `handle_start_processing_command()`: Spawn orchestrator tasks
 - `handle_tui_command()`: Main TuiCommand dispatcher
-- Processes commands: AddToQueue, RemoveFromQueue, DequeueChange, DeleteWorktree, DeleteWorktreeByPath, Stop, CancelStop, ForceStop, Retry, MergeWorktreeBranch, ResolveMerge
+- Processes commands: StartProcessing (also the retry intent — `Error` mode is what makes a start an explicit retry), AddToQueue, RemoveFromQueue, DequeueChange, DeleteWorktreeByPath, Stop, CancelStop, ForceStop, MergeWorktreeBranch, ResolveMerge
 
 Queue, stop-and-dequeue, and retry commands are adapters over the shared
 `orchestration::operator_command::OperatorCommandService`. Lifecycle validation,

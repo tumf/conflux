@@ -301,7 +301,7 @@ mod tests {
         ]);
 
         app.handle_analysis_started(1, "iteration=1;trigger=initial;queued=change-a".to_string());
-        let _ = app.handle_merge_deferred("change-a".to_string(), "merge wait".to_string(), true);
+        app.handle_merge_deferred("change-a".to_string(), "merge wait".to_string(), true);
         app.handle_analysis_started(1, "iteration=1;trigger=queue;queued=change-b".to_string());
 
         assert_eq!(count_analysis_logs(&app, 1), 2);

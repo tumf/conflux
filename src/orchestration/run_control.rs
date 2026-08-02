@@ -405,11 +405,6 @@ impl StartEligibility {
         self.lock().parallel_mode = parallel_mode;
     }
 
-    /// True when parallel mode is active.
-    pub fn parallel_mode(&self) -> bool {
-        self.lock().parallel_mode
-    }
-
     /// Publish the set of changes parallel mode refuses to start.
     pub fn set_parallel_ineligible(&self, ids: impl IntoIterator<Item = String>) {
         self.lock().parallel_ineligible = ids.into_iter().collect();
@@ -498,16 +493,6 @@ impl RunControlService {
     /// The per-change operator command service this service composes with.
     pub fn operator(&self) -> Arc<OperatorCommandService> {
         self.operator.clone()
-    }
-
-    /// Shared resolve reservation ledger.
-    pub fn resolves(&self) -> Arc<ResolveReservations> {
-        self.resolves.clone()
-    }
-
-    /// Shared start eligibility projection.
-    pub fn eligibility(&self) -> Arc<StartEligibility> {
-        self.eligibility.clone()
     }
 
     async fn display_status(&self, change_id: &str) -> String {

@@ -558,12 +558,10 @@ mod tests {
             revision: "1".to_string(),
         };
         state.write().await.apply_execution_event(&merged);
-        let command = app.handle_orchestrator_event(merged);
+        // Event handling returns `()`: promotion cannot emit a command the shared
+        // service would have to refuse.
+        app.handle_orchestrator_event(merged);
 
-        assert!(
-            command.is_none(),
-            "promotion must emit no command the shared service would have to refuse"
-        );
         assert_eq!(
             app.warning_message, None,
             "a promoted resolve is not an operator-facing refusal"

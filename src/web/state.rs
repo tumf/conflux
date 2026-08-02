@@ -13,30 +13,10 @@ use crate::web::remote_control_api::dto::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::RwLock;
 
 #[cfg(feature = "web-monitoring")]
 use utoipa::ToSchema;
-
-/// Control commands that can be sent from Web UI to orchestrator
-#[derive(Debug, Clone)]
-pub enum ControlCommand {
-    /// Start or resume processing
-    Start,
-    /// Stop processing (graceful shutdown)
-    Stop,
-    /// Cancel a pending stop request
-    CancelStop,
-    /// Force stop immediately
-    ForceStop,
-    /// Retry error changes.
-    ///
-    /// Retained because both frontend bridges implement it, but nothing produces
-    /// it today: `/api/v2` routes retry through the shared operator command
-    /// service instead of this channel.
-    #[allow(dead_code)]
-    Retry,
-}
 
 /// Change status projected into the `/api/v2` snapshot
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -375,9 +355,6 @@ impl EventSink for WebEventSink {
 pub struct WebState {
     /// Current orchestrator state snapshot (thread-safe)
     state: RwLock<OrchestratorStateSnapshot>,
-    /// Control command channel (optional, only used when web control is enabled)
-    /// Uses Mutex for interior mutability to allow setting after Arc creation
-    control_tx: Mutex<Option<mpsc::UnboundedSender<ControlCommand>>>,
     /// Reference to shared orchestration state (for unified state tracking)
     /// Wrapped in RwLock for interior mutability (can be set after construction via Arc)
     shared_orchestrator_state: tokio::sync::RwLock<
@@ -409,7 +386,6 @@ impl WebState {
 
         Self {
             state: RwLock::new(state),
-            control_tx: Mutex::new(None),
             shared_orchestrator_state: tokio::sync::RwLock::new(None),
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
             execution_marks: tokio::sync::RwLock::new(None),
@@ -521,31 +497,6 @@ impl WebState {
         let (event_type, change_id, payload) = v2::describe_event(event);
         let candidate = v2::project_snapshot(&self.operator_snapshot().await);
         projection.apply_state(event_type, change_id, payload, candidate);
-    }
-
-    /// Set the control command channel for web-based execution control
-    pub async fn set_control_channel(&self, control_tx: mpsc::UnboundedSender<ControlCommand>) {
-        *self.control_tx.lock().await = Some(control_tx);
-    }
-
-    /// Send a control command (returns error if control channel not set)
-    pub fn send_control_command(
-        &self,
-        command: ControlCommand,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Use try_lock to avoid blocking in sync context
-        let control_tx_guard = self
-            .control_tx
-            .try_lock()
-            .map_err(|_| "Control channel lock contention")?;
-
-        if let Some(tx) = control_tx_guard.as_ref() {
-            tx.send(command)
-                .map_err(|e| format!("Failed to send control command: {}", e))?;
-            Ok(())
-        } else {
-            Err("Control channel not initialized".into())
-        }
     }
 
     /// Set reference to shared orchestration state for unified tracking.

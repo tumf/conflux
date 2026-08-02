@@ -819,10 +819,10 @@ async fn run_tui_loop(
                 }
             }
 
-            if let Some(cmd) = app.handle_orchestrator_event(event) {
-                // Event triggered a command (e.g., auto-start next resolve)
-                let _ = cmd_tx.send(cmd).await;
-            }
+            // Painting only: an orchestrator event never produces a command. The
+            // scheduler dispatches every transition it implies from the
+            // reducer-owned intent the same event already recorded.
+            app.handle_orchestrator_event(event);
         }
 
         // Handle dynamic queue additions and removals
@@ -833,11 +833,6 @@ async fn run_tui_loop(
                 repo_root: &repo_root,
                 config: &config,
                 tx: &tx,
-                dynamic_queue: &dynamic_queue,
-                post_archive_action: post_archive_action.clone(),
-                // Invocation-scoped; every orchestrator start in this persistent
-                // TUI process reconstructs the same publication runtime.
-                upstream_runtime: upstream_runtime.clone(),
                 run_control: &run_control,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &web_state,
