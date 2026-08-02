@@ -3,9 +3,125 @@
 //! This module provides functions for creating, managing, and querying Git commits.
 
 use super::basic::run_git;
-use crate::vcs::{VcsError, VcsResult};
+use crate::vcs::commands::{run_vcs_command_captured, VcsCommandOutput};
+use crate::vcs::{CommitRejection, VcsBackend, VcsError, VcsResult, VerifiedCommitOutcome};
 use std::path::Path;
 use tracing::debug;
+
+/// Exit status `git commit` reports when the repository itself rejects the
+/// commit, most importantly a non-zero `pre-commit` or `commit-msg` hook.
+///
+/// Fatal Git failures (bad repository, unreadable objects, usage errors) exit
+/// with 128, and a signal-killed process reports no code at all, so matching
+/// this exact status keeps recovery eligibility structural instead of relying
+/// on the rendered error text.
+pub const GIT_REPOSITORY_REJECTION_EXIT_CODE: i32 = 1;
+
+/// Which finalization path a verified commit takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifiedCommitMode {
+    /// The worktree had changes, so they were staged and committed normally.
+    AddAndCommit,
+    /// A WIP snapshot already left the worktree clean, so HEAD is amended.
+    Amend,
+}
+
+/// Build the argument list for the verified (hook-enabled) commit.
+///
+/// Kept separate from execution so the "final commits never bypass hooks" rule
+/// is checkable without spawning Git.
+///
+/// The amend path adds `--allow-empty` because the WIP snapshot it rewrites may
+/// itself be empty (snapshots are created with `--allow-empty`), and the final
+/// commit's job is to name the completed apply rather than to introduce
+/// content. Without it Git exits 1 for "would make it empty", which is
+/// indistinguishable from a hook rejection by exit code and would spend the
+/// whole repair budget on a failure no agent can fix.
+pub fn verified_commit_args(mode: VerifiedCommitMode, message: &str) -> Vec<String> {
+    let mut args = vec!["commit".to_string()];
+    if mode == VerifiedCommitMode::Amend {
+        args.push("--amend".to_string());
+        args.push("--allow-empty".to_string());
+    }
+    args.push("-m".to_string());
+    args.push(message.to_string());
+    args
+}
+
+/// Classify the result of a verified commit process that actually ran.
+///
+/// Only an exact [`GIT_REPOSITORY_REJECTION_EXIT_CODE`] becomes
+/// [`VerifiedCommitOutcome::RepositoryRejected`]. Every other failure — fatal
+/// Git status, signal death — stays a terminal [`VcsError`]. Classification
+/// reads the preserved exit code only; it never inspects rendered error text.
+pub fn classify_verified_commit_output(
+    output: VcsCommandOutput,
+    working_dir: &Path,
+) -> VcsResult<VerifiedCommitOutcome> {
+    if output.success {
+        return Ok(VerifiedCommitOutcome::Committed);
+    }
+
+    if output.exit_code == Some(GIT_REPOSITORY_REJECTION_EXIT_CODE) {
+        debug!(
+            "Verified commit rejected by repository verification: {}",
+            output.command
+        );
+        return Ok(VerifiedCommitOutcome::RepositoryRejected(CommitRejection {
+            command: output.command,
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }));
+    }
+
+    Err(VcsError::Command {
+        backend: VcsBackend::Git,
+        message: format!("{} failed: {}", output.command, output.stderr),
+        command: Some(output.command),
+        working_dir: Some(working_dir.to_path_buf()),
+        stderr: Some(output.stderr),
+        stdout: Some(output.stdout),
+    })
+}
+
+/// Run a verified commit and classify its result structurally.
+///
+/// A spawn failure propagates as a terminal [`VcsError`] before any
+/// classification happens.
+async fn run_verified_commit<P: AsRef<Path>>(
+    cwd: P,
+    args: &[String],
+) -> VcsResult<VerifiedCommitOutcome> {
+    debug_assert!(
+        !args.iter().any(|arg| arg == "--no-verify"),
+        "verified commits must run repository hooks"
+    );
+
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_vcs_command_captured("git", &arg_refs, cwd.as_ref(), VcsBackend::Git).await?;
+
+    classify_verified_commit_output(output, cwd.as_ref())
+}
+
+/// Create the verified (hook-enabled) commit for a workspace.
+///
+/// Setup steps (`status`, `add`, staged-snapshot validation) propagate as
+/// terminal errors; only the commit itself can produce a repository rejection.
+pub async fn create_verified_commit<P: AsRef<Path>>(
+    cwd: P,
+    message: &str,
+) -> VcsResult<VerifiedCommitOutcome> {
+    let mode = if has_changes_to_commit(&cwd).await? {
+        run_git(&["add", "-A"], &cwd).await?;
+        validate_staged_snapshot(&cwd).await?;
+        VerifiedCommitMode::AddAndCommit
+    } else {
+        VerifiedCommitMode::Amend
+    };
+
+    run_verified_commit(&cwd, &verified_commit_args(mode, message)).await
+}
 
 fn staged_snapshot_anomaly<'a>(paths: impl Iterator<Item = &'a str>) -> Option<String> {
     const MAX_STAGED_FILES: usize = 5_000;
@@ -146,15 +262,6 @@ pub async fn list_changes_in_head<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<Strin
 
     change_ids.sort();
     Ok(change_ids)
-}
-
-/// Stage all changes and commit with the given message.
-#[allow(dead_code)]
-pub async fn add_and_commit<P: AsRef<Path>>(cwd: P, message: &str) -> VcsResult<()> {
-    run_git(&["add", "-A"], &cwd).await?;
-    validate_staged_snapshot(&cwd).await?;
-    run_git(&["commit", "-m", message], cwd).await?;
-    Ok(())
 }
 
 /// Check if there are staged or unstaged changes to commit.

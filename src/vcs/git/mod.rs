@@ -7,8 +7,8 @@ pub mod commands;
 
 use crate::config::OrchestratorConfig;
 use crate::vcs::{
-    VcsBackend, VcsError, VcsResult, VcsWarning, Workspace, WorkspaceInfo, WorkspaceManager,
-    WorkspaceStatus,
+    VcsBackend, VcsError, VcsResult, VcsWarning, VerifiedCommitOutcome, Workspace, WorkspaceInfo,
+    WorkspaceManager, WorkspaceStatus,
 };
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -776,20 +776,16 @@ impl WorkspaceManager for GitWorkspaceManager {
         Ok(())
     }
 
-    async fn set_commit_message(&self, workspace_path: &Path, message: &str) -> VcsResult<()> {
-        // First check if there are any changes to commit
-        if commands::has_changes_to_commit(workspace_path).await? {
-            // Stage all changes and create a commit
-            commands::add_and_commit(workspace_path, message).await?;
-        } else {
-            // Try to amend the last commit with the new message
-            let result =
-                commands::run_git(&["commit", "--amend", "-m", message], workspace_path).await;
-            if let Err(e) = result {
-                warn!("Failed to amend commit message: {}", e);
-            }
-        }
-        Ok(())
+    async fn create_verified_commit(
+        &self,
+        workspace_path: &Path,
+        message: &str,
+    ) -> VcsResult<VerifiedCommitOutcome> {
+        // Both the dirty-tree and the clean-tree amend path run repository
+        // hooks and propagate a rejection. An amend failure must never be
+        // downgraded to success: that would report an unchanged `WIP:` commit
+        // as a completed Apply and hand the change off to acceptance.
+        commands::create_verified_commit(workspace_path, message).await
     }
 
     async fn create_iteration_snapshot(

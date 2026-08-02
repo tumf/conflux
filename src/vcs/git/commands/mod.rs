@@ -20,7 +20,7 @@ pub use basic::{
     is_head_empty_commit, push_same_named_branch, run_git,
 };
 pub use commit::{
-    add_and_commit, create_archive_wip_commit, has_changes_to_commit, list_changes_in_head,
+    create_archive_wip_commit, create_verified_commit, list_changes_in_head,
     list_changes_with_uncommitted_files, squash_archive_wip_commits, validate_staged_snapshot,
 };
 pub use merge::{

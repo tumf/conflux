@@ -247,8 +247,12 @@ impl WorkspaceManager for TestWorkspaceManager {
         Ok(())
     }
 
-    async fn set_commit_message(&self, _workspace_path: &Path, _message: &str) -> VcsResult<()> {
-        Ok(())
+    async fn create_verified_commit(
+        &self,
+        _workspace_path: &Path,
+        _message: &str,
+    ) -> VcsResult<crate::vcs::VerifiedCommitOutcome> {
+        Ok(crate::vcs::VerifiedCommitOutcome::Committed)
     }
 
     async fn create_iteration_snapshot(

@@ -351,6 +351,21 @@ impl AgentRunner {
         );
     }
 
+    /// Record orchestration-originated apply feedback for the next iteration.
+    ///
+    /// Separate from [`AgentRunner::record_apply_attempt`] because this did not
+    /// come from an agent process: it is something the orchestrator observed
+    /// (currently a rejected final Apply commit) and needs the next apply
+    /// prompt to carry as untrusted diagnostic context.
+    pub fn record_apply_orchestration_feedback(
+        &mut self,
+        change_id: &str,
+        feedback: crate::history::ApplyOrchestrationFeedback,
+    ) {
+        self.apply_history
+            .record_orchestration_feedback(change_id, feedback);
+    }
+
     /// Run archive command for the given change ID with output streaming.
     /// Returns a child process handle, a receiver for output lines, and a start time.
     /// The caller is responsible for recording the attempt after the child completes
