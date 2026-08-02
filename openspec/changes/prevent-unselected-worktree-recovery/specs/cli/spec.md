@@ -2,7 +2,7 @@
 
 ### Requirement: Auto-Queue Approved Changes on TUI Startup
 
-The TUI SHALL start with all changes unselected and SHALL NOT auto-queue or auto-admit any change. Preserved worktree state MAY be displayed and used to derive the resume phase after explicit admission, but worktree discovery alone MUST NOT cause an unselected change to enter a TUI run.
+The TUI SHALL start with all changes unselected and SHALL NOT auto-queue any change. Active-change refresh and preserved worktree discovery MAY populate display/catalog state, but MUST NOT create execution eligibility. Only marked IDs accepted by Start or later accepted shared operator queue/retry intent may enter ordinary execution.
 
 #### Scenario: TUI startup clears execution marks
 
@@ -10,17 +10,25 @@ The TUI SHALL start with all changes unselected and SHALL NOT auto-queue or auto
 **Then**: All changes are unselected by default
 **And**: No changes are automatically queued or admitted to execution
 
-#### Scenario: Starting another change does not admit preserved worktrees
+#### Scenario: Initial all-change refresh preserves selection boundary
 
-**Given**: Change `fresh` is marked for execution
-**And**: Unmarked change `stale` has a preserved recoverable worktree
-**When**: The user starts processing
-**Then**: The initial run snapshot contains `fresh` and not `stale`
-**And**: Worktree reconciliation does not add `stale` to the run
+**Given**: `fresh` is marked and `stale` is unmarked
+**And**: `stale` has a preserved recoverable worktree
+**When**: The user starts processing `fresh`
+**And**: The initial `ChangesRefreshed` event contains both changes
+**Then**: Only `fresh` enters ordinary execution eligibility
+**And**: Catalog registration of `stale` does not queue, analyze, or execute it
 
-#### Scenario: Explicit selection admits preserved workspace recovery
+#### Scenario: Explicit later queue enables preserved workspace recovery
 
-**Given**: Change `stale` has a preserved recoverable worktree and starts unselected
-**When**: The user marks `stale` and starts processing
-**Then**: `stale` is admitted to the run
-**And**: Conflux derives the next phase from workspace/git/base-tree evidence
+**Given**: `stale` remains visible and unqueued with a preserved recoverable worktree
+**When**: The user explicitly adds `stale` to the Running-mode queue
+**Then**: Shared reducer queue intent makes `stale` eligible
+**And**: Conflux derives its resume phase from workspace and Git evidence
+
+#### Scenario: Queue removal revokes recovery eligibility
+
+**Given**: `stale` was explicitly queued and has not yet completed
+**When**: The user removes or successfully stops and dequeues `stale`
+**Then**: Preserved worktree discovery does not requeue it
+**And**: Explicit requeue is required before it can execute again

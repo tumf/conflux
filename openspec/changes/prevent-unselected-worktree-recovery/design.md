@@ -1,56 +1,99 @@
-# Design: Run admission boundary for workspace recovery
+# Design: Explicit intent boundary for workspace recovery
 
 ## Context
 
-A TUI start has two relevant sources of intent:
+Parallel execution receives intent through multiple frontends:
 
-1. execution marks become the initial `change_ids` passed to `run_orchestrator_parallel`;
-2. Running-mode queue commands add reducer queue intent and call `add_dynamic_change`.
+- TUI and remote mark-plus-Start resolve process-local marks into an explicit target list through the shared run-control boundary;
+- CLI `run` supplies explicit target IDs directly;
+- Running-mode TUI and remote queue commands use the shared operator command service and reducer `QueueIntent::Queued`;
+- terminal-error retry restores queued intent;
+- merge and rejection lane retries use reducer-owned `ResolveWait` and `RejectWait`.
 
-`initialize_parallel_shared_state` builds `OrchestratorState::initial_change_ids` from the first source, and `add_dynamic_change` extends it for the second. This process-local set already expresses which changes the operator admitted to the current run.
+These intent paths already exist. No additional admission store is needed.
 
-Queue reconciliation combines reducer-visible queued intent with workspace-derived archived-dirty recovery. The workspace scan currently has no admission check. It therefore turns repository evidence into both a next-action classification and an implicit user command.
+`OrchestratorState::initial_change_ids` is catalog/run bookkeeping, not authoritative admission. TUI initialization can seed it with all active changes. During parallel startup, selected IDs temporarily replace it, but `ChangesRefreshed(all_changes)` registers every newly observed active change through `add_dynamic_change`. Queue removal and dequeue do not remove IDs from the set. Therefore membership cannot prove current operator intent.
+
+Queue reconciliation currently starts from reducer-queued IDs, then scans every worktree and appends archived-dirty IDs with no reducer queue intent. This turns workflow evidence into an implicit execution command.
 
 ## Decision
 
-Use `OrchestratorState::initial_change_ids()` as the current-run admission set when scanning worktrees that have no reducer queue intent.
+Worktree discovery MUST NOT create ordinary operator intent.
 
-A workspace-derived archived-dirty candidate is eligible only if its ID is in that set. The evidence still decides which phase resumes. Admission decides whether the current run may act on that evidence.
+Ordinary archived-dirty recovery is eligible only when the ID reaches the scheduler through one of these existing explicit paths:
 
-Do not add a new field, persistence file, configuration option, or frontend-specific recovery list. The existing reducer snapshot covers initial selection and dynamic admission.
+1. an initial explicit target supplied to the current run;
+2. current reducer `QueueIntent::Queued`, including accepted dynamic queue addition and `RetryError`.
 
-## Queue Reconciliation Rules
+`RemoveFromQueue` and `DequeueChange` revoke path 2 immediately. A catalog refresh may add a runtime entry but cannot recreate queue intent. A later accepted `AddToQueue` re-enables recovery.
 
-Queue reconciliation handles three distinct inputs:
+`ResolveWait` and `RejectWait` are not ordinary queue admission. They remain distinct reducer-owned lane intent and may wake an otherwise empty scheduler. Manual `MergeWait` remains inert until `ResolveMerge` creates `ResolveWait`.
 
-- reducer-queued IDs: explicit queue intent, reconciled as today;
-- reducer-owned resolve/reject waiters: scheduler lane intent, handled as today;
-- worktree-only archived-dirty candidates: recover only when current-run membership contains the ID.
+## Scheduler Rules
 
-For a worktree-only candidate outside the admission set, reconciliation performs no queue mutation and no workspace mutation. Diagnostic logging may remain debug-level and deduplicated, but must not present the change as queued, pending repair, or executing.
+### Initial explicit targets
 
-The admission check belongs before expensive archived-dirty classification where practical. Correctness must not depend on optimization: the final insertion path must also reject a non-admitted ID.
+The initial candidate vector is already an explicit scheduler input. If an ID is absent from the active catalog because its change was moved into the workspace archive, candidate loading may fall back to that ID's preserved workspace and reconstruct archived-dirty repair evidence.
 
-## Restart Semantics
+The scheduler must retain enough identity to perform this fallback without scanning unrelated worktrees into the candidate set. This may be implemented by carrying unresolved initial IDs to reconciliation or by resolving each explicit target before ordinary analysis; it must not reuse catalog membership as intent.
 
-Execution marks reset on process restart. A restarted TUI therefore admits nothing until the operator marks changes and starts a run. Workspace state remains visible and unchanged.
+### Reducer queued intent
 
-After admission, state detection may classify the workspace as Applying, Accepting, Archiving, Archived, or another repository-derived state and resume accordingly. The admission set is not workflow evidence and does not choose the phase.
+`queued_change_ids()` is the authoritative source for later ordinary reconciliation. For each queued ID:
 
-This satisfies the Constitution: deleting process-local state changes which operator command must be issued after restart, but does not alter the next phase chosen for identical workspace evidence after the same explicit admission.
+- load the active OpenSpec change when present;
+- otherwise inspect only that ID's existing workspace for archived-dirty repair evidence;
+- apply active, manual wait, terminal, and post-archive stop gates before insertion.
 
-## Manual Merge Retry
+Dynamic queue notifications remain wake-up hints, not eligibility truth.
 
-Manual `MergeWait` is not ordinary archived-dirty repair. It requires explicit `ResolveMerge`, which records reducer-owned `ResolveWait`. Empty-queue scheduler startup must preserve that shared reducer state. The admission filter must not suppress this lane-wait path.
+### Worktree catalog scan
+
+Repository-wide worktree enumeration may support observability, cleanup, or workspace lookup. It must not append IDs to reducer queued intent, scheduler-local queued work, or dependency analysis candidates.
+
+An unrequested archived-dirty worktree does not keep an otherwise drained run alive. Its recoverable state remains visible and becomes executable after a later explicit target or queue command.
+
+## Refresh and Revocation
+
+`ChangesRefreshed` synchronizes catalog/runtime/display information. It must not set `QueueIntent::Queued`, `ResolveWait`, `RejectWait`, or any equivalent execution eligibility.
+
+`RemoveFromQueue` and `DequeueChange` set ordinary eligibility to false. Reconciliation must observe current reducer intent on every pass, so stale local/dynamic entries and preserved worktrees cannot reacquire the change. Explicit requeue is the only ordinary path back.
+
+## Frontend Neutrality
+
+The scheduler does not distinguish TUI, remote, and CLI intent after boundary validation:
+
+- TUI and remote Start use the same run-control target resolution;
+- TUI and remote queue mutations use the same operator command service;
+- CLI target IDs enter the same initial candidate contract;
+- all frontends share reducer queue/retry/wait semantics after startup.
+
+## Constitution and Restart
+
+Process-local intent controls whether the current invocation may act; it does not prove implementation completion, acceptance, archive readiness, or resume phase. Workspace file state, Git state, and base-tree comparison remain authoritative for the next phase.
+
+Restart clears marks and reducer intent. Archived-dirty evidence remains discoverable but does not execute until new explicit intent is supplied. Once supplied, identical workspace evidence yields the same phase. No external durable workflow-control state is added.
 
 ## Verification Strategy
 
-Use temporary Git repositories and existing test workspace managers:
+The principal temporary-Git regression follows production ordering:
 
-- selected `fresh`, unselected archived-dirty `stale`: only `fresh` remains queued;
-- admitted archived-dirty `stale`: recovery candidate is added and enters archive-complete/finalization routing without apply rerun;
-- dynamic `AddToQueue(stale)`: reducer snapshot grows and recovery becomes eligible;
-- manual `MergeWait(stale)`: no ordinary repair candidate until `ResolveMerge` is accepted;
-- merged residue and terminal error fixtures remain excluded.
+1. create selected active `fresh` and unselected archived-dirty `stale`;
+2. initialize shared parallel state with `fresh`;
+3. apply `ChangesRefreshed` containing both IDs;
+4. run queue reconciliation and dependency analysis;
+5. capture analyzer inputs and lifecycle events;
+6. compare `stale` HEAD, branch ref, index, status, and files before and after.
 
-A TUI boundary test must assert `initialize_parallel_shared_state` creates exact initial membership from selected IDs and does not inherit stale worktree IDs.
+It must prove only `fresh` is analyzed and no `stale` lifecycle or Git mutation occurs.
+
+Additional tests prove:
+
+- initial explicit archived-dirty target recovery;
+- reducer-queued archived-dirty recovery;
+- removal/dequeue prevents reacquisition and explicit requeue restores it;
+- TUI/remote Start and queue equivalence plus CLI initial-target behavior;
+- empty ordinary queue still consumes `ResolveWait` and `RejectWait` independently;
+- admitted merged residue reaches the merged-evidence stop gate;
+- admitted terminal error reaches the retry-required stop gate;
+- an unrequested archived-dirty worktree does not prevent drain/completion.
