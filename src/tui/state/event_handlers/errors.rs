@@ -284,11 +284,9 @@ mod tests {
         >,
         change_id: &str,
     ) {
-        shared
-            .blocking_write()
-            .apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
-                change_id.to_string(),
-            ));
+        shared.blocking_write().apply_command(
+            crate::orchestration::state::ReducerCommand::ResolveMerge(change_id.to_string()),
+        );
         app.set_resolving(change_id);
         if let Some(change) = app.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("resolve pending");

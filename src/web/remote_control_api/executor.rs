@@ -224,9 +224,9 @@ pub fn summarize_run_outcome(outcome: &RunControlOutcome) -> ExecutionSummary {
             )),
         },
         RunControlOutcome::NoOp { reason } => match reason {
-            RunNoOpReason::ResolveAlreadyReserved { change_id } => ExecutionSummary::no_op(format!(
-                "'{change_id}' already holds a resolve reservation"
-            )),
+            RunNoOpReason::ResolveAlreadyReserved { change_id } => ExecutionSummary::no_op(
+                format!("'{change_id}' already holds a resolve reservation"),
+            ),
             RunNoOpReason::NoRetryableTarget => {
                 ExecutionSummary::no_op("no marked change carried retryable evidence")
             }

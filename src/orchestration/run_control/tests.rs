@@ -106,7 +106,11 @@ impl Harness {
     }
 
     async fn status(&self, change_id: &str) -> String {
-        self.state.read().await.display_status(change_id).to_string()
+        self.state
+            .read()
+            .await
+            .display_status(change_id)
+            .to_string()
     }
 
     /// Move a change into a reducer-visible merge wait.
@@ -235,10 +239,7 @@ async fn start_refuses_parallel_ineligible_targets() {
         .await
         .expect_err("parallel mode refuses uncommitted changes");
 
-    assert!(matches!(
-        error,
-        RunControlError::NoEligibleTarget { .. }
-    ));
+    assert!(matches!(error, RunControlError::NoEligibleTarget { .. }));
     assert!(harness.scheduler.calls().is_empty());
 }
 
@@ -460,9 +461,7 @@ async fn stop_and_cancel_stop_enforce_the_mode_matrix() {
 
 #[tokio::test]
 async fn force_stop_reports_classification_truthfully_and_always_cancels() {
-    use crate::tui::stop_classification::{
-        ExecutionEvidence, ProcessReport, ShutdownWorkEvidence,
-    };
+    use crate::tui::stop_classification::{ExecutionEvidence, ProcessReport, ShutdownWorkEvidence};
 
     // Active execution: force-stop reporting plus a scheduler-owned boundary.
     let harness = Harness::new(&["a"]);
@@ -488,11 +487,18 @@ async fn force_stop_reports_classification_truthfully_and_always_cancels() {
         }
         other => panic!("unexpected outcome: {other:?}"),
     }
-    assert!(harness.scheduler.calls().contains(&SchedulerCall::Cancelled));
+    assert!(harness
+        .scheduler
+        .calls()
+        .contains(&SchedulerCall::Cancelled));
 
     // Idle scheduler: ordinary stop, no boundary wait, cancellation still issued.
     let idle = Harness::new(&["a"]);
-    let outcome = idle.service.force_stop(OperatorMode::Stopping).await.unwrap();
+    let outcome = idle
+        .service
+        .force_stop(OperatorMode::Stopping)
+        .await
+        .unwrap();
     match outcome {
         RunControlOutcome::ForceStopped {
             classification,

@@ -3084,11 +3084,9 @@ mod tests {
 
         // What the shared run-control service does when it accepts the resolve:
         // record the reducer intent, then let the adapter advance the row.
-        shared
-            .blocking_write()
-            .apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
-                "change-b".to_string(),
-            ));
+        shared.blocking_write().apply_command(
+            crate::orchestration::state::ReducerCommand::ResolveMerge("change-b".to_string()),
+        );
         app.changes[1].set_display_status_cache("resolve pending");
 
         // Simulate a ChangesRefreshed event where workspace still reports change-b
@@ -3161,11 +3159,9 @@ mod tests {
         app.clear_resolving();
 
         // What the shared run-control service does when it accepts the resolve.
-        shared
-            .blocking_write()
-            .apply_command(crate::orchestration::state::ReducerCommand::ResolveMerge(
-                "change-a".to_string(),
-            ));
+        shared.blocking_write().apply_command(
+            crate::orchestration::state::ReducerCommand::ResolveMerge("change-a".to_string()),
+        );
         app.changes[0].set_display_status_cache("resolve pending");
 
         // Simulate a ChangesRefreshed event where workspace still reports change-a

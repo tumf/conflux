@@ -92,6 +92,7 @@ pub enum SchedulerEffect {
 
 impl SchedulerEffect {
     /// True when the scheduler was really started or woken.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dispatched(self) -> bool {
         matches!(self, Self::Started | Self::Notified)
     }
@@ -189,11 +190,9 @@ pub enum RunControlError {
 impl std::fmt::Display for RunControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidMode { command, mode } => write!(
-                f,
-                "{} is not available in {mode:?} mode",
-                command.as_str()
-            ),
+            Self::InvalidMode { command, mode } => {
+                write!(f, "{} is not available in {mode:?} mode", command.as_str())
+            }
             Self::NoEligibleTarget { command, detail } => {
                 write!(f, "{} has no eligible target: {detail}", command.as_str())
             }
@@ -207,7 +206,11 @@ impl std::fmt::Display for RunControlError {
                 command.as_str()
             ),
             Self::DispatchFailed { command, message } => {
-                write!(f, "{} could not dispatch the run: {message}", command.as_str())
+                write!(
+                    f,
+                    "{} could not dispatch the run: {message}",
+                    command.as_str()
+                )
             }
             Self::Operator(error) => write!(f, "{error}"),
         }
@@ -276,7 +279,8 @@ impl ResolveReservations {
     /// makes a duplicate submission a no-op instead of a second queue entry.
     pub fn reserve(&self, change_id: &str) -> Option<ResolveReservation> {
         let mut guard = self.lock();
-        if guard.active.as_deref() == Some(change_id) || guard.waiting.iter().any(|q| q == change_id)
+        if guard.active.as_deref() == Some(change_id)
+            || guard.waiting.iter().any(|q| q == change_id)
         {
             return None;
         }
@@ -308,6 +312,7 @@ impl ResolveReservations {
     }
 
     /// Queued changes in FIFO order (the active resolver is not included).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn waiting(&self) -> Vec<String> {
         self.lock().waiting.iter().cloned().collect()
     }
@@ -353,6 +358,7 @@ impl ResolveReservations {
     }
 
     /// Drop every reservation.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn clear(&self) {
         let mut guard = self.lock();
         guard.active = None;
@@ -443,8 +449,7 @@ pub trait RunSchedulerPort: Send + Sync {
     ///
     /// An empty `targets` list is a scheduler-owned run that consumes
     /// reducer-owned intent (a manual resolve, for example).
-    async fn start_run(&self, targets: Vec<String>, explicit_retry: bool)
-        -> Result<(), String>;
+    async fn start_run(&self, targets: Vec<String>, explicit_retry: bool) -> Result<(), String>;
 
     /// Wake a scheduler that is already alive.
     async fn notify_scheduler(&self);

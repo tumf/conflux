@@ -513,9 +513,7 @@ pub async fn handle_tui_command(
                                 ctx.app.mode = AppMode::Running;
                             }
                             let how = match scheduler {
-                                SchedulerEffect::Started => {
-                                    "started scheduler for manual resolve"
-                                }
+                                SchedulerEffect::Started => "started scheduler for manual resolve",
                                 _ => "notified existing scheduler",
                             };
                             ctx.app.add_log(LogEntry::info(format!(
@@ -905,14 +903,15 @@ mod tests {
             .write()
             .await
             .apply_command(ReducerCommand::AddToQueue("change-a".to_string()));
-        app.apply_display_statuses_from_reducer(
-            &harness.state.read().await.all_display_statuses(),
-        );
+        app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
         assert!(app.changes[0].selected);
         assert_eq!(app.changes[0].display_status_cache, "queued");
 
         harness
-            .run(&mut app, TuiCommand::RemoveFromQueue("change-a".to_string()))
+            .run(
+                &mut app,
+                TuiCommand::RemoveFromQueue("change-a".to_string()),
+            )
             .await;
 
         assert_eq!(harness.status("change-a").await, "not queued");
@@ -968,11 +967,7 @@ mod tests {
 
     // ── Stop-and-dequeue ────────────────────────────────────────────────────
 
-    async fn wait_for_status(
-        state: &Arc<RwLock<OrchestratorState>>,
-        id: &str,
-        expected: &str,
-    ) {
+    async fn wait_for_status(state: &Arc<RwLock<OrchestratorState>>, id: &str, expected: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if state.read().await.display_status(id) == expected {
@@ -993,14 +988,12 @@ mod tests {
     async fn operator_command_tui_dequeue_waits_for_confirmed_termination() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        harness
-            .state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::ApplyStarted {
                 change_id: "change-a".to_string(),
                 command: "apply".to_string(),
-            });
+            },
+        );
 
         let token = CancellationToken::new();
         harness
@@ -1027,14 +1020,12 @@ mod tests {
     async fn operator_command_tui_dequeue_preserves_active_state_without_handle() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        harness
-            .state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::ApplyStarted {
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::ApplyStarted {
                 change_id: "change-a".to_string(),
                 command: "apply".to_string(),
-            });
+            },
+        );
 
         harness
             .run(&mut app, TuiCommand::DequeueChange("change-a".to_string()))
@@ -1121,17 +1112,13 @@ mod tests {
     async fn tui_retry_routes_error_rows_and_proves_scheduler_dispatch() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        harness
-            .state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::ProcessingError {
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::ProcessingError {
                 id: "change-a".to_string(),
                 error: "boom".to_string(),
-            });
-        app.apply_display_statuses_from_reducer(
-            &harness.state.read().await.all_display_statuses(),
+            },
         );
+        app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
         app.mode = AppMode::Error;
         app.changes[0].selected = true;
         app.publish_execution_marks();
@@ -1157,11 +1144,8 @@ mod tests {
     async fn tui_retry_covers_acceptance_stalled_rows() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        harness
-            .state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::AcceptanceGated {
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::AcceptanceGated {
                 change_id: "change-a".to_string(),
                 blocker: crate::events::StalledBlocker {
                     category: "acceptance_finding".to_string(),
@@ -1177,10 +1161,9 @@ mod tests {
                     resumable: true,
                     worktree_preserved: true,
                 },
-            });
-        app.apply_display_statuses_from_reducer(
-            &harness.state.read().await.all_display_statuses(),
+            },
         );
+        app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
         assert_eq!(app.changes[0].display_status_cache, "stalled");
         app.mode = AppMode::Error;
         app.changes[0].selected = true;
@@ -1189,13 +1172,10 @@ mod tests {
         harness.run(&mut app, TuiCommand::Retry).await;
 
         assert_eq!(harness.status("change-a").await, "queued");
-        assert!(harness
-            .scheduler
-            .calls()
-            .contains(&SchedulerCall::Started {
-                targets: vec!["change-a".to_string()],
-                explicit_retry: true,
-            }));
+        assert!(harness.scheduler.calls().contains(&SchedulerCall::Started {
+            targets: vec!["change-a".to_string()],
+            explicit_retry: true,
+        }));
     }
 
     /// The TUI renders dependency waits, external prerequisite waits, and
@@ -1283,15 +1263,13 @@ mod tests {
 
     /// Put a change into a reducer-visible merge wait.
     async fn to_merge_wait(harness: &AdapterHarness, change_id: &str) {
-        harness
-            .state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::MergeDeferred {
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::MergeDeferred {
                 change_id: change_id.to_string(),
                 reason: "manual resolution required".to_string(),
                 auto_resumable: false,
-            });
+            },
+        );
     }
 
     #[tokio::test]
@@ -1337,14 +1315,12 @@ mod tests {
     async fn test_resolve_merge_noop_does_not_notify_or_log_scheduled() {
         let harness = AdapterHarness::new(&["change-a"]);
         let mut app = harness.app(&["change-a"]);
-        harness
-            .state
-            .write()
-            .await
-            .apply_execution_event(&crate::events::ExecutionEvent::MergeCompleted {
+        harness.state.write().await.apply_execution_event(
+            &crate::events::ExecutionEvent::MergeCompleted {
                 change_id: "change-a".to_string(),
                 revision: "rev-a".to_string(),
-            });
+            },
+        );
         harness.scheduler.set_running(true);
 
         harness
@@ -1484,7 +1460,10 @@ mod tests {
         let app = run_force_stop(&harness, activity(1, false), true).await;
 
         assert!(
-            harness.scheduler.calls().contains(&SchedulerCall::Cancelled),
+            harness
+                .scheduler
+                .calls()
+                .contains(&SchedulerCall::Cancelled),
             "an active execution must still request managed cancellation"
         );
         assert_eq!(log_count(&app, "Force stopped"), 1);
@@ -1502,7 +1481,10 @@ mod tests {
         let harness = AdapterHarness::new(&["change-a"]);
         let app = run_force_stop(&harness, activity(0, false), true).await;
 
-        assert!(harness.scheduler.calls().contains(&SchedulerCall::Cancelled));
+        assert!(harness
+            .scheduler
+            .calls()
+            .contains(&SchedulerCall::Cancelled));
         assert_eq!(
             log_count(&app, "Force stopped"),
             0,
@@ -1517,7 +1499,10 @@ mod tests {
         let harness = AdapterHarness::new(&["change-a"]);
         let app = run_force_stop(&harness, activity(0, true), true).await;
 
-        assert!(harness.scheduler.calls().contains(&SchedulerCall::Cancelled));
+        assert!(harness
+            .scheduler
+            .calls()
+            .contains(&SchedulerCall::Cancelled));
         assert_eq!(
             log_count(&app, "Force stopped"),
             0,
@@ -1787,7 +1772,9 @@ mod run_supervisor_tests {
 
         // A persistent TUI stays alive after publishing, so the operator ends it.
         let (handle, cancel) = supervisor.take_run();
-        cancel.expect("retry must own a cancellation token").cancel();
+        cancel
+            .expect("retry must own a cancellation token")
+            .cancel();
         if let Some(handle) = handle {
             let _ = handle.await;
         }

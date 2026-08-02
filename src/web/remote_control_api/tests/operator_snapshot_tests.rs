@@ -882,12 +882,8 @@ async fn a_command_that_changes_a_decision_field_publishes_it_before_settling() 
         Arc::new(crate::orchestration::run_control::StartEligibility::new()),
     ));
     let projection = web_state.remote_control().projection();
-    let executor = SharedServiceExecutor::new(
-        service,
-        run_control,
-        web_state.clone(),
-        projection.clone(),
-    );
+    let executor =
+        SharedServiceExecutor::new(service, run_control, web_state.clone(), projection.clone());
 
     let revision_before = projection.revision();
     let summary = executor
