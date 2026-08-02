@@ -39,11 +39,11 @@ impl AppState {
             OrchestratorEvent::ResolveCompleted {
                 change_id,
                 worktree_change_ids,
-            } => return self.handle_resolve_completed(change_id, worktree_change_ids),
+            } => self.handle_resolve_completed(change_id, worktree_change_ids),
             OrchestratorEvent::MergeCompleted {
                 change_id,
                 revision: _,
-            } => return self.handle_merge_completed(change_id),
+            } => self.handle_merge_completed(change_id),
             OrchestratorEvent::BranchMergeStarted { branch_name } => {
                 self.handle_branch_merge_started(branch_name)
             }

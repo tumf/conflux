@@ -2921,10 +2921,12 @@ mod tests {
         app.changes[1].display_status_cache = "resolve pending".to_string();
 
         // Simulate resolve completion for change-a
-        let cmd = app.handle_resolve_completed("change-a".to_string(), None);
+        app.handle_resolve_completed("change-a".to_string(), None);
 
-        // Should return command to start change-b
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
+        // change-b is promoted in the ledger; the reducer-owned ResolveWait it
+        // already carries is what the scheduler dispatches from, so promotion
+        // emits no command.
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
         // is_resolving should be cleared
         assert!(!app.is_resolving());
         // Queue should be empty
@@ -2941,10 +2943,8 @@ mod tests {
         app.set_resolving("change-a");
 
         // Simulate resolve completion with empty queue
-        let cmd = app.handle_resolve_completed("change-a".to_string(), None);
+        app.handle_resolve_completed("change-a".to_string(), None);
 
-        // Should NOT return a command
-        assert!(cmd.is_none());
         // is_resolving should be cleared
         assert!(!app.is_resolving());
     }
@@ -2955,9 +2955,8 @@ mod tests {
         let mut app = AppState::new(changes);
         app.changes[0].display_status_cache = "merged".to_string();
 
-        let cmd = app.handle_resolve_completed("change-a".to_string(), None);
+        app.handle_resolve_completed("change-a".to_string(), None);
 
-        assert!(cmd.is_none());
         assert!(!app
             .logs
             .iter()
@@ -3201,7 +3200,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_orchestrator_event_merge_completed_returns_queued_resolve() {
+    fn test_handle_orchestrator_event_merge_completed_promotes_queued_resolve() {
         let changes = vec![
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
@@ -3218,8 +3217,13 @@ mod tests {
             revision: "abc123".to_string(),
         });
 
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
+        // The promoted change is dispatched from the reducer-owned ResolveWait it
+        // already holds, so the event path emits no command for it: a
+        // re-submission could only be refused as no longer `merge wait`.
+        assert!(cmd.is_none());
         assert!(!app.is_resolving());
+        assert!(app.queued_resolves().is_empty());
+        assert!(app.warning_message.is_none());
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
     }

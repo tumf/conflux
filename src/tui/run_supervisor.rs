@@ -110,9 +110,18 @@ impl TuiRunSupervisor {
         lock(&self.cancel).clone()
     }
 
-    fn spawn(&self, targets: Vec<String>, explicit_retry: bool) -> CancellationToken {
+    /// Which orchestrator this launch must use.
+    fn use_parallel_for(&self, targets: &[String]) -> bool {
+        requires_parallel_dispatch(targets, self.parallel_mode.load(Ordering::SeqCst))
+    }
+
+    fn spawn(
+        &self,
+        targets: Vec<String>,
+        explicit_retry: bool,
+        use_parallel: bool,
+    ) -> CancellationToken {
         let cancel = CancellationToken::new();
-        let use_parallel = self.parallel_mode.load(Ordering::SeqCst);
 
         let repo_root = self.launch.repo_root.clone();
         let config = self.launch.config.clone();
@@ -169,6 +178,20 @@ impl TuiRunSupervisor {
     }
 }
 
+/// Whether a launch must use the parallel orchestrator, whatever the toggle says.
+///
+/// A launch with no targets is scheduler-owned: the only caller that produces one
+/// is the resolve dispatch, which exists solely to consume reducer-recorded
+/// `ResolveWait`/`RejectWait` intent. Only the parallel machinery models that
+/// intent — it syncs `resolve_wait_changes` from the shared reducer and preserves
+/// it during empty-target startup. The serial orchestrator has no such notion: it
+/// replaces the shared `OrchestratorState` over the (empty) target list, so it
+/// would erase the very intent the launch was created to serve while still
+/// reporting a started run. An empty-target launch is therefore always parallel.
+fn requires_parallel_dispatch(targets: &[String], parallel_toggle: bool) -> bool {
+    targets.is_empty() || parallel_toggle
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -192,8 +215,12 @@ impl RunSchedulerPort for TuiRunSupervisor {
         // confirmation, and the serial dispatch path carries no upstream
         // runtime: work dispatched there would finalize as terminal `merged` and
         // publish nothing. Startup already rejects `-u` with serial effective
-        // mode, and this keeps the runtime toggle from walking around it.
-        if self.launch.upstream_runtime.is_some() && !self.parallel_mode.load(Ordering::SeqCst) {
+        // mode, and this keeps the runtime toggle from walking around it. The
+        // refusal follows the dispatch this launch really gets, not the toggle,
+        // so a scheduler-owned resolve is not refused for a serial dispatch it
+        // was never going to take.
+        let use_parallel = self.use_parallel_for(&targets);
+        if self.launch.upstream_runtime.is_some() && !use_parallel {
             return Err(
                 "serial mode cannot run while -u/--integrate-upstream is active: upstream \
                  publication is defined on the cumulative parallel base"
@@ -202,7 +229,7 @@ impl RunSchedulerPort for TuiRunSupervisor {
         }
 
         self.graceful_stop.store(false, Ordering::SeqCst);
-        self.spawn(targets, explicit_retry);
+        self.spawn(targets, explicit_retry, use_parallel);
         Ok(())
     }
 
@@ -222,5 +249,169 @@ impl RunSchedulerPort for TuiRunSupervisor {
 
     async fn stop_activity(&self) -> StopActivitySnapshot {
         collect_stop_activity_snapshot(&self.launch.dynamic_queue, &self.launch.shared_state).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::ExecutionEvent;
+    use crate::orchestration::state::{ExecutionMode, ReducerCommand};
+
+    /// Marker the parallel orchestrator emits before it touches anything else,
+    /// which is what makes the dispatched path observable from outside.
+    const PARALLEL_START_MARKER: &str = "Starting parallel processing";
+
+    fn shared_state(change_ids: &[&str]) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
+        Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            change_ids.iter().map(|id| id.to_string()).collect(),
+            10,
+            ExecutionMode::Parallel,
+        )))
+    }
+
+    fn supervisor(
+        repo_root: PathBuf,
+        tx: mpsc::Sender<OrchestratorEvent>,
+        state: Arc<tokio::sync::RwLock<OrchestratorState>>,
+        parallel_mode: Arc<AtomicBool>,
+        upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
+    ) -> TuiRunSupervisor {
+        TuiRunSupervisor::new(
+            repo_root,
+            OrchestratorConfig::default(),
+            tx,
+            DynamicQueue::new(),
+            state,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            PostArchiveAction::MergeToBase,
+            upstream_runtime,
+            Arc::new(AtomicBool::new(false)),
+            parallel_mode,
+            #[cfg(feature = "web-monitoring")]
+            None,
+        )
+    }
+
+    /// Record reducer-owned `ResolveWait` for `change_id`, the way the shared
+    /// run-control service does before it dispatches a manual resolve.
+    async fn reserve_resolve_wait(
+        state: &Arc<tokio::sync::RwLock<OrchestratorState>>,
+        change_id: &str,
+    ) {
+        let mut guard = state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: change_id.to_string(),
+            reason: "manual resolution required".to_string(),
+            auto_resumable: false,
+        });
+        guard.apply_command(ReducerCommand::ResolveMerge(change_id.to_string()));
+        assert_eq!(
+            guard.resolve_wait_change_ids(),
+            vec![change_id.to_string()],
+            "arrangement must record the intent the dispatch exists to serve"
+        );
+    }
+
+    #[test]
+    fn only_an_empty_target_launch_overrides_the_serial_toggle() {
+        let targets = vec!["alpha".to_string()];
+
+        // A scheduler-owned launch carries no targets and is always parallel.
+        assert!(requires_parallel_dispatch(&[], false));
+        assert!(requires_parallel_dispatch(&[], true));
+        // Operator-selected work still honours the toggle.
+        assert!(!requires_parallel_dispatch(&targets, false));
+        assert!(requires_parallel_dispatch(&targets, true));
+    }
+
+    /// `p` is accepted in Select/Stopped, so an operator can be in serial mode
+    /// with a merge-wait row on screen. Consuming that row dispatches a run with
+    /// no targets; serial startup would replace the shared reducer state over the
+    /// empty target list, erasing the `ResolveWait` intent while `start_run`
+    /// still reported a started run to the TUI and to `/api/v2`.
+    #[tokio::test]
+    async fn empty_target_launch_dispatches_parallel_despite_serial_toggle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, mut rx) = mpsc::channel(64);
+        let state = shared_state(&["alpha"]);
+        reserve_resolve_wait(&state, "alpha").await;
+
+        let supervisor = supervisor(
+            dir.path().to_path_buf(),
+            tx,
+            state.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+
+        supervisor
+            .start_run(Vec::new(), false)
+            .await
+            .expect("a scheduler-owned resolve must dispatch");
+
+        let started = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the dispatched run must announce itself")
+            .expect("the dispatched run must emit its first event");
+        match started {
+            ExecutionEvent::Log(entry) => assert!(
+                entry.message.contains(PARALLEL_START_MARKER),
+                "an empty-target launch must reach the parallel orchestrator, got: {}",
+                entry.message
+            ),
+            other => panic!("expected the parallel startup log, got: {other:?}"),
+        }
+
+        let (handle, cancel) = supervisor.take_run();
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        assert_eq!(
+            state.read().await.resolve_wait_change_ids(),
+            vec!["alpha".to_string()],
+            "the dispatched run must not wipe the intent it was started to consume"
+        );
+    }
+
+    /// The upstream refusal exists because the *serial* dispatch path carries no
+    /// upstream runtime. A scheduler-owned resolve never takes that path, so it
+    /// must not inherit the refusal from a toggle it does not follow.
+    #[tokio::test]
+    async fn empty_target_launch_is_not_refused_for_an_opted_in_serial_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _rx) = mpsc::channel(64);
+        let state = shared_state(&["alpha"]);
+        reserve_resolve_wait(&state, "alpha").await;
+
+        let supervisor = supervisor(
+            dir.path().to_path_buf(),
+            tx,
+            state,
+            Arc::new(AtomicBool::new(false)),
+            Some(crate::upstream::UpstreamRuntime {
+                config: crate::upstream::UpstreamIntegrationConfig::new("origin", "exit 0"),
+                branch: "main".to_string(),
+            }),
+        );
+
+        supervisor
+            .start_run(Vec::new(), false)
+            .await
+            .expect("a parallel-dispatched resolve keeps the publication contract");
+
+        let (handle, cancel) = supervisor.take_run();
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+        }
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
