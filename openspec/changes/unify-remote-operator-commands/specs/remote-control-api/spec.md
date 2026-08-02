@@ -2,7 +2,7 @@
 
 ### Requirement: Closed shared command delegation
 
-`POST /api/v2/commands` MUST accept only the command variants declared by the current v2 contract. Every command MUST include `expected_revision` and `idempotency_key`. Accepted lifecycle commands MUST execute through the same process-local application services used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution and MUST NOT maintain an independent workflow state machine.
+`POST /api/v2/commands` MUST accept only `start`, `stop`, `cancel_stop`, `force_stop`, `set_execution_mark`, `set_queue_intent`, `retry_change`, `retry_errors`, `stop_and_dequeue`, and `resolve_merge` until a later spec delta extends the enum. Every command MUST include `expected_revision` and `idempotency_key`. Accepted lifecycle commands MUST execute through the same process-local application services used by the TUI; the API MUST NOT equate internal channel enqueue with successful command execution and MUST NOT maintain an independent workflow state machine.
 
 #### Scenario: Accepted command uses shared behavior
 
@@ -12,16 +12,50 @@
 **And**: TUI-equivalent reducer, scheduler, cancellation, side-effect, and event semantics apply
 **And**: The command settles as succeeded, no-op, or failed according to the actual service outcome
 
+#### Scenario: Unknown command type is rejected
+
+**Given**: A command envelope names a type outside the closed enum
+**When**: It is submitted
+**Then**: The server returns HTTP 422 with `validation_failed`
+**And**: No service call occurs
+
 #### Scenario: Empty start target is not successful
 
 **Given**: No eligible execution-marked change exists at the admitted revision
-**When**: Start or resume is submitted
+**When**: Start is submitted
 **Then**: No scheduler is started
 **And**: The command settles as no-op or failed with actionable detail
 
 ### Requirement: Serialized optimistic revision control
 
-One process-local projection owner MUST serialize command admission, snapshot mutation, `state_revision`, `event_sequence`, event storage, and publication. For each state-affecting input it MUST increment revision exactly once if and only if the snapshot changes and MUST attach that resulting revision to the event. Log-only inputs MUST retain the current revision. Every command MUST supply `expected_revision`; a new stale command MUST fail without service execution. A command's `result_revision` MUST include its synchronously accepted decision-state effect and MUST NOT merely capture the revision observed after enqueueing deferred work.
+One process-local projection owner MUST serialize command admission, snapshot mutation, `state_revision`, `event_sequence`, event storage, and publication. For each state-affecting input it MUST increment revision exactly once if and only if the snapshot changes and MUST attach that resulting revision to the event. Log-only inputs MUST retain the current revision. Every command MUST supply `expected_revision`; a new stale command MUST fail without service execution. Snapshot mutations MUST publish all related decision fields coherently at the same resulting revision. A command's `result_revision` MUST include its synchronously accepted decision-state effect and MUST NOT merely capture the revision observed after enqueueing deferred work.
+
+#### Scenario: State event and snapshot share one revision
+
+**Given**: A state-affecting execution event changes the current snapshot
+**When**: The projection owner processes it
+**Then**: It increments revision once
+**And**: The stored snapshot and published event contain the same resulting revision
+
+#### Scenario: No-op does not advance revision
+
+**Given**: An input produces no snapshot change
+**When**: The projection owner processes it
+**Then**: `state_revision` is unchanged
+
+#### Scenario: Stale new command is rejected
+
+**Given**: The current state revision is 12
+**When**: A new command supplies expected revision 11
+**Then**: The server returns HTTP 409 with `stale_revision` and current revision 12
+**And**: No command side effect occurs
+
+#### Scenario: Mark mutation reads back coherently
+
+**Given**: An accepted command changes an execution mark without changing queue intent
+**When**: The resulting state revision is read
+**Then**: The snapshot reports the new execution mark and unchanged queue intent together
+**And**: No client-side inference is required
 
 #### Scenario: Command result revision includes admission effect
 
@@ -34,7 +68,7 @@ One process-local projection owner MUST serialize command admission, snapshot mu
 
 ### Requirement: Shared lifecycle scheduling semantics
 
-Start, resume, retry, stop, cancel stop, force stop, and resolve MUST use shared application-service semantics across TUI and v2. Retry MUST preserve reconciled evidence, resolve MUST enforce one active resolver with FIFO waiting, and force stop MUST report the actual runtime-activity classification.
+Start, retry, stop, cancel stop, force stop, and resolve MUST use shared application-service semantics across TUI and v2. Retry MUST preserve reconciled evidence, resolve MUST enforce one active resolver with FIFO waiting, and force stop MUST report the actual runtime-activity classification.
 
 #### Scenario: Retry dispatches reconciled work
 

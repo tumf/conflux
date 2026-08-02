@@ -1,8 +1,8 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
-### Requirement: Versioned single-instance remote-control resources
+### Requirement: Canonical OpenAPI ownership
 
-Single-instance web monitoring MUST expose `/api/v2` health, capabilities, instance, state, changes, logs, command, event, and WebSocket resources. `/api/v2` is the only versioned remote-control namespace; the removed multi-project `/api/v1` namespace MUST NOT be reintroduced. Every supported v2 route and schema MUST appear in one deterministically generated canonical tracked OpenAPI artifact.
+The repository MUST define one source-generated OpenAPI artifact as the tracked contract of `/api/v2`. Every supported v2 route and schema MUST appear in that deterministically generated artifact. Duplicate artifacts MUST either be removed or generated deterministically from the same source and ownership rule. Stale legacy routes MUST NOT appear as supported API paths.
 
 #### Scenario: Canonical artifact matches generated contract
 
@@ -18,12 +18,6 @@ Single-instance web monitoring MUST expose `/api/v2` health, capabilities, insta
 **When**: `make check-openapi` runs
 **Then**: The check fails with a useful diff
 **And**: It does not overwrite unrelated working-tree changes
-
-## ADDED Requirements
-
-### Requirement: Canonical OpenAPI ownership
-
-The repository MUST define one source-generated OpenAPI artifact as the tracked contract of `/api/v2`. Duplicate artifacts MUST either be removed or generated deterministically from the same source and ownership rule. Stale legacy routes MUST NOT appear as supported API paths.
 
 #### Scenario: Consumer uses the canonical artifact
 

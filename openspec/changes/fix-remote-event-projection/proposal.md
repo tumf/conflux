@@ -20,7 +20,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: Deterministic event ownership, reducer, replay, and projection test output
-    rerun: cargo test --features web-monitoring event projection reducer
+    rerun: cargo test --features web-monitoring --lib
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking

@@ -7,6 +7,7 @@ dependencies:
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/parallel-execution/spec.md
+  - openspec/specs/operator-command-execution/spec.md
   - openspec/specs/remote-control-api/spec.md
   - src/tui/state.rs
   - src/tui/state/selection_logic.rs
@@ -20,7 +21,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: Parallel eligibility, bulk-mark, command, and API projection test output
-    rerun: cargo test --features web-monitoring parallel remote_control_api
+    rerun: cargo test --features web-monitoring --lib
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking

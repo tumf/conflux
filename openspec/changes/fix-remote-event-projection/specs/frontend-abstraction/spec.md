@@ -1,39 +1,39 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
-### Requirement: Core / Frontend 状態所有の境界
+### Requirement: Single authoritative execution event transition
 
-Core が所有する reducer state と display status はすべてのfrontendに対する正規ソースでなければならない（MUST）。一つのinternal execution eventはCoreで一度だけ適用され、Frontendは受信済みeventや中間frontend modelを使ってCore stateを再適用・再導出してはならない（MUST NOT）。
+Core MUST apply each internal execution event to reducer state exactly once and MUST provide the resulting authoritative event/state output to every frontend. Frontends MUST NOT reapply received events or rederive Core state from an intermediate frontend model.
 
 #### Scenario: One event has one authoritative transition
 
-- **GIVEN** Coreが一つのexecution eventを発行する
-- **WHEN** TUIとv2 projectionが同じevent/state outputを受信する
-- **THEN** reducer transitionは一度だけ発生する
-- **AND** 各frontendは同じauthoritative stateを描画する
-- **AND** v2は中間frontend modelからfieldを再導出しない
+- **GIVEN** Core emits one execution event
+- **WHEN** TUI and v2 projection receive the resulting authoritative event/state output
+- **THEN** the reducer transition occurs exactly once
+- **AND** each frontend renders the same authoritative state
+- **AND** v2 does not rederive fields from an intermediate frontend model
 
 #### Scenario: Late completion preserves terminal mode
 
-- **GIVEN** CoreがErrorまたはStoppedをauthoritative terminal modeとして保持している
-- **WHEN** 遅延または重複したAllCompleted eventが到着する
-- **THEN** TUIとv2 projectionは同じmode preservation ruleを適用する
-- **AND** frontendごとに異なるterminal stateを表示しない
+- **GIVEN** Core retains Error or Stopped as the authoritative terminal mode
+- **WHEN** a delayed or duplicate AllCompleted event arrives
+- **THEN** TUI and v2 projection apply the same mode-preservation rule
+- **AND** frontends do not display different terminal states
 
-### Requirement: EventSink トレイトによるフロントエンド抽象化
+### Requirement: Authoritative event dispatch and frontend fan-out
 
-Core（Reducer + オーケストレーションループ）とフロントエンド（TUI/Web）の間に `EventSink` トレイトを定義しなければならない（MUST）。オーケストレーションループは一つのdispatch ownerを通してeventをreducerへ適用し、そのauthoritative event/state outputをfrontend sinkへfan outしなければならない（MUST）。Frontend sinkはreducer stateを直接再適用してはならない（MUST NOT）。
+The orchestration loop MUST use one dispatch owner to apply an event to the reducer and fan the resulting authoritative event/state output out through `EventSink`. Frontend sinks MUST NOT reapply reducer state.
 
 #### Scenario: Structured logs reach each frontend once
 
-- **GIVEN** serialまたはparallel orchestrationが一つのstructured log eventを発行する
-- **WHEN** dispatch ownerがfrontend sinkへ配信する
-- **THEN** TUIとv2は同じlogを受信する
-- **AND** v2 retained logには高々一件だけ保存される
-- **AND** log-only eventはworkflow state revisionを進めない
+- **GIVEN** serial or parallel orchestration emits one structured log event
+- **WHEN** the dispatch owner delivers it to frontend sinks
+- **THEN** TUI and v2 receive the same log
+- **AND** v2 retains at most one copy
+- **AND** the log-only event does not advance workflow state revision
 
 #### Scenario: Duplicate sink delivery is harmless
 
-- **GIVEN** 同じevent identityがfrontend boundaryで重複して観測される
-- **WHEN** v2 projectionが処理する
-- **THEN** reducer stateは再適用されない
-- **AND** event sequence、revision、retained logは重複しない
+- **GIVEN** the same event identity is observed twice at the frontend boundary
+- **WHEN** v2 projection processes the deliveries
+- **THEN** reducer state is not reapplied
+- **AND** event sequence, revision, and retained logs are not duplicated

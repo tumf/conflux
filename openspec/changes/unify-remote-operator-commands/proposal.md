@@ -19,7 +19,7 @@ verifications:
     trigger: pull-request-validation
     automation: Makefile
     evidence: Table-driven service and remote-control command test output
-    rerun: cargo test --features web-monitoring operator_command remote_control_api::tests::command_tests
+    rerun: cargo test --features web-monitoring --lib
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -35,12 +35,12 @@ Several `/api/v2` lifecycle commands report success when a control message was e
 
 ## Proposed Solution
 
-Move start, resume, retry, graceful stop, cancel stop, force stop, and resolve behind shared process-local application services used by TUI and v2 adapters. Settle command records only after admission has produced an actual changed, no-op, or failed outcome and the resulting projection revision includes the synchronous decision fields. Preserve idempotent replay, expected-revision fencing, cancellation-first dequeue, and safe-boundary force-stop classification.
+Move start, retry, graceful stop, cancel stop, force stop, and resolve behind shared process-local application services used by TUI and v2 adapters. Settle command records only after admission has produced an actual changed, no-op, or failed outcome and the resulting projection revision includes the synchronous decision fields. Preserve idempotent replay, expected-revision fencing, cancellation-first dequeue, and safe-boundary force-stop classification.
 
 ## Acceptance Criteria
 
 1. Equivalent TUI and v2 intents call the same service and produce equivalent reducer transitions, scheduler wake/spawn behavior, events, and errors.
-2. Start and resume consume the authoritative marked target set at the admitted revision and fail or no-op when no eligible target exists.
+2. Start consumes the authoritative marked target set at the admitted revision and fails or no-ops when no eligible target exists.
 3. Retry routes error, stalled acceptance, and resumable external holds correctly and proves scheduler dispatch; unsupported holds remain unchanged.
 4. Resolve enforces one active resolver, FIFO queued resolve, duplicate prevention, stale-target rejection, and actual scheduler wake/spawn.
 5. Stop, cancel stop, and force stop enforce the TUI mode matrix and return truthful safe-boundary classification.
