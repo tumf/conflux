@@ -1,67 +1,23 @@
-# サーバーモードガイド
+# Web UI ガイド
 
-`cflx server` を使った常駐運用、リモート TUI、Web UI、REST API、バックグラウンドサービス管理をまとめたガイドです。
+ローカル Web 監視 UI（`--web`）、その REST API、およびバージョン付き `/api/v2`
+リモート制御 API についてのガイドです。
 
-## いつサーバーモードを使うか
+Conflux は単一ワークスペース向けのツールです。`cflx`、`cflx tui`、`cflx run` は
+いずれもカレントリポジトリを対象に動作します。Web UI はその 1 プロセスに付随する
+任意の監視サーフェスであり、常駐デーモンやマルチプロジェクトサーバーはありません。
 
-サーバーモードは、常駐デーモン、複数プロジェクト管理、リモート API、またはサーバー管理の提案セッションが必要なときに使います。
+> **削除済み:** 旧マルチプロジェクトサーバー製品（`cflx server`、`cflx project`、
+> `cflx service`、およびリモートクライアント TUI の `--server` 系オプション）は
+> 廃止されました。[サーバーモードからの移行](#サーバーモードからの移行)を参照してください。
 
-```bash
-cflx server
-```
-
-サーバーモードでは、接続クライアント向けに Web UI と API を公開します。TUI は `--server` でリモートサーバーへ接続できます。
-
-## Web UI とリモート監視
-
-- **通常モード** では、`cflx` または `cflx run` に `--web` を付けてダッシュボードを有効化
-- **サーバーモード** では、ダッシュボードはデーモン構成の一部
-- 通常モードではローカル実行の監視用途、サーバーモードでは接続クライアント向けの監視用途として使います
+## Web UI を有効化する
 
 ```bash
-# ローカル TUI + Web UI
+# TUI + Web UI
 cflx --web
 
-# ローカルのヘッドレス実行 + Web UI
-cflx run --web
-
-# サーバーへ接続するリモート TUI
-cflx tui --server http://host:39876
-```
-
-## サーバー専用設定
-
-### 提案セッションの OPENCODE_CONFIG
-
-この設定は `cflx server` が作成する提案セッションに適用されます。
-サーバー側の提案セッションでは `OPENCODE_CONFIG` は自動生成 / 自動注入されません。
-`proposal_session.transport_env.OPENCODE_CONFIG` が未設定の場合、opencode は内蔵のデフォルト設定を使います。
-
-独自設定にしたい場合は、`OPENCODE_CONFIG` を明示的に指定してください:
-
-```jsonc
-{
-  "proposal_session": {
-    "transport_env": {
-      "OPENCODE_CONFIG": "/absolute/path/to/opencode.json"
-    }
-  }
-}
-```
-
-`OPENCODE_CONFIG` は任意で、カスタム opencode 設定ファイルを使いたいときだけ必要です。
-
-## Web UI とダッシュボード
-
-Web UI は HTTP / WebSocket ベースの監視ダッシュボードです。通常モード（`--web`）とサーバーモードの両方で利用できます。
-
-### Web UI を有効化する
-
-```bash
-# 通常モード: TUI + Web UI
-cflx --web
-
-# 通常モード: ヘッドレス実行 + Web UI
+# ヘッドレス実行 + Web UI
 cflx run --web
 
 # カスタムポート。ループバック以外の bind にはベアラートークンが必要
@@ -78,16 +34,14 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 指定してください（同時指定は不可）。詳細は
 [USAGE.md](USAGE.md#remote-control-api-apiv2) を参照してください。
 
-サーバーモード（`cflx server`）では、Web UI は設定ポートで常に利用できます。
-
-### ダッシュボード機能
+## ダッシュボード機能
 
 - **ダッシュボード UI**: `http://localhost:<port>/` で進捗を確認
 - **リアルタイム更新**: WebSocket 接続で進捗をライブ更新
 - **REST API**: 状態をプログラムから取得可能
 - **QR コードポップアップ**: TUI で `w` を押すとモバイル向けの QR コードを表示
 
-### REST API エンドポイント
+## REST API エンドポイント
 
 | エンドポイント | メソッド | 説明 |
 |----------|--------|-------------|
@@ -96,9 +50,12 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 | `/api/changes` | GET | 進捗付きの変更一覧 |
 | `/api/changes/{id}` | GET | 特定変更の詳細 |
 
+バージョン付きリモート制御 API は `/api/v2` にあります。詳細は
+[USAGE.md](USAGE.md#remote-control-api-apiv2) を参照してください。
+
 完全な API 仕様は [../openapi.yaml](../openapi.yaml) を参照してください。
 
-### WebSocket
+## WebSocket
 
 リアルタイム状態更新のために `ws://localhost:<port>/ws` へ接続します。メッセージは以下形式の JSON です:
 
@@ -118,7 +75,7 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 }
 ```
 
-### ダッシュボード概要
+## ダッシュボード概要
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -159,7 +116,7 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 - **接続状態表示**: 現在の WebSocket 接続状態（Connected / Disconnected）を表示
 - **レスポンシブデザイン**: デスクトップ / モバイル両対応
 
-### Web UI のトラブルシューティング
+## トラブルシューティング
 
 | 問題 | 解決策 |
 |-------|----------|
@@ -170,39 +127,33 @@ cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKE
 | 別デバイスからアクセスできない | 外部接続を許可するには `--web-bind 0.0.0.0` を利用（ローカルネットワーク向け。`--web-auth-token-env` も必須） |
 | ブラウザコンソールで CORS エラー | クロスオリジン要求では通常の挙動です。サーバー側で CORS ヘッダーを処理します |
 
-## バックグラウンドサービス (`cflx service`)
+## サーバーモードからの移行
 
-`cflx service` を使うと、`cflx server` をユーザーレベルのバックグラウンドサービスとして導入・管理できます。
+マルチプロジェクトサーバー製品は削除されました。`cflx server`、`cflx project`、
+`cflx service`、および TUI の `--server` / `--server-token` / `--server-token-env`
+は、いずれも usage エラーとして失敗します。
 
-- macOS: `launchd` ユーザーエージェント
-- Linux: `systemd --user` サービス
-- Windows: タスクスケジューラ
-
-```
-cflx service <install|uninstall|status|start|stop|restart>
-```
-
-例:
+アップグレードによって、利用者所有のサービスやデータが自動的に停止・削除される
+ことはありません。以前 `cflx service install` を実行していた場合は、
+アップグレードの前後どちらかで手動により停止・削除してください:
 
 ```bash
-# サービスをインストールして有効化
-cflx service install
+# macOS (launchd ユーザーエージェント)
+launchctl bootout gui/$(id -u)/com.conflux.cflx-server 2>/dev/null || true
+rm -f ~/Library/LaunchAgents/com.conflux.cflx-server.plist
 
-# バックグラウンドサーバーを開始または再起動
-cflx service start
-cflx service restart
+# Linux (systemd ユーザーサービス)
+systemctl --user disable --now cflx-server.service 2>/dev/null || true
+rm -f ~/.config/systemd/user/cflx-server.service
+systemctl --user daemon-reload
 
-# サービス状態を確認
-cflx service status
-
-# 停止または削除
-cflx service stop
-cflx service uninstall
+# Windows (タスクスケジューラ)
+schtasks /Delete /TN cflx-server /F
 ```
 
-補足:
+旧サーバーデータ（プロジェクトレジストリとその DB）は
+`${XDG_DATA_HOME:-~/.local/share}/cflx/server` にそのまま残ります。参照する
+コードはもう存在しないため、不要と確認できたら退避または削除してください。
 
-- `install`、`start`、`restart` は、サービスマネージャを触る前に有効なグローバル `server` 設定を検証します。
-- macOS では `~/Library/LaunchAgents/com.conflux.cflx-server.plist` に plist を書き込みます。
-- Linux では `~/.config/systemd/user/cflx-server.service` に unit file を書き込みます。
-- 永続的なサーバー設定は、インストール前に `~/.config/cflx/config.jsonc` などのグローバル設定ファイルで行ってください。
+グローバル設定ファイルに残った旧 `server` セクションは単に無視され、その他の
+設定はこれまでどおり動作します。

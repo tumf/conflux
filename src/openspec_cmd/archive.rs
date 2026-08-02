@@ -1,7 +1,16 @@
-use crate::openspec_cmd::promotion::{delta_to_canonical, merge_spec_delta, simulate_promotion};
+use crate::openspec_cmd::promotion::{
+    delta_to_canonical, merge_spec_delta, simulate_promotion, split_spec,
+};
 use chrono::Local;
 use std::fs;
 use std::path::Path;
+
+/// True when promoted canonical content carries no `### Requirement:` block.
+///
+/// Such a file is preamble-only: the capability has no remaining behavior.
+pub(super) fn has_no_requirements(canonical: &str) -> bool {
+    split_spec(canonical).1.is_empty()
+}
 
 pub(super) struct ArchiveEngine<'a> {
     pub(super) manager: &'a super::OpenSpecManager,
@@ -161,7 +170,15 @@ impl<'a> ArchiveEngine<'a> {
                     let canonical_content = fs::read_to_string(&canonical_spec).unwrap_or_default();
                     let (merged, errors) = merge_spec_delta(&canonical_content, &delta_content);
                     if errors.is_empty() {
-                        let _ = fs::write(&canonical_spec, merged);
+                        // A delta that removes every requirement of a capability
+                        // leaves a preamble-only file behind. Keeping it would
+                        // advertise a capability that no longer has any
+                        // behavior, so the whole capability directory goes.
+                        if has_no_requirements(&merged) {
+                            let _ = fs::remove_dir_all(&canonical_dir);
+                        } else {
+                            let _ = fs::write(&canonical_spec, merged);
+                        }
                         updated.push(spec_name);
                     } else {
                         eprintln!(

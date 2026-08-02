@@ -46,12 +46,9 @@ mod parallel_run_service;
 mod permission;
 mod process_manager;
 mod progress;
-pub mod remote;
 pub mod repo_lock;
 pub mod runtime;
 mod serial_run_service;
-#[cfg(feature = "web-monitoring")]
-pub mod server;
 mod shell_command;
 mod spec_delta;
 mod stall;

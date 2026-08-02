@@ -151,11 +151,6 @@ impl Default for ErrorCircuitBreakerConfig {
 /// Orchestrator configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OrchestratorConfig {
-    /// Server daemon configuration (used only by `cflx server` subcommand).
-    /// When present in global config, its values are applied before CLI overrides.
-    #[serde(default)]
-    pub server: Option<ServerConfig>,
-
     /// Command template for applying changes.
     /// Supports `{change_id}` placeholder.
     #[serde(default)]
@@ -405,10 +400,6 @@ pub struct OrchestratorConfig {
     #[serde(default)]
     pub command_strict_process_cleanup: Option<bool>,
 
-    /// Proposal session configuration (ACP-based interactive proposal creation).
-    #[serde(default)]
-    pub proposal_session: Option<ProposalSessionConfig>,
-
     /// Optional external lifecycle integration (observability-only adapter process).
     ///
     /// Absent by default: no adapter process is started and behavior is unchanged.
@@ -526,251 +517,6 @@ impl LifecycleIntegrationConfig {
     }
 }
 
-// ── ProposalSessionConfig ──────────────────────────────────────────────────
-
-/// Configuration for proposal sessions (ACP transport interactive proposal creation).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProposalSessionConfig {
-    /// ACP subprocess command (default: "opencode")
-    #[serde(default = "default_proposal_transport_command", alias = "acp_command")]
-    pub transport_command: String,
-
-    /// Arguments passed to the ACP command (default: ["acp"])
-    #[serde(default = "default_proposal_transport_args", alias = "acp_args")]
-    pub transport_args: Vec<String>,
-
-    /// Additional environment variables for the ACP subprocess
-    #[serde(default, alias = "acp_env")]
-    pub transport_env: HashMap<String, String>,
-
-    /// Inactivity timeout in seconds before ACP process is killed (default: 1800)
-    #[serde(default = "default_proposal_session_inactivity_timeout_secs")]
-    pub session_inactivity_timeout_secs: u64,
-}
-
-fn default_proposal_transport_command() -> String {
-    defaults::DEFAULT_PROPOSAL_TRANSPORT_COMMAND.to_string()
-}
-
-fn default_proposal_transport_args() -> Vec<String> {
-    defaults::DEFAULT_PROPOSAL_TRANSPORT_ARGS
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn default_proposal_session_inactivity_timeout_secs() -> u64 {
-    defaults::DEFAULT_PROPOSAL_SESSION_INACTIVITY_TIMEOUT_SECS
-}
-
-impl Default for ProposalSessionConfig {
-    fn default() -> Self {
-        Self {
-            transport_command: default_proposal_transport_command(),
-            transport_args: default_proposal_transport_args(),
-            transport_env: HashMap::new(),
-            session_inactivity_timeout_secs: default_proposal_session_inactivity_timeout_secs(),
-        }
-    }
-}
-
-// ── ServerAuthMode ─────────────────────────────────────────────────────────
-
-/// Authentication mode for the server daemon.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ServerAuthMode {
-    /// No authentication (only safe for loopback addresses)
-    #[default]
-    None,
-    /// Bearer token authentication (required for non-loopback addresses)
-    BearerToken,
-}
-
-// ── ServerAuthConfig ───────────────────────────────────────────────────────
-
-/// Authentication configuration for the server daemon.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ServerAuthConfig {
-    /// Authentication mode
-    #[serde(default)]
-    pub mode: ServerAuthMode,
-    /// Bearer token for authentication (required when mode = bearer_token)
-    #[serde(default)]
-    pub token: Option<String>,
-    /// Environment variable name to read the bearer token from.
-    /// If set, the token is resolved from the environment variable at startup.
-    /// Takes precedence over `token` when both are set.
-    #[serde(default)]
-    pub token_env: Option<String>,
-}
-
-impl Default for ServerAuthConfig {
-    fn default() -> Self {
-        Self {
-            mode: ServerAuthMode::None,
-            token: None,
-            token_env: None,
-        }
-    }
-}
-
-impl ServerAuthConfig {
-    /// Resolve the effective bearer token.
-    /// If `token_env` is set, read the token from the named environment variable.
-    /// If `token_env` is not set (or the variable is unset/empty), fall back to `token`.
-    pub fn resolve_token(&self) -> Option<String> {
-        if let Some(env_var) = &self.token_env {
-            if let Ok(val) = std::env::var(env_var) {
-                if !val.is_empty() {
-                    return Some(val);
-                }
-            }
-        }
-        self.token.clone()
-    }
-}
-
-// ── ServerConfig ───────────────────────────────────────────────────────────
-
-fn default_server_bind() -> String {
-    defaults::DEFAULT_SERVER_BIND.to_string()
-}
-
-fn default_server_port() -> u16 {
-    defaults::DEFAULT_SERVER_PORT
-}
-
-fn default_server_max_concurrent_total() -> usize {
-    defaults::DEFAULT_SERVER_MAX_CONCURRENT_TOTAL
-}
-
-fn default_server_data_dir() -> std::path::PathBuf {
-    defaults::default_server_data_dir()
-}
-
-/// Server daemon configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerConfig {
-    /// Bind address for the server (default: 127.0.0.1)
-    #[serde(default = "default_server_bind")]
-    pub bind: String,
-
-    /// Port for the server (default: 39876)
-    #[serde(default = "default_server_port")]
-    pub port: u16,
-
-    /// Authentication configuration
-    #[serde(default)]
-    pub auth: ServerAuthConfig,
-
-    /// Maximum number of concurrent project executions globally
-    #[serde(default = "default_server_max_concurrent_total")]
-    pub max_concurrent_total: usize,
-
-    /// Directory for persistent server data (projects registry, etc.)
-    #[serde(default = "default_server_data_dir")]
-    pub data_dir: std::path::PathBuf,
-
-    /// DEPRECATED: `server.resolve_command` is no longer supported.
-    /// Use the top-level `resolve_command` in your config file instead.
-    /// Setting this field will cause a configuration error at startup.
-    #[serde(default)]
-    pub resolve_command: Option<String>,
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            bind: default_server_bind(),
-            port: default_server_port(),
-            auth: ServerAuthConfig::default(),
-            max_concurrent_total: default_server_max_concurrent_total(),
-            data_dir: default_server_data_dir(),
-            resolve_command: None,
-        }
-    }
-}
-
-impl ServerConfig {
-    /// Check if the bind address is loopback (127.0.0.0/8 or ::1).
-    pub fn is_loopback_bind(&self) -> bool {
-        let addr = self.bind.trim();
-        if addr.starts_with("127.") || addr == "localhost" {
-            return true;
-        }
-        if addr == "::1" || addr == "[::1]" {
-            return true;
-        }
-        false
-    }
-
-    /// Validate the server configuration.
-    /// Returns error if non-loopback bind is used without bearer token authentication,
-    /// or if the deprecated `server.resolve_command` field is set.
-    pub fn validate(&self) -> crate::error::Result<()> {
-        if self.resolve_command.is_some() {
-            return Err(crate::error::OrchestratorError::ConfigLoad(
-                "Configuration error: `server.resolve_command` is no longer supported. \
-                Please remove it from your config and use the top-level `resolve_command` instead."
-                    .to_string(),
-            ));
-        }
-
-        if !self.is_loopback_bind() {
-            match self.auth.mode {
-                ServerAuthMode::BearerToken => {
-                    if self
-                        .auth
-                        .resolve_token()
-                        .as_deref()
-                        .unwrap_or("")
-                        .is_empty()
-                    {
-                        return Err(crate::error::OrchestratorError::ConfigLoad(
-                            "Server: non-loopback bind requires auth.token or auth.token_env to be set when auth.mode=bearer_token".to_string(),
-                        ));
-                    }
-                }
-                ServerAuthMode::None => {
-                    return Err(crate::error::OrchestratorError::ConfigLoad(
-                        "Server: non-loopback bind requires auth.mode=bearer_token with a token"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Apply CLI overrides (bind, port, auth_token, max_concurrent_total, data_dir).
-    pub fn apply_cli_overrides(
-        &mut self,
-        bind: Option<&str>,
-        port: Option<u16>,
-        auth_token: Option<&str>,
-        max_concurrent_total: Option<usize>,
-        data_dir: Option<&std::path::Path>,
-    ) {
-        if let Some(b) = bind {
-            self.bind = b.to_string();
-        }
-        if let Some(p) = port {
-            self.port = p;
-        }
-        if let Some(token) = auth_token {
-            self.auth.mode = ServerAuthMode::BearerToken;
-            self.auth.token = Some(token.to_string());
-        }
-        if let Some(max) = max_concurrent_total {
-            self.max_concurrent_total = max;
-        }
-        if let Some(dir) = data_dir {
-            self.data_dir = dir.to_path_buf();
-        }
-    }
-}
-
 // ── AcceptancePromptMode ───────────────────────────────────────────────────
 
 /// Acceptance prompt mode.
@@ -814,7 +560,6 @@ impl OrchestratorConfig {
     /// for fields that are `Some`.
     pub fn merge(&mut self, other: Self) {
         let Self {
-            server,
             apply_command,
             apply_escalation_command,
             apply_stall_diagnose_command,
@@ -864,13 +609,11 @@ impl OrchestratorConfig {
             command_inactivity_timeout_max_retries,
             stream_json_textify,
             command_strict_process_cleanup,
-            proposal_session,
             lifecycle_integration,
         } = other;
 
         // Plain Option fields use the standard config precedence rule:
         // a higher-priority Some value overwrites, while None preserves the existing value.
-        overwrite_if_some(&mut self.server, server);
         overwrite_if_some(&mut self.apply_command, apply_command);
         overwrite_if_some(&mut self.apply_escalation_command, apply_escalation_command);
         overwrite_if_some(
@@ -970,7 +713,6 @@ impl OrchestratorConfig {
             &mut self.command_strict_process_cleanup,
             command_strict_process_cleanup,
         );
-        overwrite_if_some(&mut self.proposal_session, proposal_session);
         overwrite_if_some(&mut self.lifecycle_integration, lifecycle_integration);
     }
 

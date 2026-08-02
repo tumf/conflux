@@ -32,35 +32,6 @@ use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
 use super::terminal::restore_terminal;
 use super::worktrees::load_worktrees_with_conflict_check;
 
-/// Run the TUI application (local mode only, no remote client).
-///
-/// This is a convenience wrapper around [`run_tui_with_remote`] for callers that
-/// do not need remote server connectivity.
-#[allow(dead_code)]
-pub async fn run_tui(
-    initial_changes: Vec<Change>,
-    config: OrchestratorConfig,
-    web_url: Option<String>,
-    #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
-) -> Result<()> {
-    run_tui_with_remote(
-        initial_changes,
-        config,
-        web_url,
-        #[cfg(feature = "web-monitoring")]
-        web_state,
-        None,
-        PostArchiveAction::MergeToBase,
-        None,
-        LifecycleHandle::disabled(),
-    )
-    .await
-}
-
-/// Run the TUI application with an optional remote client.
-///
-/// When `remote_client` is `Some`, a background task subscribes to the WebSocket
-/// endpoint of the remote server and forwards state updates into the TUI event channel.
 fn is_refresh_root_usable(repo_root: &Path) -> bool {
     repo_root.is_dir()
 }
@@ -80,10 +51,6 @@ fn should_skip_local_refresh(repo_root: &Path, stale_refresh_root_warned: &mut b
 
     *stale_refresh_root_warned = false;
     false
-}
-
-fn should_bypass_local_refresh(is_remote_mode: bool) -> bool {
-    is_remote_mode
 }
 
 fn refresh_local_changes(repo_root: &Path) -> Result<(Vec<Change>, Vec<Change>)> {
@@ -166,8 +133,7 @@ fn should_apply_event_to_tui_reducer(event: &crate::events::ExecutionEvent) -> b
         | ExecutionEvent::BranchMergeStarted { .. }
         | ExecutionEvent::BranchMergeCompleted { .. }
         | ExecutionEvent::BranchMergeFailed { .. }
-        | ExecutionEvent::ChangeStopFailed { .. }
-        | ExecutionEvent::RemoteChangeUpdate { .. } => false,
+        | ExecutionEvent::ChangeStopFailed { .. } => false,
     }
 }
 
@@ -234,13 +200,13 @@ pub(crate) async fn shutdown_local_orchestrator_task(
     }
 }
 
+/// Run the local TUI application.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_tui_with_remote(
+pub async fn run_tui(
     initial_changes: Vec<Change>,
     config: OrchestratorConfig,
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
-    remote_client: Option<crate::remote::RemoteClient>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     lifecycle: LifecycleHandle,
@@ -265,7 +231,6 @@ pub async fn run_tui_with_remote(
         web_url,
         #[cfg(feature = "web-monitoring")]
         web_state,
-        remote_client,
         post_archive_action,
         upstream_runtime,
         lifecycle,
@@ -286,51 +251,36 @@ async fn run_tui_loop(
     config: OrchestratorConfig,
     web_url: Option<String>,
     #[cfg(feature = "web-monitoring")] web_state: Option<Arc<crate::web::WebState>>,
-    remote_client: Option<crate::remote::RemoteClient>,
     post_archive_action: PostArchiveAction,
     upstream_runtime: Option<crate::upstream::UpstreamRuntime>,
     lifecycle: LifecycleHandle,
 ) -> Result<()> {
     let repo_root = std::env::current_dir()?;
 
-    // Parallel eligibility is a local-worktree concept.
-    // In remote server mode, avoid incorrectly marking all remote changes as
-    // "uncommitted" based on the local repository.
-    let (committed_change_ids, uncommitted_file_change_ids): (HashSet<String>, HashSet<String>) =
-        if remote_client.is_some() {
-            (
-                initial_changes
-                    .iter()
-                    .map(|change| change.id.clone())
-                    .collect(),
-                HashSet::new(),
-            )
-        } else {
-            let committed_change_ids: HashSet<String> =
-                match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
-                    Ok(ids) => ids.into_iter().collect(),
-                    Err(err) => {
-                        warn!("Failed to load committed change snapshot: {}", err);
-                        initial_changes
-                            .iter()
-                            .map(|change| change.id.clone())
-                            .collect()
-                    }
-                };
+    let (committed_change_ids, uncommitted_file_change_ids): (HashSet<String>, HashSet<String>) = {
+        let committed_change_ids: HashSet<String> =
+            match crate::vcs::git::commands::list_changes_in_head(&repo_root).await {
+                Ok(ids) => ids.into_iter().collect(),
+                Err(err) => {
+                    warn!("Failed to load committed change snapshot: {}", err);
+                    initial_changes
+                        .iter()
+                        .map(|change| change.id.clone())
+                        .collect()
+                }
+            };
 
-            let uncommitted_file_change_ids: HashSet<String> =
-                match crate::vcs::git::commands::list_changes_with_uncommitted_files(&repo_root)
-                    .await
-                {
-                    Ok(ids) => ids.into_iter().collect(),
-                    Err(err) => {
-                        warn!("Failed to detect uncommitted files in changes: {}", err);
-                        HashSet::new()
-                    }
-                };
+        let uncommitted_file_change_ids: HashSet<String> =
+            match crate::vcs::git::commands::list_changes_with_uncommitted_files(&repo_root).await {
+                Ok(ids) => ids.into_iter().collect(),
+                Err(err) => {
+                    warn!("Failed to detect uncommitted files in changes: {}", err);
+                    HashSet::new()
+                }
+            };
 
-            (committed_change_ids, uncommitted_file_change_ids)
-        };
+        (committed_change_ids, uncommitted_file_change_ids)
+    };
     let worktree_base_dir = config
         .get_workspace_base_dir()
         .map(PathBuf::from)
@@ -380,13 +330,9 @@ async fn run_tui_loop(
     // Inject shared state reference into TUI for unified tracking
     app.set_shared_state(shared_state.clone());
     let git_dir_exists = crate::cli::check_git_directory();
-    let mut parallel_available = crate::cli::check_parallel_available();
+    let parallel_available = crate::cli::check_parallel_available();
     let mut parallel_mode = config.resolve_parallel_mode(false, git_dir_exists);
 
-    if remote_client.is_some() {
-        parallel_available = false;
-        parallel_mode = false;
-    }
     if parallel_mode && !parallel_available {
         parallel_mode = false;
         app.warning_message =
@@ -537,182 +483,6 @@ async fn run_tui_loop(
         });
     }
 
-    // Keep a clone for user-triggered actions (F5 run/stop/retry).
-    let remote_client_actions = remote_client.clone();
-
-    // Start remote WebSocket subscription task (remote mode only)
-    let _ws_handle: Option<tokio::task::JoinHandle<()>> = if let Some(client) = remote_client {
-        let ws_url = client.ws_url();
-        let ws_token = client.token().map(str::to_owned);
-        let ws_tx = tx.clone();
-        let ws_cancel = cancel_token.clone();
-
-        info!("Starting remote WebSocket subscriber: {}", ws_url);
-
-        // Channel for WS messages
-        let (ws_msg_tx, mut ws_msg_rx) =
-            tokio::sync::mpsc::channel::<crate::remote::RemoteStateUpdate>(64);
-
-        // Spawn the WS connection task
-        let ws_task = tokio::spawn(async move {
-            loop {
-                // Try to connect; on failure, wait and retry
-                match crate::remote::ws::connect_and_subscribe(
-                    ws_url.clone(),
-                    ws_token.as_deref(),
-                    ws_msg_tx.clone(),
-                )
-                .await
-                {
-                    Ok(recv_handle) => {
-                        // Keep an abort handle so we can cancel while also awaiting
-                        let abort_handle = recv_handle.abort_handle();
-                        // Wait until the connection task finishes or cancel is requested
-                        tokio::select! {
-                            _ = ws_cancel.cancelled() => {
-                                abort_handle.abort();
-                                break;
-                            }
-                            result = recv_handle => {
-                                let _ = result; // ignore JoinError
-                                warn!("WS connection dropped, will reconnect in 5s");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("WS connect failed: {}, retrying in 5s", e);
-                    }
-                }
-
-                // Wait before reconnecting (check cancel every second)
-                for _ in 0..5u32 {
-                    if ws_cancel.is_cancelled() {
-                        return;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                }
-            }
-        });
-
-        // Spawn a translator task: RemoteStateUpdate -> OrchestratorEvent
-        // Maintains a mapping from project.id -> project.name so that ChangeUpdate
-        // incremental messages use the same "<project.name>/<change.id>" format as
-        // the initial FullState snapshot loaded by group_changes_by_project().
-        let translate_tx = ws_tx;
-        tokio::spawn(async move {
-            // project_id -> project_name mapping, populated from FullState messages
-            let mut project_name_map: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-
-            while let Some(update) = ws_msg_rx.recv().await {
-                use crate::remote::types::RemoteStateUpdate;
-                match update {
-                    RemoteStateUpdate::FullState { projects, .. } => {
-                        // Update the project id->name mapping
-                        project_name_map.clear();
-                        for proj in &projects {
-                            project_name_map.insert(proj.id.clone(), proj.name.clone());
-                        }
-
-                        let changes = crate::remote::group_changes_by_project(&projects);
-                        // Full state snapshot → send as ChangesRefreshed (replaces the full list)
-                        let _ = translate_tx
-                            .send(super::events::OrchestratorEvent::ChangesRefreshed {
-                                changes,
-                                rejected_changes: Vec::new(),
-                                committed_change_ids: std::collections::HashSet::new(),
-                                uncommitted_file_change_ids: std::collections::HashSet::new(),
-                                worktree_change_ids: std::collections::HashSet::new(),
-                                worktree_paths: std::collections::HashMap::new(),
-                                worktree_not_ahead_ids: std::collections::HashSet::new(),
-                                merge_wait_ids: std::collections::HashSet::new(),
-                            })
-                            .await;
-
-                        // Also send per-change status updates so the TUI can render
-                        // in-flight states (Applying/Archiving/etc) in remote mode.
-                        for proj in &projects {
-                            let project_display = proj.name.clone();
-                            for ch in &proj.changes {
-                                let id = format!("{}::{}/{}", proj.id, project_display, ch.id);
-                                let _ = translate_tx
-                                    .send(super::events::OrchestratorEvent::RemoteChangeUpdate {
-                                        id,
-                                        completed_tasks: ch.completed_tasks,
-                                        total_tasks: ch.total_tasks,
-                                        status: Some(ch.status.clone()),
-                                        iteration_number: ch.iteration_number,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                    RemoteStateUpdate::ChangeUpdate { change } => {
-                        // Incremental update → send as RemoteChangeUpdate (applies non-regression rule)
-                        // Use project.name (from the id->name map) to match the format used by
-                        // group_changes_by_project(): "<project_id>::<project.name>/<change.id>"
-                        let project_display = project_name_map
-                            .get(&change.project)
-                            .cloned()
-                            .unwrap_or_else(|| change.project.clone());
-                        let id = format!("{}::{}/{}", change.project, project_display, change.id);
-                        let _ = translate_tx
-                            .send(super::events::OrchestratorEvent::RemoteChangeUpdate {
-                                id,
-                                completed_tasks: change.completed_tasks,
-                                total_tasks: change.total_tasks,
-                                status: Some(change.status),
-                                iteration_number: change.iteration_number,
-                            })
-                            .await;
-                    }
-                    RemoteStateUpdate::Log { entry } => {
-                        // Convert remote log entry to a TUI log event
-                        use crate::tui::events::LogLevel;
-                        let level = match entry.level.as_str() {
-                            "error" => LogLevel::Error,
-                            "warn" | "warning" => LogLevel::Warn,
-                            "success" => LogLevel::Success,
-                            _ => LogLevel::Info,
-                        };
-                        // Normalize change_id for remote log association:
-                        // When change_id is None but project_id is set, use project_id as
-                        // the change_id so that get_latest_log_for_change() can match logs
-                        // to changes via project_id prefix matching.
-                        let effective_change_id =
-                            entry.change_id.or_else(|| entry.project_id.clone());
-                        let log_entry = crate::tui::events::LogEntry {
-                            timestamp: entry.timestamp.clone(),
-                            created_at: chrono::Utc::now(),
-                            message: entry.message,
-                            color: ratatui::style::Color::Reset,
-                            level,
-                            change_id: effective_change_id,
-                            operation: entry.operation,
-                            iteration: entry.iteration,
-                            workspace_path: None,
-                        };
-                        let _ = translate_tx
-                            .send(super::events::OrchestratorEvent::Log(log_entry))
-                            .await;
-                    }
-                    RemoteStateUpdate::ChangeRemoved { .. } | RemoteStateUpdate::Ping => {
-                        // Ping is a no-op; ChangeRemoved would require a separate event type (future work)
-                    }
-                }
-            }
-        });
-
-        Some(ws_task)
-    } else {
-        None
-    };
-
-    // In remote mode, the auto-refresh task must NOT call list_changes_native()
-    // because local openspec/ changes are irrelevant when connected to a remote server.
-    // State updates arrive exclusively via the WebSocket subscription.
-    let is_remote_mode = _ws_handle.is_some();
-
     // Start auto-refresh task
     let refresh_tx = tx.clone();
     let refresh_cancel = cancel_token.clone();
@@ -720,11 +490,6 @@ async fn run_tui_loop(
     let refresh_worktree_base_dir = worktree_base_dir.clone();
     let refresh_config = config.clone();
     let refresh_handle = tokio::spawn(async move {
-        // Skip local refresh entirely in remote mode; WS task handles updates.
-        if should_bypass_local_refresh(is_remote_mode) {
-            return;
-        }
-
         let worktree_manager = GitWorkspaceManager::new(
             refresh_worktree_base_dir,
             refresh_repo_root.clone(),
@@ -1069,7 +834,6 @@ async fn run_tui_loop(
                 config: &config,
                 tx: &tx,
                 dynamic_queue: &dynamic_queue,
-                remote_client: remote_client_actions.clone(),
                 post_archive_action: post_archive_action.clone(),
                 // Invocation-scoped; every orchestrator start in this persistent
                 // TUI process reconstructs the same publication runtime.
@@ -1308,13 +1072,6 @@ mod tests {
             },
             ExecutionEvent::Log(crate::events::LogEntry::info("hello")),
             ExecutionEvent::WorktreesRefreshed { worktrees: vec![] },
-            ExecutionEvent::RemoteChangeUpdate {
-                id: "change-a".to_string(),
-                completed_tasks: 0,
-                total_tasks: 1,
-                status: Some("applying".to_string()),
-                iteration_number: Some(1),
-            },
         ];
 
         for event in presentation_events {
@@ -1407,11 +1164,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remote_mode_bypasses_local_refresh_path() {
-        assert!(super::should_bypass_local_refresh(true));
-        assert!(!super::should_bypass_local_refresh(false));
-    }
     #[tokio::test]
     async fn shutdown_local_orchestrator_cancels_and_aborts_non_finishing_task() {
         let token = CancellationToken::new();
@@ -1453,7 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_local_orchestrator_without_handle_is_remote_client_safe_noop() {
+    async fn shutdown_local_orchestrator_without_handle_is_noop() {
         let outcome = shutdown_local_orchestrator_task(None, None, Duration::from_millis(1)).await;
 
         assert_eq!(outcome, LocalOrchestratorShutdownOutcome::NoTask);

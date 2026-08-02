@@ -5,13 +5,13 @@
 //! that perform actual file I/O.
 
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::error::{OrchestratorError, Result};
 
 use super::defaults::PROJECT_CONFIG_FILE;
 use super::jsonc;
-use super::types::{OrchestratorConfig, ProposalSessionConfig, ServerConfig};
+use super::types::OrchestratorConfig;
 // Path helpers are defined in the parent (mod.rs) and accessed via super::
 use super::get_global_config_paths;
 
@@ -36,63 +36,6 @@ impl OrchestratorConfig {
     /// Parse JSONC content (JSON with Comments)
     pub fn parse_jsonc(content: &str) -> Result<Self> {
         jsonc::parse(content)
-    }
-
-    /// Load only the server configuration from global config files (no project config).
-    /// Used by `cflx server` to load the `server` section from global config.
-    ///
-    /// Priority (lowest to highest):
-    /// 1. Platform default config
-    /// 2. XDG default config (~/.config/cflx/config.jsonc)
-    /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
-    ///
-    /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
-    #[allow(dead_code)]
-    pub fn load_server_config_from_global() -> ServerConfig {
-        let (server_config, _, _) = Self::load_server_config_and_resolve_command_from_global();
-        server_config
-    }
-
-    /// Load server configuration, top-level `resolve_command`, and proposal session config
-    /// from global config files.
-    /// Used by `cflx server` to get server-specific settings plus top-level values that
-    /// are wired into the server runtime.
-    ///
-    /// Returns `(ServerConfig, Option<resolve_command>, ProposalSessionConfig)`.
-    ///
-    /// Priority (lowest to highest):
-    /// 1. Platform default config
-    /// 2. XDG default config (~/.config/cflx/config.jsonc)
-    /// 3. XDG env config ($XDG_CONFIG_HOME/cflx/config.jsonc)
-    ///
-    /// Project config (`.cflx.jsonc`) is intentionally excluded — server mode is directory-independent.
-    pub fn load_server_config_and_resolve_command_from_global(
-    ) -> (ServerConfig, Option<String>, ProposalSessionConfig) {
-        let mut merged = OrchestratorConfig::default();
-
-        // 1-3. Global config candidates in merge priority order.
-        for path in get_global_config_paths() {
-            if path.exists() {
-                match Self::load_from_file(&path) {
-                    Ok(c) => merged.merge(c),
-                    Err(err) => {
-                        warn!(
-                            path = ?path,
-                            error = %err,
-                            "Failed to load global server config candidate; skipping"
-                        );
-                    }
-                }
-            }
-        }
-
-        let resolve_command = merged.resolve_command.clone();
-        let proposal_session = merged.proposal_session.clone().unwrap_or_default();
-        (
-            merged.server.unwrap_or_default(),
-            resolve_command,
-            proposal_session,
-        )
     }
 
     /// Load configuration with merge-based priority:

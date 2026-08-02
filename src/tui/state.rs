@@ -34,75 +34,6 @@ mod selection_logic;
 mod worktree_action_logic;
 mod worktree_logic;
 
-fn apply_remote_status(change: &mut ChangeState, status: &str) {
-    // Avoid regressing active/terminal states based on laggy remote snapshots.
-    let current = change.display_status_cache.as_str();
-
-    let next = match status {
-        "applying" => Some("applying"),
-        "archiving" => Some("archiving"),
-        "accepting" => Some("accepting"),
-        "resolving" => Some("resolving"),
-        "archived" => Some("archived"),
-        "merged" => Some("merged"),
-        "merge_wait" => Some("merge wait"),
-        "resolve_wait" => Some("resolve pending"),
-        "blocked" => Some("blocked"),
-        "stalled" => Some("stalled"),
-        "gated" => Some("stalled"),
-        "queued" => Some("queued"),
-        "idle" => Some("not queued"),
-        "rejected" => Some("rejected"),
-        "error" => Some("error"),
-        _ => None,
-    };
-
-    let Some(next) = next else {
-        return;
-    };
-
-    // Don't downgrade active states to queued/idle.
-    if matches!(
-        current,
-        "applying" | "archiving" | "accepting" | "resolving"
-    ) && matches!(next, "queued" | "not queued")
-    {
-        return;
-    }
-
-    // Only set queued/idle if we're not already in an immutable terminal state.
-    // Note: error is intentionally excluded to allow error -> queued retry transitions.
-    if matches!(next, "queued" | "not queued") && matches!(current, "archived" | "merged") {
-        return;
-    }
-
-    // Transition bookkeeping for elapsed time.
-    if matches!(next, "applying") && change.started_at.is_none() {
-        change.started_at = Some(Instant::now());
-        change.elapsed_time = None;
-    }
-
-    if !matches!(next, "applying" | "archiving" | "accepting" | "resolving")
-        && matches!(
-            current,
-            "applying" | "archiving" | "accepting" | "resolving"
-        )
-    {
-        if let Some(started) = change.started_at {
-            change.elapsed_time = Some(started.elapsed());
-        }
-    }
-
-    if next == "error" {
-        if change.error_message_cache.is_none() {
-            change.error_message_cache = Some("remote".to_string());
-        }
-        change.set_display_status_cache("error");
-    } else {
-        change.set_display_status_cache(next);
-    }
-}
-
 // ============================================================================
 // Constants
 // ============================================================================
@@ -2881,49 +2812,6 @@ mod tests {
 
         app.toggle_selection(); // Select first
         assert_eq!(app.selected_count(), 1);
-    }
-
-    #[test]
-    fn test_update_change_status_blocks_archived_and_merged_to_queued() {
-        let mut archived = ChangeState {
-            id: "archived-change".to_string(),
-            completed_tasks: 0,
-            total_tasks: 1,
-            display_status_cache: "archived".to_string(),
-            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
-            blocker_detail_cache: None,
-            display_color_cache: Color::Blue,
-            error_message_cache: None,
-            selected: false,
-            is_new: false,
-            is_parallel_eligible: true,
-            has_worktree: false,
-            started_at: None,
-            elapsed_time: None,
-            iteration_number: None,
-        };
-        apply_remote_status(&mut archived, "queued");
-        assert_eq!(archived.display_status_cache, "archived");
-
-        let mut merged = ChangeState {
-            id: "merged-change".to_string(),
-            completed_tasks: 0,
-            total_tasks: 1,
-            display_status_cache: "merged".to_string(),
-            blocker_kind_cache: crate::orchestration::state::BlockerKind::None,
-            blocker_detail_cache: None,
-            display_color_cache: Color::LightBlue,
-            error_message_cache: None,
-            selected: false,
-            is_new: false,
-            is_parallel_eligible: true,
-            has_worktree: false,
-            started_at: None,
-            elapsed_time: None,
-            iteration_number: None,
-        };
-        apply_remote_status(&mut merged, "queued");
-        assert_eq!(merged.display_status_cache, "merged");
     }
 
     #[test]

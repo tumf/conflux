@@ -52,7 +52,7 @@ Conflux 是一个基于规格驱动开发、用于编排 AI 编码代理自主�
 | `F5` | 开始、恢复、重试或继续处理 |
 | `x` | 处理运行中时，将符合条件的 `not queued` change 加入队列 |
 
-关于服务器模式、远程 TUI、REST API 和 `cflx service`，请参阅[服务器模式指南（英文）](docs/guides/SERVER.md)。
+关于 Web 监控界面、REST API 和 `/api/v2`，请参阅 [Web UI 指南（英文）](docs/guides/WEBUI.md)。
 
 ## 快速开始
 
@@ -123,7 +123,7 @@ cargo install cflx
 | 文档 | 说明 |
 |----------|-------------|
 | [QUICKSTART.zh-CN.md](QUICKSTART.zh-CN.md) | 首次设置 |
-| [服务器模式指南（英文）](docs/guides/SERVER.md) | 服务器模式、远程 TUI、Web UI、REST API、后台服务 |
+| [Web UI 指南（英文）](docs/guides/WEBUI.md) | Web UI、REST API、`/api/v2`、从服务器模式迁移 |
 | [README.md](README.md) | 完整文档（英文） |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | 使用示例 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 贡献指南 |

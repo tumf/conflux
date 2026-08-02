@@ -14,20 +14,20 @@ Conflux(cflx) automates the OpenSpec change workflow (list → dependency analys
 Conflux has the following frontends:
 
 * TUI
-* WebUI (server mode)
+* WebUI (local `--web` monitoring)
 
 ## Web UI
 
-The WebUI provides a dashboard when Conflux runs in server mode.
-The dashboard source files are located in the `dashboard/` directory.
-The build output (`dashboard/dist/`) is embedded into the Rust binary via `include_str!` at compile time.
+The WebUI is an optional local monitoring dashboard enabled with `--web` on
+`cflx`, `cflx tui`, or `cflx run`. Its static assets live in `web/` and are
+embedded into the Rust binary via `include_str!` at compile time. There is no
+standalone server daemon and no multi-project mode.
 
 ## Directories
 
 * `src/`: Main Rust source code
 * `tests/`: Rust test code
-* `dashboard/`: WebUI dashboard source files
-* `web/`: Embedded static web assets used by the Rust application
+* `web/`: Embedded static web assets used by the WebUI
 * `skills/`: Source files for `cflx-*` skills that are embedded into the Rust binary
 * `openspec/`: OpenSpec changes and specs
 * `docs/`: Project documentation

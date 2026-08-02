@@ -1,29 +1,24 @@
-.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
+.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit openapi check-openapi publish build-linux build-linux-x86 build-linux-arm
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
 ZIGBUILD_PATH := PATH="$(RUSTUP_BIN):$(HOME)/.cargo/bin:$(PATH)"
 
-# Build dashboard frontend
-dashboard-build:
-	@echo "Building dashboard frontend..."
-	bash dashboard/build.sh
-
 # Build the project
-build: dashboard-build
+build:
 	cargo build --release
 
 # Cross-compile for Linux (both x86_64 and aarch64)
 build-linux: build-linux-x86 build-linux-arm
 
 # Cross-compile for Linux x86_64
-build-linux-x86: dashboard-build
+build-linux-x86:
 	@echo "Building for x86_64-unknown-linux-gnu..."
 	$(ZIGBUILD_PATH) cargo zigbuild --release --target x86_64-unknown-linux-gnu
 	@echo "Binary: target/x86_64-unknown-linux-gnu/release/cflx"
 
 # Cross-compile for Linux aarch64
-build-linux-arm: dashboard-build
+build-linux-arm:
 	@echo "Building for aarch64-unknown-linux-gnu..."
 	$(ZIGBUILD_PATH) cargo zigbuild --release --target aarch64-unknown-linux-gnu
 	@echo "Binary: target/aarch64-unknown-linux-gnu/release/cflx"
@@ -33,7 +28,7 @@ clean:
 	cargo clean
 
 # Install the binary locally
-install: dashboard-build
+install:
 	cargo install --path .
 
 # Install from crates.io
@@ -156,48 +151,3 @@ check-openapi:
 		echo "OpenAPI specification is up to date."; \
 		rm /tmp/openapi-check.yaml; \
 	fi
-
-# Server mode tasks
-PLIST_PATH := $(HOME)/Library/LaunchAgents/com.conflux.cflx-server.plist
-
-# Install server as launchd service
-server-install: build
-	@echo "Installing cflx server as launchd service..."
-	@mkdir -p $(HOME)/Library/LaunchAgents
-	@printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"\n    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n    <key>Label</key>\n    <string>com.conflux.cflx-server</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>%s/.cargo/bin/cflx</string>\n        <string>server</string>\n    </array>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>KeepAlive</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>/tmp/cflx-server.log</string>\n    <key>StandardErrorPath</key>\n    <string>/tmp/cflx-server.log</string>\n</dict>\n</plist>\n' "$(HOME)" > $(PLIST_PATH)
-	@launchctl load $(PLIST_PATH) 2>/dev/null || launchctl enable gui/$$(id -u)/com.conflux.cflx-server
-	@launchctl start com.conflux.cflx-server
-	@echo "Server installed and started"
-
-# Start the server
-server-start:
-	@echo "Starting cflx server..."
-	@launchctl start com.conflux.cflx-server
-	@echo "Server started"
-
-# Stop the server
-server-stop:
-	@echo "Stopping cflx server..."
-	@launchctl stop com.conflux.cflx-server
-	@echo "Server stopped"
-
-# Restart the server
-server-restart:
-	@echo "Restarting cflx server..."
-	@launchctl stop com.conflux.cflx-server 2>/dev/null || true
-	@sleep 2
-	@launchctl start com.conflux.cflx-server
-	@echo "Server restarted"
-
-# Show server logs
-server-logs:
-	@echo "=== Latest 50 lines from cflx server log ==="
-	@tail -50 /tmp/cflx-server.log 2>/dev/null || echo "Log file not found"
-
-# Check server status
-server-status:
-	@echo "=== cflx Server Status ==="
-	@launchctl print gui/$$(id -u)/com.conflux.cflx-server 2>/dev/null | grep -E "state|pid" || echo "Service not loaded"
-	@echo ""
-	@echo "Running processes:"
-	@pgrep -a cflx | head -5 || echo "No cflx processes running"
