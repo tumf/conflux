@@ -1,4 +1,4 @@
-.PHONY: install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
+.PHONY: web-test install build clean bump-minor bump-patch bump-major index index-full setup fmt lint test test-heavy check pre-commit audit openapi check-openapi publish build-linux build-linux-x86 build-linux-arm server-install server-start server-stop server-restart server-logs server-status dashboard-build
 
 # Ensure rustup-managed toolchain is used (not Homebrew rustc)
 RUSTUP_BIN := $(HOME)/.rustup/toolchains/stable-$(shell rustup show active-toolchain 2>/dev/null | awk '{print $$1}' | sed 's/^stable-//')/bin
@@ -87,6 +87,14 @@ lint:
 test:
 	@echo "Running default-path tests..."
 	cargo test
+
+# Run the repository-local browser tests for the embedded operator console.
+# Production assets in web/ stay dependency-free; the tooling is dev-only and
+# lives entirely under tests/web.
+web-test:
+	@echo "Running operator-console browser tests..."
+	@if [ ! -d tests/web/node_modules ]; then npm --prefix tests/web ci --no-audit --no-fund; fi
+	@npm --prefix tests/web test
 
 # Run heavy real-boundary E2E/integration tests explicitly
 test-heavy:

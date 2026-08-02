@@ -123,7 +123,7 @@ cargo install cflx
 | Document | Description |
 |----------|-------------|
 | [QUICKSTART.md](QUICKSTART.md) | Initial setup |
-| [Server Mode Guide (English)](docs/guides/SERVER.md) | Server mode, remote TUI, Web UI, REST API, background service |
+| [Server Mode Guide (English)](docs/guides/SERVER.md) | Server mode, remote TUI, the `/api/v2` web operator console, background service |
 | [README.ja.md](README.ja.md) | Full documentation (Japanese) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Usage examples |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |

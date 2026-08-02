@@ -1,0 +1,15 @@
+{
+  "name": "cflx-web-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Repository-local browser tests for the embedded Conflux operator console. Dev-only: the production assets in web/ stay dependency-free.",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "axe-core": "^4.10.2",
+    "jsdom": "^26.1.0",
+    "vitest": "^3.2.4"
+  }
+}

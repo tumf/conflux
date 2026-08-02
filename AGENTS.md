@@ -18,9 +18,16 @@ Conflux has the following frontends:
 
 ## Web UI
 
-The WebUI provides a dashboard when Conflux runs in server mode.
-The dashboard source files are located in the `dashboard/` directory.
-The build output (`dashboard/dist/`) is embedded into the Rust binary via `include_str!` at compile time.
+Two distinct browser surfaces exist; do not confuse them.
+
+* **Operator console (`--web` / web-monitoring)**: `web/index.html`, `web/style.css`, and
+  `web/app.js`, embedded via `include_str!` in `src/web/mod.rs`. No build step and no
+  frontend framework: it is dependency-free HTML/CSS/JS and a first-class `/api/v2`
+  client. There is no legacy unversioned `/api/*` or `/ws` surface any more.
+  Browser tests live in `tests/web/` and run with `make web-test`; that tooling is
+  dev-only and must never become a production dependency.
+* **Server-mode dashboard**: source in `dashboard/`, build output `dashboard/dist/`,
+  embedded by `src/server/api/dashboard.rs`. Built with `make dashboard-build`.
 
 ## Directories
 

@@ -158,9 +158,10 @@ Notes for client authors:
   invalidates it.
 - Credentials go in the `Authorization` header only. Tokens in query strings or
   WebSocket subprotocols are rejected, so browser-native `EventSource` and
-  `WebSocket` cannot be used against a protected `/api/v2`; browsers should read
-  `/api/v2/events` with `fetch()` response streaming. The dashboard itself stays
-  on the legacy `/ws` endpoint.
+  `WebSocket` cannot be used against a protected `/api/v2`; browsers read
+  `/api/v2/events` with `fetch()` response streaming. The embedded operator
+  console does exactly that — `/api/v2` is its only contract, and the legacy
+  unversioned `/api/*` and `/ws` routes have been removed.
 - Cross-origin access is same-origin by default. A reverse proxy that changes
   the externally visible origin must declare it with `--web-allowed-origin`
   (repeatable, exact `scheme://host[:port]`); wildcards and forwarded headers
