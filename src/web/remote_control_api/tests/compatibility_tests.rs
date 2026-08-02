@@ -194,11 +194,12 @@ async fn v2_is_mounted_next_to_the_legacy_surface_not_inside_it() {
     );
     assert_eq!(v2["api_version"], "v2");
 
-    // v1 is server mode's multi-project namespace and is not served here.
+    // `/api/v1` was the removed multi-project namespace. Nothing may answer for
+    // it, so a reintroduced multi-project surface fails here.
     let response = send(&app, request(Method::GET, "/api/v1/projects")).await;
     assert_eq!(
         response.status(),
         StatusCode::NOT_FOUND,
-        "single-instance mode must not answer for the multi-project namespace"
+        "the removed multi-project namespace must not be served"
     );
 }

@@ -28,7 +28,6 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
 
     let file_gated = [
         "tests/e2e_tests.rs",
-        "tests/e2e_proposal_session.rs",
         "tests/e2e_git_worktree_tests.rs",
         "tests/process_cleanup_test.rs",
         "tests/merge_conflict_check_tests.rs",
@@ -43,7 +42,7 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
         );
     }
 
-    let function_gated: [(&str, &[&str]); 7] = [
+    let function_gated: [(&str, &[&str]); 6] = [
         (
             "tests/lifecycle_integration.rs",
             &[
@@ -56,14 +55,6 @@ fn heavy_real_boundary_suites_stay_feature_gated() {
             &[
                 "test_attempt_merge_succeeds_when_change_archived",
                 "test_merge_proceeds_when_archive_complete",
-            ],
-        ),
-        (
-            "src/server/api/projects.rs",
-            &[
-                "test_add_project_setup_failure_returns_422_and_rolls_back_registry",
-                "test_add_project_without_repo_root_setup_succeeds_without_marker",
-                "test_app_state_resolve_command_comes_from_top_level_config",
             ],
         ),
         (

@@ -52,7 +52,7 @@ Các phím TUI hữu ích:
 | `F5` | Bắt đầu, tiếp tục, thử lại hoặc tiếp tục xử lý |
 | `x` | Đưa các changes `not queued` đủ điều kiện vào hàng đợi khi quá trình xử lý đang chạy |
 
-Đối với chế độ máy chủ, TUI từ xa, REST API và `cflx service`, hãy xem [hướng dẫn chế độ máy chủ (bản tiếng Anh)](docs/guides/SERVER.md).
+Đối với giao diện web giám sát, REST API và `/api/v2`, hãy xem [hướng dẫn Web UI (bản tiếng Anh)](docs/guides/WEBUI.md).
 
 ## Bắt đầu nhanh
 
@@ -123,7 +123,7 @@ cargo install cflx
 | Tài liệu | Mô tả |
 |----------|-------------|
 | [QUICKSTART.vi.md](QUICKSTART.vi.md) | Thiết lập lần đầu |
-| [Hướng dẫn chế độ máy chủ (bản tiếng Anh)](docs/guides/SERVER.md) | Chế độ máy chủ, TUI từ xa, Web UI, REST API, dịch vụ nền |
+| [Hướng dẫn Web UI (bản tiếng Anh)](docs/guides/WEBUI.md) | Web UI, REST API, `/api/v2`, di chuyển từ chế độ máy chủ |
 | [README.md](README.md) | Tài liệu đầy đủ (tiếng Anh) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Ví dụ sử dụng |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Hướng dẫn đóng góp |

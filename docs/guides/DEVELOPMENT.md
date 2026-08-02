@@ -43,12 +43,10 @@ Conflux separates tests into two explicit tiers:
 | `tests/no_backup_files_test.rs` | fast integration/contract | yes | Repository hygiene guard |
 | `tests/install_skills_test.rs` | fast integration | yes | Filesystem + embedded skill install behavior |
 | `tests/e2e_tests.rs` | heavy contract/E2E (opt-in) | no (requires `heavy-tests`) | Mock-basedだが長時間化しやすいため heavy tier へ分離 |
-| `tests/e2e_proposal_session.rs` | heavy E2E / real-boundary | no (requires `heavy-tests`) | Real git repo + websocket/session boundary |
 | `tests/e2e_git_worktree_tests.rs` | heavy E2E / real-boundary | no (requires `heavy-tests`) | Real git worktree lifecycle + merge/conflict |
 | `tests/process_cleanup_test.rs` | heavy integration / real-boundary | no (requires `heavy-tests`) | OS process group and signal semantics |
 | `tests/merge_conflict_check_tests.rs` | heavy integration / real-boundary | no (requires `heavy-tests`) | Real `git merge-tree` process + repo mutation |
 | `src/parallel/tests/executor.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real git repo/worktree/merge lifecycle used by parallel executor merge tests |
-| `src/server/api.rs` (selected tests) | heavy integration / real-boundary | no (requires `heavy-tests`) | Real repo setup / project add flow / setup script behavior |
 | `src/ai_command_runner.rs` (selected inactivity-timeout tests) | heavy integration / real-time | no (requires `heavy-tests`) | Deliberately waits on inactivity timeout/retry behavior and is too slow for default path |
 | `src/orchestration/archive.rs` (selected retry/verify test) | heavy integration / shell-retry | no (requires `heavy-tests`) | End-to-end archive retry verification via shell script and filesystem mutation |
 
@@ -160,9 +158,7 @@ src/
 ├── openspec.rs             # OpenSpec wrapper (list, archive)
 ├── progress.rs             # Progress display (indicatif)
 ├── tui/                    # Interactive TUI dashboard (ratatui)
-├── server/                 # HTTP/WebSocket server for remote control
-├── remote/                 # Remote client and WebSocket types
-└── web/                    # Web API types and WebSocket protocol
+└── web/                    # Local web monitoring UI, `/api/v2`, WebSocket protocol
 ```
 
 ## Architecture Overview
@@ -182,7 +178,7 @@ src/
 | Parallel | `parallel/` | Parallel execution across jj/git workspaces |
 | VCS | `vcs/` | VCS abstraction layer (git commands, workspace operations) |
 | TUI | `tui/` | Interactive terminal dashboard using ratatui |
-| Server | `server/` | HTTP/WebSocket server for remote control |
+| Web | `web/` | Local `--web` monitoring UI, REST/WebSocket state, `/api/v2` remote control |
 | OpenSpec | `openspec.rs` | Wrapper for OpenSpec CLI commands |
 
 ### Data Flow
@@ -254,12 +250,6 @@ prek install
 ```
 
 The prek hook configuration is defined in `.pre-commit-config.yaml` (prek is fully compatible with pre-commit configuration format). When you run `prek run --all-files`, it auto-runs `make openapi` and stages `docs/openapi.yaml`.
-
-### Dashboard generated publish artifacts and fixer-hook policy
-
-`dashboard/dist/assets` contains committed generated publish artifacts embedded at compile time. In particular, `dashboard/dist/assets/index-*.js` and `dashboard/dist/assets/index-*.css` are intentionally committed outputs.
-
-Because these files are generated artifacts, `end-of-file-fixer` excludes them to avoid producing dirty worktrees during standard validation. Developers should use the standard validation path (`bash dashboard/build.sh`, `prek run --all-files`, `make check`) and expect hook execution to complete without rewriting `dashboard/dist/assets/index-*` files.
 
 ## Adding New Features
 

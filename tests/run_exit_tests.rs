@@ -104,29 +104,150 @@ fn test_run_rejects_bare_target_before_execution() {
     assert!(!bare.success());
 }
 
+/// The removed multi-project server surfaces must fail as Clap usage errors.
+///
+/// Rejection has to happen before anything observable: no log file, no
+/// repository lock, no listener, no orchestration. The workspace is a real git
+/// repository with a real config so the failure cannot be an accident of a
+/// missing prerequisite.
 #[test]
-fn test_tui_entrypoints_reject_push_with_server_consistently_before_tui_init() {
+fn removed_server_surfaces_are_rejected_without_side_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+    init_git_repo(tmp.path());
+
+    let state_home = tmp.path().join("state");
+    let removed: [&[&str]; 10] = [
+        &["--server", "http://127.0.0.1:39876"],
+        &["--server-token", "mytoken"],
+        &["--server-token-env", "CFLX_TEST_TOKEN"],
+        &["tui", "--server", "http://127.0.0.1:39876"],
+        &["tui", "--server-token", "mytoken"],
+        &["tui", "--server-token-env", "CFLX_TEST_TOKEN"],
+        &["server"],
+        &["service", "install"],
+        &["project", "status"],
+        &["project", "sync", "--all"],
+    ];
+
+    for args in removed {
+        let output = Command::new(env!("CARGO_BIN_EXE_cflx"))
+            .args(args)
+            .current_dir(tmp.path())
+            .env("XDG_STATE_HOME", &state_home)
+            .output()
+            .expect("failed to run cflx");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let label = format!("cflx {}", args.join(" "));
+
+        assert!(
+            !output.status.success(),
+            "{label}: removed surface must exit non-zero, got {:?}",
+            output.status
+        );
+        assert!(
+            stderr.contains("error:"),
+            "{label}: expected a Clap usage error, got stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("Starting cflx"),
+            "{label}: must not announce startup, got stdout={stdout}"
+        );
+    }
+
+    // Clap rejects before logging is initialized, so no log file was created.
+    assert!(
+        !state_home.exists(),
+        "removed surfaces must be rejected before any log file is written"
+    );
+    // ...and before the repository lock file exists.
+    let common_dir = repo_lock::discover_common_dir(tmp.path()).expect("git common dir");
+    assert!(
+        !common_dir.join(repo_lock::LOCK_FILE_NAME).exists(),
+        "removed surfaces must be rejected before the repository lock is taken"
+    );
+}
+
+/// The retained local surfaces must still parse and advertise their options.
+#[test]
+fn retained_local_web_options_still_parse() {
     let tmp = tempfile::tempdir().unwrap();
     setup_empty_project(tmp.path());
 
-    let bin = env!("CARGO_BIN_EXE_cflx");
-    let endpoint = "http://127.0.0.1:39876";
-    let bare = Command::new(bin)
-        .args(["--push", "--server", endpoint])
-        .current_dir(tmp.path())
-        .output()
-        .unwrap();
-    let explicit = Command::new(bin)
-        .args(["tui", "--push", "--server", endpoint])
-        .current_dir(tmp.path())
-        .output()
-        .unwrap();
+    for args in [vec!["run", "--help"], vec!["tui", "--help"], vec!["--help"]] {
+        let output = cflx_output(tmp.path(), &args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "cflx {} must succeed, got {:?}",
+            args.join(" "),
+            output.status
+        );
+        for needle in ["--web", "--web-port", "--web-bind", "--web-auth-token"] {
+            assert!(
+                stdout.contains(needle),
+                "cflx {} must still advertise {needle}, got stdout={stdout}",
+                args.join(" ")
+            );
+        }
+        for needle in ["--server", "cflx server", "cflx project", "cflx service"] {
+            assert!(
+                !stdout.contains(needle),
+                "cflx {} must not advertise '{needle}', got stdout={stdout}",
+                args.join(" ")
+            );
+        }
+    }
+}
 
-    assert!(!bare.status.success());
-    assert_eq!(bare.status.code(), explicit.status.code());
-    assert_eq!(bare.stderr, explicit.stderr);
-    assert!(String::from_utf8_lossy(&bare.stderr)
-        .contains("--push is not supported with TUI --server mode"));
+/// The retained `/api/v2` bind guarantee must still be enforced by the binary.
+///
+/// A routable `--web-bind` without credentials has to refuse startup. A stubbed
+/// or bypassed web path would silently succeed here.
+#[test]
+#[cfg(feature = "web-monitoring")]
+fn retained_web_bind_validation_still_refuses_an_unauthenticated_routable_listener() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+
+    let output = cflx_output(
+        tmp.path(),
+        &["run", "--all", "--web", "--web-bind", "0.0.0.0"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a routable bind without credentials must not start, got {:?}",
+        output.status
+    );
+    assert!(
+        stderr.contains("Error:"),
+        "expected a startup refusal diagnostic, got stderr={stderr}"
+    );
+
+    // The same bind with a token is accepted, so the refusal above is the
+    // credential rule rather than a broken `--web-bind`.
+    let authenticated = cflx_output(
+        tmp.path(),
+        &[
+            "run",
+            "--all",
+            "--web",
+            "--web-bind",
+            "127.0.0.1",
+            "--web-port",
+            "0",
+            "--web-auth-token",
+            "test-token",
+        ],
+    );
+    assert!(
+        authenticated.status.success(),
+        "an authenticated local web run must still succeed, got {:?} (stderr={})",
+        authenticated.status,
+        String::from_utf8_lossy(&authenticated.stderr)
+    );
 }
 
 #[test]
@@ -320,39 +441,21 @@ fn every_local_orchestration_entrypoint_is_guarded() {
     let tmp = tempfile::tempdir().unwrap();
     setup_empty_project(tmp.path());
     init_git_repo(tmp.path());
-    let data_dir = tmp.path().join("server-data");
 
     let owner = take_repository_lock(tmp.path(), InvocationMode::Tui);
 
-    // Default TUI (no subcommand), explicit local TUI, run, and server.
-    let guarded: [Vec<&str>; 4] = [
-        vec![],
-        vec!["tui"],
-        vec!["run", "--all"],
-        vec![
-            "server",
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--data-dir",
-            data_dir.to_str().unwrap(),
-        ],
-    ];
+    // Default TUI (no subcommand), explicit local TUI, and run.
+    let guarded: [Vec<&str>; 3] = [vec![], vec!["tui"], vec!["run", "--all"]];
     for args in guarded {
         let output = cflx_output(tmp.path(), &args);
         assert_rejected_as_lock_conflict(&output, &format!("cflx {}", args.join(" ")));
     }
-    assert!(
-        !data_dir.exists(),
-        "server must not create its data directory before winning the lock"
-    );
 
     drop(owner);
 }
 
 #[test]
-fn non_orchestration_commands_and_remote_tui_bypass_the_lock() {
+fn non_orchestration_commands_bypass_the_lock() {
     let tmp = tempfile::tempdir().unwrap();
     setup_empty_project(tmp.path());
     init_git_repo(tmp.path());
@@ -373,22 +476,6 @@ fn non_orchestration_commands_and_remote_tui_bypass_the_lock() {
             args.join(" ")
         );
     }
-
-    // Remote-client TUI owns no local orchestration: it must reach its own
-    // argument validation instead of being rejected by the local lock.
-    let remote = cflx_output(
-        tmp.path(),
-        &["tui", "--push", "--server", "http://127.0.0.1:39876"],
-    );
-    let remote_stderr = String::from_utf8_lossy(&remote.stderr);
-    assert!(
-        remote_stderr.contains("--push is not supported with TUI --server mode"),
-        "remote TUI must bypass the lock and reach TUI validation, got stderr={remote_stderr}"
-    );
-    assert!(
-        !remote_stderr.contains(CONFLICT_HEADLINE),
-        "remote TUI must not acquire the local orchestration lock, got stderr={remote_stderr}"
-    );
 
     drop(owner);
 }
@@ -533,7 +620,7 @@ fn conflict_reports_a_published_api_url() {
     setup_empty_project(tmp.path());
     init_git_repo(tmp.path());
 
-    let owner = take_repository_lock(tmp.path(), InvocationMode::Server);
+    let owner = take_repository_lock(tmp.path(), InvocationMode::Tui);
     // Stand in for a listener that has just returned its actual bound address.
     owner.publish_api_url("http://127.0.0.1:39931");
 
@@ -547,94 +634,108 @@ fn conflict_reports_a_published_api_url() {
     drop(owner);
 }
 
-/// Ensures a spawned daemon never outlives the test, including on panic.
+/// Positive proof that local `--web` really binds and publishes a reachable URL.
+///
+/// A stubbed or accidentally removed web path fails here: the run must report a
+/// concrete OS-assigned port, not the requested `0`.
+#[test]
 #[cfg(feature = "web-monitoring")]
+fn local_run_web_binds_a_real_port_and_publishes_its_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+    init_git_repo(tmp.path());
+
+    let output = cflx_output(tmp.path(), &["run", "--all", "--web", "--web-port", "0"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "cflx run --web must succeed, got {:?} (stdout={stdout})",
+        output.status
+    );
+
+    let url = stdout
+        .split_whitespace()
+        .find(|token| token.starts_with("http://"))
+        .unwrap_or_else(|| panic!("no web URL reported, stdout={stdout}"))
+        .trim_end_matches(|c: char| !c.is_ascii_digit())
+        .to_string();
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("web URL has no port: {url}"));
+    assert!(
+        port != 0,
+        "expected a real OS-assigned port from an actual bind, got {url}"
+    );
+}
+
+/// Abnormal termination of the lock owner releases ownership.
+///
+/// The owner is a real child process holding the OS advisory lock, so this
+/// proves file-descriptor release semantics rather than in-process cleanup.
+#[test]
+fn killing_the_lock_owner_releases_the_repository_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    setup_empty_project(tmp.path());
+    init_git_repo(tmp.path());
+
+    // A long-running local orchestration process: `run` blocks on the apply
+    // command, so it holds the repository lock until it is killed.
+    add_change(tmp.path(), "slow");
+    fs::write(
+        tmp.path().join(".cflx.jsonc"),
+        r#"{
+  "apply_command": "sleep 120",
+  "archive_command": "echo archive",
+  "analyze_command": "echo analyze",
+  "acceptance_command": "",
+  "use_llm_analysis": false
+}
+"#,
+    )
+    .unwrap();
+
+    let mut owner = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_cflx"))
+            .args(["run", "--all"])
+            .current_dir(tmp.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn cflx run"),
+    );
+
+    // Wait until the child actually owns the lock, proven by a competing
+    // invocation being rejected with the conflict diagnostic.
+    let start = Instant::now();
+    loop {
+        let output = cflx_output(tmp.path(), &["run", "--all"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() && stderr.contains(CONFLICT_HEADLINE) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the spawned owner never took the repository lock (stderr={stderr})"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+
+    let reacquired = repo_lock::acquire(tmp.path(), InvocationMode::Run)
+        .expect("lock must be acquirable after the owner is killed");
+    assert!(reacquired.is_some());
+}
+
+/// Ensures a spawned child never outlives the test, including on panic.
 struct KillOnDrop(std::process::Child);
 
-#[cfg(feature = "web-monitoring")]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-/// Poll `path` until it contains a URL line, or the timeout expires.
-///
-/// The daemon writes startup logs to stdout as well, so the URL is matched by
-/// prefix rather than by position.
-#[cfg(feature = "web-monitoring")]
-fn wait_for_url_line(path: &Path, timeout: Duration) -> String {
-    let start = Instant::now();
-    loop {
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Some(line) = content.lines().find(|line| line.starts_with("http://")) {
-                return line.trim().to_string();
-            }
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "no URL line appeared in {} within {timeout:?}",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// End-to-end proof that the reported endpoint comes from a real bind and that
-/// forced termination releases ownership.
-#[test]
-#[cfg(feature = "web-monitoring")]
-fn server_publishes_its_bound_api_url_and_kill_releases_the_lock() {
-    let tmp = tempfile::tempdir().unwrap();
-    setup_empty_project(tmp.path());
-    init_git_repo(tmp.path());
-    let data_dir = tmp.path().join("server-data");
-    let stdout_path = tmp.path().join("server-stdout.txt");
-    let stdout_file = fs::File::create(&stdout_path).unwrap();
-
-    // Port 0 forces an OS-assigned port, so a correct diagnostic can only come
-    // from the address the listener actually bound.
-    let mut server = KillOnDrop(
-        Command::new(env!("CARGO_BIN_EXE_cflx"))
-            .args([
-                "server",
-                "--bind",
-                "127.0.0.1",
-                "--port",
-                "0",
-                "--data-dir",
-                data_dir.to_str().unwrap(),
-            ])
-            .current_dir(tmp.path())
-            .stdout(std::process::Stdio::from(stdout_file))
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("failed to spawn cflx server"),
-    );
-
-    let url = wait_for_url_line(&stdout_path, Duration::from_secs(30));
-    assert!(!url.ends_with(":0"), "expected an OS-assigned port: {url}");
-
-    let output = cflx_output(tmp.path(), &["run", "--all"]);
-    let stderr = assert_rejected_as_lock_conflict(&output, "conflict with a live server");
-    assert!(
-        stderr.contains(&url),
-        "expected the actual bound API URL {url}, got stderr={stderr}"
-    );
-    assert!(
-        stderr.contains(&server.0.id().to_string()),
-        "expected the server pid, got stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("mode:       server"),
-        "expected the server invocation mode, got stderr={stderr}"
-    );
-
-    // Abnormal termination releases the lock through file-descriptor semantics.
-    server.0.kill().unwrap();
-    server.0.wait().unwrap();
-    let reacquired = repo_lock::acquire(tmp.path(), InvocationMode::Run)
-        .expect("lock must be acquirable after the owner is killed");
-    assert!(reacquired.is_some());
 }

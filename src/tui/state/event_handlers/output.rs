@@ -176,7 +176,6 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
-    use crate::remote::types::RemoteLogEntry;
     use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
     use crate::tui::types::AppMode;
 
@@ -470,66 +469,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_change_update_keeps_progress_monotonic() {
-        let changes = vec![create_test_change("MyProj/feat", 4, 5)];
-        let mut app = AppState::new(changes);
-
-        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
-            id: "MyProj/feat".to_string(),
-            completed_tasks: 2,
-            total_tasks: 5,
-            status: None,
-            iteration_number: None,
-        });
-
-        assert_eq!(app.changes[0].completed_tasks, 4);
-    }
-
-    #[test]
-    fn remote_status_transition_log_carries_structured_change_id() {
-        let mut app = AppState::new(vec![create_test_change("MyProj/feat", 1, 5)]);
-        app.logs.clear();
-
-        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
-            id: "MyProj/feat".to_string(),
-            completed_tasks: 2,
-            total_tasks: 5,
-            status: Some("applying".to_string()),
-            iteration_number: None,
-        });
-
-        let entry = app
-            .logs
-            .iter()
-            .find(|entry| entry.message.starts_with("Remote status:"))
-            .expect("remote status transition log");
-        assert_eq!(entry.change_id.as_deref(), Some("MyProj/feat"));
-    }
-
-    #[test]
-    fn remote_change_update_keeps_iteration_monotonic() {
-        let changes = vec![create_test_change("MyProj/feat", 1, 5)];
-        let mut app = AppState::new(changes);
-
-        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
-            id: "MyProj/feat".to_string(),
-            completed_tasks: 2,
-            total_tasks: 5,
-            status: None,
-            iteration_number: Some(3),
-        });
-        app.handle_orchestrator_event(OrchestratorEvent::RemoteChangeUpdate {
-            id: "MyProj/feat".to_string(),
-            completed_tasks: 3,
-            total_tasks: 5,
-            status: None,
-            iteration_number: Some(2),
-        });
-
-        assert_eq!(app.changes[0].iteration_number, Some(3));
-    }
-
-    #[test]
     fn remote_log_event_is_added() {
         let mut app = AppState::new(vec![create_test_change("proj/change-a", 0, 3)]);
         let initial = app.logs.len();
@@ -552,26 +491,6 @@ mod tests {
         let last = app.logs.last().expect("at least one log entry");
         assert_eq!(last.message, entry.message);
         assert_eq!(last.change_id, entry.change_id);
-    }
-
-    #[test]
-    fn remote_log_entry_project_id_round_trip() {
-        let entry = RemoteLogEntry {
-            message: "stdout: tests passed".to_string(),
-            level: "info".to_string(),
-            change_id: None,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            project_id: Some("proj-abc123".to_string()),
-            operation: Some("apply".to_string()),
-            iteration: Some(2),
-        };
-
-        let json = serde_json::to_string(&entry).unwrap();
-        let decoded: RemoteLogEntry = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(decoded.project_id, entry.project_id);
-        assert_eq!(decoded.operation, entry.operation);
-        assert_eq!(decoded.iteration, entry.iteration);
     }
 
     #[test]

@@ -1,6 +1,5 @@
-use super::apply_remote_status;
 use super::AppState;
-use crate::tui::events::{LogEntry, OrchestratorEvent, TuiCommand};
+use crate::tui::events::{OrchestratorEvent, TuiCommand};
 
 mod completion;
 mod errors;
@@ -154,38 +153,6 @@ impl AppState {
                 self.handle_parallel_start_rejected(change_ids, reason)
             }
             OrchestratorEvent::Error { message } => self.handle_error(message),
-            OrchestratorEvent::RemoteChangeUpdate {
-                id,
-                completed_tasks,
-                total_tasks,
-                status,
-                iteration_number,
-            } => {
-                let mut status_log: Option<String> = None;
-                if let Some(change) = self.changes.iter_mut().find(|c| c.id == id) {
-                    if completed_tasks >= change.completed_tasks {
-                        change.completed_tasks = completed_tasks;
-                    }
-                    change.total_tasks = total_tasks;
-
-                    if let Some(status) = status.as_deref() {
-                        let before = change.display_status_cache.clone();
-                        apply_remote_status(change, status);
-                        if before != change.display_status_cache {
-                            status_log = Some(format!(
-                                "Remote status: {} -> {}",
-                                id,
-                                change.display_status_cache.as_str()
-                            ));
-                        }
-                    }
-
-                    change.update_iteration_monotonic(iteration_number);
-                }
-                if let Some(line) = status_log {
-                    self.add_log(LogEntry::info(line).with_change_id(&id));
-                }
-            }
             _ => {}
         }
         None

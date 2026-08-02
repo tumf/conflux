@@ -30,15 +30,11 @@ mod parallel_run_service;
 mod permission;
 mod process_manager;
 mod progress;
-mod remote;
 #[allow(dead_code)]
 mod repo_lock;
 #[allow(dead_code, unused_imports)]
 mod runtime;
 mod serial_run_service;
-#[cfg(feature = "web-monitoring")]
-mod server;
-mod service;
 mod shell_command;
 mod spec_delta;
 #[cfg(test)]
@@ -61,7 +57,7 @@ mod test_support;
 use clap::{CommandFactory, Parser};
 use cli::{
     install_skills_legacy_error, Cli, Commands, InstallSkillsTarget, InternalCompleteCommands,
-    LogsArgs, ProjectCommands, TuiArgs, VERSION_WITH_BUILD,
+    LogsArgs, TuiArgs, VERSION_WITH_BUILD,
 };
 use config::OrchestratorConfig;
 use error::Result;
@@ -72,38 +68,14 @@ use lifecycle_integration::{
 use orchestrator::Orchestrator;
 use parallel::PostArchiveAction;
 use std::path::Path;
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::{filter::LevelFilter, prelude::*};
 
-/// Helper: resolve the bearer token from CLI args for a TUI invocation.
-fn resolve_tui_token(args: &TuiArgs) -> Option<String> {
-    remote::RemoteClient::resolve_token(args.server_token.clone(), args.server_token_env.as_deref())
-}
-
-fn tui_post_archive_action(args: &TuiArgs) -> Result<PostArchiveAction> {
-    if args.push.is_some() && args.server.is_some() {
-        return Err(error::OrchestratorError::ConfigLoad(
-            "--push is not supported with TUI --server mode".to_string(),
-        ));
-    }
-
-    Ok(args
-        .push
+fn tui_post_archive_action(args: &TuiArgs) -> PostArchiveAction {
+    args.push
         .clone()
         .map(|remote| PostArchiveAction::PushToRemote { remote })
-        .unwrap_or_default())
-}
-
-/// Helper: load the initial change list for remote mode.
-///
-/// Fetches the project+change list from the remote server and maps it to the
-/// local `Change` type so the TUI can display it unchanged.
-async fn load_remote_changes(args: &TuiArgs) -> Result<Vec<openspec::Change>> {
-    let endpoint = args.server.as_deref().unwrap_or_default();
-    let token = resolve_tui_token(args);
-    let client = remote::RemoteClient::new(endpoint, token);
-    let projects = client.list_projects().await?;
-    Ok(remote::group_changes_by_project(&projects))
+        .unwrap_or_default()
 }
 
 /// Privacy-safe lifecycle context identifying this cflx process.
@@ -122,8 +94,7 @@ fn lifecycle_process_context() -> LifecycleContext {
 ///
 /// This is deliberately the same contract as `cflx run`: it resolves the option
 /// through the shared frontend normalizer, then runs the same static and
-/// initial-fetch validation. A remote-client TUI is rejected by the normalizer,
-/// so no repository observation is attempted for it.
+/// initial-fetch validation.
 ///
 /// The default-off path additionally refuses to start while repository evidence
 /// proves an unpublished opted-in integration, which is the option-less restart
@@ -176,7 +147,7 @@ async fn resolve_tui_upstream_runtime(
             }
         }
         None => {
-            if args.server.is_none() && use_parallel && git_dir_exists {
+            if use_parallel && git_dir_exists {
                 if let Err(err) = upstream::ensure_no_unpushed_upstream_recovery(&repo_root).await {
                     if matches!(err, upstream::UpstreamStartupError::Invalid(_)) {
                         eprintln!("Error: {err}");
@@ -191,7 +162,7 @@ async fn resolve_tui_upstream_runtime(
 }
 
 async fn launch_tui(args: TuiArgs) -> Result<()> {
-    let post_archive_action = tui_post_archive_action(&args)?;
+    let post_archive_action = tui_post_archive_action(&args);
 
     init_logging(false)?;
     log_startup("tui");
@@ -234,15 +205,7 @@ async fn launch_tui_inner(
     upstream_runtime: Option<upstream::UpstreamRuntime>,
     lifecycle: lifecycle_integration::LifecycleHandle,
 ) -> Result<()> {
-    let changes = if args.server.is_some() {
-        info!(
-            "Remote TUI mode: connecting to {}",
-            args.server.as_deref().unwrap_or("")
-        );
-        load_remote_changes(&args).await?
-    } else {
-        openspec::list_changes_native()?
-    };
+    let changes = openspec::list_changes_native()?;
 
     #[cfg(feature = "web-monitoring")]
     let (web_url, web_state_opt) = if args.web {
@@ -280,91 +243,17 @@ async fn launch_tui_inner(
         None
     };
 
-    let remote_client = args.server.clone().map(|endpoint| {
-        let token = resolve_tui_token(&args);
-        remote::RemoteClient::new(endpoint, token)
-    });
-
-    tui::run_tui_with_remote(
+    tui::run_tui(
         changes,
         config,
         web_url,
         #[cfg(feature = "web-monitoring")]
         web_state_opt,
-        remote_client,
         post_archive_action,
         upstream_runtime,
         lifecycle,
     )
     .await
-}
-
-/// Resolve the server URL for `cflx project` commands.
-///
-/// Priority:
-/// 1. Explicit `--server <url>` argument
-/// 2. Global config `server.bind` / `server.port`
-/// 3. Default: `http://127.0.0.1:39876`
-fn resolve_project_server_url(explicit: Option<&str>) -> String {
-    if let Some(url) = explicit {
-        return url.to_string();
-    }
-    let server_config = OrchestratorConfig::load_server_config_from_global();
-    format!("http://{}:{}", server_config.bind, server_config.port)
-}
-
-/// Guard: `cflx project` does not support bearer token authentication.
-///
-/// Returns `Err` if the caller supplied `--server-token` / `--server-token-env`,
-/// or if the global config has `server.auth.mode=bearer_token` for the resolved server.
-fn check_project_auth_not_required(
-    server_url: &str,
-    explicit_server: bool,
-) -> std::result::Result<(), String> {
-    // Only check global-config auth when the URL was resolved from config (not explicit)
-    if !explicit_server {
-        let server_config = OrchestratorConfig::load_server_config_from_global();
-        if matches!(server_config.auth.mode, config::ServerAuthMode::BearerToken) {
-            return Err(format!(
-                "The server at '{}' requires bearer token authentication, \
-                 which is not supported by 'cflx project'. \
-                 Use the TUI or provide an unauthenticated server URL with --server.",
-                server_url
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Print project JSON value in human-readable form.
-fn print_projects_human(value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Array(projects) => {
-            if projects.is_empty() {
-                println!("No projects registered.");
-                return;
-            }
-            for p in projects {
-                print_project_human(p);
-            }
-        }
-        serde_json::Value::Null => {
-            println!("Done.");
-        }
-        other => print_project_human(other),
-    }
-}
-
-fn print_project_human(p: &serde_json::Value) {
-    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("-");
-    let url = p.get("remote_url").and_then(|v| v.as_str()).unwrap_or("-");
-    let branch = p.get("branch").and_then(|v| v.as_str()).unwrap_or("-");
-    let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("-");
-    println!("id:         {}", id);
-    println!("remote_url: {}", url);
-    println!("branch:     {}", branch);
-    println!("status:     {}", status);
-    println!();
 }
 
 /// Initialize logging.
@@ -447,16 +336,12 @@ fn log_startup(mode: &str) {
 }
 
 /// Classify the parsed CLI invocation for repository-lock purposes.
-///
-/// Returns the entrypoint kind plus whether a TUI invocation is a remote client
-/// (which owns no local orchestration).
-fn repository_lock_invocation(cli: &Cli) -> (repo_lock::InvocationKind, bool) {
+fn repository_lock_invocation(cli: &Cli) -> repo_lock::InvocationKind {
     match &cli.command {
-        None => (repo_lock::InvocationKind::DefaultTui, cli.server.is_some()),
-        Some(Commands::Tui(args)) => (repo_lock::InvocationKind::Tui, args.server.is_some()),
-        Some(Commands::Run(_)) => (repo_lock::InvocationKind::Run, false),
-        Some(Commands::Server(_)) => (repo_lock::InvocationKind::Server, false),
-        _ => (repo_lock::InvocationKind::Other, false),
+        None => repo_lock::InvocationKind::DefaultTui,
+        Some(Commands::Tui(_)) => repo_lock::InvocationKind::Tui,
+        Some(Commands::Run(_)) => repo_lock::InvocationKind::Run,
+        _ => repo_lock::InvocationKind::Other,
     }
 }
 
@@ -467,8 +352,8 @@ fn repository_lock_invocation(cli: &Cli) -> (repo_lock::InvocationKind, bool) {
 /// completely untouched. The acquired lock is retained for the process
 /// lifetime; the OS releases it when the process exits, normally or not.
 fn acquire_repository_lock(cli: &Cli) {
-    let (kind, remote_client) = repository_lock_invocation(cli);
-    let mode = match repo_lock::classify_invocation(kind, remote_client) {
+    let kind = repository_lock_invocation(cli);
+    let mode = match repo_lock::classify_invocation(kind) {
         repo_lock::LockDecision::Bypass => return,
         repo_lock::LockDecision::Acquire(mode) => mode,
     };
@@ -755,9 +640,6 @@ async fn main() -> Result<()> {
                 web_auth_token_env: cli.web_auth_token_env,
                 web_allowed_origins: cli.web_allowed_origins,
                 push: cli.push,
-                server: cli.server,
-                server_token: cli.server_token,
-                server_token_env: cli.server_token_env,
                 // Bare local TUI carries the same upstream contract as `cflx tui`.
                 integrate_upstream: cli.integrate_upstream,
                 integrate_upstream_default_remote: cli.integrate_upstream_default_remote,
@@ -995,7 +877,9 @@ async fn main() -> Result<()> {
                                             )
                                             .await;
                                     } else {
-                                        warn!("Web control: Cancel stop requested but not in stopping state");
+                                        tracing::warn!(
+                                            "Web control: Cancel stop requested but not in stopping state"
+                                        );
                                     }
                                 }
                                 ControlCommand::ForceStop => {
@@ -1235,182 +1119,6 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Server subcommand: start the multi-project server daemon
-        #[cfg(feature = "web-monitoring")]
-        Some(Commands::Server(args)) => {
-            // Initialize logging (file + stdout)
-            init_logging(true)?;
-            log_startup("server");
-
-            // Build ServerConfig from global config and CLI overrides.
-            // Server mode uses only global config (not project .cflx.jsonc).
-            // Global config is loaded first, then CLI args override individual fields.
-            let (mut server_config, resolve_command, proposal_session_config) =
-                config::OrchestratorConfig::load_server_config_and_resolve_command_from_global();
-
-            // Apply CLI overrides on top of global config values.
-            // Only override fields that were explicitly specified on the CLI
-            // (None means "not specified", so global config value is preserved).
-            server_config.apply_cli_overrides(
-                args.bind.as_deref(),
-                args.port,
-                args.auth_token.as_deref(),
-                args.max_concurrent_total,
-                args.data_dir.as_deref(),
-            );
-
-            info!(
-                "Starting server daemon on {}:{} (data_dir: {:?})",
-                server_config.bind, server_config.port, server_config.data_dir
-            );
-
-            server::run_server(server_config, resolve_command, proposal_session_config).await?;
-        }
-
-        // Server subcommand (web-monitoring feature disabled)
-        #[cfg(not(feature = "web-monitoring"))]
-        Some(Commands::Server(_)) => {
-            eprintln!(
-                "Error: Server daemon requires the 'web-monitoring' feature. Compile with --features web-monitoring"
-            );
-            std::process::exit(1);
-        }
-
-        // Project subcommand: manage projects on a remote Conflux server
-        Some(Commands::Project(args)) => {
-            // Guard: top-level --server-token / --server-token-env are not supported
-            if cli.server_token.is_some() || cli.server_token_env.is_some() {
-                eprintln!(
-                    "Error: --server-token and --server-token-env are not supported by \
-                     'cflx project'. Authentication is not supported by this command."
-                );
-                std::process::exit(1);
-            }
-
-            let explicit_server = args.server.is_some();
-            let server_url = resolve_project_server_url(args.server.as_deref());
-
-            // Auth guard: project commands do not support bearer token auth
-            if let Err(msg) = check_project_auth_not_required(&server_url, explicit_server) {
-                eprintln!("Error: {}", msg);
-                std::process::exit(1);
-            }
-
-            // Project commands use an unauthenticated client (no token)
-            let client = remote::RemoteClient::new(&server_url, None);
-
-            let result: crate::error::Result<serde_json::Value> = match args.command {
-                ProjectCommands::Add(add_args) => {
-                    // Resolve (base_url, branch) using URL parsing + default branch resolution
-                    let (base_url, branch) = match remote::resolve_project_url_and_branch(
-                        &add_args.remote_url,
-                        add_args.branch.as_deref(),
-                        |url| async move { remote::resolve_default_branch(&url).await },
-                    )
-                    .await
-                    {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
-                    client.add_project(&base_url, &branch).await
-                }
-                ProjectCommands::Remove(remove_args) => {
-                    client.delete_project(&remove_args.project_id).await
-                }
-                ProjectCommands::Status(status_args) => {
-                    if let Some(ref id) = status_args.project_id {
-                        client.get_project(id).await
-                    } else {
-                        client.list_projects_management().await
-                    }
-                }
-                ProjectCommands::Sync(sync_args) => {
-                    if sync_args.all {
-                        // Sync all registered projects
-                        let sync_server = sync_args.server.clone();
-                        let sync_client = remote::RemoteClient::new(&sync_server, None);
-                        let projects = match sync_client.list_all_projects().await {
-                            Ok(p) => p,
-                            Err(e) => {
-                                eprintln!("Error listing projects: {}", e);
-                                std::process::exit(1);
-                            }
-                        };
-
-                        if projects.is_empty() {
-                            println!("No projects registered. Nothing to sync.");
-                            std::process::exit(0);
-                        }
-
-                        let mut any_failed = false;
-                        for project in &projects {
-                            match sync_client.sync_project(&project.id).await {
-                                Ok(()) => {
-                                    println!(
-                                        "project {}: synced ({}#{})",
-                                        project.id, project.remote_url, project.branch
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "project {}: failed to sync ({}#{}) - {}",
-                                        project.id, project.remote_url, project.branch, e
-                                    );
-                                    any_failed = true;
-                                }
-                            }
-                        }
-                        if any_failed {
-                            std::process::exit(1);
-                        }
-                        std::process::exit(0);
-                    } else if let Some(ref project_id) = sync_args.project_id {
-                        client.git_sync(project_id).await
-                    } else {
-                        eprintln!("Error: specify --all or a PROJECT_ID");
-                        std::process::exit(1);
-                    }
-                }
-            };
-
-            match result {
-                Ok(value) => {
-                    if args.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&value).unwrap_or_default()
-                        );
-                    } else {
-                        print_projects_human(&value);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-
-        // Service subcommand: manage cflx server as a background service
-        Some(Commands::Service(args)) => {
-            use cli::ServiceSubcommand;
-            let result = match args.command {
-                ServiceSubcommand::Install => service::install(),
-                ServiceSubcommand::Uninstall => service::uninstall(),
-                ServiceSubcommand::Status => service::status(),
-                ServiceSubcommand::Start => service::start(),
-                ServiceSubcommand::Stop => service::stop(),
-                ServiceSubcommand::Restart => service::restart(),
-            };
-            if let Err(e) = result {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-
         // install-skills subcommand: install agent skills
         Some(Commands::InstallSkills(args)) => {
             if let Some(src) = &args.legacy_source {
@@ -1532,42 +1240,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod project_command_tests {
-    use super::*;
-
-    /// When `--server` is specified explicitly the URL is returned as-is.
-    #[test]
-    fn test_resolve_project_server_url_explicit() {
-        let url = resolve_project_server_url(Some("http://custom:1234"));
-        assert_eq!(url, "http://custom:1234");
-    }
-
-    /// Without global config the URL falls back to the default (127.0.0.1:39876).
-    #[test]
-    fn test_resolve_project_server_url_default_fallback() {
-        let url = resolve_project_server_url(None);
-        assert!(
-            url.starts_with("http://"),
-            "Expected http URL, got: {}",
-            url
-        );
-        assert!(url.contains(':'), "URL should contain a port: {}", url);
-    }
-
-    /// When `explicit_server=true` the auth guard always passes (no global config check).
-    #[test]
-    fn test_check_project_auth_explicit_server_always_passes() {
-        let result = check_project_auth_not_required("http://custom:1234", true);
-        assert!(result.is_ok(), "Should pass for explicit server URL");
-    }
-
-    /// Without global config the auth mode defaults to None, so the guard passes.
-    #[test]
-    fn test_check_project_auth_default_no_auth_passes() {
-        let result = check_project_auth_not_required("http://127.0.0.1:39876", false);
-        assert!(result.is_ok(), "Should pass when auth mode is None");
-    }
 }

@@ -7,7 +7,7 @@ Provides HTTP-based monitoring capabilities for the orchestrator, including REST
 
 ### Requirement: HTTP Server Lifecycle
 
-オーケストレーターは、オーケストレーション状態を監視するための任意のHTTPサーバーを提供しなければならない（SHALL）。
+When web monitoring is enabled for a local TUI or `cflx run` process, the HTTP server SHALL start as a process-scoped single-instance monitoring and remote-control endpoint. The system SHALL NOT provide a standalone multi-project server daemon.
 
 #### Scenario: Server enabled via CLI flag
 - **WHEN** ユーザーが`--web`を指定し、CLIおよび設定ファイルでポートが未指定
@@ -38,8 +38,14 @@ Provides HTTP-based monitoring capabilities for the orchestrator, including REST
 - **THEN** run モードが起動したHTTPサーバーと関連バックグラウンドタスクは停止する
 - **AND** プロセスは追加の外部シグナルなしで正常終了する
 
+#### Scenario: No standalone daemon lifecycle
+- **GIVEN** the installed CLI
+- **WHEN** a user requests CLI help
+- **THEN** no standalone multi-project server command or service lifecycle is advertised
+
 ### Requirement: Configuration Options
-オーケストレーターは、CLIと設定ファイルでWeb監視のパラメータを設定できなければならない（SHALL）。
+
+The HTTP monitoring server SHALL remain configurable by its retained CLI options and `web` configuration. Removed multi-project `server.*` configuration SHALL NOT be required to start or use local web monitoring.
 
 #### Scenario: Port configuration via CLI
 - **WHEN** ユーザーが`--web --web-port 3000`で実行する
@@ -54,6 +60,16 @@ Provides HTTP-based monitoring capabilities for the orchestrator, including REST
 - **WHEN** 設定ファイルに`web.enabled = true`と`web.port = 9000`がある
 - **THEN** CLIフラグがなくてもHTTPサーバーはポート9000で起動する
 - **AND** CLIで指定した値は設定ファイルより優先される
+
+#### Scenario: Retained web options configure listener
+- **GIVEN** a local TUI or run invocation
+- **WHEN** the user supplies retained web bind, port, token, token-env, or allowed-origin options
+- **THEN** those values configure the process-scoped web listener under existing validation rules
+
+#### Scenario: Server configuration is absent
+- **GIVEN** a configuration without obsolete `server.*` fields
+- **WHEN** local web monitoring starts
+- **THEN** startup does not require multi-project server configuration
 
 ### Requirement: REST API - Health Check
 The HTTP server SHALL provide a health check endpoint for monitoring service availability.

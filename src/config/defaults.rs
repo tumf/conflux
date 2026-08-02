@@ -159,17 +159,6 @@ pub const DEFAULT_ERROR_CIRCUIT_BREAKER_THRESHOLD: usize = 5;
 /// Default maximum number of acceptance CONTINUE retries before treating as FAIL
 pub const DEFAULT_ACCEPTANCE_MAX_CONTINUES: u32 = 10;
 
-// ── Proposal session defaults ──────────────────────────────────────────────
-
-/// Default transport command for proposal sessions (ACP subprocess)
-pub const DEFAULT_PROPOSAL_TRANSPORT_COMMAND: &str = "opencode";
-
-/// Default transport arguments for proposal sessions (ACP stdio mode)
-pub const DEFAULT_PROPOSAL_TRANSPORT_ARGS: &[&str] = &["acp"];
-
-/// Default inactivity timeout for proposal sessions (seconds)
-pub const DEFAULT_PROPOSAL_SESSION_INACTIVITY_TIMEOUT_SECS: u64 = 1800;
-
 // ── External lifecycle integration defaults ────────────────────────────────
 
 /// Default bounded queue capacity for the external lifecycle dispatcher.
@@ -183,42 +172,6 @@ pub const DEFAULT_LIFECYCLE_WRITE_TIMEOUT_MS: u64 = 2_000;
 
 /// Default bounded shutdown deadline for the lifecycle adapter (milliseconds).
 pub const DEFAULT_LIFECYCLE_SHUTDOWN_TIMEOUT_MS: u64 = 2_000;
-
-// ── Server defaults ───────────────────────────────────────────────────────
-
-/// Default server bind address
-pub const DEFAULT_SERVER_BIND: &str = "127.0.0.1";
-
-/// Default server port
-pub const DEFAULT_SERVER_PORT: u16 = 39876;
-
-/// Default maximum concurrent project executions (server mode)
-pub const DEFAULT_SERVER_MAX_CONCURRENT_TOTAL: usize = 4;
-
-/// Default server data directory (relative path component, under XDG_DATA_HOME/cflx/)
-pub const DEFAULT_SERVER_DATA_SUBDIR: &str = "server";
-
-/// Returns the default server data directory path.
-/// Uses ${XDG_DATA_HOME}/cflx/server, falling back to ~/.local/share/cflx/server.
-pub fn default_server_data_dir() -> std::path::PathBuf {
-    if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
-        if !xdg_data_home.is_empty() {
-            return std::path::PathBuf::from(xdg_data_home)
-                .join("cflx")
-                .join(DEFAULT_SERVER_DATA_SUBDIR);
-        }
-    }
-    if let Some(home) = dirs::home_dir() {
-        return home
-            .join(".local")
-            .join("share")
-            .join("cflx")
-            .join(DEFAULT_SERVER_DATA_SUBDIR);
-    }
-    std::env::temp_dir()
-        .join("cflx-server-fallback")
-        .join(DEFAULT_SERVER_DATA_SUBDIR)
-}
 
 /// Generates a project slug from the repository root path.
 /// Format: `{repo_basename}-{hash8}` where hash8 is the first 8 chars of the SHA256 hash
@@ -328,38 +281,6 @@ pub fn default_workspace_base_dir(repo_root: Option<&std::path::Path>) -> PathBu
         path = path.join(slug);
     }
     path
-}
-
-/// Returns server service log path using XDG_STATE_HOME-compliant defaults.
-///
-/// - Uses `${XDG_STATE_HOME}/cflx/server.log` when XDG_STATE_HOME is set and non-empty
-/// - Falls back to `~/.local/state/cflx/server.log` when home directory is available
-/// - Falls back to `{temp_dir}/cflx-server.log` when home directory is unavailable
-#[cfg(target_os = "macos")]
-pub fn get_server_log_path() -> PathBuf {
-    let xdg_state_home = std::env::var("XDG_STATE_HOME").ok();
-    get_server_log_path_from(xdg_state_home.as_deref(), dirs::home_dir())
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn get_server_log_path_from(xdg_state_home: Option<&str>, home_dir: Option<PathBuf>) -> PathBuf {
-    if let Some(xdg_state_home) = xdg_state_home {
-        if !xdg_state_home.is_empty() {
-            return PathBuf::from(xdg_state_home)
-                .join("cflx")
-                .join("server.log");
-        }
-    }
-
-    if let Some(home) = home_dir {
-        return home
-            .join(".local")
-            .join("state")
-            .join("cflx")
-            .join("server.log");
-    }
-
-    std::env::temp_dir().join("cflx-server.log")
 }
 
 /// Generates log file path using XDG_STATE_HOME with project_slug and date.
@@ -682,51 +603,6 @@ mod tests {
             "Expected path to end with '.log', got {:?}",
             log_path
         );
-    }
-
-    #[test]
-    fn test_get_server_log_path_with_xdg_state_home() {
-        let result = get_server_log_path_from(
-            Some("/custom/state"),
-            Some(PathBuf::from("/home/test-user")),
-        );
-
-        assert_eq!(result, PathBuf::from("/custom/state/cflx/server.log"));
-    }
-
-    #[test]
-    fn test_get_server_log_path_without_xdg_state_home() {
-        use std::env;
-
-        let original = env::var("XDG_STATE_HOME").ok();
-        remove_env_var("XDG_STATE_HOME");
-
-        let home = PathBuf::from("/home/test-user");
-        let result = get_server_log_path_from(None, Some(home.clone()));
-
-        assert_eq!(result, home.join(".local/state/cflx/server.log"));
-
-        match original {
-            Some(val) => set_env_var("XDG_STATE_HOME", val),
-            None => remove_env_var("XDG_STATE_HOME"),
-        }
-    }
-
-    #[test]
-    fn test_get_server_log_path_without_home_directory() {
-        use std::env;
-
-        let original = env::var("XDG_STATE_HOME").ok();
-        remove_env_var("XDG_STATE_HOME");
-
-        let result = get_server_log_path_from(None, None);
-
-        assert_eq!(result, std::env::temp_dir().join("cflx-server.log"));
-
-        match original {
-            Some(val) => set_env_var("XDG_STATE_HOME", val),
-            None => remove_env_var("XDG_STATE_HOME"),
-        }
     }
 
     #[test]

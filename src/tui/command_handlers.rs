@@ -153,7 +153,6 @@ pub struct TuiCommandContext<'a> {
     pub config: &'a OrchestratorConfig,
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub dynamic_queue: &'a DynamicQueue,
-    pub remote_client: Option<crate::remote::RemoteClient>,
     pub post_archive_action: PostArchiveAction,
     /// Invocation-scoped upstream publication runtime for local parallel TUI.
     ///
@@ -221,42 +220,6 @@ pub async fn handle_start_processing_command(
 
     if let Some(TuiCommand::StartProcessing(selected_ids)) = cmd {
         if !selected_ids.is_empty() {
-            // Remote server mode: trigger server-side run instead of local orchestrator.
-            if let Some(remote) = ctx.remote_client.as_ref() {
-                // Group selected changes by project_id (encoded as "<project_id>::...").
-                let mut by_project: std::collections::BTreeMap<String, Vec<String>> =
-                    std::collections::BTreeMap::new();
-                for id in &selected_ids {
-                    let Some((project_id, rest)) = id.split_once("::") else {
-                        // Unknown format; skip.
-                        continue;
-                    };
-                    // rest looks like "<project_name>/<change_id>".
-                    let change_id = rest.rsplit('/').next().unwrap_or(rest).to_string();
-                    by_project
-                        .entry(project_id.to_string())
-                        .or_default()
-                        .push(change_id);
-                }
-
-                for (project_id, change_ids) in by_project {
-                    if let Err(e) = remote.control_run(&project_id, Some(change_ids)).await {
-                        ctx.app.add_log(LogEntry::error(format!(
-                            "Remote run failed for {}: {}",
-                            project_id, e
-                        )));
-                    } else {
-                        ctx.app.add_log(LogEntry::success(format!(
-                            "Remote run started: {}",
-                            project_id
-                        )));
-                    }
-                }
-
-                // No local orchestrator task.
-                return None;
-            }
-
             // An opted-in session's terminal success is remote confirmation, and
             // the serial dispatch branch below carries no upstream runtime — work
             // dispatched there would finalize as terminal `merged` and publish
@@ -895,7 +858,6 @@ mod tests {
             config,
             tx,
             dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: false,
@@ -1007,7 +969,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: false,
@@ -1079,7 +1040,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -1135,7 +1095,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: false,
@@ -1170,7 +1129,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -1225,7 +1183,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -1293,7 +1250,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -1357,7 +1313,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -1411,7 +1366,6 @@ mod tests {
                 config: &config,
                 tx: &tx,
                 dynamic_queue: &dynamic_queue,
-                remote_client: None,
                 post_archive_action: PostArchiveAction::MergeToBase,
                 upstream_runtime: None,
                 orchestrator_running: running,
@@ -1448,7 +1402,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -1595,7 +1548,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: Some(crate::upstream::UpstreamRuntime {
                 config: crate::upstream::UpstreamIntegrationConfig::new("origin", "exit 0"),
@@ -1707,7 +1659,6 @@ mod tests {
             config: &config,
             tx: &tx,
             dynamic_queue: &dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: Some(crate::upstream::UpstreamRuntime {
                 config: crate::upstream::UpstreamIntegrationConfig::new("origin", "exit 0"),
@@ -1826,7 +1777,6 @@ mod operator_command_parity_tests {
             config: &config,
             tx: &tx,
             dynamic_queue: queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running: true,
@@ -2262,7 +2212,6 @@ mod operator_command_parity_tests {
             config,
             tx,
             dynamic_queue,
-            remote_client: None,
             post_archive_action: PostArchiveAction::MergeToBase,
             upstream_runtime: None,
             orchestrator_running,

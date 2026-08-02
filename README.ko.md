@@ -52,7 +52,7 @@ Conflux가 지향하는 것은 일회성 코드 생성만이 아닙니다. 먼�
 | `F5` | 처리 시작, 재개, 재시도 또는 계속 |
 | `x` | 처리 실행 중 eligible `not queued` change 를 큐에 추가 |
 
-서버 모드, 원격 TUI, REST API, `cflx service`에 대해서는 [서버 모드 가이드(영문)](docs/guides/SERVER.md)를 참고하세요.
+웹 모니터링 UI, REST API, `/api/v2`에 대해서는 [Web UI 가이드(영문)](docs/guides/WEBUI.md)를 참고하세요.
 
 ## 빠른 시작
 
@@ -123,7 +123,7 @@ cargo install cflx
 | 문서 | 설명 |
 |----------|-------------|
 | [QUICKSTART.ko.md](QUICKSTART.ko.md) | 초기 설정 |
-| [서버 모드 가이드(영문)](docs/guides/SERVER.md) | 서버 모드, 원격 TUI, Web UI, REST API, 백그라운드 서비스 |
+| [Web UI 가이드(영문)](docs/guides/WEBUI.md) | Web UI, REST API, `/api/v2`, 서버 모드에서의 마이그레이션 |
 | [README.md](README.md) | 전체 문서(영어) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | 사용 예시 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 기여 가이드 |

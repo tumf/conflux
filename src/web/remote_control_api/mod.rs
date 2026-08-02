@@ -5,12 +5,10 @@
 //! command from a closed set with optimistic concurrency and idempotency, and
 //! follow an ordered, resumable event stream.
 //!
-//! It is deliberately separate from two things it could be confused with:
-//!
-//! * the legacy single-instance `/api/*` routes and `/ws`, which the dashboard
-//!   still uses and which keep working unchanged;
-//! * multi-project server-mode `/api/v1`, which supervises many projects and is
-//!   a different contract with a different lifetime.
+//! It is deliberately separate from the legacy single-instance `/api/*` routes
+//! and `/ws`, which the browser monitoring UI still uses and which keep working
+//! unchanged. `/api/v2` is the only versioned remote-control namespace; the
+//! multi-project `/api/v1` namespace was removed with server mode.
 //!
 //! Everything v2 tracks — `instance_id`, `state_revision`, `event_sequence`, the
 //! command registry — is scoped to one process incarnation and is gone after a

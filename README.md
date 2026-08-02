@@ -52,7 +52,7 @@ Useful TUI keys:
 | `F5` | Start, resume, retry, or continue processing |
 | `x` | Queue eligible `not queued` changes while processing is running |
 
-For server mode, remote TUI, REST API, and `cflx service`, see the [Server Mode Guide (English)](docs/guides/SERVER.md).
+For the web monitoring UI, REST API, and `/api/v2`, see the [Web UI Guide (English)](docs/guides/WEBUI.md).
 
 ## Quick Start
 
@@ -123,7 +123,7 @@ cargo install cflx
 | Document | Description |
 |----------|-------------|
 | [QUICKSTART.md](QUICKSTART.md) | Initial setup |
-| [Server Mode Guide (English)](docs/guides/SERVER.md) | Server mode, remote TUI, Web UI, REST API, background service |
+| [Web UI Guide (English)](docs/guides/WEBUI.md) | Web UI, REST API, `/api/v2`, migrating from server mode |
 | [README.ja.md](README.ja.md) | Full documentation (Japanese) |
 | [docs/guides/USAGE.md](docs/guides/USAGE.md) | Usage examples |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution guide |

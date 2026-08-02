@@ -3068,6 +3068,71 @@ mod openspec_list_show_tests {
         assert!(err.contains("### Requirement: Missing Feature"));
     }
 
+    /// Removing every requirement of a capability deletes its canonical directory.
+    ///
+    /// Promotion alone would leave a preamble-only `spec.md` behind, which still
+    /// advertises a capability that no longer defines any behavior.
+    #[test]
+    fn test_archive_removes_canonical_capability_left_without_requirements() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "obsolete-capability",
+            "# Obsolete Capability\n\n### Requirement: Only Feature\n\nOld behavior.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/remove-only-feature"),
+            "obsolete-capability",
+            "## REMOVED Requirements\n\n### Requirement: Only Feature\n\nRemoved.\n\n#### Scenario: No only feature\n- WHEN the capability is inspected\n- THEN no requirement remains\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        let message = mgr
+            .archive_change("remove-only-feature", false)
+            .expect("archive should succeed");
+
+        assert!(message.contains("obsolete-capability"));
+        assert!(
+            !temp
+                .path()
+                .join("openspec/specs/obsolete-capability")
+                .exists(),
+            "a capability with no remaining requirements must not keep a canonical directory"
+        );
+    }
+
+    /// A capability that keeps at least one requirement is preserved.
+    #[test]
+    fn test_archive_keeps_canonical_capability_with_remaining_requirements() {
+        let temp = TempDir::new().unwrap();
+        let _guard = CwdTestGuard::enter(temp.path());
+
+        create_canonical_spec(
+            temp.path(),
+            "partial-capability",
+            "# Partial Capability\n\n### Requirement: Doomed Feature\n\nOld behavior.\n\n### Requirement: Kept Feature\n\nStays.\n",
+        );
+        create_strict_change_with_spec_delta(
+            &temp.path().join("openspec/changes/remove-doomed-feature"),
+            "partial-capability",
+            "## REMOVED Requirements\n\n### Requirement: Doomed Feature\n\nRemoved.\n\n#### Scenario: No doomed feature\n- WHEN the capability is inspected\n- THEN only the kept requirement remains\n",
+        );
+
+        let mgr = OpenSpecManager::new();
+        mgr.archive_change("remove-doomed-feature", false)
+            .expect("archive should succeed");
+
+        let canonical = fs::read_to_string(
+            temp.path()
+                .join("openspec/specs/partial-capability/spec.md"),
+        )
+        .expect("partially modified capability must keep its canonical spec");
+        assert!(canonical.contains("### Requirement: Kept Feature"));
+        assert!(!canonical.contains("### Requirement: Doomed Feature"));
+    }
+
     #[test]
     fn test_archive_change_creates_dated_destination_and_message() {
         let temp = TempDir::new().unwrap();
