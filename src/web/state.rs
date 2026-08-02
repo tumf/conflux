@@ -5,6 +5,11 @@
 use crate::events::{EventSink, ExecutionEvent, LogEntry};
 use crate::openspec::Change;
 use crate::tui::types::WorktreeInfo;
+use crate::web::operator_facts::OperatorFactsStore;
+use crate::web::remote_control_api::dto::{
+    AttentionState, BlockerKind as RemoteBlockerKind, ChangeActivity, ChangeBlocker, ChangeTiming,
+    ChangeWorktree, ParallelEligibility, QueueIntent as RemoteQueueIntent,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -34,7 +39,7 @@ pub enum ControlCommand {
 }
 
 /// Change status projected into the `/api/v2` snapshot
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "web-monitoring", derive(ToSchema))]
 pub struct ChangeStatus {
     /// Change ID
@@ -57,6 +62,33 @@ pub struct ChangeStatus {
     /// Current iteration number for apply/archive loops
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iteration_number: Option<u32>,
+    /// Process-local execution mark (operator intent, never durable).
+    #[serde(default)]
+    pub execution_marked: bool,
+    /// Reducer-owned queue intent, kept distinct from `queue_status`.
+    #[serde(default)]
+    pub queue_intent: RemoteQueueIntent,
+    /// Reducer-derived blocker detail for a blocked or stalled change.
+    #[serde(default)]
+    pub blocker: Option<ChangeBlocker>,
+    /// Sanitized change-local error detail.
+    #[serde(default)]
+    pub error_detail: Option<String>,
+    /// Server-observed parallel-execution eligibility.
+    #[serde(default)]
+    pub parallel: ParallelEligibility,
+    /// Run timing boundaries.
+    #[serde(default)]
+    pub timing: ChangeTiming,
+    /// Latest lifecycle-significant activity.
+    #[serde(default)]
+    pub latest_activity: Option<ChangeActivity>,
+    /// Managed worktree relation.
+    #[serde(default)]
+    pub worktree: Option<ChangeWorktree>,
+    /// Operator attention state.
+    #[serde(default)]
+    pub attention: AttentionState,
 }
 
 impl From<&Change> for ChangeStatus {
@@ -78,6 +110,19 @@ impl From<&Change> for ChangeStatus {
             dependencies: change.dependencies.clone(),
             queue_status: None, // Set by event handlers based on execution state
             iteration_number: None, // Set by event handlers during apply/archive loops
+            // Every authoritative operator field below is filled in by
+            // `enrich_operator_state`, from the reducer, the execution-mark
+            // store, and the process-local facts store. A change parsed from
+            // disk carries none of them on its own.
+            execution_marked: false,
+            queue_intent: RemoteQueueIntent::NotQueued,
+            blocker: None,
+            error_detail: None,
+            parallel: ParallelEligibility::default(),
+            timing: ChangeTiming::default(),
+            latest_activity: None,
+            worktree: None,
+            attention: AttentionState::None,
         }
     }
 }
@@ -106,6 +151,10 @@ pub struct OrchestratorStateSnapshot {
     pub app_mode: String,
     /// Whether resolve is currently running
     pub is_resolving: bool,
+    /// Sanitized fatal process-level error, kept distinct from a change's own
+    /// error so "the run died" and "one change failed" stay separable.
+    #[serde(default)]
+    pub process_error: Option<String>,
 }
 
 impl OrchestratorStateSnapshot {
@@ -177,6 +226,7 @@ impl OrchestratorStateSnapshot {
             worktrees: Vec::new(),
             app_mode: "select".to_string(),
             is_resolving: false,
+            process_error: None,
         }
     }
 }
@@ -215,6 +265,60 @@ fn apply_reducer_derived_queue_statuses(
         if apply_count > 0 {
             change.iteration_number = Some(apply_count);
         }
+    }
+    apply_reducer_derived_operator_state(state, shared);
+}
+
+/// Copy the reducer-owned operator decision fields onto every change.
+///
+/// Queue intent, blocker detail, and change-local error are read straight off
+/// the reducer's own runtime state rather than re-derived from the display
+/// status: `blocked` alone cannot tell a dependency wait from an external
+/// prerequisite wait, and `error` alone carries no message.
+fn apply_reducer_derived_operator_state(
+    state: &mut OrchestratorStateSnapshot,
+    shared: &crate::orchestration::state::OrchestratorState,
+) {
+    use crate::orchestration::state::{ChangeRuntimeState, QueueIntent};
+
+    for change in &mut state.changes {
+        let runtime = shared.change_runtime(&change.id);
+        change.queue_intent = match runtime.map(|rt| &rt.queue_intent) {
+            Some(QueueIntent::Queued) => RemoteQueueIntent::Queued,
+            _ => RemoteQueueIntent::NotQueued,
+        };
+        change.blocker = runtime
+            .and_then(ChangeRuntimeState::blocker_view)
+            .map(project_blocker);
+        change.error_detail = runtime
+            .and_then(ChangeRuntimeState::error_message)
+            .map(crate::events::sanitize_detail);
+    }
+}
+
+/// Project the reducer's blocker view into the wire DTO.
+fn project_blocker(view: crate::orchestration::state::BlockerView) -> ChangeBlocker {
+    use crate::orchestration::state::BlockerKind;
+
+    ChangeBlocker {
+        status: view.status.to_string(),
+        kind: match view.kind {
+            BlockerKind::None => RemoteBlockerKind::None,
+            BlockerKind::Dependency => RemoteBlockerKind::Dependency,
+            BlockerKind::External => RemoteBlockerKind::External,
+        },
+        category: view.category.as_deref().map(crate::events::sanitize_detail),
+        detail: view.detail.as_deref().map(crate::events::sanitize_detail),
+        unblock_condition: view
+            .unblock_condition
+            .as_deref()
+            .map(crate::events::sanitize_detail),
+        prerequisite_owner: view
+            .prerequisite_owner
+            .as_deref()
+            .map(crate::events::sanitize_detail),
+        origin: view.origin.as_deref().map(crate::events::sanitize_detail),
+        resumable: view.resumable,
     }
 }
 
@@ -284,6 +388,18 @@ pub struct WebState {
     /// Created with the process so `instance_id` exists from the first request,
     /// independently of whether an orchestration runtime is ever bound.
     remote_control: Arc<crate::web::remote_control_api::RemoteControlRuntime>,
+    /// Process-local execution marks, shared with the operator command service.
+    ///
+    /// Late-bound for the same reason the executor is: the web server can start
+    /// before an orchestration runtime exists. Until it is bound, every change
+    /// reports `execution_marked: false`, which is exactly what a process with no
+    /// operator intent yet should report.
+    execution_marks: tokio::sync::RwLock<
+        Option<Arc<crate::orchestration::operator_command::ExecutionMarkStore>>,
+    >,
+    /// Timing, latest activity, attention, parallel eligibility, and worktree
+    /// relation for this process incarnation.
+    operator_facts: tokio::sync::RwLock<OperatorFactsStore>,
 }
 
 impl WebState {
@@ -296,6 +412,8 @@ impl WebState {
             control_tx: Mutex::new(None),
             shared_orchestrator_state: tokio::sync::RwLock::new(None),
             remote_control: Arc::new(crate::web::remote_control_api::RemoteControlRuntime::new()),
+            execution_marks: tokio::sync::RwLock::new(None),
+            operator_facts: tokio::sync::RwLock::new(OperatorFactsStore::new()),
         }
     }
 
@@ -304,14 +422,84 @@ impl WebState {
         self.remote_control.clone()
     }
 
+    /// Bind the shared process-local execution-mark store.
+    ///
+    /// The same `Arc` the operator command service mutates, so a mark set by a
+    /// remote command or by a keypress is readable at the next revision without
+    /// a second copy that could drift.
+    pub async fn set_execution_marks(
+        &self,
+        marks: Arc<crate::orchestration::operator_command::ExecutionMarkStore>,
+    ) {
+        *self.execution_marks.write().await = Some(marks);
+        self.sync_remote_control_projection().await;
+    }
+
+    /// Bind the repository root used to redact published worktree paths.
+    pub async fn set_repo_root(&self, repo_root: std::path::PathBuf) {
+        self.operator_facts.write().await.set_repo_root(repo_root);
+    }
+
+    /// Reconcile attention tracking with a complete change list.
+    async fn observe_changes_for_attention(&self, changes: &[Change]) {
+        self.operator_facts
+            .write()
+            .await
+            .observe_changes(changes.iter().map(|change| change.id.as_str()));
+    }
+
+    /// The monitoring snapshot with every authoritative operator field filled in.
+    ///
+    /// This is the only input the v2 projection is built from, so the reducer
+    /// state, the execution marks, and the process-local facts are read at one
+    /// instant and published at one revision rather than trickling in.
+    async fn operator_snapshot(&self) -> OrchestratorStateSnapshot {
+        let mut snapshot = self.get_state().await;
+
+        // The reducer is the authority for display status, queue intent,
+        // blocker detail, and change-local error. Reading all of them here — not
+        // only on the event paths that happen to set `updated` — is what makes a
+        // reducer-only transition such as an acceptance hold visible at the
+        // revision it happened. `try_read` matches the rest of this file: a
+        // contended reducer must not stall event projection.
+        if let Ok(shared_state_opt) = self.shared_orchestrator_state.try_read() {
+            if let Some(shared_arc) = shared_state_opt.as_ref() {
+                if let Ok(shared) = shared_arc.try_read() {
+                    apply_reducer_derived_queue_statuses(&mut snapshot, &shared);
+                    refresh_summary(&mut snapshot);
+                }
+            }
+        }
+
+        let marks = self.execution_marks.read().await.clone();
+        let facts = self.operator_facts.read().await;
+        snapshot.process_error = facts.process_error();
+        for change in &mut snapshot.changes {
+            change.execution_marked = marks
+                .as_ref()
+                .is_some_and(|marks| marks.is_marked(&change.id));
+            let change_facts = facts.facts(&change.id);
+            change.parallel = change_facts.parallel;
+            change.worktree = change_facts.worktree.clone();
+            change.timing = change_facts.timing.clone();
+            change.latest_activity = change_facts.latest_activity.clone();
+            change.attention = change_facts.attention(
+                change.execution_marked,
+                matches!(change.queue_intent, RemoteQueueIntent::Queued),
+            );
+        }
+        snapshot
+    }
+
     /// Push the current monitoring snapshot into the v2 projection.
     ///
     /// Emits an event (and advances the revision) only when the projected
     /// snapshot really differs, so a periodic refresh over an idle process is
     /// invisible to v2 clients.
     pub async fn sync_remote_control_projection(&self) {
-        let candidate =
-            crate::web::remote_control_api::projection::project_snapshot(&self.get_state().await);
+        let candidate = crate::web::remote_control_api::projection::project_snapshot(
+            &self.operator_snapshot().await,
+        );
         self.remote_control
             .projection()
             .apply_state_if_changed("state_refreshed", candidate);
@@ -331,7 +519,7 @@ impl WebState {
             return;
         }
         let (event_type, change_id, payload) = v2::describe_event(event);
-        let candidate = v2::project_snapshot(&self.get_state().await);
+        let candidate = v2::project_snapshot(&self.operator_snapshot().await);
         projection.apply_state(event_type, change_id, payload, candidate);
     }
 
@@ -438,6 +626,7 @@ impl WebState {
             *state = new_state;
         }
 
+        self.observe_changes_for_attention(changes).await;
         self.sync_remote_control_projection().await;
     }
 
@@ -498,6 +687,7 @@ impl WebState {
             *state = new_state;
         }
 
+        self.observe_changes_for_attention(changes).await;
         self.sync_remote_control_projection().await;
     }
 
@@ -783,9 +973,44 @@ impl WebState {
             }
         }
 
+        // Absorb the same event into the process-local operator facts before the
+        // snapshot is projected, so timing, latest activity, eligibility, and
+        // the worktree relation all reach the client at the revision this event
+        // produced rather than one revision late.
+        self.absorb_operator_facts(event).await;
+
         // Project into `/api/v2` last, so the candidate snapshot it compares
         // against is the one this event just produced.
         self.project_execution_event(event).await;
+    }
+
+    /// Update the process-local operator facts from one execution event.
+    async fn absorb_operator_facts(&self, event: &ExecutionEvent) {
+        let mut facts = self.operator_facts.write().await;
+        match event {
+            ExecutionEvent::ChangesRefreshed {
+                changes,
+                rejected_changes,
+                committed_change_ids,
+                uncommitted_file_change_ids,
+                worktree_paths,
+                ..
+            } => {
+                facts.observe_changes(
+                    changes
+                        .iter()
+                        .chain(rejected_changes.iter())
+                        .map(|change| change.id.as_str()),
+                );
+                facts.apply_parallel_eligibility(committed_change_ids, uncommitted_file_change_ids);
+                facts.apply_worktree_paths(worktree_paths.clone());
+            }
+            ExecutionEvent::WorktreesRefreshed { worktrees } => {
+                facts.apply_worktrees(worktrees.clone());
+            }
+            _ => {}
+        }
+        facts.record_event(event);
     }
 
     pub async fn refresh_from_disk(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -800,6 +1025,10 @@ impl WebState {
 
         // Enrich progress from worktrees (uncommitted tasks.md)
         // Use unified fallback helper: worktree → archive → base
+        // The same lookup also supplies the change-to-worktree relation the v2
+        // snapshot publishes, so a monitoring-only process reports it too.
+        let mut worktree_paths: std::collections::HashMap<String, std::path::PathBuf> =
+            std::collections::HashMap::new();
         for change in &mut changes {
             let worktree_path =
                 match crate::vcs::git::get_worktree_path_for_change(&repo_root, &change.id).await {
@@ -810,6 +1039,9 @@ impl WebState {
                         None
                     }
                 };
+            if let Some(path) = &worktree_path {
+                worktree_paths.insert(change.id.clone(), path.clone());
+            }
 
             match crate::task_parser::parse_progress_with_fallback(
                 &change.id,
@@ -839,6 +1071,13 @@ impl WebState {
             let state = self.state.read().await;
             state.app_mode.clone()
         };
+
+        {
+            let mut facts = self.operator_facts.write().await;
+            facts.set_repo_root(repo_root.clone());
+            facts.apply_worktrees(worktrees.clone());
+            facts.apply_worktree_paths(worktree_paths);
+        }
 
         // Update state with refreshed changes, preserving app_mode
         self.update_with_mode(&changes, &current_app_mode).await;

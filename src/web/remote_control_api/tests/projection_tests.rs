@@ -242,16 +242,12 @@ fn snapshot_projection_preserves_reducer_derived_statuses() {
             dependencies: vec!["dep".to_string()],
             queue_status: Some("blocked".to_string()),
             iteration_number: Some(3),
+            ..Default::default()
         },
         crate::web::state::ChangeStatus {
             id: "idle-change".to_string(),
-            completed_tasks: 0,
-            total_tasks: 0,
-            progress_percent: 0.0,
             status: "pending".to_string(),
-            dependencies: Vec::new(),
-            queue_status: None,
-            iteration_number: None,
+            ..Default::default()
         },
     ];
     source.completed_changes = 0;
@@ -283,8 +279,8 @@ fn projected_snapshot_has_no_wall_clock_field() {
     assert!(!object.contains_key("timestamp"));
     assert_eq!(
         object.keys().collect::<Vec<_>>().len(),
-        4,
-        "snapshot fields: app_mode, is_resolving, changes, totals"
+        5,
+        "snapshot fields: app_mode, is_resolving, process_error, changes, totals"
     );
 }
 

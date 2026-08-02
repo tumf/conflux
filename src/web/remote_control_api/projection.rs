@@ -17,11 +17,17 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::events::{ExecutionEvent, LogEntry};
+use crate::orchestration::operator_command::{
+    classify_mark_route, classify_retry_route, is_active_status, is_final_status, MarkRoute,
+    OperatorMode, RetryRoute,
+};
+use crate::orchestration::state::BlockerKind;
 use crate::web::state::OrchestratorStateSnapshot;
 
 use super::dto::{
-    new_hex_id, ChangeResource, CommandRecord, CommandRequest, CommandState, EventCategory,
-    EventEnvelope, InstanceSnapshot, SnapshotTotals, MAX_EVENTS, MAX_LOGS,
+    new_hex_id, ActionBlockedReason, ActionEligibility, BlockerKind as DtoBlockerKind,
+    ChangeActions, ChangeBlocker, ChangeResource, CommandRecord, CommandRequest, CommandState,
+    EventCategory, EventEnvelope, InstanceSnapshot, SnapshotTotals, MAX_EVENTS, MAX_LOGS,
 };
 use super::registry::{CommandOutcome, CommandRegistry, IdempotencyLookup, ReserveError};
 
@@ -396,27 +402,42 @@ impl Projection {
 /// display taxonomy, and `not queued` is its explicit absence rather than a
 /// separate concept.
 pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot {
+    let mode = OperatorMode::from_app_mode(&source.app_mode);
     let changes: Vec<ChangeResource> = source
         .changes
         .iter()
-        .map(|change| ChangeResource {
-            id: change.id.clone(),
-            display_status: change
+        .map(|change| {
+            let display_status = change
                 .queue_status
                 .clone()
-                .unwrap_or_else(|| "not queued".to_string()),
-            progress_status: change.status.clone(),
-            completed_tasks: change.completed_tasks,
-            total_tasks: change.total_tasks,
-            progress_percent: change.progress_percent,
-            dependencies: change.dependencies.clone(),
-            iteration_number: change.iteration_number,
+                .unwrap_or_else(|| "not queued".to_string());
+            ChangeResource {
+                id: change.id.clone(),
+                actions: classify_actions(mode, &display_status, change.blocker.as_ref()),
+                display_status,
+                progress_status: change.status.clone(),
+                completed_tasks: change.completed_tasks,
+                total_tasks: change.total_tasks,
+                progress_percent: change.progress_percent,
+                dependencies: change.dependencies.clone(),
+                iteration_number: change.iteration_number,
+                execution_marked: change.execution_marked,
+                queue_intent: change.queue_intent,
+                attention: change.attention,
+                blocker: change.blocker.clone(),
+                error_detail: change.error_detail.clone(),
+                parallel: change.parallel,
+                timing: change.timing.clone(),
+                latest_activity: change.latest_activity.clone(),
+                worktree: change.worktree.clone(),
+            }
         })
         .collect();
 
     InstanceSnapshot {
         app_mode: source.app_mode.clone(),
         is_resolving: source.is_resolving,
+        process_error: source.process_error.clone(),
         totals: SnapshotTotals {
             total: changes.len(),
             completed: source.completed_changes,
@@ -425,6 +446,124 @@ pub fn project_snapshot(source: &OrchestratorStateSnapshot) -> InstanceSnapshot 
         },
         changes,
     }
+}
+
+/// Decide which change-addressed commands the current state permits.
+///
+/// Every decision comes from the shared lifecycle matrix in
+/// [`crate::orchestration::operator_command`] — the same one the TUI routes key
+/// presses through — so a remote controller and a keypress can never be offered
+/// different actions for the same change.
+///
+/// The rule is one-directional on purpose: an action reported as `allowed` must
+/// really pass its guards, while an action may be reported as blocked slightly
+/// more often than the reducer strictly requires. `resolve_merge` is the case
+/// where that matters: the reducer would also accept it for an idle non-terminal
+/// change, but advertising "resolve" on a change that is not waiting on a merge
+/// describes an operation nobody asked for.
+fn classify_actions(
+    mode: OperatorMode,
+    display_status: &str,
+    blocker: Option<&ChangeBlocker>,
+) -> ChangeActions {
+    let final_status = is_final_status(display_status);
+    let route = classify_mark_route(mode, display_status);
+
+    let immutable_reason = if final_status {
+        ActionBlockedReason::FinalStatus
+    } else if matches!(mode, OperatorMode::Stopping) {
+        ActionBlockedReason::StopPending
+    } else {
+        ActionBlockedReason::StatusImmutable
+    };
+
+    let set_execution_mark = match route {
+        MarkRoute::MarkOnly | MarkRoute::QueueIntent => ActionEligibility::allowed(),
+        MarkRoute::RetryRequired => ActionEligibility::blocked(ActionBlockedReason::RetryRequired),
+        MarkRoute::Immutable => ActionEligibility::blocked(immutable_reason),
+    };
+
+    let set_queue_intent = match route {
+        MarkRoute::QueueIntent => ActionEligibility::allowed(),
+        // Select and Stopped have no runtime queue to mutate; a base-lane wait in
+        // Running has one but refuses membership changes.
+        MarkRoute::MarkOnly if matches!(mode, OperatorMode::Select | OperatorMode::Stopped) => {
+            ActionEligibility::blocked(ActionBlockedReason::ModeHasNoQueue)
+        }
+        MarkRoute::MarkOnly => ActionEligibility::blocked(ActionBlockedReason::StatusImmutable),
+        MarkRoute::RetryRequired => ActionEligibility::blocked(ActionBlockedReason::RetryRequired),
+        MarkRoute::Immutable => ActionEligibility::blocked(immutable_reason),
+    };
+
+    let retry_change = classify_retry_action(display_status, blocker, final_status);
+
+    // `DequeueChange` is refused only for a final outcome; `error` and `stopped`
+    // are terminal for accounting but still dequeuable.
+    let stop_and_dequeue = if final_status {
+        ActionEligibility::blocked(ActionBlockedReason::FinalStatus)
+    } else {
+        ActionEligibility::allowed()
+    };
+
+    let resolve_merge = match display_status {
+        "merge wait" | "resolve pending" | "archived" => ActionEligibility::allowed(),
+        status if is_active_status(status) => {
+            ActionEligibility::blocked(ActionBlockedReason::ChangeActive)
+        }
+        status if is_final_status(status) => {
+            ActionEligibility::blocked(ActionBlockedReason::FinalStatus)
+        }
+        _ => ActionEligibility::blocked(ActionBlockedReason::NotMergeWaiting),
+    };
+
+    ChangeActions {
+        set_execution_mark,
+        set_queue_intent,
+        retry_change,
+        stop_and_dequeue,
+        resolve_merge,
+    }
+}
+
+/// Action eligibility for an `app_mode`/status pair, for tests and fixtures.
+#[cfg(test)]
+pub fn change_actions_for_test(
+    app_mode: &str,
+    display_status: &str,
+    blocker: Option<&ChangeBlocker>,
+) -> ChangeActions {
+    classify_actions(
+        OperatorMode::from_app_mode(app_mode),
+        display_status,
+        blocker,
+    )
+}
+
+/// Retry eligibility, including the non-resumable hold the service refuses.
+fn classify_retry_action(
+    display_status: &str,
+    blocker: Option<&ChangeBlocker>,
+    final_status: bool,
+) -> ActionEligibility {
+    if final_status {
+        return ActionEligibility::blocked(ActionBlockedReason::FinalStatus);
+    }
+    let blocker_kind = match blocker.map(|blocker| blocker.kind) {
+        Some(DtoBlockerKind::Dependency) => BlockerKind::Dependency,
+        Some(DtoBlockerKind::External) => BlockerKind::External,
+        _ => BlockerKind::None,
+    };
+    let Some(route) = classify_retry_route(display_status, blocker_kind) else {
+        return ActionEligibility::blocked(ActionBlockedReason::NoRetryableEvidence);
+    };
+    // A non-resumable acceptance hold keeps its blocker evidence instead of
+    // being retried, so it must not be advertised as retryable.
+    if matches!(route, RetryRoute::AcceptanceStall)
+        && blocker.is_some_and(|blocker| !blocker.resumable)
+    {
+        return ActionEligibility::blocked(ActionBlockedReason::HoldNotResumable);
+    }
+    ActionEligibility::allowed()
 }
 
 /// Wire event type, target change, and sanitized payload for an execution event.
@@ -495,6 +634,40 @@ pub fn describe_event(event: &ExecutionEvent) -> (&'static str, Option<String>, 
             ("acceptance_output", Some(change_id.clone()), None)
         }
         E::ProgressUpdated { change_id, .. } => ("progress_updated", Some(change_id.clone()), None),
+        // Post-archive and merge-lane transitions. They are the difference
+        // between "archived" and "actually landed", so a controller that cannot
+        // see them cannot tell a finished change from a waiting one.
+        E::ResolveStarted { change_id, .. } => ("resolve_started", Some(change_id.clone()), None),
+        E::ResolveCompleted { change_id, .. } => {
+            ("resolve_completed", Some(change_id.clone()), None)
+        }
+        E::ResolveFailed { change_id, error } => (
+            "resolve_failed",
+            Some(change_id.clone()),
+            Some(error.clone()),
+        ),
+        E::MergeCompleted { change_id, .. } => ("merge_completed", Some(change_id.clone()), None),
+        E::MergeDeferred {
+            change_id, reason, ..
+        } => (
+            "merge_deferred",
+            Some(change_id.clone()),
+            Some(reason.clone()),
+        ),
+        E::PushStarted { change_id, .. } => ("push_started", Some(change_id.clone()), None),
+        E::PushCompleted { change_id, .. } => ("push_completed", Some(change_id.clone()), None),
+        E::PushFailed {
+            change_id, error, ..
+        } => ("push_failed", Some(change_id.clone()), Some(error.clone())),
+        E::DependencyBlocked { change_id, .. } => {
+            ("dependency_blocked", Some(change_id.clone()), None)
+        }
+        E::DependencyResolved { change_id } => {
+            ("dependency_resolved", Some(change_id.clone()), None)
+        }
+        E::ChangeDequeued { change_id } => ("change_dequeued", Some(change_id.clone()), None),
+        // Process-level, not change-level.
+        E::Error { message } => ("process_error", None, Some(message.clone())),
         E::Log(entry) => ("log", entry.change_id.clone(), None),
         _ => ("orchestration_event", None, None),
     };

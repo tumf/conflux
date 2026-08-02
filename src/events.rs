@@ -89,6 +89,16 @@ pub fn command_log_summary(command: &str) -> String {
     )
 }
 
+/// Strip control characters and ANSI escapes from operator-facing detail and
+/// bound its length.
+///
+/// Exposed because log entries are not the only place a raw tool string reaches
+/// an operator: the `/api/v2` snapshot publishes blocker, error, and activity
+/// detail, and those must be sanitized by exactly the same rule.
+pub fn sanitize_detail(message: &str) -> String {
+    sanitize_log_message(message)
+}
+
 fn sanitize_log_message(message: &str) -> String {
     const MAX_LOG_MESSAGE_BYTES: usize = 8_192;
 

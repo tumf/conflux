@@ -7,6 +7,7 @@ mod auth_tests;
 mod command_tests;
 mod compatibility_tests;
 mod dto_tests;
+mod operator_snapshot_tests;
 mod projection_tests;
 mod read_tests;
 mod registry_tests;
@@ -23,7 +24,8 @@ use tower::ServiceExt;
 
 use crate::web::remote_control_api::auth::RemoteControlAuth;
 use crate::web::remote_control_api::dto::{
-    ChangeResource, CommandSpec, InstanceSnapshot, SnapshotTotals,
+    AttentionState, ChangeResource, ChangeTiming, CommandSpec, InstanceSnapshot,
+    ParallelEligibility, QueueIntent, SnapshotTotals,
 };
 use crate::web::remote_control_api::executor::{
     CommandFailure, ExecutionSummary, RemoteControlExecutor,
@@ -155,22 +157,45 @@ pub(crate) fn snapshot_with(change_id: &str, display_status: &str) -> InstanceSn
     InstanceSnapshot {
         app_mode: "running".to_string(),
         is_resolving: false,
-        changes: vec![ChangeResource {
-            id: change_id.to_string(),
-            display_status: display_status.to_string(),
-            progress_status: "in_progress".to_string(),
-            completed_tasks: 1,
-            total_tasks: 3,
-            progress_percent: 33.3,
-            dependencies: Vec::new(),
-            iteration_number: Some(1),
-        }],
+        process_error: None,
+        changes: vec![change_resource(change_id, display_status)],
         totals: SnapshotTotals {
             total: 1,
             completed: 0,
             in_progress: 1,
             pending: 0,
         },
+    }
+}
+
+/// One projected change with the operator fields at their empty values.
+///
+/// Built through the real projection so a test fixture can never drift from the
+/// action eligibility the server actually publishes.
+pub(crate) fn change_resource(change_id: &str, display_status: &str) -> ChangeResource {
+    ChangeResource {
+        id: change_id.to_string(),
+        display_status: display_status.to_string(),
+        progress_status: "in_progress".to_string(),
+        completed_tasks: 1,
+        total_tasks: 3,
+        progress_percent: 33.3,
+        dependencies: Vec::new(),
+        iteration_number: Some(1),
+        execution_marked: false,
+        queue_intent: QueueIntent::NotQueued,
+        attention: AttentionState::None,
+        blocker: None,
+        error_detail: None,
+        actions: crate::web::remote_control_api::projection::change_actions_for_test(
+            "running",
+            display_status,
+            None,
+        ),
+        parallel: ParallelEligibility::default(),
+        timing: ChangeTiming::default(),
+        latest_activity: None,
+        worktree: None,
     }
 }
 

@@ -84,6 +84,24 @@ pub enum OperatorMode {
     Error,
 }
 
+impl OperatorMode {
+    /// Parse the canonical `app_mode` token carried by the monitoring snapshot.
+    ///
+    /// The mapping lives next to the enum rather than in a frontend so every
+    /// surface resolves the same token to the same lifecycle mode. An unknown
+    /// token falls back to [`OperatorMode::Select`], which is the most
+    /// restrictive interpretation that still lets an operator express intent.
+    pub fn from_app_mode(app_mode: &str) -> Self {
+        match app_mode {
+            "running" => Self::Running,
+            "stopping" => Self::Stopping,
+            "stopped" => Self::Stopped,
+            "error" => Self::Error,
+            _ => Self::Select,
+        }
+    }
+}
+
 /// How an execution-mark request must be routed for a mode/status pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkRoute {

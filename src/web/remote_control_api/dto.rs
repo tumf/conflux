@@ -572,6 +572,233 @@ pub struct InstanceResponse {
     pub api_version: String,
 }
 
+// ============================================================================
+// Authoritative operator state
+// ============================================================================
+//
+// Everything below exists so a controller never has to *infer* an operator
+// decision. Each value is either reducer-owned, owned by the process-local
+// operator intent store, or a server-side observation — and each one is present
+// on every change, with an explicit empty value rather than an omitted key, so a
+// single `GET /api/v2/state` is a complete replacement for whatever a client had
+// before.
+
+/// Reducer-owned queue membership intent.
+///
+/// Deliberately separate from `display_status`: a change can be `Queued` while
+/// its display status reads `blocked`, and collapsing the two would make a
+/// client guess which one the operator actually asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueIntent {
+    /// The change has not been requested to run.
+    #[default]
+    NotQueued,
+    /// The change has been requested to run.
+    Queued,
+}
+
+/// Operator attention state for a change.
+///
+/// Process-local and non-durable: a restart re-observes the workspace and
+/// nothing carries a prior incarnation's attention forward.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionState {
+    /// Nothing to draw the operator's eye.
+    #[default]
+    None,
+    /// Newly detected in this process incarnation and not yet acted on.
+    New,
+}
+
+/// Machine-readable reason a change is `blocked`.
+///
+/// Mirrors [`crate::orchestration::state::BlockerKind`]; `none` is the value a
+/// `stalled` execution hold carries, because a stop is not a wait on a named
+/// prerequisite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerKind {
+    /// Not blocked on a named prerequisite.
+    #[default]
+    None,
+    /// Waiting on an unarchived proposal dependency.
+    Dependency,
+    /// Waiting on a validated non-repository prerequisite.
+    External,
+}
+
+/// Reducer-derived detail for a `blocked` or `stalled` change.
+///
+/// `null` on every other status, so a client can never render a blocker badge on
+/// a change that is not actually held.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeBlocker {
+    /// Reducer display status this blocker belongs to: `blocked` or `stalled`.
+    pub status: String,
+    /// Machine-readable kind; `none` for a stalled execution hold.
+    pub kind: BlockerKind,
+    /// Machine-readable blocker category, when the reporter supplied one.
+    pub category: Option<String>,
+    /// One-line operator-facing explanation.
+    pub detail: Option<String>,
+    /// Verifiable condition that clears an external wait.
+    pub unblock_condition: Option<String>,
+    /// Owning team or role for an external wait.
+    pub prerequisite_owner: Option<String>,
+    /// Phase that observed the prerequisite.
+    pub origin: Option<String>,
+    /// Whether work resumes once the prerequisite is satisfied.
+    pub resumable: bool,
+}
+
+/// Why an operator action is refused right now.
+///
+/// These are stable tokens, not prose: a client branches on them and never
+/// parses a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionBlockedReason {
+    /// The change reached a final outcome and accepts no operator mutation.
+    FinalStatus,
+    /// Recovery in this mode is owned by the retry commands.
+    RetryRequired,
+    /// A graceful stop is in flight; intent changes wait for it.
+    StopPending,
+    /// The mode/status pair refuses this mutation.
+    StatusImmutable,
+    /// This mode has no runtime queue, so queue intent cannot be mutated.
+    ModeHasNoQueue,
+    /// The change carries no retryable evidence.
+    NoRetryableEvidence,
+    /// The hold is not resumable, so its blocker evidence is retained.
+    HoldNotResumable,
+    /// The change is executing and must be stopped rather than mutated.
+    ChangeActive,
+    /// The change is not waiting on a merge.
+    NotMergeWaiting,
+}
+
+/// Whether one operator action is currently permitted, and why not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ActionEligibility {
+    /// True when the command would pass its lifecycle guards right now.
+    pub allowed: bool,
+    /// Stable reason the command is refused; `null` when it is allowed.
+    pub blocked_reason: Option<ActionBlockedReason>,
+}
+
+impl ActionEligibility {
+    /// The action is permitted.
+    pub fn allowed() -> Self {
+        Self {
+            allowed: true,
+            blocked_reason: None,
+        }
+    }
+
+    /// The action is refused for the given stable reason.
+    pub fn blocked(reason: ActionBlockedReason) -> Self {
+        Self {
+            allowed: false,
+            blocked_reason: Some(reason),
+        }
+    }
+}
+
+/// Per-change eligibility for every change-addressed operator command.
+///
+/// Derived server-side from the one shared lifecycle matrix the TUI uses, so a
+/// remote frontend and a keypress can never disagree about what is offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeActions {
+    /// `set_execution_mark`.
+    pub set_execution_mark: ActionEligibility,
+    /// `set_queue_intent`.
+    pub set_queue_intent: ActionEligibility,
+    /// `retry_change`.
+    pub retry_change: ActionEligibility,
+    /// `stop_and_dequeue`.
+    pub stop_and_dequeue: ActionEligibility,
+    /// `resolve_merge`.
+    pub resolve_merge: ActionEligibility,
+}
+
+/// Why a change cannot take part in parallel execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelBlockedReason {
+    /// The change does not exist in the base commit tree.
+    NotCommitted,
+    /// The change has uncommitted or untracked files under its directory.
+    UncommittedChanges,
+}
+
+/// Server-observed parallel-execution eligibility.
+///
+/// Present so a client never has to run Git itself to decide whether a change
+/// can be queued in parallel mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ParallelEligibility {
+    /// True when the change may take part in parallel execution.
+    pub eligible: bool,
+    /// Stable reason it may not; `null` when it may.
+    pub blocked_reason: Option<ParallelBlockedReason>,
+}
+
+impl Default for ParallelEligibility {
+    fn default() -> Self {
+        Self {
+            eligible: true,
+            blocked_reason: None,
+        }
+    }
+}
+
+/// Active-run timing for one change.
+///
+/// Only boundary instants are published. A live elapsed counter in the snapshot
+/// would make every projection look changed and advance the revision forever, so
+/// a client derives "running for" from `started_at` itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeTiming {
+    /// When the current or most recent run started (RFC 3339).
+    pub started_at: Option<String>,
+    /// When it finished (RFC 3339); `null` while it is still running.
+    pub completed_at: Option<String>,
+    /// Duration of the finished run in milliseconds.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// The latest lifecycle-significant activity observed for a change.
+///
+/// Fed from the state-event projection, never from the log ring: a log must not
+/// advance the revision, and a per-chunk output event would churn it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeActivity {
+    /// Wire event type, identical to the stream's `event_type`.
+    pub event_type: String,
+    /// Observation time (RFC 3339).
+    pub timestamp: String,
+    /// Sanitized detail, when the event carried one.
+    pub detail: Option<String>,
+}
+
+/// Server-stated relation between a change and its managed worktree.
+///
+/// The path is repository-relative and produced by the same redaction the
+/// worktree resources use, so joining a change to `/api/v2/worktrees` is an
+/// exact match rather than a client-side guess. Absolute and canonical roots are
+/// never serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ChangeWorktree {
+    /// Repository-relative worktree path.
+    pub path: String,
+    /// Checked-out branch, when it is known.
+    pub branch: Option<String>,
+}
+
 /// One change as projected into the v2 snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ChangeResource {
@@ -592,6 +819,26 @@ pub struct ChangeResource {
     /// Apply/archive iteration number, when a loop is running.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iteration_number: Option<u32>,
+    /// Process-local execution mark. Never durable; `false` after a restart.
+    pub execution_marked: bool,
+    /// Reducer-owned queue intent, distinct from `display_status`.
+    pub queue_intent: QueueIntent,
+    /// Operator attention state.
+    pub attention: AttentionState,
+    /// Blocker detail for a `blocked` or `stalled` change; `null` otherwise.
+    pub blocker: Option<ChangeBlocker>,
+    /// Sanitized change-local error detail; `null` when the change has no error.
+    pub error_detail: Option<String>,
+    /// Eligibility for every change-addressed command.
+    pub actions: ChangeActions,
+    /// Parallel-execution eligibility.
+    pub parallel: ParallelEligibility,
+    /// Run timing boundaries.
+    pub timing: ChangeTiming,
+    /// Latest lifecycle-significant activity; `null` when nothing was observed.
+    pub latest_activity: Option<ChangeActivity>,
+    /// Managed worktree relation; `null` when no worktree exists.
+    pub worktree: Option<ChangeWorktree>,
 }
 
 /// Aggregate counts over the projected changes.
@@ -618,6 +865,11 @@ pub struct InstanceSnapshot {
     pub app_mode: String,
     /// Whether merge resolution is currently running.
     pub is_resolving: bool,
+    /// Sanitized detail of a fatal process-level error; `null` when there is none.
+    ///
+    /// Kept separate from a change's `error_detail` so "this run died" and "this
+    /// one change failed" stay distinguishable without reading `app_mode` prose.
+    pub process_error: Option<String>,
     /// Projected changes.
     pub changes: Vec<ChangeResource>,
     /// Aggregate counts.
@@ -630,6 +882,7 @@ impl InstanceSnapshot {
         Self {
             app_mode: "select".to_string(),
             is_resolving: false,
+            process_error: None,
             changes: Vec::new(),
             totals: SnapshotTotals {
                 total: 0,
