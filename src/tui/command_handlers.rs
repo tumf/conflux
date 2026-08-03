@@ -299,15 +299,24 @@ pub async fn handle_tui_command(
             )));
             debug_assert_eq!(outcome.mutation, QueueMutation::Removed);
         }
-        TuiCommand::DeleteWorktreeByPath(path, _branch_name, skip_teardown) => {
+        TuiCommand::DeleteWorktreeByPath(path, branch_name, skip_teardown) => {
             // Adapter only: the shared service owns the delete guards, mandatory
             // teardown ordering, branch cleanup, and the refresh event. The TUI
             // keeps its local recovery `skip_teardown` escape hatch and its
             // documented fail-open behavior for an unobservable dirty state;
             // `/api/v2` passes the fail-closed policy instead.
+            //
+            // The branch the modal confirmed travels with the command so the
+            // service can revalidate it under its own mutation guard: the
+            // pre-dispatch modal check is necessary but not sufficient, since the
+            // path can be re-occupied between confirmation and mutation.
             let service = build_worktree_service(ctx.repo_root, ctx.config, ctx.tx);
             let delete_result = service
-                .delete_worktree(&path, DeleteOptions::local(skip_teardown))
+                .delete_worktree(
+                    &path,
+                    branch_name.as_deref(),
+                    DeleteOptions::local(skip_teardown),
+                )
                 .await;
             ctx.app.clear_worktree_deleting(&path);
 
@@ -846,6 +855,48 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("Worktree delete failed")));
+    }
+
+    #[tokio::test]
+    async fn test_delete_worktree_command_refuses_a_stale_confirmed_branch() {
+        let harness = AdapterHarness::new(&["change-a"]);
+        let mut app = harness.app(&["change-a"]);
+        let path = PathBuf::from("/tmp/worktree-replaced");
+        // The stub observes every registered path on `feature-a`, so confirming a
+        // different branch is exactly the "path was re-occupied since the modal"
+        // case: the adapter must forward the confirmed identity and the service
+        // must refuse before the backend is asked to remove anything.
+        set_delete_worktree_test_outcome(path.clone(), DeleteWorktreeTestOutcome::Success);
+        app.worktrees = vec![create_test_worktree(path.to_str().unwrap())];
+        app.mark_worktree_deleting(path.clone());
+
+        harness
+            .run(
+                &mut app,
+                TuiCommand::DeleteWorktreeByPath(
+                    path.clone(),
+                    Some("feature-stale".to_string()),
+                    false,
+                ),
+            )
+            .await;
+
+        assert!(!app.is_worktree_deleting(&path));
+        assert!(
+            app.logs
+                .iter()
+                .any(|entry| entry.message.contains("Worktree delete failed")
+                    && entry.message.contains("feature-stale")),
+            "the identity refusal must be reported verbatim: {:?}",
+            app.logs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(
+            DELETE_WORKTREE_TEST_OUTCOMES
+                .lock()
+                .expect("delete worktree test outcomes lock")
+                .contains_key(&path),
+            "a refused delete must never reach the backend remove"
+        );
     }
 
     // ── Queue intent ────────────────────────────────────────────────────────

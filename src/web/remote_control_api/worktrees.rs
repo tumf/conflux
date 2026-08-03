@@ -556,7 +556,11 @@ impl WorktreeOperations for RemoteWorktreeOperations {
             .service
             // Fail-closed on purpose: teardown is mandatory and an unobservable
             // dirty state refuses. Neither is a client-supplied parameter.
-            .delete_worktree(&key.path, DeleteOptions::fail_closed())
+            //
+            // The confirmed identity here is the registry key, which the listing
+            // sync retires as soon as a bound worktree disappears, so no branch
+            // is passed as a second expectation.
+            .delete_worktree(&key.path, None, DeleteOptions::fail_closed())
             .await
             .map_err(|error| map_worktree_error(&error))?;
 
