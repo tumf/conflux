@@ -12,13 +12,16 @@
 //! re-attempts the normal Git operations.
 
 use std::future::Future;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::execution::index_lock::{
+    is_managed_lock_path, managed_worktree_lock_paths, parse_existing_index_lock,
+};
 use crate::vcs::git::commands::run_git;
 use crate::vcs::{VcsBackend, VcsError, VcsResult};
 
@@ -50,10 +53,7 @@ pub struct WipSnapshotIdentity {
 
 impl WipSnapshotIdentity {
     fn matches_lock(&self, reported: &Path) -> bool {
-        let reported = lexically_normalize(reported);
-        self.lock_paths
-            .iter()
-            .any(|candidate| lexically_normalize(candidate) == reported)
+        is_managed_lock_path(&self.lock_paths, reported)
     }
 }
 
@@ -82,43 +82,10 @@ pub trait WipSnapshotEnvironment: Send + Sync {
 /// Production environment backed by real Git commands and a real timer.
 pub struct GitWipSnapshotEnvironment;
 
-/// Record a git directory and its canonical form as the same lock identity.
-fn push_git_dir_variants(git_dirs: &mut Vec<PathBuf>, git_dir: PathBuf) {
-    let canonical = std::fs::canonicalize(&git_dir).ok();
-    for candidate in [Some(git_dir), canonical].into_iter().flatten() {
-        if !git_dirs.contains(&candidate) {
-            git_dirs.push(candidate);
-        }
-    }
-}
-
 #[async_trait]
 impl WipSnapshotEnvironment for GitWipSnapshotEnvironment {
     async fn lock_paths(&self, workspace_path: &Path) -> VcsResult<Vec<PathBuf>> {
-        let mut git_dirs = Vec::new();
-        push_git_dir_variants(
-            &mut git_dirs,
-            PathBuf::from(run_git(&["rev-parse", "--absolute-git-dir"], workspace_path).await?),
-        );
-
-        // A failing command names the git directory the way Git resolved the
-        // current directory, which can keep a symlinked prefix that
-        // `--absolute-git-dir` already resolved (`/tmp` vs `/private/tmp` on
-        // macOS). Rebuilding it from the workspace path covers that form too.
-        if let Ok(git_dir) = run_git(&["rev-parse", "--git-dir"], workspace_path).await {
-            let git_dir = Path::new(&git_dir);
-            let git_dir = if git_dir.is_absolute() {
-                git_dir.to_path_buf()
-            } else {
-                workspace_path.join(git_dir)
-            };
-            push_git_dir_variants(&mut git_dirs, git_dir);
-        }
-
-        Ok(git_dirs
-            .into_iter()
-            .map(|git_dir| git_dir.join("index.lock"))
-            .collect())
+        managed_worktree_lock_paths(workspace_path).await
     }
 
     async fn head_commit(&self, workspace_path: &Path) -> VcsResult<Option<String>> {
@@ -201,45 +168,6 @@ pub fn is_transient_wip_index_lock_failure(
 fn is_wip_snapshot_command(command: &str, wip_message: &str) -> bool {
     command == "git add -A"
         || command == format!("git commit --no-verify --allow-empty -m {}", wip_message)
-}
-
-/// Extract the `index.lock` path from an existing-lock Git failure.
-///
-/// Git reports `fatal: Unable to create '<path>': File exists.` for this case;
-/// any other lock prose (or any other lock file) is not this failure.
-fn parse_existing_index_lock(stderr: &str) -> Option<PathBuf> {
-    for line in stderr.lines() {
-        let Some((_, rest)) = line.split_once("Unable to create '") else {
-            continue;
-        };
-        let Some((path, tail)) = rest.split_once('\'') else {
-            continue;
-        };
-        if !tail.trim_start().starts_with(": File exists") {
-            continue;
-        }
-        let path = PathBuf::from(path);
-        if path.file_name().is_some_and(|name| name == "index.lock") {
-            return Some(path);
-        }
-    }
-    None
-}
-
-/// Normalize a path without touching the filesystem, so that classification
-/// stays a pure decision.
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
 }
 
 /// Run the WIP snapshot sequence, retrying only transient index-lock contention.
