@@ -394,9 +394,12 @@ fn cflx_output_bounded(cwd: &Path, args: &[&str], timeout: Duration) -> std::pro
     let capture = tempfile::tempdir().expect("capture dir");
     let out_path = capture.path().join("stdout");
     let err_path = capture.path().join("stderr");
+    // A null stdin keeps a TUI invocation from ever reaching the terminal that
+    // is running the test suite.
     let mut child = Command::new(env!("CARGO_BIN_EXE_cflx"))
         .args(args)
         .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
         .stdout(fs::File::create(&out_path).unwrap())
         .stderr(fs::File::create(&err_path).unwrap())
         .spawn()
@@ -1161,6 +1164,127 @@ fn a_blocked_socket_path_exits_before_orchestration_and_preserves_the_entry() {
     );
     assert!(!applied.exists(), "no AI subprocess may run");
     assert!(!adapter_ran.exists(), "no lifecycle adapter may start");
+}
+
+/// Every remote-tracking ref in `dir`, as `for-each-ref` prints them.
+#[cfg(all(unix, feature = "web-monitoring"))]
+fn remote_tracking_refs(dir: &Path) -> String {
+    let output = Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)", "refs/remotes"])
+        .current_dir(dir)
+        .output()
+        .expect("git for-each-ref");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A workspace with an `origin` whose `main` exists remotely but has left no
+/// local trace, so any remote-tracking ref afterwards can only come from a fetch
+/// performed by the process under test.
+#[cfg(all(unix, feature = "web-monitoring"))]
+fn workspace_with_a_fetchable_origin(tmp: &Path) -> std::path::PathBuf {
+    let upstream = tmp.join("upstream.git");
+    git(
+        tmp,
+        &["init", "--bare", "--quiet", upstream.to_str().unwrap()],
+    );
+
+    let workspace = tmp.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    setup_empty_project(&workspace);
+    init_git_repo(&workspace);
+    git(&workspace, &["add", "-A"]);
+    git(&workspace, &["commit", "--quiet", "-m", "init"]);
+    git(&workspace, &["branch", "-M", "main"]);
+    git(
+        &workspace,
+        &["remote", "add", "origin", upstream.to_str().unwrap()],
+    );
+    git(&workspace, &["push", "--quiet", "origin", "main"]);
+
+    // The push itself updated a remote-tracking ref; erase it so the test starts
+    // from "nothing has ever been fetched here".
+    git(
+        &workspace,
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let _ = fs::remove_file(workspace.join(".git/FETCH_HEAD"));
+    assert!(
+        remote_tracking_refs(&workspace).is_empty(),
+        "the workspace must start with no remote-tracking refs"
+    );
+    workspace
+}
+
+/// A TUI bind failure must be decided before upstream startup touches a remote.
+///
+/// The initial upstream fetch (`git fetch --prune`) is the first startup step
+/// that reaches the network and writes local refs, so "listeners bind before
+/// anything else" is only true if a refused socket leaves `refs/remotes/*` and
+/// `FETCH_HEAD` untouched. The control run at the end performs the identical
+/// invocation with the socket opted out and *does* fetch, so the refusal
+/// assertion cannot pass merely because this workspace never fetches.
+#[test]
+#[cfg(all(unix, feature = "web-monitoring"))]
+fn a_tui_bind_failure_refuses_before_the_upstream_fetch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = workspace_with_a_fetchable_origin(tmp.path());
+
+    // A regular file at the target path: a bind failure the process cannot fix.
+    let socket = default_socket_path(&workspace);
+    fs::write(&socket, b"not a socket").unwrap();
+
+    let refused = cflx_output_bounded(
+        &workspace,
+        &[
+            "tui",
+            "--integrate-upstream=origin",
+            "--upstream-verify-command",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "a blocked socket path must exit non-zero, got {:?} (stderr={stderr})",
+        refused.status
+    );
+    assert!(stderr.contains("not a socket"), "stderr={stderr}");
+    assert_eq!(
+        remote_tracking_refs(&workspace),
+        "",
+        "the startup fetch must not have run before the listener bound"
+    );
+    assert!(
+        !workspace.join(".git/FETCH_HEAD").exists(),
+        "a refused startup must not have contacted the remote at all"
+    );
+    assert_eq!(
+        fs::read(&socket).unwrap(),
+        b"not a socket",
+        "the blocking entry must be preserved byte for byte"
+    );
+
+    // Control: identical invocation, socket opted out. The fetch is reachable,
+    // which is what makes the assertions above meaningful. The TUI itself then
+    // fails on the non-terminal stdout of this harness, which is expected.
+    fs::remove_file(&socket).unwrap();
+    let control = cflx_output_bounded(
+        &workspace,
+        &[
+            "tui",
+            "--no-web-unix-socket",
+            "--integrate-upstream=origin",
+            "--upstream-verify-command",
+            "true",
+        ],
+        Duration::from_secs(60),
+    );
+    assert!(
+        remote_tracking_refs(&workspace).contains("refs/remotes/origin/main"),
+        "the control run must reach the fetch (stderr={})",
+        String::from_utf8_lossy(&control.stderr)
+    );
 }
 
 /// A socket left behind by a dead owner must not wedge the repository forever.

@@ -101,17 +101,15 @@ fn lifecycle_process_context() -> LifecycleContext {
 /// The default-off path additionally refuses to start while repository evidence
 /// proves an unpublished opted-in integration, which is the option-less restart
 /// refusal. That scan is offline, so a disabled TUI gains no network access.
+///
+/// Failures are returned rather than exited on, because by the time this runs
+/// the local API listeners are already bound: the caller has to give the socket
+/// back before it terminates.
 async fn resolve_tui_upstream_runtime(
     args: &TuiArgs,
     config: &OrchestratorConfig,
-) -> Option<upstream::UpstreamRuntime> {
-    let upstream_config = match args.upstream_integration() {
-        Ok(config) => config,
-        Err(err) => {
-            eprintln!("Error: {err}");
-            std::process::exit(1);
-        }
-    };
+) -> std::result::Result<Option<upstream::UpstreamRuntime>, String> {
+    let upstream_config = args.upstream_integration().map_err(|err| err.to_string())?;
 
     let git_dir_exists = cli::check_git_directory();
     // Local TUI upstream publication is a cumulative parallel capability; the
@@ -122,43 +120,36 @@ async fn resolve_tui_upstream_runtime(
         Ok(root) => root,
         Err(err) => {
             if upstream_config.is_some() {
-                eprintln!("Error: upstream integration requires a readable workspace: {err}");
-                std::process::exit(1);
+                return Err(format!(
+                    "upstream integration requires a readable workspace: {err}"
+                ));
             }
-            return None;
+            return Ok(None);
         }
     };
 
     match upstream_config {
-        Some(upstream_config) => {
-            match upstream::prepare_upstream_integration(
-                upstream_config,
-                &repo_root,
-                use_parallel,
-                args.push.clone(),
-                git_dir_exists,
-                false,
-            )
-            .await
-            {
-                Ok(runtime) => Some(runtime),
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    std::process::exit(1);
-                }
-            }
-        }
+        Some(upstream_config) => upstream::prepare_upstream_integration(
+            upstream_config,
+            &repo_root,
+            use_parallel,
+            args.push.clone(),
+            git_dir_exists,
+            false,
+        )
+        .await
+        .map(Some)
+        .map_err(|err| err.to_string()),
         None => {
             if use_parallel && git_dir_exists {
                 if let Err(err) = upstream::ensure_no_unpushed_upstream_recovery(&repo_root).await {
                     if matches!(err, upstream::UpstreamStartupError::Invalid(_)) {
-                        eprintln!("Error: {err}");
-                        std::process::exit(1);
+                        return Err(err.to_string());
                     }
                     tracing::debug!("Upstream recovery scan unavailable, continuing: {}", err);
                 }
             }
-            None
+            Ok(None)
         }
     }
 }
@@ -172,18 +163,34 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
     let config = OrchestratorConfig::load(args.config.as_deref())?;
     tui::log_deduplicator::configure_logging(config.get_logging());
 
-    // Startup validation runs before the terminal is taken over, so a rejected
-    // invocation reports plainly and leaves no orchestration state behind.
-    let upstream_runtime = resolve_tui_upstream_runtime(&args, &config).await;
-
+    // Listing changes is a local read of the workspace; it starts nothing and
+    // reaches no network, so it may precede the listeners it feeds.
     let changes = openspec::list_changes_native()?;
 
     // The local API is a startup contract, so every requested listener binds
-    // before the lifecycle adapter, any AI subprocess, or the TUI itself. A
-    // process that cannot serve its API must fail here, while it still has
-    // nothing to clean up.
+    // before upstream validation, the lifecycle adapter, any AI subprocess, or
+    // the TUI itself. A process that cannot serve its API must fail here, while
+    // it still has nothing to clean up — in particular before the initial
+    // upstream fetch, which is the first startup step that touches a remote and
+    // updates local refs.
     #[cfg(feature = "web-monitoring")]
     let started = start_local_api(LocalApiOptions::from(&args), &changes).await;
+
+    // Startup validation runs before the terminal is taken over, so a rejected
+    // invocation reports plainly and leaves no orchestration state behind. The
+    // listeners are already bound here, so a refusal gives the socket back on
+    // its way out instead of leaving a stale entry.
+    let upstream_runtime = match resolve_tui_upstream_runtime(&args, &config).await {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            #[cfg(feature = "web-monitoring")]
+            if let Some((handle, _)) = started {
+                handle.shutdown().await;
+            }
+            std::process::exit(1);
+        }
+    };
 
     #[cfg(feature = "web-monitoring")]
     let (web_url, web_state_opt) = match &started {

@@ -358,6 +358,23 @@ impl ServerHandle {
     }
 }
 
+/// Stop every listener this failed startup transaction already started.
+///
+/// "Start none of them" has to mean the tasks too, not just the pathname: a
+/// leaked `axum::serve` task would keep answering the endpoint it bound while
+/// the caller believes nothing started. Cancelling and then awaiting is what
+/// makes the failure return only once no listener is serving any more.
+#[cfg(feature = "web-monitoring")]
+async fn abort_started_listeners(
+    shutdown: &tokio_util::sync::CancellationToken,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+) {
+    shutdown.cancel();
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
 /// Start every requested listener before returning, or start none of them.
 ///
 /// Ordering is the point: the caller runs this before lifecycle adapters, AI
@@ -408,13 +425,25 @@ pub async fn start_listeners(
     let mut tcp_url = None;
     if plan.tcp {
         // A TCP failure after the socket bound must not leave a half-started
-        // process behind: returning here drops `socket_guard`, which removes the
-        // socket this transaction created.
-        let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        // process behind: the rollback stops the listener task already spawned,
+        // and returning then drops `socket_guard`, which removes the socket this
+        // transaction created.
         // The actual address includes an OS-assigned port when 0 was requested,
         // so what gets published is what a client can actually connect to.
-        let actual_port = listener.local_addr()?.port();
+        let bound = async {
+            let addr: SocketAddr = format!("{}:{}", config.bind, config.port).parse()?;
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let actual_port = listener.local_addr()?.port();
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((listener, actual_port))
+        }
+        .await;
+        let (listener, actual_port) = match bound {
+            Ok(bound) => bound,
+            Err(error) => {
+                abort_started_listeners(&shutdown, tasks).await;
+                return Err(error);
+            }
+        };
         let url = build_access_url(&config.bind, actual_port);
         info!("Web monitoring server listening on {}", url);
         endpoints.push(url.clone());

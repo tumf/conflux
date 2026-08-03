@@ -301,14 +301,24 @@ async fn shutdown_preserves_a_replacement_socket() {
 }
 
 /// The startup transaction is all-or-nothing: a TCP failure after the socket
-/// bound must leave no socket behind for a client to find.
+/// bound must leave no socket behind for a client to find, and no listener task
+/// still running behind it.
+///
+/// Removing the pathname alone is not rollback — an orphaned `axum::serve` task
+/// would keep serving the socket it already bound, and keep the process alive,
+/// while the caller believes nothing started. The live task count is the direct
+/// evidence for that, so it is asserted rather than inferred from the filesystem.
 #[tokio::test]
-async fn a_failed_tcp_bind_publishes_nothing_and_removes_the_socket() {
+async fn a_failed_tcp_bind_publishes_nothing_and_stops_the_unix_listener() {
     let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = occupied.local_addr().unwrap().port();
 
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("cflx-api.sock");
+
+    let before = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
     let error = start(
         WebConfig::enabled(port, "127.0.0.1".to_string()),
         Some(&socket),
@@ -318,10 +328,25 @@ async fn a_failed_tcp_bind_publishes_nothing_and_removes_the_socket() {
     .expect_err("the occupied port must fail startup");
     assert!(!error.is_empty());
 
+    assert_eq!(
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks(),
+        before,
+        "the Unix listener task spawned by the failed transaction must be \
+         cancelled and awaited before the error is returned"
+    );
     assert!(
         !socket.exists(),
         "a failed startup transaction must not leave its socket behind"
     );
+
+    // Nothing owns the path any more, so the next attempt gets a clean start.
+    let retry = start(WebConfig::default(), Some(&socket), false)
+        .await
+        .expect("the path must be reusable after the rolled-back attempt");
+    assert_eq!(unix_get(&socket, "/api/v2/health", None).await.0, 200);
+    retry.shutdown().await;
 }
 
 /// An occupied socket path fails startup before any listener exists, and the

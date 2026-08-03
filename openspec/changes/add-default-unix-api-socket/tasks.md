@@ -39,3 +39,15 @@ Archive validation is the authoritative final OpenSpec gate. Expected archive ga
 
 - Add an XDG runtime-directory fallback only if real repositories regularly exceed platform Unix socket path limits and a discoverable repository-to-socket mapping can remain non-authoritative.
 - Add reverse-proxy configuration helpers only if repeated operator setup demonstrates a stable cross-proxy contract.
+
+## Current Acceptance Follow-up
+- attempt: 1
+- [x] Fix TUI startup ordering: src/main.rs:177 calls resolve_tui_upstream_runtime before start_local_api at src/main.rs:186, allowing git fetch --prune through src/upstream/startup.rs:128, src/upstream/coordinator.rs:257, and src/upstream/git_ops.rs:147-153 before the required socket bind. Bind listeners first and add a process-boundary TUI test proving bind failure prevents fetch/ref updates.
+  evidence: `launch_tui` now binds via `start_local_api` (src/main.rs:177) before `resolve_tui_upstream_runtime` (src/main.rs:183), which was rewritten to return `Result` so a refusal shuts the listeners down instead of `exit`ing over a bound socket.
+  evidence: New process-boundary test `a_tui_bind_failure_refuses_before_the_upstream_fetch` (tests/run_exit_tests.rs:1207) runs `cflx tui --integrate-upstream=origin` against a blocked socket path and asserts exit non-zero, empty `refs/remotes`, and no `.git/FETCH_HEAD`.
+  evidence: The test discriminates: restoring the pre-fix ordering makes it fail with `left: "refs/remotes/origin/HEAD\nrefs/remotes/origin/main"` vs `right: ""`, and its `--no-web-unix-socket` control run proves the same workspace does reach the fetch.
+- [x] Make failed multi-listener startup stop already-started listeners: src/web/mod.rs:387-405 spawns the UDS task, but TCP bind errors at src/web/mod.rs:413-414 return without cancelling or awaiting it. Add rollback and strengthen src/web/listener_tests.rs:303-325 to verify task termination, not only pathname removal.
+  evidence: `start_listeners` routes TCP bind errors through new `abort_started_listeners` (src/web/mod.rs:368) which cancels the shared token and awaits every spawned `JoinHandle` before returning the error at src/web/mod.rs:443.
+  evidence: `a_failed_tcp_bind_publishes_nothing_and_stops_the_unix_listener` (src/web/listener_tests.rs:310) now asserts `num_alive_tasks()` returns to its pre-start value, plus socket absence and a successful rebind on the same path.
+  evidence: The task-count assertion discriminates: removing the `abort_started_listeners` call makes it fail with `left: 1, right: 0`, which pathname-only assertions did not catch.
+  evidence: Gates green on the restored tree — `cargo fmt --check`, `cargo clippy --features web-monitoring --all-targets -- -D warnings`, `cargo test --features web-monitoring --test run_exit_tests` (28 passed), `cargo test --features web-monitoring --lib -- web::listener_tests` (10 passed).
