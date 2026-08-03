@@ -68,6 +68,8 @@ use lifecycle_integration::{
 use orchestrator::Orchestrator;
 use parallel::PostArchiveAction;
 use std::path::Path;
+#[cfg(feature = "web-monitoring")]
+use std::path::PathBuf;
 use tracing::{error, info, Level};
 use tracing_subscriber::{filter::LevelFilter, prelude::*};
 
@@ -174,63 +176,19 @@ async fn launch_tui(args: TuiArgs) -> Result<()> {
     // invocation reports plainly and leaves no orchestration state behind.
     let upstream_runtime = resolve_tui_upstream_runtime(&args, &config).await;
 
-    // Start the optional external lifecycle adapter before the interactive TUI
-    // is presented. Failures here are observability-only and never block startup.
-    let lifecycle = LifecycleIntegration::start(
-        config.get_lifecycle_integration(),
-        LifecycleExecutionMode::Tui,
-    );
-    lifecycle.handle().publish(LifecycleEvent::ProcessStarted {
-        context: lifecycle_process_context(),
-    });
-
-    let result = launch_tui_inner(
-        args,
-        config,
-        post_archive_action,
-        upstream_runtime,
-        lifecycle.handle(),
-    )
-    .await;
-
-    lifecycle.shutdown().await;
-
-    result
-}
-
-async fn launch_tui_inner(
-    args: TuiArgs,
-    config: OrchestratorConfig,
-    post_archive_action: PostArchiveAction,
-    upstream_runtime: Option<upstream::UpstreamRuntime>,
-    lifecycle: lifecycle_integration::LifecycleHandle,
-) -> Result<()> {
     let changes = openspec::list_changes_native()?;
 
+    // The local API is a startup contract, so every requested listener binds
+    // before the lifecycle adapter, any AI subprocess, or the TUI itself. A
+    // process that cannot serve its API must fail here, while it still has
+    // nothing to clean up.
     #[cfg(feature = "web-monitoring")]
-    let (web_url, web_state_opt) = if args.web {
-        let web_state = std::sync::Arc::new(web::WebState::new(&changes));
-        let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone()).with_auth(
-            args.web_auth_token.clone(),
-            args.web_auth_token_env.clone(),
-            args.web_allowed_origins.clone(),
-        );
-        // An unsafe or contradictory web configuration is a hard startup error.
-        // Degrading to "no web server" would leave an operator who asked for a
-        // routable listener believing they had one.
-        if let Err(error) = web_config.validate() {
-            eprintln!("Error: {error}");
-            std::process::exit(1);
-        }
-        match web::spawn_server_with_url(web_config, web_state.clone()).await {
-            Ok((_web_handle, url)) => (Some(url), Some(web_state)),
-            Err(e) => {
-                tracing::warn!("Failed to start web monitoring server: {}", e);
-                (None, None)
-            }
-        }
-    } else {
-        (None, None)
+    let started = start_local_api(LocalApiOptions::from(&args), &changes).await;
+
+    #[cfg(feature = "web-monitoring")]
+    let (web_url, web_state_opt) = match &started {
+        Some((handle, state)) => (handle.tcp_url().map(str::to_string), Some(state.clone())),
+        None => (None, None),
     };
 
     #[cfg(not(feature = "web-monitoring"))]
@@ -243,7 +201,17 @@ async fn launch_tui_inner(
         None
     };
 
-    tui::run_tui(
+    // Start the optional external lifecycle adapter before the interactive TUI
+    // is presented. Failures here are observability-only and never block startup.
+    let lifecycle = LifecycleIntegration::start(
+        config.get_lifecycle_integration(),
+        LifecycleExecutionMode::Tui,
+    );
+    lifecycle.handle().publish(LifecycleEvent::ProcessStarted {
+        context: lifecycle_process_context(),
+    });
+
+    let result = tui::run_tui(
         changes,
         config,
         web_url,
@@ -251,9 +219,156 @@ async fn launch_tui_inner(
         web_state_opt,
         post_archive_action,
         upstream_runtime,
-        lifecycle,
+        lifecycle.handle(),
     )
-    .await
+    .await;
+
+    lifecycle.shutdown().await;
+
+    // Graceful termination stops the listeners and gives the socket path back
+    // without waiting for another signal.
+    #[cfg(feature = "web-monitoring")]
+    if let Some((handle, _)) = started {
+        handle.shutdown().await;
+    }
+
+    result
+}
+
+/// Resolve which listeners this local orchestration invocation must start.
+///
+/// Repository identity comes from the same canonical Git common directory the
+/// repository lock uses, so linked worktrees agree on one socket and no new
+/// out-of-worktree routing state is introduced.
+#[cfg(feature = "web-monitoring")]
+fn resolve_listener_plan(
+    tcp: bool,
+    unix_socket: Option<&Path>,
+    no_unix_socket: bool,
+) -> std::result::Result<web::ListenerPlan, String> {
+    #[cfg(unix)]
+    {
+        let workspace = std::env::current_dir()
+            .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
+        let common_dir = repo_lock::discover_common_dir(&workspace);
+        let selection = web::unix_socket::resolve_unix_socket(
+            unix_socket,
+            no_unix_socket,
+            common_dir.as_deref(),
+        )?;
+        Ok(web::ListenerPlan {
+            unix_socket: selection.path().map(Path::to_path_buf),
+            tcp,
+        })
+    }
+    // Unix-domain sockets are the only default local API surface, so a
+    // non-Unix build keeps exactly the retained `--web` behavior.
+    #[cfg(not(unix))]
+    {
+        let _ = (unix_socket, no_unix_socket);
+        Ok(web::ListenerPlan { tcp })
+    }
+}
+
+/// The listener-selecting options every local orchestration entrypoint carries.
+///
+/// `cflx`, `cflx tui`, and `cflx run` parse their own copies of these flags, so
+/// collecting them here is what keeps the three entrypoints one contract rather
+/// than three that happen to agree today.
+#[cfg(feature = "web-monitoring")]
+struct LocalApiOptions {
+    tcp: bool,
+    port: u16,
+    bind: String,
+    auth_token: Option<String>,
+    auth_token_env: Option<String>,
+    allowed_origins: Vec<String>,
+    unix_socket: Option<PathBuf>,
+    no_unix_socket: bool,
+}
+
+#[cfg(feature = "web-monitoring")]
+impl From<&TuiArgs> for LocalApiOptions {
+    fn from(args: &TuiArgs) -> Self {
+        Self {
+            tcp: args.web,
+            port: args.web_port,
+            bind: args.web_bind.clone(),
+            auth_token: args.web_auth_token.clone(),
+            auth_token_env: args.web_auth_token_env.clone(),
+            allowed_origins: args.web_allowed_origins.clone(),
+            unix_socket: args.web_unix_socket.clone(),
+            no_unix_socket: args.no_web_unix_socket,
+        }
+    }
+}
+
+#[cfg(feature = "web-monitoring")]
+impl From<&cli::RunArgs> for LocalApiOptions {
+    fn from(args: &cli::RunArgs) -> Self {
+        Self {
+            tcp: args.web,
+            port: args.web_port,
+            bind: args.web_bind.clone(),
+            auth_token: args.web_auth_token.clone(),
+            auth_token_env: args.web_auth_token_env.clone(),
+            allowed_origins: args.web_allowed_origins.clone(),
+            unix_socket: args.web_unix_socket.clone(),
+            no_unix_socket: args.no_web_unix_socket,
+        }
+    }
+}
+
+/// Bind every requested listener, or exit non-zero without side effects.
+///
+/// Returns `None` only when the operator opted out of every listener. Any other
+/// failure — an unsafe TCP configuration, a non-Git default path, an occupied
+/// socket path, a bind or permission error — is a hard startup error, because a
+/// process that advertised an endpoint it never bound is worse than one that
+/// refused to start.
+#[cfg(feature = "web-monitoring")]
+async fn start_local_api(
+    options: LocalApiOptions,
+    changes: &[openspec::Change],
+) -> Option<(web::ServerHandle, std::sync::Arc<web::WebState>)> {
+    let plan = match resolve_listener_plan(
+        options.tcp,
+        options.unix_socket.as_deref(),
+        options.no_unix_socket,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    if plan.is_empty() {
+        return None;
+    }
+
+    let config = web::WebConfig::enabled(options.port, options.bind)
+        .with_tcp_enabled(options.tcp)
+        .with_auth(
+            options.auth_token,
+            options.auth_token_env,
+            options.allowed_origins,
+        );
+    let state = std::sync::Arc::new(web::WebState::new(changes));
+
+    match web::start_listeners(config, plan, state.clone()).await {
+        Ok(handle) => {
+            // Only bound endpoints reach this list, so what an operator reads
+            // here is always something a client can actually connect to.
+            for endpoint in handle.endpoints() {
+                info!("Local API available at: {}", endpoint);
+            }
+            Some((handle, state))
+        }
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Initialize logging.
@@ -639,6 +754,8 @@ async fn main() -> Result<()> {
                 web_auth_token: cli.web_auth_token,
                 web_auth_token_env: cli.web_auth_token_env,
                 web_allowed_origins: cli.web_allowed_origins,
+                web_unix_socket: cli.web_unix_socket,
+                no_web_unix_socket: cli.no_web_unix_socket,
                 push: cli.push,
                 // Bare local TUI carries the same upstream contract as `cflx tui`.
                 integrate_upstream: cli.integrate_upstream,
@@ -657,37 +774,16 @@ async fn main() -> Result<()> {
             init_logging(true)?;
             log_startup("run");
 
-            // Start web monitoring server if enabled
+            // The local API binds before the lifecycle adapter, any AI
+            // subprocess, and orchestration, so a run that cannot serve its
+            // required endpoint exits without having started any work.
             #[cfg(feature = "web-monitoring")]
-            let web_state_arc = if args.web {
+            let started_api = {
                 let initial_changes = openspec::list_changes_native()?;
-                let web_state = std::sync::Arc::new(web::WebState::new(&initial_changes));
-                let web_config = web::WebConfig::enabled(args.web_port, args.web_bind.clone())
-                    .with_auth(
-                        args.web_auth_token.clone(),
-                        args.web_auth_token_env.clone(),
-                        args.web_allowed_origins.clone(),
-                    );
-                // An unsafe or contradictory web configuration is a hard startup error.
-                // Degrading to "no web server" would leave an operator who asked for a
-                // routable listener believing they had one.
-                if let Err(error) = web_config.validate() {
-                    eprintln!("Error: {error}");
-                    std::process::exit(1);
-                }
-                match web::spawn_server_with_url(web_config, web_state.clone()).await {
-                    Ok((_handle, url)) => {
-                        info!("Web monitoring available at: {}", url);
-                        Some(web_state)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to start web monitoring server: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
+                start_local_api(LocalApiOptions::from(&args), &initial_changes).await
             };
+            #[cfg(feature = "web-monitoring")]
+            let web_state_arc = started_api.as_ref().map(|(_, state)| state.clone());
 
             #[cfg(not(feature = "web-monitoring"))]
             if args.web {
@@ -979,6 +1075,15 @@ async fn main() -> Result<()> {
             }
 
             lifecycle.shutdown().await;
+
+            // Terminal completion stops the listeners and refresh task and
+            // removes the socket this run created, so a finite run needs no
+            // external signal to give its endpoint back. Error exits rely on the
+            // socket guard's drop for the same cleanup.
+            #[cfg(feature = "web-monitoring")]
+            if let Some((handle, _)) = started_api {
+                handle.shutdown().await;
+            }
         }
 
         // Logs subcommand: read-only persistent log viewer. Intentionally runs before

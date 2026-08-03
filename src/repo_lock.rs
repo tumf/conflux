@@ -86,8 +86,16 @@ pub struct OwnerMetadata {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Legacy single-endpoint field. Still read so metadata written by an older
+    /// version stays useful; new owners write [`Self::endpoints`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_url: Option<String>,
+    /// Every endpoint whose listener completed startup, in publication order.
+    ///
+    /// Unix endpoints appear as `unix://<path>` and TCP endpoints as their
+    /// browser URL, so the transport is readable without a second field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
 }
 
 impl OwnerMetadata {
@@ -98,6 +106,19 @@ impl OwnerMetadata {
             && self.workspace.is_none()
             && self.mode.is_none()
             && self.api_url.is_none()
+            && self.endpoints.is_empty()
+    }
+
+    /// Endpoints this owner claims, newest format first.
+    ///
+    /// Legacy metadata carrying only `api_url` reports that URL, so a conflict
+    /// diagnostic never loses the endpoint just because the writer predates the
+    /// collection.
+    pub fn available_endpoints(&self) -> Vec<&str> {
+        if !self.endpoints.is_empty() {
+            return self.endpoints.iter().map(String::as_str).collect();
+        }
+        self.api_url.as_deref().into_iter().collect()
     }
 
     /// Drop fields that cannot describe a live owner (blank strings, pid 0).
@@ -112,6 +133,17 @@ impl OwnerMetadata {
         self.workspace = clean(self.workspace);
         self.mode = clean(self.mode);
         self.api_url = clean(self.api_url);
+        // A blank or duplicated entry describes no reachable endpoint.
+        let mut seen = Vec::new();
+        self.endpoints.retain(|endpoint| {
+            let trimmed = endpoint.trim().to_string();
+            if trimmed.is_empty() || seen.contains(&trimmed) {
+                return false;
+            }
+            seen.push(trimmed);
+            true
+        });
+        self.endpoints = seen;
         self
     }
 }
@@ -157,8 +189,10 @@ pub fn conflict_message(common_dir: &Path, owner: Option<&OwnerMetadata>) -> Str
             out.push_str(&format!("  workspace:  {workspace}\n"));
             described = true;
         }
-        if let Some(api_url) = &owner.api_url {
-            out.push_str(&format!("  api url:    {api_url}\n"));
+        // One line per successfully bound endpoint, so a process serving both
+        // UDS and TCP is reported as both rather than as whichever came first.
+        for endpoint in owner.available_endpoints() {
+            out.push_str(&format!("  api url:    {endpoint}\n"));
             described = true;
         }
     }
@@ -330,21 +364,28 @@ impl RepositoryLock {
             .unwrap_or_default()
     }
 
-    /// Record the API base URL after a listener has actually bound.
+    /// Record every endpoint whose listener has actually bound.
     ///
-    /// Called only with a URL returned by a successful bind, so a conflicting
-    /// invocation never sees an endpoint that was requested but not reachable.
-    pub fn publish_api_url(&self, url: &str) {
+    /// Called only after the whole startup transaction succeeded, so a
+    /// conflicting invocation never sees an endpoint that was requested but not
+    /// reachable. Purely observational: nothing about lock ownership or workflow
+    /// routing reads this.
+    pub fn publish_endpoints(&self, endpoints: &[String]) {
         let Ok(mut guard) = self.metadata.lock() else {
             return;
         };
-        if guard.api_url.as_deref() == Some(url) {
+        if guard.endpoints == endpoints {
             return;
         }
-        guard.api_url = Some(url.to_string());
+        guard.endpoints = endpoints.to_vec();
         let snapshot = guard.clone();
         drop(guard);
         write_owner_metadata(&self.owner_path, &snapshot);
+    }
+
+    /// Record a single API base URL after a listener has actually bound.
+    pub fn publish_api_url(&self, url: &str) {
+        self.publish_endpoints(std::slice::from_ref(&url.to_string()));
     }
 }
 
@@ -401,6 +442,7 @@ pub fn acquire(
         workspace: Some(workspace_display),
         mode: Some(mode.as_str().to_string()),
         api_url: None,
+        endpoints: Vec::new(),
     };
     write_owner_metadata(&owner_path, &metadata);
 
@@ -466,14 +508,19 @@ pub fn install(lock: RepositoryLock) {
     let _ = ACTIVE_LOCK.set(lock);
 }
 
-/// Publish an API base URL onto the installed lock, if this process owns one.
+/// Publish bound API endpoints onto the installed lock, if this process owns one.
 ///
 /// A no-op for bypassed invocations and for non-repository workspaces, so
 /// listener startup paths can call it unconditionally after a successful bind.
-pub fn publish_api_url(url: &str) {
+pub fn publish_endpoints(endpoints: &[String]) {
     if let Some(lock) = ACTIVE_LOCK.get() {
-        lock.publish_api_url(url);
+        lock.publish_endpoints(endpoints);
     }
+}
+
+/// Publish a single API base URL onto the installed lock.
+pub fn publish_api_url(url: &str) {
+    publish_endpoints(std::slice::from_ref(&url.to_string()));
 }
 
 #[cfg(test)]
@@ -501,17 +548,78 @@ mod tests {
     }
 
     #[test]
-    fn owner_metadata_round_trips_without_api_url() {
+    fn owner_metadata_round_trips_without_endpoints() {
         let metadata = OwnerMetadata {
             pid: Some(4321),
             started_at: Some("2026-07-31T12:00:00+00:00".to_string()),
             workspace: Some("/repo".to_string()),
             mode: Some("run".to_string()),
             api_url: None,
+            endpoints: Vec::new(),
         };
         let json = serde_json::to_string(&metadata).unwrap();
         assert!(!json.contains("api_url"), "json={json}");
+        assert!(!json.contains("endpoints"), "json={json}");
         assert_eq!(parse_owner_metadata(&json), Some(metadata));
+    }
+
+    /// A dual-listener owner serializes both endpoints and reads them back in
+    /// publication order.
+    #[test]
+    fn owner_metadata_round_trips_a_dual_endpoint_collection() {
+        let metadata = OwnerMetadata {
+            pid: Some(4321),
+            mode: Some("tui".to_string()),
+            endpoints: vec![
+                "unix:///repo/.git/cflx-api.sock".to_string(),
+                "http://localhost:39876".to_string(),
+            ],
+            ..OwnerMetadata::default()
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        let parsed = parse_owner_metadata(&json).expect("metadata");
+        assert_eq!(parsed, metadata);
+        assert_eq!(
+            parsed.available_endpoints(),
+            vec!["unix:///repo/.git/cflx-api.sock", "http://localhost:39876"]
+        );
+    }
+
+    /// Metadata written before the collection existed must keep reporting its
+    /// endpoint rather than becoming silently endpoint-less.
+    #[test]
+    fn legacy_single_url_metadata_still_reports_its_endpoint() {
+        let parsed =
+            parse_owner_metadata(r#"{"pid": 91, "api_url": "http://localhost:39876"}"#).unwrap();
+        assert_eq!(parsed.available_endpoints(), vec!["http://localhost:39876"]);
+        assert!(parsed.endpoints.is_empty());
+
+        // When both forms are present the collection wins: it is the one the
+        // current startup transaction wrote.
+        let both = parse_owner_metadata(
+            r#"{"api_url": "http://legacy", "endpoints": ["unix:///repo/.git/cflx-api.sock"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            both.available_endpoints(),
+            vec!["unix:///repo/.git/cflx-api.sock"]
+        );
+    }
+
+    #[test]
+    fn blank_and_duplicate_endpoints_describe_nothing_and_are_dropped() {
+        let parsed = parse_owner_metadata(
+            r#"{"pid": 3, "endpoints": ["  ", "unix:///a.sock", "unix:///a.sock", " http://x "]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.endpoints, vec!["unix:///a.sock", "http://x"]);
+
+        // Endpoints alone are enough to describe an owner...
+        let only_endpoints =
+            parse_owner_metadata(r#"{"endpoints": ["unix:///a.sock"]}"#).expect("readable");
+        assert_eq!(only_endpoints.available_endpoints(), vec!["unix:///a.sock"]);
+        // ...but an all-blank collection describes none.
+        assert_eq!(parse_owner_metadata(r#"{"endpoints": ["", "   "]}"#), None);
     }
 
     #[test]
@@ -546,6 +654,7 @@ mod tests {
             workspace: Some("/repo".to_string()),
             mode: Some("server".to_string()),
             api_url: Some("http://localhost:39876".to_string()),
+            endpoints: Vec::new(),
         };
         let message = conflict_message(Path::new("/repo/.git"), Some(&owner));
         assert!(message.contains("/repo/.git"), "message={message}");
@@ -560,6 +669,41 @@ mod tests {
             message.contains("http://localhost:39876"),
             "message={message}"
         );
+    }
+
+    #[test]
+    fn conflict_message_reports_both_bound_endpoints() {
+        let owner = OwnerMetadata {
+            pid: Some(4321),
+            endpoints: vec![
+                "unix:///repo/.git/cflx-api.sock".to_string(),
+                "http://localhost:39876".to_string(),
+            ],
+            ..OwnerMetadata::default()
+        };
+        let message = conflict_message(Path::new("/repo/.git"), Some(&owner));
+        assert!(
+            message.contains("unix:///repo/.git/cflx-api.sock"),
+            "message={message}"
+        );
+        assert!(
+            message.contains("http://localhost:39876"),
+            "message={message}"
+        );
+    }
+
+    /// A failed startup transaction publishes nothing, so a conflict must not
+    /// name an endpoint the owner never finished binding.
+    #[test]
+    fn conflict_message_claims_no_endpoint_after_a_partial_startup() {
+        let owner = OwnerMetadata {
+            pid: Some(4321),
+            mode: Some("run".to_string()),
+            ..OwnerMetadata::default()
+        };
+        let message = conflict_message(Path::new("/repo/.git"), Some(&owner));
+        assert!(!message.contains("api url"), "message={message}");
+        assert!(!message.contains("unix://"), "message={message}");
     }
 
     #[test]
