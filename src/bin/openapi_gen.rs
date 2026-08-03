@@ -1,7 +1,10 @@
-//! OpenAPI specification generator for the Conflux remote-control API.
+//! Generator for the canonical `/api/v2` OpenAPI artifact.
+//!
+//! Writes exactly what `docs/openapi.yaml` must contain. The bytes come from
+//! `conflux::web::openapi::document_yaml`, which a running instance also serves
+//! at `/api/v2/openapi.yaml`, so the tracked file and the live contract are the
+//! same document by construction rather than by convention.
 
 fn main() {
-    let yaml = serde_yaml::to_string(&conflux::web::openapi::document())
-        .expect("Failed to serialize OpenAPI spec to YAML");
-    println!("{}", yaml.trim_end());
+    print!("{}", conflux::web::openapi::document_yaml());
 }

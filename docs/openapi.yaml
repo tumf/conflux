@@ -1,7 +1,45 @@
+# GENERATED FILE — DO NOT EDIT.
+# Source of truth: src/web/openapi.rs and the #[utoipa::path] attributes it names.
+# Regenerate: make openapi   Verify: make check-openapi
+# docs/openapi.yaml is the one canonical /api/v2 contract in this repository.
 openapi: 3.1.0
 info:
   title: Conflux Remote Control API
-  description: API for monitoring and controlling a running Conflux TUI instance
+  description: |-
+    Remote control of one running `cflx` process incarnation.
+
+    **Authentication.** When a token is configured, every route except
+    `/api/v2/health` and the contract-discovery routes requires
+    `Authorization: Bearer <token>`. Credentials are accepted *only* in that header:
+    a token in a query string or a WebSocket subprotocol is rejected rather than
+    honored, on every path, so a client cannot learn a leaky habit on one route.
+    `GET /api/v2/capabilities` reports whether authentication is enforced at all.
+
+    **Process incarnation.** `instance_id` identifies one process lifetime.
+    `state_revision`, `event_sequence`, and every command record are scoped to it and
+    are gone after a restart. A client that sees a new `instance_id` must discard its
+    cursor and re-snapshot from `GET /api/v2/state`.
+
+    **Streaming.** `GET /api/v2/events` is Server-Sent Events, but a browser must
+    read it with `fetch()` response streaming: native `EventSource` cannot attach the
+    bearer header. `GET /api/v2/ws` is for non-browser clients, since browsers cannot
+    set request headers on a WebSocket handshake.
+
+    **Replay gaps.** Resume with `after_sequence` plus the `instance_id` the cursor
+    belongs to. If the requested cursor has fallen out of the retained ring, or names
+    another incarnation, the stream emits a `gap` envelope; the client must re-read
+    `GET /api/v2/state` rather than assume continuity.
+
+    **Revisions and idempotency.** Every command is side-effecting, so
+    `expected_revision` and `idempotency_key` are both mandatory. A stale
+    `expected_revision` fails with `stale_revision`. Replaying a key bound to a
+    different typed command identity fails with `idempotency_mismatch`; replaying the
+    same identity returns the original record instead of acting twice.
+
+    **Worktree safety.** Worktrees are addressed only by the opaque process-local
+    `worktree_id` handed out by a v2 read. Paths, branches, and base commits are
+    server-derived and are rejected as mutation input, so no client can steer where a
+    worktree lands or what it is cut from.
   license:
     name: MIT
     identifier: MIT
@@ -128,6 +166,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+  /api/v2/docs:
+    get:
+      tags:
+      - contract
+      summary: Swagger UI for this build.
+      description: Human-facing HTML console for the contract. Unauthenticated; requests it issues still need a bearer token of their own.
+      operationId: openapi_docs
+      responses:
+        '200':
+          description: Swagger UI page
+      security: []
   /api/v2/events:
     get:
       tags:
@@ -155,7 +204,11 @@ paths:
           type: string
       responses:
         '200':
-          description: Ordered SSE event stream (fetch() response streaming)
+          description: Ordered SSE stream read with fetch() response streaming. Each `data:` frame is one EventEnvelope; a `gap` category means the requested cursor is no longer replayable and the client must re-read GET /api/v2/state.
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/EventEnvelope'
         '401':
           description: Missing or invalid bearer credentials
           content:
@@ -177,6 +230,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+      security: []
   /api/v2/instance:
     get:
       tags:
@@ -203,6 +257,33 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LogsResponse'
+  /api/v2/openapi.json:
+    get:
+      tags:
+      - contract
+      summary: This document as JSON.
+      description: 'Served by the embedded Swagger UI router. Unauthenticated: it describes the API and exposes no instance state.'
+      operationId: openapi_json
+      responses:
+        '200':
+          description: OpenAPI document (JSON)
+      security: []
+  /api/v2/openapi.yaml:
+    get:
+      tags:
+      - contract
+      summary: |-
+        This build's canonical contract, byte-for-byte the same document that
+        `make openapi` writes to `docs/openapi.yaml`.
+      description: |-
+        Unauthenticated on purpose: it describes the API and reads no instance state,
+        so requiring a token here would only stop a client from discovering how to
+        present one.
+      operationId: openapi_yaml
+      responses:
+        '200':
+          description: OpenAPI document (YAML), content type `application/yaml`
+      security: []
   /api/v2/state:
     get:
       tags:
@@ -304,7 +385,7 @@ paths:
           type: string
       responses:
         '101':
-          description: Switching protocols
+          description: Switching protocols. Every subsequent text frame is one EventEnvelope, in the same order and with the same `gap` semantics as the SSE stream.
         '401':
           description: Missing bearer header, or credentials in query/subprotocol
           content:
@@ -1668,6 +1749,15 @@ components:
           items:
             $ref: '#/components/schemas/WorktreeResource'
           description: Current worktrees.
+  securitySchemes:
+    bearer_token:
+      type: http
+      scheme: bearer
+      description: Bearer token in the `Authorization` header. Credentials are refused anywhere else, including query strings and WebSocket subprotocols. Absent when the instance runs without a configured token; `GET /api/v2/capabilities` reports which.
+security:
+- bearer_token: []
 tags:
 - name: remote-control
   description: Single-instance remote-control API
+- name: contract
+  description: Unauthenticated contract discovery for this build

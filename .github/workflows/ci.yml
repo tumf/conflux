@@ -8,13 +8,17 @@ on:
     branches: [main, master]
     paths-ignore:
       - "**/*.md"
-      - "docs/**"
+      # Not "docs/**": docs/openapi.yaml is the canonical API contract, so a
+      # hand-edit of it must still run the drift check.
+      - "docs/images/**"
       - "openspec/**"
   pull_request:
     branches: [main, master]
     paths-ignore:
       - "**/*.md"
-      - "docs/**"
+      # Not "docs/**": docs/openapi.yaml is the canonical API contract, so a
+      # hand-edit of it must still run the drift check.
+      - "docs/images/**"
       - "openspec/**"
 
 concurrency:

@@ -29,3 +29,12 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # Deliberately the *check*, not a regenerate-and-stage hook: CI retries a
+      # failed hook run, so a hook that silently rewrote docs/openapi.yaml would
+      # pass on the second attempt and let contract drift land unnoticed.
+      - id: openapi-contract
+        name: openapi contract (docs/openapi.yaml)
+        entry: make check-openapi
+        language: system
+        pass_filenames: false
+        always_run: true
