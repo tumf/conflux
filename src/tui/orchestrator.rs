@@ -1899,12 +1899,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_run_report_only_flags_completed_with_errors() {
+    fn scheduler_run_report_flags_unfinished_work_only() {
         use crate::parallel::SchedulerRunReport;
 
-        assert!(SchedulerRunReport::CompletedWithErrors.has_change_failures());
-        assert!(!SchedulerRunReport::Completed.has_change_failures());
-        assert!(!SchedulerRunReport::Stopped.has_change_failures());
+        assert!(SchedulerRunReport::CompletedWithErrors.is_incomplete());
+        assert!(SchedulerRunReport::BlockedOrStalled.is_incomplete());
+        assert!(!SchedulerRunReport::Completed.is_incomplete());
+        assert!(!SchedulerRunReport::Stopped.is_incomplete());
     }
 
     // ------------------------------------------------------------------
