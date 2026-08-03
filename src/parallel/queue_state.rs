@@ -1739,17 +1739,26 @@ impl ParallelExecutor {
                     "Rejecting review confirmed rejection (proposal: {})",
                     rejected_path.display()
                 );
-                let base_branch = self
+                // Base identity is repository truth, not a guess. The rejection
+                // flow checks out this branch and commits REJECTED.md on it, so
+                // substituting a literal default here would mutate whatever
+                // branch happens to carry that name. Losing base identity fails
+                // closed and the queue boundary owns the single global Error.
+                let base_branch = match self
                     .workspace_manager
                     .ensure_original_branch_initialized()
                     .await
-                    .unwrap_or_else(|error| {
-                        warn!(
+                {
+                    Ok(branch) => branch,
+                    Err(error) => {
+                        let message = format!(
                             "Failed to resolve base branch while confirming deferred rejection review for '{}': {}",
                             change_id, error
                         );
-                        "main".to_string()
-                    });
+                        error!("{}", message);
+                        return MergeTaskOutcome::run_fatal(message);
+                    }
+                };
 
                 match execute_rejection_flow(
                     &change_id,
@@ -1798,6 +1807,16 @@ impl ParallelExecutor {
                         };
                         self.apply_rejection_review_event_in_shared_state(&failed_event)
                             .await;
+                        // `RejectionReviewFailed` is the typed change-scoped
+                        // owner for this failure, so the outcome must cross the
+                        // shared base-lane boundary as already-reported. Leaving
+                        // it as `Merged` would report a failed rejection as a
+                        // completed merge and arm success-only follow-up.
+                        outcome = MergeTaskOutcome::already_reported(
+                            &change_id,
+                            AlreadyReportedFailureKind::RejectionReview,
+                            error.to_string(),
+                        );
                         send_event(&self.event_tx, failed_event).await;
                     }
                 }

@@ -137,6 +137,7 @@ pub(super) struct TestWorkspaceManager {
     repo_root: PathBuf,
     existing_workspaces: HashMap<String, WorkspaceInfo>,
     remove_existing_on_lookup: Arc<AtomicBool>,
+    fail_original_branch: Arc<AtomicBool>,
 }
 
 impl TestWorkspaceManager {
@@ -148,6 +149,7 @@ impl TestWorkspaceManager {
             repo_root: PathBuf::from("/tmp/test-repo"),
             existing_workspaces: HashMap::new(),
             remove_existing_on_lookup: Arc::new(AtomicBool::new(false)),
+            fail_original_branch: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -168,6 +170,14 @@ impl TestWorkspaceManager {
     #[allow(dead_code)]
     fn with_remove_existing_on_lookup(self) -> Self {
         self.remove_existing_on_lookup.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Make base identity resolution fail, as a detached HEAD or a lost original
+    /// branch does in a real repository.
+    #[allow(dead_code)]
+    pub(super) fn with_failing_original_branch(self) -> Self {
+        self.fail_original_branch.store(true, Ordering::SeqCst);
         self
     }
 }
@@ -298,10 +308,18 @@ impl WorkspaceManager for TestWorkspaceManager {
     }
 
     async fn ensure_original_branch_initialized(&self) -> VcsResult<String> {
+        if self.fail_original_branch.load(Ordering::SeqCst) {
+            return Err(VcsError::git_command(
+                "detached HEAD with no recorded original branch",
+            ));
+        }
         Ok("main".to_string())
     }
 
     fn original_branch(&self) -> Option<String> {
+        if self.fail_original_branch.load(Ordering::SeqCst) {
+            return None;
+        }
         Some("main".to_string())
     }
 
@@ -9910,6 +9928,305 @@ async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
     );
     assert_eq!(guard.display_status(second_id), "reject pending");
     assert_eq!(guard.reject_wait_change_ids(), vec![second_id.to_string()]);
+}
+
+/// A deferred CONFIRM verdict whose rejection flow fails is a change-local
+/// failure already owned by `RejectionReviewFailed`; it must not cross the
+/// shared base-lane boundary as a completed merge.
+#[tokio::test]
+async fn deferred_confirm_rejection_flow_failure_is_already_reported_not_merged() {
+    use crate::parallel::{AlreadyReportedFailureKind, MergeResult, MergeResultOrigin};
+
+    let workspace_dir = TempDir::new().or_fail("create rejecting workspace");
+    let change_id = "reject-confirm-flow-failure";
+    let rejected_dir = workspace_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join(change_id);
+    std::fs::create_dir_all(&rejected_dir).or_fail("create change directory");
+    std::fs::write(
+        rejected_dir.join("REJECTED.md"),
+        "# REJECTED\n\n- change_id: reject-confirm-flow-failure\n- reason: unrecoverable blocker\n",
+    )
+    .or_fail("write REJECTED.md");
+
+    // `execute_rejection_flow` checks out the base branch in this repo root, so
+    // a missing repository fails the flow deterministically *after* the CONFIRM
+    // verdict has already been produced.
+    let missing_repo_root = workspace_dir.path().join("missing-repo-root");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: CONFIRM'".to_string()),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_strict_process_cleanup: Some(false),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(missing_repo_root, config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["lane-owner".to_string(), change_id.to_string()],
+        2,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        // The change only enters RejectWait while another change holds the
+        // post-archive base-mutating lane; releasing it promotes this waiter.
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane-owner".to_string()));
+        guard.mark_reject_wait(change_id);
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "lane-owner".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some((change_id.to_string(), WaitState::RejectWait))
+        );
+        assert!(guard.is_base_mutating_lane_occupied());
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.reject_wait_changes.insert(change_id.to_string());
+
+    let outcome = executor
+        .retry_deferred_rejection_review_for(change_id.to_string())
+        .await;
+
+    match &outcome {
+        MergeTaskOutcome::RecoverableAlreadyReported {
+            change_id: scoped_id,
+            kind,
+            ..
+        } => {
+            assert_eq!(scoped_id, change_id);
+            assert_eq!(*kind, AlreadyReportedFailureKind::RejectionReview);
+        }
+        other => panic!(
+            "a failed CONFIRM rejection flow must not report a completed merge, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        outcome.disposition(),
+        MergeResultDisposition::ContinueWithErrors
+    );
+
+    let mut rejection_review_failures = 0;
+    let mut saw_rejected_or_completed = false;
+    let mut producer_errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::RejectionReviewFailed { change_id: id, .. } if id == change_id => {
+                rejection_review_failures += 1;
+            }
+            ExecutionEvent::RejectionReviewCompleted { change_id: id, .. }
+            | ExecutionEvent::ChangeRejected { change_id: id, .. }
+            | ExecutionEvent::ChangeDequeued { change_id: id } => {
+                if id == change_id {
+                    saw_rejected_or_completed = true;
+                }
+            }
+            ExecutionEvent::Error { message } => producer_errors.push(message),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        rejection_review_failures, 1,
+        "the rejection-review owner must report the failure exactly once"
+    );
+    assert!(
+        !saw_rejected_or_completed,
+        "a failed rejection flow must not synthesize rejection success events"
+    );
+    assert!(
+        producer_errors.is_empty(),
+        "the change-scoped owner must not also emit a global Error: {producer_errors:?}"
+    );
+
+    // The scheduler boundary continues the run and stays free of a duplicate
+    // global Error.
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    let disposition = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                origin: MergeResultOrigin::RejectWaitRetry,
+                outcome,
+            },
+            &merge_result_tx,
+        )
+        .await;
+
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
+    assert!(
+        executor.run_fatal_abort.is_none(),
+        "an already-reported rejection failure must not abort the run"
+    );
+    assert!(executor.had_change_failures());
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Error { message } = event {
+            panic!("the queue wrapper must not duplicate the reported failure: {message}");
+        }
+    }
+    {
+        let guard = shared.read().await;
+        assert!(
+            !guard.is_base_mutating_lane_occupied(),
+            "the borrowed base-mutating lane must be released regardless of severity"
+        );
+        assert!(guard.global_invariants_hold());
+    }
+    assert!(
+        workspace_dir.path().join("openspec").exists(),
+        "workspace evidence must survive for explicit retry"
+    );
+}
+
+/// Losing base identity during a deferred CONFIRM must fail closed: guessing a
+/// branch name would commit REJECTED.md onto whatever branch carries it.
+#[tokio::test]
+async fn deferred_confirm_base_identity_failure_is_run_fatal_without_mutation() {
+    use crate::parallel::{MergeResult, MergeResultOrigin};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+
+    let workspace_dir = TempDir::new().or_fail("create rejecting workspace");
+    let change_id = "reject-confirm-base-identity";
+    let rejected_dir = workspace_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join(change_id);
+    std::fs::create_dir_all(&rejected_dir).or_fail("create change directory");
+    std::fs::write(
+        rejected_dir.join("REJECTED.md"),
+        "# REJECTED\n\n- change_id: reject-confirm-base-identity\n- reason: unrecoverable blocker\n",
+    )
+    .or_fail("write REJECTED.md");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: CONFIRM'".to_string()),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_strict_process_cleanup: Some(false),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf())
+            .with_failing_original_branch(),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["lane-owner".to_string(), change_id.to_string()],
+        2,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane-owner".to_string()));
+        guard.mark_reject_wait(change_id);
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "lane-owner".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some((change_id.to_string(), WaitState::RejectWait))
+        );
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.reject_wait_changes.insert(change_id.to_string());
+
+    let outcome = executor
+        .retry_deferred_rejection_review_for(change_id.to_string())
+        .await;
+
+    match &outcome {
+        MergeTaskOutcome::RunFatal { detail } => {
+            assert!(
+                detail.contains(change_id),
+                "run-fatal detail must name the change it aborted on: {detail}"
+            );
+        }
+        other => panic!("lost base identity must fail closed as run-fatal, got {other:?}"),
+    }
+    assert_eq!(outcome.disposition(), MergeResultDisposition::AbortRun);
+
+    assert!(
+        !repo_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join(change_id)
+            .join("REJECTED.md")
+            .exists(),
+        "the rejection flow must not run against a guessed base branch"
+    );
+
+    let mut producer_errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::RejectionReviewCompleted { change_id: id, .. }
+            | ExecutionEvent::RejectionReviewFailed { change_id: id, .. }
+            | ExecutionEvent::ChangeRejected { change_id: id, .. }
+            | ExecutionEvent::ChangeDequeued { change_id: id } => {
+                if id == change_id {
+                    panic!("aborting on lost base identity must not mutate rejection state");
+                }
+            }
+            ExecutionEvent::Error { message } => producer_errors.push(message),
+            _ => {}
+        }
+    }
+    assert!(
+        producer_errors.is_empty(),
+        "the global Error owner is the queue boundary, not the producer: {producer_errors:?}"
+    );
+
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    let disposition = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                origin: MergeResultOrigin::RejectWaitRetry,
+                outcome,
+            },
+            &merge_result_tx,
+        )
+        .await;
+
+    assert_eq!(disposition, MergeResultDisposition::AbortRun);
+    assert!(executor.run_fatal_abort.is_some());
+    let global_errors = {
+        let mut collected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::Error { message } = event {
+                collected.push(message);
+            }
+        }
+        collected
+    };
+    assert_eq!(
+        global_errors.len(),
+        1,
+        "an aborting run emits exactly one global Error: {global_errors:?}"
+    );
+    assert!(shared.read().await.global_invariants_hold());
 }
 
 #[tokio::test]
