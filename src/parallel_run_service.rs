@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::hooks::HookRunner;
 use crate::openspec::Change;
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
-use crate::parallel::{ParallelEvent, ParallelExecutor, PostArchiveAction};
+use crate::parallel::{ParallelEvent, ParallelExecutor, PostArchiveAction, SchedulerRunReport};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -355,6 +355,23 @@ impl ParallelRunService {
             }
         };
 
+        // A CLI target list is explicit operator intent, exactly like a TUI or
+        // remote Start, so it enters the same reducer contract that
+        // `initialize_parallel_shared_state` and `RunControlService::start_marked`
+        // use: the scheduler reads reducer queue intent — not the local candidate
+        // list — when it decides what may still run, and registration alone
+        // leaves a change `NotQueued`. Intent is recorded *after* the committed
+        // filter, so a change this run just rejected is not granted eligibility
+        // that reconciliation would hand straight back.
+        {
+            let mut guard = self.shared_orchestrator_state.write().await;
+            for change in &changes {
+                guard.apply_command(crate::orchestration::state::ReducerCommand::AddToQueue(
+                    change.id.clone(),
+                ));
+            }
+        }
+
         info!(
             "Starting parallel execution with re-analysis for {} changes",
             changes.len()
@@ -429,10 +446,20 @@ impl ParallelRunService {
             )
             .await;
 
+        // Close the event channel before joining the forwarder. The forwarder
+        // also breaks on a terminal event, but not every terminal path emits
+        // one: a scheduler failure and a blocked/stalled exit both return
+        // without `AllCompleted`, and a forwarder still holding a live sender
+        // would wait forever. The analyzer closure owned the only other clone
+        // and was consumed by the call above, so this closes the channel.
+        drop(executor);
+
         // Wait for event forwarding to complete
         let _ = forward_handle.await;
 
-        result
+        // The callback API reports through events; the typed terminal report is
+        // consumed by boundaries that publish their own completion transition.
+        result.map(|_report| ())
     }
 
     /// Run parallel execution with an mpsc sender for events and optional shared queue change state.
@@ -458,7 +485,7 @@ impl ParallelRunService {
             std::sync::Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
         >,
         explicit_retry: bool,
-    ) -> Result<()> {
+    ) -> Result<SchedulerRunReport> {
         let mut executor = self.create_executor_with_queue_state(
             Some(event_tx.clone()),
             cancel_token,
@@ -482,7 +509,7 @@ impl ParallelRunService {
         mut executor: ParallelExecutor,
         changes: Vec<Change>,
         event_tx: mpsc::Sender<ParallelEvent>,
-    ) -> Result<()> {
+    ) -> Result<SchedulerRunReport> {
         // Prepare changes using the common helper (sends warning event if needed).
         // Preserve caller-provided reducer state: manual TUI retry startup records
         // ResolveWait/RejectWait in the reducer before constructing the executor, and
@@ -500,7 +527,7 @@ impl ParallelRunService {
             .await?
         {
             Some(changes) => changes,
-            None => return Ok(()),
+            None => return Ok(SchedulerRunReport::Completed),
         };
 
         info!(

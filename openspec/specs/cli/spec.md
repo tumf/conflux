@@ -811,12 +811,36 @@ The TUI SHALL ignore approval toggles and SHALL NOT change any state on `@` key 
 
 ### Requirement: Auto-Queue Approved Changes on TUI Startup
 
-The TUI SHALL start with all changes unselected and SHALL NOT auto-queue any change.
+The TUI SHALL start with all changes unselected and SHALL NOT auto-queue any change. Active-change refresh and preserved worktree discovery MAY populate display/catalog state, but MUST NOT create execution eligibility. Only marked IDs accepted by Start or later accepted shared operator queue/retry intent may enter ordinary execution.
 
 #### Scenario: TUI startup clears execution marks
-- **WHEN** user starts the TUI
-- **THEN** all changes are unselected by default
-- **AND** no changes are automatically queued
+
+**When**: The user starts the TUI
+**Then**: All changes are unselected by default
+**And**: No changes are automatically queued or admitted to execution
+
+#### Scenario: Initial all-change refresh preserves selection boundary
+
+**Given**: `fresh` is marked and `stale` is unmarked
+**And**: `stale` has a preserved recoverable worktree
+**When**: The user starts processing `fresh`
+**And**: The initial `ChangesRefreshed` event contains both changes
+**Then**: Only `fresh` enters ordinary execution eligibility
+**And**: Catalog registration of `stale` does not queue, analyze, or execute it
+
+#### Scenario: Explicit later queue enables preserved workspace recovery
+
+**Given**: `stale` remains visible and unqueued with a preserved recoverable worktree
+**When**: The user explicitly adds `stale` to the Running-mode queue
+**Then**: Shared reducer queue intent makes `stale` eligible
+**And**: Conflux derives its resume phase from workspace and Git evidence
+
+#### Scenario: Queue removal revokes recovery eligibility
+
+**Given**: `stale` was explicitly queued and has not yet completed
+**When**: The user removes or successfully stops and dequeues `stale`
+**Then**: Preserved worktree discovery does not requeue it
+**And**: Explicit requeue is required before it can execute again
 
 ### Requirement: Unapproved Changes Cannot Be Queued
 
@@ -1211,43 +1235,50 @@ TUI は `rejected` terminal row を execution candidate として扱ってはな
 
 ### Requirement: Web Monitoring Flags
 
-The CLI SHALL support flags to enable and configure web-based monitoring.
+The CLI SHALL expose the browser-facing `--web` TCP listener and the default local Unix API listener as distinct controls. In web-enabled builds, default TUI, `tui`, and `run` SHALL use `${GIT_COMMON_DIR}/cflx-api.sock` unless `--web-unix-socket PATH` overrides it or `--no-web-unix-socket` disables it. The override and opt-out SHALL be mutually exclusive. `--web` SHALL add the retained TCP/Web UI listener without disabling UDS.
 
-#### Scenario: Enable web monitoring
-- **WHEN** user runs with `--web` flag
-- **THEN** HTTP server starts for web monitoring
-- **AND** server binds to default port 8080 on 127.0.0.1
+#### Scenario: Default UDS starts without web flag
 
-#### Scenario: Configure web port
-- **WHEN** user runs with `--web --web-port 3000`
-- **THEN** HTTP server starts on port 3000 instead of default
+- **GIVEN** a web-enabled build inside a Git repository
+- **WHEN** the user starts default TUI, `cflx tui`, or `cflx run` without Unix socket flags
+- **THEN** the API binds `${GIT_COMMON_DIR}/cflx-api.sock`
+- **AND** no TCP Web UI listener starts unless `--web` is supplied
 
-#### Scenario: Configure bind address
-- **WHEN** user runs with `--web --web-bind 0.0.0.0`
-- **THEN** HTTP server accepts connections from any network interface
-- **AND** warning is logged about exposing server to network
+#### Scenario: Override default Unix path
 
-#### Scenario: Web flags without --web
-- **WHEN** user runs with `--web-port 3000` but without `--web` flag
-- **THEN** HTTP server does not start
-- **AND** web-port flag is ignored
+- **WHEN** the user supplies `--web-unix-socket /run/user/1000/custom.sock`
+- **THEN** the API binds that path instead of the Git common-directory default
 
-#### Scenario: Invalid port number
-- **WHEN** user runs with `--web --web-port 99999`
-- **THEN** error message is displayed about invalid port range
-- **AND** orchestrator exits with non-zero status
+#### Scenario: Disable default Unix listener
 
-#### Scenario: Web monitoring in TUI mode
-- **WHEN** user runs TUI mode with `--web` flag
-- **THEN** HTTP server starts in background
-- **AND** TUI displays message indicating web server is running
-- **AND** TUI shows web server URL (e.g., "Web monitoring: http://127.0.0.1:8080")
+- **WHEN** the user supplies `--no-web-unix-socket`
+- **THEN** no UDS listener starts
+- **AND** local orchestration may continue
 
-#### Scenario: Web monitoring in run mode
-- **WHEN** user runs `cflx run --web`
-- **THEN** HTTP server starts before orchestration begins
-- **AND** server URL is logged to console
-- **AND** orchestration proceeds normally
+#### Scenario: Unix options are mutually exclusive
+
+- **WHEN** the user supplies both `--web-unix-socket PATH` and `--no-web-unix-socket`
+- **THEN** CLI parsing fails with an actionable conflict error
+
+#### Scenario: Enable web monitoring alongside UDS
+
+- **WHEN** the user runs with `--web`
+- **THEN** the retained TCP server starts on the configured bind and actual port
+- **AND** the default or explicit UDS remains active
+- **AND** the TUI displays and encodes only the TCP Web UI URL as QR
+
+#### Scenario: Configure TCP listener
+
+- **WHEN** the user runs with `--web --web-bind 0.0.0.0 --web-port 3000` and valid required authentication
+- **THEN** the TCP server accepts connections on port 3000 from the configured interface
+- **AND** the UDS path remains controlled only by its default, override, or opt-out
+
+#### Scenario: Non-Git invocation requires a decision
+
+- **GIVEN** a web-enabled local orchestration invocation outside Git
+- **WHEN** neither `--web-unix-socket PATH` nor `--no-web-unix-socket` is supplied
+- **THEN** startup exits non-zero before orchestration
+- **AND** the error explains both explicit choices
 
 ### Requirement: Archived change の一覧保持
 
@@ -2145,35 +2176,39 @@ Conflux MUST allow at most one local orchestration-owning process for a Git repo
 
 ### Requirement: Repository Lock Conflict Diagnostics
 
-A lock owner MUST publish best-effort diagnostic metadata containing its PID, start time, canonical workspace, and invocation mode. After an API listener successfully binds, the owner MUST update the metadata with the actual API base URL. A conflicting invocation MUST display all valid available owner metadata, MUST omit unavailable API information, and MUST remain safe when metadata is missing or malformed.
+A lock owner MUST publish best-effort diagnostic metadata containing its PID, start time, canonical workspace, invocation mode, and every API endpoint whose listener completed startup. Endpoint metadata MUST distinguish Unix and TCP addresses. Readers MUST accept legacy metadata containing only `api_url`. A conflicting invocation MUST display all valid available owner metadata, omit unavailable endpoints, and remain safe when metadata is missing or malformed. Endpoint metadata MUST NOT control lock ownership or workflow routing.
 
-#### Scenario: Conflict reports an active API endpoint
-
-- **GIVEN** a process owns the repository lock
-- **AND** its API listener has successfully bound and returned an actual accessible URL
-- **WHEN** another local orchestration-owning invocation targets the repository
-- **THEN** the conflict diagnostic includes the owner PID, invocation mode, start time, canonical workspace, and actual API base URL
-- **AND** an OS-assigned port is reported when the owner requested port `0`
-
-#### Scenario: Conflict before API bind omits endpoint
+#### Scenario: Conflict reports default Unix endpoint
 
 - **GIVEN** a process owns the repository lock
-- **AND** no API listener is active or listener binding has not completed
+- **AND** its default Unix listener successfully bound
 - **WHEN** another local orchestration-owning invocation targets the repository
-- **THEN** the conflict diagnostic identifies the owner from valid available metadata
-- **AND** the diagnostic does not claim an API URL
+- **THEN** the conflict diagnostic includes `unix://${GIT_COMMON_DIR}/cflx-api.sock`
 
-#### Scenario: Malformed metadata does not control ownership
+#### Scenario: Conflict reports dual endpoints
 
-- **GIVEN** the repository lock is held but its diagnostic metadata is absent, incomplete, or malformed
-- **WHEN** another local orchestration-owning invocation attempts startup
+- **GIVEN** a process successfully bound its UDS and `--web` TCP listeners
+- **WHEN** another local orchestration-owning invocation targets the repository
+- **THEN** the conflict diagnostic includes both actual endpoints
+- **AND** an OS-assigned TCP port is reported when the owner requested port `0`
+
+#### Scenario: Legacy single URL metadata remains readable
+
+- **GIVEN** owner metadata was written by a prior version with only `api_url`
+- **WHEN** a conflict diagnostic reads it
+- **THEN** the legacy URL is reported as an available endpoint
+- **AND** it does not affect OS lock ownership
+
+#### Scenario: Partial startup publishes no endpoints
+
+- **GIVEN** one requested listener binds but another requested listener fails during startup
+- **WHEN** the process exits the failed startup transaction
+- **THEN** owner metadata does not claim either endpoint as active
+- **AND** any created listener and owned socket are cleaned up
+
+#### Scenario: Malformed endpoint metadata does not control ownership
+
+- **GIVEN** the repository lock is held but endpoint metadata is absent, incomplete, or malformed
+- **WHEN** another invocation attempts startup
 - **THEN** the second invocation is rejected because the OS lock is held
-- **AND** the conflict diagnostic reports a generic live-lock conflict plus any fields that can be read safely
-
-#### Scenario: Stale metadata does not block startup
-
-- **GIVEN** diagnostic metadata remains from a previous process
-- **AND** no process holds the OS lock
-- **WHEN** local orchestration starts
-- **THEN** it acquires the lock and replaces the stale diagnostic metadata
-- **AND** the previous PID or API URL does not affect workflow routing
+- **AND** the diagnostic reports only fields and endpoints that can be read safely

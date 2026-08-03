@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::task_parser;
 use crate::tui::events::LogEntry;
-use crate::tui::types::{AppMode, StopMode};
+use crate::tui::types::{AppExecutionMode, StopMode};
 
 use super::AppState;
 
@@ -24,9 +24,9 @@ impl AppState {
     /// Only the retained terminal modes need to be named exactly; every other
     /// mode is non-terminal as far as completion handling is concerned.
     fn terminal_mode_name(&self) -> &'static str {
-        match self.mode {
-            AppMode::Stopped => "stopped",
-            AppMode::Error => "error",
+        match self.execution_mode {
+            AppExecutionMode::Stopped => "stopped",
+            AppExecutionMode::Error => "error",
             _ => "running",
         }
     }
@@ -49,7 +49,7 @@ impl AppState {
             }
         }
 
-        self.mode = AppMode::Select;
+        self.execution_mode = AppExecutionMode::Select;
         self.current_change = None;
         self.stop_mode = StopMode::None;
         if let Some(started) = self.orchestration_started_at {
@@ -200,14 +200,20 @@ impl AppState {
         );
     }
 
+    /// Record the compatibility observation that a failed dependency excluded a
+    /// change from dispatch.
+    ///
+    /// `ChangeSkipped` is *not* a queue-intent revocation. The change stays
+    /// reducer-queued and locally selected, waiting for its blocker to be
+    /// retried or resolved, so this handler deliberately leaves `selected` and
+    /// the run-timing fields alone. Authoritative blocked presentation belongs
+    /// to `DependencyBlocked` (see `handle_dependency_blocked`); clearing
+    /// selection here used to make an operator's still-live queue intent
+    /// disappear from the frontend while the reducer still held it.
     pub(crate) fn handle_change_skipped(&mut self, change_id: String, reason: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(reason.clone());
-            change.selected = false;
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         self.add_log(
             LogEntry::warn(format!("Skipped {}: {}", change_id, reason)).with_change_id(&change_id),
@@ -272,9 +278,12 @@ mod tests {
     /// projection would describe the same run differently.
     #[test]
     fn late_all_completed_preserves_retained_terminal_modes() {
-        for (mode, expected_name) in [(AppMode::Stopped, "stopped"), (AppMode::Error, "error")] {
+        for (mode, expected_name) in [
+            (AppExecutionMode::Stopped, "stopped"),
+            (AppExecutionMode::Error, "error"),
+        ] {
             let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-            app.mode = mode.clone();
+            app.execution_mode = mode;
             assert_eq!(app.terminal_mode_name(), expected_name);
             assert!(!crate::events::all_completed_may_overwrite_mode(
                 expected_name
@@ -283,7 +292,7 @@ mod tests {
             app.handle_all_completed();
 
             assert_eq!(
-                app.mode, mode,
+                app.execution_mode, mode,
                 "a late completion overwrote the authoritative terminal mode"
             );
         }
@@ -293,14 +302,61 @@ mod tests {
     #[test]
     fn all_completed_still_completes_a_running_frontend() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         assert!(crate::events::all_completed_may_overwrite_mode(
             app.terminal_mode_name()
         ));
 
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
+    }
+
+    /// `ChangeSkipped` for a failed dependency is a compatibility observation,
+    /// not a queue-intent revocation: the change is still reducer-queued and
+    /// still selected, waiting for the blocker to be retried or resolved.
+    /// `DependencyBlocked` is what owns blocked presentation.
+    #[test]
+    fn failed_dependency_event_consumer_preserves_queue_selection() {
+        let mut app = AppState::new(vec![create_test_change("change-b", 0, 1)]);
+        if let Some(change) = app.changes.iter_mut().find(|c| c.id == "change-b") {
+            change.selected = true;
+        }
+
+        app.handle_change_skipped(
+            "change-b".to_string(),
+            "Dependency 'change-a' failed".to_string(),
+        );
+
+        let change = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-b")
+            .expect("queued change row");
+        assert!(
+            change.selected,
+            "a failed-dependency compatibility event must not deselect still-accepted queue intent"
+        );
+        assert_eq!(
+            change.error_message_cache.as_deref(),
+            Some("Dependency 'change-a' failed"),
+            "the compatibility reason is still reported to the operator"
+        );
+
+        app.handle_dependency_blocked("change-b".to_string());
+        let change = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-b")
+            .expect("queued change row");
+        assert_eq!(
+            change.display_status_cache, "blocked",
+            "DependencyBlocked owns the authoritative blocked presentation"
+        );
+        assert!(
+            change.selected,
+            "blocked presentation must not revoke queue intent either"
+        );
     }
 
     #[test]
@@ -354,7 +410,7 @@ mod tests {
     #[test]
     fn global_completion_log_remains_unscoped() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         app.handle_all_completed();
 
@@ -397,10 +453,10 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         assert_eq!(app.current_change, None);
     }
 
@@ -409,21 +465,21 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Error;
+        app.execution_mode = AppExecutionMode::Error;
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Error);
+        assert_eq!(app.execution_mode, AppExecutionMode::Error);
     }
 
     #[test]
     fn all_completed_keeps_stopped_mode() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
 
         app.handle_all_completed();
 
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[test]
@@ -452,7 +508,7 @@ mod tests {
     fn all_completed_resets_blocked_and_queued_to_not_queued() {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
         app.changes[1].display_status_cache = "blocked".to_string();
@@ -462,7 +518,7 @@ mod tests {
 
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(app.changes[1].display_status_cache, "not queued");
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
     }
 
     #[test]
@@ -488,7 +544,7 @@ mod tests {
     fn merge_completed_closes_active_resolve_lifecycle() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
 
@@ -509,7 +565,7 @@ mod tests {
             create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
         app.changes[1].set_display_status_cache("resolve pending");
@@ -598,7 +654,7 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolve_reservations(resolves.clone());
         app.set_shared_state(state.clone());
         app.apply_display_statuses_from_reducer(&state.read().await.all_display_statuses());

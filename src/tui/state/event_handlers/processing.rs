@@ -3,7 +3,7 @@ use std::time::Instant;
 use crate::parallel::dedup::DiagnosticDeduplicationKey;
 use crate::task_parser;
 use crate::tui::events::LogEntry;
-use crate::tui::types::{AppMode, StopMode};
+use crate::tui::types::{AppExecutionMode, StopMode};
 
 use super::AppState;
 
@@ -144,12 +144,12 @@ impl AppState {
         );
     }
 
-    /// Transition to `AppMode::Select` if no active changes remain.
+    /// Transition to `AppExecutionMode::Select` if no active changes remain.
     ///
     /// "Active" means any change is still in a processing queue status:
     /// Queued, Blocked, Applying, Accepting, Archiving, Resolving, or ResolveWait.
     pub(crate) fn try_transition_to_select(&mut self) {
-        if !matches!(self.mode, AppMode::Running) {
+        if !matches!(self.execution_mode, AppExecutionMode::Running) {
             return;
         }
 
@@ -168,7 +168,7 @@ impl AppState {
 
         if !has_active {
             tracing::info!("No active changes remaining after resolve; transitioning to Select");
-            self.mode = AppMode::Select;
+            self.execution_mode = AppExecutionMode::Select;
             self.current_change = None;
             self.stop_mode = StopMode::None;
             if let Some(started) = self.orchestration_started_at {
@@ -180,15 +180,15 @@ impl AppState {
 
     /// Apply a terminal `Stopped` transition.
     ///
-    /// The first transition into `AppMode::Stopped` owns the terminal
+    /// The first transition into `AppExecutionMode::Stopped` owns the terminal
     /// `Processing stopped` message. A repeated or late `Stopped` delivery (for
     /// example the scheduler's own cancellation event arriving after the
     /// frontend already applied the stop) still reconciles queue and mode state,
     /// but must not append a duplicate terminal message.
     pub(crate) fn handle_stopped(&mut self) {
-        let already_stopped = matches!(self.mode, AppMode::Stopped);
+        let already_stopped = matches!(self.execution_mode, AppExecutionMode::Stopped);
         self.reset_analysis_log_dedupe();
-        self.mode = AppMode::Stopped;
+        self.execution_mode = AppExecutionMode::Stopped;
         self.current_change = None;
         self.stop_mode = StopMode::None;
         if let Some(started) = self.orchestration_started_at {
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn global_orchestration_logs_remain_unscoped() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         app.handle_analysis_started(1, "attempt-a".to_string());
         app.try_transition_to_select();
@@ -410,7 +410,7 @@ mod tests {
 
         app.handle_stopped();
 
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected);
     }
@@ -419,7 +419,7 @@ mod tests {
     fn handle_stopped_resets_blocked_to_not_queued() {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string();
         app.changes[0].selected = true;
         app.changes[1].display_status_cache = "blocked".to_string();
@@ -429,7 +429,7 @@ mod tests {
 
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert_eq!(app.changes[1].display_status_cache, "not queued");
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[test]
@@ -439,7 +439,7 @@ mod tests {
             create_test_change("change-b", 2, 4),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[0].selected = true;
         app.changes[1].display_status_cache = "merged".to_string();
@@ -448,42 +448,42 @@ mod tests {
 
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected);
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[test]
     fn try_transition_to_select_no_op_when_not_running() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
 
         app.try_transition_to_select();
 
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
     }
 
     #[test]
     fn try_transition_to_select_stays_running_with_active() {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string();
 
         app.try_transition_to_select();
 
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
     }
 
     #[test]
     fn idle_parallel_stop_first_stopped_transition_owns_the_terminal_message() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].set_display_status_cache("applying");
         app.changes[0].selected = true;
 
         app.handle_stopped();
 
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
         assert_eq!(count_logs(&app, "Processing stopped"), 1);
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected, "execution marks must be preserved");
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn idle_parallel_stop_repeated_stopped_delivery_does_not_duplicate_the_message() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].set_display_status_cache("applying");
         app.changes[0].selected = true;
 
@@ -503,7 +503,7 @@ mod tests {
         app.handle_stopped();
 
         assert_eq!(count_logs(&app, "Processing stopped"), 1);
-        assert_eq!(app.mode, AppMode::Stopped);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopped);
         assert_eq!(app.changes[0].display_status_cache, "not queued");
         assert!(app.changes[0].selected, "execution marks must be preserved");
     }
@@ -511,10 +511,10 @@ mod tests {
     #[test]
     fn idle_parallel_stop_new_run_can_report_its_own_terminal_stop() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         app.handle_stopped();
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.handle_stopped();
 
         assert_eq!(

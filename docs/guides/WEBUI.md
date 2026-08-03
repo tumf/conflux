@@ -1,7 +1,7 @@
 # Web UI Guide
 
-This guide covers the local web monitoring UI (`--web`), its REST API, and the
-versioned `/api/v2` remote-control API.
+This guide covers the default local API socket, the optional web monitoring UI
+(`--web`), and the versioned `/api/v2` remote-control API.
 
 Conflux is a single-workspace tool: `cflx`, `cflx tui`, and `cflx run` all
 operate on the current repository. The web UI is an optional monitoring surface
@@ -12,10 +12,72 @@ multi-project server.
 > `cflx project`, `cflx service`, and the remote-client TUI `--server` options)
 > no longer exists. See [Migrating from server mode](#migrating-from-server-mode).
 
-## Enabling the Web UI
+## The default local API socket
+
+`cflx`, `cflx tui`, and `cflx run` serve `/api/v2` on a Unix domain socket by
+default. No flag enables it and no TCP port is consumed:
+
+```
+${GIT_COMMON_DIR}/cflx-api.sock
+```
 
 ```bash
-# TUI + Web UI
+# Query the running process from a script, an agent, or another shell
+SOCK="$(git rev-parse --git-common-dir)/cflx-api.sock"
+curl --unix-socket "$SOCK" http://localhost/api/v2/health
+curl --unix-socket "$SOCK" http://localhost/api/v2/state
+
+# With a bearer token configured
+curl --unix-socket "$SOCK" -H "Authorization: Bearer $CFLX_WEB_TOKEN" \
+  http://localhost/api/v2/state
+```
+
+The host part of those URLs is ignored by the server; `curl` needs *some*
+authority, so `localhost` is conventional.
+
+The path comes from the canonical Git *common* directory — the same repository
+identity the orchestration lock uses. Every linked worktree of one repository
+therefore resolves the same socket, unrelated repositories resolve different
+ones, and the lock is what keeps two default owners from racing for it.
+
+| Option | Effect |
+|--------|--------|
+| *(none)* | Bind `${GIT_COMMON_DIR}/cflx-api.sock` |
+| `--web-unix-socket PATH` | Bind `PATH` instead |
+| `--no-web-unix-socket` | Bind no Unix socket at all |
+
+The two options are mutually exclusive. Outside a Git repository there is no
+identity to derive a deterministic path from, so startup fails with an error
+naming both explicit choices rather than guessing a location.
+
+**Permissions and authentication.** The socket is created with mode `0600`, so
+filesystem permissions are the access boundary. Token-free access is permitted
+there exactly as it is on loopback TCP. When a bearer token *is* configured, one
+policy applies to every active listener: `/api/v2/health` stays public and every
+other v2 HTTP, SSE, and WebSocket resource requires it.
+
+**Startup and shutdown.** The listener binds before lifecycle adapters, AI
+subprocesses, or orchestration begin. A bind, permission, or path-safety failure
+exits non-zero with none of that started. A live socket or a non-socket entry at
+the target path is never removed — startup fails and leaves it alone — while an
+unreachable socket left by a dead process is replaced. A finite `cflx run` and a
+graceful TUI exit both remove the socket they created, and never a replacement
+that appeared at the path during the run.
+
+**Browsers and QR codes.** A `unix://` endpoint is discovery information for
+local clients and reverse proxies. Browsers cannot open it, and the TUI QR popup
+still encodes the TCP Web UI URL only. To expose the API over HTTP, front the
+socket with a reverse proxy (nginx `proxy_pass http://unix:/path/to/cflx-api.sock:/`,
+Caddy `reverse_proxy unix//path/to/cflx-api.sock`) or use `--web`.
+
+## Enabling the Web UI
+
+`--web` *adds* the browser-facing TCP listener; it does not replace or disable
+the Unix socket. Both listeners serve the same router and the same process
+state.
+
+```bash
+# TUI + Web UI (plus the default Unix socket)
 cflx --web
 
 # Headless run + Web UI
@@ -24,6 +86,9 @@ cflx run --web
 # Custom port, plus a bearer token because the bind is not loopback
 export CFLX_WEB_TOKEN="$(openssl rand -hex 32)"
 cflx --web --web-port 9000 --web-bind 0.0.0.0 --web-auth-token-env CFLX_WEB_TOKEN
+
+# TCP only, with no Unix socket
+cflx run --web --no-web-unix-socket
 ```
 
 When using the default port (`0`), the OS automatically assigns an available port.
@@ -33,6 +98,10 @@ A non-loopback `--web-bind` requires a bearer token for the `/api/v2`
 remote-control API, and the process refuses to start without one. Use
 `--web-auth-token-env VAR` (recommended) or `--web-auth-token TOKEN`; the two are
 mutually exclusive. See [USAGE.md](USAGE.md#remote-control-api-apiv2).
+
+`--web-port`, `--web-bind`, and the allowed-origin options configure the TCP
+listener only; the Unix socket is controlled solely by its default, override, or
+opt-out.
 
 ## Dashboard Features
 

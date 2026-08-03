@@ -507,20 +507,39 @@ async fn second_completion_edge_rearms_analysis_and_capacity_recovery_dispatches
 /// sticky trigger from an earlier edge.
 #[tokio::test]
 async fn every_background_merge_outcome_releases_capacity_and_only_merged_arms_an_edge() {
-    let cases: Vec<(&str, Result<MergeTaskOutcome, String>, ReanalysisReason)> = vec![
+    let cases: Vec<(&str, MergeTaskOutcome, ReanalysisReason)> = vec![
         (
             "merged",
-            Ok(MergeTaskOutcome::Merged),
+            MergeTaskOutcome::Merged,
             ReanalysisReason::ResolveCompletion,
         ),
         (
             "deferred",
-            Ok(MergeTaskOutcome::deferred("merge lane busy", true)),
+            MergeTaskOutcome::deferred("merge lane busy", true),
             ReanalysisReason::Initial,
         ),
         (
-            "failed",
-            Err("background merge failed".to_string()),
+            "resolve exhausted",
+            MergeTaskOutcome::resolve_exhausted(
+                "change-a",
+                3,
+                crate::parallel::ResolveFailureClassification::UnresolvedConflict,
+                "conflicts remain",
+            ),
+            ReanalysisReason::Initial,
+        ),
+        (
+            "already reported",
+            MergeTaskOutcome::already_reported(
+                "change-a",
+                crate::parallel::AlreadyReportedFailureKind::Push,
+                "push already reported",
+            ),
+            ReanalysisReason::Initial,
+        ),
+        (
+            "run fatal",
+            MergeTaskOutcome::run_fatal("background merge failed"),
             ReanalysisReason::Initial,
         ),
     ];

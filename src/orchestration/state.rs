@@ -1454,6 +1454,35 @@ impl OrchestratorState {
             .unwrap_or(false)
     }
 
+    /// Return true when current reducer intent still admits `change_id` as ordinary queued work.
+    ///
+    /// This is the revocation check a scheduler wake-up hint must pass before it
+    /// is treated as work. `RemoveFromQueue` and `DequeueChange` clear queue
+    /// intent immediately, so a dynamic-queue entry left over from an earlier
+    /// accepted addition cannot reacquire the change; an explicit `AddToQueue`
+    /// or `RetryError` restores eligibility.
+    ///
+    /// A change the reducer has never seen carries no execution intent at all, so
+    /// it is not eligible either. Every accepted path into ordinary work —
+    /// start, `AddToQueue`, `RetryError`, and catalog registration through
+    /// `add_dynamic_change` — records reducer runtime state before any scheduler
+    /// wake-up hint is published, so "unknown to the reducer" cannot describe
+    /// work an operator asked for. Treating unknown as admissible would let any
+    /// ID that reaches the wake-up channel be resolved from the catalog and
+    /// executed without intent, which is the bypass this predicate exists to
+    /// close. Catalog membership alone still is not eligibility: a registered
+    /// change stays `QueueIntent::NotQueued` until an explicit command.
+    pub fn is_ordinary_queue_eligible(&self, change_id: &str) -> bool {
+        match self.change_runtime.get(change_id) {
+            None => false,
+            Some(rt) => {
+                !rt.is_terminal()
+                    && !rt.dequeued
+                    && (rt.is_active() || matches!(rt.queue_intent, QueueIntent::Queued))
+            }
+        }
+    }
+
     /// Return true when a recoverable terminal error is currently gating ordinary apply dispatch.
     pub fn is_terminal_error_change(&self, change_id: &str) -> bool {
         self.change_runtime
@@ -5863,5 +5892,115 @@ mod tests {
                 .contains(&"alpha".to_string()),
             "confirmed publication must clear base-lane retry intent"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Explicit-intent boundary
+    // ------------------------------------------------------------------
+
+    /// Catalog refresh is registration, not intent: an all-change refresh may
+    /// make an unselected change visible but must leave every execution lane
+    /// clear for it.
+    #[test]
+    fn changes_refreshed_registers_without_creating_queue_or_lane_eligibility() {
+        use crate::events::ExecutionEvent;
+        use std::collections::{HashMap, HashSet};
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["fresh".to_string()], 1, ExecutionMode::Parallel);
+        state.apply_command(ReducerCommand::AddToQueue("fresh".to_string()));
+
+        let change = |id: &str| crate::openspec::Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
+        };
+
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![change("fresh"), change("stale")],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::from(["fresh".to_string(), "stale".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["stale".to_string()]),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+
+        assert!(
+            state.is_in_snapshot("stale"),
+            "refresh may register a newly observed change"
+        );
+        assert_eq!(state.display_status("stale"), "not queued");
+        assert_eq!(
+            state
+                .change_runtime("stale")
+                .expect("refresh registers runtime state")
+                .queue_intent,
+            QueueIntent::NotQueued
+        );
+        assert_eq!(state.queued_change_ids(), vec!["fresh".to_string()]);
+        assert!(state.merge_wait_change_ids().is_empty());
+        assert!(state.resolve_wait_change_ids().is_empty());
+        assert!(state.reject_wait_change_ids().is_empty());
+        assert!(state.active_change_ids().is_empty());
+        assert!(
+            !state.is_ordinary_queue_eligible("stale"),
+            "a registered but unqueued change must not be dispatchable"
+        );
+    }
+
+    /// Revocation is immediate, and a later refresh cannot undo it.
+    #[test]
+    fn removal_and_dequeue_revoke_ordinary_eligibility_until_explicit_requeue() {
+        use crate::events::ExecutionEvent;
+        use std::collections::{HashMap, HashSet};
+
+        let mut state =
+            OrchestratorState::with_mode(vec!["alpha".to_string()], 1, ExecutionMode::Parallel);
+        state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        assert!(state.is_ordinary_queue_eligible("alpha"));
+
+        state.apply_command(ReducerCommand::RemoveFromQueue("alpha".to_string()));
+        assert!(!state.is_ordinary_queue_eligible("alpha"));
+        assert!(state.queued_change_ids().is_empty());
+
+        // A refresh that re-observes the change and its worktree must not
+        // resurrect eligibility.
+        state.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![crate::openspec::Change {
+                id: "alpha".to_string(),
+                completed_tasks: 0,
+                total_tasks: 1,
+                last_modified: "now".to_string(),
+                dependencies: Vec::new(),
+                metadata: crate::openspec::ProposalMetadata::default(),
+            }],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::from(["alpha".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["alpha".to_string()]),
+            worktree_paths: HashMap::new(),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+        assert!(!state.is_ordinary_queue_eligible("alpha"));
+
+        state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        state.apply_command(ReducerCommand::DequeueChange("alpha".to_string()));
+        assert!(
+            !state.is_ordinary_queue_eligible("alpha"),
+            "stop-and-dequeue revokes ordinary eligibility"
+        );
+
+        state.apply_command(ReducerCommand::AddToQueue("alpha".to_string()));
+        assert!(
+            state.is_ordinary_queue_eligible("alpha"),
+            "explicit requeue restores eligibility"
+        );
+        assert_eq!(state.queued_change_ids(), vec!["alpha".to_string()]);
     }
 }
