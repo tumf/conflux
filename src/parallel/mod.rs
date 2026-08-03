@@ -100,12 +100,28 @@ pub enum SchedulerRunReport {
     CompletedWithErrors,
     /// Operator cancellation stopped the run.
     Stopped,
+    /// A finite run ended with queued work that is still blocked or stalled.
+    ///
+    /// Nothing drained: the remaining candidates are held by a failed
+    /// dependency, an unresolved blocker, or another wait lane. This is neither
+    /// a success nor an execution failure, and it must never be announced as
+    /// completion.
+    BlockedOrStalled,
 }
 
 impl SchedulerRunReport {
     /// Whether this run finished with unresolved change-local failures.
     pub fn has_change_failures(self) -> bool {
         matches!(self, Self::CompletedWithErrors)
+    }
+
+    /// Whether this run ended without completing every eligible change.
+    ///
+    /// Boundaries use this to withhold a success announcement: both
+    /// change-local failures and blocked/stalled remainders leave work the
+    /// operator still owns.
+    pub fn is_incomplete(self) -> bool {
+        matches!(self, Self::CompletedWithErrors | Self::BlockedOrStalled)
     }
 }
 

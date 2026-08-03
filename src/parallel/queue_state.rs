@@ -639,34 +639,31 @@ impl ParallelExecutor {
             .saturating_sub(auto_resolve_count)
     }
 
-    /// Filter queued changes to remove those with failed dependencies.
+    /// Classify queued candidates against the ephemeral failed-change tracker.
     ///
-    /// # Arguments
-    /// * `queued` - List of queued changes to filter
+    /// Returns `(change_id, sorted failed blockers)` for every candidate that is
+    /// currently held back by a failed dependency, in candidate order.
     ///
-    /// # Returns
-    /// Tuple of (executable_changes, skipped_changes_with_reasons)
-    pub(super) fn filter_executable_changes(
+    /// Nothing is removed from the caller's candidate list: reducer-admitted
+    /// queue intent stays authoritative, so a failed-dependent change remains
+    /// locally represented as blocked queued work. Removing it here and letting
+    /// reconciliation restore it from reducer intent is exactly the churn that
+    /// produced an unbounded skip/re-add/re-analysis cycle.
+    pub(super) fn failed_dependency_blocked_candidates(
         &self,
         queued: &[crate::openspec::Change],
-    ) -> (Vec<crate::openspec::Change>, Vec<(String, String)>) {
-        let mut executable_changes: Vec<crate::openspec::Change> = Vec::new();
-        let mut skipped_changes: Vec<(String, String)> = Vec::new();
-
-        for change in queued {
-            if let Some(failed_dep) = self.failed_tracker.should_skip(&change.id) {
-                let reason = format!("Dependency '{}' failed", failed_dep);
-                warn!(
-                    "Skipping change-{} because dependency change-{} failed",
-                    change.id, failed_dep
-                );
-                skipped_changes.push((change.id.clone(), reason));
-            } else {
-                executable_changes.push(change.clone());
-            }
-        }
-
-        (executable_changes, skipped_changes)
+    ) -> Vec<(String, Vec<String>)> {
+        queued
+            .iter()
+            .filter_map(|change| {
+                let blockers = self.failed_tracker.failed_blockers(&change.id);
+                if blockers.is_empty() {
+                    None
+                } else {
+                    Some((change.id.clone(), blockers))
+                }
+            })
+            .collect()
     }
 
     /// Select changes to dispatch based on order, available slots, and dependency resolution.
@@ -708,6 +705,19 @@ impl ParallelExecutor {
                 info!(
                     change_id = %change_id,
                     "Skipping ordinary apply dispatch because current reducer intent does not admit ordinary work"
+                );
+                continue;
+            }
+
+            // A failed-dependent candidate stays in the local queue now, so it
+            // reaches the analysis order and this gate is what keeps it out of
+            // dispatch. Observation is owned by `observe_failed_dependency_blocks`,
+            // so nothing is emitted here.
+            if let Some(failed_dep) = self.failed_tracker.should_skip(change_id) {
+                debug!(
+                    change_id = %change_id,
+                    dependency = %failed_dep,
+                    "Skipping ordinary apply dispatch because a dependency failed in this run"
                 );
                 continue;
             }
@@ -2212,6 +2222,41 @@ impl ParallelExecutor {
         }
     }
 
+    /// Consume every pending explicit-retry edge before reconciliation and
+    /// classification, and report whether one reevaluation must be armed.
+    ///
+    /// An edge is produced only by an accepted, state-changing
+    /// `ReducerCommand::RetryError` carrying the retried change ID, so this is
+    /// the one path that may clear an ephemeral failed classification. Clearing
+    /// removes a fast dispatch gate and the dependents' blocker-notification
+    /// epoch — never more: whether the dependency is actually resolved is still
+    /// decided by ordinary repository and dependency evidence, so a dependent
+    /// stays blocked while its blocker is queued, in flight, or unmerged.
+    pub(super) async fn consume_explicit_retry_edges(&mut self) -> bool {
+        let Some(queue) = self.dynamic_queue.clone() else {
+            return false;
+        };
+        let retried = queue.drain_explicit_retries().await;
+        if retried.is_empty() {
+            return false;
+        }
+
+        for change_id in &retried {
+            let cleared = self.failed_tracker.clear_failed(change_id);
+            // A retried change's own blocked fingerprint is dropped too, so a
+            // later blocked observation for it is a new transition rather than a
+            // suppressed duplicate.
+            self.dependency_blocker_fingerprints.remove(change_id);
+            info!(
+                change_id = %change_id,
+                cleared_failed_marker = cleared,
+                "Consumed explicit-retry edge before queue reconciliation"
+            );
+        }
+
+        true
+    }
+
     pub(super) async fn reconcile_queued_candidates_from_shared_state(
         &mut self,
         queued: &mut Vec<crate::openspec::Change>,
@@ -2285,6 +2330,10 @@ impl ParallelExecutor {
             queued.retain(|change| !revoked.contains(&change.id));
             outcome.revoked_removed = revoked_local_ids.len();
             for change_id in &revoked_local_ids {
+                // Revocation ends this candidate's failed-blocker epoch: a later
+                // explicit re-add is a genuine queue addition and may announce
+                // one new bounded blocker transition.
+                self.failed_tracker.clear_blocker_epoch(change_id);
                 info!(
                     change_id = %change_id,
                     "Queue reconciliation dropped candidate because reducer queue intent was revoked"
@@ -3353,35 +3402,90 @@ impl ParallelExecutor {
         }
     }
 
-    async fn filter_executable_candidates(
+    /// Announce failed-dependency blocking once per blocker epoch and decide
+    /// whether this pass still has non-blocked candidates to analyse.
+    ///
+    /// Candidates are never removed from `queued`: they stay locally
+    /// represented as dependency-blocked queued work, which is what makes
+    /// reconciliation report `queued_added == 0` on every later wake instead of
+    /// synthesising a fresh queue edge. `select_changes_for_dispatch` and
+    /// `classify_queued_work` apply the dispatch gate itself.
+    ///
+    /// Exactly two events are emitted per `(change, failed blocker set)` epoch:
+    /// a compatibility `ChangeSkipped` — which observes dispatch exclusion and
+    /// never revokes accepted queue intent — and the authoritative
+    /// `DependencyBlocked` transition.
+    async fn observe_failed_dependency_blocks(
         &mut self,
-        queued: &mut Vec<crate::openspec::Change>,
+        queued: &[crate::openspec::Change],
         in_flight: &HashSet<String>,
         max_parallelism: usize,
         iteration: u32,
     ) -> ReanalysisFlowDecision {
-        let (executable_changes, skipped_changes) = self.filter_executable_changes(queued);
+        let blocked = self.failed_dependency_blocked_candidates(queued);
 
-        for (change_id, reason) in skipped_changes {
+        // A candidate that is present but no longer failed-dependency blocked
+        // ends its epoch here, so a later refailure is announced as a genuinely
+        // new transition rather than suppressed as a duplicate.
+        for change in queued {
+            if !blocked.iter().any(|(id, _)| id == &change.id) {
+                self.failed_tracker.clear_blocker_epoch(&change.id);
+            }
+        }
+
+        for (change_id, blockers) in &blocked {
+            if !self.failed_tracker.begin_blocker_epoch(change_id, blockers) {
+                debug!(
+                    change_id = %change_id,
+                    blockers = ?blockers,
+                    "Suppressing repeated failed-dependency observation for an unchanged blocker epoch"
+                );
+                continue;
+            }
+
+            // `should_skip` picks the first declared failed dependency; the
+            // compatibility reason keeps that exact wording so existing
+            // consumers are unaffected.
+            let primary = blockers
+                .first()
+                .cloned()
+                .unwrap_or_else(|| change_id.clone());
+            warn!(
+                "Skipping change-{} because dependency change-{} failed",
+                change_id, primary
+            );
             send_event(
                 &self.event_tx,
-                ParallelEvent::ChangeSkipped { change_id, reason },
+                ParallelEvent::ChangeSkipped {
+                    change_id: change_id.clone(),
+                    reason: format!("Dependency '{}' failed", primary),
+                },
+            )
+            .await;
+            send_event(
+                &self.event_tx,
+                ParallelEvent::DependencyBlocked {
+                    change_id: change_id.clone(),
+                    dependency_ids: blockers.clone(),
+                },
             )
             .await;
         }
 
-        *queued = executable_changes;
-
-        if queued.is_empty() {
-            info!("All queued changes skipped due to failed dependencies");
+        if !queued.is_empty() && blocked.len() == queued.len() {
+            info!("All queued changes are blocked by failed dependencies");
             self.emit_no_analysis_diagnostic(
                 queued,
                 in_flight,
                 max_parallelism,
-                "local_queue_empty_after_reconciliation",
+                "all_candidates_failed_dependency_blocked",
             )
             .await;
-            return ReanalysisFlowDecision::done(in_flight.is_empty(), iteration);
+            // Never `should_break` here: blocked work is not drained work. The
+            // canonical drain and blocked-only lifetime checks own termination,
+            // so a finite run reports blocked/stalled and a persistent run waits
+            // for an explicit notification.
+            return ReanalysisFlowDecision::done(false, iteration);
         }
 
         ReanalysisFlowDecision::Continue
@@ -3599,6 +3703,20 @@ impl ParallelExecutor {
             + Send
             + Sync,
     {
+        // Failed-dependency observation runs before classification and before
+        // the debounce gate: it owns bounded, once-per-epoch operator
+        // notification, so a blocked-only pass that stops at classification
+        // still reports why.
+        if let Some((should_break, iteration)) = self
+            .observe_failed_dependency_blocks(queued, in_flight, max_parallelism, iteration)
+            .await
+            .into_result()
+        {
+            return Ok(DependencyAnalysisPass::terminal(
+                ReanalysisFlowDecision::done(should_break, iteration),
+            ));
+        }
+
         if let Some((should_break, iteration)) = self
             .prepare_dispatch_candidates(queued, in_flight, max_parallelism, iteration)
             .await
@@ -3623,16 +3741,6 @@ impl ParallelExecutor {
                 iteration,
                 analysis_decision.effective_reason,
             )
-            .await
-            .into_result()
-        {
-            return Ok(DependencyAnalysisPass::terminal(
-                ReanalysisFlowDecision::done(should_break, iteration),
-            ));
-        }
-
-        if let Some((should_break, iteration)) = self
-            .filter_executable_candidates(queued, in_flight, max_parallelism, iteration)
             .await
             .into_result()
         {

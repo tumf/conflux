@@ -200,14 +200,20 @@ impl AppState {
         );
     }
 
+    /// Record the compatibility observation that a failed dependency excluded a
+    /// change from dispatch.
+    ///
+    /// `ChangeSkipped` is *not* a queue-intent revocation. The change stays
+    /// reducer-queued and locally selected, waiting for its blocker to be
+    /// retried or resolved, so this handler deliberately leaves `selected` and
+    /// the run-timing fields alone. Authoritative blocked presentation belongs
+    /// to `DependencyBlocked` (see `handle_dependency_blocked`); clearing
+    /// selection here used to make an operator's still-live queue intent
+    /// disappear from the frontend while the reducer still held it.
     pub(crate) fn handle_change_skipped(&mut self, change_id: String, reason: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_error_message_cache(reason.clone());
-            change.selected = false;
-            if let Some(started) = change.started_at {
-                change.elapsed_time = Some(started.elapsed());
-            }
         }
         self.add_log(
             LogEntry::warn(format!("Skipped {}: {}", change_id, reason)).with_change_id(&change_id),
@@ -304,6 +310,53 @@ mod tests {
         app.handle_all_completed();
 
         assert_eq!(app.execution_mode, AppExecutionMode::Select);
+    }
+
+    /// `ChangeSkipped` for a failed dependency is a compatibility observation,
+    /// not a queue-intent revocation: the change is still reducer-queued and
+    /// still selected, waiting for the blocker to be retried or resolved.
+    /// `DependencyBlocked` is what owns blocked presentation.
+    #[test]
+    fn failed_dependency_event_consumer_preserves_queue_selection() {
+        let mut app = AppState::new(vec![create_test_change("change-b", 0, 1)]);
+        if let Some(change) = app.changes.iter_mut().find(|c| c.id == "change-b") {
+            change.selected = true;
+        }
+
+        app.handle_change_skipped(
+            "change-b".to_string(),
+            "Dependency 'change-a' failed".to_string(),
+        );
+
+        let change = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-b")
+            .expect("queued change row");
+        assert!(
+            change.selected,
+            "a failed-dependency compatibility event must not deselect still-accepted queue intent"
+        );
+        assert_eq!(
+            change.error_message_cache.as_deref(),
+            Some("Dependency 'change-a' failed"),
+            "the compatibility reason is still reported to the operator"
+        );
+
+        app.handle_dependency_blocked("change-b".to_string());
+        let change = app
+            .changes
+            .iter()
+            .find(|c| c.id == "change-b")
+            .expect("queued change row");
+        assert_eq!(
+            change.display_status_cache, "blocked",
+            "DependencyBlocked owns the authoritative blocked presentation"
+        );
+        assert!(
+            change.selected,
+            "blocked presentation must not revoke queue intent either"
+        );
     }
 
     #[test]

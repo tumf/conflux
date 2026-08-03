@@ -260,14 +260,28 @@ pub struct MergeResult {
 
 /// Tracks failed changes and their dependencies to enable automatic skipping.
 ///
-/// When a change fails, any changes that depend on it should be skipped
-/// since they are unlikely to succeed without the dependency.
+/// When a change fails, any change that depends on it is held back as
+/// dependency-blocked queued work until the failure is cleared by an explicit
+/// retry or the dependency is resolved by repository evidence.
+///
+/// Every field here is ephemeral process state. It is never persisted, so a
+/// restart begins with an empty tracker and routing is recomputed from
+/// workspace and Git evidence alone (`openspec/CONSTITUTION.md`, law 1).
 #[derive(Debug, Default)]
 pub struct FailedChangeTracker {
     /// Set of failed change IDs
     failed_changes: HashSet<String>,
     /// Dependencies between changes (change_id -> list of dependencies)
     dependencies: HashMap<String, Vec<String>>,
+    /// Failed-blocker notification epoch per dependent change.
+    ///
+    /// The value is the sorted set of failed blockers that was last announced
+    /// for that dependent. A dependent whose recorded epoch equals its current
+    /// blocker set has already been announced and must not produce another
+    /// `ChangeSkipped` / `DependencyBlocked` pair, however many scheduler wakes
+    /// rediscover it. This is observability bookkeeping only: it never decides
+    /// dispatch eligibility.
+    notified_blocker_epochs: HashMap<String, Vec<String>>,
 }
 
 impl FailedChangeTracker {
@@ -301,6 +315,76 @@ impl FailedChangeTracker {
             }
         }
         None
+    }
+
+    /// Every failed dependency of `change_id`, deduplicated and sorted.
+    ///
+    /// The sorted form is the blocker-epoch identity: it must not depend on
+    /// declaration order so that a re-analysis that reorders the same blocker
+    /// set does not look like a new epoch.
+    pub fn failed_blockers(&self, change_id: &str) -> Vec<String> {
+        let Some(deps) = self.dependencies.get(change_id) else {
+            return Vec::new();
+        };
+        let mut blockers: Vec<String> = deps
+            .iter()
+            .filter(|dep| self.failed_changes.contains(*dep))
+            .cloned()
+            .collect();
+        blockers.sort_unstable();
+        blockers.dedup();
+        blockers
+    }
+
+    /// Clear the ephemeral failed marker for one change.
+    ///
+    /// This is the *only* narrowly scoped clear: it removes a fast dispatch gate
+    /// for `change_id` and drops every dependent notification epoch that named
+    /// it, so a later refailure is announced as a new epoch. It never asserts
+    /// that the dependency succeeded — dispatch eligibility is still decided by
+    /// ordinary repository and dependency evidence.
+    ///
+    /// Returns true when a failed marker was actually removed.
+    pub fn clear_failed(&mut self, change_id: &str) -> bool {
+        let cleared = self.failed_changes.remove(change_id);
+        self.notified_blocker_epochs
+            .retain(|_, blockers| !blockers.iter().any(|blocker| blocker == change_id));
+        cleared
+    }
+
+    /// Whether this dependent's current failed-blocker set is a new epoch.
+    ///
+    /// Returns true exactly once per distinct `(change_id, blockers)` pair, and
+    /// records the pair so repeated rediscovery of the same blocked state is
+    /// silent. A changed blocker set, a cleared-then-refailed blocker, or a
+    /// dequeue followed by an explicit re-add all produce a new epoch.
+    pub fn begin_blocker_epoch(&mut self, change_id: &str, blockers: &[String]) -> bool {
+        if self
+            .notified_blocker_epochs
+            .get(change_id)
+            .is_some_and(|recorded| recorded.as_slice() == blockers)
+        {
+            return false;
+        }
+        self.notified_blocker_epochs
+            .insert(change_id.to_string(), blockers.to_vec());
+        true
+    }
+
+    /// Forget one dependent's failed-blocker notification epoch.
+    ///
+    /// Used when queue intent for the dependent is revoked: a later explicit
+    /// re-add is a genuine queue addition and may announce a new epoch.
+    ///
+    /// Returns true when an epoch was actually recorded for `change_id`.
+    pub fn clear_blocker_epoch(&mut self, change_id: &str) -> bool {
+        self.notified_blocker_epochs.remove(change_id).is_some()
+    }
+
+    /// Whether a failed-blocker notification epoch is currently recorded.
+    #[cfg(test)]
+    pub fn has_blocker_epoch(&self, change_id: &str) -> bool {
+        self.notified_blocker_epochs.contains_key(change_id)
     }
 
     /// Get all failed changes
@@ -473,6 +557,137 @@ mod tests {
         // change-a did NOT fail
         // change-b should NOT be skipped
         assert!(tracker.should_skip("change-b").is_none());
+    }
+
+    fn failed_change_tracker_with_dependency(
+        dependent: &str,
+        dependency: &str,
+    ) -> FailedChangeTracker {
+        let mut tracker = FailedChangeTracker::new();
+        let mut deps = HashMap::new();
+        deps.insert(dependent.to_string(), vec![dependency.to_string()]);
+        tracker.set_dependencies(deps);
+        tracker
+    }
+
+    #[test]
+    fn failed_change_tracker_reports_sorted_deduplicated_blockers() {
+        let mut tracker = FailedChangeTracker::new();
+        let mut deps = HashMap::new();
+        deps.insert(
+            "c".to_string(),
+            vec![
+                "z".to_string(),
+                "a".to_string(),
+                "z".to_string(),
+                "healthy".to_string(),
+            ],
+        );
+        tracker.set_dependencies(deps);
+        tracker.mark_failed("z");
+        tracker.mark_failed("a");
+
+        assert_eq!(
+            tracker.failed_blockers("c"),
+            vec!["a".to_string(), "z".to_string()],
+            "blocker epochs must not depend on declaration order or duplicates"
+        );
+        assert!(
+            tracker.failed_blockers("unknown").is_empty(),
+            "an unknown change has no failed blockers"
+        );
+    }
+
+    #[test]
+    fn failed_change_tracker_epoch_is_announced_once_per_blocker_set() {
+        let mut tracker = failed_change_tracker_with_dependency("b", "a");
+        tracker.mark_failed("a");
+
+        let blockers = tracker.failed_blockers("b");
+        assert!(
+            tracker.begin_blocker_epoch("b", &blockers),
+            "the first blocked observation is a new epoch"
+        );
+        assert!(
+            !tracker.begin_blocker_epoch("b", &blockers),
+            "rediscovering the same blocker set must not open a new epoch"
+        );
+
+        let changed = vec!["a".to_string(), "other".to_string()];
+        assert!(
+            tracker.begin_blocker_epoch("b", &changed),
+            "a changed blocker set is a new epoch"
+        );
+    }
+
+    #[test]
+    fn failed_change_tracker_clear_failed_is_narrowly_scoped() {
+        let mut tracker = FailedChangeTracker::new();
+        let mut deps = HashMap::new();
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        deps.insert("d".to_string(), vec!["other".to_string()]);
+        tracker.set_dependencies(deps);
+        tracker.mark_failed("a");
+        tracker.mark_failed("other");
+        let a_blockers = tracker.failed_blockers("b");
+        let other_blockers = tracker.failed_blockers("d");
+        assert!(tracker.begin_blocker_epoch("b", &a_blockers));
+        assert!(tracker.begin_blocker_epoch("d", &other_blockers));
+
+        assert!(tracker.clear_failed("a"), "the failed marker was removed");
+        assert!(
+            !tracker.clear_failed("a"),
+            "clearing an unmarked change reports no change"
+        );
+
+        assert!(tracker.should_skip("b").is_none(), "b's gate is released");
+        assert!(
+            !tracker.has_blocker_epoch("b"),
+            "the epoch naming the retried change must be dropped"
+        );
+        assert_eq!(
+            tracker.should_skip("d"),
+            Some("other".to_string()),
+            "an unrelated failure must survive a narrowly scoped clear"
+        );
+        assert!(
+            tracker.has_blocker_epoch("d"),
+            "an unrelated epoch must survive a narrowly scoped clear"
+        );
+
+        // Refailure after a clear is a genuinely new epoch.
+        tracker.mark_failed("a");
+        let refailed = tracker.failed_blockers("b");
+        assert!(
+            tracker.begin_blocker_epoch("b", &refailed),
+            "refailure must be announced as a new epoch"
+        );
+    }
+
+    #[test]
+    fn failed_change_tracker_clear_blocker_epoch_allows_one_new_announcement() {
+        let mut tracker = failed_change_tracker_with_dependency("b", "a");
+        tracker.mark_failed("a");
+        let blockers = tracker.failed_blockers("b");
+        assert!(tracker.begin_blocker_epoch("b", &blockers));
+
+        assert!(
+            tracker.clear_blocker_epoch("b"),
+            "a recorded epoch is reported as cleared"
+        );
+        assert!(
+            !tracker.clear_blocker_epoch("b"),
+            "clearing twice reports no recorded epoch"
+        );
+        assert!(
+            tracker.begin_blocker_epoch("b", &blockers),
+            "an explicit re-add after revocation may announce once more"
+        );
+        assert_eq!(
+            tracker.should_skip("b"),
+            Some("a".to_string()),
+            "clearing a notification epoch must not clear the failure itself"
+        );
     }
 
     #[test]
