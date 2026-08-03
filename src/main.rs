@@ -808,112 +808,10 @@ async fn main() -> Result<()> {
             let force_stop_flag = Arc::new(AtomicBool::new(false));
             let restart_requested = Arc::new(AtomicBool::new(false));
 
-            // Handle for the web control bridge task; aborted on run completion.
-            #[cfg(feature = "web-monitoring")]
-            let mut web_bridge_handle: Option<tokio::task::JoinHandle<()>> = None;
-
-            // Set web state for broadcasting updates and wire control channel
-            #[cfg(feature = "web-monitoring")]
-            if let Some(web_state) = &web_state_arc {
-                // Create unbounded channel for web control commands
-                let (control_tx, mut control_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<web::state::ControlCommand>();
-
-                // Set the control channel in WebState
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        web_state.set_control_channel(control_tx).await;
-                    })
-                });
-
-                // Spawn bridge task to handle control commands
-                let bridge_run_state = run_state.clone();
-                let bridge_graceful_stop = graceful_stop_flag.clone();
-                let bridge_force_stop = force_stop_flag.clone();
-                let bridge_restart = restart_requested.clone();
-                let bridge_web_state = web_state.clone();
-                web_bridge_handle = Some(tokio::spawn(async move {
-                    loop {
-                        if let Some(control_cmd) = control_rx.recv().await {
-                            use crate::events::ExecutionEvent;
-                            use web::state::ControlCommand;
-                            match control_cmd {
-                                ControlCommand::Start => {
-                                    let current_state = bridge_run_state.load(Ordering::SeqCst);
-                                    if current_state == 2 {
-                                        // Stopping -> Running (acts like CancelStop)
-                                        info!("Web control: Start requested, canceling stop and resuming");
-                                        bridge_graceful_stop.store(false, Ordering::SeqCst);
-                                        bridge_run_state.store(1, Ordering::SeqCst);
-                                    } else if current_state == 1 {
-                                        info!("Web control: Start requested but already running");
-                                    } else {
-                                        // State 0 (Stopped) - request restart in outer loop
-                                        info!("Web control: Start requested after stop, will restart orchestrator");
-                                        bridge_restart.store(true, Ordering::SeqCst);
-                                        bridge_run_state.store(1, Ordering::SeqCst);
-                                    }
-                                }
-                                ControlCommand::Stop => {
-                                    info!("Web control: Graceful stop requested");
-                                    bridge_graceful_stop.store(true, Ordering::SeqCst);
-                                    bridge_run_state.store(2, Ordering::SeqCst);
-                                    // Immediately broadcast stopping mode to web UI
-                                    bridge_web_state
-                                        .apply_execution_event(&ExecutionEvent::Stopping)
-                                        .await;
-                                }
-                                ControlCommand::CancelStop => {
-                                    let current_state = bridge_run_state.load(Ordering::SeqCst);
-                                    if current_state == 2 {
-                                        // Stopping -> Running
-                                        info!("Web control: Cancel stop requested");
-                                        bridge_graceful_stop.store(false, Ordering::SeqCst);
-                                        bridge_run_state.store(1, Ordering::SeqCst);
-                                        // Broadcast running mode immediately
-                                        bridge_web_state
-                                            .apply_execution_event(
-                                                &ExecutionEvent::ProcessingStarted("".to_string()),
-                                            )
-                                            .await;
-                                    } else {
-                                        tracing::warn!(
-                                            "Web control: Cancel stop requested but not in stopping state"
-                                        );
-                                    }
-                                }
-                                ControlCommand::ForceStop => {
-                                    info!("Web control: Force stop requested");
-                                    bridge_force_stop.store(true, Ordering::SeqCst);
-                                    bridge_graceful_stop.store(true, Ordering::SeqCst);
-                                    bridge_run_state.store(0, Ordering::SeqCst);
-                                    // Broadcast stopped mode immediately
-                                    bridge_web_state
-                                        .apply_execution_event(&ExecutionEvent::Stopped)
-                                        .await;
-                                }
-                                ControlCommand::Retry => {
-                                    let current_state = bridge_run_state.load(Ordering::SeqCst);
-                                    if current_state == 2 {
-                                        // Stopping -> Running (resume)
-                                        info!("Web control: Retry requested, canceling stop and resuming");
-                                        bridge_graceful_stop.store(false, Ordering::SeqCst);
-                                        bridge_run_state.store(1, Ordering::SeqCst);
-                                    } else if current_state == 1 {
-                                        info!("Web control: Retry requested during execution, will restart after completion");
-                                        bridge_restart.store(true, Ordering::SeqCst);
-                                    } else {
-                                        // State 0 (Stopped) - request restart
-                                        info!("Web control: Retry requested after stop, will restart orchestrator");
-                                        bridge_restart.store(true, Ordering::SeqCst);
-                                        bridge_run_state.store(1, Ordering::SeqCst);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }));
-            }
+            // `cflx run --web` has no control bridge: `/api/v2` executes every
+            // lifecycle command through the shared run-control service instead of
+            // enqueueing it onto a process-local channel, so there is nothing left
+            // for a bridge task to receive.
 
             // Signal handler flags (shared across all iterations)
             let signal_stop = Arc::new(AtomicBool::new(false));
@@ -1078,13 +976,6 @@ async fn main() -> Result<()> {
 
                 // No restart requested, exit loop
                 break;
-            }
-
-            // Abort run-scoped web bridge task explicitly so cleanup does not
-            // depend on Tokio runtime teardown ordering.
-            #[cfg(feature = "web-monitoring")]
-            if let Some(handle) = web_bridge_handle {
-                handle.abort();
             }
 
             lifecycle.shutdown().await;

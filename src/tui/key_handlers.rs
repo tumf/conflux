@@ -13,10 +13,8 @@ use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::DefaultTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::terminal::{execute_worktree_command, suspend_terminal_and_execute_sync};
@@ -137,14 +135,16 @@ pub struct KeyEventContext<'a> {
     pub tx: &'a mpsc::Sender<OrchestratorEvent>,
     pub cmd_tx: &'a mpsc::Sender<TuiCommand>,
     pub ai_runner: &'a AiCommandRunner,
-    pub graceful_stop_flag: &'a Arc<AtomicBool>,
-    pub orchestrator_cancel: &'a Option<CancellationToken>,
-    pub orchestrator_handle: &'a Option<tokio::task::JoinHandle<Result<()>>>,
+    /// The local run supervisor, shared with the run-control service.
+    pub supervisor: &'a Arc<crate::tui::run_supervisor::TuiRunSupervisor>,
 }
 
-fn request_local_tui_quit(app: &mut AppState, orchestrator_cancel: &Option<CancellationToken>) {
+fn request_local_tui_quit(
+    app: &mut AppState,
+    supervisor: &crate::tui::run_supervisor::TuiRunSupervisor,
+) {
     app.should_quit = true;
-    if let Some(cancel) = orchestrator_cancel {
+    if let Some(cancel) = supervisor.cancel_token() {
         cancel.cancel();
         app.add_log(LogEntry::warn(
             "Quit requested: cancelling local orchestration before TUI shutdown",
@@ -304,17 +304,15 @@ pub(crate) fn esc_stop_action(mode: &AppMode, stop_mode: &StopMode) -> EscStopAc
     }
 }
 
-pub(crate) async fn handle_esc_key_inner(
-    app: &mut AppState,
-    graceful_stop_flag: &AtomicBool,
-    cmd_tx: &mpsc::Sender<TuiCommand>,
-) {
+pub(crate) async fn handle_esc_key_inner(app: &mut AppState, cmd_tx: &mpsc::Sender<TuiCommand>) {
     match esc_stop_action(&app.mode, &app.stop_mode) {
         EscStopAction::RequestGracefulStop => {
+            // The stop effect itself belongs to the shared service, so the first
+            // Esc enqueues the same command a remote `stop` submits. Recording
+            // the pending mode here is what makes the second Esc an immediate
+            // stop rather than a duplicate graceful request.
             app.stop_mode = StopMode::GracefulPending;
-            graceful_stop_flag.store(true, Ordering::SeqCst);
-            app.mode = AppMode::Stopping;
-            app.add_log(LogEntry::warn("Stopping after current change completes..."));
+            let _ = cmd_tx.send(TuiCommand::Stop).await;
         }
         EscStopAction::RequestImmediateStop => {
             app.stop_mode = StopMode::ImmediatePending;
@@ -331,51 +329,28 @@ pub(crate) async fn handle_esc_key_inner(
 /// consume one runtime activity snapshot, issue one cancellation request, and
 /// report force stop only when an agent execution was actually active.
 pub async fn handle_esc_key(ctx: &mut KeyEventContext<'_>) {
-    handle_esc_key_inner(ctx.app, ctx.graceful_stop_flag, ctx.cmd_tx).await;
+    handle_esc_key_inner(ctx.app, ctx.cmd_tx).await;
 }
 
-fn handle_start_key_inner(
-    app: &mut AppState,
-    graceful_stop_flag: &AtomicBool,
-    orchestrator_handle: &Option<tokio::task::JoinHandle<Result<()>>>,
-) -> Option<TuiCommand> {
+fn handle_start_key_inner(app: &mut AppState) -> Option<TuiCommand> {
     // Handle the configured start key in Stopping mode to cancel graceful stop.
+    // Whether a cancellable run still exists is a runtime fact the shared service
+    // owns, so the key path only expresses the intent.
     if app.mode == AppMode::Stopping {
-        // Check if orchestrator is still running.
-        if orchestrator_handle
-            .as_ref()
-            .is_some_and(|h| !h.is_finished())
-        {
-            // Cancel graceful stop and return to Running mode.
-            graceful_stop_flag.store(false, Ordering::SeqCst);
-            app.stop_mode = StopMode::None;
-            app.mode = AppMode::Running;
-            app.add_log(LogEntry::info("Stop canceled, continuing..."));
-        } else {
-            // Already stopped, cannot cancel.
-            app.add_log(LogEntry::warn(
-                "Cannot cancel stop: processing already completed",
-            ));
-        }
-        return None;
+        return Some(TuiCommand::CancelStop);
     }
 
     // The configured start key is a cursor-independent orchestration control.
     // It must not inspect the selected row for MergeWait/ResolveWait and must
     // not resolve cursor-local merge waits; Changes-view M is the cursor-local
-    // resolve-intent key.
-    if app.mode == AppMode::Error {
-        app.retry_error_changes()
-    } else if app.mode == AppMode::Stopped {
-        app.resume_processing()
-    } else {
-        app.start_processing()
-    }
+    // resolve-intent key. Which of start/resume/retry applies is decided by the
+    // shared service from the mode it is given.
+    Some(TuiCommand::StartProcessing(Vec::new()))
 }
 
 /// Handle the configured start key: start, resume, or retry orchestration; or cancel stop.
 pub fn handle_start_key(ctx: &mut KeyEventContext<'_>) -> Option<TuiCommand> {
-    handle_start_key_inner(ctx.app, ctx.graceful_stop_flag, ctx.orchestrator_handle)
+    handle_start_key_inner(ctx.app)
 }
 
 /// Handle Enter key: Execute worktree command in selected worktree
@@ -763,7 +738,7 @@ pub async fn handle_key_event(
 
     match (key.code, key.modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            request_local_tui_quit(ctx.app, ctx.orchestrator_cancel);
+            request_local_tui_quit(ctx.app, ctx.supervisor);
         }
         (KeyCode::Tab, _) => {
             handle_tab_key(ctx).await?;
@@ -883,6 +858,7 @@ mod tests {
     use crate::tui::events::LogLevel;
     use crate::tui::types::ViewMode;
     use crossterm::event::KeyCode;
+    use std::sync::atomic::Ordering;
 
     fn create_test_change(id: &str) -> Change {
         Change {
@@ -899,8 +875,28 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn inert_stop_flag() -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
+    /// A supervisor with no launch context behind it.
+    ///
+    /// Key handling only ever asks the supervisor for the live cancellation
+    /// token, so an unstarted supervisor is the whole surface these tests need.
+    fn idle_supervisor() -> Arc<crate::tui::run_supervisor::TuiRunSupervisor> {
+        let (tx, _rx) = mpsc::channel(1);
+        Arc::new(crate::tui::run_supervisor::TuiRunSupervisor::new(
+            PathBuf::from("."),
+            OrchestratorConfig::default(),
+            tx,
+            crate::tui::queue::DynamicQueue::new(),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::orchestration::state::OrchestratorState::new(Vec::new(), 1),
+            )),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            crate::parallel::PostArchiveAction::MergeToBase,
+            None,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "web-monitoring")]
+            None,
+        ))
     }
 
     #[test]
@@ -1036,8 +1032,6 @@ mod tests {
 
     #[test]
     fn configured_start_key_triggers_same_command_as_f5() {
-        let graceful_stop = inert_stop_flag();
-        let handle = None;
         let custom = TuiConfig::parse_jsonc(
             r#"{"keybindings":{"start":["F5","!"]}}"#,
             std::path::Path::new("/tmp/tui.jsonc"),
@@ -1048,7 +1042,7 @@ mod tests {
         f5_app.set_tui_config(custom.clone());
         f5_app.changes[0].selected = true;
         let f5_command = if f5_app.tui_config.matches_start_key(&key(KeyCode::F(5))) {
-            handle_start_key_inner(&mut f5_app, &graceful_stop, &handle)
+            handle_start_key_inner(&mut f5_app)
         } else {
             None
         };
@@ -1060,7 +1054,7 @@ mod tests {
             .tui_config
             .matches_start_key(&key(KeyCode::Char('!')))
         {
-            handle_start_key_inner(&mut bang_app, &graceful_stop, &handle)
+            handle_start_key_inner(&mut bang_app)
         } else {
             None
         };
@@ -1068,12 +1062,14 @@ mod tests {
         assert_eq!(format!("{:?}", f5_command), format!("{:?}", bang_command));
         assert!(matches!(
             bang_command,
-            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["run-me".to_string()]
+            Some(TuiCommand::StartProcessing(ids)) if ids.is_empty()
         ));
     }
 
+    /// The start key is cursor-independent: it never inspects the row under the
+    /// cursor, so a merge-wait row can never turn it into a resolve.
     #[test]
-    fn f5_on_merge_wait_row_does_not_emit_resolve_merge() {
+    fn start_key_never_emits_resolve_merge_for_the_row_under_the_cursor() {
         let mut app = AppState::new(vec![
             create_test_change("merge-wait"),
             create_test_change("run-me"),
@@ -1082,87 +1078,41 @@ mod tests {
         app.cursor_index = 0;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.changes[1].selected = true;
-        let graceful_stop = inert_stop_flag();
-        let handle = None;
 
-        let command = handle_start_key_inner(&mut app, &graceful_stop, &handle);
+        let command = handle_start_key_inner(&mut app);
 
-        assert!(
-            !matches!(command, Some(TuiCommand::ResolveMerge(_))),
-            "F5 must not dispatch cursor-local ResolveMerge for MergeWait rows"
-        );
         assert!(matches!(
             command,
-            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["run-me".to_string()]
+            Some(TuiCommand::StartProcessing(ids)) if ids.is_empty()
         ));
         assert_eq!(app.changes[0].display_status_cache, "merge wait");
-        assert_eq!(app.changes[1].display_status_cache, "queued");
     }
 
+    /// Target selection belongs to the shared service, so the key path emits the
+    /// same command in Select, Stopped, and Error mode; only Stopping differs,
+    /// where the start key withdraws a pending graceful stop.
     #[test]
-    fn f5_delegates_start_resume_and_retry_while_resolving() {
-        let graceful_stop = inert_stop_flag();
-        let handle = None;
+    fn start_key_emits_one_command_per_mode_class() {
+        for mode in [AppMode::Select, AppMode::Stopped, AppMode::Error] {
+            let mut app = AppState::new(vec![create_test_change("a")]);
+            app.mode = mode.clone();
+            app.set_resolving("__active__");
+            assert!(
+                matches!(
+                    handle_start_key_inner(&mut app),
+                    Some(TuiCommand::StartProcessing(ref ids)) if ids.is_empty()
+                ),
+                "{mode:?} must delegate start to the shared service"
+            );
+            assert!(app.warning_message.is_none());
+        }
 
-        let mut select_app = AppState::new(vec![create_test_change("select-a")]);
-        select_app.mode = AppMode::Select;
-        select_app.is_resolving = true;
-        select_app.changes[0].selected = true;
-        let command = handle_start_key_inner(&mut select_app, &graceful_stop, &handle);
+        let mut stopping = AppState::new(vec![create_test_change("a")]);
+        stopping.mode = AppMode::Stopping;
         assert!(matches!(
-            command,
-            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["select-a".to_string()]
+            handle_start_key_inner(&mut stopping),
+            Some(TuiCommand::CancelStop)
         ));
-        assert!(select_app.warning_message.is_none());
-
-        let mut stopped_app = AppState::new(vec![create_test_change("stopped-a")]);
-        stopped_app.mode = AppMode::Stopped;
-        stopped_app.is_resolving = true;
-        stopped_app.changes[0].selected = true;
-        let command = handle_start_key_inner(&mut stopped_app, &graceful_stop, &handle);
-        assert!(matches!(
-            command,
-            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["stopped-a".to_string()]
-        ));
-        assert!(stopped_app.warning_message.is_none());
-
-        let mut errobang_app = AppState::new(vec![create_test_change("error-a")]);
-        errobang_app.mode = AppMode::Error;
-        errobang_app.is_resolving = true;
-        errobang_app.changes[0].set_error_message_cache("boom".to_string());
-        errobang_app.changes[0].selected = true;
-        let shared = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::orchestration::state::OrchestratorState::new(vec!["error-a".to_string()], 0),
-        ));
-        shared.blocking_write().apply_execution_event(
-            &crate::events::ExecutionEvent::ProcessingError {
-                id: "error-a".to_string(),
-                error: "boom".to_string(),
-            },
-        );
-        errobang_app.set_shared_state(shared);
-        let command = handle_start_key_inner(&mut errobang_app, &graceful_stop, &handle);
-        assert!(matches!(
-            command,
-            Some(TuiCommand::StartProcessing(ids)) if ids == vec!["error-a".to_string()]
-        ));
-        assert!(errobang_app.warning_message.is_none());
-    }
-
-    #[test]
-    fn f5_on_merge_wait_with_no_runnable_work_is_noop_not_resolve() {
-        let mut app = AppState::new(vec![create_test_change("merge-wait")]);
-        app.mode = AppMode::Select;
-        app.cursor_index = 0;
-        app.changes[0].display_status_cache = "merge wait".to_string();
-        let graceful_stop = inert_stop_flag();
-        let handle = None;
-
-        let command = handle_start_key_inner(&mut app, &graceful_stop, &handle);
-
-        assert!(command.is_none());
-        assert_eq!(app.changes[0].display_status_cache, "merge wait");
-        assert_eq!(app.warning_message.as_deref(), Some("No changes selected"));
     }
 
     #[test]
@@ -1549,11 +1499,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let ai_runner = test_ai_runner();
-        let graceful_stop_flag = inert_stop_flag();
         let runtime = StubPlusRuntime::new();
         let worktree_base_dir = temp_dir.path().join("worktrees");
-        let orchestrator_cancel = None;
-        let orchestrator_handle = None;
+        let supervisor = idle_supervisor();
         let mut ctx = KeyEventContext {
             app: &mut app,
             terminal: &mut terminal,
@@ -1563,9 +1511,7 @@ mod tests {
             tx: &tx,
             cmd_tx: &cmd_tx,
             ai_runner: &ai_runner,
-            graceful_stop_flag: &graceful_stop_flag,
-            orchestrator_cancel: &orchestrator_cancel,
-            orchestrator_handle: &orchestrator_handle,
+            supervisor: &supervisor,
         };
 
         handle_plus_key_with_runtime(&mut ctx, &runtime)
@@ -1689,12 +1635,19 @@ mod tests {
         assert!(app.warning_message.is_none());
     }
 
-    #[test]
-    fn ctrl_c_quit_cancels_local_orchestrator_token() {
-        let mut app = AppState::new(vec![create_test_change("change-a")]);
-        let token = CancellationToken::new();
+    #[tokio::test]
+    async fn ctrl_c_quit_cancels_local_orchestrator_token() {
+        use crate::orchestration::run_control::RunSchedulerPort;
 
-        request_local_tui_quit(&mut app, &Some(token.clone()));
+        let mut app = AppState::new(vec![create_test_change("change-a")]);
+        let supervisor = idle_supervisor();
+        supervisor
+            .start_run(Vec::new(), false)
+            .await
+            .expect("an idle supervisor accepts a launch");
+        let token = supervisor.cancel_token().expect("a live run owns a token");
+
+        request_local_tui_quit(&mut app, &supervisor);
 
         assert!(app.should_quit);
         assert!(token.is_cancelled());
@@ -1702,13 +1655,17 @@ mod tests {
             .logs
             .iter()
             .any(|entry| entry.message.contains("cancelling local orchestration")));
+        let (handle, _) = supervisor.take_run();
+        if let Some(handle) = handle {
+            handle.abort();
+        }
     }
 
     #[test]
     fn ctrl_c_quit_without_local_orchestrator_only_sets_quit() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
 
-        request_local_tui_quit(&mut app, &None);
+        request_local_tui_quit(&mut app, &idle_supervisor());
 
         assert!(app.should_quit);
     }
@@ -1742,10 +1699,9 @@ mod tests {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         app.mode = AppMode::Stopping;
         app.stop_mode = StopMode::GracefulPending;
-        let flag = inert_stop_flag();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
 
-        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+        handle_esc_key_inner(&mut app, &cmd_tx).await;
 
         assert!(
             matches!(cmd_rx.try_recv(), Ok(TuiCommand::ForceStop)),
@@ -1776,11 +1732,10 @@ mod tests {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         app.mode = AppMode::Stopping;
         app.stop_mode = StopMode::GracefulPending;
-        let flag = inert_stop_flag();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
 
-        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
-        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+        handle_esc_key_inner(&mut app, &cmd_tx).await;
+        handle_esc_key_inner(&mut app, &cmd_tx).await;
 
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ForceStop)));
         assert!(
@@ -1793,17 +1748,18 @@ mod tests {
     async fn idle_parallel_stop_first_esc_keeps_graceful_stop_contract() {
         let mut app = AppState::new(vec![create_test_change("change-a")]);
         app.mode = AppMode::Running;
-        let flag = inert_stop_flag();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
 
-        handle_esc_key_inner(&mut app, &flag, &cmd_tx).await;
+        handle_esc_key_inner(&mut app, &cmd_tx).await;
 
-        assert_eq!(app.mode, AppMode::Stopping);
+        // The key path records the pending mode so a second Esc is an immediate
+        // stop, but the graceful-stop effect itself is the shared service's.
         assert_eq!(app.stop_mode, StopMode::GracefulPending);
-        assert!(flag.load(Ordering::SeqCst));
-        assert!(cmd_rx.try_recv().is_err());
-        assert!(app.logs.iter().any(|entry| entry
-            .message
-            .contains("Stopping after current change completes")));
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::Stop)));
+        assert_eq!(
+            app.mode,
+            AppMode::Running,
+            "the key path must not apply the stop transition itself"
+        );
     }
 }

@@ -874,8 +874,16 @@ async fn a_command_that_changes_a_decision_field_publishes_it_before_settling() 
         Arc::new(NoopQueueHooks),
         marks.clone(),
     ));
+    let run_control = Arc::new(crate::orchestration::run_control::RunControlService::new(
+        reducer.clone(),
+        service.clone(),
+        Arc::new(crate::orchestration::run_control::testing::RecordingScheduler::new()),
+        Arc::new(crate::orchestration::run_control::ResolveReservations::new()),
+        Arc::new(crate::orchestration::run_control::StartEligibility::new()),
+    ));
     let projection = web_state.remote_control().projection();
-    let executor = SharedServiceExecutor::new(service, web_state.clone(), projection.clone());
+    let executor =
+        SharedServiceExecutor::new(service, run_control, web_state.clone(), projection.clone());
 
     let revision_before = projection.revision();
     let summary = executor

@@ -11,10 +11,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use tokio::sync::mpsc;
 use tower::ServiceExt;
 
-use crate::web::state::{ControlCommand, WebState};
+use crate::web::state::WebState;
 use crate::web::WebConfig;
 
 use super::{json_body, send};
@@ -99,8 +98,12 @@ async fn removed_legacy_routes_are_absent_even_when_v2_requires_a_token() {
 #[tokio::test]
 async fn a_request_to_a_removed_mutation_route_has_no_side_effect() {
     let state = Arc::new(WebState::new(&[]));
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<ControlCommand>();
-    state.set_control_channel(control_tx).await;
+    // The process-local control channel these routes used to enqueue onto is
+    // gone: `/api/v2` executes lifecycle commands through the shared run-control
+    // service, so the observable side-effect surface is the v2 projection —
+    // its revision and its admitted/settled command registry.
+    let projection = state.remote_control().projection();
+    let before = (projection.revision(), projection.registry_sizes());
 
     let config = WebConfig::enabled(0, "127.0.0.1".to_string());
     let app = app_with(state, &config);
@@ -113,9 +116,10 @@ async fn a_request_to_a_removed_mutation_route_has_no_side_effect() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
     }
 
-    assert!(
-        control_rx.try_recv().is_err(),
-        "no removed route may reach the orchestration control channel"
+    assert_eq!(
+        (projection.revision(), projection.registry_sizes()),
+        before,
+        "no removed route may reach the shared command surface"
     );
 }
 

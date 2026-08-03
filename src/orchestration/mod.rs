@@ -10,6 +10,7 @@ pub mod hooks;
 pub mod operator_command;
 pub mod output;
 pub mod rejection;
+pub mod run_control;
 pub mod state;
 pub mod target_resolution;
 

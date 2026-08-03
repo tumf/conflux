@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::task_parser;
-use crate::tui::events::{LogEntry, TuiCommand};
+use crate::tui::events::LogEntry;
 use crate::tui::types::{AppMode, StopMode};
 
 use super::AppState;
@@ -82,7 +82,7 @@ impl AppState {
         &mut self,
         change_id: String,
         worktree_change_ids: Option<HashSet<String>>,
-    ) -> Option<TuiCommand> {
+    ) {
         self.reset_analysis_log_dedupe();
         let mut already_merged = false;
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
@@ -111,10 +111,10 @@ impl AppState {
             );
         }
 
-        self.complete_resolve_lifecycle()
+        self.complete_resolve_lifecycle();
     }
 
-    pub(crate) fn handle_merge_completed(&mut self, change_id: String) -> Option<TuiCommand> {
+    pub(crate) fn handle_merge_completed(&mut self, change_id: String) {
         self.reset_analysis_log_dedupe();
         if let Some(change) = self.changes.iter_mut().find(|c| c.id == change_id) {
             change.set_display_status_cache("merged");
@@ -136,20 +136,26 @@ impl AppState {
                 .with_change_id(&change_id),
         );
 
-        if self.is_resolving || !self.resolve_queue.is_empty() {
-            self.complete_resolve_lifecycle()
-        } else {
-            None
+        if self.is_resolving() || self.has_queued_resolves() {
+            self.complete_resolve_lifecycle();
         }
     }
 
-    fn complete_resolve_lifecycle(&mut self) -> Option<TuiCommand> {
-        self.is_resolving = false;
-
+    /// Release the finished resolver and promote the next waiting change.
+    ///
+    /// This is ledger and presentation bookkeeping only. The promoted change was
+    /// already given reducer-owned `ResolveWait` intent when its resolve was
+    /// admitted, and the parallel executor syncs its resolve-wait set from that
+    /// reducer state — so the scheduler already owns the promoted resolve and
+    /// cannot exit while the intent stands. Re-submitting a `ResolveMerge`
+    /// command here would only ask the shared service to admit a change whose
+    /// display status is no longer `merge wait`, which it must refuse; the TUI
+    /// would then show a red refusal for a resolve that is in fact proceeding.
+    fn complete_resolve_lifecycle(&mut self) {
         if let Some(next_change_id) = self.pop_from_resolve_queue() {
             self.add_log(
                 LogEntry::info(format!(
-                    "Queueing scheduler retry intent for '{}' from resolve queue",
+                    "Promoted '{}' from the resolve queue to the active resolver",
                     next_change_id
                 ))
                 .with_change_id(&next_change_id),
@@ -157,10 +163,8 @@ impl AppState {
             if let Some(change) = self.changes.iter_mut().find(|c| c.id == next_change_id) {
                 change.set_display_status_cache("resolve pending");
             }
-            Some(TuiCommand::ResolveMerge(next_change_id))
         } else {
             self.try_transition_to_select();
-            None
         }
     }
 
@@ -306,7 +310,7 @@ mod tests {
         app.handle_processing_completed("change-a".to_string());
         app.handle_change_archived("change-a".to_string());
         app.handle_acceptance_completed("change-a".to_string());
-        let _ = app.handle_merge_completed("change-a".to_string());
+        app.handle_merge_completed("change-a".to_string());
         app.handle_change_skipped("change-a".to_string(), "dependency".to_string());
         app.handle_change_stopped("change-a".to_string());
 
@@ -332,16 +336,17 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
+        app.set_resolving("change-a");
         app.add_to_resolve_queue("change-b");
 
-        let _ = app.handle_resolve_completed("change-a".to_string(), None);
+        app.handle_resolve_completed("change-a".to_string(), None);
 
         assert_eq!(
             change_ids_for_message(&app, "Merge resolved for 'change-a'"),
             vec![Some("change-a".to_string())]
         );
         assert_eq!(
-            change_ids_for_message(&app, "Queueing scheduler retry intent for 'change-b'"),
+            change_ids_for_message(&app, "Promoted 'change-b' from the resolve queue"),
             vec![Some("change-b".to_string())]
         );
     }
@@ -484,13 +489,12 @@ mod tests {
         let changes = vec![create_test_change("change-a", 0, 1)];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
 
-        let cmd = app.handle_merge_completed("change-a".to_string());
+        app.handle_merge_completed("change-a".to_string());
 
-        assert!(cmd.is_none());
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert!(app
             .logs
@@ -506,19 +510,121 @@ mod tests {
         ];
         let mut app = AppState::new(changes);
         app.mode = AppMode::Running;
-        app.is_resolving = true;
+        app.set_resolving("__active__");
         app.changes[0].set_display_status_cache("resolving");
         app.changes[1].set_display_status_cache("resolve pending");
         app.add_to_resolve_queue("change-b");
 
-        let cmd = app.handle_merge_completed("change-a".to_string());
+        app.handle_merge_completed("change-a".to_string());
 
-        assert!(matches!(cmd, Some(TuiCommand::ResolveMerge(id)) if id == "change-b"));
-        assert!(!app.is_resolving);
-        assert!(app.resolve_queue.is_empty());
-        assert!(!app.resolve_queue_set.contains("change-b"));
+        assert!(!app.is_resolving());
+        assert!(app.queued_resolves().is_empty());
+        assert!(!app.resolve_reservations().is_reserved("change-b"));
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+    }
+
+    /// Promotion is bookkeeping, not a new submission.
+    ///
+    /// Both resolves are admitted through the same shared service the TUI adapter
+    /// uses, so the queued change already carries reducer-owned `ResolveWait` —
+    /// which is what the parallel executor actually dispatches from. Re-submitting
+    /// the promoted change would ask the service to admit a row whose display
+    /// status is no longer `merge wait`, and the refusal would reach the operator
+    /// as a red status-bar warning for a resolve that is proceeding normally.
+    #[tokio::test]
+    async fn merge_completed_promotes_the_queued_resolve_without_a_refusal() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::operator_command::{
+            ExecutionMarkStore, NoopQueueHooks, OperatorCommandService,
+        };
+        use crate::orchestration::run_control::testing::RecordingScheduler;
+        use crate::orchestration::run_control::{
+            ResolveReservation, ResolveReservations, RunControlOutcome, RunControlService,
+            StartEligibility,
+        };
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use crate::tui::queue::DynamicQueue;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+            vec!["change-a".to_string(), "change-b".to_string()],
+            10,
+            ExecutionMode::Parallel,
+        )));
+        {
+            let mut guard = state.write().await;
+            for id in ["change-a", "change-b"] {
+                guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+                    change_id: id.to_string(),
+                    reason: "manual resolution required".to_string(),
+                    auto_resumable: false,
+                });
+            }
+        }
+
+        let resolves = Arc::new(ResolveReservations::new());
+        let queue = DynamicQueue::new();
+        let run_control = RunControlService::new(
+            state.clone(),
+            Arc::new(OperatorCommandService::new(
+                state.clone(),
+                Arc::new(queue.clone()),
+                Arc::new(NoopQueueHooks),
+                Arc::new(ExecutionMarkStore::new()),
+            )),
+            Arc::new(RecordingScheduler::new()),
+            resolves.clone(),
+            Arc::new(StartEligibility::new()),
+        );
+
+        assert!(matches!(
+            run_control.resolve_merge("change-a").await,
+            Ok(RunControlOutcome::ResolveReserved {
+                reservation: ResolveReservation::Active,
+                ..
+            })
+        ));
+        assert!(matches!(
+            run_control.resolve_merge("change-b").await,
+            Ok(RunControlOutcome::ResolveReserved {
+                reservation: ResolveReservation::Queued { .. },
+                ..
+            })
+        ));
+
+        let mut app = AppState::new(vec![
+            create_test_change("change-a", 0, 1),
+            create_test_change("change-b", 0, 1),
+        ]);
+        app.mode = AppMode::Running;
+        app.set_resolve_reservations(resolves.clone());
+        app.set_shared_state(state.clone());
+        app.apply_display_statuses_from_reducer(&state.read().await.all_display_statuses());
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+
+        // The runtime applies the event to the reducer before the TUI sees it.
+        let merged = ExecutionEvent::MergeCompleted {
+            change_id: "change-a".to_string(),
+            revision: "1".to_string(),
+        };
+        state.write().await.apply_execution_event(&merged);
+        // Event handling returns `()`: promotion cannot emit a command the shared
+        // service would have to refuse.
+        app.handle_orchestrator_event(merged);
+
+        assert_eq!(
+            app.warning_message, None,
+            "a promoted resolve is not an operator-facing refusal"
+        );
+        assert_eq!(app.changes[1].display_status_cache, "resolve pending");
+        assert_eq!(
+            state.read().await.resolve_wait_change_ids(),
+            vec!["change-b".to_string()],
+            "the promoted change keeps the reducer intent the scheduler dispatches from"
+        );
+        assert!(app.queued_resolves().is_empty());
     }
 
     #[test]
@@ -528,10 +634,9 @@ mod tests {
         app.changes[0].set_display_status_cache("merge wait");
         app.changes[0].started_at = Some(std::time::Instant::now());
 
-        let cmd = app.handle_merge_completed("change-a".to_string());
+        app.handle_merge_completed("change-a".to_string());
 
-        assert!(cmd.is_none());
-        assert!(!app.is_resolving);
+        assert!(!app.is_resolving());
         assert_eq!(app.changes[0].display_status_cache, "merged");
         assert!(app.changes[0].elapsed_time.is_some());
         assert!(app

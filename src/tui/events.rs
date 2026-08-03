@@ -43,7 +43,11 @@ use crate::orchestration::state::OrchestratorState;
 /// Commands sent from TUI to orchestrator
 #[derive(Debug, Clone)]
 pub enum TuiCommand {
-    /// Start processing selected changes
+    /// Start processing selected changes.
+    ///
+    /// This is also the retry intent: retry is start in `Error` mode, so the
+    /// shared run-control service decides start vs. resume vs. retry from the
+    /// mode it is given rather than from a separate command variant.
     StartProcessing(Vec<String>),
     /// Add a change to the queue dynamically
     AddToQueue(String),
@@ -56,8 +60,6 @@ pub enum TuiCommand {
     CancelStop,
     /// Force stop immediately
     ForceStop,
-    /// Retry error changes
-    Retry,
     /// Delete a worktree by path (from worktree view)
     /// The optional String is the branch name to delete after worktree removal
     /// bool=true means skip teardown hook explicitly for recovery

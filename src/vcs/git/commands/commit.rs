@@ -271,6 +271,19 @@ pub async fn has_changes_to_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     Ok(!output.is_empty())
 }
 
+/// Argv of the read-oriented repository monitoring query.
+///
+/// `--no-optional-locks` is a Git *global* option, so it must come before the
+/// `status` subcommand; Git rejects it once the subcommand has been parsed.
+/// Without it, `git status` may take `.git/index.lock` just to persist a
+/// refreshed stat cache, which contends with hooks and release commits that
+/// mutate the same repository.
+///
+/// Suppression is deliberately expressed as a child-command argument rather
+/// than a `GIT_OPTIONAL_LOCKS` environment variable: the environment would be
+/// process-wide and would also weaken repo-mutating Git commands.
+const UNCOMMITTED_MONITOR_ARGV: [&str; 4] = ["--no-optional-locks", "status", "--porcelain", "-u"];
+
 /// List change IDs that have uncommitted or untracked files under `openspec/changes/<change_id>/`.
 ///
 /// This function detects changes with:
@@ -278,13 +291,17 @@ pub async fn has_changes_to_commit<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
 /// - Unstaged changes (modified, deleted)
 /// - Untracked files
 ///
+/// The query is read-oriented monitoring (TUI refresh, parallel startup, queue
+/// filtering), so it reports a point-in-time observation and never persists an
+/// optional index refresh. See [`UNCOMMITTED_MONITOR_ARGV`].
+///
 /// Returns a sorted vector of change IDs that have uncommitted modifications.
 pub async fn list_changes_with_uncommitted_files<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<String>> {
     let cwd_ref = cwd.as_ref();
 
     // Get all files with uncommitted changes or untracked status
     // Use -u to show individual untracked files instead of just directories
-    let output = run_git(&["status", "--porcelain", "-u"], cwd_ref).await?;
+    let output = run_git(&UNCOMMITTED_MONITOR_ARGV, cwd_ref).await?;
 
     let mut change_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -789,6 +806,218 @@ mod tests {
         assert_eq!(
             extract_change_id_from_path("openspec/specs/auth/spec.md"),
             None
+        );
+    }
+
+    #[test]
+    fn uncommitted_monitor_argv_disables_optional_locks_before_subcommand() {
+        assert_eq!(
+            UNCOMMITTED_MONITOR_ARGV,
+            ["--no-optional-locks", "status", "--porcelain", "-u"],
+            "monitoring argv must stay exactly `--no-optional-locks status --porcelain -u`"
+        );
+
+        let option_index = UNCOMMITTED_MONITOR_ARGV
+            .iter()
+            .position(|arg| *arg == "--no-optional-locks")
+            .expect("monitoring argv must disable optional locks");
+        let subcommand_index = UNCOMMITTED_MONITOR_ARGV
+            .iter()
+            .position(|arg| *arg == "status")
+            .expect("monitoring argv must run the status subcommand");
+        assert!(
+            option_index < subcommand_index,
+            "`--no-optional-locks` is a global option and must precede `status`"
+        );
+
+        // Suppression must stay child-command-local: a process-wide
+        // GIT_OPTIONAL_LOCKS would also weaken repo-mutating Git commands.
+        assert!(
+            std::env::var_os("GIT_OPTIONAL_LOCKS").is_none(),
+            "optional-lock suppression must not be delivered through process-wide environment state"
+        );
+    }
+
+    /// Run a Git fixture command, failing the test if the command fails.
+    async fn git_fixture(cwd: &Path, args: &[&str]) -> String {
+        run_git(args, cwd)
+            .await
+            .unwrap_or_else(|error| panic!("git fixture command {args:?} failed: {error}"))
+    }
+
+    /// Create a Git repository whose commits do not depend on ambient user config.
+    async fn init_fixture_repo(cwd: &Path) {
+        git_fixture(cwd, &["init", "-q"]).await;
+        git_fixture(cwd, &["config", "user.email", "test@example.com"]).await;
+        git_fixture(cwd, &["config", "user.name", "Test User"]).await;
+        git_fixture(cwd, &["config", "commit.gpgsign", "false"]).await;
+    }
+
+    fn write_fixture_file(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("fixture path has a parent"))
+            .expect("create fixture directory");
+        std::fs::write(path, contents).expect("write fixture file");
+    }
+
+    #[tokio::test]
+    async fn monitoring_classifies_active_changes_and_keeps_exclusions() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        init_fixture_repo(root).await;
+
+        let changes = root.join("openspec/changes");
+
+        // Committed baseline: every path that later mutates must exist in HEAD.
+        write_fixture_file(&changes.join("change-staged-modify/proposal.md"), "base");
+        write_fixture_file(&changes.join("change-staged-delete/proposal.md"), "base");
+        write_fixture_file(&changes.join("change-unstaged-modify/proposal.md"), "base");
+        write_fixture_file(&changes.join("change-unstaged-delete/proposal.md"), "base");
+        write_fixture_file(&changes.join("change-rename/old.md"), "base");
+        write_fixture_file(&changes.join("change-clean/proposal.md"), "base");
+        write_fixture_file(&changes.join("change-ignored/proposal.md"), "base");
+        write_fixture_file(&root.join("docs/notes.md"), "base");
+        write_fixture_file(&root.join(".gitignore"), "*.log\n");
+        git_fixture(root, &["add", "-A"]).await;
+        git_fixture(root, &["commit", "-qm", "baseline"]).await;
+
+        // Staged add.
+        write_fixture_file(&changes.join("change-staged-add/proposal.md"), "added");
+        git_fixture(
+            root,
+            &["add", "openspec/changes/change-staged-add/proposal.md"],
+        )
+        .await;
+
+        // Staged modify.
+        write_fixture_file(
+            &changes.join("change-staged-modify/proposal.md"),
+            "modified",
+        );
+        git_fixture(
+            root,
+            &["add", "openspec/changes/change-staged-modify/proposal.md"],
+        )
+        .await;
+
+        // Staged delete.
+        git_fixture(
+            root,
+            &[
+                "rm",
+                "-q",
+                "openspec/changes/change-staged-delete/proposal.md",
+            ],
+        )
+        .await;
+
+        // Unstaged modify.
+        write_fixture_file(
+            &changes.join("change-unstaged-modify/proposal.md"),
+            "modified",
+        );
+
+        // Unstaged delete.
+        std::fs::remove_file(changes.join("change-unstaged-delete/proposal.md"))
+            .expect("remove fixture file");
+
+        // Untracked file in a change that has never been committed.
+        write_fixture_file(&changes.join("change-untracked/proposal.md"), "untracked");
+
+        // Rename within the same change.
+        git_fixture(
+            root,
+            &[
+                "mv",
+                "openspec/changes/change-rename/old.md",
+                "openspec/changes/change-rename/new.md",
+            ],
+        )
+        .await;
+
+        // Exclusions: archive entry, hidden change directory, ignored file, and
+        // an unrelated repository path.
+        write_fixture_file(&changes.join("archive/change-old/proposal.md"), "archived");
+        write_fixture_file(&changes.join(".hidden-change/proposal.md"), "hidden");
+        write_fixture_file(&changes.join("change-ignored/debug.log"), "ignored");
+        write_fixture_file(&root.join("docs/notes.md"), "unrelated change");
+
+        let uncommitted = list_changes_with_uncommitted_files(root).await.unwrap();
+
+        assert_eq!(
+            uncommitted,
+            vec![
+                "change-rename".to_string(),
+                "change-staged-add".to_string(),
+                "change-staged-delete".to_string(),
+                "change-staged-modify".to_string(),
+                "change-unstaged-delete".to_string(),
+                "change-unstaged-modify".to_string(),
+                "change-untracked".to_string(),
+            ],
+            "classification drifted; raw status was: {:?}",
+            run_git(&UNCOMMITTED_MONITOR_ARGV, root).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn monitoring_does_not_persist_optional_index_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        init_fixture_repo(root).await;
+
+        let changes = root.join("openspec/changes");
+        write_fixture_file(&changes.join("change-a/proposal.md"), "base");
+        write_fixture_file(&changes.join("change-a/tasks.md"), "- [ ] task\n");
+        git_fixture(root, &["add", "-A"]).await;
+        git_fixture(root, &["commit", "-qm", "baseline"]).await;
+
+        // Current worktree state the monitoring query must still report. The
+        // rewrite changes the file size so detection cannot depend on mtime
+        // granularity.
+        write_fixture_file(
+            &changes.join("change-a/tasks.md"),
+            "- [x] task\n- [ ] second task\n",
+        );
+
+        // Make the cached stat information of a content-identical file stale so
+        // that a normal `git status` has a reason to rewrite the index.
+        let stale_target = changes.join("change-a/proposal.md");
+        let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale_target)
+            .expect("open fixture file")
+            .set_times(std::fs::FileTimes::new().set_modified(stale_time))
+            .expect("backdate fixture mtime");
+
+        let index_path = root.join(".git/index");
+        let stale_index = std::fs::read(&index_path).expect("read index");
+
+        // Positive control: without optional-lock suppression the fixture must
+        // demonstrably persist an index refresh, otherwise the assertion below
+        // would be vacuous.
+        git_fixture(root, &["status", "--porcelain", "-u"]).await;
+        let control_index = std::fs::read(&index_path).expect("read index after control");
+        assert_ne!(
+            stale_index, control_index,
+            "fixture cannot detect an optional index refresh; the index-safety assertion would be vacuous"
+        );
+
+        // Restore the stale index so the production helper faces the same
+        // refresh opportunity the control command just took.
+        std::fs::write(&index_path, &stale_index).expect("restore stale index");
+
+        let uncommitted = list_changes_with_uncommitted_files(root).await.unwrap();
+        let after_index = std::fs::read(&index_path).expect("read index after monitoring");
+
+        assert_eq!(
+            uncommitted,
+            vec!["change-a".to_string()],
+            "monitoring query must still report current worktree changes"
+        );
+        assert_eq!(
+            stale_index, after_index,
+            "monitoring query must leave the complete Git index bytes unchanged"
         );
     }
 }

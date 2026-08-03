@@ -426,14 +426,45 @@ async fn run_tui_loop(
     // Dynamic queue for runtime change additions
     let dynamic_queue = DynamicQueue::new();
 
-    // Bind `/api/v2` command delegation to the shared operator command service.
+    // Manual resolve counter for tracking active manual resolves
+    // This allows manual resolves to consume parallel execution slots
+    let manual_resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Shared flag for graceful stop (signaling orchestrator to stop after current change)
+    let graceful_stop_flag = Arc::new(AtomicBool::new(false));
+
+    // The parallel toggle is read by the run supervisor when it spawns, and by
+    // the shared start-eligibility guard, so it lives outside `AppState`.
+    let parallel_mode_flag = Arc::new(AtomicBool::new(app.parallel_mode));
+
+    // One run supervisor owns the local orchestrator task for this invocation.
+    // The TUI adapter and the `/api/v2` adapter drive it through the same
+    // run-control service, so neither can start or cancel a run the other
+    // cannot see.
     //
-    // The web server started before this point (it owns the URL shown in the
-    // TUI), so v2 refuses commands until the same service the TUI uses exists.
-    // Binding it here is what makes a remote command and a keypress take
-    // identical paths through lifecycle validation and side effects.
-    #[cfg(feature = "web-monitoring")]
-    if let Some(ref ws) = web_state {
+    // It gets `frontend_tx`, not `tx`: a spawned run is an orchestration
+    // boundary that dispatches its own events, so it must reach this frontend
+    // through the delivery side.
+    let supervisor = Arc::new(crate::tui::run_supervisor::TuiRunSupervisor::new(
+        repo_root.clone(),
+        config.clone(),
+        frontend_tx.clone(),
+        dynamic_queue.clone(),
+        shared_state.clone(),
+        manual_resolve_counter.clone(),
+        post_archive_action.clone(),
+        upstream_runtime.clone(),
+        graceful_stop_flag.clone(),
+        parallel_mode_flag.clone(),
+        #[cfg(feature = "web-monitoring")]
+        web_state.clone(),
+    ));
+
+    // The single process-local application services every frontend commands
+    // through. They are built once here, before the first keypress and before v2
+    // is bound, so a remote command and a keypress cannot reach different
+    // instances of the lifecycle matrix.
+    let operator_service = {
         use crate::orchestration::operator_command::{
             HookRunnerQueueHooks, OperatorCommandService,
         };
@@ -442,12 +473,38 @@ async fn run_tui_loop(
             repo_root.clone(),
             tx.clone(),
         );
-        let service = Arc::new(OperatorCommandService::new(
+        Arc::new(OperatorCommandService::new(
             shared_state.clone(),
             Arc::new(dynamic_queue.clone()),
             Arc::new(HookRunnerQueueHooks::new(hook_runner)),
             app.execution_marks(),
-        ));
+        ))
+    };
+    let start_eligibility = Arc::new(crate::orchestration::run_control::StartEligibility::new());
+    start_eligibility.set_parallel_mode(app.parallel_mode);
+    start_eligibility.set_parallel_ineligible(
+        app.changes
+            .iter()
+            .filter(|change| !change.is_parallel_eligible)
+            .map(|change| change.id.clone()),
+    );
+    let run_control = Arc::new(crate::orchestration::run_control::RunControlService::new(
+        shared_state.clone(),
+        operator_service.clone(),
+        supervisor.clone(),
+        app.resolve_reservations(),
+        start_eligibility.clone(),
+    ));
+
+    // Bind `/api/v2` command delegation to the shared application services.
+    //
+    // The web server started before this point (it owns the URL shown in the
+    // TUI), so v2 refuses commands until the same services the TUI uses exist.
+    // Binding them here is what makes a remote command and a keypress take
+    // identical paths through lifecycle validation and side effects.
+    #[cfg(feature = "web-monitoring")]
+    if let Some(ref ws) = web_state {
+        let service = operator_service.clone();
         // The remote worktree port is built once and bound to both halves of v2:
         // the read routes and the command executor must agree about which
         // worktrees exist and which opaque IDs address them.
@@ -482,6 +539,7 @@ async fn run_tui_loop(
             .bind(Arc::new(
                 crate::web::remote_control_api::executor::SharedServiceExecutor::new(
                     service,
+                    run_control.clone(),
                     ws.clone(),
                     runtime.projection(),
                 )
@@ -491,60 +549,8 @@ async fn run_tui_loop(
         runtime.bind_worktrees(worktree_port).await;
     }
 
-    // Manual resolve counter for tracking active manual resolves
-    // This allows manual resolves to consume parallel execution slots
-    let manual_resolve_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
     // Cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
-
-    // Wire web control channel to TUI command channel
-    #[cfg(feature = "web-monitoring")]
-    if let Some(ref ws) = web_state {
-        // Create unbounded channel for web control commands
-        let (control_tx, mut control_rx) =
-            mpsc::unbounded_channel::<crate::web::state::ControlCommand>();
-
-        // Set the control channel in WebState
-        ws.set_control_channel(control_tx).await;
-
-        // Spawn bridge task to translate ControlCommand -> TuiCommand
-        let bridge_cmd_tx = cmd_tx.clone();
-        let bridge_cancel = cancel_token.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = bridge_cancel.cancelled() => {
-                        break;
-                    }
-                    Some(control_cmd) = control_rx.recv() => {
-                        use crate::web::state::ControlCommand;
-
-                        // For Start command, we need a special marker that will be handled
-                        // in the main loop to call app.start_processing()/resume_processing()/retry_error_changes()
-                        // For other commands, we can directly translate to TuiCommand
-                        let tui_cmd_opt = match control_cmd {
-                            ControlCommand::Start => {
-                                // Send a special StartProcessing with empty vec as a signal
-                                // The main loop will need to handle this by calling the appropriate method
-                                Some(TuiCommand::StartProcessing(vec![]))
-                            }
-                            ControlCommand::Stop => Some(TuiCommand::Stop),
-                            ControlCommand::CancelStop => Some(TuiCommand::CancelStop),
-                            ControlCommand::ForceStop => Some(TuiCommand::ForceStop),
-                            ControlCommand::Retry => Some(TuiCommand::Retry),
-                        };
-
-                        if let Some(tui_cmd) = tui_cmd_opt {
-                            if bridge_cmd_tx.send(tui_cmd).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
 
     // Start auto-refresh task
     let refresh_tx = tx.clone();
@@ -743,13 +749,6 @@ async fn run_tui_loop(
         }
     });
 
-    // Orchestrator task (spawned when processing starts)
-    let mut orchestrator_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
-    let mut orchestrator_cancel: Option<CancellationToken> = None;
-
-    // Shared flag for graceful stop (signaling orchestrator to stop after current change)
-    let graceful_stop_flag = Arc::new(AtomicBool::new(false));
-
     // External lifecycle reporting is derived from typed TUI state, never from
     // rendered screen contents. Unchanged states are deduplicated by the
     // dispatcher, so publishing once per frame is cheap and non-blocking.
@@ -788,9 +787,7 @@ async fn run_tui_loop(
                         tx: &tx,
                         cmd_tx: &cmd_tx,
                         ai_runner: &ai_runner,
-                        graceful_stop_flag: &graceful_stop_flag,
-                        orchestrator_cancel: &orchestrator_cancel,
-                        orchestrator_handle: &orchestrator_handle,
+                        supervisor: &supervisor,
                     };
 
                     // Handle key event using helper
@@ -838,10 +835,10 @@ async fn run_tui_loop(
             crate::events::dispatch_event(&shared_state, &local_event_sinks, event.clone()).await;
             sync_reducer_display_caches(&mut app, &shared_state, &event).await;
 
-            if let Some(cmd) = app.handle_orchestrator_event(event) {
-                // Event triggered a command (e.g., auto-start next resolve)
-                let _ = cmd_tx.send(cmd).await;
-            }
+            // Painting only: an orchestrator event never produces a command. The
+            // scheduler dispatches every transition it implies from the
+            // reducer-owned intent the same event already recorded.
+            app.handle_orchestrator_event(event);
         }
 
         // Authoritative deliveries from the orchestration boundary's dispatch
@@ -850,9 +847,10 @@ async fn run_tui_loop(
         while let Ok(event) = frontend_rx.try_recv() {
             sync_reducer_display_caches(&mut app, &shared_state, &event).await;
 
-            if let Some(cmd) = app.handle_orchestrator_event(event) {
-                let _ = cmd_tx.send(cmd).await;
-            }
+            // Painting only, for the same reason as the producer loop above: the
+            // scheduler dispatches every transition the event implies from the
+            // reducer-owned intent it already recorded.
+            app.handle_orchestrator_event(event);
         }
 
         // Handle dynamic queue additions and removals
@@ -863,41 +861,28 @@ async fn run_tui_loop(
                 repo_root: &repo_root,
                 config: &config,
                 tx: &tx,
-                frontend_tx: &frontend_tx,
-                dynamic_queue: &dynamic_queue,
-                post_archive_action: post_archive_action.clone(),
-                // Invocation-scoped; every orchestrator start in this persistent
-                // TUI process reconstructs the same publication runtime.
-                upstream_runtime: upstream_runtime.clone(),
-                orchestrator_running: orchestrator_handle
-                    .as_ref()
-                    .is_some_and(|handle| !handle.is_finished()),
+                run_control: &run_control,
                 #[cfg(feature = "web-monitoring")]
                 web_state: &web_state,
             };
 
             // Handle TuiCommand using helper
-            match handle_tui_command(
-                cmd,
-                &mut cmd_ctx,
-                &graceful_stop_flag,
-                &shared_state,
-                &manual_resolve_counter,
-                &mut orchestrator_cancel,
-            )
-            .await
-            {
-                Ok(Some(handle)) => {
-                    orchestrator_handle = Some(handle);
-                }
-                Ok(None) => {
-                    // Command processed without starting orchestrator
-                }
-                Err(e) => {
-                    app.add_log(LogEntry::error(format!("Command handling error: {}", e)));
-                }
+            if let Err(e) = handle_tui_command(cmd, &mut cmd_ctx, &shared_state).await {
+                app.add_log(LogEntry::error(format!("Command handling error: {}", e)));
             }
         }
+
+        // The parallel toggle and its eligibility set are read by the shared
+        // start guard, so republish them once per frame instead of at every
+        // place the TUI can change them.
+        parallel_mode_flag.store(app.parallel_mode, std::sync::atomic::Ordering::SeqCst);
+        start_eligibility.set_parallel_mode(app.parallel_mode);
+        start_eligibility.set_parallel_ineligible(
+            app.changes
+                .iter()
+                .filter(|change| !change.is_parallel_eligible)
+                .map(|change| change.id.clone()),
+        );
 
         publish_lifecycle_state(&app);
 
@@ -912,6 +897,7 @@ async fn run_tui_loop(
     // Wait for tasks to finish gracefully. Remote mode has no local orchestrator handle here;
     // remote server-side work is stopped only by explicit Stop/ForceStop commands.
     refresh_handle.abort();
+    let (orchestrator_handle, orchestrator_cancel) = supervisor.take_run();
     let _ = shutdown_local_orchestrator_task(
         orchestrator_handle,
         orchestrator_cancel,
