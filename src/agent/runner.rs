@@ -119,6 +119,18 @@ pub struct AgentRunner {
     acceptance_history: AcceptanceHistory,
     /// Tracks which changes have had acceptance tail injected (to prevent re-injection)
     acceptance_tail_injected: std::collections::HashMap<String, bool>,
+    /// Latest-only Acceptance command-recovery diagnosis per change.
+    ///
+    /// Deliberately stored apart from canonical [`AcceptanceHistory`]: a command
+    /// that never completed produced no verdict, so its bounded output must never
+    /// be rendered as an acceptance attempt, merged into protocol continuation
+    /// context, or replayed across attempts. Exactly one entry per change may
+    /// exist, and the shared reset boundary clears it after any completed
+    /// non-command-failure invocation. Active-run memory only.
+    acceptance_command_recovery: std::collections::HashMap<
+        String,
+        crate::orchestration::acceptance::AcceptanceCommandDiagnostic,
+    >,
 }
 
 impl AgentRunner {
@@ -135,6 +147,7 @@ impl AgentRunner {
             archive_history: ArchiveHistory::new(),
             acceptance_history: AcceptanceHistory::new(),
             acceptance_tail_injected: std::collections::HashMap::new(),
+            acceptance_command_recovery: std::collections::HashMap::new(),
         }
     }
 
@@ -162,6 +175,7 @@ impl AgentRunner {
             archive_history: ArchiveHistory::new(),
             acceptance_history: AcceptanceHistory::new(),
             acceptance_tail_injected: std::collections::HashMap::new(),
+            acceptance_command_recovery: std::collections::HashMap::new(),
         }
     }
 
@@ -689,6 +703,33 @@ impl AgentRunner {
         history_ops::clear_acceptance_history(&mut self.acceptance_history, change_id);
     }
 
+    /// Store the latest-only Acceptance command-recovery diagnosis for `change_id`.
+    ///
+    /// Replaces any previous entry, so a corrective prompt never replays earlier
+    /// command failures.
+    pub fn set_acceptance_command_recovery(
+        &mut self,
+        change_id: &str,
+        diagnostic: crate::orchestration::acceptance::AcceptanceCommandDiagnostic,
+    ) {
+        self.acceptance_command_recovery
+            .insert(change_id.to_string(), diagnostic);
+    }
+
+    /// Drop the Acceptance command-recovery diagnosis for `change_id`.
+    pub fn clear_acceptance_command_recovery(&mut self, change_id: &str) {
+        self.acceptance_command_recovery.remove(change_id);
+    }
+
+    /// The latest-only Acceptance command-recovery diagnosis, if a command
+    /// failure is currently being recovered.
+    pub fn acceptance_command_recovery(
+        &self,
+        change_id: &str,
+    ) -> Option<&crate::orchestration::acceptance::AcceptanceCommandDiagnostic> {
+        self.acceptance_command_recovery.get(change_id)
+    }
+
     pub fn format_acceptance_history(&self, change_id: &str) -> String {
         self.acceptance_history.format_context(change_id)
     }
@@ -740,6 +781,12 @@ impl AgentRunner {
             stdout_tail.as_deref(),
             stderr_tail.as_deref(),
         );
+        // Latest-only command-recovery evidence, kept separate from canonical and
+        // protocol context. Empty for every invocation that is not recovering
+        // from a command failure.
+        let command_recovery_context = super::prompt::build_acceptance_command_recovery_context(
+            self.acceptance_command_recovery.get(change_id),
+        );
 
         // Build prompt injected into `{prompt}`
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
@@ -753,6 +800,7 @@ impl AgentRunner {
                 &last_output_context,
                 &diff_context,
                 &protocol_retry_context,
+                &command_recovery_context,
             ),
             crate::config::AcceptancePromptMode::ContextOnly => {
                 build_acceptance_prompt_context_only_with_skill(
@@ -763,6 +811,7 @@ impl AgentRunner {
                     &last_output_context,
                     &diff_context,
                     &protocol_retry_context,
+                    &command_recovery_context,
                 )
             }
         };
@@ -837,6 +886,12 @@ impl AgentRunner {
             stdout_tail.as_deref(),
             stderr_tail.as_deref(),
         );
+        // Latest-only command-recovery evidence, kept separate from canonical and
+        // protocol context. Empty for every invocation that is not recovering
+        // from a command failure.
+        let command_recovery_context = super::prompt::build_acceptance_command_recovery_context(
+            self.acceptance_command_recovery.get(change_id),
+        );
 
         // Build prompt injected into `{prompt}`
         // NOTE: Full and ContextOnly modes now behave identically (no embedded system prompt).
@@ -850,6 +905,7 @@ impl AgentRunner {
                 &last_output_context,
                 &diff_context,
                 &protocol_retry_context,
+                &command_recovery_context,
             ),
             crate::config::AcceptancePromptMode::ContextOnly => {
                 build_acceptance_prompt_context_only_with_skill(
@@ -860,6 +916,7 @@ impl AgentRunner {
                     &last_output_context,
                     &diff_context,
                     &protocol_retry_context,
+                    &command_recovery_context,
                 )
             }
         };

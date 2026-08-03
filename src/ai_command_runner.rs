@@ -267,6 +267,21 @@ impl AiCommandRunner {
                             "Failed to spawn command: {}",
                             e
                         );
+                        // The caller only ever sees a synthetic failure status
+                        // for this path, so the cause travels on the output
+                        // channel it already collects. That is what puts a
+                        // launch failure into Apply history, the Acceptance
+                        // command diagnostic, and the cleanup-review diagnosis
+                        // instead of leaving them with a bare exit code.
+                        let _ = out_tx
+                            .send(OutputLine::Stderr(launch_failure_line(
+                                "spawn",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                                attempt,
+                                &e.to_string(),
+                            )))
+                            .await;
                         break 'retry;
                     }
                 };
@@ -280,6 +295,15 @@ impl AiCommandRunner {
                             "Failed to wrap child in ManagedChild: {}",
                             e
                         );
+                        let _ = out_tx
+                            .send(OutputLine::Stderr(launch_failure_line(
+                                "process-manager",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                                attempt,
+                                &e.to_string(),
+                            )))
+                            .await;
                         break 'retry;
                     }
                 };
@@ -834,6 +858,42 @@ impl AiCommandRunner {
     }
 }
 
+/// Longest launch-error cause carried on the output channel.
+///
+/// The cause is operational evidence for the next agent prompt and for terminal
+/// diagnostics, so it is bounded exactly like every other tail this workflow
+/// carries.
+const MAX_LAUNCH_ERROR_CHARS: usize = 400;
+
+/// One bounded stderr line describing why a command never started.
+///
+/// A command that fails before it runs produces no output of its own and only a
+/// synthetic failure status, so this line is the only evidence the caller can
+/// collect. It is emitted on the same output channel every operation already
+/// drains, which is what carries it into Apply history, the Acceptance command
+/// diagnostic, and the cleanup-review diagnosis.
+fn launch_failure_line(
+    stage: &str,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+    attempt: u32,
+    cause: &str,
+) -> String {
+    let single_line = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded = match single_line.char_indices().nth(MAX_LAUNCH_ERROR_CHARS) {
+        Some((idx, _)) => format!("{}...", &single_line[..idx]),
+        None => single_line,
+    };
+    format!(
+        "Command launch failed (stage={}, op={}, change_id={}, attempt={}): {}",
+        stage,
+        operation_type.unwrap_or("unknown"),
+        change_id.unwrap_or("none"),
+        attempt,
+        bounded
+    )
+}
+
 /// Runs bounded cleanup on the owned process group and returns typed evidence.
 ///
 /// The report is the only accepted proof that no owned descendant can still be
@@ -1125,6 +1185,117 @@ mod tests {
             unsafe {
                 libc::killpg(*last_pgid, libc::SIGKILL);
             }
+        }
+    }
+
+    /// A command that never starts still owes the caller its cause.
+    ///
+    /// Apply history, the Acceptance command diagnostic, and the cleanup-review
+    /// diagnosis are all built from the bounded tails collected off this output
+    /// channel, so forwarding the launch error here is what makes a launch
+    /// failure legible to all three instead of a bare synthetic exit code.
+    mod launch_failure_diagnostics {
+        use super::*;
+
+        #[test]
+        fn the_line_names_the_stage_operation_change_and_cause() {
+            let line = launch_failure_line(
+                "spawn",
+                Some("acceptance"),
+                Some("change-a"),
+                2,
+                "No such file or directory (os error 2)",
+            );
+
+            assert!(line.contains("stage=spawn"), "{line}");
+            assert!(line.contains("op=acceptance"), "{line}");
+            assert!(line.contains("change_id=change-a"), "{line}");
+            assert!(line.contains("attempt=2"), "{line}");
+            assert!(
+                line.contains("No such file or directory (os error 2)"),
+                "the cause must survive, not just the fact of failure: {line}"
+            );
+        }
+
+        #[test]
+        fn an_unlabelled_invocation_still_reports_its_cause() {
+            let line = launch_failure_line("process-manager", None, None, 1, "broken pipe");
+
+            assert!(line.contains("op=unknown"), "{line}");
+            assert!(line.contains("change_id=none"), "{line}");
+            assert!(line.contains("broken pipe"), "{line}");
+        }
+
+        #[test]
+        fn the_cause_is_bounded_and_single_line() {
+            let line = launch_failure_line(
+                "spawn",
+                Some("apply"),
+                Some("change-a"),
+                1,
+                &format!("failure\n{}", "x".repeat(5_000)),
+            );
+
+            assert_eq!(line.lines().count(), 1, "diagnostics stay one line");
+            assert!(line.ends_with("..."), "an over-long cause is truncated");
+            assert!(
+                line.chars().count() < MAX_LAUNCH_ERROR_CHARS + 200,
+                "the bounded cause keeps the line small: {} chars",
+                line.chars().count()
+            );
+        }
+
+        /// End to end over the real channel: a command that cannot be spawned at
+        /// all reaches the caller as a stderr line carrying the cause, followed
+        /// by the failure status.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_command_that_cannot_start_reports_its_cause_on_the_output_channel() {
+            let config = CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: vec![],
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            };
+            let runner = AiCommandRunner::new(config, Arc::new(Mutex::new(None)));
+
+            // A working directory that does not exist makes the spawn itself
+            // fail, which is the path that previously produced no output at all.
+            let missing_cwd = std::path::Path::new("/nonexistent-cflx-launch-failure-dir");
+            let (mut handle, mut rx) = runner
+                .execute_streaming_with_retry(
+                    "echo never-runs",
+                    Some(missing_cwd),
+                    Some("acceptance"),
+                    Some("change-a"),
+                )
+                .await
+                .expect("the call itself succeeds; the launch is what fails");
+
+            let mut stderr_lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                if let OutputLine::Stderr(s) = line {
+                    stderr_lines.push(s);
+                }
+            }
+
+            let status = handle.wait().await.expect("a final status is reported");
+            assert!(!status.success(), "a launch failure is not a success");
+            let joined = stderr_lines.join("\n");
+            assert!(
+                joined.contains("Command launch failed"),
+                "the failure must be visible to every diagnostic built from this channel: \
+                 {stderr_lines:?}"
+            );
+            assert!(
+                joined.contains("op=acceptance") && joined.contains("change_id=change-a"),
+                "{stderr_lines:?}"
+            );
         }
     }
 
