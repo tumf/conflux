@@ -30,8 +30,3 @@ The implementation must also pass `make check-openapi`.
 ## Future Work
 
 - Hosted API documentation publication is an operational follow-up, not a completion gate.
-
-## Current Acceptance Follow-up
-- attempt: 1
-- [x] `src/web/openapi.rs:63-66` and the generated artifact promise rejection of query/subprotocol credentials on every path, but `src/web/remote_control_api/mod.rs:218-240` applies `gate` before adding `/api/v2/openapi.yaml`, `/api/v2/openapi.json`, and `/api/v2/docs`, so those routes bypass `reject_out_of_band_credentials`; route them through the gate while skipping only bearer enforcement and add router-level regression coverage.
-  evidence: `router` now registers `/api/v2/openapi.yaml` and the SwaggerUi merge *before* `route_layer(gate)` (`src/web/remote_control_api/mod.rs:236-243`), and `gate` skips only the bearer check via the new `crate::web::openapi::is_unauthenticated_v2_path` (`src/web/openapi.rs:57-71`, `mod.rs:281`), so origin policy and `reject_out_of_band_credentials` now cover the contract routes; `query_credentials_are_refused_on_the_contract_discovery_routes`, `subprotocol_credentials_are_refused_on_the_contract_discovery_routes`, `a_rejected_origin_cannot_read_the_contract_documents`, and `the_contract_documents_stay_credential_free_behind_the_gate` in `src/web/remote_control_api/tests/auth_tests.rs` drive the real router and pass (32/32 auth tests, 267/267 `web::` lib tests, 16/16 `openapi_contract_tests`, `make check-openapi` clean).
