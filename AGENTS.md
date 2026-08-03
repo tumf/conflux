@@ -16,11 +16,40 @@ Conflux has the following frontends:
 * TUI
 * WebUI (local `--web` monitoring)
 
+## Local API socket
+
+`cflx`, `cflx tui`, and `cflx run` serve the versioned `/api/v2` API on
+`${GIT_COMMON_DIR}/cflx-api.sock` by default in `web-monitoring` builds — no
+TCP port and no flag required. Linked worktrees of one repository share that
+single socket because it is derived from the same canonical Git common directory
+the repository lock uses, and the lock is what prevents two default owners.
+
+```bash
+curl --unix-socket "$(git rev-parse --git-common-dir)/cflx-api.sock" \
+  http://localhost/api/v2/state
+```
+
+- `--web-unix-socket PATH` overrides the path; `--no-web-unix-socket` disables
+  the listener. The two are mutually exclusive.
+- Outside a Git repository the default has no identity to derive, so startup
+  fails unless one of those two options is supplied.
+- The socket is mode `0600`. A configured bearer token applies to UDS and TCP
+  alike (`/api/v2/health` stays public); without one, UDS is token-free local
+  access, protected by filesystem permissions.
+- The listener must be bound before lifecycle adapters, AI subprocesses, or
+  orchestration start. A bind, permission, or path-safety failure exits non-zero
+  with nothing started; a finite run removes its own socket on completion.
+- A live socket or non-socket entry at the target path is never removed; only an
+  unreachable stale socket is replaced.
+- Browsers cannot open a `unix://` endpoint. It is for local clients and reverse
+  proxies; the QR popup still encodes the TCP URL only.
+
 ## Web UI
 
 The WebUI is an optional local monitoring dashboard enabled with `--web` on
-`cflx`, `cflx tui`, or `cflx run`. There is no standalone server daemon and no
-multi-project mode.
+`cflx`, `cflx tui`, or `cflx run`. `--web` *adds* the TCP listener alongside the
+Unix socket; it never replaces it, and both listeners serve the same router and
+`WebState`. There is no standalone server daemon and no multi-project mode.
 
 The operator console consists of `web/index.html`, `web/style.css`, and
 `web/app.js`, embedded via `include_str!` in `src/web/mod.rs`. No build step and

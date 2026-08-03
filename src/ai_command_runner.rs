@@ -7,7 +7,10 @@
 use crate::command_queue::{CommandQueue, CommandQueueConfig};
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
-use crate::process_manager::{cleanup_process_group, ManagedChild, StreamingChildHandle};
+use crate::process_manager::{
+    cleanup_process_group_verified, ManagedChild, ProcessGroupCleanupReport, StreamingChildHandle,
+    DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS, DEFAULT_PROCESS_GROUP_SIGTERM_GRACE_MS,
+};
 use crate::stream_json_textifier::{process_stdout_line, StreamJsonTextBuffer};
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,6 +53,10 @@ pub struct AiCommandRunner {
     /// process group after every command outcome (success, failure, cancellation, or
     /// inactivity timeout) to prevent orphaned background processes.
     strict_process_cleanup: bool,
+    /// Bounded budget for proving that the owned process group became quiescent
+    /// after termination was requested. Callers that gate repository work on
+    /// cleanup evidence fail when this budget expires without proof.
+    process_group_cleanup_timeout_ms: u64,
     command_envs: HashMap<String, String>,
 }
 
@@ -68,6 +75,7 @@ impl AiCommandRunner {
             command_queue: CommandQueue::new_with_shared_state(config, shared_state),
             stream_json_textify: true,
             strict_process_cleanup: true,
+            process_group_cleanup_timeout_ms: DEFAULT_PROCESS_GROUP_CLEANUP_TIMEOUT_MS,
             command_envs: HashMap::new(),
         }
     }
@@ -103,6 +111,15 @@ impl AiCommandRunner {
     /// debugging workflows where intentional background processes must outlive the command.
     pub fn set_strict_process_cleanup(&mut self, enabled: bool) {
         self.strict_process_cleanup = enabled;
+    }
+
+    /// Override the bounded budget for proving process-group quiescence.
+    ///
+    /// A shorter budget makes an unconfirmed cleanup surface sooner; it never
+    /// makes an unproven group count as quiescent.
+    #[allow(dead_code)] // Exercised by the process-group barrier tests.
+    pub fn set_process_group_cleanup_timeout_ms(&mut self, timeout_ms: u64) {
+        self.process_group_cleanup_timeout_ms = timeout_ms;
     }
 
     /// Get access to the underlying CommandQueue configuration.
@@ -166,6 +183,12 @@ impl AiCommandRunner {
         // Completion signal: background task → StreamingChildHandle.wait().
         let (status_tx, status_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
 
+        // Process-group cleanup evidence: background task → callers that gate
+        // repository finalization on confirmed quiescence. Always published
+        // before the final status so a caller that observes completion can also
+        // observe why cleanup succeeded or failed.
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel::<ProcessGroupCleanupReport>();
+
         // Clone values for the background task.
         let command_queue = self.command_queue.clone();
         let command_str = command.to_string();
@@ -175,6 +198,7 @@ impl AiCommandRunner {
         let pid_arc = current_pid.clone();
         let stream_json_textify = self.stream_json_textify;
         let strict_process_cleanup = self.strict_process_cleanup;
+        let cleanup_timeout_ms = self.process_group_cleanup_timeout_ms;
         let command_envs = self.command_envs.clone();
 
         // Spawn the background retry task. It owns the real child processes and responds
@@ -190,6 +214,13 @@ impl AiCommandRunner {
             // cancel_rx is wrapped in Option so we can neutralise it after first use.
             let mut cancel_rx_opt = Some(cancel_rx);
             let mut cancel_observed = false;
+
+            // Cleanup evidence for the attempt that ends this execution. A run
+            // that never spawns a process has no owned group to prove quiescent.
+            let mut cleanup_tx = Some(cleanup_tx);
+            let mut cleanup_report = ProcessGroupCleanupReport::not_applicable(
+                "no command process was started, so there is no owned process group",
+            );
 
             let mut attempt = 0u32;
             let mut inactivity_retries_used = 0u32;
@@ -236,6 +267,21 @@ impl AiCommandRunner {
                             "Failed to spawn command: {}",
                             e
                         );
+                        // The caller only ever sees a synthetic failure status
+                        // for this path, so the cause travels on the output
+                        // channel it already collects. That is what puts a
+                        // launch failure into Apply history, the Acceptance
+                        // command diagnostic, and the cleanup-review diagnosis
+                        // instead of leaving them with a bare exit code.
+                        let _ = out_tx
+                            .send(OutputLine::Stderr(launch_failure_line(
+                                "spawn",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                                attempt,
+                                &e.to_string(),
+                            )))
+                            .await;
                         break 'retry;
                     }
                 };
@@ -249,6 +295,15 @@ impl AiCommandRunner {
                             "Failed to wrap child in ManagedChild: {}",
                             e
                         );
+                        let _ = out_tx
+                            .send(OutputLine::Stderr(launch_failure_line(
+                                "process-manager",
+                                operation_type_owned.as_deref(),
+                                change_id_owned.as_deref(),
+                                attempt,
+                                &e.to_string(),
+                            )))
+                            .await;
                         break 'retry;
                     }
                 };
@@ -363,7 +418,19 @@ impl AiCommandRunner {
                                     let _ = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
+                                    // Reaping the leader is not proof that the
+                                    // group is empty: verify quiescence before
+                                    // the caller may touch the worktree.
+                                    let report = verify_owned_process_group(
+                                        pid,
+                                        cleanup_timeout_ms,
+                                        operation_type_owned.as_deref(),
+                                        change_id_owned.as_deref(),
+                                        &out_tx,
+                                    )
+                                    .await;
                                     pid_arc.store(0, Ordering::SeqCst);
+                                    publish_cleanup_report(&mut cleanup_tx, report);
                                     let _ = status_tx.send(make_fail_status());
                                     return;
                                 }
@@ -525,7 +592,16 @@ impl AiCommandRunner {
                                     let _ = managed_child
                                         .terminate_with_timeout(Duration::from_secs(5))
                                         .await;
+                                    let report = verify_owned_process_group(
+                                        pid,
+                                        cleanup_timeout_ms,
+                                        operation_type_owned.as_deref(),
+                                        change_id_owned.as_deref(),
+                                        &out_tx,
+                                    )
+                                    .await;
                                     pid_arc.store(0, Ordering::SeqCst);
+                                    publish_cleanup_report(&mut cleanup_tx, report);
                                     let _ = status_tx.send(make_fail_status());
                                     return;
                                 }
@@ -564,14 +640,24 @@ impl AiCommandRunner {
                 // Strict post-completion cleanup: sweep the process group after every
                 // command outcome (success, failure, inactivity timeout) to ensure no
                 // background processes spawned by the agent command outlive it.
-                if strict_process_cleanup && pid > 0 {
-                    cleanup_process_group(
+                let attempt_cleanup = if strict_process_cleanup {
+                    verify_owned_process_group(
                         pid,
-                        100,
+                        cleanup_timeout_ms,
                         operation_type_owned.as_deref(),
                         change_id_owned.as_deref(),
+                        &out_tx,
                     )
-                    .await;
+                    .await
+                } else {
+                    ProcessGroupCleanupReport::not_applicable(
+                        "strict post-completion process-group cleanup is disabled",
+                    )
+                };
+                // An earlier attempt that could not be proven quiescent stays
+                // the published verdict: its survivors may still be running.
+                if cleanup_report.is_confirmed() {
+                    cleanup_report = attempt_cleanup;
                 }
 
                 // Handle inactivity-timeout exits with dedicated retry policy.
@@ -662,12 +748,25 @@ impl AiCommandRunner {
             }
 
             // Send final exit status (failure if we exited the retry loop without one).
-            let final_status = final_exit_status.unwrap_or_else(make_fail_status);
+            // An unconfirmed process-group cleanup can never be published as a
+            // successful completion: descendants may still be mutating the
+            // worktree the caller is about to finalize.
+            let mut final_status = final_exit_status.unwrap_or_else(make_fail_status);
+            if !cleanup_report.is_confirmed() && final_status.success() {
+                warn!(
+                    op = ?operation_type_owned,
+                    change_id = ?change_id_owned,
+                    "Downgrading successful command status: {}",
+                    cleanup_report.diagnostics()
+                );
+                final_status = make_fail_status();
+            }
+            publish_cleanup_report(&mut cleanup_tx, cleanup_report);
             let _ = status_tx.send(final_status);
             // Dropping out_tx closes the output channel, signalling end-of-output to callers.
         });
 
-        let handle = StreamingChildHandle::new(cancel_tx, current_pid, status_rx);
+        let handle = StreamingChildHandle::new(cancel_tx, current_pid, status_rx, cleanup_rx);
         Ok((handle, out_rx))
     }
 
@@ -756,6 +855,86 @@ impl AiCommandRunner {
         });
 
         Ok((managed, rx))
+    }
+}
+
+/// Longest launch-error cause carried on the output channel.
+///
+/// The cause is operational evidence for the next agent prompt and for terminal
+/// diagnostics, so it is bounded exactly like every other tail this workflow
+/// carries.
+const MAX_LAUNCH_ERROR_CHARS: usize = 400;
+
+/// One bounded stderr line describing why a command never started.
+///
+/// A command that fails before it runs produces no output of its own and only a
+/// synthetic failure status, so this line is the only evidence the caller can
+/// collect. It is emitted on the same output channel every operation already
+/// drains, which is what carries it into Apply history, the Acceptance command
+/// diagnostic, and the cleanup-review diagnosis.
+fn launch_failure_line(
+    stage: &str,
+    operation_type: Option<&str>,
+    change_id: Option<&str>,
+    attempt: u32,
+    cause: &str,
+) -> String {
+    let single_line = cause.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded = match single_line.char_indices().nth(MAX_LAUNCH_ERROR_CHARS) {
+        Some((idx, _)) => format!("{}...", &single_line[..idx]),
+        None => single_line,
+    };
+    format!(
+        "Command launch failed (stage={}, op={}, change_id={}, attempt={}): {}",
+        stage,
+        operation_type.unwrap_or("unknown"),
+        change_id.unwrap_or("none"),
+        attempt,
+        bounded
+    )
+}
+
+/// Runs bounded cleanup on the owned process group and returns typed evidence.
+///
+/// The report is the only accepted proof that no owned descendant can still be
+/// touching the managed worktree; unconfirmed cleanup is surfaced on the output
+/// stream so operators see the same diagnostics the caller acts on.
+async fn verify_owned_process_group(
+    pid: u32,
+    cleanup_timeout_ms: u64,
+    op: Option<&str>,
+    change_id: Option<&str>,
+    out_tx: &mpsc::Sender<OutputLine>,
+) -> ProcessGroupCleanupReport {
+    if pid == 0 {
+        return ProcessGroupCleanupReport::not_applicable(
+            "no process group id was available for cleanup",
+        );
+    }
+
+    let report = cleanup_process_group_verified(
+        pid,
+        DEFAULT_PROCESS_GROUP_SIGTERM_GRACE_MS,
+        cleanup_timeout_ms,
+        op,
+        change_id,
+    )
+    .await;
+
+    if !report.is_confirmed() {
+        let _ = out_tx.send(OutputLine::Stderr(report.diagnostics())).await;
+    }
+
+    report
+}
+
+/// Publishes cleanup evidence exactly once for this execution.
+fn publish_cleanup_report(
+    cleanup_tx: &mut Option<tokio::sync::oneshot::Sender<ProcessGroupCleanupReport>>,
+    report: ProcessGroupCleanupReport,
+) {
+    if let Some(tx) = cleanup_tx.take() {
+        let _ = tx.send(report);
     }
 }
 
@@ -1006,6 +1185,117 @@ mod tests {
             unsafe {
                 libc::killpg(*last_pgid, libc::SIGKILL);
             }
+        }
+    }
+
+    /// A command that never starts still owes the caller its cause.
+    ///
+    /// Apply history, the Acceptance command diagnostic, and the cleanup-review
+    /// diagnosis are all built from the bounded tails collected off this output
+    /// channel, so forwarding the launch error here is what makes a launch
+    /// failure legible to all three instead of a bare synthetic exit code.
+    mod launch_failure_diagnostics {
+        use super::*;
+
+        #[test]
+        fn the_line_names_the_stage_operation_change_and_cause() {
+            let line = launch_failure_line(
+                "spawn",
+                Some("acceptance"),
+                Some("change-a"),
+                2,
+                "No such file or directory (os error 2)",
+            );
+
+            assert!(line.contains("stage=spawn"), "{line}");
+            assert!(line.contains("op=acceptance"), "{line}");
+            assert!(line.contains("change_id=change-a"), "{line}");
+            assert!(line.contains("attempt=2"), "{line}");
+            assert!(
+                line.contains("No such file or directory (os error 2)"),
+                "the cause must survive, not just the fact of failure: {line}"
+            );
+        }
+
+        #[test]
+        fn an_unlabelled_invocation_still_reports_its_cause() {
+            let line = launch_failure_line("process-manager", None, None, 1, "broken pipe");
+
+            assert!(line.contains("op=unknown"), "{line}");
+            assert!(line.contains("change_id=none"), "{line}");
+            assert!(line.contains("broken pipe"), "{line}");
+        }
+
+        #[test]
+        fn the_cause_is_bounded_and_single_line() {
+            let line = launch_failure_line(
+                "spawn",
+                Some("apply"),
+                Some("change-a"),
+                1,
+                &format!("failure\n{}", "x".repeat(5_000)),
+            );
+
+            assert_eq!(line.lines().count(), 1, "diagnostics stay one line");
+            assert!(line.ends_with("..."), "an over-long cause is truncated");
+            assert!(
+                line.chars().count() < MAX_LAUNCH_ERROR_CHARS + 200,
+                "the bounded cause keeps the line small: {} chars",
+                line.chars().count()
+            );
+        }
+
+        /// End to end over the real channel: a command that cannot be spawned at
+        /// all reaches the caller as a stderr line carrying the cause, followed
+        /// by the failure status.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_command_that_cannot_start_reports_its_cause_on_the_output_channel() {
+            let config = CommandQueueConfig {
+                stagger_delay_ms: 0,
+                max_retries: 0,
+                retry_delay_ms: 0,
+                retry_error_patterns: vec![],
+                retry_if_duration_under_secs: 0,
+                inactivity_timeout_secs: 0,
+                inactivity_kill_grace_secs: 1,
+                inactivity_timeout_max_retries: 0,
+                strict_process_cleanup: true,
+            };
+            let runner = AiCommandRunner::new(config, Arc::new(Mutex::new(None)));
+
+            // A working directory that does not exist makes the spawn itself
+            // fail, which is the path that previously produced no output at all.
+            let missing_cwd = std::path::Path::new("/nonexistent-cflx-launch-failure-dir");
+            let (mut handle, mut rx) = runner
+                .execute_streaming_with_retry(
+                    "echo never-runs",
+                    Some(missing_cwd),
+                    Some("acceptance"),
+                    Some("change-a"),
+                )
+                .await
+                .expect("the call itself succeeds; the launch is what fails");
+
+            let mut stderr_lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                if let OutputLine::Stderr(s) = line {
+                    stderr_lines.push(s);
+                }
+            }
+
+            let status = handle.wait().await.expect("a final status is reported");
+            assert!(!status.success(), "a launch failure is not a success");
+            let joined = stderr_lines.join("\n");
+            assert!(
+                joined.contains("Command launch failed"),
+                "the failure must be visible to every diagnostic built from this channel: \
+                 {stderr_lines:?}"
+            );
+            assert!(
+                joined.contains("op=acceptance") && joined.contains("change_id=change-a"),
+                "{stderr_lines:?}"
+            );
         }
     }
 
@@ -1300,6 +1590,152 @@ mod tests {
             pgid,
             errno
         );
+    }
+
+    /// A natural, clean completion publishes confirmed cleanup evidence, so
+    /// callers that gate repository work on it may proceed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_completion_publishes_confirmed_cleanup_for_clean_exit() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        let (mut handle, mut rx) = runner
+            .execute_streaming_with_retry("echo done", None, Some("apply"), Some("change-a"))
+            .await
+            .unwrap();
+
+        while rx.recv().await.is_some() {}
+        let status = handle.wait().await.expect("wait");
+        let report = handle.process_group_cleanup().await;
+
+        assert!(status.success());
+        assert!(
+            report.is_confirmed(),
+            "clean completion must publish confirmed quiescence: {}",
+            report.diagnostics()
+        );
+    }
+
+    /// Completion-grace cancellation must not report success when the owned
+    /// process group cannot be proven quiescent within the cleanup budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_completion_grace_termination_reports_unconfirmed_cleanup() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let mut runner = AiCommandRunner::new(config, shared_state);
+        // Zero budget: a SIGTERM-immune descendant can never be proven gone.
+        runner.set_process_group_cleanup_timeout_ms(0);
+
+        let (mut handle, _rx) = runner
+            .execute_streaming_with_retry(
+                "sh -c 'trap \"\" TERM; while :; do sleep 0.2; done' >/dev/null 2>&1 </dev/null & \
+                 sleep 120",
+                None,
+                Some("apply"),
+                Some("change-a"),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let pgid = handle.id().expect("real pid") as i32;
+
+        // Simulate the apply completion-grace termination: signal, then wait for
+        // the runner to publish its status and cleanup evidence.
+        handle.terminate().expect("terminate");
+        let status = handle.wait().await.expect("wait");
+        let report = handle.process_group_cleanup().await;
+
+        // Reap the survivor before asserting so a failure cannot leak it.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+
+        assert!(
+            !report.is_confirmed(),
+            "a surviving descendant must not be published as quiescent: {}",
+            report.diagnostics()
+        );
+        assert!(
+            !status.success(),
+            "unconfirmed cleanup must not be published as a successful completion"
+        );
+        assert!(
+            report.diagnostics().contains("cleanup budget expired"),
+            "diagnostics must be actionable: {}",
+            report.diagnostics()
+        );
+    }
+
+    /// Completion-grace termination of a cooperative group publishes confirmed
+    /// quiescence only after every owned member is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_completion_grace_termination_confirms_quiescent_group() {
+        let shared_state = Arc::new(Mutex::new(None));
+        let config = CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 1,
+            retry_delay_ms: 50,
+            retry_error_patterns: vec![],
+            retry_if_duration_under_secs: 0,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 5,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: true,
+        };
+        let runner = AiCommandRunner::new(config, shared_state);
+
+        // Leader plus a descendant that outlives it until the group is swept.
+        let (mut handle, _rx) = runner
+            .execute_streaming_with_retry(
+                "sleep 300 >/dev/null 2>&1 </dev/null & sleep 300",
+                None,
+                Some("apply"),
+                Some("change-a"),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let pgid = handle.id().expect("real pid") as i32;
+
+        handle.terminate().expect("terminate");
+        let _ = handle.wait().await;
+        let report = handle.process_group_cleanup().await;
+
+        assert!(
+            report.is_confirmed(),
+            "cooperative group must reach confirmed quiescence: {}",
+            report.diagnostics()
+        );
+        // Independently verify the published evidence against the real group.
+        let result = unsafe { libc::killpg(pgid, 0) };
+        if result == 0 {
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            panic!("cleanup reported quiescence while pgid {pgid} still has live members");
+        }
     }
 
     /// Regression test (task 1.8): cancellation via StreamingChildHandle triggers full

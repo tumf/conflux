@@ -28,7 +28,7 @@ use super::log_deduplicator;
 use super::queue::DynamicQueue;
 use super::render::{render, SPINNER_CHARS};
 use super::state::{AppState, AUTO_REFRESH_INTERVAL_SECS};
-// AppMode/StopMode are used in handlers
+// AppExecutionMode/StopMode are used in handlers
 use super::terminal::restore_terminal;
 use super::worktrees::load_worktrees_with_conflict_check;
 

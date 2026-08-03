@@ -219,6 +219,37 @@ fn task_format_blocks_acceptance(workspace_path: &Path, change_id: &str) -> Vec<
     diagnostics
 }
 
+/// Evaluates the Apply repository-finalization barrier.
+///
+/// Conflux may only start owned index-mutating Git work (WIP snapshot, final
+/// Apply commit), cleanup review, a rejecting handoff, or an Acceptance
+/// dispatch once the owned Apply process group is proven to have no remaining
+/// members. Reaping the group leader is not that proof: a descendant can still
+/// hold the managed worktree `index.lock` after `sh` exits.
+///
+/// The verdict is derived purely from the passed-in ephemeral cleanup evidence,
+/// so it introduces no durable workflow state.
+pub(crate) fn evaluate_process_group_barrier(
+    report: &crate::process_manager::ProcessGroupCleanupReport,
+    change_id: &str,
+    workspace_path: &Path,
+    iteration: u32,
+) -> Result<()> {
+    if report.is_confirmed() {
+        return Ok(());
+    }
+
+    Err(OrchestratorError::AgentCommand(format!(
+        "Apply process-group cleanup could not be confirmed for '{}' in workspace '{}' \
+         (iteration {}); repository finalization was not started. {}. \
+         Resolve or terminate the surviving processes, then retry apply.",
+        change_id,
+        workspace_path.display(),
+        iteration,
+        report.diagnostics()
+    )))
+}
+
 fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<ApplyCompletionKind> {
     if detect_apply_blocked_handoff(workspace_path, change_id).is_some() {
         return Some(ApplyCompletionKind::BlockedHandoff);
@@ -234,6 +265,137 @@ fn detect_apply_completion(workspace_path: &Path, change_id: &str) -> Option<App
 
 /// Default maximum iterations for apply loops.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 50;
+
+/// Per-change cumulative Apply-dispatch accounting for one change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ApplyBudgetState {
+    /// Configured Apply-agent dispatches reserved so far.
+    attempts: u32,
+    /// Whether the 80% warning was already emitted for this threshold crossing.
+    warned: bool,
+}
+
+/// Outcome of asking the sole budget owner for one more Apply dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyBudgetReservation {
+    /// The dispatch is authorized. `attempt` is the cumulative 1-based dispatch
+    /// number for this change; `warning` carries the 80%-threshold message
+    /// exactly once per crossing.
+    Reserved {
+        attempt: u32,
+        warning: Option<String>,
+    },
+    /// The positive ceiling is spent. No dispatch was started and the counter
+    /// was not advanced.
+    Exhausted { attempts: u32, max: u32 },
+}
+
+/// The single per-change, active-run owner of the configured `max_iterations`
+/// Apply-dispatch budget.
+///
+/// One instance is created per process run and shared by serial CLI, TUI, and
+/// parallel execution. Every configured Apply-agent dispatch for a change —
+/// ordinary implementation, command-failure recovery, Acceptance FAIL-to-Apply
+/// repair, task-format repair, empty-WIP escalation, and final-commit repair —
+/// reserves from the same per-change total. Command-queue transport retries stay
+/// inside one reservation and never advance it.
+///
+/// Per `openspec/CONSTITUTION.md` this is active-run memory only: it is never
+/// persisted, so a fresh process starts every change from zero and re-derives
+/// the next action from workspace and Git evidence.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyBudget {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ApplyBudgetState>>>,
+}
+
+impl ApplyBudget {
+    /// Create an empty active-run budget owner.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve one configured Apply-agent dispatch for `change_id`.
+    ///
+    /// `max_iterations` of `0` disables only the numeric ceiling: the counter
+    /// still advances so diagnostics and hooks report the true cumulative count,
+    /// but no reservation is ever refused.
+    pub fn reserve(&self, change_id: &str, max_iterations: u32) -> ApplyBudgetReservation {
+        let mut guard = self.lock();
+        let state = guard.entry(change_id.to_string()).or_default();
+
+        if max_iterations > 0 && state.attempts >= max_iterations {
+            return ApplyBudgetReservation::Exhausted {
+                attempts: state.attempts,
+                max: max_iterations,
+            };
+        }
+
+        state.attempts = state.attempts.saturating_add(1);
+        let attempt = state.attempts;
+
+        let warning = if max_iterations > 0 {
+            // Integer ceiling: the warning belongs to the first dispatch that
+            // actually reaches 80% of the ceiling. Truncating multiplication
+            // warned early for small limits (3 warned at attempt 2 = 67%) and
+            // never warned at all for a limit of 1.
+            let threshold = Self::warning_threshold(max_iterations);
+            if !state.warned && attempt >= threshold {
+                state.warned = true;
+                Some(format!(
+                    "Approaching max iterations: {}/{}",
+                    attempt, max_iterations
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        ApplyBudgetReservation::Reserved { attempt, warning }
+    }
+
+    /// First 1-based dispatch number that reaches at least 80% of a positive
+    /// `max_iterations`, using integer ceiling semantics.
+    pub fn warning_threshold(max_iterations: u32) -> u32 {
+        (u64::from(max_iterations) * 4).div_ceil(5) as u32
+    }
+
+    /// Whether the positive ceiling for `change_id` is already spent.
+    ///
+    /// Lets a caller refuse a dispatch *before* running pre-dispatch hooks or
+    /// launching a child, so a refused cycle neither runs `pre_apply` nor
+    /// advances the counter. Returns `(attempts_so_far, max_iterations)`.
+    pub fn exhaustion(&self, change_id: &str, max_iterations: u32) -> Option<(u32, u32)> {
+        if max_iterations == 0 {
+            return None;
+        }
+        let attempts = self.attempts(change_id);
+        (attempts >= max_iterations).then_some((attempts, max_iterations))
+    }
+
+    /// Cumulative configured Apply dispatches reserved for `change_id` so far.
+    pub fn attempts(&self, change_id: &str) -> u32 {
+        self.lock().get(change_id).map_or(0, |state| state.attempts)
+    }
+
+    /// Drop all accounting for `change_id`.
+    ///
+    /// Used by explicit lifecycle boundaries that restart a change's Apply
+    /// sequence within the same process; a process restart clears everything by
+    /// construction because the map lives only in memory.
+    pub fn reset(&self, change_id: &str) {
+        self.lock().remove(change_id);
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, ApplyBudgetState>> {
+        // A poisoned budget must not abort the run: the counter is advisory
+        // accounting, and the inner value is always structurally valid.
+        self.inner.lock().unwrap_or_else(|err| err.into_inner())
+    }
+}
 
 /// Configuration for apply iteration behavior.
 #[derive(Debug, Clone)]
@@ -800,6 +962,12 @@ pub trait ApplyEventHandler {
     fn on_hook_failed(&self, change_id: &str, hook_type: &str, error: &str);
     /// Called when apply output is generated
     fn on_apply_output(&self, change_id: &str, line: &OutputLine, iteration: u32);
+    /// Called when the sole Apply-budget owner emits an operator-visible warning
+    /// (currently the once-per-crossing 80% threshold notice).
+    ///
+    /// Defaulted so existing handlers keep the plain `tracing` warning without
+    /// having to opt in to a frontend event.
+    fn on_apply_warning(&self, _change_id: &str, _message: &str) {}
 }
 
 /// No-op event handler for cases where events are not needed
@@ -948,6 +1116,134 @@ fn detect_apply_rejected_handoff(
         .then_some(ApplyRejectedHandoff { rejected_path })
 }
 
+/// Build the typed `iteration_limit` error for a dispatch the budget owner
+/// refused, and run the existing `on_error` hook once for it.
+///
+/// Shared by the pre-hook refusal check and the reservation itself so both
+/// report the same diagnosis and fire `on_error` exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_dispatch_on_iteration_limit(
+    change_id: &str,
+    workspace_path: &Path,
+    attempts: u32,
+    max: u32,
+    pending_commit_repair: Option<&CommitRejection>,
+    latest_failure_diagnostic: Option<&str>,
+    hooks: Option<&HookRunner>,
+    hook_ctx: &ApplyLoopHookContext,
+    progress: &TaskProgress,
+) -> OrchestratorError {
+    // Commit-hook recovery shares this budget, so an exhausted budget must
+    // surface the last actionable diagnostics instead of a bare iteration count.
+    let diagnostic = match (pending_commit_repair, latest_failure_diagnostic) {
+        (Some(rejection), _) => format!(
+            "the final Apply commit in workspace '{}' is still rejected by repository verification ({})",
+            workspace_path.display(),
+            format_commit_rejection_for_error(rejection)
+        ),
+        (None, Some(failure)) => format!(
+            "latest Apply failure in workspace '{}': {}",
+            workspace_path.display(),
+            failure
+        ),
+        (None, None) => format!(
+            "no owned completion, hold, or stall outcome was reached in workspace '{}'",
+            workspace_path.display()
+        ),
+    };
+    let error = OrchestratorError::IterationLimit {
+        change_id: change_id.to_string(),
+        attempts,
+        max,
+        diagnostic,
+    };
+    let error_msg = error.to_string();
+
+    if let Some(hook_runner) = hooks {
+        let error_ctx = hook_ctx
+            .build_hook_context(change_id, progress.completed, progress.total, attempts)
+            .with_error(&error_msg);
+        if let Err(e) = hook_runner.run_hook(HookType::OnError, &error_ctx).await {
+            error!("on_error hook failed: {}", e);
+        }
+    }
+
+    error
+}
+
+/// Bounded fingerprint of repository state, used to decide whether an Apply
+/// attempt that exited non-zero still moved the repository forward.
+///
+/// Modes that take no WIP snapshot (serial apply) have no empty-commit signal,
+/// so this is the only Git evidence available to their stall accounting. A
+/// query that cannot be answered returns `None`, which is treated as "no
+/// evidence" rather than as progress.
+async fn repository_progress_fingerprint(workspace_path: &Path) -> Option<String> {
+    let head = crate::vcs::git::commands::get_current_commit(workspace_path)
+        .await
+        .ok()?;
+    let (_, status) = crate::vcs::git::commands::has_uncommitted_changes(workspace_path)
+        .await
+        .ok()?;
+    let content = repository_content_digest(workspace_path).await;
+    Some(format!("{}\n{}\ncontent:{}", head.trim(), status, content))
+}
+
+/// Fixed-size digest of the content currently present in the worktree.
+///
+/// `git status --porcelain` reports only a path and its status letters, so an
+/// attempt that rewrites a file which was *already* dirty leaves an identical
+/// status line. Without content evidence that real repository progress reads as
+/// an empty stall step. Hashing the tracked diff against `HEAD` together with
+/// the object hashes of untracked files supplies that evidence while keeping
+/// the fingerprint bounded: only the digest is retained, never the diff itself.
+///
+/// A query that cannot be answered contributes a stable `unavailable` marker
+/// rather than a fresh value, so missing evidence still reports "no change"
+/// instead of inventing progress.
+async fn repository_content_digest(workspace_path: &Path) -> String {
+    use crate::vcs::git::commands::run_git;
+
+    let mut evidence = String::new();
+
+    match run_git(&["diff", "HEAD"], workspace_path).await {
+        Ok(diff) => evidence.push_str(&diff),
+        Err(_) => evidence.push_str("tracked-diff:unavailable"),
+    }
+    evidence.push('\n');
+
+    // Untracked files are absent from `git diff`, so their content is hashed
+    // separately. `hash-object` only reads the files; it never writes to the
+    // object store or the index.
+    match run_git(
+        &["ls-files", "--others", "--exclude-standard"],
+        workspace_path,
+    )
+    .await
+    {
+        Ok(untracked) if untracked.trim().is_empty() => {}
+        Ok(untracked) => {
+            let paths: Vec<&str> = untracked.lines().filter(|line| !line.is_empty()).collect();
+            let mut args = vec!["hash-object", "--"];
+            args.extend(paths.iter().copied());
+            match run_git(&args, workspace_path).await {
+                Ok(hashes) => {
+                    evidence.push_str(&untracked);
+                    evidence.push('\n');
+                    evidence.push_str(&hashes);
+                }
+                // Falling back to the path list alone keeps the digest stable
+                // and conservative: it can miss content-only progress, never
+                // invent it.
+                Err(_) => evidence.push_str(&untracked),
+            }
+        }
+        Err(_) => evidence.push_str("untracked:unavailable"),
+    }
+
+    format!("{:x}", md5::compute(evidence.as_bytes()))
+}
+
 /// Execute apply iterations until tasks are complete or max iterations reached.
 ///
 /// This is the unified apply loop used by both serial and parallel modes.
@@ -981,6 +1277,7 @@ pub async fn execute_apply_loop<E, F, Fut>(
     event_handler: &E,
     cancel_token: Option<&CancellationToken>,
     ai_runner: &crate::ai_command_runner::AiCommandRunner,
+    budget: &ApplyBudget,
     mut output_handler: F,
 ) -> Result<ApplyLoopResult>
 where
@@ -990,7 +1287,7 @@ where
 {
     hydrate_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
     let max_iterations = config.get_max_iterations();
-    let mut iteration = 0;
+    let mut iteration;
     let mut first_apply = true;
     let stall_config = config.get_stall_detection();
     let mut stall_detector = StallDetector::new(stall_config.clone());
@@ -1002,12 +1299,25 @@ where
     // real repair iteration always runs before the commit is retried.
     let mut pending_commit_repair: Option<CommitRejection> = None;
     let mut change_complete_hook_fired = false;
+    // Latest bounded actionable failure observed by this loop. It travels into
+    // the typed `iteration_limit` outcome so budget exhaustion never surfaces as
+    // a bare count.
+    let mut latest_failure_diagnostic: Option<String> = None;
 
     // Check if VCS is Git for WIP/stall features
     let is_git = matches!(vcs_backend, VcsBackend::Git);
 
+    // Serial apply runs against the repository itself and takes no WIP snapshot,
+    // so it has no empty-commit signal. Repository fingerprints around each
+    // dispatch supply the Git/file evidence its stall accounting would otherwise
+    // lack.
+    let serial_git_progress_accounting = is_git && workspace_manager.is_none();
+
     let apply_succeeded = loop {
-        iteration += 1;
+        // Dispatches reserved for this change so far, across every Apply entry in
+        // this process run. Used for pre-dispatch context until this cycle
+        // reserves its own attempt number.
+        let attempts_so_far = budget.attempts(change_id);
 
         // Check cancellation
         if cancel_token.is_some_and(|token| token.is_cancelled()) {
@@ -1016,42 +1326,6 @@ where
                 change_id,
                 workspace_path.display()
             )));
-        }
-
-        // Check max iterations
-        if iteration > max_iterations {
-            // Commit-hook recovery shares this budget, so an exhausted budget
-            // must surface the last actionable commit diagnostics instead of a
-            // bare iteration count.
-            let error_msg = match &pending_commit_repair {
-                Some(rejection) => format!(
-                    "Max iterations ({}) reached for change '{}' in workspace '{}'; the final Apply commit is still rejected by repository verification ({})",
-                    max_iterations,
-                    change_id,
-                    workspace_path.display(),
-                    format_commit_rejection_for_error(rejection)
-                ),
-                None => format!(
-                    "Max iterations ({}) reached for change '{}' in workspace '{}'",
-                    max_iterations,
-                    change_id,
-                    workspace_path.display()
-                ),
-            };
-
-            // Run on_error hook
-            if let Some(hook_runner) = hooks {
-                let progress = check_task_progress(workspace_path, change_id)
-                    .unwrap_or_else(|_| TaskProgress::default());
-                let error_ctx = hook_ctx
-                    .build_hook_context(change_id, progress.completed, progress.total, iteration)
-                    .with_error(&error_msg);
-                if let Err(e) = hook_runner.run_hook(HookType::OnError, &error_ctx).await {
-                    error!("on_error hook failed: {}", e);
-                }
-            }
-
-            return Err(OrchestratorError::AgentCommand(error_msg));
         }
 
         ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
@@ -1096,7 +1370,7 @@ where
                     is_git,
                     workspace_path,
                     change_id,
-                    iteration,
+                    attempts_so_far,
                 )
                 .await?
                 {
@@ -1143,6 +1417,85 @@ where
             );
         }
 
+        // Refuse the dispatch before anything is started when the sole per-change
+        // budget owner has no ceiling left. This runs ahead of `pre_apply` so a
+        // refused cycle neither fires a pre-dispatch hook nor advances the
+        // counter.
+        if let Some((attempts, max)) = budget.exhaustion(change_id, max_iterations) {
+            return Err(refuse_dispatch_on_iteration_limit(
+                change_id,
+                workspace_path,
+                attempts,
+                max,
+                pending_commit_repair.as_ref(),
+                latest_failure_diagnostic.as_deref(),
+                hooks,
+                hook_ctx,
+                &progress,
+            )
+            .await);
+        }
+
+        // Run pre_apply hook *before* any child is launched and before the
+        // budget is consumed: the hook decides whether this dispatch is
+        // authorized at all, so a failing hook must leave no running command and
+        // no spent attempt. The prospective attempt number is what the
+        // reservation below will hand out.
+        let prospective_attempt = attempts_so_far.saturating_add(1);
+        if let Some(hook_runner) = hooks {
+            let current_hook_ctx = hook_ctx.build_hook_context(
+                change_id,
+                progress.completed,
+                progress.total,
+                prospective_attempt,
+            );
+
+            event_handler.on_hook_started(change_id, "pre_apply");
+
+            match hook_runner
+                .run_hook(HookType::PreApply, &current_hook_ctx)
+                .await
+            {
+                Ok(()) => {
+                    event_handler.on_hook_completed(change_id, "pre_apply");
+                }
+                Err(e) => {
+                    error!("pre_apply hook failed for {}: {}", change_id, e);
+                    event_handler.on_hook_failed(change_id, "pre_apply", &e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+
+        // Reserve the configured Apply-agent dispatch from the sole per-change
+        // budget owner. Everything above this point is workspace inspection,
+        // routing, and pre-dispatch authorization, so a cycle that completes,
+        // hands off, or is refused never consumes budget. Command-queue transport
+        // retries happen inside this one reservation.
+        iteration = match budget.reserve(change_id, max_iterations) {
+            ApplyBudgetReservation::Reserved { attempt, warning } => {
+                if let Some(warning) = warning {
+                    warn!(change_id = change_id, "{}", warning);
+                    event_handler.on_apply_warning(change_id, &warning);
+                }
+                attempt
+            }
+            ApplyBudgetReservation::Exhausted { attempts, max } => {
+                return Err(refuse_dispatch_on_iteration_limit(
+                    change_id,
+                    workspace_path,
+                    attempts,
+                    max,
+                    pending_commit_repair.as_ref(),
+                    latest_failure_diagnostic.as_deref(),
+                    hooks,
+                    hook_ctx,
+                    &progress,
+                )
+                .await);
+            }
+        };
+
         let stage_label = if escalation_eligible {
             "apply_escalation"
         } else {
@@ -1158,6 +1511,15 @@ where
             current_empty_wip_count,
             apply_escalation_uses_for_current_stall
         );
+
+        // Repository fingerprint taken immediately before the dispatch. Modes
+        // without a WIP snapshot compare it against a fresh one after a failed
+        // attempt so real Git/file work still counts as progress.
+        let pre_dispatch_fingerprint = if serial_git_progress_accounting {
+            repository_progress_fingerprint(workspace_path).await
+        } else {
+            None
+        };
 
         // Execute apply command with history context via AiCommandRunner
         let (mut child, mut rx, start_time, command) = if escalation_eligible {
@@ -1186,32 +1548,6 @@ where
         if first_apply {
             first_apply = false;
             event_handler.on_apply_started(change_id, &command);
-        }
-
-        // Run pre_apply hook
-        if let Some(hook_runner) = hooks {
-            let current_hook_ctx = hook_ctx.build_hook_context(
-                change_id,
-                progress.completed,
-                progress.total,
-                iteration,
-            );
-
-            event_handler.on_hook_started(change_id, "pre_apply");
-
-            match hook_runner
-                .run_hook(HookType::PreApply, &current_hook_ctx)
-                .await
-            {
-                Ok(()) => {
-                    event_handler.on_hook_completed(change_id, "pre_apply");
-                }
-                Err(e) => {
-                    error!("pre_apply hook failed for {}: {}", change_id, e);
-                    event_handler.on_hook_failed(change_id, "pre_apply", &e.to_string());
-                    return Err(e);
-                }
-            }
         }
 
         // Create output collector for history
@@ -1405,19 +1741,66 @@ where
             );
         }
 
-        if !status.success() && permission_denial.is_none() && !completion_finalized_run {
-            let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
+        // An ordinary non-zero exit — one the command queue already retried at
+        // transport level, and that neither cancellation, permission
+        // classification, nor completion-finalized routing owns. The failed
+        // attempt is already recorded in `ApplyHistory` above (exit code plus
+        // bounded stdout/stderr tails), so the next Apply prompt can consume it.
+        // Instead of converting the failure into a terminal workspace error, run
+        // `on_error` once and fall through to the same fresh task/Git,
+        // completion, handoff, permission, progress/WIP, and stall evaluation a
+        // successful attempt reaches. Only that evaluation may authorize another
+        // dispatch.
+        let ordinary_command_failure =
+            !status.success() && permission_denial.is_none() && !completion_finalized_run;
 
-            // Run on_error hook
+        if ordinary_command_failure {
+            let error_msg = format!("Apply command failed with exit code: {:?}", status.code());
+            latest_failure_diagnostic = Some(format_apply_failure_diagnostic(
+                &error_msg,
+                output_collector.stdout_tail().as_deref(),
+                output_collector.stderr_tail().as_deref(),
+            ));
+            warn!(
+                change_id = change_id,
+                iteration = iteration,
+                exit_code = ?status.code(),
+                "Apply command failed after command-queue retries; evaluating repository evidence before deciding on another iteration"
+            );
+
+            // Run on_error hook exactly once for this failed attempt.
             if let Some(hook_runner) = hooks {
                 let error_ctx = hook_ctx
                     .build_hook_context(change_id, progress.completed, progress.total, iteration)
                     .with_error(&error_msg);
                 let _ = hook_runner.run_hook(HookType::OnError, &error_ctx).await;
             }
-
-            return Err(OrchestratorError::AgentCommand(error_msg));
         }
+
+        // Repository-finalization barrier. Everything below this point may
+        // mutate the managed worktree or hand the change to another stage, so
+        // it runs only once the owned Apply process group is proven quiescent.
+        // The evidence is ephemeral process-lifetime state; a restart re-derives
+        // routing from the workspace alone.
+        let cleanup_report = child.process_group_cleanup().await;
+        if let Err(barrier_error) =
+            evaluate_process_group_barrier(&cleanup_report, change_id, workspace_path, iteration)
+        {
+            warn!(
+                change_id = change_id,
+                iteration = iteration,
+                workspace = %workspace_path.display(),
+                quiescence = cleanup_report.quiescence().as_str(),
+                "Apply process-group cleanup unconfirmed; skipping WIP snapshot, final commit, and handoff"
+            );
+            return Err(barrier_error);
+        }
+        debug!(
+            change_id = change_id,
+            iteration = iteration,
+            force_killed = cleanup_report.force_killed(),
+            "Apply process-group quiescence confirmed; repository finalization may start"
+        );
 
         ensure_runtime_acceptance_follow_up(workspace_path, change_id, agent)?;
 
@@ -1456,9 +1839,23 @@ where
             break false;
         }
 
-        // Even when the apply command exits naturally, REJECTED.md must hand off
-        // immediately to rejecting review before post_apply hooks, WIP snapshots,
-        // or stall detection can run.
+        // Even when the apply command exits naturally — including a non-zero
+        // ordinary failure — a handoff marker written by that attempt must be
+        // honoured immediately. Both markers are read from the fresh
+        // post-command inspection above, before permission accounting, post_apply
+        // hooks, WIP snapshots, or stall routing can turn the same cycle into a
+        // stall or authorize another dispatch.
+        if let Some(blocked_handoff) = detect_apply_blocked_handoff(workspace_path, change_id) {
+            info!(
+                change_id = change_id,
+                blocker_path = %blocked_handoff.blocker_path.display(),
+                completed = new_progress.completed,
+                total = new_progress.total,
+                "Apply loop exiting for blocked handoff after normal apply command exit"
+            );
+            break false;
+        }
+
         if detect_apply_rejected_handoff(workspace_path, change_id).is_some() {
             info!(
                 change_id = change_id,
@@ -1507,8 +1904,10 @@ where
             }
         }
 
-        // Run post_apply hook
-        if let Some(hook_runner) = hooks {
+        // Run post_apply hook. Recovering from an ordinary command failure must
+        // not newly authorize a success-style post hook: `post_apply` keeps its
+        // existing "the apply command completed" eligibility.
+        if let Some(hook_runner) = hooks.filter(|_| !ordinary_command_failure) {
             let current_hook_ctx = hook_ctx.build_hook_context(
                 change_id,
                 new_progress.completed,
@@ -1534,6 +1933,7 @@ where
         }
 
         // Create iteration snapshot (Git-only)
+        let wip_stall_accounting_ran = is_git && workspace_manager.is_some();
         if is_git {
             if let Some(ws_mgr) = workspace_manager {
                 match create_progress_commit(
@@ -1650,6 +2050,47 @@ where
             }
         } else {
             debug!("Skipping WIP snapshot for {} (non-Git backend)", change_id);
+        }
+
+        // Modes without a WIP snapshot (serial apply, non-Git backends) never
+        // reach the block above, so an ordinary command failure must still
+        // register with existing stall policy. Without this, `max_iterations = 0`
+        // could retry a permanently failing command forever instead of reaching
+        // the configured stall threshold.
+        //
+        // Checkbox progress alone is not enough evidence here: a failing attempt
+        // that still commits work or edits files in the repository is making
+        // progress even though no task line was ticked. On Git the repository
+        // fingerprint taken around this dispatch supplies that evidence, so only
+        // an attempt that moved neither tasks nor the repository counts as empty.
+        if !wip_stall_accounting_ran && ordinary_command_failure {
+            let task_progressed = new_progress.completed > progress.completed;
+            let repository_progressed = match &pre_dispatch_fingerprint {
+                Some(before) => repository_progress_fingerprint(workspace_path)
+                    .await
+                    .is_some_and(|after| after != *before),
+                None => false,
+            };
+            let is_empty = !task_progressed && !repository_progressed;
+
+            if repository_progressed {
+                info!(
+                    change_id = change_id,
+                    iteration = iteration,
+                    "Apply command failed but the repository advanced; not counting this attempt as an empty stall step"
+                );
+            }
+
+            if stall_detector.register_commit(change_id, StallPhase::Apply, is_empty) {
+                let count = stall_detector.current_count(change_id, StallPhase::Apply);
+                let threshold = stall_detector.config().threshold;
+                let message = format!(
+                    "Stall detected for {} after {} apply command failures without task or repository progress (apply)",
+                    change_id, count
+                );
+                warn!("{} (threshold {})", message, threshold);
+                return Err(OrchestratorError::AgentCommand(message));
+            }
         }
 
         // Check if complete. A completed checkbox set with an invalid active-section
@@ -1776,16 +2217,168 @@ where
     Ok(ApplyLoopResult {
         revision,
         completed: apply_succeeded,
-        iterations: iteration,
+        // The cumulative per-change dispatch count owned by the shared budget,
+        // not this call's local loop count: a change that re-enters apply after
+        // an Acceptance FAIL keeps counting from where it left off.
+        iterations: budget.attempts(change_id),
         blocked_handoff,
         rejected_handoff,
     })
+}
+
+/// Format one bounded, operator-actionable diagnostic for a failed Apply attempt.
+///
+/// The stdout/stderr tails are already bounded by [`OutputCollector`]; this
+/// keeps them on one line so the typed `iteration_limit` outcome stays readable.
+fn format_apply_failure_diagnostic(
+    error: &str,
+    stdout_tail: Option<&str>,
+    stderr_tail: Option<&str>,
+) -> String {
+    const MAX_TAIL_CHARS: usize = 400;
+
+    fn condense(tail: &str) -> String {
+        let single_line = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        match single_line.char_indices().nth(MAX_TAIL_CHARS) {
+            Some((idx, _)) => format!("{}...", &single_line[..idx]),
+            None => single_line,
+        }
+    }
+
+    let mut parts = vec![error.to_string()];
+    if let Some(stderr) = stderr_tail.filter(|tail| !tail.trim().is_empty()) {
+        parts.push(format!("stderr: {}", condense(stderr)));
+    } else if let Some(stdout) = stdout_tail.filter(|tail| !tail.trim().is_empty()) {
+        parts.push(format!("stdout: {}", condense(stdout)));
+    }
+    parts.join(" | ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Stall accounting for a failed Apply attempt asks one question: did the
+    /// repository move? These pin the evidence that answers it.
+    mod repository_progress_evidence {
+        use super::*;
+
+        fn git(repo: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn repo_with_committed_file() -> TempDir {
+            let temp_dir = TempDir::new().unwrap();
+            let repo = temp_dir.path();
+            git(repo, &["init", "-b", "main"]);
+            git(repo, &["config", "user.email", "test@example.com"]);
+            git(repo, &["config", "user.name", "Test User"]);
+            std::fs::write(repo.join("src.rs"), "fn main() {}\n").unwrap();
+            git(repo, &["add", "src.rs"]);
+            git(repo, &["commit", "-m", "base"]);
+            temp_dir
+        }
+
+        /// Regression: a path that is *already* dirty keeps the same porcelain
+        /// path and status letters no matter how much its content changes, so a
+        /// fingerprint built from status alone reported "no progress" for an
+        /// attempt that really did advance the repository — and drove it into
+        /// the stall threshold.
+        #[tokio::test]
+        async fn editing_an_already_dirty_tracked_file_counts_as_progress() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+
+            std::fs::write(repo.join("src.rs"), "fn main() { first(); }\n").unwrap();
+            let before = repository_progress_fingerprint(repo)
+                .await
+                .expect("a Git worktree answers the fingerprint query");
+
+            // Same path, same ` M` status letters, different content.
+            std::fs::write(repo.join("src.rs"), "fn main() { second(); }\n").unwrap();
+            let after = repository_progress_fingerprint(repo)
+                .await
+                .expect("a Git worktree answers the fingerprint query");
+
+            let (_, status) = crate::vcs::git::commands::has_uncommitted_changes(repo)
+                .await
+                .unwrap();
+            assert_eq!(
+                status.trim(),
+                "M src.rs",
+                "the porcelain status is unchanged, which is exactly why it cannot be the only \
+                 evidence"
+            );
+            assert_ne!(
+                before, after,
+                "content progress on an already-dirty path must change the fingerprint"
+            );
+        }
+
+        /// The same holds for an untracked file the attempt keeps rewriting: it
+        /// never appears in `git diff`, so its content is hashed on its own.
+        #[tokio::test]
+        async fn rewriting_an_already_untracked_file_counts_as_progress() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+
+            std::fs::write(repo.join("new.rs"), "first\n").unwrap();
+            let before = repository_progress_fingerprint(repo).await.unwrap();
+
+            std::fs::write(repo.join("new.rs"), "second\n").unwrap();
+            let after = repository_progress_fingerprint(repo).await.unwrap();
+
+            assert_ne!(
+                before, after,
+                "content progress on an already-untracked path must change the fingerprint"
+            );
+        }
+
+        /// An attempt that changed nothing must still read as no progress, or
+        /// stall detection would never fire.
+        #[tokio::test]
+        async fn an_unchanged_worktree_keeps_one_stable_fingerprint() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+            std::fs::write(repo.join("src.rs"), "fn main() { first(); }\n").unwrap();
+            std::fs::write(repo.join("new.rs"), "untracked\n").unwrap();
+
+            let first = repository_progress_fingerprint(repo).await.unwrap();
+            let second = repository_progress_fingerprint(repo).await.unwrap();
+
+            assert_eq!(
+                first, second,
+                "an unchanged worktree must not look like progress"
+            );
+        }
+
+        /// The digest is what keeps the fingerprint bounded: a huge diff must not
+        /// grow the value the loop holds across a dispatch.
+        #[tokio::test]
+        async fn the_fingerprint_stays_bounded_for_large_diffs() {
+            let repo_dir = repo_with_committed_file();
+            let repo = repo_dir.path();
+            std::fs::write(repo.join("src.rs"), "x\n".repeat(20_000)).unwrap();
+
+            let fingerprint = repository_progress_fingerprint(repo).await.unwrap();
+
+            assert!(
+                fingerprint.len() < 512,
+                "content evidence is hashed, never retained: {} chars",
+                fingerprint.len()
+            );
+        }
+    }
 
     // === ApplyConfig tests ===
 
@@ -2207,6 +2800,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await
@@ -2262,6 +2856,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await
@@ -2272,8 +2867,8 @@ mod tests {
             "blocked handoff should not be treated as completed apply"
         );
         assert_eq!(
-            result.iterations, 1,
-            "blocked handoff should exit before retry/stall loop"
+            result.iterations, 0,
+            "blocked handoff should exit before reserving any Apply dispatch"
         );
         assert!(
             result.blocked_handoff.is_some(),
@@ -2401,6 +2996,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await
@@ -2475,6 +3071,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await
@@ -2556,6 +3153,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await
@@ -2614,6 +3212,7 @@ mod tests {
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
+                    &ApplyBudget::new(),
                     |_line| async move {},
                 ),
             ),
@@ -2638,6 +3237,366 @@ mod tests {
         assert_eq!(
             result.iterations, 1,
             "tasks-complete grace-terminated run should exit in a single iteration"
+        );
+    }
+
+    // === Apply process-group finalization barrier ===
+
+    fn cleanup_report_for_test(
+        quiescence: crate::process_manager::ProcessGroupQuiescence,
+        detail: &str,
+    ) -> crate::process_manager::ProcessGroupCleanupReport {
+        crate::process_manager::ProcessGroupCleanupReport::for_test(quiescence, Some(4242), detail)
+    }
+
+    #[test]
+    fn apply_process_group_barrier_allows_finalization_when_quiescence_confirmed() {
+        let report = cleanup_report_for_test(
+            crate::process_manager::ProcessGroupQuiescence::Confirmed,
+            "no members remained after graceful termination",
+        );
+
+        evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 2)
+            .expect("confirmed quiescence must allow repository finalization");
+    }
+
+    #[test]
+    fn apply_process_group_barrier_allows_finalization_when_verification_not_applicable() {
+        let report = crate::process_manager::ProcessGroupCleanupReport::not_applicable(
+            "strict post-completion process-group cleanup is disabled",
+        );
+
+        evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 1)
+            .expect("a platform/config without an owned group must not block finalization");
+    }
+
+    #[test]
+    fn apply_process_group_barrier_blocks_finalization_when_members_remain() {
+        let report = cleanup_report_for_test(
+            crate::process_manager::ProcessGroupQuiescence::MembersRemain,
+            "members were still alive after SIGKILL and the cleanup budget expired",
+        );
+
+        let err = evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 3)
+            .expect_err("surviving process-group members must block repository finalization");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("repository finalization was not started"),
+            "error must state that no finalization ran: {message}"
+        );
+        assert!(
+            message.contains("pgid=4242") && message.contains("members_remain"),
+            "error must carry actionable cleanup diagnostics: {message}"
+        );
+        assert!(
+            message.contains("change-a") && message.contains("iteration 3"),
+            "error must identify the change and iteration: {message}"
+        );
+    }
+
+    #[test]
+    fn apply_process_group_barrier_blocks_finalization_when_membership_unverifiable() {
+        let report = cleanup_report_for_test(
+            crate::process_manager::ProcessGroupQuiescence::Unverifiable,
+            "group membership could not be checked after SIGKILL (EPERM)",
+        );
+
+        let err = evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 1)
+            .expect_err("unverifiable membership must block repository finalization");
+        assert!(
+            err.to_string().contains("unverifiable"),
+            "error must name the unverifiable verdict: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_process_group_barrier_blocks_finalization_when_evidence_is_missing() {
+        // Absence of evidence must never be read as quiescence.
+        let report = crate::process_manager::ProcessGroupCleanupReport::missing(
+            "the command runner ended without publishing process-group cleanup evidence",
+        );
+
+        evaluate_process_group_barrier(&report, "change-a", Path::new("/tmp/ws"), 1)
+            .expect_err("missing cleanup evidence must block repository finalization");
+    }
+
+    /// Writes an executable-free shell script and returns its path.
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("script should be written");
+        path
+    }
+
+    #[cfg(unix)]
+    fn git_log_subjects(workspace: &Path) -> Vec<String> {
+        let output = std::process::Command::new("git")
+            .args(["log", "--format=%s"])
+            .current_dir(workspace)
+            .output()
+            .expect("git log should run");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    /// Unconfirmed process-group cleanup must fail Apply before any
+    /// Conflux-owned Git finalization, cleanup review, or Acceptance dispatch.
+    ///
+    /// Uses a real SIGTERM-immune descendant plus a zero cleanup budget so the
+    /// group provably cannot be shown quiescent.
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    #[tokio::test]
+    async fn apply_process_group_barrier_blocks_git_finalization_for_unconfirmed_cleanup() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "unconfirmed-cleanup";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        let pgid_file = temp_dir.path().join("survivor.pgid");
+        let survivor = write_script(
+            temp_dir.path(),
+            "survivor.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 trap '' TERM\n\
+                 echo $$ > {pgid}\n\
+                 while :; do sleep 0.2; done\n",
+                pgid = pgid_file.display()
+            ),
+        );
+        let apply_script = write_script(
+            temp_dir.path(),
+            "apply.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 printf '## Implementation Tasks\\n- [x] one\\n' > {tasks}\n\
+                 sh {survivor} >/dev/null 2>&1 </dev/null &\n\
+                 sleep 120\n",
+                tasks = change_dir.join("tasks.md").display(),
+                survivor = survivor.display()
+            ),
+        );
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh {}", apply_script.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let mut ai_runner = make_test_ai_runner();
+        // Zero budget: the surviving descendant can never be proven gone.
+        ai_runner.set_process_group_cleanup_timeout_ms(0);
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let commits_before = git_log_subjects(workspace);
+
+        let err = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&workspace_manager),
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    &ApplyBudget::new(),
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect_err("unconfirmed process-group cleanup must fail apply");
+
+        // Terminate the survivor before asserting so a failure cannot leak it.
+        let survivor_pid: i32 = std::fs::read_to_string(&pgid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .expect("survivor should have recorded its pid");
+        unsafe {
+            let pgid = libc::getpgid(survivor_pid);
+            if pgid > 0 {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+            libc::kill(survivor_pid, libc::SIGKILL);
+        }
+
+        let message = err.to_string();
+        assert!(
+            message.contains("process-group cleanup")
+                && message.contains("repository finalization was not started"),
+            "apply must fail with actionable cleanup diagnostics: {message}"
+        );
+
+        assert_eq!(
+            git_log_subjects(workspace),
+            commits_before,
+            "no WIP snapshot or final Apply commit may be created after unconfirmed cleanup"
+        );
+        // An Err result is the same signal callers use to skip cleanup review and
+        // Acceptance dispatch, so neither can start from this run.
+        assert_eq!(
+            std::fs::read_to_string(change_dir.join("tasks.md")).unwrap(),
+            "## Implementation Tasks\n- [x] one\n",
+            "workspace contents must be preserved for the retry"
+        );
+    }
+
+    /// A descendant that keeps the managed worktree `index.lock` past leader
+    /// exit must not race Git finalization: the barrier waits for it to release
+    /// the lock and exit, and only then does the final Apply commit run.
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "heavy-tests"), ignore)]
+    #[tokio::test]
+    async fn apply_process_group_barrier_finalizes_after_descendant_releases_index_lock() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        let change_id = "lock-holder";
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(
+            change_dir.join("tasks.md"),
+            "## Implementation Tasks\n- [ ] one\n",
+        )
+        .unwrap();
+
+        let index_lock = workspace.join(".git").join("index.lock");
+        let released_marker = workspace.join("released-after-cleanup.txt");
+        // Holds the real index.lock, and starts releasing it only when the group
+        // sweep signals it. The handler first ignores further SIGTERMs, and an
+        // ignored disposition is inherited across exec, so its `sleep` cannot be
+        // cut short: the lock is deterministically held for one second *after*
+        // the leader exits, far longer than the WIP snapshot retry budget
+        // (3 x 200ms) and well inside the cleanup grace window. Because Git
+        // refuses to commit while index.lock exists, and because the marker only
+        // appears at release time, a final Apply commit containing the marker
+        // proves finalization started after the descendant was gone.
+        let holder = write_script(
+            temp_dir.path(),
+            "holder.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 release() {{\n\
+                 \x20 trap '' TERM\n\
+                 \x20 sleep 1\n\
+                 \x20 rm -f {lock}\n\
+                 \x20 echo released > {marker}\n\
+                 \x20 exit 0\n\
+                 }}\n\
+                 trap release TERM\n\
+                 : > {lock}\n\
+                 while :; do sleep 60; done\n",
+                lock = index_lock.display(),
+                marker = released_marker.display()
+            ),
+        );
+        let apply_script = write_script(
+            temp_dir.path(),
+            "apply.sh",
+            &format!(
+                "#!/bin/sh\n\
+                 printf '## Implementation Tasks\\n- [x] one\\n' > {tasks}\n\
+                 sh {holder} >/dev/null 2>&1 </dev/null &\n\
+                 sleep 120\n",
+                tasks = change_dir.join("tasks.md").display(),
+                holder = holder.display()
+            ),
+        );
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh {}", apply_script.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let workspace_manager = crate::vcs::git::GitWorkspaceManager::new(
+            temp_dir.path().join("worktrees"),
+            workspace.to_path_buf(),
+            1,
+            config.clone(),
+        );
+
+        let result = scoped_apply_completion_grace_secs_for_test(
+            1,
+            scoped_apply_completion_check_interval_ms_for_test(
+                200,
+                execute_apply_loop(
+                    change_id,
+                    workspace,
+                    &config,
+                    &mut agent,
+                    VcsBackend::Git,
+                    Some(&workspace_manager),
+                    None,
+                    &ApplyLoopHookContext::serial(0, 1, 1),
+                    &NoOpEventHandler,
+                    None,
+                    &ai_runner,
+                    &ApplyBudget::new(),
+                    |_line| async move {},
+                ),
+            ),
+        )
+        .await
+        .expect("apply must succeed once the lock-holding descendant is gone");
+
+        assert!(
+            released_marker.exists(),
+            "the descendant must have released index.lock itself; Conflux never deletes lock files"
+        );
+        assert!(
+            !index_lock.exists(),
+            "index.lock must be gone once cleanup confirmed quiescence"
+        );
+        assert!(
+            result.completed,
+            "apply must complete after confirmed cleanup"
+        );
+
+        // Git refuses to commit while index.lock exists, so the presence of the
+        // final Apply commit proves finalization ran only after the release.
+        let subjects = git_log_subjects(workspace);
+        assert!(
+            subjects.iter().any(|s| s == &format!("Apply: {change_id}")),
+            "final Apply commit must exist after confirmed cleanup, got: {subjects:?}"
+        );
+
+        // The release marker is written only when the descendant exits, so a
+        // commit that contains it cannot have been snapshotted any earlier.
+        let tracked = std::process::Command::new("git")
+            .args(["ls-tree", "-r", "HEAD", "--name-only"])
+            .current_dir(workspace)
+            .output()
+            .expect("git ls-tree should run");
+        let tracked = String::from_utf8_lossy(&tracked.stdout).to_string();
+        assert!(
+            tracked.contains("released-after-cleanup.txt"),
+            "final commit must have snapshotted the workspace after the descendant exited: {tracked}"
         );
     }
 
@@ -2681,6 +3640,7 @@ mod tests {
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
+                    &ApplyBudget::new(),
                     |_line| async move {},
                 ),
             ),
@@ -2736,6 +3696,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await
@@ -2793,6 +3754,7 @@ mod tests {
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
+                    &ApplyBudget::new(),
                     |_line| async move {},
                 ),
             ),
@@ -2961,6 +3923,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await;
@@ -3026,6 +3989,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await;
@@ -3083,6 +4047,7 @@ mod tests {
             &NoOpEventHandler,
             None,
             &ai_runner,
+            &ApplyBudget::new(),
             |_line| async move {},
         )
         .await;
@@ -3095,8 +4060,8 @@ mod tests {
         let loop_result = result.expect("valid completed task file should complete apply");
         assert!(loop_result.completed);
         assert_eq!(
-            loop_result.iterations, 1,
-            "the gate must not add an agent cycle for an already-valid task file"
+            loop_result.iterations, 0,
+            "the gate must not reserve an Apply dispatch for an already-valid task file"
         );
     }
 }
@@ -3536,6 +4501,7 @@ mod apply_commit_recovery {
                     &NoOpEventHandler,
                     None,
                     &ai_runner,
+                    &ApplyBudget::new(),
                     |_line| async move {},
                 ),
             ),
@@ -3729,5 +4695,804 @@ mod apply_commit_recovery {
                 .completed
         );
         assert_eq!(parallel_repo.head_subject(), "Apply: caller-parallel");
+    }
+}
+
+/// Operation-level Apply recovery: the sole per-change `max_iterations` budget
+/// owner and ordinary command-failure continuation.
+///
+/// Grouped under one module so `cargo test --lib apply_budget_recovery` runs the
+/// whole verification set declared by the change proposal.
+#[cfg(test)]
+mod apply_budget_recovery {
+    use super::tests::{init_git_repo, make_test_ai_runner};
+    use super::*;
+    use tempfile::TempDir;
+
+    const PENDING_TASKS: &str = "## Implementation Tasks\n- [ ] implement\n";
+
+    fn write_tasks(workspace: &Path, change_id: &str, content: &str) {
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), content).unwrap();
+    }
+
+    /// Collects the operator-visible warnings the budget owner emits, so warning
+    /// cardinality is observable without scraping the tracing subscriber.
+    #[derive(Default)]
+    struct WarningRecorder {
+        warnings: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl WarningRecorder {
+        fn warnings(&self) -> Vec<String> {
+            self.warnings.lock().unwrap().clone()
+        }
+    }
+
+    impl ApplyEventHandler for WarningRecorder {
+        fn on_apply_started(&self, _change_id: &str, _command: &str) {}
+        fn on_progress_updated(&self, _change_id: &str, _completed: u32, _total: u32) {}
+        fn on_hook_started(&self, _change_id: &str, _hook_type: &str) {}
+        fn on_hook_completed(&self, _change_id: &str, _hook_type: &str) {}
+        fn on_hook_failed(&self, _change_id: &str, _hook_type: &str, _error: &str) {}
+        fn on_apply_output(&self, _change_id: &str, _line: &OutputLine, _iteration: u32) {}
+        fn on_apply_warning(&self, _change_id: &str, message: &str) {
+            self.warnings.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    async fn run_loop<E: ApplyEventHandler>(
+        workspace: &Path,
+        change_id: &str,
+        config: &OrchestratorConfig,
+        budget: &ApplyBudget,
+        event_handler: &E,
+    ) -> Result<ApplyLoopResult> {
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        execute_apply_loop(
+            change_id,
+            workspace,
+            config,
+            &mut agent,
+            VcsBackend::Git,
+            None,
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            event_handler,
+            None,
+            &ai_runner,
+            budget,
+            |_line| async move {},
+        )
+        .await
+    }
+
+    // === Budget ownership (unit) ===
+
+    #[test]
+    fn every_reservation_advances_one_cumulative_per_change_count() {
+        let budget = ApplyBudget::new();
+
+        for expected in 1..=4 {
+            assert_eq!(
+                budget.reserve("change-a", 0),
+                ApplyBudgetReservation::Reserved {
+                    attempt: expected,
+                    warning: None
+                },
+                "each Apply dispatch reserves the next cumulative attempt"
+            );
+        }
+        assert_eq!(budget.attempts("change-a"), 4);
+    }
+
+    #[test]
+    fn each_change_owns_an_independent_total() {
+        let budget = ApplyBudget::new();
+
+        budget.reserve("change-a", 0);
+        budget.reserve("change-a", 0);
+        budget.reserve("change-b", 0);
+
+        assert_eq!(budget.attempts("change-a"), 2);
+        assert_eq!(
+            budget.attempts("change-b"),
+            1,
+            "one change's dispatches must not consume another change's budget"
+        );
+    }
+
+    #[test]
+    fn a_positive_ceiling_refuses_the_dispatch_beyond_it_without_advancing() {
+        let budget = ApplyBudget::new();
+
+        for _ in 0..3 {
+            assert!(matches!(
+                budget.reserve("change-a", 3),
+                ApplyBudgetReservation::Reserved { .. }
+            ));
+        }
+
+        assert_eq!(
+            budget.reserve("change-a", 3),
+            ApplyBudgetReservation::Exhausted {
+                attempts: 3,
+                max: 3
+            },
+            "no dispatch may start beyond the exact ceiling"
+        );
+        assert_eq!(
+            budget.attempts("change-a"),
+            3,
+            "a refused reservation must not advance the count"
+        );
+    }
+
+    #[test]
+    fn the_eighty_percent_warning_is_emitted_once_per_threshold_crossing() {
+        let budget = ApplyBudget::new();
+        let mut warnings = Vec::new();
+
+        for _ in 0..10 {
+            if let ApplyBudgetReservation::Reserved {
+                warning: Some(warning),
+                ..
+            } = budget.reserve("change-a", 10)
+            {
+                warnings.push(warning);
+            }
+        }
+
+        assert_eq!(
+            warnings,
+            vec!["Approaching max iterations: 8/10".to_string()],
+            "the sole owner warns exactly once at the configured threshold"
+        );
+    }
+
+    #[test]
+    fn zero_disables_only_the_numeric_ceiling() {
+        let budget = ApplyBudget::new();
+
+        for _ in 0..(DEFAULT_MAX_ITERATIONS + 5) {
+            assert!(
+                matches!(
+                    budget.reserve("change-a", 0),
+                    ApplyBudgetReservation::Reserved { warning: None, .. }
+                ),
+                "zero never refuses a reservation and never warns"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_process_budget_starts_every_change_at_zero() {
+        let spent = ApplyBudget::new();
+        spent.reserve("change-a", 10);
+        spent.reserve("change-a", 10);
+        assert_eq!(spent.attempts("change-a"), 2);
+
+        // A restart cannot consult the previous process: the map lives only in
+        // memory, so a new owner is indistinguishable from a fresh run.
+        let restarted = ApplyBudget::new();
+        assert_eq!(restarted.attempts("change-a"), 0);
+        assert_eq!(
+            restarted.reserve("change-a", 10),
+            ApplyBudgetReservation::Reserved {
+                attempt: 1,
+                warning: None
+            }
+        );
+    }
+
+    // === Budget ownership across Apply entries (integration) ===
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn one_budget_spans_every_apply_entry_for_a_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+        write_tasks(workspace, "change-b", PENDING_TASKS);
+
+        // Never completes and never fails: each entry spends its whole budget on
+        // dispatches, which is exactly what the cumulative total must observe.
+        let config = OrchestratorConfig {
+            apply_command: Some("true".to_string()),
+            max_iterations: Some(2),
+            ..Default::default()
+        };
+        let budget = ApplyBudget::new();
+
+        let first = run_loop(workspace, "change-a", &config, &budget, &NoOpEventHandler).await;
+        assert!(
+            matches!(
+                first,
+                Err(OrchestratorError::IterationLimit { attempts: 2, .. })
+            ),
+            "the first entry spends the whole per-change budget: {first:?}"
+        );
+
+        // A later re-entry — the shape Acceptance FAIL-to-Apply repair takes —
+        // must not get a fresh allowance.
+        let second = run_loop(workspace, "change-a", &config, &budget, &NoOpEventHandler).await;
+        let Err(OrchestratorError::IterationLimit { attempts, max, .. }) = second else {
+            panic!("a re-entry with a spent budget must refuse immediately: {second:?}");
+        };
+        assert_eq!((attempts, max), (2, 2));
+        assert_eq!(budget.attempts("change-a"), 2);
+
+        // Another change under the same owner still has its full allowance.
+        let other = run_loop(workspace, "change-b", &config, &budget, &NoOpEventHandler).await;
+        assert!(
+            matches!(
+                other,
+                Err(OrchestratorError::IterationLimit { attempts: 2, .. })
+            ),
+            "per-change isolation must survive a shared owner: {other:?}"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn exhaustion_returns_typed_iteration_limit_with_the_latest_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let config = OrchestratorConfig {
+            apply_command: Some("sh -c 'echo apply-boom >&2; exit 3'".to_string()),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let recorder = WarningRecorder::default();
+        let budget = ApplyBudget::new();
+
+        let error = run_loop(workspace, "change-a", &config, &budget, &recorder)
+            .await
+            .expect_err("a spent budget must stop the loop");
+
+        let OrchestratorError::IterationLimit {
+            change_id,
+            attempts,
+            max,
+            diagnostic,
+        } = error
+        else {
+            panic!("budget exhaustion must stay typed, not become an agent-command crash");
+        };
+        assert_eq!((change_id.as_str(), attempts, max), ("change-a", 1, 1));
+        assert!(
+            diagnostic.contains("exit code: Some(3)"),
+            "the diagnostic must carry the latest actionable failure: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("apply-boom"),
+            "the diagnostic must carry bounded stream evidence: {diagnostic}"
+        );
+        assert_eq!(
+            recorder.warnings(),
+            vec!["Approaching max iterations: 1/1".to_string()],
+            "a ceiling of 1 is crossed by its only dispatch, so exactly one warning is due"
+        );
+    }
+
+    // === Ordinary command-failure continuation (integration) ===
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn the_loop_forwards_the_single_threshold_warning_to_the_frontend() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        // Ceiling 5 puts the 80% threshold at dispatch 4, so dispatches 4 and 5
+        // both sit at or above it and only the first may warn.
+        let config = OrchestratorConfig {
+            apply_command: Some("true".to_string()),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let recorder = WarningRecorder::default();
+
+        let _ = run_loop(
+            workspace,
+            "change-a",
+            &config,
+            &ApplyBudget::new(),
+            &recorder,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.warnings(),
+            vec!["Approaching max iterations: 4/5".to_string()],
+            "the sole owner's warning reaches the frontend exactly once"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn an_ordinary_command_failure_continues_into_a_history_backed_iteration() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+        let tasks_path = workspace
+            .join("openspec")
+            .join("changes")
+            .join("change-a")
+            .join("tasks.md");
+        let attempts_log = temp_dir.path().join("attempts.log");
+
+        // First dispatch writes partial evidence and exits non-zero; the second
+        // completes the tasks. Continuation is only possible because the failed
+        // attempt did not terminate the workspace.
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo run >> {log}; \
+                 if [ $(wc -l < {log}) -ge 2 ]; then printf \"## Implementation Tasks\\n- [x] implement\\n\" > {tasks}; exit 0; fi; \
+                 echo partial-progress >&2; exit 7'",
+                log = attempts_log.display(),
+                tasks = tasks_path.display(),
+            )),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        let budget = ApplyBudget::new();
+
+        let result = execute_apply_loop(
+            "change-a",
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            None,
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            &budget,
+            |_line| async move {},
+        )
+        .await
+        .expect("a recoverable command failure must not become a terminal workspace error");
+
+        assert!(result.completed);
+        assert_eq!(
+            result.iterations, 2,
+            "exactly one recovery dispatch followed the failed attempt"
+        );
+
+        // The failed attempt is in history, so the next prompt could consume it.
+        let history = agent.format_apply_history("change-a");
+        assert!(
+            history.contains("partial-progress"),
+            "the failed attempt must be recorded with bounded stream evidence: {history}"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn no_progress_command_failures_still_reach_stall_with_an_unlimited_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        // Zero disables only the numeric ceiling. Without stall policy this loop
+        // would retry a permanently failing command forever.
+        let config = OrchestratorConfig {
+            apply_command: Some("sh -c 'exit 9'".to_string()),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let budget = ApplyBudget::new();
+
+        let error = run_loop(workspace, "change-a", &config, &budget, &NoOpEventHandler)
+            .await
+            .expect_err("repeated no-progress failures must reach stall policy");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("Stall detected for change-a"),
+            "an unlimited budget must still stop on the stall threshold: {message}"
+        );
+        assert!(
+            !matches!(error, OrchestratorError::IterationLimit { .. }),
+            "no numeric ceiling applies when max_iterations is 0"
+        );
+        assert_eq!(
+            budget.attempts("change-a"),
+            config.get_stall_detection().threshold,
+            "the loop stops on the configured empty-progress threshold, not a count limit"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn command_queue_transport_retries_stay_inside_one_reservation() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+        let attempts_log = temp_dir.path().join("transport.log");
+
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo run >> {log}; echo transient failure >&2; exit 1'",
+                log = attempts_log.display()
+            )),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        // Two transport retries inside one dispatch: the command queue owns them,
+        // so the outer per-change count must still observe exactly one dispatch.
+        let queue_config = crate::command_queue::CommandQueueConfig {
+            stagger_delay_ms: 0,
+            max_retries: 2,
+            retry_delay_ms: 0,
+            retry_error_patterns: vec!["transient failure".to_string()],
+            retry_if_duration_under_secs: 3600,
+            inactivity_timeout_secs: 0,
+            inactivity_kill_grace_secs: 0,
+            inactivity_timeout_max_retries: 0,
+            strict_process_cleanup: false,
+        };
+        let ai_runner = crate::ai_command_runner::AiCommandRunner::new(
+            queue_config,
+            std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        );
+        let mut agent = AgentRunner::new(config.clone());
+        let budget = ApplyBudget::new();
+
+        let error = execute_apply_loop(
+            "change-a",
+            workspace,
+            &config,
+            &mut agent,
+            VcsBackend::Git,
+            None,
+            None,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            &budget,
+            |_line| async move {},
+        )
+        .await
+        .expect_err("a ceiling of one permits exactly one dispatch");
+
+        assert!(matches!(
+            error,
+            OrchestratorError::IterationLimit { attempts: 1, .. }
+        ));
+        assert_eq!(budget.attempts("change-a"), 1);
+        let transport_attempts = std::fs::read_to_string(&attempts_log)
+            .expect("the fixture ran")
+            .lines()
+            .count();
+        assert!(
+            transport_attempts > 1,
+            "the fixture must exercise real transport retries, saw {transport_attempts}"
+        );
+    }
+}
+
+/// Dispatch authorization: what must be true *before* an Apply child starts, and
+/// what a completed attempt's own artifacts decide before stall routing runs.
+#[cfg(test)]
+mod apply_dispatch_authorization {
+    use super::tests::{init_git_repo, make_test_ai_runner};
+    use super::*;
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use tempfile::TempDir;
+
+    const PENDING_TASKS: &str = "## Implementation Tasks\n- [ ] implement\n";
+
+    fn write_tasks(workspace: &Path, change_id: &str, content: &str) {
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), content).unwrap();
+    }
+
+    fn hook(command: String) -> HookConfigValue {
+        HookConfigValue::Full(HookConfig {
+            command,
+            continue_on_failure: false,
+            timeout: 30,
+            git_commit_no_verify: false,
+            max_retries: 0,
+            retry_delay_secs: 0,
+        })
+    }
+
+    async fn run_loop_with_hooks(
+        workspace: &Path,
+        change_id: &str,
+        config: &OrchestratorConfig,
+        budget: &ApplyBudget,
+        hooks: Option<&HookRunner>,
+    ) -> Result<ApplyLoopResult> {
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        execute_apply_loop(
+            change_id,
+            workspace,
+            config,
+            &mut agent,
+            VcsBackend::Git,
+            None,
+            hooks,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            budget,
+            |_line| async move {},
+        )
+        .await
+    }
+
+    // === 80% warning threshold (unit) ===
+
+    #[test]
+    fn the_warning_threshold_is_the_integer_ceiling_of_eighty_percent() {
+        // ceil(max * 0.8): the first dispatch that actually reaches 80%.
+        for (max, expected) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 4), (100, 80)] {
+            assert_eq!(
+                ApplyBudget::warning_threshold(max),
+                expected,
+                "a ceiling of {max} is first reached at 80% on dispatch {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_positive_ceiling_warns_exactly_once_at_its_ceiling_threshold() {
+        for (max, expected_attempt) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 4), (100, 80)] {
+            let budget = ApplyBudget::new();
+            let mut warned_at = Vec::new();
+
+            for attempt in 1..=max {
+                match budget.reserve("change-a", max) {
+                    ApplyBudgetReservation::Reserved {
+                        warning: Some(warning),
+                        ..
+                    } => {
+                        assert_eq!(
+                            warning,
+                            format!("Approaching max iterations: {attempt}/{max}")
+                        );
+                        warned_at.push(attempt);
+                    }
+                    ApplyBudgetReservation::Reserved { warning: None, .. } => {}
+                    other => panic!("a dispatch inside the ceiling must be reserved: {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                warned_at,
+                vec![expected_attempt],
+                "a ceiling of {max} must warn exactly once, on dispatch {expected_attempt}"
+            );
+        }
+    }
+
+    // === pre_apply authorizes the dispatch (integration) ===
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_failing_pre_apply_starts_no_command_and_spends_no_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        // The apply command records that it ran. A refused dispatch must leave
+        // this marker absent: no child may be launched before the hook decides.
+        let apply_marker = temp_dir.path().join("apply-ran.txt");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo ran >> {}'", apply_marker.display())),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let hooks = HookRunner::new(
+            HooksConfig {
+                pre_apply: Some(hook("sh -c 'exit 7'".to_string())),
+                ..Default::default()
+            },
+            workspace,
+        );
+        let budget = ApplyBudget::new();
+
+        let error = run_loop_with_hooks(workspace, "change-a", &config, &budget, Some(&hooks))
+            .await
+            .expect_err("a failing pre_apply hook must stop the loop");
+
+        assert!(
+            !matches!(error, OrchestratorError::IterationLimit { .. }),
+            "the hook failure — not the ceiling — owns this stop: {error}"
+        );
+        assert!(
+            !apply_marker.exists(),
+            "no Apply child may start before pre_apply succeeds"
+        );
+        assert_eq!(
+            budget.attempts("change-a"),
+            0,
+            "an unauthorized dispatch must not consume the per-change budget"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_succeeding_pre_apply_still_authorizes_the_dispatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let apply_marker = temp_dir.path().join("apply-ran.txt");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo ran >> {}'", apply_marker.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let hooks = HookRunner::new(
+            HooksConfig {
+                pre_apply: Some(hook("true".to_string())),
+                ..Default::default()
+            },
+            workspace,
+        );
+        let budget = ApplyBudget::new();
+
+        let _ = run_loop_with_hooks(workspace, "change-a", &config, &budget, Some(&hooks)).await;
+
+        assert!(
+            apply_marker.exists(),
+            "an authorized dispatch must still launch the Apply child"
+        );
+        assert_eq!(budget.attempts("change-a"), 1);
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_refused_dispatch_never_reaches_pre_apply() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let hook_marker = temp_dir.path().join("pre-apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some("true".to_string()),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let hooks = HookRunner::new(
+            HooksConfig {
+                pre_apply: Some(hook(format!(
+                    "sh -c 'echo pre >> {}'",
+                    hook_marker.display()
+                ))),
+                ..Default::default()
+            },
+            workspace,
+        );
+        let budget = ApplyBudget::new();
+        // The ceiling is already spent, so the re-entry below is refused.
+        budget.reserve("change-a", 1);
+
+        let error = run_loop_with_hooks(workspace, "change-a", &config, &budget, Some(&hooks))
+            .await
+            .expect_err("a spent budget must refuse the re-entry");
+
+        assert!(matches!(
+            error,
+            OrchestratorError::IterationLimit {
+                attempts: 1,
+                max: 1,
+                ..
+            }
+        ));
+        assert!(
+            !hook_marker.exists(),
+            "a refused dispatch must not run the pre-dispatch hook"
+        );
+    }
+
+    // === Handoff markers outrank stall routing (integration) ===
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_non_zero_natural_exit_that_wrote_apply_blocked_hands_off_without_another_dispatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let blocker_dir = workspace
+            .join("openspec")
+            .join("changes")
+            .join("change-a")
+            .join("APPLY_BLOCKED");
+        let config = OrchestratorConfig {
+            // Writes the blocker marker, then exits non-zero — an ordinary
+            // command failure that nevertheless produced a handoff.
+            apply_command: Some(format!(
+                "sh -c 'mkdir -p {dir} && echo blocked > {dir}/marker.md; exit 4'",
+                dir = blocker_dir.display()
+            )),
+            // A threshold of one means stall routing would fire on this very
+            // attempt if it were allowed to run first.
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 1,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let budget = ApplyBudget::new();
+
+        let result = run_loop_with_hooks(workspace, "change-a", &config, &budget, None)
+            .await
+            .expect("the blocked handoff owns this outcome, not stall routing");
+
+        let handoff = result
+            .blocked_handoff
+            .expect("APPLY_BLOCKED written by the failed attempt must route to blocked handoff");
+        assert!(handoff.blocker_path.ends_with("APPLY_BLOCKED/marker.md"));
+        assert!(!result.completed);
+        assert_eq!(
+            budget.attempts("change-a"),
+            1,
+            "the handoff must be honoured without authorizing another dispatch"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_non_zero_natural_exit_that_wrote_rejected_hands_off_without_another_dispatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo rejected > {}/REJECTED.md; exit 4'",
+                change_dir.display()
+            )),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 1,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let budget = ApplyBudget::new();
+
+        let result = run_loop_with_hooks(workspace, "change-a", &config, &budget, None)
+            .await
+            .expect("the rejecting handoff owns this outcome, not stall routing");
+
+        assert!(result.rejected_handoff.is_some());
+        assert_eq!(budget.attempts("change-a"), 1);
     }
 }

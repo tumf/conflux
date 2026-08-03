@@ -110,6 +110,7 @@ struct FakeQueue {
     contents: StdMutex<Vec<String>>,
     cancellation: CancellationBehavior,
     notified: StdMutex<usize>,
+    explicit_retries: StdMutex<Vec<String>>,
 }
 
 impl FakeQueue {
@@ -118,7 +119,15 @@ impl FakeQueue {
             contents: StdMutex::new(Vec::new()),
             cancellation,
             notified: StdMutex::new(0),
+            explicit_retries: StdMutex::new(Vec::new()),
         }
+    }
+
+    fn explicit_retries(&self) -> Vec<String> {
+        self.explicit_retries
+            .lock()
+            .expect("explicit retries lock")
+            .clone()
     }
 }
 
@@ -156,6 +165,13 @@ impl QueuePort for FakeQueue {
 
     async fn notify_scheduler(&self) {
         *self.notified.lock().expect("notified lock") += 1;
+    }
+
+    async fn publish_explicit_retry(&self, change_id: &str) {
+        self.explicit_retries
+            .lock()
+            .expect("explicit retries lock")
+            .push(change_id.to_string());
     }
 }
 
@@ -863,16 +879,24 @@ async fn operator_command_stop_and_dequeue_of_idle_row_needs_no_handle() {
     );
 }
 
+/// The guard is on the *call* `.force_kill(`, not on the words "force kill".
+///
+/// `force_kill` returns a best-effort boolean that says a signal was sent, never
+/// that the task ended, so neither the service nor the TUI adapter may invoke it
+/// and treat the result as termination evidence. The operator-facing feature is
+/// still named force-kill, and identifiers such as `confirm_force_kill` describe
+/// the confirmation that produces a stop-and-dequeue command — they are not calls
+/// into that API and must not trip this guard.
 #[test]
 fn operator_command_force_kill_result_is_not_treated_as_termination_proof() {
     let source = include_str!("../operator_command.rs");
     assert!(
-        !source.contains("force_kill"),
+        !source.contains(".force_kill("),
         "the service must use the cancellation handshake, not force_kill's boolean"
     );
     let handlers = include_str!("../../tui/command_handlers.rs");
     assert!(
-        !handlers.contains("force_kill"),
+        !handlers.contains(".force_kill("),
         "the TUI adapter must not treat force_kill's result as proof of termination"
     );
 }
@@ -909,6 +933,128 @@ async fn operator_command_terminal_error_retry_uses_retry_error() {
         fixture.state.read().await.display_status("change-a"),
         "queued",
         "RetryError must restore ordinary queued dispatch eligibility"
+    );
+}
+
+/// Only an accepted, state-changing `RetryError` may reach the live scheduler as
+/// a target-ID-bearing one-shot retry edge. That edge is what releases a change's
+/// ephemeral failed classification, so anything weaker must publish nothing.
+#[tokio::test]
+async fn failed_dependency_retry_edge_follows_accepted_state_changing_retry_only() {
+    let fixture = fixture(&["change-a", "change-b"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "change-a".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+
+    // Ordinary queue intent for a healthy change is not a retry.
+    fixture
+        .service
+        .add_to_queue("change-b")
+        .await
+        .expect("ordinary queue add");
+    assert!(
+        fixture.queue.explicit_retries().is_empty(),
+        "an ordinary AddToQueue must not look like an explicit retry"
+    );
+
+    // A generic scheduler wake is not a retry either.
+    fixture.service.queue.notify_scheduler().await;
+    assert!(
+        fixture.queue.explicit_retries().is_empty(),
+        "a generic queue notification must not look like an explicit retry"
+    );
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("terminal error must be retryable");
+    assert_eq!(plan.routes, vec![RetryRoute::TerminalError]);
+    assert_eq!(
+        fixture.queue.explicit_retries(),
+        vec!["change-a".to_string()],
+        "an accepted terminal-error retry publishes exactly one target-ID-bearing edge"
+    );
+
+    // The change is queued now, so a duplicate retry carries no retryable
+    // evidence and must publish nothing further.
+    assert!(
+        fixture.service.retry_change("change-a").await.is_err(),
+        "a retried change no longer carries retryable evidence"
+    );
+    assert_eq!(
+        fixture.queue.explicit_retries(),
+        vec!["change-a".to_string()],
+        "a refused retry must not publish a second edge"
+    );
+
+    // A duplicate ordinary add is a reducer no-op and publishes nothing.
+    fixture
+        .service
+        .add_to_queue("change-a")
+        .await
+        .expect("duplicate queue add");
+    assert_eq!(
+        fixture.queue.explicit_retries(),
+        vec!["change-a".to_string()],
+        "a no-op AddToQueue must not publish an edge"
+    );
+}
+
+/// A refused acceptance-stall retry keeps its blocker evidence and dispatches
+/// nothing, so it must not publish a retry edge either.
+#[tokio::test]
+async fn failed_dependency_retry_edge_absent_for_acceptance_stall_routes() {
+    let fixture = fixture(&["change-a"]);
+    {
+        let mut guard = fixture.state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::AcceptanceGated {
+            change_id: "change-a".to_string(),
+            blocker: acceptance_blocker(),
+        });
+    }
+
+    let plan = fixture
+        .service
+        .retry_change("change-a")
+        .await
+        .expect("acceptance stall must be retryable");
+    assert_eq!(plan.routes, vec![RetryRoute::AcceptanceStall]);
+    assert!(
+        fixture.queue.explicit_retries().is_empty(),
+        "an acceptance-stall retry restores queue intent; it clears no failed classification"
+    );
+}
+
+/// The real `DynamicQueue` carries the edge, one-shot, with the retried ID.
+#[tokio::test]
+async fn failed_dependency_retry_edge_reaches_the_real_dynamic_queue_once() {
+    let (service, state, _hooks, queue) = dynamic_queue_fixture(&["change-a"]);
+    {
+        let mut guard = state.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ProcessingError {
+            id: "change-a".to_string(),
+            error: "boom".to_string(),
+        });
+    }
+
+    service
+        .retry_change("change-a")
+        .await
+        .expect("terminal error must be retryable");
+
+    assert_eq!(
+        queue.drain_explicit_retries().await,
+        vec!["change-a".to_string()],
+        "the scheduler receives the retried change ID"
+    );
+    assert!(
+        queue.drain_explicit_retries().await.is_empty(),
+        "the edge is one-shot and cannot be replayed by a later wake"
     );
 }
 

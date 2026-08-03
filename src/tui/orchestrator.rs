@@ -54,6 +54,42 @@ fn configure_parallel_upstream_integration(
 const PARALLEL_CANCELLATION_CLEANUP_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(120);
 
+/// Run `on_finish` exactly once for a TUI parallel run.
+///
+/// The workspace task records the shared Apply-budget owner's refusal as a typed
+/// observation on the reducer, so this boundary reports `iteration_limit` with
+/// that change's exact cumulative dispatch count — the same contract `cflx run`
+/// reports through `Orchestrator::run_parallel_finish_hook` and serial reports
+/// through `LoopControl::Break`. Without this call the TUI never delivered the
+/// typed outcome to the hook at all.
+async fn run_tui_parallel_finish_hook(
+    hooks: &crate::hooks::HookRunner,
+    shared_state: &Arc<tokio::sync::RwLock<crate::orchestration::state::OrchestratorState>>,
+) -> Result<()> {
+    use crate::hooks::{HookContext, HookType};
+
+    let state = shared_state.read().await;
+    let (finish_status, finish_apply_count) = state.parallel_finish_report();
+    let iteration_limit = state.apply_iteration_limits().first().cloned();
+    let processed = state.changes_processed();
+    let total = state.total_changes();
+    drop(state);
+
+    if let Some(record) = &iteration_limit {
+        tracing::info!(
+            change_id = %record.change_id,
+            attempts = record.attempts,
+            max = record.max,
+            "Parallel run stopped on the Apply-dispatch ceiling"
+        );
+    }
+
+    let finish_context = HookContext::new(processed, total, 0, false)
+        .with_status(finish_status)
+        .with_apply_count(finish_apply_count);
+    hooks.run_hook(HookType::OnFinish, &finish_context).await
+}
+
 /// How one parallel orchestration boundary run reached its terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParallelTermination {
@@ -102,6 +138,10 @@ where
 pub(crate) enum ParallelTerminalReport {
     /// Normal completion: success log and `AllCompleted`.
     Completed,
+    /// The run drained, but one or more changes ended in a change-local failure
+    /// whose evidence is preserved for explicit retry: warning and
+    /// `AllCompleted`, no success message and no Error.
+    CompletedWithErrors,
     /// Genuine execution error: failure log, completion-with-errors, `AllCompleted`.
     Failed,
     /// Operator stop or scheduler-reported stop: one stop diagnostic only, with
@@ -114,11 +154,17 @@ pub(crate) enum ParallelTerminalReport {
 /// Operator cancellation is a stopped outcome, never an agent-command failure,
 /// even when the bounded cleanup barrier had to escalate. Only a scheduler that
 /// returned on its own may report a genuine execution error.
+///
+/// `scheduler_completed_with_errors` is the scheduler's own typed report, not an
+/// inference from diagnostics: a run that drained while changes remain in manual
+/// `MergeWait` is neither a success nor a failure, and reporting it as either
+/// would be untruthful about work the operator still owns.
 pub(crate) fn classify_parallel_terminal_report(
     termination: ParallelTermination,
     scheduler_failed: bool,
     scheduler_reported_stop: bool,
     reducer_owned_lane_wait_or_active: bool,
+    scheduler_completed_with_errors: bool,
 ) -> ParallelTerminalReport {
     if termination.is_operator_cancellation() || scheduler_reported_stop {
         return ParallelTerminalReport::Stopped;
@@ -128,6 +174,9 @@ pub(crate) fn classify_parallel_terminal_report(
     }
     if reducer_owned_lane_wait_or_active {
         return ParallelTerminalReport::Stopped;
+    }
+    if scheduler_completed_with_errors {
+        return ParallelTerminalReport::CompletedWithErrors;
     }
     ParallelTerminalReport::Completed
 }
@@ -289,6 +338,11 @@ pub async fn run_orchestrator(
             .await;
     }
 
+    // Finish status reported to `on_finish` exactly once at the end of this run,
+    // plus the cumulative Apply-dispatch count that accompanies `iteration_limit`.
+    let mut finish_status = "completed";
+    let mut finish_apply_count = 0u32;
+
     // Main two-phase loop
     loop {
         // Check for cancellation before each iteration
@@ -312,32 +366,11 @@ pub async fn run_orchestrator(
             break;
         }
 
-        // Check max iterations limit (0 = no limit)
-        let current_iteration = serial_service.iteration();
-        if max_iterations > 0 && current_iteration >= max_iterations {
-            dispatcher
-                .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                    "Max iterations ({}) reached, stopping orchestration",
-                    max_iterations
-                ))))
-                .await;
-            // Send completion event
-            dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
-            break;
-        }
-
-        // Log warning when approaching limit (80%)
-        if max_iterations > 0 {
-            let warning_threshold = (max_iterations as f32 * 0.8) as u32;
-            if current_iteration == warning_threshold {
-                dispatcher
-                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
-                        "Approaching max iterations: {}/{}",
-                        current_iteration, max_iterations
-                    ))))
-                    .await;
-            }
-        }
+        // `max_iterations` has exactly one owner: the per-change `ApplyBudget`
+        // inside `SerialRunService`, which reserves before each configured Apply
+        // dispatch, emits the single 80% warning, and returns the typed
+        // `iteration_limit` outcome handled below. This loop imposes no second
+        // ceiling and duplicates no warning.
 
         // Check dynamic queue for new changes before checking if we're done
         while let Some(dynamic_id) = dynamic_queue.pop().await {
@@ -796,6 +829,25 @@ pub async fn run_orchestrator(
                 };
                 dispatcher.dispatch(processing_error_event).await;
             }
+            // The sole per-change budget owner refused another dispatch. Stop the
+            // run with the canonical `iteration_limit` finish status and the exact
+            // cumulative count instead of reclassifying it as a command crash.
+            Ok(ChangeProcessResult::IterationLimit { attempts, error }) => {
+                dispatcher
+                    .dispatch(OrchestratorEvent::Log(LogEntry::warn(error.clone())))
+                    .await;
+                dispatcher
+                    .dispatch(OrchestratorEvent::ProcessingError {
+                        id: change_id.clone(),
+                        error,
+                    })
+                    .await;
+                shared_state.write().await.remove_from_pending(&change_id);
+                finish_status = "iteration_limit";
+                finish_apply_count = attempts;
+                dispatcher.dispatch(OrchestratorEvent::AllCompleted).await;
+                break;
+            }
             Ok(ChangeProcessResult::Archived) => {
                 // Change was complete and successfully archived
                 dispatcher
@@ -884,7 +936,9 @@ pub async fn run_orchestrator(
     // Run on_finish hook after all changes processed or stopped
     let state = shared_state.read().await;
     let complete_context =
-        HookContext::new(state.changes_processed(), state.total_changes(), 0, false);
+        HookContext::new(state.changes_processed(), state.total_changes(), 0, false)
+            .with_status(finish_status)
+            .with_apply_count(finish_apply_count);
     if let Err(e) = hooks.run_hook(HookType::OnFinish, &complete_context).await {
         dispatcher
             .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
@@ -1113,6 +1167,12 @@ pub async fn run_orchestrator_parallel(
 
     let scheduler_reported_stop = merge_deferred_stop.load(Ordering::SeqCst);
     let scheduler_failed = matches!(result, Some(Err(_)));
+    // Blocked/stalled remainders join change-local failures here: both leave
+    // work the operator still owns, so neither may produce a success message.
+    let scheduler_completed_with_errors = matches!(
+        &result,
+        Some(Ok(report)) if report.is_incomplete()
+    );
 
     let has_reducer_owned_lane_wait_or_active = {
         let state = shared_state.read().await;
@@ -1126,7 +1186,31 @@ pub async fn run_orchestrator_parallel(
         scheduler_failed,
         scheduler_reported_stop,
         has_reducer_owned_lane_wait_or_active,
+        scheduler_completed_with_errors,
     );
+
+    // Exactly one `on_finish` per TUI parallel boundary run, before any terminal
+    // event, so a hook log can never be ordered after completion. A run stopped
+    // by the shared Apply-dispatch ceiling reports the typed `iteration_limit`
+    // status with its exact cumulative count.
+    {
+        let (hook_event_bridge, hook_bridge_handle) = dispatcher.bridge(EVENT_BRIDGE_BUFFER);
+        let hooks = crate::hooks::HookRunner::with_event_tx(
+            config.get_hooks(),
+            &repo_root,
+            hook_event_bridge,
+        );
+        if let Err(e) = run_tui_parallel_finish_hook(&hooks, &shared_state).await {
+            dispatcher
+                .dispatch(OrchestratorEvent::Log(LogEntry::warn(format!(
+                    "on_finish hook failed: {}",
+                    e
+                ))))
+                .await;
+        }
+        drop(hooks);
+        let _ = tokio::time::timeout(EVENT_BRIDGE_DRAIN_TIMEOUT, hook_bridge_handle).await;
+    }
 
     match report {
         ParallelTerminalReport::Stopped => {
@@ -1160,6 +1244,9 @@ pub async fn run_orchestrator_parallel(
                     .await;
             }
         }
+        // Deliberately no success log: changes are still waiting for an
+        // explicit retry, so claiming completion here would be untruthful.
+        ParallelTerminalReport::CompletedWithErrors => {}
         ParallelTerminalReport::Completed => {
             dispatcher
                 .dispatch(OrchestratorEvent::Log(LogEntry::success(format!(
@@ -1173,7 +1260,7 @@ pub async fn run_orchestrator_parallel(
     // Only send completion message and AllCompleted event if not stopped/cancelled
     match report {
         ParallelTerminalReport::Stopped => {}
-        ParallelTerminalReport::Failed => {
+        ParallelTerminalReport::Failed | ParallelTerminalReport::CompletedWithErrors => {
             dispatcher
                 .dispatch(OrchestratorEvent::Log(LogEntry::warn(
                     "Processing completed with errors".to_string(),
@@ -1196,6 +1283,117 @@ pub async fn run_orchestrator_parallel(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    /// The TUI parallel boundary owns the same typed finish contract `cflx run`
+    /// owns: the reducer's Apply-ceiling observation, not an error string, is
+    /// what `on_finish` reports.
+    mod parallel_finish_hook {
+        use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        fn hooks_writing_finish_status(
+            log: &std::path::Path,
+            repo_root: &std::path::Path,
+        ) -> HookRunner {
+            HookRunner::new(
+                HooksConfig {
+                    on_finish: Some(HookConfigValue::Full(HookConfig {
+                        command: format!(
+                            "sh -c 'echo \"$OPENSPEC_STATUS $OPENSPEC_APPLY_COUNT\" >> {}'",
+                            log.display()
+                        ),
+                        continue_on_failure: false,
+                        timeout: 30,
+                        git_commit_no_verify: false,
+                        max_retries: 0,
+                        retry_delay_secs: 0,
+                    })),
+                    ..Default::default()
+                },
+                repo_root,
+            )
+        }
+
+        fn lines(log: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        fn parallel_state(
+            change_id: &str,
+            max_iterations: u32,
+        ) -> Arc<tokio::sync::RwLock<OrchestratorState>> {
+            Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+                vec![change_id.to_string()],
+                max_iterations,
+                ExecutionMode::Parallel,
+            )))
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_recorded_iteration_limit_reports_status_and_exact_count_once() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let hooks = hooks_writing_finish_status(&log, temp_dir.path());
+            let shared_state = parallel_state("change-a", 7);
+
+            {
+                let mut state = shared_state.write().await;
+                // The workspace task's typed observation: the ceiling refused
+                // dispatch 8 after 7 cumulative dispatches.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+                // A repeated observation for the same change must not duplicate.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+            }
+
+            super::super::run_tui_parallel_finish_hook(&hooks, &shared_state)
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(
+                lines(&log),
+                vec!["iteration_limit 7".to_string()],
+                "the TUI parallel boundary runs on_finish exactly once with the typed status and \
+                 the exact cumulative count"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_run_without_an_iteration_limit_reports_completed() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let hooks = hooks_writing_finish_status(&log, temp_dir.path());
+            let shared_state = parallel_state("change-a", 7);
+
+            super::super::run_tui_parallel_finish_hook(&hooks, &shared_state)
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(lines(&log), vec!["completed 0".to_string()]);
+        }
+
+        /// Both parallel boundaries read the same reducer observation, so a
+        /// frontend can never report a different finish status for one run.
+        #[tokio::test]
+        async fn tui_and_run_derive_the_same_report_from_one_observation() {
+            let mut state = OrchestratorState::with_mode(
+                vec!["change-a".to_string()],
+                7,
+                ExecutionMode::Parallel,
+            );
+            assert_eq!(state.parallel_finish_report(), ("completed", 0));
+            state.record_apply_iteration_limit("change-a", 7, 7);
+            assert_eq!(state.parallel_finish_report(), ("iteration_limit", 7));
+        }
+    }
 
     #[test]
     fn parallel_service_uses_tui_post_archive_action() {
@@ -1734,7 +1932,7 @@ mod tests {
             "pending base-lane results must be handled before terminal stop"
         );
         assert_eq!(
-            classify_parallel_terminal_report(termination, false, true, false),
+            classify_parallel_terminal_report(termination, false, true, false, false),
             ParallelTerminalReport::Stopped,
             "a drained pending merge is never a force-stopped agent process failure"
         );
@@ -1754,7 +1952,7 @@ mod tests {
         assert!(result.is_none());
         assert!(termination.is_operator_cancellation());
         assert_eq!(
-            classify_parallel_terminal_report(termination, false, false, false),
+            classify_parallel_terminal_report(termination, false, false, false, false),
             ParallelTerminalReport::Stopped,
             "a bounded cleanup escalation stays operator cancellation"
         );
@@ -1767,7 +1965,7 @@ mod tests {
             ParallelTermination::CancelledAfterCleanupTimeout,
         ] {
             assert_eq!(
-                classify_parallel_terminal_report(termination, true, false, false),
+                classify_parallel_terminal_report(termination, true, false, false, false),
                 ParallelTerminalReport::Stopped,
                 "cancellation must never be reported as an agent-command failure"
             );
@@ -1781,6 +1979,7 @@ mod tests {
                 ParallelTermination::SchedulerReturned,
                 true,
                 false,
+                false,
                 false
             ),
             ParallelTerminalReport::Failed
@@ -1792,6 +1991,7 @@ mod tests {
         assert_eq!(
             classify_parallel_terminal_report(
                 ParallelTermination::SchedulerReturned,
+                false,
                 false,
                 false,
                 false
@@ -1807,6 +2007,7 @@ mod tests {
                 ParallelTermination::SchedulerReturned,
                 false,
                 true,
+                false,
                 false
             ),
             ParallelTerminalReport::Stopped
@@ -1820,9 +2021,134 @@ mod tests {
                 ParallelTermination::SchedulerReturned,
                 false,
                 false,
-                true
+                true,
+                false
             ),
             ParallelTerminalReport::Stopped
         );
+    }
+
+    #[test]
+    fn finite_change_local_failure_completes_with_errors_not_success() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                false,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::CompletedWithErrors,
+            "a drained run holding a change in merge wait is neither success nor failure"
+        );
+    }
+
+    #[test]
+    fn run_fatal_scheduler_failure_outranks_change_local_failures() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::SchedulerReturned,
+                true,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::Failed,
+            "an aborted run stays Failed; change-local suppression must not downgrade it"
+        );
+    }
+
+    #[test]
+    fn operator_cancellation_outranks_change_local_failures() {
+        assert_eq!(
+            classify_parallel_terminal_report(
+                ParallelTermination::CancelledAfterCleanup,
+                false,
+                false,
+                false,
+                true
+            ),
+            ParallelTerminalReport::Stopped,
+            "operator cancellation owns the terminal transition"
+        );
+    }
+
+    #[test]
+    fn scheduler_run_report_flags_unfinished_work_only() {
+        use crate::parallel::SchedulerRunReport;
+
+        assert!(SchedulerRunReport::CompletedWithErrors.is_incomplete());
+        assert!(SchedulerRunReport::BlockedOrStalled.is_incomplete());
+        assert!(!SchedulerRunReport::Completed.is_incomplete());
+        assert!(!SchedulerRunReport::Stopped.is_incomplete());
+    }
+
+    // ------------------------------------------------------------------
+    // Explicit-intent boundary at TUI/remote parallel startup
+    // ------------------------------------------------------------------
+
+    /// TUI and remote Start both come through this initialisation. Only the
+    /// resolved targets may gain queue intent, and the initial all-change
+    /// refresh that immediately follows must not widen it.
+    #[tokio::test]
+    async fn parallel_startup_queues_only_selected_targets_and_refresh_does_not_widen_it() {
+        use crate::events::ExecutionEvent;
+        use crate::orchestration::state::{ExecutionMode, OrchestratorState, QueueIntent};
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+
+        let shared = Arc::new(tokio::sync::RwLock::new(OrchestratorState::with_mode(
+            vec!["fresh".to_string(), "stale".to_string()],
+            1,
+            ExecutionMode::Parallel,
+        )));
+
+        let preserved = super::initialize_parallel_shared_state(
+            &shared,
+            std::slice::from_ref(&"fresh".to_string()),
+            10,
+        )
+        .await;
+        assert!(
+            !preserved,
+            "a non-empty target set replaces reducer state instead of preserving resolve startup"
+        );
+
+        let change = |id: &str| crate::openspec::Change {
+            id: id.to_string(),
+            completed_tasks: 0,
+            total_tasks: 1,
+            last_modified: "now".to_string(),
+            dependencies: Vec::new(),
+            metadata: crate::openspec::ProposalMetadata::default(),
+        };
+
+        shared
+            .write()
+            .await
+            .apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+                changes: vec![change("fresh"), change("stale")],
+                rejected_changes: Vec::new(),
+                committed_change_ids: HashSet::from(["fresh".to_string(), "stale".to_string()]),
+                uncommitted_file_change_ids: HashSet::new(),
+                worktree_change_ids: HashSet::from(["stale".to_string()]),
+                worktree_paths: HashMap::new(),
+                worktree_not_ahead_ids: HashSet::new(),
+                merge_wait_ids: HashSet::new(),
+            });
+
+        let guard = shared.read().await;
+        assert_eq!(guard.queued_change_ids(), vec!["fresh".to_string()]);
+        assert_eq!(
+            guard
+                .change_runtime("stale")
+                .expect("refresh registers the unselected change")
+                .queue_intent,
+            QueueIntent::NotQueued
+        );
+        assert!(!guard.is_ordinary_queue_eligible("stale"));
+        assert!(guard.merge_wait_change_ids().is_empty());
+        assert!(guard.resolve_wait_change_ids().is_empty());
+        assert!(guard.reject_wait_change_ids().is_empty());
     }
 }

@@ -160,13 +160,13 @@ impl AppState {
     ///
     /// Fatality is decided by event type alone. Diagnostic message content is never
     /// inspected: a genuine fatal error can quote or wrap recoverable-fallback wording,
-    /// and downgrading on that text would keep `AppMode::Running` after orchestration
+    /// and downgrading on that text would keep `AppExecutionMode::Running` after orchestration
     /// had already stopped. Recoverable dependency-analysis fallback stays non-fatal by
     /// arriving on the producer's warning-log event path instead of this channel.
     pub(crate) fn handle_error(&mut self, message: String) {
         self.reset_analysis_log_dedupe();
         self.add_log(LogEntry::error(message.clone()));
-        self.mode = crate::tui::types::AppMode::Error;
+        self.execution_mode = crate::tui::types::AppExecutionMode::Error;
         self.error_change_id = None;
         self.current_change = None;
     }
@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::events::{LogEntry, LogLevel, OrchestratorEvent};
-    use crate::tui::types::AppMode;
+    use crate::tui::types::AppExecutionMode;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
         Change {
@@ -233,7 +233,7 @@ mod tests {
             ));
         }
         app.set_shared_state(shared.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.orchestration_started_at = Some(std::time::Instant::now());
         app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("change-a".to_string()));
         app.changes[1].display_status_cache = "queued".to_string();
@@ -272,8 +272,8 @@ mod tests {
         });
 
         assert_eq!(
-            app.mode,
-            AppMode::Error,
+            app.execution_mode,
+            AppExecutionMode::Error,
             "message content must not downgrade a global error event"
         );
         assert_eq!(app.current_change, None, "fatal error must clear context");
@@ -310,7 +310,11 @@ mod tests {
         // log event, so the running presentation must survive untouched.
         app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(&fallback)));
 
-        assert_eq!(app.mode, AppMode::Running, "fallback must not stop the TUI");
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "fallback must not stop the TUI"
+        );
         assert_eq!(app.current_change.as_deref(), Some("change-a"));
         assert_eq!(app.error_change_id, None);
         assert_eq!(app.orchestration_started_at, started_at);
@@ -356,7 +360,7 @@ mod tests {
         // Production path: the scheduler emits the diagnostic as a warning log event.
         app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(&fallback)));
 
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         assert_eq!(app.current_change.as_deref(), Some("change-a"));
         assert!(app
             .logs
@@ -391,14 +395,14 @@ mod tests {
         assert_eq!(app.changes[1].completed_tasks, 1);
 
         app.handle_orchestrator_event(OrchestratorEvent::ProcessingStarted("change-b".to_string()));
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         assert_eq!(app.current_change.as_deref(), Some("change-b"));
         assert_eq!(app.changes[1].display_status_cache, "applying");
 
         app.handle_orchestrator_event(OrchestratorEvent::Stopped);
         assert_eq!(
-            app.mode,
-            AppMode::Stopped,
+            app.execution_mode,
+            AppExecutionMode::Stopped,
             "stop must still take effect without an intervening retry"
         );
     }
@@ -427,7 +431,7 @@ mod tests {
         app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(&fallback)));
         app.handle_orchestrator_event(OrchestratorEvent::ChangeArchived("change-a".to_string()));
 
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         assert_eq!(app.changes[0].display_status_cache, "archived");
         assert_eq!(
             (app.changes[0].completed_tasks, app.changes[0].total_tasks),
@@ -444,7 +448,7 @@ mod tests {
             message: "Parallel execution failed: base worktree is unusable".to_string(),
         });
 
-        assert_eq!(app.mode, AppMode::Error);
+        assert_eq!(app.execution_mode, AppExecutionMode::Error);
         assert_eq!(app.current_change, None);
         assert_eq!(app.error_change_id, None);
         assert!(app.logs.iter().any(|entry| entry.level == LogLevel::Error
@@ -520,7 +524,7 @@ mod tests {
             create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[1].display_status_cache = "queued".to_string();
 

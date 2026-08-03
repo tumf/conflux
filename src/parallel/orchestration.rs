@@ -101,6 +101,7 @@ use super::types::WorkspaceResult;
 use super::ParallelEvent;
 use super::ParallelExecutor;
 use super::SchedulerLifetime;
+use super::SchedulerRunReport;
 use crate::upstream::coordinator::SchedulerOutcome;
 
 /// Bounded deadline for handling pending background merge/base-lane results on the
@@ -167,6 +168,14 @@ impl ParallelExecutor {
                 .await
     }
 
+    /// Whether this invocation recorded any change-local base-lane failure.
+    ///
+    /// Invocation-scoped and in-memory: it exists so a finite run cannot report
+    /// plain success while a change sits in manual `MergeWait`.
+    pub(super) fn had_change_failures(&self) -> bool {
+        !self.change_failures_this_run.is_empty()
+    }
+
     /// Execute changes with order-based dependency analysis and concurrent re-analysis.
     ///
     /// This method uses a `tokio::select!` based scheduler loop that:
@@ -183,11 +192,15 @@ impl ParallelExecutor {
     ///   - First parameter: queued changes to analyze
     ///   - Second parameter: in-flight change IDs (currently executing)
     ///   - Third parameter: iteration number
+    ///
+    /// Returns the run's terminal report. A scheduler failure — including a
+    /// run-fatal `AbortRun` — is the `Err` half; `Ok` distinguishes a clean
+    /// completion from one that drained with unresolved change-local failures.
     pub async fn execute_with_order_based_reanalysis<F>(
         &mut self,
         changes: Vec<crate::openspec::Change>,
         analyzer: F,
-    ) -> Result<()>
+    ) -> Result<SchedulerRunReport>
     where
         for<'a> F: Fn(
                 &'a [crate::openspec::Change],
@@ -219,8 +232,7 @@ impl ParallelExecutor {
                 })
                 .unwrap_or((false, false));
             if !reducer_has_queued_intent && !reducer_has_lane_wait {
-                send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
-                return Ok(());
+                return Ok(self.finish_completed_run().await);
             }
             if reducer_has_lane_wait {
                 info!(
@@ -319,6 +331,10 @@ impl ParallelExecutor {
         // Reanalysis reason is derived from scheduler events/state each iteration.
         let mut reanalysis_reason = ReanalysisReason::Initial;
         let mut cancelled = false;
+        // Set when the loop exits because nothing is dispatchable while blocked
+        // or waiting work remains. Such a run owes a truthful blocked report,
+        // never `AllCompleted`.
+        let mut blocked_exit = false;
         // Explicit scheduler outcome. Only `DrainedSuccessfully` may enter
         // upstream finalization (final checkpoint, verification, push,
         // confirmation); blocked/stalled and cancelled outcomes never push.
@@ -326,6 +342,39 @@ impl ParallelExecutor {
 
         // Main scheduler loop: wait for triggers and dispatch changes
         loop {
+            // Run-fatal abort. The queue boundary already emitted the single
+            // global Error, so this owes the other half of that contract: stop
+            // admitting work, bounded-drain everything this run owns through the
+            // same managed cleanup path cancellation uses, and fail. A frontend
+            // Error without a run that actually stopped is exactly what this
+            // branch exists to prevent.
+            if self.run_fatal_abort.is_some() {
+                let remaining: Vec<String> = queued.iter().map(|c| c.id.clone()).collect();
+                error!(
+                    queued = remaining.len(),
+                    in_flight = in_flight.len(),
+                    "Run-fatal base-lane outcome; stopping dispatch and draining owned work"
+                );
+                join_set.abort_all();
+                while let Some(result) = join_set.join_next().await {
+                    if let Err(err) = result {
+                        if !err.is_cancelled() {
+                            warn!(error = %err, "In-flight workspace task failed while draining after run-fatal abort");
+                        }
+                    }
+                }
+                self.release_execution_handles_after_cancellation().await;
+                in_flight.clear();
+                queued.clear();
+                self.drain_pending_merge_results_after_cancellation(
+                    &merge_result_tx,
+                    &mut merge_result_rx,
+                    CANCELLATION_MERGE_DRAIN_DEADLINE,
+                )
+                .await;
+                break;
+            }
+
             // Check for cancellation
             if self.is_cancelled() {
                 let remaining_changes: Vec<String> = queued.iter().map(|c| c.id.clone()).collect();
@@ -366,6 +415,12 @@ impl ParallelExecutor {
                 break;
             }
 
+            // Step 0: Consume accepted explicit-retry edges before reconciliation
+            // and classification, so a retried change's ephemeral failed
+            // classification is already gone when this pass classifies its
+            // dependents.
+            let explicit_retry_edge = self.consume_explicit_retry_edges().await;
+
             // Step 1: Check dynamic queue for newly added changes (TUI mode)
             let dynamic_queue_added = self
                 .check_dynamic_queue_and_add_changes(
@@ -385,7 +440,11 @@ impl ParallelExecutor {
             let reconciliation = self
                 .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
                 .await;
-            if reconciliation.has_queued_additions() {
+            if reconciliation.has_queued_additions() || explicit_retry_edge {
+                // A consumed explicit-retry edge arms exactly one reevaluation:
+                // it is a real operator state transition, so this pass bypasses
+                // debounce and unchanged-input suppression once, and the branch
+                // below returns the loop to the ordinary policy afterwards.
                 reanalysis_reason = ReanalysisReason::QueueNotification;
             } else if reconciliation.has_repair_additions() {
                 reanalysis_reason = ReanalysisReason::RepairCandidate;
@@ -453,6 +512,7 @@ impl ParallelExecutor {
                 ) {
                     SchedulerOutcome::DrainedSuccessfully
                 } else {
+                    blocked_exit = true;
                     SchedulerOutcome::BlockedOrStalled
                 };
                 break;
@@ -487,10 +547,21 @@ impl ParallelExecutor {
         // Cleanup is only performed explicitly after successful merge via cleanup_workspace()
         drop(cleanup_guard);
 
-        // Send appropriate completion event based on how we exited
+        // Send appropriate completion event based on how we exited.
+        //
+        // Operator cancellation is checked first on purpose: a fatal result can
+        // arrive during the cancellation drain, and a cancelled run still owes
+        // its one terminal `Stopped` rather than an execution failure.
         if cancelled {
             send_event(&self.event_tx, ParallelEvent::Stopped).await;
-            return Ok(());
+            return Ok(SchedulerRunReport::Stopped);
+        }
+
+        // A run-fatal abort terminates the scheduler future as failure. It has
+        // already emitted its one global Error and drained the work it owned, so
+        // it never reaches completion or upstream finalization.
+        if let Some(detail) = self.run_fatal_abort.clone() {
+            return Err(crate::error::OrchestratorError::GitCommand(detail));
         }
 
         // Every change that reached cumulative base owes change-scoped remote
@@ -512,7 +583,7 @@ impl ParallelExecutor {
                     },
                 )
                 .await;
-                return Ok(());
+                return Ok(self.terminal_report());
             }
         }
 
@@ -532,7 +603,7 @@ impl ParallelExecutor {
                 },
             )
             .await;
-            return Ok(());
+            return Ok(self.terminal_report());
         }
 
         // Finalization can itself integrate upstream and record a new marker, so
@@ -556,12 +627,70 @@ impl ParallelExecutor {
                     },
                 )
                 .await;
-                return Ok(());
+                return Ok(self.terminal_report());
             }
         }
 
+        if blocked_exit {
+            return Ok(self.finish_blocked_run(&queued).await);
+        }
+
+        Ok(self.finish_completed_run().await)
+    }
+
+    /// Emit the terminal output for a finite run that stopped with blocked work.
+    ///
+    /// No `AllCompleted`: nothing completed. The one operator-facing diagnostic
+    /// names the work that is still held, and the typed report tells the calling
+    /// boundary to withhold its success announcement.
+    async fn finish_blocked_run(&self, queued: &[crate::openspec::Change]) -> SchedulerRunReport {
+        let mut blocked: Vec<String> = queued.iter().map(|change| change.id.clone()).collect();
+        blocked.sort();
+        let message = format!(
+            "Processing stopped with blocked work remaining; no dispatchable candidate is available: {}",
+            blocked.join(", ")
+        );
+        warn!("{}", message);
+        send_event(&self.event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
+        SchedulerRunReport::BlockedOrStalled
+    }
+
+    /// Emit the terminal completion output for a run that drained on its own.
+    ///
+    /// Every completion path goes through here so a completed-with-errors run
+    /// cannot pick up a success announcement from one exit and a warning from
+    /// another.
+    async fn finish_completed_run(&self) -> SchedulerRunReport {
+        let report = self.terminal_report();
+        if report == SchedulerRunReport::CompletedWithErrors {
+            // Truthful terminal reporting: eligible work drained, but changes
+            // are still waiting for explicit retry. No success message and no
+            // global Error — a warning plus the existing terminal event.
+            let mut failed: Vec<String> = self.change_failures_this_run.iter().cloned().collect();
+            failed.sort();
+            let message = format!(
+                "Processing completed with errors; unresolved change-local failures preserved for explicit retry: {}",
+                failed.join(", ")
+            );
+            warn!("{}", message);
+            send_event(&self.event_tx, ParallelEvent::Log(LogEntry::warn(&message))).await;
+        }
+
         send_event(&self.event_tx, ParallelEvent::AllCompleted).await;
-        Ok(())
+        report
+    }
+
+    /// Terminal report for a scheduler run that returned on its own.
+    ///
+    /// Manual `MergeWait` left by a change-local failure does not block finite
+    /// termination, so the report — not the exit path — is what keeps the run
+    /// from being announced as plain success.
+    fn terminal_report(&self) -> SchedulerRunReport {
+        if self.had_change_failures() {
+            SchedulerRunReport::CompletedWithErrors
+        } else {
+            SchedulerRunReport::Completed
+        }
     }
 
     /// Channel used by the scheduler loop for background merge / base-lane results.
@@ -744,8 +873,11 @@ impl ParallelExecutor {
 
             // Background merge completion: merge+cleanup finished asynchronously
             Some(merge_result) = merge_result_rx.recv() => {
-                let merged = self.handle_merge_result_with_tx(merge_result, merge_result_tx).await;
-                if merged {
+                // Only an actual merge arms success-only follow-up. A
+                // change-local failure keeps the run alive without pretending
+                // capacity was recovered by a completed merge, and a fatal
+                // outcome is picked up by the loop's abort check.
+                if self.handle_merge_result_with_tx(merge_result, merge_result_tx).await.is_merged() {
                     self.trigger_resolve_wait_retry_dispatch();
                     *reanalysis_reason = ReanalysisReason::ResolveCompletion;
                 }
@@ -797,8 +929,11 @@ impl ParallelExecutor {
 
         tokio::select! {
             Some(merge_result) = merge_result_rx.recv() => {
-                let merged = self.handle_merge_result_with_tx(merge_result, merge_result_tx).await;
-                if merged {
+                // Only an actual merge arms success-only follow-up. A
+                // change-local failure keeps the run alive without pretending
+                // capacity was recovered by a completed merge, and a fatal
+                // outcome is picked up by the loop's abort check.
+                if self.handle_merge_result_with_tx(merge_result, merge_result_tx).await.is_merged() {
                     self.trigger_resolve_wait_retry_dispatch();
                     *reanalysis_reason = ReanalysisReason::ResolveCompletion;
                 }

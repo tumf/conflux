@@ -778,7 +778,9 @@ fn run_entrypoint_streams_ordered_lifecycle_to_a_configured_adapter() {
     let record = setup_lifecycle_project(dir.path());
     let workspace = fs::canonicalize(dir.path()).expect("canonical workspace");
 
-    let output = run_cflx(dir.path(), &["run", "--all"]);
+    // The workspace is deliberately outside Git, so the default repository
+    // socket has no identity to bind; this test is about the lifecycle stream.
+    let output = run_cflx(dir.path(), &["run", "--all", "--no-web-unix-socket"]);
     assert!(
         output.status.success(),
         "cflx run --all must succeed: {}",

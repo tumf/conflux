@@ -134,6 +134,7 @@ impl ParallelExecutor {
             archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
             acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
             acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            apply_budget: crate::execution::apply::ApplyBudget::new(),
             manual_resolve_count: None,
             auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -156,6 +157,9 @@ impl ParallelExecutor {
             upstream: None,
             // Default: explicit targets are resolved before construction.
             explicit_target_plan: None,
+            // Invocation-scoped terminal-report bookkeeping starts clean.
+            change_failures_this_run: HashSet::new(),
+            run_fatal_abort: None,
             // Default: the scheduler loop owns its merge-result channel.
             #[cfg(test)]
             merge_result_channel_override: None,

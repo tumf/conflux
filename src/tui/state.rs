@@ -18,7 +18,7 @@ use crate::openspec::Change;
 use crate::parallel::dedup::{DiagnosticDeduplicationKey, DiagnosticDeduplicationStore};
 use crate::tui::config::TuiConfig;
 use crate::tui::events::{LogEntry, LogLevel, TuiCommand};
-use crate::tui::types::{AppMode, StopMode, ViewMode, WorktreeAction, WorktreeInfo};
+use crate::tui::types::{AppExecutionMode, ModalState, StopMode, ViewMode, WorktreeInfo};
 use ratatui::style::Color;
 use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
 mod log_logic;
+pub(crate) mod modal_logic;
 mod processing_logic;
 mod selection_logic;
 mod worktree_action_logic;
@@ -106,8 +107,16 @@ pub struct ChangeState {
 pub struct AppState {
     /// Current view mode (Changes or Worktrees)
     pub view_mode: ViewMode,
-    /// Current mode
-    pub mode: AppMode,
+    /// Current orchestration execution mode.
+    ///
+    /// This axis is never replaced by a popup: overlays live in [`AppState::modal`].
+    pub execution_mode: AppExecutionMode,
+    /// Active modal interaction layered over `execution_mode`, if any.
+    ///
+    /// Process-local presentation/input-ownership state. It is never persisted and
+    /// must not be used as scheduler dispatch, resume routing, acceptance, archive,
+    /// merge, or next-action input.
+    pub modal: Option<ModalState>,
     /// List of changes with their states
     pub changes: Vec<ChangeState>,
     /// Current cursor position in the list
@@ -120,10 +129,6 @@ pub struct AppState {
     pub worktree_cursor_index: usize,
     /// Worktree list widget state
     pub worktree_list_state: ListState,
-    /// Pending worktree action confirmation (path, action)
-    pub pending_worktree_action: Option<(String, WorktreeAction)>,
-    /// Branch name associated with pending worktree action (for deletion)
-    pub pending_worktree_branch: Option<String>,
     /// ID of the currently processing change
     pub current_change: Option<String>,
     /// ID of the change that caused the error (for display in Error mode)
@@ -164,8 +169,6 @@ pub struct AppState {
     pub orchestration_started_at: Option<Instant>,
     /// Total elapsed time when orchestration finished
     pub orchestration_elapsed: Option<Duration>,
-    /// Mode to return to after closing modal popups
-    pub previous_mode: Option<AppMode>,
     /// Web UI URL (set when web server is enabled)
     pub web_url: Option<String>,
     /// Map of change_id to worktree path for active worktrees (for progress fallback)
@@ -376,15 +379,14 @@ impl AppState {
 
         Self {
             view_mode: ViewMode::Changes,
-            mode: AppMode::Select,
+            execution_mode: AppExecutionMode::Select,
+            modal: None,
             changes: change_states,
             cursor_index: 0,
             list_state,
             worktrees: Vec::new(),
             worktree_cursor_index: 0,
             worktree_list_state: ListState::default(),
-            pending_worktree_action: None,
-            pending_worktree_branch: None,
             current_change: None,
             error_change_id: None,
             logs: Vec::new(),
@@ -405,7 +407,6 @@ impl AppState {
             max_concurrent: 4, // Default value, can be overridden from config
             orchestration_started_at: None,
             orchestration_elapsed: None,
-            previous_mode: None,
             web_url: None,
             worktree_paths: HashMap::new(),
             deleting_worktree_paths: HashSet::new(),
@@ -644,21 +645,67 @@ impl AppState {
         self.shared_orchestrator_state = Some(shared_state);
     }
 
-    /// Show QR popup (only when web_url is set)
+    /// Show QR popup (only when web_url is set).
+    ///
+    /// The popup is layered over the current execution mode; it never captures or
+    /// replaces it, so a background transition arriving while the popup is open is
+    /// exactly what the operator sees once it closes.
     pub fn show_qr_popup(&mut self) {
         if self.web_url.is_some() {
-            self.previous_mode = Some(self.mode.clone());
-            self.mode = AppMode::QrPopup;
+            self.modal = Some(ModalState::QrPopup);
         }
     }
 
-    /// Hide QR popup and return to previous mode
+    /// Hide the QR popup, exposing the latest execution mode.
     pub fn hide_qr_popup(&mut self) {
-        if let Some(mode) = self.previous_mode.take() {
-            self.mode = mode;
-        } else {
-            self.mode = AppMode::Select;
+        if matches!(self.modal, Some(ModalState::QrPopup)) {
+            self.modal = None;
         }
+    }
+
+    /// True when any overlay — warning popup or modal — owns input.
+    ///
+    /// The warning popup is an independent diagnostic overlay with its own
+    /// scrolling contract; both must suppress ordinary view commands.
+    pub fn has_overlay(&self) -> bool {
+        self.warning_popup.is_some() || self.modal.is_some()
+    }
+
+    /// Fresh observation the active modal's validity is judged against.
+    fn modal_validity_context(&self) -> modal_logic::ModalValidityContext<'_> {
+        modal_logic::ModalValidityContext {
+            execution_mode: self.execution_mode,
+            web_url: self.web_url.as_deref(),
+            worktrees: &self.worktrees,
+            changes: &self.changes,
+            deleting_worktree_paths: &self.deleting_worktree_paths,
+        }
+    }
+
+    /// Re-evaluate the active modal against current state.
+    ///
+    /// Clearing the modal clears its identity payload with it, because the payload
+    /// lives inside the variant. Execution state is never touched here: an overlay
+    /// losing its target must not rewrite the lifecycle underneath it.
+    ///
+    /// Returns the reason when a modal was invalidated.
+    pub(crate) fn revalidate_modal(&mut self) -> Option<modal_logic::ModalInvalidation> {
+        let modal = self.modal.as_ref()?;
+        let invalidation = modal_logic::evaluate(modal, &self.modal_validity_context()).err()?;
+        self.modal = None;
+        Some(invalidation)
+    }
+
+    /// Clear the active modal and report the invalidation reason to the operator.
+    fn invalidate_modal_with_report(
+        &mut self,
+        invalidation: modal_logic::ModalInvalidation,
+        action: &str,
+    ) {
+        self.modal = None;
+        let message = format!("{} canceled: {}", action, invalidation.reason());
+        self.warning_message = Some(message.clone());
+        self.add_log(LogEntry::warn(message));
     }
 
     /// Move cursor up
@@ -800,14 +847,10 @@ impl AppState {
             &self.changes,
         ) {
             Ok((path, branch)) => {
-                worktree_action_logic::apply_delete_confirmation_state(
-                    path,
-                    branch,
-                    &mut self.mode,
-                    &mut self.pending_worktree_action,
-                    &mut self.pending_worktree_branch,
-                    &mut self.previous_mode,
-                );
+                // Opening a confirmation is advisory. The identity that will be
+                // revalidated at confirmation time is captured here, inside the
+                // modal variant, so it cannot drift away from the modal itself.
+                self.modal = Some(ModalState::ConfirmWorktreeDelete { path, branch });
                 None
             }
             Err(msg) => {
@@ -823,53 +866,114 @@ impl AppState {
     }
 
     /// Confirm and execute pending worktree deletion with explicit teardown behavior.
+    ///
+    /// The confirmation is re-checked against a fresh worktree observation before
+    /// anything is mutated: a stale identity refuses the command and leaves the
+    /// worktree untouched rather than deleting whatever now occupies the path.
     pub fn confirm_worktree_action_delete_with_options(
         &mut self,
         skip_teardown: bool,
     ) -> Option<TuiCommand> {
-        if let Some((path, WorktreeAction::Delete)) = self.pending_worktree_action.take() {
-            // Get the branch name that was stored when the delete was requested
-            let branch_name = self.pending_worktree_branch.take();
-            let path_buf = PathBuf::from(&path);
-            self.mark_worktree_deleting(path_buf.clone());
-            let teardown_note = if skip_teardown {
-                " with skip-teardown"
-            } else {
-                ""
-            };
-            self.add_log(LogEntry::info(format!(
-                "Deleting worktree{}: {}",
-                teardown_note,
-                path_buf.display()
-            )));
+        let Some(ModalState::ConfirmWorktreeDelete { path, branch }) = self.modal.clone() else {
+            return None;
+        };
 
-            // Restore previous mode
-            if let Some(mode) = self.previous_mode.take() {
-                self.mode = mode;
-            } else {
-                self.mode = AppMode::Select;
-            }
+        if let Err(invalidation) =
+            modal_logic::evaluate_worktree_delete(&path, &branch, &self.modal_validity_context())
+        {
+            self.invalidate_modal_with_report(invalidation, "Worktree delete");
+            return None;
+        }
 
-            Some(TuiCommand::DeleteWorktreeByPath(
-                path_buf,
-                branch_name,
-                skip_teardown,
-            ))
+        self.modal = None;
+        self.mark_worktree_deleting(path.clone());
+        let teardown_note = if skip_teardown {
+            " with skip-teardown"
         } else {
-            None
+            ""
+        };
+        self.add_log(LogEntry::info(format!(
+            "Deleting worktree{}: {}",
+            teardown_note,
+            path.display()
+        )));
+
+        Some(TuiCommand::DeleteWorktreeByPath(
+            path,
+            branch,
+            skip_teardown,
+        ))
+    }
+
+    /// Cancel pending worktree action.
+    ///
+    /// Only the overlay is dismissed; the execution mode underneath is whatever the
+    /// latest lifecycle event left it as.
+    pub fn cancel_worktree_action(&mut self) {
+        if matches!(self.modal, Some(ModalState::ConfirmWorktreeDelete { .. })) {
+            self.modal = None;
         }
     }
 
-    /// Cancel pending worktree action
-    pub fn cancel_worktree_action(&mut self) {
-        self.pending_worktree_action = None;
-        self.pending_worktree_branch = None;
+    /// Open the force-kill confirmation for the change under the cursor.
+    ///
+    /// Returns true when the confirmation was opened. Opening is advisory: the
+    /// shared operator command service still revalidates before terminating.
+    pub fn request_force_kill_confirmation(&mut self) -> bool {
+        if self.view_mode != ViewMode::Changes
+            || !matches!(self.execution_mode, AppExecutionMode::Running)
+            || self.cursor_index >= self.changes.len()
+        {
+            return false;
+        }
 
-        // Restore previous mode
-        if let Some(mode) = self.previous_mode.take() {
-            self.mode = mode;
-        } else {
-            self.mode = AppMode::Select;
+        let change = &self.changes[self.cursor_index];
+        if !crate::orchestration::operator_command::is_active_status(&change.display_status_cache) {
+            return false;
+        }
+
+        let change_id = change.id.clone();
+        self.modal = Some(ModalState::ConfirmForceKill {
+            change_id: change_id.clone(),
+        });
+        self.add_log(LogEntry::warn(format!(
+            "Confirm force-kill for '{}': press Y to confirm, N/Esc to cancel",
+            change_id
+        )));
+        true
+    }
+
+    /// Confirm the pending force-kill, dispatching through the shared service.
+    ///
+    /// The TUI display cache can only refuse; it never authorizes. A surviving but
+    /// stale target is refused here, and everything that survives this check is
+    /// still revalidated by `OperatorCommandService::stop_and_dequeue`, which owns
+    /// cancellation, termination evidence, and the timeout path.
+    pub fn confirm_force_kill(&mut self) -> Option<TuiCommand> {
+        let Some(ModalState::ConfirmForceKill { change_id }) = self.modal.clone() else {
+            return None;
+        };
+
+        if let Err(invalidation) =
+            modal_logic::evaluate_force_kill(&change_id, &self.modal_validity_context())
+        {
+            self.invalidate_modal_with_report(invalidation, "Force-kill");
+            return None;
+        }
+
+        self.modal = None;
+        self.add_log(LogEntry::info(format!(
+            "Force-kill confirmed: {}",
+            change_id
+        )));
+        Some(TuiCommand::DequeueChange(change_id))
+    }
+
+    /// Cancel the pending force-kill without touching execution state.
+    pub fn cancel_force_kill(&mut self) {
+        if matches!(self.modal, Some(ModalState::ConfirmForceKill { .. })) {
+            self.modal = None;
+            self.add_log(LogEntry::info("Force-kill canceled".to_string()));
         }
     }
 
@@ -892,12 +996,18 @@ impl AppState {
     }
 
     fn can_bulk_toggle_change(&self, change: &ChangeState) -> bool {
-        selection_logic::can_bulk_toggle_change(self.mode.clone(), self.parallel_mode, change)
+        selection_logic::can_bulk_toggle_change(self.execution_mode, self.parallel_mode, change)
     }
 
     /// Returns true when at least one change can be targeted by bulk toggle.
+    ///
+    /// Mirrors the admission `toggle_all_marks` enforces — Changes view, no
+    /// overlay owning input, and a mode the shared lifecycle matrix admits — so
+    /// the `x` hint is never offered for a key that would be refused.
     pub fn has_bulk_toggle_targets(&self) -> bool {
-        selection_logic::is_bulk_toggle_mode(&self.mode)
+        self.view_mode == ViewMode::Changes
+            && !self.has_overlay()
+            && selection_logic::is_bulk_toggle_mode(&self.execution_mode)
             && self
                 .changes
                 .iter()
@@ -937,8 +1047,8 @@ impl AppState {
 
         // Must be in correct mode
         if !matches!(
-            self.mode,
-            AppMode::Select | AppMode::Stopped | AppMode::Running
+            self.execution_mode,
+            AppExecutionMode::Select | AppExecutionMode::Stopped | AppExecutionMode::Running
         ) {
             return None;
         }
@@ -1007,7 +1117,12 @@ impl AppState {
                 && !uncommitted_file_change_ids.contains(&change.id);
         }
 
-        if self.parallel_mode && matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+        if self.parallel_mode
+            && matches!(
+                self.execution_mode,
+                AppExecutionMode::Select | AppExecutionMode::Stopped
+            )
+        {
             self.clear_parallel_ineligible_intent();
         }
 
@@ -1113,7 +1228,10 @@ impl AppState {
     /// The two local refusals below exist only so `=` is never silent; the
     /// service re-validates both.
     pub fn toggle_parallel_mode(&mut self) -> Option<TuiCommand> {
-        if !matches!(self.mode, AppMode::Select | AppMode::Stopped) {
+        if !matches!(
+            self.execution_mode,
+            AppExecutionMode::Select | AppExecutionMode::Stopped
+        ) {
             self.warning_message = Some("Cannot toggle parallel mode while processing".to_string());
             return None;
         }
@@ -1144,26 +1262,11 @@ impl AppState {
 
     /// Project this frontend's lifecycle mode onto the shared operator vocabulary.
     ///
-    /// Modal popups are presentation state, so the mode underneath them is what
-    /// the shared lifecycle matrix must see; a popup must never silently widen or
-    /// narrow what an operator is allowed to do.
+    /// Modal popups live on a separate axis, so there is nothing to see through
+    /// here: the execution mode is already the only thing the shared lifecycle
+    /// matrix must see, and a popup can neither widen nor narrow it.
     pub fn operator_mode(&self) -> crate::orchestration::operator_command::OperatorMode {
-        use crate::orchestration::operator_command::OperatorMode;
-        let effective = match &self.mode {
-            AppMode::ConfirmWorktreeDelete
-            | AppMode::QrPopup
-            | AppMode::ConfirmForceKill { .. } => {
-                self.previous_mode.clone().unwrap_or(AppMode::Select)
-            }
-            other => other.clone(),
-        };
-        match effective {
-            AppMode::Running => OperatorMode::Running,
-            AppMode::Stopping => OperatorMode::Stopping,
-            AppMode::Stopped => OperatorMode::Stopped,
-            AppMode::Error => OperatorMode::Error,
-            _ => OperatorMode::Select,
-        }
+        self.execution_mode.operator_mode()
     }
 
     /// Project an accepted run dispatch onto TUI presentation state.
@@ -1179,7 +1282,7 @@ impl AppState {
             }
         }
         self.reset_for_run();
-        self.mode = AppMode::Running;
+        self.execution_mode = AppExecutionMode::Running;
         self.publish_execution_marks();
     }
 }
@@ -1924,7 +2027,7 @@ mod tests {
         assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
         assert!(matches!(
             command,
-            Some(TuiCommand::DeleteWorktreeByPath(path, Some(branch), false))
+            Some(TuiCommand::DeleteWorktreeByPath(path, branch, false))
                 if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
         ));
         assert!(app
@@ -1944,7 +2047,7 @@ mod tests {
         assert!(app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")));
         assert!(matches!(
             command,
-            Some(TuiCommand::DeleteWorktreeByPath(path, Some(branch), true))
+            Some(TuiCommand::DeleteWorktreeByPath(path, branch, true))
                 if path.as_path() == PathBuf::from("/tmp/worktree-a").as_path() && branch == "feature-a"
         ));
         assert!(app.logs.iter().any(|entry| {
@@ -1952,6 +2055,79 @@ mod tests {
                 .message
                 .contains("Deleting worktree with skip-teardown: /tmp/worktree-a")
         }));
+    }
+
+    #[test]
+    fn a_worktree_without_a_branch_identity_can_never_produce_a_delete_command() {
+        // Both ways an observation loses its identity, driven through the whole
+        // request → confirm path: no modal opens, so no confirmation exists to
+        // dispatch, and the delete marker is never taken either.
+        let mut detached = create_test_worktree("/tmp/worktree-a", "feature-a", false);
+        detached.is_detached = true;
+        let nameless = create_test_worktree("/tmp/worktree-a", "", false);
+
+        for (name, worktree) in [("detached", detached), ("empty-branch", nameless)] {
+            let mut app = AppState::new(vec![]);
+            app.view_mode = ViewMode::Worktrees;
+            app.worktrees = vec![worktree];
+
+            assert!(app.request_worktree_delete_from_list().is_none());
+
+            assert!(
+                app.modal.is_none(),
+                "{name}: no confirmation may open without a revalidatable identity"
+            );
+            assert!(
+                app.warning_message
+                    .as_deref()
+                    .is_some_and(|msg| msg.contains("no branch to confirm against")),
+                "{name}: the operator must be told why: {:?}",
+                app.warning_message
+            );
+            assert!(
+                app.confirm_worktree_action_delete().is_none(),
+                "{name}: confirming without a modal must not emit a delete command"
+            );
+            assert!(
+                app.confirm_worktree_action_delete_with_options(true)
+                    .is_none(),
+                "{name}: skip-teardown confirm must not emit a delete command either"
+            );
+            assert!(
+                !app.is_worktree_deleting(&PathBuf::from("/tmp/worktree-a")),
+                "{name}: a refused request must not mark the worktree deleting"
+            );
+        }
+    }
+
+    #[test]
+    fn a_branch_bearing_worktree_beside_a_detached_one_stays_deletable() {
+        // The identity guard refuses the target it cannot revalidate without
+        // narrowing deletion for ordinary branch-bearing worktrees.
+        let mut detached = create_test_worktree("/tmp/worktree-detached", "feature-a", false);
+        detached.is_detached = true;
+        let mut app = AppState::new(vec![]);
+        app.view_mode = ViewMode::Worktrees;
+        app.worktrees = vec![
+            detached,
+            create_test_worktree("/tmp/worktree-b", "feature-b", false),
+        ];
+        app.worktree_cursor_index = 1;
+
+        app.request_worktree_delete_from_list();
+
+        assert_eq!(
+            app.modal,
+            Some(ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/worktree-b"),
+                branch: "feature-b".to_string(),
+            })
+        );
+        assert!(matches!(
+            app.confirm_worktree_action_delete(),
+            Some(TuiCommand::DeleteWorktreeByPath(path, branch, false))
+                if path == std::path::Path::new("/tmp/worktree-b") && branch == "feature-b"
+        ));
     }
 
     #[test]
@@ -1963,7 +2139,7 @@ mod tests {
 
         app.request_worktree_delete_from_list();
 
-        assert!(app.pending_worktree_action.is_none());
+        assert!(app.modal.is_none());
         assert_eq!(
             app.warning_message.as_deref(),
             Some("Worktree is already being deleted")
@@ -2049,7 +2225,7 @@ mod tests {
 
         let app = AppState::new(changes);
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         assert_eq!(app.changes.len(), 2);
         assert_eq!(app.cursor_index, 0);
         assert!(!app.changes[0].selected);
@@ -2066,7 +2242,7 @@ mod tests {
 
         let app = AppState::new(changes);
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         assert_eq!(app.changes.len(), 2);
         assert!(!app.changes[0].selected);
         assert!(!app.changes[1].selected);
@@ -2128,7 +2304,7 @@ mod tests {
         ];
 
         let mut app = AppState::new(changes);
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
 
         // All start unselected
         assert!(!app.changes[0].selected);
@@ -2154,7 +2330,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
 
         // First toggle: should mark all
         app.toggle_all_marks();
@@ -2176,7 +2352,7 @@ mod tests {
         ];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.parallel_mode = true;
         app.parallel_available = true;
 
@@ -2232,7 +2408,7 @@ mod tests {
         ];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "not queued".to_string();
@@ -2268,7 +2444,7 @@ mod tests {
         ];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[1].display_status_cache = "not queued".to_string();
         app.changes[2].display_status_cache = "not queued".to_string();
@@ -2294,7 +2470,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true;
         app.changes[1].display_status_cache = "queued".to_string();
@@ -2323,7 +2499,7 @@ mod tests {
         ];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "not queued".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
         app.changes[2].display_status_cache = "resolve pending".to_string();
@@ -2354,7 +2530,7 @@ mod tests {
         ];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string();
         app.changes[1].display_status_cache = "not queued".to_string();
 
@@ -2382,7 +2558,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[0].selected = true; // already marked
         app.changes[1].display_status_cache = "not queued".to_string();
@@ -2405,7 +2581,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
 
         let commands = app.toggle_all_marks();
 
@@ -2423,7 +2599,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
 
         let commands = app.toggle_all_marks();
 
@@ -2440,7 +2616,7 @@ mod tests {
 
     /// Applies one bulk toggle case and returns the resulting `selected` flags.
     fn run_bulk_toggle_case(
-        mode: AppMode,
+        mode: AppExecutionMode,
         parallel_mode: bool,
         rows: &[BulkToggleRow],
     ) -> (AppState, Vec<TuiCommand>) {
@@ -2449,7 +2625,7 @@ mod tests {
             .map(|(id, _, _, _)| create_test_change(id, 0, 1))
             .collect();
         let mut app = AppState::new(changes);
-        app.mode = mode;
+        app.execution_mode = mode;
         app.parallel_mode = parallel_mode;
         app.parallel_available = parallel_mode;
         for (index, (_, status, parallel_eligible, selected)) in rows.iter().enumerate() {
@@ -2465,7 +2641,7 @@ mod tests {
     /// One table-driven bulk toggle regression case.
     struct BulkToggleCase {
         name: &'static str,
-        mode: AppMode,
+        mode: AppExecutionMode,
         parallel_mode: bool,
         rows: Vec<BulkToggleRow>,
         /// Expected `selected` flag for each row after the toggle.
@@ -2477,7 +2653,7 @@ mod tests {
         let cases = vec![
             BulkToggleCase {
                 name: "select mode marks every eligible row alongside a rejected row",
-                mode: AppMode::Select,
+                mode: AppExecutionMode::Select,
                 parallel_mode: false,
                 rows: vec![
                     ("eligible-marked", "not queued", true, true),
@@ -2488,7 +2664,7 @@ mod tests {
             },
             BulkToggleCase {
                 name: "select mode unmarks every eligible row when all are marked",
-                mode: AppMode::Select,
+                mode: AppExecutionMode::Select,
                 parallel_mode: false,
                 rows: vec![
                     ("eligible-a", "not queued", true, true),
@@ -2499,7 +2675,7 @@ mod tests {
             },
             BulkToggleCase {
                 name: "stopped mode marks every eligible row alongside a rejected row",
-                mode: AppMode::Stopped,
+                mode: AppExecutionMode::Stopped,
                 parallel_mode: false,
                 rows: vec![
                     ("eligible-marked", "merge wait", true, true),
@@ -2510,7 +2686,7 @@ mod tests {
             },
             BulkToggleCase {
                 name: "running mode marks every eligible row and skips active rows",
-                mode: AppMode::Running,
+                mode: AppExecutionMode::Running,
                 parallel_mode: false,
                 rows: vec![
                     ("active", "applying", true, false),
@@ -2522,7 +2698,7 @@ mod tests {
             },
             BulkToggleCase {
                 name: "parallel mode marks every committed row and skips uncommitted rows",
-                mode: AppMode::Select,
+                mode: AppExecutionMode::Select,
                 parallel_mode: true,
                 rows: vec![
                     ("committed-marked", "not queued", true, true),
@@ -2551,7 +2727,7 @@ mod tests {
     #[test]
     fn test_toggle_all_marks_reports_changed_and_excluded_counts_with_reasons() {
         let (app, commands) = run_bulk_toggle_case(
-            AppMode::Running,
+            AppExecutionMode::Running,
             false,
             &[
                 ("active", "applying", true, false),
@@ -2586,7 +2762,7 @@ mod tests {
     #[test]
     fn test_toggle_all_marks_without_exclusions_does_not_warn() {
         let (app, _) = run_bulk_toggle_case(
-            AppMode::Select,
+            AppExecutionMode::Select,
             false,
             &[
                 ("a", "not queued", true, false),
@@ -2604,7 +2780,7 @@ mod tests {
     #[test]
     fn test_toggle_all_marks_with_zero_eligible_targets_reports_reason() {
         let (app, commands) = run_bulk_toggle_case(
-            AppMode::Running,
+            AppExecutionMode::Running,
             false,
             &[
                 ("active", "applying", true, false),
@@ -2639,7 +2815,7 @@ mod tests {
     #[test]
     fn test_toggle_all_marks_with_no_changes_reports_reason() {
         let mut app = AppState::new(Vec::new());
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
 
         let commands = app.toggle_all_marks();
 
@@ -2651,22 +2827,115 @@ mod tests {
     }
 
     #[test]
-    fn test_toggle_all_marks_in_unsupported_mode_reports_reason() {
-        let (app, commands) =
-            run_bulk_toggle_case(AppMode::Error, false, &[("a", "error", true, false)]);
+    fn test_toggle_all_marks_in_error_mode_reports_retry_ownership() {
+        let (app, commands) = run_bulk_toggle_case(
+            AppExecutionMode::Error,
+            false,
+            &[("a", "error", true, false)],
+        );
 
         assert!(commands.is_empty());
         assert!(!app.changes[0].selected);
-        assert!(app
-            .warning_message
-            .as_ref()
-            .is_some_and(|msg| msg.contains("Select, Running, or Stopped mode")));
+        let message = app.warning_message.clone().expect("rejection is reported");
+        assert!(
+            message.contains("Error mode") && message.contains("retry"),
+            "Error rejection must name the execution mode and retry ownership: {message}"
+        );
+    }
+
+    #[test]
+    fn test_toggle_all_marks_in_stopping_mode_reports_immutability() {
+        let (app, commands) = run_bulk_toggle_case(
+            AppExecutionMode::Stopping,
+            false,
+            &[("a", "not queued", true, false)],
+        );
+
+        assert!(commands.is_empty());
+        assert!(!app.changes[0].selected);
+        let message = app.warning_message.clone().expect("rejection is reported");
+        assert!(
+            message.contains("Stopping mode") && message.contains("immutable"),
+            "Stopping rejection must name the execution mode and immutability: {message}"
+        );
+    }
+
+    /// The original incident: a fatal `ExecutionEvent::Error` put the TUI in
+    /// `Error`, and `x` reported a generic mode list that named modal variants as
+    /// execution states. Rejection text must now name only execution modes.
+    #[test]
+    fn bulk_mark_rejection_never_describes_a_modal_as_an_execution_mode() {
+        for mode in [AppExecutionMode::Stopping, AppExecutionMode::Error] {
+            let (app, commands) =
+                run_bulk_toggle_case(mode, false, &[("a", "not queued", true, false)]);
+
+            assert!(commands.is_empty());
+            let message = app.warning_message.clone().expect("rejection is reported");
+            for modal_word in ["QR", "Confirm", "popup", "ConfirmForceKill"] {
+                assert!(
+                    !message.contains(modal_word),
+                    "{mode:?} rejection must not mention modal presentation: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_mark_admission_is_derived_from_the_shared_lifecycle_matrix() {
+        use crate::orchestration::operator_command::{classify_mark_route, MarkRoute};
+
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Running,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let shared_admits = !matches!(
+                classify_mark_route(mode.operator_mode(), "not queued"),
+                MarkRoute::Immutable | MarkRoute::RetryRequired
+            );
+            let mut app = AppState::new(vec![create_test_change("a", 0, 1)]);
+            app.execution_mode = mode;
+
+            assert_eq!(
+                app.has_bulk_toggle_targets(),
+                shared_admits,
+                "{mode:?} must follow the shared operator lifecycle matrix"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_mark_requires_changes_view_without_an_overlay() {
+        let mut app = AppState::new(vec![create_test_change("a", 0, 1)]);
+        app.execution_mode = AppExecutionMode::Select;
+        assert!(app.has_bulk_toggle_targets());
+
+        app.view_mode = ViewMode::Worktrees;
+        assert!(!app.has_bulk_toggle_targets());
+
+        app.view_mode = ViewMode::Changes;
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app.show_qr_popup();
+        assert!(!app.has_bulk_toggle_targets());
+        assert!(
+            app.toggle_all_marks().is_empty(),
+            "an overlay owning input must not let `x` mutate marks"
+        );
+        assert!(!app.changes[0].selected);
+
+        app.modal = None;
+        app.show_warning_popup("warning", "diagnostic");
+        assert!(!app.has_bulk_toggle_targets());
+        assert!(app.toggle_all_marks().is_empty());
+        assert!(!app.changes[0].selected);
     }
 
     #[test]
     fn test_toggle_all_marks_running_partial_selection_emits_command_for_every_eligible_row() {
         let (app, commands) = run_bulk_toggle_case(
-            AppMode::Running,
+            AppExecutionMode::Running,
             false,
             &[
                 ("already-queued", "queued", true, true),
@@ -2702,7 +2971,7 @@ mod tests {
         let changes = vec![create_test_change("a", 0, 1), create_test_change("b", 0, 1)];
 
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string();
         app.changes[1].display_status_cache = "resolving".to_string();
         assert!(!app.has_bulk_toggle_targets());
@@ -2732,7 +3001,7 @@ mod tests {
     fn test_running_mode_error_change_toggle_sets_retry_mark() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
@@ -2755,7 +3024,7 @@ mod tests {
     fn test_running_mode_error_change_toggle_queue() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
@@ -2784,7 +3053,7 @@ mod tests {
     fn running_not_queued_toggle_survives_reducer_sync_and_changes_refreshed() {
         let changes = vec![create_test_change("dynamic-change", 0, 1)];
         let mut app = AppState::new(changes.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         let command = app.toggle_selection();
         assert!(matches!(command, Some(TuiCommand::AddToQueue(ref id)) if id == "dynamic-change"));
@@ -2816,7 +3085,7 @@ mod tests {
     fn reducer_sync_marks_queued_rows_selected_for_running_unqueue() {
         let changes = vec![create_test_change("queued-change", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         app.apply_display_statuses_from_reducer(&HashMap::from([(
             "queued-change".to_string(),
@@ -2838,7 +3107,7 @@ mod tests {
     fn active_status_survives_reducer_sync_and_changes_refreshed() {
         let changes = vec![create_test_change("active-change", 0, 1)];
         let mut app = AppState::new(changes.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].set_display_status_cache("queued");
         app.changes[0].selected = true;
 
@@ -2865,7 +3134,7 @@ mod tests {
     fn test_stopped_mode_error_change_toggle_sets_retry_mark() {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Stopped;
+        app.execution_mode = AppExecutionMode::Stopped;
         app.changes[0].set_error_message_cache("boom".to_string());
         app.changes[0].selected = false;
 
@@ -3065,7 +3334,7 @@ mod tests {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         let cmd = app.resolve_merge();
 
@@ -3089,18 +3358,22 @@ mod tests {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
         app.changes[0].display_status_cache = "queued".to_string();
         app.cursor_index = 0;
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         assert!(app.resolve_merge().is_none());
     }
 
     #[test]
     fn m_offers_the_same_command_in_every_mode_that_allows_it() {
-        for mode in [AppMode::Select, AppMode::Stopped, AppMode::Running] {
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Running,
+        ] {
             let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
             app.changes[0].display_status_cache = "merge wait".to_string();
             app.cursor_index = 0;
-            app.mode = mode.clone();
+            app.execution_mode = mode;
 
             assert!(
                 matches!(
@@ -3120,7 +3393,7 @@ mod tests {
         ]);
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         app.cursor_index = 0;
         let first = app.resolve_merge();
@@ -3167,7 +3440,7 @@ mod tests {
         // change-b is in MergeWait; user presses M to queue resolve
         app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 1;
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         // What the shared run-control service does when it accepts the resolve:
         // record the reducer intent, then let the adapter advance the row.
@@ -3242,7 +3515,7 @@ mod tests {
         // change-a is in MergeWait, no resolve in progress; user presses M
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.clear_resolving();
 
         // What the shared run-control service does when it accepts the resolve.
@@ -3294,7 +3567,7 @@ mod tests {
             create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.set_resolving("__active__");
         app.changes[0].display_status_cache = "resolving".to_string();
         app.changes[1].display_status_cache = "resolve pending".to_string();
@@ -3421,7 +3694,7 @@ mod tests {
         let changes = vec![create_test_change("change-a", 1, 1)];
         let mut app = AppState::new(changes);
         app.changes[0].display_status_cache = "rejected".to_string();
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
 
         let cmd = app.toggle_selection();
 
@@ -3445,7 +3718,7 @@ mod tests {
             create_test_change("change-b", 0, 1),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.changes[0].display_status_cache = "rejected".to_string();
         app.changes[1].display_status_cache = "not queued".to_string();
 
@@ -3574,7 +3847,7 @@ mod tests {
             create_test_change("c2", 0, 3),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         // Simulate c1 in NotQueued state.
         app.changes[0].display_status_cache = "not queued".to_string();
@@ -3616,7 +3889,7 @@ mod tests {
     fn test_running_mode_space_on_active_change_does_not_stop() {
         let changes = vec![create_test_change("c1", 0, 3)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string();
 
         let cmd = app.toggle_selection();
@@ -3631,7 +3904,7 @@ mod tests {
     fn test_running_mode_space_on_accepting_does_not_stop() {
         let changes = vec![create_test_change("c1", 0, 3)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "accepting".to_string();
 
         let cmd = app.toggle_selection();
@@ -3650,7 +3923,7 @@ mod tests {
     fn test_merge_wait_queue_operations() {
         let changes = vec![create_test_change("c1", 0, 3)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
 
         // Space on MergeWait toggles selection only (no queue change).
@@ -3672,7 +3945,7 @@ mod tests {
     fn test_resolve_wait_queue_operations() {
         let changes = vec![create_test_change("c1", 0, 3)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolve pending".to_string();
 
         // Space on ResolveWait toggles selection only (no queue change).
@@ -3977,7 +4250,7 @@ mod tests {
         }
         app.changes[0].display_status_cache = "queued".to_string();
         app.changes[1].display_status_cache = "queued".to_string();
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
 
         // Backend rejects only change-a.
         app.handle_orchestrator_event(OrchestratorEvent::ParallelStartRejected {
@@ -4015,14 +4288,14 @@ mod tests {
             create_test_change("change-b", 2, 4),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
 
         app.handle_all_completed();
 
         assert_eq!(
-            app.mode,
-            AppMode::Select,
+            app.execution_mode,
+            AppExecutionMode::Select,
             "Should transition to Select because scheduler manages ResolveWait"
         );
     }
@@ -4036,7 +4309,7 @@ mod tests {
             create_test_change("change-b", 2, 4),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merged".to_string(); // already done
         app.changes[1].display_status_cache = "resolving".to_string();
         app.set_resolving("__active__");
@@ -4045,8 +4318,8 @@ mod tests {
         app.handle_resolve_completed("change-b".to_string(), None);
 
         assert_eq!(
-            app.mode,
-            AppMode::Select,
+            app.execution_mode,
+            AppExecutionMode::Select,
             "Should transition to Select when no active changes remain after resolve"
         );
     }
@@ -4059,7 +4332,7 @@ mod tests {
             create_test_change("change-b", 2, 4),
         ];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "applying".to_string(); // still active
         app.changes[1].display_status_cache = "resolving".to_string();
         app.set_resolving("__active__");
@@ -4067,9 +4340,214 @@ mod tests {
         app.handle_resolve_completed("change-b".to_string(), None);
 
         assert_eq!(
-            app.mode,
-            AppMode::Running,
+            app.execution_mode,
+            AppExecutionMode::Running,
             "Should stay Running when other active changes remain"
         );
+    }
+
+    // ========================================================================
+    // Execution / modal state separation
+    // ========================================================================
+
+    const ALL_EXECUTION_MODES: [AppExecutionMode; 5] = [
+        AppExecutionMode::Select,
+        AppExecutionMode::Running,
+        AppExecutionMode::Stopping,
+        AppExecutionMode::Stopped,
+        AppExecutionMode::Error,
+    ];
+
+    fn modal_app() -> AppState {
+        let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+        app.web_url = Some("http://127.0.0.1:8080".to_string());
+        app.worktrees = vec![create_test_worktree("/tmp/wt-a", "change-a", false)];
+        app
+    }
+
+    #[test]
+    fn new_state_starts_in_select_execution_with_no_modal() {
+        let app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
+
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
+        assert_eq!(app.modal, None);
+        assert!(!app.has_overlay());
+    }
+
+    #[test]
+    fn qr_round_trip_preserves_the_execution_mode_it_opened_over() {
+        for mode in ALL_EXECUTION_MODES {
+            let mut app = modal_app();
+            app.execution_mode = mode;
+
+            app.show_qr_popup();
+            assert_eq!(app.modal, Some(ModalState::QrPopup));
+            assert_eq!(
+                app.execution_mode, mode,
+                "opening QR must not capture or replace the execution mode"
+            );
+
+            app.hide_qr_popup();
+            assert_eq!(app.modal, None);
+            assert_eq!(
+                app.execution_mode, mode,
+                "closing QR must not restore a captured execution mode"
+            );
+        }
+    }
+
+    #[test]
+    fn qr_survives_a_background_execution_transition_and_exposes_the_latest_mode() {
+        let mut app = modal_app();
+        app.execution_mode = AppExecutionMode::Running;
+        app.show_qr_popup();
+
+        for mode in [
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            app.execution_mode = mode;
+            assert_eq!(app.revalidate_modal(), None);
+            assert_eq!(app.modal, Some(ModalState::QrPopup));
+        }
+
+        app.hide_qr_popup();
+        assert_eq!(app.execution_mode, AppExecutionMode::Error);
+    }
+
+    #[test]
+    fn qr_is_not_opened_while_web_monitoring_is_disabled() {
+        let mut app = modal_app();
+        app.web_url = None;
+
+        app.show_qr_popup();
+
+        assert_eq!(app.modal, None);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
+    }
+
+    #[test]
+    fn worktree_confirmation_carries_the_identity_it_was_opened_with() {
+        let mut app = modal_app();
+        app.view_mode = ViewMode::Worktrees;
+
+        assert!(app.request_worktree_delete_from_list().is_none());
+
+        assert_eq!(
+            app.modal,
+            Some(ModalState::ConfirmWorktreeDelete {
+                path: PathBuf::from("/tmp/wt-a"),
+                branch: "change-a".to_string(),
+            })
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Select,
+            "opening a confirmation must not move the execution axis"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_confirmation_leaves_the_latest_execution_mode_in_place() {
+        let mut app = modal_app();
+        app.view_mode = ViewMode::Worktrees;
+        app.request_worktree_delete_from_list();
+
+        // A background transition lands while the confirmation is visible.
+        app.execution_mode = AppExecutionMode::Stopping;
+        app.cancel_worktree_action();
+
+        assert_eq!(app.modal, None);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
+    }
+
+    #[test]
+    fn a_stale_worktree_confirmation_is_refused_and_cleared_atomically() {
+        let mut app = modal_app();
+        app.view_mode = ViewMode::Worktrees;
+        app.request_worktree_delete_from_list();
+
+        // The path now carries a different branch identity.
+        app.worktrees[0].branch = "change-z".to_string();
+
+        assert!(app.confirm_worktree_action_delete().is_none());
+        assert_eq!(app.modal, None, "modal and payload are cleared together");
+        assert!(!app.is_worktree_deleting(&PathBuf::from("/tmp/wt-a")));
+        assert!(app
+            .warning_message
+            .as_ref()
+            .is_some_and(|msg| msg.contains("Worktree delete canceled")));
+    }
+
+    #[test]
+    fn force_kill_confirmation_opens_only_for_active_work_in_running_execution() {
+        // Not Running: no confirmation.
+        for mode in [
+            AppExecutionMode::Select,
+            AppExecutionMode::Stopping,
+            AppExecutionMode::Stopped,
+            AppExecutionMode::Error,
+        ] {
+            let mut app = modal_app();
+            app.execution_mode = mode;
+            app.changes[0].set_display_status_cache("applying");
+            assert!(!app.request_force_kill_confirmation(), "{mode:?}");
+            assert_eq!(app.modal, None);
+        }
+
+        // Running but the row is not active: no confirmation.
+        let mut idle = modal_app();
+        idle.execution_mode = AppExecutionMode::Running;
+        assert!(!idle.request_force_kill_confirmation());
+        assert_eq!(idle.modal, None);
+
+        // Running with active work: confirmation carries the target identity.
+        let mut active = modal_app();
+        active.execution_mode = AppExecutionMode::Running;
+        active.changes[0].set_display_status_cache("applying");
+        assert!(active.request_force_kill_confirmation());
+        assert_eq!(
+            active.modal,
+            Some(ModalState::ConfirmForceKill {
+                change_id: "change-a".to_string()
+            })
+        );
+        assert_eq!(active.execution_mode, AppExecutionMode::Running);
+    }
+
+    #[test]
+    fn force_kill_survives_running_to_stopping_and_cancel_preserves_stopping() {
+        let mut app = modal_app();
+        app.execution_mode = AppExecutionMode::Running;
+        app.changes[0].set_display_status_cache("applying");
+        app.request_force_kill_confirmation();
+
+        app.execution_mode = AppExecutionMode::Stopping;
+        assert_eq!(app.revalidate_modal(), None);
+        assert!(app.modal.is_some());
+
+        app.cancel_force_kill();
+        assert_eq!(app.modal, None);
+        assert_eq!(app.execution_mode, AppExecutionMode::Stopping);
+    }
+
+    #[test]
+    fn revalidation_never_mutates_execution_state() {
+        for mode in ALL_EXECUTION_MODES {
+            let mut app = modal_app();
+            app.execution_mode = mode;
+            app.modal = Some(ModalState::ConfirmForceKill {
+                change_id: "gone".to_string(),
+            });
+
+            app.revalidate_modal();
+
+            assert_eq!(app.modal, None);
+            assert_eq!(
+                app.execution_mode, mode,
+                "clearing an invalid modal must leave execution untouched"
+            );
+        }
     }
 }

@@ -23,7 +23,7 @@ use super::*;
 
 use crate::events::ExecutionEvent;
 use crate::orchestration::run_control::testing::SchedulerCall;
-use crate::tui::types::AppMode;
+use crate::tui::types::AppExecutionMode;
 use crate::web::remote_control_api::dto::{CommandSpec, ErrorCode};
 use crate::web::remote_control_api::executor::{RemoteControlExecutor, SharedServiceExecutor};
 use crate::web::state::WebState;
@@ -194,18 +194,14 @@ async fn merge_wait(harness: &AdapterHarness) {
         });
 }
 
-/// The `app_mode` string the v2 projection publishes for a TUI mode.
+/// The `app_mode` string the v2 projection publishes for a TUI execution mode.
 ///
 /// Both adapters must be given the *same* operator mode or the comparison would
-/// be meaningless, and this is the only place the two vocabularies meet.
-fn app_mode_string(mode: &AppMode) -> &'static str {
-    match mode {
-        AppMode::Running => "running",
-        AppMode::Stopping => "stopping",
-        AppMode::Stopped => "stopped",
-        AppMode::Error => "error",
-        _ => "select",
-    }
+/// be meaningless, and this is the only place the two vocabularies meet. The
+/// token comes from the shared execution vocabulary rather than a table local to
+/// this test, so canonical `app_mode` stays execution-only for both sides.
+fn app_mode_string(mode: &AppExecutionMode) -> &'static str {
+    mode.app_mode_token()
 }
 
 // ============================================================================
@@ -218,7 +214,7 @@ fn app_mode_string(mode: &AppMode) -> &'static str {
 /// its counterpart to the v2 summary detail.
 async fn through_tui(
     setup: Setup,
-    mode: AppMode,
+    mode: AppExecutionMode,
     command: TuiCommand,
 ) -> (Effects, Option<String>) {
     let harness = AdapterHarness::new(&CHANGES);
@@ -228,7 +224,7 @@ async fn through_tui(
     let ineligible = harness.parallel.ineligible_ids();
 
     let mut app = harness.app(&CHANGES);
-    app.mode = mode;
+    app.execution_mode = mode;
     for change in &mut app.changes {
         change.is_parallel_eligible = !ineligible.contains(&change.id);
     }
@@ -247,7 +243,7 @@ async fn through_tui(
 /// consequence the command did not ask for.
 async fn through_v2(
     setup: Setup,
-    mode: AppMode,
+    mode: AppExecutionMode,
     command: CommandSpec,
 ) -> (Effects, Settlement, Option<String>) {
     let harness = AdapterHarness::new(&CHANGES);
@@ -293,7 +289,7 @@ struct Row {
     /// What the row demonstrates; used as the assertion label.
     name: &'static str,
     setup: Setup,
-    mode: AppMode,
+    mode: AppExecutionMode,
     tui: TuiCommand,
     v2: CommandSpec,
     expect: Settlement,
@@ -309,7 +305,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start with an idle scheduler spawns one run over the marked set",
             setup: Setup::Marked,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -318,7 +314,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start with a live scheduler wakes it instead of spawning a second run",
             setup: Setup::MarkedWithLiveScheduler,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -327,7 +323,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start from a stopped run resumes the marked set",
             setup: Setup::Marked,
-            mode: AppMode::Stopped,
+            mode: AppExecutionMode::Stopped,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -336,7 +332,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start is refused while a run owns the lifecycle",
             setup: Setup::MarkedWithLiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -345,7 +341,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "start with an empty target set is not a success",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::TargetIneligible),
@@ -354,7 +350,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "a runtime launch failure is reported, not claimed as started",
             setup: Setup::MarkedWithFailingLaunch,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::InternalError),
@@ -366,7 +362,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "retry routes a marked error row and dispatches the scheduler",
             setup: Setup::MarkedError,
-            mode: AppMode::Error,
+            mode: AppExecutionMode::Error,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
@@ -375,7 +371,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "retry without retryable evidence changes nothing",
             setup: Setup::Marked,
-            mode: AppMode::Error,
+            mode: AppExecutionMode::Error,
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::NoOp,
@@ -385,7 +381,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "graceful stop while running sets the stop request",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::Stop,
             v2: CommandSpec::Stop,
             expect: Settlement::Changed,
@@ -394,7 +390,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "graceful stop outside running is refused",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::Stop,
             v2: CommandSpec::Stop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -403,7 +399,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "cancel stop while stopping withdraws the request",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Stopping,
+            mode: AppExecutionMode::Stopping,
             tui: TuiCommand::CancelStop,
             v2: CommandSpec::CancelStop,
             expect: Settlement::Changed,
@@ -412,7 +408,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "cancel stop outside stopping is refused",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::CancelStop,
             v2: CommandSpec::CancelStop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -421,7 +417,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "force stop while running cancels the live run",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::ForceStop,
             v2: CommandSpec::ForceStop,
             expect: Settlement::Changed,
@@ -430,7 +426,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "force stop outside running and stopping is refused",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ForceStop,
             v2: CommandSpec::ForceStop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -440,7 +436,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "resolve of a merge-wait change takes the single resolver slot",
             setup: Setup::MergeWait,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ResolveMerge("c1".to_string()),
             v2: CommandSpec::ResolveMerge {
                 change_id: "c1".to_string(),
@@ -451,7 +447,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "a duplicate resolve submission does not reserve twice",
             setup: Setup::MergeWaitAlreadyReserved,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ResolveMerge("c1".to_string()),
             v2: CommandSpec::ResolveMerge {
                 change_id: "c1".to_string(),
@@ -462,7 +458,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "resolve of a stale target is refused without a reservation",
             setup: Setup::Bare,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::ResolveMerge("c1".to_string()),
             v2: CommandSpec::ResolveMerge {
                 change_id: "c1".to_string(),
@@ -474,7 +470,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "enabling parallel mode clears the mark and queue intent of an ineligible change",
             setup: Setup::MarkedWithIneligible,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::Changed,
@@ -483,7 +479,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "enabling parallel mode from a stopped run is accepted",
             setup: Setup::Marked,
-            mode: AppMode::Stopped,
+            mode: AppExecutionMode::Stopped,
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::Changed,
@@ -492,7 +488,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "the parallel toggle is refused while a run owns the lifecycle",
             setup: Setup::LiveScheduler,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
@@ -501,7 +497,7 @@ fn rows() -> Vec<Row> {
         Row {
             name: "an idempotent parallel toggle replay changes nothing on either side",
             setup: Setup::ParallelAlreadyEnabled,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::NoOp,
@@ -513,10 +509,8 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
     for row in rows() {
-        let (tui_effects, tui_message) =
-            through_tui(row.setup, row.mode.clone(), row.tui.clone()).await;
-        let (v2_effects, v2_settlement, v2_detail) =
-            through_v2(row.setup, row.mode.clone(), row.v2).await;
+        let (tui_effects, tui_message) = through_tui(row.setup, row.mode, row.tui.clone()).await;
+        let (v2_effects, v2_settlement, v2_detail) = through_v2(row.setup, row.mode, row.v2).await;
 
         assert_eq!(
             v2_settlement, row.expect,
@@ -610,14 +604,14 @@ async fn bulk_through_tui(
     rows: &[BulkRow],
     marked: &[&str],
     parallel: bool,
-    mode: AppMode,
+    mode: AppExecutionMode,
 ) -> Effects {
     let ids: Vec<&str> = rows.iter().map(|(id, ..)| *id).collect();
     let harness = AdapterHarness::new(&ids);
     arrange_bulk(&harness, rows, marked, parallel).await;
 
     let mut app = harness.app(&ids);
-    app.mode = mode;
+    app.execution_mode = mode;
     app.apply_display_statuses_from_reducer(&harness.state.read().await.all_display_statuses());
     for (index, (_, _, eligible)) in rows.iter().enumerate() {
         app.changes[index].is_parallel_eligible = *eligible;
@@ -638,7 +632,7 @@ async fn bulk_through_v2(
     rows: &[BulkRow],
     marked: &[&str],
     parallel: bool,
-    mode: AppMode,
+    mode: AppExecutionMode,
 ) -> (Effects, Settlement) {
     let ids: Vec<&str> = rows.iter().map(|(id, ..)| *id).collect();
     let harness = AdapterHarness::new(&ids);
@@ -681,7 +675,7 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
         rows: Vec<BulkRow>,
         marked: Vec<&'static str>,
         parallel: bool,
-        mode: AppMode,
+        mode: AppExecutionMode,
         expect: Settlement,
     }
 
@@ -691,7 +685,7 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             rows: vec![("c1", "not queued", true), ("c2", "rejected", true)],
             marked: vec![],
             parallel: false,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
         Case {
@@ -699,7 +693,7 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             rows: vec![("c1", "not queued", true), ("c2", "rejected", true)],
             marked: vec!["c1"],
             parallel: false,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
         Case {
@@ -707,7 +701,7 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             rows: vec![("c1", "not queued", true), ("c2", "not queued", false)],
             marked: vec![],
             parallel: true,
-            mode: AppMode::Select,
+            mode: AppExecutionMode::Select,
             expect: Settlement::Changed,
         },
         Case {
@@ -715,7 +709,7 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             rows: vec![("c1", "not queued", true), ("c2", "applying", true)],
             marked: vec![],
             parallel: false,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             expect: Settlement::Changed,
         },
         Case {
@@ -723,7 +717,7 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             rows: vec![("c1", "queued", true), ("c2", "applying", true)],
             marked: vec!["c1"],
             parallel: false,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             expect: Settlement::Changed,
         },
         Case {
@@ -731,16 +725,16 @@ async fn tui_and_v2_derive_the_same_bulk_mark_target_set_and_exclusions() {
             rows: vec![("c1", "rejected", true), ("c2", "applying", true)],
             marked: vec![],
             parallel: false,
-            mode: AppMode::Running,
+            mode: AppExecutionMode::Running,
             expect: Settlement::NoOp,
         },
     ];
 
     for case in cases {
         let tui =
-            bulk_through_tui(&case.rows, &case.marked, case.parallel, case.mode.clone()).await;
+            bulk_through_tui(&case.rows, &case.marked, case.parallel, case.mode).await;
         let (v2, settlement) =
-            bulk_through_v2(&case.rows, &case.marked, case.parallel, case.mode.clone()).await;
+            bulk_through_v2(&case.rows, &case.marked, case.parallel, case.mode).await;
 
         assert_eq!(
             settlement, case.expect,

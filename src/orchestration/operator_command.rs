@@ -934,6 +934,16 @@ pub trait QueuePort: Send + Sync {
 
     /// Wake the scheduler without changing queue contents.
     async fn notify_scheduler(&self);
+
+    /// Publish a target-ID-bearing one-shot explicit-retry edge to a live scheduler.
+    ///
+    /// Only an accepted, state-changing `ReducerCommand::RetryError` reaches
+    /// here. A refused or no-op retry, an ordinary `AddToQueue`, and a generic
+    /// queue notification deliberately do not: retry intent is what releases a
+    /// change's ephemeral failed classification, and nothing else may look like
+    /// it. The default implementation drops the edge, which is correct for
+    /// ports without a live scheduler behind them.
+    async fn publish_explicit_retry(&self, _change_id: &str) {}
 }
 
 /// Queue hook dispatch, isolated so the service can be verified without
@@ -1309,15 +1319,28 @@ impl OperatorCommandService {
     /// blocking is reported later as `blocked` display status, never by
     /// rejecting the operator's request.
     pub async fn add_to_queue(&self, change_id: &str) -> OperatorResult<QueueOutcome> {
-        let reduce_outcome = {
+        let (reduce_outcome, was_error_retry) = {
             let mut guard = self.state.write().await;
             if guard.is_terminal_error_change(change_id) {
-                guard.apply_command(ReducerCommand::RetryError(change_id.to_string()))
+                (
+                    guard.apply_command(ReducerCommand::RetryError(change_id.to_string())),
+                    true,
+                )
             } else {
-                guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()))
+                (
+                    guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string())),
+                    false,
+                )
             }
         };
         let reducer_changed = matches!(reduce_outcome, ReduceOutcome::Changed(_));
+
+        // Only the `RetryError` half of this branch is an explicit retry, and
+        // only when the reducer actually changed state. An ordinary `AddToQueue`
+        // never releases a failed classification.
+        if was_error_retry && reducer_changed {
+            self.queue.publish_explicit_retry(change_id).await;
+        }
 
         // Effect before commit: hooks describe real runtime mutations only.
         let dynamic_queue_mutated = if reducer_changed {
@@ -1513,6 +1536,7 @@ impl OperatorCommandService {
                 ReducerCommand::AddToQueue(change_id.to_string())
             }
         };
+        let is_error_retry = matches!(command, ReducerCommand::RetryError(_));
         let reduce_outcome = {
             let mut guard = self.state.write().await;
             guard.apply_command(command)
@@ -1523,6 +1547,13 @@ impl OperatorCommandService {
                 routes: Vec::new(),
                 explicit_retry: false,
             };
+        }
+        // A live scheduler holds an ephemeral failed classification for this
+        // change that only an accepted, state-changing `RetryError` may release.
+        // The acceptance-stall route restores ordinary queue intent instead and
+        // deliberately publishes nothing.
+        if is_error_retry {
+            self.queue.publish_explicit_retry(change_id).await;
         }
         self.marks.set(change_id, true);
         RetryPlan {
@@ -1567,6 +1598,10 @@ impl QueuePort for crate::tui::queue::DynamicQueue {
 
     async fn notify_scheduler(&self) {
         crate::tui::queue::DynamicQueue::notify_scheduler(self);
+    }
+
+    async fn publish_explicit_retry(&self, change_id: &str) {
+        crate::tui::queue::DynamicQueue::publish_explicit_retry(self, change_id.to_string()).await;
     }
 }
 

@@ -836,7 +836,7 @@ async fn remote_worktree_adapters_share_one_service_implementation() {
         let path = Path::new("/srv/workspaces/change-a");
         service.merge_worktree(path, policy).await.expect("merged");
         service
-            .delete_worktree(path, options)
+            .delete_worktree(path, None, options)
             .await
             .expect("deleted");
         let calls = backend.calls.lock().unwrap().clone();

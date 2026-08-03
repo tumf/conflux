@@ -137,6 +137,7 @@ pub(super) struct TestWorkspaceManager {
     repo_root: PathBuf,
     existing_workspaces: HashMap<String, WorkspaceInfo>,
     remove_existing_on_lookup: Arc<AtomicBool>,
+    fail_original_branch: Arc<AtomicBool>,
 }
 
 impl TestWorkspaceManager {
@@ -148,6 +149,7 @@ impl TestWorkspaceManager {
             repo_root: PathBuf::from("/tmp/test-repo"),
             existing_workspaces: HashMap::new(),
             remove_existing_on_lookup: Arc::new(AtomicBool::new(false)),
+            fail_original_branch: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -168,6 +170,14 @@ impl TestWorkspaceManager {
     #[allow(dead_code)]
     fn with_remove_existing_on_lookup(self) -> Self {
         self.remove_existing_on_lookup.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Make base identity resolution fail, as a detached HEAD or a lost original
+    /// branch does in a real repository.
+    #[allow(dead_code)]
+    pub(super) fn with_failing_original_branch(self) -> Self {
+        self.fail_original_branch.store(true, Ordering::SeqCst);
         self
     }
 }
@@ -298,10 +308,18 @@ impl WorkspaceManager for TestWorkspaceManager {
     }
 
     async fn ensure_original_branch_initialized(&self) -> VcsResult<String> {
+        if self.fail_original_branch.load(Ordering::SeqCst) {
+            return Err(VcsError::git_command(
+                "detached HEAD with no recorded original branch",
+            ));
+        }
         Ok("main".to_string())
     }
 
     fn original_branch(&self) -> Option<String> {
+        if self.fail_original_branch.load(Ordering::SeqCst) {
+            return None;
+        }
         Some("main".to_string())
     }
 
@@ -486,13 +504,17 @@ async fn resolving_dependency_blocks_its_dependent_but_not_unrelated_dispatch() 
         1,
         ExecutionMode::Parallel,
     )));
-    shared
-        .write()
-        .await
-        .apply_execution_event(&ExecutionEvent::ResolveStarted {
+    {
+        let mut guard = shared.write().await;
+        // Production start records queue intent for its targets before the
+        // scheduler runs; ordinary dispatch reads that intent, not the local list.
+        guard.apply_command(ReducerCommand::AddToQueue("dependent".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("unrelated".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving".to_string(),
             command: "resolve".to_string(),
         });
+    }
     executor.set_shared_orchestrator_state(shared.clone());
 
     let analysis = crate::analyzer::AnalysisResult {
@@ -623,13 +645,16 @@ async fn resolving_dependency_diagnostic_dedupes_and_reemits_after_signature_cha
         1,
         ExecutionMode::Parallel,
     )));
-    shared
-        .write()
-        .await
-        .apply_execution_event(&ExecutionEvent::ResolveStarted {
+    {
+        let mut guard = shared.write().await;
+        // Production start records queue intent for its targets before the
+        // scheduler runs; ordinary dispatch reads that intent, not the local list.
+        guard.apply_command(ReducerCommand::AddToQueue("dependent".to_string()));
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
             change_id: "resolving-a".to_string(),
             command: "resolve".to_string(),
         });
+    }
     executor.set_shared_orchestrator_state(shared.clone());
     let resolving_analysis = crate::analyzer::AnalysisResult {
         order: vec!["dependent".to_string()],
@@ -966,13 +991,20 @@ async fn test_queue_reconciliation_skips_archived_dirty_candidate_when_post_arch
         .with_existing_workspace("gamma", workspace_path.clone());
     let mut executor = ParallelExecutor::new(temp.path().to_path_buf(), create_test_config(), None);
     executor.workspace_manager = Box::new(manager);
-    executor.set_shared_orchestrator_state(Arc::new(tokio::sync::RwLock::new(
+    // Explicit queue intent, so the post-archive-merge gate is what stops the
+    // candidate rather than the absence of ordinary intent.
+    let shared = Arc::new(tokio::sync::RwLock::new(
         crate::orchestration::state::OrchestratorState::with_mode(
             vec!["gamma".to_string()],
             0,
             crate::orchestration::state::ExecutionMode::Parallel,
         ),
-    )));
+    ));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("gamma".to_string()));
+    executor.set_shared_orchestrator_state(shared);
 
     let _active_merge_guard =
         crate::parallel::merge::ActivePostArchiveMergeGuard::force_register_for_test("gamma");
@@ -1040,6 +1072,7 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         pending_merge_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1057,6 +1090,8 @@ fn test_skip_reason_for_merge_deferred_dependency() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1189,6 +1224,7 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1207,6 +1243,8 @@ async fn test_merge_conflictless_path_skips_resolve_started_event() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1355,6 +1393,7 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1373,6 +1412,8 @@ async fn test_merge_conflict_path_emits_resolve_started_event() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1576,6 +1617,7 @@ async fn test_merge_retries_when_merge_commit_missing() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1594,6 +1636,8 @@ async fn test_merge_retries_when_merge_commit_missing() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -1789,6 +1833,7 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1807,6 +1852,8 @@ async fn test_merge_resolves_conflict_with_resolve_command() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -2008,6 +2055,7 @@ async fn test_merge_retries_after_pre_commit_changes() {
         archive_history: Arc::new(Mutex::new(crate::history::ArchiveHistory::new())),
         acceptance_history: Arc::new(Mutex::new(crate::history::AcceptanceHistory::new())),
         acceptance_tail_injected: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        apply_budget: crate::execution::apply::ApplyBudget::new(),
         shared_stagger_state,
         manual_resolve_count: None,
         auto_resolve_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2026,6 +2074,8 @@ async fn test_merge_retries_after_pre_commit_changes() {
         analysis_input_probe: None,
         upstream: None,
         explicit_target_plan: None,
+        change_failures_this_run: HashSet::new(),
+        run_fatal_abort: None,
         merge_result_channel_override: None,
     };
 
@@ -2979,6 +3029,11 @@ async fn test_blocked_only_classifier_distinguishes_scheduler_work_classes() {
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue("candidate-missing".to_string()));
+        // Ordinary candidates carry the queue intent an explicit start records
+        // for them; the lane and terminal fixtures below are classified by their
+        // own reducer-owned state.
+        guard.apply_command(ReducerCommand::AddToQueue("dispatchable".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("dependency-blocked".to_string()));
         guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
             change_id: "manual-merge".to_string(),
             reason: "manual merge required".to_string(),
@@ -3326,9 +3381,10 @@ async fn test_resolve_wait_completion_unblocks_dependents() {
                 change_id: "alpha".to_string(),
                 workspace_name: "ws-alpha".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             })
-            .await,
+            .await
+            .is_merged(),
         "merged resolve_wait result should be treated as a successful base-lane completion"
     );
     assert!(
@@ -5021,27 +5077,29 @@ async fn test_handle_merge_result_keeps_pending_counter_non_negative() {
     let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
 
     executor.pending_merge_count.store(2, Ordering::Relaxed);
-    assert!(
+    assert_eq!(
         executor
             .handle_merge_result(MergeResult {
                 change_id: "change-ok".to_string(),
                 workspace_name: "ws-change-ok".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             })
-            .await
+            .await,
+        MergeResultDisposition::Merged
     );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 1);
 
-    assert!(
-        !executor
+    assert_eq!(
+        executor
             .handle_merge_result(MergeResult {
                 change_id: "change-err".to_string(),
                 workspace_name: "ws-change-err".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Err("merge failed".to_string()),
+                outcome: MergeTaskOutcome::run_fatal("merge failed"),
             })
-            .await
+            .await,
+        MergeResultDisposition::AbortRun
     );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
 }
@@ -5061,17 +5119,17 @@ async fn fix_scheduler_premature_exit_decrements_pending_merge_counter_on_merge_
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result(MergeResult {
             change_id: "change-ok".to_string(),
             workspace_name: "ws-change-ok".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Ok(MergeTaskOutcome::Merged),
+            outcome: MergeTaskOutcome::Merged,
         })
         .await;
 
     assert!(
-        merged,
+        disposition.is_merged(),
         "actual merged background outcomes must trigger success-only scheduler follow-up"
     );
     assert_eq!(
@@ -5097,21 +5155,23 @@ async fn test_handle_merge_result_deferred_is_not_successful_completion() {
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
     executor.resolve_wait_changes.insert("beta".to_string());
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result(MergeResult {
             change_id: "alpha".to_string(),
             workspace_name: "ws-alpha".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Ok(MergeTaskOutcome::deferred(
-                "archive verification incomplete",
-                false,
-            )),
+            outcome: MergeTaskOutcome::deferred("archive verification incomplete", false),
         })
         .await;
 
-    assert!(
-        !merged,
+    assert_eq!(
+        disposition,
+        MergeResultDisposition::Deferred,
         "deferred background merge outcomes must not be reported as completed merges"
+    );
+    assert!(
+        !executor.had_change_failures(),
+        "a deferral is pending work, not a change failure"
     );
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
     assert!(
@@ -5120,9 +5180,11 @@ async fn test_handle_merge_result_deferred_is_not_successful_completion() {
     );
 }
 
+/// Only a run-fatal outcome may reach the single global-Error owner, and when it
+/// does it must ask for an abort rather than a decorated continuation.
 #[tokio::test]
-async fn test_handle_merge_result_failed_emits_error_event_with_context() {
-    use crate::parallel::{MergeResult, MergeResultOrigin};
+async fn run_fatal_merge_result_emits_one_global_error_and_requests_abort() {
+    use crate::parallel::{MergeResult, MergeResultOrigin, MergeTaskOutcome};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
@@ -5135,16 +5197,16 @@ async fn test_handle_merge_result_failed_emits_error_event_with_context() {
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result(MergeResult {
             change_id: "alpha".to_string(),
             workspace_name: "ws-alpha".to_string(),
             origin: MergeResultOrigin::PostArchiveMerge,
-            outcome: Err("merge failed hard".to_string()),
+            outcome: MergeTaskOutcome::run_fatal("merge failed hard"),
         })
         .await;
 
-    assert!(!merged, "failed merge outcomes are not successful merges");
+    assert_eq!(disposition, MergeResultDisposition::AbortRun);
     let event = rx.try_recv().or_fail("expected merge failure event");
     match event {
         ExecutionEvent::Error { message } => {
@@ -5159,6 +5221,192 @@ async fn test_handle_merge_result_failed_emits_error_event_with_context() {
             );
         }
         other => panic!("expected error event, got {other:?}"),
+    }
+
+    // A second fatal result arriving during the bounded drain must not add a
+    // second global Error: the run is already aborting.
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(
+        executor
+            .handle_merge_result(MergeResult {
+                change_id: "beta".to_string(),
+                workspace_name: "ws-beta".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: MergeTaskOutcome::run_fatal("second fatal outcome"),
+            })
+            .await,
+        MergeResultDisposition::AbortRun
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "an aborting run emits exactly one global Error"
+    );
+}
+
+/// The regression this change exists for: bounded post-archive resolve
+/// exhaustion is change-local, so the queue wrapper must not wrap it in a global
+/// Error, and the run must keep going.
+#[tokio::test]
+async fn resolve_exhausted_merge_result_continues_without_a_global_error() {
+    use crate::parallel::{
+        MergeResult, MergeResultOrigin, MergeTaskOutcome, ResolveFailureClassification,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let config = create_test_config();
+    let (tx, mut rx) = mpsc::channel(32);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+
+    let disposition = executor
+        .handle_merge_result(MergeResult {
+            change_id: "alpha".to_string(),
+            workspace_name: "ws-alpha".to_string(),
+            origin: MergeResultOrigin::PostArchiveMerge,
+            outcome: MergeTaskOutcome::resolve_exhausted(
+                "alpha",
+                3,
+                ResolveFailureClassification::UnresolvedConflict,
+                "conflicts remain",
+            ),
+        })
+        .await;
+
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
+    assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
+    assert!(
+        executor.had_change_failures(),
+        "a change-local failure must be remembered for truthful terminal reporting"
+    );
+    assert!(
+        executor.run_fatal_abort.is_none(),
+        "an exhausted resolve must never request a run abort"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the queue wrapper must not emit a global Error for an already-classified change failure"
+    );
+}
+
+/// Publication and hook failures keep their own typed owners across the shared
+/// boundary; the queue must neither duplicate nor escalate them.
+#[tokio::test]
+async fn already_reported_merge_results_are_never_promoted_to_global_errors() {
+    use crate::parallel::{
+        AlreadyReportedFailureKind, MergeResult, MergeResultOrigin, MergeTaskOutcome,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    for kind in [
+        AlreadyReportedFailureKind::Push,
+        AlreadyReportedFailureKind::Hook,
+        AlreadyReportedFailureKind::RejectionReview,
+    ] {
+        let config = create_test_config();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+        executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+
+        let disposition = executor
+            .handle_merge_result(MergeResult {
+                change_id: "alpha".to_string(),
+                workspace_name: "ws-alpha".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: MergeTaskOutcome::already_reported(
+                    "alpha",
+                    kind,
+                    "already reported by its typed owner",
+                ),
+            })
+            .await;
+
+        assert_eq!(
+            disposition,
+            MergeResultDisposition::ContinueWithErrors,
+            "{:?} must continue the run",
+            kind
+        );
+        assert!(
+            executor.run_fatal_abort.is_none(),
+            "{:?} must not fall through to a run-fatal abort",
+            kind
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "{:?} already emitted its lifecycle event; a duplicate global Error is forbidden",
+            kind
+        );
+    }
+}
+
+/// Ownership release is independent of severity: every outcome returns the
+/// pending counter, and every non-merged spawned-retry outcome returns the lane.
+#[tokio::test]
+async fn every_outcome_releases_pending_accounting_regardless_of_severity() {
+    use crate::parallel::{
+        AlreadyReportedFailureKind, MergeResult, MergeResultOrigin, MergeTaskOutcome,
+        ResolveFailureClassification,
+    };
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    let repo_dir = TempDir::new().or_fail("unexpected error");
+    init_git_repo(repo_dir.path()).await;
+
+    let outcomes = [
+        MergeTaskOutcome::Merged,
+        MergeTaskOutcome::deferred("base lane busy", true),
+        MergeTaskOutcome::deferred("needs operator action", false),
+        MergeTaskOutcome::resolve_exhausted(
+            "alpha",
+            3,
+            ResolveFailureClassification::RetriesExhausted,
+            "budget exhausted",
+        ),
+        MergeTaskOutcome::already_reported(
+            "alpha",
+            AlreadyReportedFailureKind::Push,
+            "push already reported",
+        ),
+        MergeTaskOutcome::run_fatal("base identity lost"),
+    ];
+
+    for outcome in outcomes {
+        let config = create_test_config();
+        let (tx, _rx) = mpsc::channel(32);
+        let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+        executor.pending_merge_count.store(1, Ordering::Relaxed);
+
+        let expected = outcome.disposition();
+        let disposition = executor
+            .handle_merge_result(MergeResult {
+                change_id: "alpha".to_string(),
+                workspace_name: "ws-alpha".to_string(),
+                origin: MergeResultOrigin::PostArchiveMerge,
+                outcome: outcome.clone(),
+            })
+            .await;
+
+        assert_eq!(
+            disposition, expected,
+            "disposition drifted for {:?}",
+            outcome
+        );
+        assert_eq!(
+            executor.pending_merge_count.load(Ordering::Relaxed),
+            0,
+            "pending accounting must be released for {:?}",
+            outcome
+        );
     }
 }
 
@@ -5353,6 +5601,20 @@ async fn test_idle_queue_addition_marks_reanalysis_and_enqueues_change() {
         .map(|change| change.id.clone())
         .or_else(|| all_changes.first().map(|change| change.id.clone()))
         .or_fail("expected at least one change");
+
+    // Production order: an accepted queue addition records reducer intent
+    // before the wake-up hint is published, and ingestion validates against that
+    // intent rather than the catalog.
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.clone()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue(change_id.clone()));
+    executor.set_shared_orchestrator_state(shared);
 
     let dynamic_queue = Arc::new(DynamicQueue::new());
     dynamic_queue.push(change_id.to_string()).await;
@@ -5739,19 +6001,19 @@ async fn handle_merge_result_releases_resolve_wait_retry_lane_on_auto_deferred()
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                outcome: MergeTaskOutcome::deferred("Merge lane busy", true),
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::Deferred);
     let guard = shared.read().await;
     assert!(!guard.is_base_mutating_lane_occupied());
     assert_eq!(
@@ -5789,19 +6051,23 @@ async fn handle_merge_result_releases_reject_wait_retry_lane_and_suppresses_dupl
     }
     executor.set_shared_orchestrator_state(shared.clone());
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "reject-a".to_string(),
                 workspace_name: "ws-reject-a".to_string(),
                 origin: MergeResultOrigin::RejectWaitRetry,
-                outcome: Err("specific rejection review failure already emitted".to_string()),
+                outcome: MergeTaskOutcome::already_reported(
+                    "reject-a",
+                    crate::parallel::AlreadyReportedFailureKind::RejectionReview,
+                    "specific rejection review failure already emitted",
+                ),
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
     let guard = shared.read().await;
     assert!(!guard.is_base_mutating_lane_occupied());
     assert_eq!(guard.reject_wait_change_ids(), vec!["reject-a".to_string()]);
@@ -5821,19 +6087,24 @@ async fn handle_merge_result_suppresses_resolve_retry_generic_error() {
     let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
 
     executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "resolve-a".to_string(),
                 workspace_name: "ws-resolve-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Err("ResolveFailed already emitted by retry body".to_string()),
+                outcome: MergeTaskOutcome::resolve_exhausted(
+                    "resolve-a",
+                    3,
+                    crate::parallel::ResolveFailureClassification::UnresolvedConflict,
+                    "ResolveFailed already emitted by retry body",
+                ),
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
     assert_eq!(executor.pending_merge_count.load(Ordering::Relaxed), 0);
     assert!(
         event_rx.try_recv().is_err(),
@@ -5880,20 +6151,29 @@ async fn resolve_retry_workspace_lookup_failure_is_operator_visible() {
 
     let outcome = executor
         .retry_deferred_merges_for(vec!["missing-ws".to_string()])
-        .await
-        .or_fail("missing workspace is treated as stale intent cleanup");
+        .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
-    let mut saw_workspace_error = false;
+    let mut saw_workspace_warning = false;
     while let Ok(event) = event_rx.try_recv() {
-        if let ExecutionEvent::Error { message } = event {
-            saw_workspace_error =
-                message.contains("No workspace found for ResolveWait retry 'missing-ws'");
+        match event {
+            ExecutionEvent::Log(entry) => {
+                if entry
+                    .message
+                    .contains("No workspace found for ResolveWait retry 'missing-ws'")
+                {
+                    saw_workspace_warning = true;
+                }
+            }
+            ExecutionEvent::Error { message } => panic!(
+                "clearing stale retry intent is not a run-fatal outcome, got global Error: {message}"
+            ),
+            _ => {}
         }
     }
     assert!(
-        saw_workspace_error,
-        "missing-workspace retry path must emit an operator-visible Error event"
+        saw_workspace_warning,
+        "missing-workspace retry path must stay operator-visible as a warning"
     );
     {
         let guard = shared.read().await;
@@ -5954,20 +6234,29 @@ async fn reject_retry_workspace_lookup_failure_is_operator_visible() {
 
     let outcome = executor
         .retry_deferred_rejection_review_for("missing-reject-ws".to_string())
-        .await
-        .or_fail("missing rejection workspace is treated as stale intent cleanup");
+        .await;
 
     assert_eq!(outcome, MergeTaskOutcome::Merged);
-    let mut saw_workspace_error = false;
+    let mut saw_workspace_warning = false;
     while let Ok(event) = event_rx.try_recv() {
-        if let ExecutionEvent::Error { message } = event {
-            saw_workspace_error =
-                message.contains("No workspace found for RejectWait retry 'missing-reject-ws'");
+        match event {
+            ExecutionEvent::Log(entry) => {
+                if entry
+                    .message
+                    .contains("No workspace found for RejectWait retry 'missing-reject-ws'")
+                {
+                    saw_workspace_warning = true;
+                }
+            }
+            ExecutionEvent::Error { message } => panic!(
+                "clearing stale reject-wait intent is not a run-fatal outcome, got global Error: {message}"
+            ),
+            _ => {}
         }
     }
     assert!(
-        saw_workspace_error,
-        "missing RejectWait workspace path must emit an operator-visible Error event"
+        saw_workspace_warning,
+        "missing RejectWait workspace path must stay operator-visible as a warning"
     );
     {
         let guard = shared.read().await;
@@ -6024,22 +6313,21 @@ async fn resolve_give_up_promotes_next_waiter_without_user_action() {
 
     let outcome = executor
         .retry_deferred_merges_for(vec!["first".to_string()])
-        .await
-        .or_fail("missing first workspace gives up as merged trigger");
+        .await;
     assert_eq!(outcome, MergeTaskOutcome::Merged);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "first".to_string(),
                 workspace_name: "ws-first".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             },
             &merge_result_tx,
         )
         .await;
-    assert!(merged);
+    assert!(disposition.is_merged());
 
     {
         let guard = shared.read().await;
@@ -6120,19 +6408,19 @@ async fn retry_lane_busy_release_allows_subsequent_repromotion() {
     };
     drop(merge_guard);
 
-    let merged = executor
+    let disposition = executor
         .handle_merge_result_with_tx(
             MergeResult {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(outcome),
+                outcome,
             },
             &merge_result_tx,
         )
         .await;
 
-    assert!(!merged);
+    assert_eq!(disposition, MergeResultDisposition::Deferred);
     {
         let guard = shared.read().await;
         assert!(!guard.is_base_mutating_lane_occupied());
@@ -6185,7 +6473,7 @@ async fn deferred_retry_lane_repromotes_after_merge_completion_trigger() {
                 change_id: "change-a".to_string(),
                 workspace_name: "ws-change-a".to_string(),
                 origin: MergeResultOrigin::ResolveWaitRetry,
-                outcome: Ok(MergeTaskOutcome::deferred("Merge lane busy", true)),
+                outcome: MergeTaskOutcome::deferred("Merge lane busy", true),
             },
             &merge_result_tx,
         )
@@ -6198,7 +6486,7 @@ async fn deferred_retry_lane_repromotes_after_merge_completion_trigger() {
                 change_id: "blocking-merge".to_string(),
                 workspace_name: "ws-blocking-merge".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             },
             &merge_result_tx,
         )
@@ -6253,7 +6541,7 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
                 change_id: "blocking-merge".to_string(),
                 workspace_name: "ws-blocking-merge".to_string(),
                 origin: MergeResultOrigin::PostArchiveMerge,
-                outcome: Ok(MergeTaskOutcome::Merged),
+                outcome: MergeTaskOutcome::Merged,
             },
             &merge_result_tx,
         )
@@ -6286,19 +6574,18 @@ async fn finite_scheduler_does_not_drain_while_spawned_retry_is_pending() {
         "receiving a spawned result is not enough; the scheduler must handle it first"
     );
 
-    assert!(
-        executor
-            .handle_merge_result_with_tx(
-                MergeResult {
-                    change_id: "retry-a".to_string(),
-                    workspace_name: "ws-retry-a".to_string(),
-                    origin: MergeResultOrigin::ResolveWaitRetry,
-                    outcome: Ok(MergeTaskOutcome::Merged),
-                },
-                &merge_result_tx,
-            )
-            .await
-    );
+    assert!(executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: "retry-a".to_string(),
+                workspace_name: "ws-retry-a".to_string(),
+                origin: MergeResultOrigin::ResolveWaitRetry,
+                outcome: MergeTaskOutcome::Merged,
+            },
+            &merge_result_tx,
+        )
+        .await
+        .is_merged());
 
     assert!(
         !shared
@@ -6752,12 +7039,25 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
             .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
     );
 
+    // The merged-evidence stop gate must hold *after* the explicit-intent
+    // boundary is passed, so this fixture gives the change real reducer queue
+    // intent instead of relying on the absence of intent.
     let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
-        Vec::new(),
+        vec![change_id.to_string()],
         1,
         ExecutionMode::Parallel,
     )));
-    executor.set_shared_orchestrator_state(shared);
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    assert_eq!(
+        shared.read().await.queued_change_ids(),
+        vec![change_id.to_string()],
+        "fixture must pass the explicit-intent boundary before the merged stop gate is exercised"
+    );
 
     let mut queued = Vec::new();
     let added = executor
@@ -6767,7 +7067,7 @@ async fn test_archived_dirty_reconciliation_skips_workspace_already_merged_to_ba
     assert_eq!(
         added.total_added(),
         0,
-        "terminal merged leftover worktree must not be rediscovered as an archived dirty repair candidate"
+        "an explicitly queued but already-merged worktree must stay terminal residue instead of becoming repair work"
     );
     assert!(
         queued.is_empty(),
@@ -6840,17 +7140,29 @@ async fn test_archived_dirty_reconciliation_skips_manual_merge_wait() {
         1,
         ExecutionMode::Parallel,
     )));
+    // Explicit queue intent that survives into manual merge wait. A resolve
+    // failure restores `MergeWait` without clearing `QueueIntent::Queued`, so
+    // this change really does reach candidate evaluation and is stopped by the
+    // merge-wait gate itself rather than by having no ordinary intent at all.
     {
         let mut guard = shared.write().await;
         guard.apply_command(ReducerCommand::AddToQueue(change_id.to_string()));
-        guard.apply_execution_event(&ExecutionEvent::ChangeArchived(change_id.to_string()));
-        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+        guard.apply_execution_event(&ExecutionEvent::ResolveFailed {
             change_id: change_id.to_string(),
-            reason: "base has unresolved conflicts".to_string(),
-            auto_resumable: false,
+            error: "base has unresolved conflicts".to_string(),
         });
     }
     executor.set_shared_orchestrator_state(shared.clone());
+
+    assert_eq!(
+        shared.read().await.queued_change_ids(),
+        vec![change_id.to_string()],
+        "fixture must pass the explicit-intent boundary before the merge-wait gate is exercised"
+    );
+    assert_eq!(
+        shared.read().await.merge_wait_change_ids(),
+        vec![change_id.to_string()]
+    );
 
     let mut queued = Vec::new();
     let added = executor
@@ -6863,11 +7175,6 @@ async fn test_archived_dirty_reconciliation_skips_manual_merge_wait() {
     assert_eq!(added.total_added(), 0);
     assert_eq!(rediscovered.total_added(), 0);
     assert!(queued.is_empty());
-    assert!(shared.read().await.queued_change_ids().is_empty());
-    assert_eq!(
-        shared.read().await.merge_wait_change_ids(),
-        vec![change_id.to_string()]
-    );
 
     let mut manual_wait_diagnostic_count = 0usize;
     while let Ok(event) = rx.try_recv() {
@@ -6883,6 +7190,31 @@ async fn test_archived_dirty_reconciliation_skips_manual_merge_wait() {
         }
     }
     assert_eq!(manual_wait_diagnostic_count, 1);
+
+    // Manual merge wait advances only through an accepted `ResolveMerge`, which
+    // moves the change onto the reducer-owned resolve lane instead of back into
+    // ordinary queued work.
+    assert!(matches!(
+        shared
+            .write()
+            .await
+            .apply_command(ReducerCommand::ResolveMerge(change_id.to_string())),
+        crate::orchestration::state::ReduceOutcome::Changed(_)
+    ));
+    assert_eq!(
+        shared.read().await.resolve_wait_change_ids(),
+        vec![change_id.to_string()]
+    );
+    assert!(shared.read().await.merge_wait_change_ids().is_empty());
+
+    let after_resolve_intent = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+    assert_eq!(
+        after_resolve_intent.total_added(),
+        0,
+        "resolve lane intent must not be laundered into ordinary queued work"
+    );
 }
 
 #[tokio::test]
@@ -6985,13 +7317,18 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
     );
     assert!(queued.is_empty());
 
-    let reducer_queued = shared.read().await.queued_change_ids();
-    assert!(
-        reducer_queued.is_empty(),
-        "test must exercise the real post-failure reducer shape: terminal ArchiveFailed excludes queued_change_ids"
-    );
+    {
+        let guard = shared.read().await;
+        assert!(
+            guard.is_terminal_error_change(change_id),
+            "fixture must reach the real post-failure terminal-error shape"
+        );
+        assert!(
+            guard.queued_change_ids().is_empty(),
+            "a terminal error revokes ordinary queue intent until RetryError restores it"
+        );
+    }
 
-    let mut retry_required_diagnostic_count = 0usize;
     while let Ok(event) = rx.try_recv() {
         if let crate::events::ExecutionEvent::Log(log) = event {
             assert!(
@@ -6999,15 +7336,47 @@ async fn test_archived_dirty_reconciliation_keeps_terminal_error_stopped_until_r
                 "terminal-error worktree must not emit archived-dirty repair diagnostics: {}",
                 log.message
             );
-            if log.message.contains("terminal_error_retry_required") {
-                retry_required_diagnostic_count += 1;
+        }
+    }
+
+    // Accepted `RetryError` is the only path back: the identical workspace
+    // evidence that was refused above now resolves to archive-finalization
+    // repair work, which proves the stop was the terminal-error gate rather
+    // than unusable evidence.
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::RetryError(change_id.to_string()));
+    }
+    assert_eq!(
+        shared.read().await.queued_change_ids(),
+        vec![change_id.to_string()]
+    );
+
+    let after_retry = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+    assert_eq!(
+        after_retry.repair_added, 1,
+        "explicit RetryError must re-enable archived-dirty repair for the same workspace evidence"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![change_id],
+        "retry recovery must resolve the change from its preserved workspace"
+    );
+
+    let mut repair_candidate_diagnostics = 0usize;
+    while let Ok(event) = rx.try_recv() {
+        if let crate::events::ExecutionEvent::Log(log) = event {
+            if log.message.contains("archived_dirty_repair_candidate") {
+                repair_candidate_diagnostics += 1;
             }
         }
     }
-    assert_eq!(
-        retry_required_diagnostic_count, 1,
-        "reconciliation should emit one retry-required diagnostic while bounding unchanged repeats"
-    );
+    assert_eq!(repair_candidate_diagnostics, 1);
 }
 
 async fn assert_parallel_acceptance_failure_stalls_within_one_run(stale_checkpoint: bool) {
@@ -9339,8 +9708,7 @@ async fn push_post_archive_success_cleans_workspace_and_does_not_merge_base() {
             error: None,
             rejected: None,
         })
-        .await
-        .or_fail("push post-archive should succeed");
+        .await;
     assert_eq!(outcome, MergeTaskOutcome::Merged);
     assert_eq!(
         get_current_commit(repo.path())
@@ -9447,7 +9815,7 @@ async fn push_post_archive_failure_preserves_workspace_and_skips_on_merged_hook(
         remote: "missing-remote".to_string(),
     };
 
-    let error = executor
+    let outcome = executor
         .handle_merge_and_cleanup(WorkspaceResult {
             change_id: "alpha".to_string(),
             workspace_name: workspace.name.clone(),
@@ -9455,9 +9823,25 @@ async fn push_post_archive_failure_preserves_workspace_and_skips_on_merged_hook(
             error: None,
             rejected: None,
         })
-        .await
-        .expect_err("push to missing remote should fail");
-    assert!(error.to_string().contains("Failed to push archived alpha"));
+        .await;
+    // `PushFailed` already owns this change transition, so the shared boundary
+    // reports it as already reported rather than promoting it to run-fatal.
+    match &outcome {
+        MergeTaskOutcome::RecoverableAlreadyReported {
+            change_id,
+            kind,
+            detail,
+        } => {
+            assert_eq!(change_id, "alpha");
+            assert_eq!(*kind, crate::parallel::AlreadyReportedFailureKind::Push);
+            assert!(detail.contains("Failed to push archived alpha"), "{detail}");
+        }
+        other => panic!("a reported push failure must not become run-fatal, got {other:?}"),
+    }
+    assert_eq!(
+        outcome.disposition(),
+        MergeResultDisposition::ContinueWithErrors
+    );
     assert!(
         workspace.path.exists(),
         "failed push must preserve worktree for inspection/retry"
@@ -9665,6 +10049,305 @@ async fn test_reject_wait_lane_clear_promotes_only_one_waiter() {
     );
     assert_eq!(guard.display_status(second_id), "reject pending");
     assert_eq!(guard.reject_wait_change_ids(), vec![second_id.to_string()]);
+}
+
+/// A deferred CONFIRM verdict whose rejection flow fails is a change-local
+/// failure already owned by `RejectionReviewFailed`; it must not cross the
+/// shared base-lane boundary as a completed merge.
+#[tokio::test]
+async fn deferred_confirm_rejection_flow_failure_is_already_reported_not_merged() {
+    use crate::parallel::{AlreadyReportedFailureKind, MergeResult, MergeResultOrigin};
+
+    let workspace_dir = TempDir::new().or_fail("create rejecting workspace");
+    let change_id = "reject-confirm-flow-failure";
+    let rejected_dir = workspace_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join(change_id);
+    std::fs::create_dir_all(&rejected_dir).or_fail("create change directory");
+    std::fs::write(
+        rejected_dir.join("REJECTED.md"),
+        "# REJECTED\n\n- change_id: reject-confirm-flow-failure\n- reason: unrecoverable blocker\n",
+    )
+    .or_fail("write REJECTED.md");
+
+    // `execute_rejection_flow` checks out the base branch in this repo root, so
+    // a missing repository fails the flow deterministically *after* the CONFIRM
+    // verdict has already been produced.
+    let missing_repo_root = workspace_dir.path().join("missing-repo-root");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: CONFIRM'".to_string()),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_strict_process_cleanup: Some(false),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(missing_repo_root, config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["lane-owner".to_string(), change_id.to_string()],
+        2,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        // The change only enters RejectWait while another change holds the
+        // post-archive base-mutating lane; releasing it promotes this waiter.
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane-owner".to_string()));
+        guard.mark_reject_wait(change_id);
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "lane-owner".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some((change_id.to_string(), WaitState::RejectWait))
+        );
+        assert!(guard.is_base_mutating_lane_occupied());
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.reject_wait_changes.insert(change_id.to_string());
+
+    let outcome = executor
+        .retry_deferred_rejection_review_for(change_id.to_string())
+        .await;
+
+    match &outcome {
+        MergeTaskOutcome::RecoverableAlreadyReported {
+            change_id: scoped_id,
+            kind,
+            ..
+        } => {
+            assert_eq!(scoped_id, change_id);
+            assert_eq!(*kind, AlreadyReportedFailureKind::RejectionReview);
+        }
+        other => panic!(
+            "a failed CONFIRM rejection flow must not report a completed merge, got {other:?}"
+        ),
+    }
+    assert_eq!(
+        outcome.disposition(),
+        MergeResultDisposition::ContinueWithErrors
+    );
+
+    let mut rejection_review_failures = 0;
+    let mut saw_rejected_or_completed = false;
+    let mut producer_errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::RejectionReviewFailed { change_id: id, .. } if id == change_id => {
+                rejection_review_failures += 1;
+            }
+            ExecutionEvent::RejectionReviewCompleted { change_id: id, .. }
+            | ExecutionEvent::ChangeRejected { change_id: id, .. }
+            | ExecutionEvent::ChangeDequeued { change_id: id } => {
+                if id == change_id {
+                    saw_rejected_or_completed = true;
+                }
+            }
+            ExecutionEvent::Error { message } => producer_errors.push(message),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        rejection_review_failures, 1,
+        "the rejection-review owner must report the failure exactly once"
+    );
+    assert!(
+        !saw_rejected_or_completed,
+        "a failed rejection flow must not synthesize rejection success events"
+    );
+    assert!(
+        producer_errors.is_empty(),
+        "the change-scoped owner must not also emit a global Error: {producer_errors:?}"
+    );
+
+    // The scheduler boundary continues the run and stays free of a duplicate
+    // global Error.
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    let disposition = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                origin: MergeResultOrigin::RejectWaitRetry,
+                outcome,
+            },
+            &merge_result_tx,
+        )
+        .await;
+
+    assert_eq!(disposition, MergeResultDisposition::ContinueWithErrors);
+    assert!(
+        executor.run_fatal_abort.is_none(),
+        "an already-reported rejection failure must not abort the run"
+    );
+    assert!(executor.had_change_failures());
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Error { message } = event {
+            panic!("the queue wrapper must not duplicate the reported failure: {message}");
+        }
+    }
+    {
+        let guard = shared.read().await;
+        assert!(
+            !guard.is_base_mutating_lane_occupied(),
+            "the borrowed base-mutating lane must be released regardless of severity"
+        );
+        assert!(guard.global_invariants_hold());
+    }
+    assert!(
+        workspace_dir.path().join("openspec").exists(),
+        "workspace evidence must survive for explicit retry"
+    );
+}
+
+/// Losing base identity during a deferred CONFIRM must fail closed: guessing a
+/// branch name would commit REJECTED.md onto whatever branch carries it.
+#[tokio::test]
+async fn deferred_confirm_base_identity_failure_is_run_fatal_without_mutation() {
+    use crate::parallel::{MergeResult, MergeResultOrigin};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+
+    let workspace_dir = TempDir::new().or_fail("create rejecting workspace");
+    let change_id = "reject-confirm-base-identity";
+    let rejected_dir = workspace_dir
+        .path()
+        .join("openspec")
+        .join("changes")
+        .join(change_id);
+    std::fs::create_dir_all(&rejected_dir).or_fail("create change directory");
+    std::fs::write(
+        rejected_dir.join("REJECTED.md"),
+        "# REJECTED\n\n- change_id: reject-confirm-base-identity\n- reason: unrecoverable blocker\n",
+    )
+    .or_fail("write REJECTED.md");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        acceptance_command: Some("sh -c 'echo REJECTION_REVIEW: CONFIRM'".to_string()),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_strict_process_cleanup: Some(false),
+        ..Default::default()
+    });
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace(change_id, workspace_dir.path().to_path_buf())
+            .with_failing_original_branch(),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["lane-owner".to_string(), change_id.to_string()],
+        2,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_execution_event(&ExecutionEvent::ChangeArchived("lane-owner".to_string()));
+        guard.mark_reject_wait(change_id);
+        guard.apply_execution_event(&ExecutionEvent::MergeCompleted {
+            change_id: "lane-owner".to_string(),
+            revision: "rev".to_string(),
+        });
+        assert_eq!(
+            guard.promote_next_base_mutating_lane_waiter(),
+            Some((change_id.to_string(), WaitState::RejectWait))
+        );
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+    executor.reject_wait_changes.insert(change_id.to_string());
+
+    let outcome = executor
+        .retry_deferred_rejection_review_for(change_id.to_string())
+        .await;
+
+    match &outcome {
+        MergeTaskOutcome::RunFatal { detail } => {
+            assert!(
+                detail.contains(change_id),
+                "run-fatal detail must name the change it aborted on: {detail}"
+            );
+        }
+        other => panic!("lost base identity must fail closed as run-fatal, got {other:?}"),
+    }
+    assert_eq!(outcome.disposition(), MergeResultDisposition::AbortRun);
+
+    assert!(
+        !repo_dir
+            .path()
+            .join("openspec")
+            .join("changes")
+            .join(change_id)
+            .join("REJECTED.md")
+            .exists(),
+        "the rejection flow must not run against a guessed base branch"
+    );
+
+    let mut producer_errors = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::RejectionReviewCompleted { change_id: id, .. }
+            | ExecutionEvent::RejectionReviewFailed { change_id: id, .. }
+            | ExecutionEvent::ChangeRejected { change_id: id, .. }
+            | ExecutionEvent::ChangeDequeued { change_id: id } => {
+                if id == change_id {
+                    panic!("aborting on lost base identity must not mutate rejection state");
+                }
+            }
+            ExecutionEvent::Error { message } => producer_errors.push(message),
+            _ => {}
+        }
+    }
+    assert!(
+        producer_errors.is_empty(),
+        "the global Error owner is the queue boundary, not the producer: {producer_errors:?}"
+    );
+
+    let (merge_result_tx, _merge_result_rx) = mpsc::channel(4);
+    executor.pending_merge_count.fetch_add(1, Ordering::Relaxed);
+    let disposition = executor
+        .handle_merge_result_with_tx(
+            MergeResult {
+                change_id: change_id.to_string(),
+                workspace_name: format!("ws-{change_id}"),
+                origin: MergeResultOrigin::RejectWaitRetry,
+                outcome,
+            },
+            &merge_result_tx,
+        )
+        .await;
+
+    assert_eq!(disposition, MergeResultDisposition::AbortRun);
+    assert!(executor.run_fatal_abort.is_some());
+    let global_errors = {
+        let mut collected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ExecutionEvent::Error { message } = event {
+                collected.push(message);
+            }
+        }
+        collected
+    };
+    assert_eq!(
+        global_errors.len(),
+        1,
+        "an aborting run emits exactly one global Error: {global_errors:?}"
+    );
+    assert!(shared.read().await.global_invariants_hold());
 }
 
 #[tokio::test]
@@ -10643,14 +11326,9 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
     .await
     .or_fail("unexpected error");
 
-    assert!(
-        matches!(
-            result,
-            crate::orchestration::AcceptanceResult::CommandFailed { .. }
-        ),
-        "failing acceptance command should return CommandFailed, got {:?}",
-        result
-    );
+    let crate::orchestration::AcceptanceResult::CommandFailed { diagnostic, .. } = &result else {
+        panic!("failing acceptance command should return CommandFailed, got {result:?}");
+    };
     let report_path = repo_root.path().join("ACCEPTANCE_REPORT.json");
     assert!(
         !report_path.exists(),
@@ -10658,21 +11336,34 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
         report_path.display()
     );
 
-    let history = acceptance_history.lock().await;
-    let attempts = history
-        .get("change-a")
-        .expect("command-failure acceptance must be recorded in history");
-    assert_eq!(attempts.len(), 1);
-    assert!(!attempts[0].passed);
-    assert_eq!(attempts[0].exit_code, Some(42));
+    // The transport evidence lives only in the bounded latest-only diagnosis.
+    assert_eq!(diagnostic.exit_code, Some(42));
     assert!(
-        attempts[0]
+        diagnostic
             .stdout_tail
             .as_deref()
             .unwrap_or_default()
             .contains("command-failed-before-verdict"),
-        "acceptance history should retain command-failure stdout tail, got {:?}",
-        attempts[0].stdout_tail
+        "the command-recovery diagnosis must carry the stdout tail, got {:?}",
+        diagnostic.stdout_tail
+    );
+
+    // A command that never completed produced no verdict, so canonical
+    // Acceptance history — shared and agent-local — stays untouched. Otherwise
+    // the failed output would be replayed to the next reviewer as previous
+    // findings and would consume attempt numbering.
+    assert!(
+        acceptance_history.lock().await.get("change-a").is_none(),
+        "command failures must not enter shared canonical Acceptance history"
+    );
+    assert!(
+        agent.get_last_acceptance_attempt("change-a").is_none(),
+        "command failures must not enter agent-local canonical Acceptance history"
+    );
+    assert_eq!(
+        agent.next_acceptance_attempt_number("change-a"),
+        1,
+        "a command failure must not consume canonical attempt numbering"
     );
 }
 
@@ -11718,6 +12409,299 @@ async fn dispatch_scripted_repair_cycle(
     observed
 }
 
+/// Dispatch one change whose acceptance command *fails at command level* on the
+/// invocations listed in `failing_attempts`, and otherwise prints the recorded
+/// verdict for that invocation.
+///
+/// This is the production shape of Acceptance command recovery: the command
+/// queue already exhausted its transport retries, but the applied workspace is
+/// unchanged and clean.
+async fn dispatch_scripted_command_failure_cycle(
+    change_id: &str,
+    failing_attempts: &[u32],
+    verdicts: &[String],
+) -> ScriptedRepairDispatch {
+    dispatch_scripted_acceptance_failure_cycle(
+        change_id,
+        failing_attempts,
+        "acceptance transport crashed on attempt $n",
+        verdicts,
+    )
+    .await
+}
+
+/// Same scaffolding as [`dispatch_scripted_command_failure_cycle`], with the
+/// text a failing acceptance invocation writes to stderr under the caller's
+/// control so a failure can carry classified permission-denial evidence instead
+/// of an ordinary crash message.
+async fn dispatch_scripted_acceptance_failure_cycle(
+    change_id: &str,
+    failing_attempts: &[u32],
+    failure_stderr: &str,
+    verdicts: &[String],
+) -> ScriptedRepairDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    let state_dir = TempDir::new().or_fail("create scripted verdict state dir");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+
+    let verdict_dir = state_dir.path().join("verdicts");
+    std::fs::create_dir_all(&verdict_dir).or_fail("create verdict dir");
+    for (index, verdict) in verdicts.iter().enumerate() {
+        std::fs::write(
+            verdict_dir.join(format!("verdict-{}.json", index + 1)),
+            verdict,
+        )
+        .or_fail("write scripted verdict");
+    }
+    std::fs::write(
+        verdict_dir.join("verdict-last.json"),
+        verdicts.last().or_fail("at least one verdict"),
+    )
+    .or_fail("write trailing verdict");
+
+    let counter = state_dir.path().join("attempts").display().to_string();
+    let verdict_dir = verdict_dir.display().to_string();
+    let failing = failing_attempts
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(format!(
+            "sh -c \"sed 's/- \\[ \\]/- [x]/g' openspec/changes/{change_id}/tasks.md \
+             > openspec/changes/{change_id}/tasks.next \
+             && mv openspec/changes/{change_id}/tasks.next openspec/changes/{change_id}/tasks.md\""
+        )),
+        acceptance_command: Some(format!(
+            "sh -c 'n=$(cat \"{counter}\" 2>/dev/null || echo 0); n=$((n+1)); \
+             echo $n > \"{counter}\"; \
+             for f in {failing}; do \
+             if [ \"$f\" = \"$n\" ]; then \
+             echo \"{failure_stderr}\" >&2; exit 1; fi; done; \
+             verdict=\"{verdict_dir}/verdict-$n.json\"; \
+             [ -f \"$verdict\" ] || verdict=\"{verdict_dir}/verdict-last.json\"; cat \"$verdict\"'"
+        )),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch scripted command-failure cycle");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let workspace_path = workspace_base.path().join(format!("cflx-{change_id}"));
+    let mut observed = ScriptedRepairDispatch {
+        result,
+        workspace_path,
+        acceptance_invocations: 0,
+        apply_invocations: 0,
+        acceptance_error_logs: Vec::new(),
+        execution_hold: None,
+    };
+
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ExecutionEvent::AcceptanceStarted { change_id: id, .. } if id == change_id => {
+                observed.acceptance_invocations += 1;
+            }
+            ExecutionEvent::ApplyStarted { change_id: id, .. } if id == change_id => {
+                observed.apply_invocations += 1;
+            }
+            ExecutionEvent::ExecutionBlocked {
+                change_id: id,
+                blocker,
+            } if id == change_id => {
+                observed.execution_hold = Some(blocker);
+            }
+            ExecutionEvent::Log(log)
+                if matches!(log.level, crate::events::LogLevel::Error)
+                    && log.operation.as_deref() == Some("acceptance") =>
+            {
+                observed.acceptance_error_logs.push(log.message.clone());
+            }
+            _ => {}
+        }
+    }
+
+    observed
+}
+
+/// A recoverable Acceptance command failure re-runs only Acceptance against the
+/// same applied, clean workspace.
+#[tokio::test]
+async fn parallel_acceptance_command_failure_reruns_only_acceptance() {
+    let change_id = "parallel-cmd-recover";
+    let observed = dispatch_scripted_command_failure_cycle(
+        change_id,
+        &[1],
+        &["{\"acceptance\":\"pass\"}".to_string()],
+    )
+    .await;
+
+    assert_eq!(
+        observed.result.error, None,
+        "a recovered command failure must not fail the workspace"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 2,
+        "exactly one Acceptance-only retry follows the command failure"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "command recovery must never rerun Apply"
+    );
+    assert!(
+        observed.result.final_revision.is_some(),
+        "the recovered cycle proceeds to archive handoff"
+    );
+}
+
+/// Three consecutive command failures are terminal, and no fourth attempt runs.
+#[tokio::test]
+async fn parallel_acceptance_command_failure_exhausts_after_three_attempts() {
+    let change_id = "parallel-cmd-exhaust";
+    let observed = dispatch_scripted_command_failure_cycle(
+        change_id,
+        &[1, 2, 3, 4],
+        &["{\"acceptance\":\"pass\"}".to_string()],
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("exhausted command recovery is terminal");
+    assert!(
+        error.contains("3 consecutive attempts after 2 command-failure retries"),
+        "{error}"
+    );
+    assert!(
+        error.contains("acceptance transport crashed on attempt 3"),
+        "the terminal error carries the latest bounded diagnostics: {error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 3,
+        "no fourth command-failure attempt may start"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "the outer apply+acceptance cycle budget is untouched by command failures"
+    );
+}
+
+/// A completed non-command-failure invocation ends the consecutive sequence, so
+/// later failures form a fresh one with its own full budget.
+#[tokio::test]
+async fn parallel_completed_protocol_result_resets_acceptance_command_recovery() {
+    let change_id = "parallel-cmd-reset";
+    // CommandFailed, then a completed missing-verdict invocation, then three
+    // fresh command failures.
+    let observed = dispatch_scripted_command_failure_cycle(
+        change_id,
+        &[1, 3, 4, 5, 6],
+        &["status: still waiting for verification".to_string()],
+    )
+    .await;
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("the fresh sequence exhausts on its own third failure");
+    assert!(
+        error.contains("3 consecutive attempts after 2 command-failure retries"),
+        "{error}"
+    );
+    assert_eq!(
+        observed.acceptance_invocations, 5,
+        "one failure, one completed protocol result, then three fresh failures"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "neither command recovery nor protocol retry reruns Apply"
+    );
+}
+
+/// A permission/tool-policy denial observed by an invocation that never
+/// completed is still a denial: the classification survives the command-failure
+/// retry, so the unchanged repeat enters the existing non-terminal hold instead
+/// of spending the whole command-recovery budget.
+///
+/// Regression: command failures record no canonical Acceptance attempt, so
+/// reconstructing "the previous denial" from history alone always saw `None`
+/// and every repeat looked like a first observation.
+#[tokio::test]
+async fn parallel_repeated_acceptance_denial_holds_without_spending_command_recovery() {
+    let change_id = "parallel-cmd-denial";
+    let observed = dispatch_scripted_acceptance_failure_cycle(
+        change_id,
+        &[1, 2, 3, 4],
+        "Tool access denied: Bash(git push)",
+        &["{\"acceptance\":\"pass\"}".to_string()],
+    )
+    .await;
+
+    assert_eq!(
+        observed.acceptance_invocations, 2,
+        "the second unchanged denial holds instead of consuming the third attempt"
+    );
+    assert_eq!(
+        observed.apply_invocations, 1,
+        "a permission hold never reruns Apply"
+    );
+    assert_eq!(
+        observed.result.error, None,
+        "a permission hold is non-terminal, not a workspace failure"
+    );
+    let blocker = observed
+        .execution_hold
+        .as_ref()
+        .or_fail("the repeated denial must enter the existing non-terminal hold");
+    let summary = blocker.summary();
+    assert!(
+        summary.to_lowercase().contains("permission")
+            || summary.to_lowercase().contains("tool_access"),
+        "the hold must name the classified denial: {summary}"
+    );
+}
+
 /// A repair that only nudges an unrelated calibration constant must not buy
 /// another acceptance invocation.
 #[tokio::test]
@@ -12034,5 +13018,1411 @@ async fn serial_and_parallel_repeated_finding_stops_report_equivalent_diagnostic
             .get("stop_reason")
             .and_then(|value| value.as_str()),
         Some(crate::orchestration::acceptance::REPEATED_FINDING_REASON)
+    );
+}
+
+// === Parallel Apply hook wiring and typed iteration-limit propagation ===
+//
+// These drive `dispatch_change_to_workspace` end to end so the hook runner and
+// the reducer record are observed on the production path, not by calling
+// `execute_apply_in_workspace` with hand-built arguments.
+
+/// One dispatch driven with a scripted apply command and configured hooks.
+struct HookedDispatch {
+    result: WorkspaceResult,
+    /// Every hook invocation, in order, as `<hook> <apply_count>`.
+    hook_log: Vec<String>,
+    apply_invocations: u32,
+    shared_state: Arc<RwLock<OrchestratorState>>,
+}
+
+fn hook_entry(log: &Path, name: &str) -> crate::hooks::HookConfigValue {
+    crate::hooks::HookConfigValue::Full(crate::hooks::HookConfig {
+        command: format!(
+            "sh -c 'echo \"{name} $OPENSPEC_APPLY_COUNT\" >> {}'",
+            log.display()
+        ),
+        continue_on_failure: false,
+        timeout: 30,
+        git_commit_no_verify: false,
+        max_retries: 0,
+        retry_delay_secs: 0,
+    })
+}
+
+async fn dispatch_with_hooks(
+    change_id: &str,
+    apply_body: &str,
+    max_iterations: u32,
+    hook_log: &Path,
+) -> HookedDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(apply_body.to_string()),
+        acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS'".to_string()),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        max_iterations: Some(max_iterations),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.set_hooks(crate::hooks::HookRunner::new(
+        crate::hooks::HooksConfig {
+            pre_apply: Some(hook_entry(hook_log, "pre_apply")),
+            post_apply: Some(hook_entry(hook_log, "post_apply")),
+            on_error: Some(hook_entry(hook_log, "on_error")),
+            ..Default::default()
+        },
+        repo_dir.path(),
+    ));
+    let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        max_iterations,
+        ExecutionMode::Parallel,
+    )));
+    executor.set_shared_orchestrator_state(shared_state.clone());
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch hooked change");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let mut apply_invocations = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::ApplyOutput {
+            change_id: id,
+            iteration: Some(iteration),
+            ..
+        } = &event
+        {
+            if id == change_id {
+                apply_invocations = apply_invocations.max(*iteration);
+            }
+        }
+    }
+
+    HookedDispatch {
+        result,
+        hook_log: std::fs::read_to_string(hook_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+        apply_invocations,
+        shared_state,
+    }
+}
+
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn parallel_apply_runs_configured_hooks_across_command_failure_recovery() {
+    let change_id = "hooked-recovery";
+    let hook_dir = TempDir::new().or_fail("create hook log dir");
+    let hook_log = hook_dir.path().join("hooks.log");
+    let state_dir = TempDir::new().or_fail("create apply state dir");
+    let counter = state_dir.path().join("apply-attempts");
+
+    // Attempt 1 fails without touching tasks; attempt 2 completes them. The
+    // failure must reach `on_error` and must not reach `post_apply`.
+    let apply_body = format!(
+        "sh -c 'n=$(cat {counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {counter}; \
+         if [ $n = 1 ]; then echo apply-crash >&2; exit 3; fi; \
+         sed \"s/- \\[ \\]/- [x]/g\" openspec/changes/{change_id}/tasks.md > tasks.next \
+         && mv tasks.next openspec/changes/{change_id}/tasks.md'",
+        counter = counter.display(),
+        change_id = change_id,
+    );
+
+    let observed = dispatch_with_hooks(change_id, &apply_body, 5, &hook_log).await;
+
+    let count = |name: &str| {
+        observed
+            .hook_log
+            .iter()
+            .filter(|line| line.starts_with(name))
+            .count()
+    };
+
+    assert_eq!(
+        count("pre_apply"),
+        2,
+        "each authorized dispatch runs pre_apply: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        count("on_error"),
+        1,
+        "the failed attempt runs on_error exactly once: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        count("post_apply"),
+        1,
+        "only the attempt whose command completed is post_apply-eligible: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        observed.hook_log.first().map(String::as_str),
+        Some("pre_apply 1"),
+        "pre_apply must precede the first dispatch: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        observed.result.error, None,
+        "recovery must still complete the change"
+    );
+}
+
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn parallel_iteration_limit_is_preserved_as_a_typed_record_without_another_dispatch() {
+    let change_id = "hooked-ceiling";
+    let hook_dir = TempDir::new().or_fail("create hook log dir");
+    let hook_log = hook_dir.path().join("hooks.log");
+
+    // Never completes and never progresses: the ceiling is the only stop.
+    let observed = dispatch_with_hooks(
+        change_id,
+        "sh -c 'echo still-working; exit 1'",
+        2,
+        &hook_log,
+    )
+    .await;
+
+    assert_eq!(
+        observed.apply_invocations, 2,
+        "the ceiling must refuse the third dispatch"
+    );
+    assert_eq!(
+        observed
+            .hook_log
+            .iter()
+            .filter(|line| line.starts_with("pre_apply"))
+            .count(),
+        2,
+        "a refused dispatch runs no pre-dispatch hook: {:?}",
+        observed.hook_log
+    );
+
+    let state = observed.shared_state.read().await;
+    assert_eq!(
+        state.apply_iteration_limits().len(),
+        1,
+        "exactly one typed iteration-limit record crosses the parallel boundary"
+    );
+    let record = &state.apply_iteration_limits()[0];
+    assert_eq!(record.change_id, change_id);
+    assert_eq!(
+        (record.attempts, record.max),
+        (2, 2),
+        "the exact cumulative dispatch count must survive the boundary"
+    );
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("the ceiling stops the change with a diagnosis");
+    assert!(
+        error.contains("still-working") || error.contains("exit code"),
+        "the operator diagnosis must carry the latest actionable failure: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Explicit-intent boundary for preserved-workspace recovery.
+//
+// Repository evidence may prove that a workspace is recoverable; it may never
+// turn that evidence into an operator command. These tests fix the boundary
+// from both sides: an unrequested archived-dirty worktree stays invisible to
+// ordinary scheduling, and an explicitly requested one still recovers from the
+// same evidence.
+// ---------------------------------------------------------------------------
+
+/// Everything about a preserved workspace that execution would disturb.
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspaceEvidenceSnapshot {
+    head: String,
+    branch: String,
+    status: String,
+    index: String,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+async fn git_output(workspace_root: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace_root)
+        .output()
+        .await
+        .or_fail("run git evidence command");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn read_tracked_files(root: &Path, prefix: &Path, into: &mut Vec<(String, Vec<u8>)>) {
+    let mut entries: Vec<_> = std::fs::read_dir(root)
+        .or_fail("read workspace directory")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let relative = prefix.join(&name);
+        if path.is_dir() {
+            read_tracked_files(&path, &relative, into);
+        } else {
+            into.push((
+                relative.to_string_lossy().to_string(),
+                std::fs::read(&path).or_fail("read workspace file"),
+            ));
+        }
+    }
+}
+
+/// Capture the Git and file state a scheduler must not touch.
+async fn capture_workspace_evidence(workspace_root: &Path) -> WorkspaceEvidenceSnapshot {
+    let mut files = Vec::new();
+    read_tracked_files(workspace_root, Path::new(""), &mut files);
+    WorkspaceEvidenceSnapshot {
+        head: git_output(workspace_root, &["rev-parse", "HEAD"]).await,
+        branch: git_output(workspace_root, &["symbolic-ref", "--short", "HEAD"]).await,
+        status: git_output(workspace_root, &["status", "--porcelain"]).await,
+        index: git_output(workspace_root, &["diff", "--cached", "--name-status"]).await,
+        files,
+    }
+}
+
+/// Write a preserved workspace whose repository evidence is archived-dirty:
+/// the change directory has already moved under `openspec/changes/archive/`,
+/// and the archive commit is still incomplete.
+async fn write_archived_dirty_workspace(
+    workspace_root: &Path,
+    change_id: &str,
+    archive_leaf: &str,
+) {
+    init_git_repo(workspace_root).await;
+    let archive_dir = workspace_root
+        .join("openspec/changes/archive")
+        .join(archive_leaf);
+    std::fs::create_dir_all(&archive_dir).or_fail("create archived change dir");
+    std::fs::write(
+        archive_dir.join("proposal.md"),
+        format!("---\ndependencies:\n---\n# {change_id}\n"),
+    )
+    .or_fail("write archived proposal");
+    std::fs::write(
+        archive_dir.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Apply completed\n- [x] Archive move completed\n",
+    )
+    .or_fail("write archived tasks");
+    // The uncommitted report is the "commit incomplete" half of archived-dirty.
+    std::fs::write(
+        archive_dir.join("report.md"),
+        "# archive report pending commit\n",
+    )
+    .or_fail("leave archived workspace dirty");
+}
+
+/// The scheduler's analyzer callback shape.
+type AnalyzerFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::analyzer::AnalysisOutcome> + Send + 'a>,
+>;
+
+/// Analyzer stub that records exactly which changes production handed it.
+fn recording_analyzer(
+    captured: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+) -> impl for<'a> Fn(&'a [crate::openspec::Change], &'a [String], u32) -> AnalyzerFuture<'a> + Send + Sync
+{
+    move |changes: &[crate::openspec::Change], _in_flight: &[String], _iteration: u32| {
+        let order: Vec<String> = changes.iter().map(|change| change.id.clone()).collect();
+        captured
+            .lock()
+            .expect("analyzer input lock")
+            .push(order.clone());
+        Box::pin(async move {
+            crate::analyzer::AnalysisResult {
+                order,
+                dependencies: HashMap::new(),
+                groups: None,
+            }
+            .into()
+        })
+    }
+}
+
+/// The observed failure, in production order: one selected change, an
+/// all-change refresh, reconciliation, and analysis. The unselected
+/// archived-dirty worktree must reach none of them and must come out
+/// byte-identical.
+#[tokio::test]
+async fn unselected_archived_dirty_worktree_never_reaches_analysis_execution_or_git() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    write_change_proposal(repo_dir.path(), "fresh", &[]);
+    std::fs::write(
+        repo_dir
+            .path()
+            .join("openspec/changes/fresh")
+            .join("tasks.md"),
+        "## Implementation Tasks\n\n- [ ] Do the work\n",
+    )
+    .or_fail("write fresh tasks");
+
+    let stale_workspace = TempDir::new().or_fail("create stale workspace");
+    write_archived_dirty_workspace(stale_workspace.path(), "stale", "2026-06-02-stale").await;
+    let before = capture_workspace_evidence(stale_workspace.path()).await;
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    // The worktree catalog knows about `stale`; that knowledge must stay
+    // observability rather than becoming intent.
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("stale", stale_workspace.path().to_path_buf()),
+    );
+
+    // Production startup order: shared state is initialised with the selected
+    // targets only, and each selected target gets explicit queue intent.
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["fresh".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("fresh".to_string()));
+        // Then the initial all-change refresh arrives, carrying both IDs.
+        guard.apply_execution_event(&ExecutionEvent::ChangesRefreshed {
+            changes: vec![make_test_change("fresh"), make_test_change("stale")],
+            rejected_changes: Vec::new(),
+            committed_change_ids: HashSet::from(["fresh".to_string(), "stale".to_string()]),
+            uncommitted_file_change_ids: HashSet::new(),
+            worktree_change_ids: HashSet::from(["stale".to_string()]),
+            worktree_paths: HashMap::from([(
+                "stale".to_string(),
+                stale_workspace.path().to_path_buf(),
+            )]),
+            worktree_not_ahead_ids: HashSet::new(),
+            merge_wait_ids: HashSet::new(),
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    {
+        let guard = shared.read().await;
+        assert!(
+            guard.is_in_snapshot("stale"),
+            "refresh may register `stale` for display"
+        );
+        assert_eq!(
+            guard.queued_change_ids(),
+            vec!["fresh".to_string()],
+            "refresh must not grant `stale` ordinary queue eligibility"
+        );
+        assert_eq!(guard.display_status("stale"), "not queued");
+        assert!(guard.merge_wait_change_ids().is_empty());
+        assert!(guard.resolve_wait_change_ids().is_empty());
+        assert!(guard.reject_wait_change_ids().is_empty());
+    }
+
+    let mut queued = vec![make_test_change("fresh")];
+    let mut in_flight = HashSet::new();
+    let reconciliation = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+
+    assert_eq!(
+        reconciliation.total_added(),
+        0,
+        "worktree discovery must not append candidates"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fresh"],
+        "only the selected change may survive reconciliation"
+    );
+
+    // Dependency analysis runs on exactly what reconciliation produced. Zero
+    // parallelism keeps this test at the analysis boundary: capacity, not
+    // eligibility, is what stops dispatch here.
+    let analyzer_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let analyzer = recording_analyzer(analyzer_inputs.clone());
+    let mut join_set = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            max_parallelism: 0,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::Initial,
+            analyzer: &analyzer,
+            semaphore: Arc::new(Semaphore::new(1)),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("analysis must succeed");
+
+    let captured = analyzer_inputs.lock().expect("analyzer input lock").clone();
+    assert_eq!(
+        captured,
+        vec![vec!["fresh".to_string()]],
+        "the analyzer must never be handed an unrequested worktree"
+    );
+
+    while let Ok(event) = rx.try_recv() {
+        let touched_stale = match &event {
+            ExecutionEvent::ApplyStarted { change_id, .. }
+            | ExecutionEvent::ApplyCompleted { change_id, .. }
+            | ExecutionEvent::AcceptanceStarted { change_id, .. }
+            | ExecutionEvent::AcceptanceCompleted { change_id, .. }
+            | ExecutionEvent::ArchiveStarted { change_id, .. }
+            | ExecutionEvent::ResolveStarted { change_id, .. }
+            | ExecutionEvent::ResolveCompleted { change_id, .. }
+            | ExecutionEvent::MergeCompleted { change_id, .. } => change_id == "stale",
+            ExecutionEvent::ProcessingStarted(change_id)
+            | ExecutionEvent::ChangeArchived(change_id) => change_id == "stale",
+            _ => false,
+        };
+        assert!(
+            !touched_stale,
+            "unrequested worktree must not emit lifecycle events: {event:?}"
+        );
+    }
+
+    assert_eq!(
+        capture_workspace_evidence(stale_workspace.path()).await,
+        before,
+        "an excluded workspace must be byte-identical afterwards"
+    );
+
+    // Once the selected change is done, the still-present archived-dirty
+    // residue is not current-run work, so the run drains instead of being held
+    // open by a workspace nobody asked for.
+    queued.clear();
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::RemoveFromQueue("fresh".to_string()));
+    }
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .total_added(),
+        0
+    );
+    assert!(
+        executor
+            .should_exit_when_idle(join_set.is_empty(), &queued, &in_flight)
+            .await,
+        "residue must not keep an otherwise drained run alive"
+    );
+}
+
+/// An explicitly requested archived-dirty change recovers from the same
+/// evidence the unselected one was refused for, and resumes from the archive
+/// state already on disk rather than rerunning apply.
+#[tokio::test]
+async fn explicit_start_target_recovers_its_archived_dirty_workspace() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    write_archived_dirty_workspace(workspace_dir.path(), "stale", "2026-06-02-stale").await;
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("stale", workspace_dir.path().to_path_buf()),
+    );
+
+    // Exactly what `initialize_parallel_shared_state` does for a TUI or remote
+    // Start, and what `RunControlService::start_marked` does for the shared
+    // boundary: the resolved targets become reducer queue intent.
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["stale".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("stale".to_string()));
+    executor.set_shared_orchestrator_state(shared);
+
+    let mut queued = Vec::new();
+    let outcome = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+        .await;
+
+    assert_eq!(outcome.repair_added, 1);
+    assert_eq!(outcome.queued_added, 0);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, "stale");
+    assert_eq!(
+        (queued[0].completed_tasks, queued[0].total_tasks),
+        (2, 2),
+        "the resume phase must be derived from archived repository evidence, not from a rerun"
+    );
+
+    let mut saw_repair_diagnostic = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(log) = event {
+            if log.message.contains("archived_dirty_repair_candidate") {
+                saw_repair_diagnostic = true;
+            }
+        }
+    }
+    assert!(saw_repair_diagnostic);
+}
+
+/// Revocation is immediate and rediscovery is impossible: neither the preserved
+/// worktree nor a stale dynamic-queue entry can reacquire a removed or dequeued
+/// change, and only an explicit requeue brings it back.
+#[tokio::test]
+async fn queue_revocation_blocks_worktree_and_dynamic_reacquisition_until_explicit_requeue() {
+    use crate::tui::queue::DynamicQueue;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    write_archived_dirty_workspace(workspace_dir.path(), "stale", "2026-06-02-stale").await;
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("stale", workspace_dir.path().to_path_buf()),
+    );
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    executor.set_dynamic_queue(dynamic_queue.clone());
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["stale".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("stale".to_string()));
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let mut queued = Vec::new();
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+            .await
+            .repair_added,
+        1,
+        "explicit queue intent enables archived-dirty recovery"
+    );
+
+    // Removal revokes ordinary eligibility. Repeated reconciliation over the
+    // still-present worktree must not bring it back.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::RemoveFromQueue("stale".to_string()));
+    let mut queued_after_removal = Vec::new();
+    for _ in 0..3 {
+        assert_eq!(
+            executor
+                .reconcile_queued_candidates_from_shared_state(
+                    &mut queued_after_removal,
+                    &HashSet::new()
+                )
+                .await
+                .total_added(),
+            0,
+            "a preserved worktree must not reacquire a removed change"
+        );
+    }
+    assert!(queued_after_removal.is_empty());
+
+    // Stop-and-dequeue leaves the dynamic-queue entry behind; current reducer
+    // intent, not the leftover hint, decides.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("stale".to_string()));
+    dynamic_queue.push("stale".to_string()).await;
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::DequeueChange("stale".to_string()));
+
+    let mut reason = ReanalysisReason::Initial;
+    let ingested = executor
+        .check_dynamic_queue_and_add_changes(
+            &mut queued_after_removal,
+            &HashSet::new(),
+            &mut reason,
+        )
+        .await;
+    assert!(!ingested, "a dequeued change must not be ingested");
+    assert!(queued_after_removal.is_empty());
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(
+                &mut queued_after_removal,
+                &HashSet::new()
+            )
+            .await
+            .total_added(),
+        0,
+        "dequeue must survive later reconciliation passes"
+    );
+
+    // Explicit requeue is the only ordinary way back.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("stale".to_string()));
+    let mut queued_after_requeue = Vec::new();
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(
+                &mut queued_after_requeue,
+                &HashSet::new()
+            )
+            .await
+            .repair_added,
+        1,
+        "explicit requeue restores archived-dirty recovery"
+    );
+    assert_eq!(queued_after_requeue[0].id, "stale");
+}
+
+/// Membership in the scheduler-local candidate list is history, not intent: it
+/// proves the change was admitted on some earlier pass. A candidate that was
+/// added while it carried queue intent, and is then revoked under a perfectly
+/// readable reducer, must stop being ordinary work immediately — it leaves the
+/// local list, stays out of the analyzer's input, is refused by dispatch
+/// selection even when a stale analysis order still names it, and returns only
+/// after an explicit `AddToQueue`. A second candidate keeps real intent
+/// throughout, so the run stays live and the refusal cannot be an artifact of a
+/// blocked-only pass.
+#[tokio::test]
+async fn revoked_queue_intent_stops_an_already_added_candidate_before_analysis_and_dispatch() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    for change_id in ["keeper", "revoked"] {
+        write_change_proposal(repo_dir.path(), change_id, &[]);
+        std::fs::write(
+            repo_dir
+                .path()
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .or_fail("write change tasks");
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["keeper".to_string(), "revoked".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        guard.apply_command(ReducerCommand::AddToQueue("keeper".to_string()));
+        guard.apply_command(ReducerCommand::AddToQueue("revoked".to_string()));
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    // Both candidates enter the local list the ordinary way, while both still
+    // carry accepted queue intent.
+    let mut queued = Vec::new();
+    let in_flight = HashSet::new();
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .queued_added,
+        2,
+        "both explicitly queued changes are admitted"
+    );
+    assert_eq!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::DispatchableApply),
+        "this fixture must start from a genuinely dispatchable candidate"
+    );
+
+    // Revocation happens with the reducer fully readable: nothing about lock
+    // contention or an unknown ID can explain what follows.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::RemoveFromQueue("revoked".to_string()));
+    assert!(
+        queued.iter().any(|change| change.id == "revoked"),
+        "the revoked candidate is deliberately still on the scheduler-local list"
+    );
+
+    let classification = executor.classify_queued_work(&queued, &in_flight).await;
+    assert_eq!(
+        classification.class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
+        "a readable reducer that no longer admits the change makes it non-dispatchable"
+    );
+    assert_eq!(
+        classification
+            .dispatchable
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keeper"],
+        "only current reducer intent stays dispatchable"
+    );
+
+    // Dispatch selection refuses it too, even when handed an order computed
+    // before the revocation.
+    let stale_order = crate::analyzer::AnalysisResult {
+        order: vec!["keeper".to_string(), "revoked".to_string()],
+        dependencies: HashMap::new(),
+        groups: None,
+    };
+    assert_eq!(
+        executor
+            .select_changes_for_dispatch(&stale_order, 4, &in_flight)
+            .await,
+        vec!["keeper".to_string()],
+        "a stale analysis order must not carry a revoked candidate into dispatch"
+    );
+
+    // Reconciliation drops it from the local list, so the analyzer is never
+    // handed work nobody wants any more.
+    let reconciliation = executor
+        .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+        .await;
+    assert_eq!(reconciliation.revoked_removed, 1);
+    assert_eq!(reconciliation.total_added(), 0);
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keeper"],
+        "revoked work leaves the scheduler-local candidate list"
+    );
+
+    let analyzer_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let analyzer = recording_analyzer(analyzer_inputs.clone());
+    let mut in_flight_for_dispatch = HashSet::new();
+    let mut join_set = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight_for_dispatch,
+            // Zero capacity keeps this at the analysis boundary: eligibility,
+            // not slots, is what must exclude the revoked candidate.
+            max_parallelism: 0,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::Initial,
+            analyzer: &analyzer,
+            semaphore: Arc::new(Semaphore::new(1)),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("analysis must succeed");
+    assert_eq!(
+        analyzer_inputs.lock().expect("analyzer input lock").clone(),
+        vec![vec!["keeper".to_string()]],
+        "a revoked candidate must never reach the analyzer"
+    );
+    assert!(
+        in_flight_for_dispatch.is_empty() && join_set.is_empty(),
+        "nothing may be dispatched for a revoked candidate"
+    );
+
+    // Explicit requeue is the only way back, and it works on the very next pass.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("revoked".to_string()));
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .queued_added,
+        1,
+        "explicit requeue restores ordinary eligibility"
+    );
+    assert_eq!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::DispatchableApply),
+        "a requeued candidate is dispatchable again"
+    );
+    assert!(
+        executor
+            .select_changes_for_dispatch(&stale_order, 4, &in_flight)
+            .await
+            .contains(&"revoked".to_string()),
+        "dispatch selection admits the requeued candidate again"
+    );
+
+    // Stop-and-dequeue revokes the same way, and `dequeued` outlives a refresh.
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::DequeueChange("revoked".to_string()));
+    assert_eq!(
+        executor
+            .classify_queued_work(&queued, &in_flight)
+            .await
+            .class_for("revoked"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
+        "a dequeued candidate is non-dispatchable for the same reason"
+    );
+    assert_eq!(
+        executor
+            .select_changes_for_dispatch(&stale_order, 4, &in_flight)
+            .await,
+        vec!["keeper".to_string()],
+        "dequeue keeps the candidate out of dispatch selection"
+    );
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .revoked_removed,
+        1,
+        "dequeued work leaves the scheduler-local candidate list too"
+    );
+}
+
+/// A dynamic queue entry is a wake-up hint, never intent. An ID the reducer has
+/// never seen carries no intent at all, so the catalog must not be allowed to
+/// turn it into work: it must not enter the queued candidates and must never
+/// reach the analyzer.
+#[tokio::test]
+async fn reducer_unknown_dynamic_hint_never_enters_analysis_or_dispatch() {
+    use crate::tui::queue::DynamicQueue;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    // Both changes are loadable from the catalog. Only reducer intent differs,
+    // so a refusal here can only come from the intent gate.
+    for change_id in ["selected", "unknown-to-reducer"] {
+        write_change_proposal(repo_dir.path(), change_id, &[]);
+        std::fs::write(
+            repo_dir
+                .path()
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .or_fail("write change tasks");
+    }
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(
+        repo_dir.path().to_path_buf(),
+        create_test_config(),
+        Some(tx),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec!["selected".to_string()],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    shared
+        .write()
+        .await
+        .apply_command(ReducerCommand::AddToQueue("selected".to_string()));
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    assert!(dynamic_queue.push("unknown-to-reducer".to_string()).await);
+
+    assert!(
+        !shared
+            .read()
+            .await
+            .is_ordinary_queue_eligible("unknown-to-reducer"),
+        "an ID the reducer never saw carries no ordinary queue intent"
+    );
+
+    let mut queued = vec![make_test_change("selected")];
+    let mut in_flight = HashSet::new();
+    let mut reason = ReanalysisReason::Initial;
+    let ingested = executor
+        .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+        .await;
+
+    assert!(
+        !ingested,
+        "a reducer-unknown hint must not change the queued candidates"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["selected"],
+        "only the explicitly queued change may survive ingestion"
+    );
+    assert_eq!(reason, ReanalysisReason::Initial);
+
+    // Analysis runs on exactly what ingestion produced.
+    let analyzer_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let analyzer = recording_analyzer(analyzer_inputs.clone());
+    let mut join_set = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    executor
+        .perform_reanalysis_and_dispatch(ReanalysisDispatchContext {
+            queued: &mut queued,
+            in_flight: &mut in_flight,
+            // Zero capacity keeps this at the analysis boundary: eligibility,
+            // not slots, is what must exclude the hint.
+            max_parallelism: 0,
+            iteration: 1,
+            reanalysis_reason: ReanalysisReason::Initial,
+            analyzer: &analyzer,
+            semaphore: Arc::new(Semaphore::new(1)),
+            join_set: &mut join_set,
+            cleanup_guard: &mut cleanup_guard,
+        })
+        .await
+        .or_fail("analysis must succeed");
+
+    assert_eq!(
+        analyzer_inputs.lock().expect("analyzer input lock").clone(),
+        vec![vec!["selected".to_string()]],
+        "the analyzer must never be handed a reducer-unknown hint"
+    );
+    assert!(
+        in_flight.is_empty() && join_set.is_empty(),
+        "nothing may be dispatched for a reducer-unknown hint"
+    );
+
+    let mut refused_for_missing_intent = false;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::Log(entry) = &event {
+            assert!(
+                !entry
+                    .message
+                    .contains("Dynamically added to parallel execution: unknown-to-reducer"),
+                "a reducer-unknown hint must never be admitted"
+            );
+            if entry.message.contains(
+                "Ignoring stale queue entry without current queue intent: unknown-to-reducer",
+            ) {
+                refused_for_missing_intent = true;
+            }
+        }
+    }
+    assert!(
+        refused_for_missing_intent,
+        "the refusal must be reported as missing queue intent, not as a catalog miss"
+    );
+}
+
+/// The reducer is the only authority on ordinary queue intent, so a snapshot it
+/// cannot hand out right now must fail closed. A hint observed while the shared
+/// write lock is held may not be admitted, and classification may not read the
+/// resulting empty wait sets as "nothing is waiting" and dispatch.
+#[tokio::test]
+async fn dynamic_hint_and_classification_fail_closed_under_reducer_lock_contention() {
+    use crate::tui::queue::DynamicQueue;
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    for change_id in ["revoked", "queued-elsewhere", "merge-waiting"] {
+        write_change_proposal(repo_dir.path(), change_id, &[]);
+        std::fs::write(
+            repo_dir
+                .path()
+                .join("openspec/changes")
+                .join(change_id)
+                .join("tasks.md"),
+            "## Implementation Tasks\n\n- [ ] Do the work\n",
+        )
+        .or_fail("write change tasks");
+    }
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            "revoked".to_string(),
+            "queued-elsewhere".to_string(),
+            "merge-waiting".to_string(),
+        ],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        // `revoked` was queued and then stopped-and-dequeued, which leaves the
+        // wake-up hint behind because `DequeueChange` does not drain the queue.
+        guard.apply_command(ReducerCommand::AddToQueue("revoked".to_string()));
+        guard.apply_command(ReducerCommand::DequeueChange("revoked".to_string()));
+        // `queued-elsewhere` carries real, current queue intent.
+        guard.apply_command(ReducerCommand::AddToQueue("queued-elsewhere".to_string()));
+        // A manual merge wait is reducer-owned waiting work that contention
+        // must not erase into "dispatchable".
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "merge-waiting".to_string(),
+            reason: "manual merge required".to_string(),
+            auto_resumable: false,
+        });
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    let dynamic_queue = Arc::new(DynamicQueue::new());
+    executor.set_dynamic_queue(dynamic_queue.clone());
+    assert!(dynamic_queue.push("revoked".to_string()).await);
+    assert!(dynamic_queue.push("queued-elsewhere".to_string()).await);
+
+    let mut queued: Vec<crate::openspec::Change> = Vec::new();
+    let in_flight = HashSet::new();
+    let mut reason = ReanalysisReason::Initial;
+
+    {
+        // Hold the shared write lock for the whole ingestion and classification
+        // pass, so every `try_read` inside them fails.
+        let _contended = shared.write().await;
+
+        let ingested = executor
+            .check_dynamic_queue_and_add_changes(&mut queued, &in_flight, &mut reason)
+            .await;
+        assert!(
+            !ingested,
+            "no hint may be ingested while reducer intent is unreadable"
+        );
+        assert!(
+            queued.is_empty(),
+            "contention must not admit hints from the catalog"
+        );
+        assert_eq!(reason, ReanalysisReason::Initial);
+
+        // Reconciliation is the other candidate source and already fails closed.
+        assert_eq!(
+            executor
+                .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+                .await
+                .total_added(),
+            0,
+            "reconciliation must add nothing while the reducer is unreadable"
+        );
+
+        // Classification over an already-added candidate must not turn an
+        // unreadable snapshot into "no wait state, therefore dispatchable".
+        let contended_classification = executor
+            .classify_queued_work(
+                std::slice::from_ref(&make_test_change("merge-waiting")),
+                &in_flight,
+            )
+            .await;
+        assert!(
+            contended_classification.dispatchable.is_empty(),
+            "an unreadable reducer snapshot must not produce dispatchable work"
+        );
+        assert_eq!(
+            contended_classification.class_for("merge-waiting"),
+            Some(crate::parallel::queue_state::QueuedWorkClass::CandidateUnavailable),
+            "a candidate whose intent cannot be read is waiting, never dispatchable"
+        );
+        assert!(
+            contended_classification.is_blocked_only(),
+            "a contended pass must be blocked-only so analysis is skipped"
+        );
+    }
+
+    // Failing closed costs at most one wake-up: once the reducer is readable,
+    // real intent still arrives through reconciliation, and the revoked hint
+    // stays out.
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &in_flight)
+            .await
+            .queued_added,
+        1,
+        "genuine reducer intent is recovered on the next readable pass"
+    );
+    assert_eq!(
+        queued
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["queued-elsewhere"],
+        "only the change with current reducer queue intent comes back"
+    );
+
+    let readable_classification = executor
+        .classify_queued_work(
+            std::slice::from_ref(&make_test_change("merge-waiting")),
+            &in_flight,
+        )
+        .await;
+    assert!(
+        readable_classification.dispatchable.is_empty(),
+        "the reducer-owned merge wait is visible again and still blocks dispatch"
+    );
+    assert_eq!(
+        readable_classification.class_for("merge-waiting"),
+        Some(crate::parallel::queue_state::QueuedWorkClass::ManualMergeWait),
+        "a readable snapshot reports the real wait lane instead of contention"
+    );
+}
+
+/// Reducer-owned lane intent is consumable on its own: an empty ordinary queue
+/// still leaves `ResolveWait` and `RejectWait` visible to the scheduler.
+#[tokio::test]
+async fn empty_ordinary_queue_still_exposes_resolve_and_reject_lane_intent() {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_dir = TempDir::new().or_fail("create temp workspace");
+    write_archived_dirty_workspace(workspace_dir.path(), "residue", "2026-06-02-residue").await;
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.workspace_manager = Box::new(
+        TestWorkspaceManager::new(Arc::new(AtomicUsize::new(0)))
+            .with_existing_workspace("residue", workspace_dir.path().to_path_buf()),
+    );
+
+    let shared = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![
+            "lane-owner".to_string(),
+            "resolver".to_string(),
+            "rejector".to_string(),
+        ],
+        1,
+        ExecutionMode::Parallel,
+    )));
+    {
+        let mut guard = shared.write().await;
+        // One change owns the single base-mutating lane, so both retry lanes park.
+        guard.apply_execution_event(&ExecutionEvent::ResolveStarted {
+            change_id: "lane-owner".to_string(),
+            command: "resolve".to_string(),
+        });
+        guard.apply_execution_event(&ExecutionEvent::MergeDeferred {
+            change_id: "resolver".to_string(),
+            reason: "base has unresolved conflicts".to_string(),
+            auto_resumable: true,
+        });
+        guard.mark_reject_wait("rejector");
+    }
+    executor.set_shared_orchestrator_state(shared.clone());
+
+    {
+        let guard = shared.read().await;
+        assert!(
+            guard.queued_change_ids().is_empty(),
+            "this fixture must exercise lane intent with an empty ordinary queue"
+        );
+        assert_eq!(
+            guard.resolve_wait_change_ids(),
+            vec!["resolver".to_string()]
+        );
+        assert_eq!(guard.reject_wait_change_ids(), vec!["rejector".to_string()]);
+    }
+
+    let mut queued = Vec::new();
+    assert_eq!(
+        executor
+            .reconcile_queued_candidates_from_shared_state(&mut queued, &HashSet::new())
+            .await
+            .total_added(),
+        0,
+        "lane intent is not ordinary queued work, and residue is not intent at all"
+    );
+
+    executor.sync_resolve_wait_from_shared_state_nonblocking();
+    assert!(
+        executor.has_resolve_wait(),
+        "resolve-lane intent must remain independently consumable"
+    );
+    executor.retry_deferred_rejection_reviews().await;
+    assert!(
+        !executor.reject_wait_changes.is_empty() || executor.manual_resolve_active() > 0,
+        "reject-lane intent must remain reducer-owned and visible"
+    );
+}
+
+/// CLI explicit targets enter the same scheduler contract the other frontends
+/// use: the requested IDs become the initial candidate vector, and an unrelated
+/// managed worktree that is perfectly recoverable stays out because nobody
+/// asked for it.
+#[tokio::test]
+async fn cli_explicit_targets_enter_the_initial_candidate_contract_without_unrelated_worktrees() {
+    use crate::orchestration::target_resolution::{ExplicitTargetPlan, TargetResolutionOptions};
+
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    init_git_repo(repo_dir.path()).await;
+    write_change_proposal(repo_dir.path(), "alpha", &[]);
+    std::fs::write(
+        repo_dir
+            .path()
+            .join("openspec/changes/alpha")
+            .join("tasks.md"),
+        "## Implementation Tasks\n\n- [ ] Do the work\n",
+    )
+    .or_fail("write alpha tasks");
+    Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git add alpha");
+    Command::new("git")
+        .args(["commit", "-m", "Add alpha"])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("git commit alpha");
+
+    // A real cflx-managed worktree for an unrequested change, left archived-dirty.
+    let worktree_root = TempDir::new().or_fail("create worktree root");
+    let beta_path = worktree_root.path().join("beta");
+    Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            "beta",
+            &beta_path.to_string_lossy(),
+            "HEAD",
+        ])
+        .current_dir(repo_dir.path())
+        .output()
+        .await
+        .or_fail("create beta worktree");
+    std::fs::remove_dir_all(beta_path.join("openspec/changes/alpha"))
+        .or_fail("clear unrelated active change in beta worktree");
+    let beta_archive = beta_path.join("openspec/changes/archive/2026-06-02-beta");
+    std::fs::create_dir_all(&beta_archive).or_fail("create beta archive dir");
+    std::fs::write(
+        beta_archive.join("proposal.md"),
+        "---\ndependencies:\n---\n# beta\n",
+    )
+    .or_fail("write beta archived proposal");
+    std::fs::write(
+        beta_archive.join("tasks.md"),
+        "## Implementation Tasks\n\n- [x] Apply completed\n- [x] Archive move completed\n",
+    )
+    .or_fail("write beta archived tasks");
+
+    let active =
+        crate::openspec::list_changes_native_from(repo_dir.path()).or_fail("list active changes");
+
+    let mut executor =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    executor.set_explicit_target_plan(ExplicitTargetPlan::new(
+        vec!["alpha".to_string()],
+        "main".to_string(),
+        TargetResolutionOptions::default(),
+    ));
+    let targeted = executor
+        .apply_explicit_target_plan(active.clone())
+        .await
+        .or_fail("resolve CLI explicit targets");
+    assert_eq!(
+        targeted
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha"],
+        "an unrequested managed worktree must not enter the initial candidate vector"
+    );
+
+    // The exclusion is about intent, not capability: requesting `beta` resolves
+    // it from the very workspace that was ignored above.
+    let mut recovering =
+        ParallelExecutor::new(repo_dir.path().to_path_buf(), create_test_config(), None);
+    recovering.set_explicit_target_plan(ExplicitTargetPlan::new(
+        vec!["beta".to_string()],
+        "main".to_string(),
+        TargetResolutionOptions::default(),
+    ));
+    let recovered = recovering
+        .apply_explicit_target_plan(active)
+        .await
+        .or_fail("resolve explicit resumable target");
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|change| change.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta"],
+        "an explicitly requested archived-dirty workspace is still recoverable"
     );
 }

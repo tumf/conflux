@@ -264,7 +264,7 @@ mod tests {
     use super::*;
     use crate::openspec::{Change, ProposalMetadata};
     use crate::tui::events::OrchestratorEvent;
-    use crate::tui::types::AppMode;
+    use crate::tui::types::AppExecutionMode;
     use std::collections::HashMap;
 
     fn create_test_change(id: &str, completed: u32, total: u32) -> Change {
@@ -364,13 +364,13 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.current_change = Some("test-change".to_string());
         app.changes[0].selected = true;
 
         app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
 
-        assert_eq!(app.mode, AppMode::Running);
+        assert_eq!(app.execution_mode, AppExecutionMode::Running);
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
@@ -383,12 +383,12 @@ mod tests {
         let changes = vec![create_test_change("test-change", 0, 1)];
         let mut app = AppState::new(changes);
 
-        app.mode = AppMode::Select;
+        app.execution_mode = AppExecutionMode::Select;
         app.changes[0].selected = true;
 
         app.handle_processing_error("test-change".to_string(), "Test error message".to_string());
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
         let change = app.changes.iter().find(|c| c.id == "test-change").unwrap();
         assert_eq!(change.display_status_cache, "error");
         assert!(!change.selected);
@@ -598,7 +598,7 @@ mod tests {
             guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
         }
         app.set_shared_state(shared.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.clear_resolving();
 
         let deferred = crate::events::ExecutionEvent::MergeDeferred {
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn manual_deferral_before_resolve_started_clears_optimistic_reservation() {
         let mut app = AppState::new(vec![create_test_change("change-a", 0, 1)]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.clear_resolving();
@@ -861,7 +861,7 @@ mod tests {
             create_test_change("change-a", 0, 1),
             create_test_change("change-b", 0, 1),
         ]);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.changes[1].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
@@ -902,7 +902,7 @@ mod tests {
             guard.apply_observation("change-a", WorkspaceObservation::WorkspaceArchived);
         }
         app.set_shared_state(shared.clone());
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "merge wait".to_string();
         app.cursor_index = 0;
         app.clear_resolving();
@@ -959,12 +959,141 @@ mod tests {
     fn resolve_failed_transitions_to_select_when_no_active() {
         let changes = vec![create_test_change("change-a", 3, 3)];
         let mut app = AppState::new(changes);
-        app.mode = AppMode::Running;
+        app.execution_mode = AppExecutionMode::Running;
         app.changes[0].display_status_cache = "resolving".to_string();
         app.set_resolving("__active__");
 
         app.handle_resolve_failed("change-a".to_string(), "conflict".to_string());
 
-        assert_eq!(app.mode, AppMode::Select);
+        assert_eq!(app.execution_mode, AppExecutionMode::Select);
+    }
+
+    /// The bounded-exhaustion diagnostic the conflict layer actually emits.
+    ///
+    /// Built from the producer's own helper rather than a hand-copied string, so
+    /// these regressions cannot drift away from the real wording.
+    fn exhaustion_detail() -> String {
+        crate::parallel::resolve_failure_detail(
+            3,
+            crate::parallel::ResolveFailureClassification::UnresolvedConflict,
+            "conflicts still present after merge resolution attempt: a.rs",
+        )
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// A bounded post-archive resolve exhaustion arrives as the real event
+    /// sequence — presentation telemetry plus one change-scoped `ResolveFailed`.
+    /// The change goes back to `merge wait` for explicit retry, the diagnostic
+    /// keeps `alpha` as structured identity, and the run stays `Running` because
+    /// other work is still active.
+    #[test]
+    fn exhausted_post_archive_resolve_stays_change_scoped_and_keeps_running() {
+        let changes = vec![
+            create_test_change("alpha", 3, 3),
+            create_test_change("beta", 0, 1),
+        ];
+        let mut app = AppState::new(changes);
+        app.execution_mode = AppExecutionMode::Running;
+        // `beta` is the other active change that must keep the run alive.
+        app.current_change = Some("beta".to_string());
+        if let Some(change) = app.changes.iter_mut().find(|c| c.id == "beta") {
+            change.set_display_status_cache("applying");
+        }
+
+        let detail = exhaustion_detail();
+        app.handle_orchestrator_event(OrchestratorEvent::ConflictResolutionFailed {
+            error: detail.clone(),
+        });
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "presentation telemetry must not change execution mode"
+        );
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: detail,
+        });
+
+        let alpha = app
+            .changes
+            .iter()
+            .find(|c| c.id == "alpha")
+            .expect("alpha row");
+        assert_eq!(alpha.display_status_cache, "merge wait");
+        assert_ne!(
+            app.execution_mode,
+            AppExecutionMode::Error,
+            "a change-local merge failure must never become a global TUI error"
+        );
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Running,
+            "the run stays Running while other work is active"
+        );
+        assert_eq!(
+            change_ids_for_message(&app, "Failed to resolve merge for 'alpha'"),
+            vec![Some("alpha".to_string())],
+            "the failure diagnostic must retain structured change identity"
+        );
+    }
+
+    /// A run-fatal global Error is still fatal. Change-local suppression must not
+    /// downgrade the one event that means the run was actually invalidated.
+    #[test]
+    fn run_fatal_global_error_still_enters_error_mode() {
+        let mut app = AppState::new(vec![create_test_change("alpha", 3, 3)]);
+        app.execution_mode = AppExecutionMode::Running;
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: exhaustion_detail(),
+        });
+        assert_ne!(app.execution_mode, AppExecutionMode::Error);
+
+        app.handle_orchestrator_event(OrchestratorEvent::Error {
+            message: "Background merge failed for 'alpha' (workspace 'ws-alpha'): base branch could not be identified".to_string(),
+        });
+
+        assert_eq!(
+            app.execution_mode,
+            AppExecutionMode::Error,
+            "a run-fatal outcome must still stop the frontend"
+        );
+    }
+
+    /// A finite `CompletedWithErrors` boundary report is a warning plus the
+    /// existing terminal transition — never a success message and never Error.
+    #[test]
+    fn finite_completion_with_errors_is_not_fatal_and_keeps_retry_available() {
+        let mut app = AppState::new(vec![create_test_change("alpha", 3, 3)]);
+        app.execution_mode = AppExecutionMode::Running;
+
+        app.handle_orchestrator_event(OrchestratorEvent::ResolveFailed {
+            change_id: "alpha".to_string(),
+            error: exhaustion_detail(),
+        });
+        app.handle_orchestrator_event(OrchestratorEvent::Log(LogEntry::warn(
+            "Processing completed with errors".to_string(),
+        )));
+        app.handle_orchestrator_event(OrchestratorEvent::AllCompleted);
+
+        assert_ne!(app.execution_mode, AppExecutionMode::Error);
+        assert!(
+            !app.logs
+                .iter()
+                .any(|entry| entry.message.contains("All parallel changes completed")),
+            "no success completion message may accompany an unresolved change failure"
+        );
+        let alpha = app
+            .changes
+            .iter()
+            .find(|c| c.id == "alpha")
+            .expect("alpha row");
+        assert_eq!(
+            alpha.display_status_cache, "merge wait",
+            "explicit merge retry must remain available after the run ends"
+        );
     }
 }
