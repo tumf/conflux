@@ -311,7 +311,7 @@ async fn the_new_commands_are_admitted_delegated_and_replayed_like_every_other()
         ),
         (
             json!({"type": "set_all_execution_marks"}),
-            CommandSpec::SetAllExecutionMarks,
+            CommandSpec::SetAllExecutionMarks {},
         ),
     ] {
         let h = harness(None, &[]);
@@ -482,7 +482,7 @@ async fn remote_bulk_mark_is_atomic_over_one_revision_and_names_its_exclusions()
 
     let summary = wired
         .executor
-        .execute(&CommandSpec::SetAllExecutionMarks)
+        .execute(&CommandSpec::SetAllExecutionMarks {})
         .await
         .expect("Running mode accepts a bulk mutation");
 
@@ -546,7 +546,7 @@ async fn remote_bulk_mark_with_no_eligible_row_settles_as_a_no_op() {
 
     let summary = wired
         .executor
-        .execute(&CommandSpec::SetAllExecutionMarks)
+        .execute(&CommandSpec::SetAllExecutionMarks {})
         .await
         .expect("a zero-eligible bulk mutation is valid, not an error");
 
@@ -564,7 +564,7 @@ async fn remote_bulk_mark_is_refused_in_error_mode_without_touching_any_row() {
 
     let failure = wired
         .executor
-        .execute(&CommandSpec::SetAllExecutionMarks)
+        .execute(&CommandSpec::SetAllExecutionMarks {})
         .await
         .expect_err("recovery in Error mode is owned by the retry commands");
 

@@ -327,13 +327,6 @@ impl ChangeState {
         self.set_display_status_cache("error");
     }
 
-    pub fn is_active_display_status(&self) -> bool {
-        matches!(
-            self.display_status_cache.as_str(),
-            "applying" | "accepting" | "archiving" | "resolving"
-        )
-    }
-
     /// Update iteration number with monotonic increase guard
     ///
     /// This helper ensures iteration display doesn't regress within the same stage.
@@ -443,9 +436,12 @@ impl AppState {
 
     /// Adopt an externally owned parallel runtime store.
     ///
-    /// Same direction as [`AppState::set_execution_marks`]: a caller that built
-    /// the shared services first joins the store they already read, so the
-    /// toggle exists once rather than once per frontend.
+    /// Test-only for the same reason as [`AppState::set_execution_marks`]:
+    /// production wires this the other way round — the run-control service and
+    /// the web state are built over `parallel_runtime()` — but a test that
+    /// builds the shared services first needs the app to join the store they
+    /// already read, or the toggle would exist once per frontend.
+    #[cfg(test)]
     pub fn set_parallel_runtime(
         &mut self,
         parallel: std::sync::Arc<crate::orchestration::operator_command::ParallelRuntime>,

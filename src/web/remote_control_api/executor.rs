@@ -440,7 +440,7 @@ impl SharedServiceExecutor {
                 .await
                 .map(|outcome| summarize_outcome(&outcome))
                 .map_err(|error| map_operator_error(&error)),
-            CommandSpec::SetAllExecutionMarks => self
+            CommandSpec::SetAllExecutionMarks {} => self
                 .service
                 .set_all_execution_marks(mode)
                 .await

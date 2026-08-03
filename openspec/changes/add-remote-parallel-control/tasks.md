@@ -24,6 +24,13 @@
   one exclusion vocabulary.
 - Start is fenced against the *complete* marked set before it is narrowed to
   startable rows, which is what makes parallel start all-or-nothing.
+- The snapshot's per-change `actions` block consults parallel eligibility with
+  the same precedence `classify_bulk_mark_row` uses, so a row parallel mode
+  would refuse to start is never advertised as markable.
+- `set_all_execution_marks` is a struct variant with `deny_unknown_fields`, so a
+  client-supplied `marked` is a schema failure rather than an ignored field.
+- `docs/openapi.yaml` was regenerated (`make openapi`) for the new commands,
+  capabilities, and parallel schemas.
 
 ## Final Validation
 

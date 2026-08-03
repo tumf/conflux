@@ -212,7 +212,7 @@ pub fn new_hex_id() -> String {
 /// Adding a variant is a spec change: an envelope naming any other type fails
 /// typed validation before a service call can happen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CommandSpec {
     /// Start or resume processing.
     Start,
@@ -271,7 +271,7 @@ pub enum CommandSpec {
     /// Deliberately parameterless: the target state is derived from the eligible
     /// rows at the admitted revision, exactly as the TUI's bulk toggle does, so
     /// a client cannot ask for a target set the server never classified.
-    SetAllExecutionMarks,
+    SetAllExecutionMarks {},
     /// Create the managed worktree for an eligible change.
     ///
     /// The change ID is the *only* input: branch, path, and base commit are all
@@ -348,7 +348,7 @@ impl CommandSpec {
             Self::StopAndDequeue { .. } => "stop_and_dequeue",
             Self::ResolveMerge { .. } => "resolve_merge",
             Self::SetParallelMode { .. } => "set_parallel_mode",
-            Self::SetAllExecutionMarks => "set_all_execution_marks",
+            Self::SetAllExecutionMarks { .. } => "set_all_execution_marks",
             Self::CreateWorktree { .. } => "create_worktree",
             Self::DeleteWorktree { .. } => "delete_worktree",
             Self::MergeWorktree { .. } => "merge_worktree",
@@ -369,7 +369,7 @@ impl CommandSpec {
             Self::RetryErrors { .. } => None,
             // Process-wide mutations: they address the whole target set, never
             // one change.
-            Self::SetParallelMode { .. } | Self::SetAllExecutionMarks => None,
+            Self::SetParallelMode { .. } | Self::SetAllExecutionMarks { .. } => None,
             // Worktree mutations are addressed by opaque ID, not by change.
             Self::DeleteWorktree { .. } | Self::MergeWorktree { .. } => None,
         }
@@ -722,22 +722,6 @@ impl ActionBlockedReason {
             E::ChangeActive => Self::ChangeActive,
             E::StatusImmutable => Self::StatusImmutable,
             E::ParallelIneligible => Self::ParallelIneligible,
-        }
-    }
-
-    /// Stable wire token.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::FinalStatus => "final_status",
-            Self::RetryRequired => "retry_required",
-            Self::StopPending => "stop_pending",
-            Self::StatusImmutable => "status_immutable",
-            Self::ModeHasNoQueue => "mode_has_no_queue",
-            Self::NoRetryableEvidence => "no_retryable_evidence",
-            Self::HoldNotResumable => "hold_not_resumable",
-            Self::ChangeActive => "change_active",
-            Self::NotMergeWaiting => "not_merge_waiting",
-            Self::ParallelIneligible => "parallel_ineligible",
         }
     }
 }

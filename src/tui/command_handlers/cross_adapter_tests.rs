@@ -213,7 +213,14 @@ fn app_mode_string(mode: &AppMode) -> &'static str {
 // ============================================================================
 
 /// Run one intent through the TUI adapter and report what it settled as.
-async fn through_tui(setup: Setup, mode: AppMode, command: TuiCommand) -> (Effects, bool) {
+///
+/// The second element is the operator-facing message the TUI surfaced, which is
+/// its counterpart to the v2 summary detail.
+async fn through_tui(
+    setup: Setup,
+    mode: AppMode,
+    command: TuiCommand,
+) -> (Effects, Option<String>) {
     let harness = AdapterHarness::new(&CHANGES);
     arrange(&harness, setup).await;
     // Captured before the app is built: binding an `AppState` republishes the
@@ -231,11 +238,18 @@ async fn through_tui(setup: Setup, mode: AppMode, command: TuiCommand) -> (Effec
 
     harness.run(&mut app, command).await;
 
-    (effects(&harness).await, app.warning_message.is_some())
+    (effects(&harness).await, app.warning_message.clone())
 }
 
 /// Run one intent through the `/api/v2` executor and report what it settled as.
-async fn through_v2(setup: Setup, mode: AppMode, command: CommandSpec) -> (Effects, Settlement) {
+///
+/// The third element is the summary detail, the only place v2 names a
+/// consequence the command did not ask for.
+async fn through_v2(
+    setup: Setup,
+    mode: AppMode,
+    command: CommandSpec,
+) -> (Effects, Settlement, Option<String>) {
     let harness = AdapterHarness::new(&CHANGES);
     arrange(&harness, setup).await;
 
@@ -258,13 +272,16 @@ async fn through_v2(setup: Setup, mode: AppMode, command: CommandSpec) -> (Effec
         web_state.remote_control().projection(),
     );
 
-    let settlement = match executor.execute(&command).await {
-        Ok(summary) if summary.changed => Settlement::Changed,
-        Ok(_) => Settlement::NoOp,
-        Err(failure) => Settlement::Failed(failure.error_code),
+    let (settlement, detail) = match executor.execute(&command).await {
+        Ok(summary) if summary.changed => (Settlement::Changed, summary.detail),
+        Ok(summary) => (Settlement::NoOp, summary.detail),
+        Err(failure) => (
+            Settlement::Failed(failure.error_code),
+            Some(failure.message),
+        ),
     };
 
-    (effects(&harness).await, settlement)
+    (effects(&harness).await, settlement, detail)
 }
 
 // ============================================================================
@@ -280,6 +297,10 @@ struct Row {
     tui: TuiCommand,
     v2: CommandSpec,
     expect: Settlement,
+    /// A change the command did not name but whose operator intent it
+    /// clears; both adapters must say so. `None` when the command has no
+    /// consequence beyond what it was asked to do.
+    notice: Option<&'static str>,
 }
 
 fn rows() -> Vec<Row> {
@@ -292,6 +313,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "start with a live scheduler wakes it instead of spawning a second run",
@@ -300,6 +322,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "start from a stopped run resumes the marked set",
@@ -308,6 +331,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "start is refused while a run owns the lifecycle",
@@ -316,6 +340,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
+            notice: None,
         },
         Row {
             name: "start with an empty target set is not a success",
@@ -324,6 +349,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::TargetIneligible),
+            notice: None,
         },
         Row {
             name: "a runtime launch failure is reported, not claimed as started",
@@ -332,6 +358,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Failed(ErrorCode::InternalError),
+            notice: None,
         },
         // ── retry ───────────────────────────────────────────────────────────
         // Retry has no command variant of its own on either side: `Error` mode is
@@ -343,6 +370,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "retry without retryable evidence changes nothing",
@@ -351,6 +379,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::StartProcessing(Vec::new()),
             v2: CommandSpec::Start,
             expect: Settlement::NoOp,
+            notice: None,
         },
         // ── stop family ─────────────────────────────────────────────────────
         Row {
@@ -360,6 +389,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::Stop,
             v2: CommandSpec::Stop,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "graceful stop outside running is refused",
@@ -368,6 +398,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::Stop,
             v2: CommandSpec::Stop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
+            notice: None,
         },
         Row {
             name: "cancel stop while stopping withdraws the request",
@@ -376,6 +407,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::CancelStop,
             v2: CommandSpec::CancelStop,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "cancel stop outside stopping is refused",
@@ -384,6 +416,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::CancelStop,
             v2: CommandSpec::CancelStop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
+            notice: None,
         },
         Row {
             name: "force stop while running cancels the live run",
@@ -392,6 +425,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::ForceStop,
             v2: CommandSpec::ForceStop,
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "force stop outside running and stopping is refused",
@@ -400,6 +434,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::ForceStop,
             v2: CommandSpec::ForceStop,
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
+            notice: None,
         },
         // ── resolve ─────────────────────────────────────────────────────────
         Row {
@@ -411,6 +446,7 @@ fn rows() -> Vec<Row> {
                 change_id: "c1".to_string(),
             },
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "a duplicate resolve submission does not reserve twice",
@@ -421,6 +457,7 @@ fn rows() -> Vec<Row> {
                 change_id: "c1".to_string(),
             },
             expect: Settlement::NoOp,
+            notice: None,
         },
         Row {
             name: "resolve of a stale target is refused without a reservation",
@@ -431,6 +468,7 @@ fn rows() -> Vec<Row> {
                 change_id: "c1".to_string(),
             },
             expect: Settlement::Failed(ErrorCode::TargetIneligible),
+            notice: None,
         },
         // ── parallel mode ───────────────────────────────────────────────────
         Row {
@@ -440,6 +478,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::Changed,
+            notice: Some("c2"),
         },
         Row {
             name: "enabling parallel mode from a stopped run is accepted",
@@ -448,6 +487,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::Changed,
+            notice: None,
         },
         Row {
             name: "the parallel toggle is refused while a run owns the lifecycle",
@@ -456,6 +496,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::Failed(ErrorCode::LifecycleConflict),
+            notice: None,
         },
         Row {
             name: "an idempotent parallel toggle replay changes nothing on either side",
@@ -464,6 +505,7 @@ fn rows() -> Vec<Row> {
             tui: TuiCommand::SetParallelMode(true),
             v2: CommandSpec::SetParallelMode { enabled: true },
             expect: Settlement::NoOp,
+            notice: None,
         },
     ]
 }
@@ -471,9 +513,10 @@ fn rows() -> Vec<Row> {
 #[tokio::test]
 async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
     for row in rows() {
-        let (tui_effects, tui_reported) =
+        let (tui_effects, tui_message) =
             through_tui(row.setup, row.mode.clone(), row.tui.clone()).await;
-        let (v2_effects, v2_settlement) = through_v2(row.setup, row.mode.clone(), row.v2).await;
+        let (v2_effects, v2_settlement, v2_detail) =
+            through_v2(row.setup, row.mode.clone(), row.v2).await;
 
         assert_eq!(
             v2_settlement, row.expect,
@@ -485,12 +528,34 @@ async fn tui_and_v2_settle_every_lifecycle_intent_identically() {
             "{}: the TUI and /api/v2 must produce the same reducer, scheduler, mark, and resolver effects",
             row.name
         );
+        // A refusal or a no-op is reported by both adapters; so is a consequence
+        // the command did not ask for. Anything else is a plain success and must
+        // be silent on both sides, or one frontend is telling an operator
+        // something the other is hiding.
+        let must_report = row.expect.is_reported_to_the_operator() || row.notice.is_some();
         assert_eq!(
-            tui_reported,
-            row.expect.is_reported_to_the_operator(),
-            "{}: the TUI must surface exactly the refusals and no-ops /api/v2 reports",
+            tui_message.is_some(),
+            must_report,
+            "{}: the TUI must surface exactly what /api/v2 reports, got {tui_message:?}",
             row.name
         );
+
+        if let Some(cleared) = row.notice {
+            // Naming the change is the point: an operator whose intent vanished
+            // must be able to tell that from a lost command, on both adapters.
+            let tui_message = tui_message.expect("a consequence row surfaces a TUI message");
+            assert!(
+                tui_message.contains(cleared),
+                "{}: the TUI must name '{cleared}', got {tui_message:?}",
+                row.name
+            );
+            let v2_detail = v2_detail.expect("a consequence row carries a v2 detail");
+            assert!(
+                v2_detail.contains(cleared),
+                "{}: /api/v2 must name '{cleared}', got {v2_detail:?}",
+                row.name
+            );
+        }
     }
 }
 
@@ -597,7 +662,10 @@ async fn bulk_through_v2(
         web_state.clone(),
         web_state.remote_control().projection(),
     );
-    let settlement = match executor.execute(&CommandSpec::SetAllExecutionMarks).await {
+    let settlement = match executor
+        .execute(&CommandSpec::SetAllExecutionMarks {})
+        .await
+    {
         Ok(summary) if summary.changed => Settlement::Changed,
         Ok(_) => Settlement::NoOp,
         Err(failure) => Settlement::Failed(failure.error_code),
