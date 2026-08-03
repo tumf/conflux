@@ -41,10 +41,13 @@ pub use crate::events::ExecutionEvent as ParallelEvent;
 #[allow(unused_imports)]
 pub use merge::{base_dirty_reason, resolve_deferred_merge};
 pub use types::{
-    resolve_failure_detail, AlreadyReportedFailureKind, FailedChangeTracker, MergeResult,
-    MergeResultDisposition, MergeResultOrigin, MergeTaskOutcome, ResolveFailureClassification,
-    WorkspaceResult,
+    AlreadyReportedFailureKind, FailedChangeTracker, MergeResult, MergeResultDisposition,
+    MergeResultOrigin, MergeTaskOutcome, ResolveFailureClassification, WorkspaceResult,
 };
+// Only test code re-exports this helper through `crate::parallel`; production callers use
+// `super::types` directly.
+#[allow(unused_imports)]
+pub use types::resolve_failure_detail;
 
 // Re-exports used in tests via `use super::super::*`.
 #[cfg(test)]
