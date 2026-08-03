@@ -217,7 +217,9 @@ impl FinalCommitEnvironment for GitFinalCommitEnvironment {
 /// object store, and only this policy needs it.
 async fn workspace_content_tree(workspace_path: &Path) -> VcsResult<String> {
     let scratch = tempfile::TempDir::new().map_err(|error| {
-        VcsError::git_command(format!("could not create a scratch index directory: {error}"))
+        VcsError::git_command(format!(
+            "could not create a scratch index directory: {error}"
+        ))
     })?;
     let scratch_index = scratch.path().join("index");
 
@@ -638,7 +640,9 @@ pub(crate) mod test_support {
         }
 
         async fn workspace_tree(&self, workspace_path: &Path) -> VcsResult<String> {
-            GitFinalCommitEnvironment.workspace_tree(workspace_path).await
+            GitFinalCommitEnvironment
+                .workspace_tree(workspace_path)
+                .await
         }
 
         async fn has_uncommitted_changes(&self, workspace_path: &Path) -> VcsResult<bool> {
