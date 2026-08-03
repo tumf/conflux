@@ -1126,9 +1126,11 @@ pub async fn run_orchestrator_parallel(
 
     let scheduler_reported_stop = merge_deferred_stop.load(Ordering::SeqCst);
     let scheduler_failed = matches!(result, Some(Err(_)));
+    // Blocked/stalled remainders join change-local failures here: both leave
+    // work the operator still owns, so neither may produce a success message.
     let scheduler_completed_with_errors = matches!(
         &result,
-        Some(Ok(report)) if report.has_change_failures()
+        Some(Ok(report)) if report.is_incomplete()
     );
 
     let has_reducer_owned_lane_wait_or_active = {
@@ -1897,12 +1899,13 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_run_report_only_flags_completed_with_errors() {
+    fn scheduler_run_report_flags_unfinished_work_only() {
         use crate::parallel::SchedulerRunReport;
 
-        assert!(SchedulerRunReport::CompletedWithErrors.has_change_failures());
-        assert!(!SchedulerRunReport::Completed.has_change_failures());
-        assert!(!SchedulerRunReport::Stopped.has_change_failures());
+        assert!(SchedulerRunReport::CompletedWithErrors.is_incomplete());
+        assert!(SchedulerRunReport::BlockedOrStalled.is_incomplete());
+        assert!(!SchedulerRunReport::Completed.is_incomplete());
+        assert!(!SchedulerRunReport::Stopped.is_incomplete());
     }
 
     // ------------------------------------------------------------------

@@ -1,42 +1,52 @@
 # Design: transient final Apply commit lock retry
 
-## Scope
+## Scope and Dependency
 
-The policy applies only to the hook-enabled final Apply commit boundary. It complements the archived WIP snapshot retry without broadening retry behavior to arbitrary Git commands.
+The policy applies only to hook-enabled final Apply commit after `wait-for-apply-process-group-before-git-finalization` has produced confirmed quiescence. It consumes that change's typed cleanup result and Apply gate; retry without it could hide a live Apply descendant, so the dependency is hard rather than roadmap ordering.
 
-## Decisions
+## Immutable Finalization Plan
 
-### Classify from structured command data
+Create one plan before mutation:
 
-Retry requires all of the following:
+- baseline HEAD OID and its parent OIDs
+- fixed mode: `AddAndCommit` or `Amend`
+- exact subject `Apply: <change-id>`
+- expected tree OID
 
-- a Git `VcsError::Command` from final Apply finalization
-- a structured command matching final `git add -A`, add-and-commit, or amend
-- stderr stating that Git could not create an existing `index.lock`
-- a reported path resolving to the current managed worktree Git directory
+Initial mode detection uses `git --no-optional-locks status --porcelain`. For `AddAndCommit`, create an ephemeral isolated index from the current index, run `git add -A` against that index, and use `git write-tree` as the complete intended snapshot. This includes staged, unstaged, deleted, and untracked content without touching the real index. For `Amend`, require clean status and use baseline HEAD's tree.
 
-Hook rejection and every near match remain outside this policy.
+## Retry Preflight
 
-### Retry complete finalization preparation
+Before every attempt after the first:
 
-Each attempt re-reads whether the worktree needs add-and-commit or amend, stages and validates when dirty, and runs the normal verified commit. This avoids replaying a stale mode decision after another actor changes repository state.
+1. Check mode-specific exact-success evidence.
+2. If not successful, require current HEAD equals baseline HEAD.
+3. Recompute the complete workspace tree with an isolated index and require it equals expected tree.
+4. Require the fixed mode's real-index state is compatible; never re-derive or switch mode.
+5. For add-and-commit, run real `git add -A` only after checks, then require real `git write-tree` equals expected tree.
+6. Run the fixed verified commit command.
 
-### Preserve verification hooks
+Any mismatch is a terminal concurrent-mutation error. Conflux does not absorb, reset, or reconcile external changes.
 
-Every commit attempt uses the existing verified commit arguments. `--no-verify` remains exclusive to WIP snapshots. A hook exit follows `RepositoryRejected`; it never enters lock retry.
+## Mode-Specific Success Proof
 
-### Prove ambiguous success
+| Mode | Exact success evidence |
+| --- | --- |
+| AddAndCommit | HEAD differs from baseline, has exactly baseline HEAD as sole parent, exact subject, expected tree |
+| Amend | HEAD differs from baseline, has exactly the same parent set/order as baseline HEAD, exact subject, expected tree |
 
-Before each attempt, capture HEAD and the expected workspace tree. If command reporting is ambiguous, accept success only when current HEAD is the exact expected successor, has subject `Apply: <change-id>`, and contains the expected tree. Otherwise apply the narrow lock classifier or return the terminal error.
+A same-subject historical commit, external HEAD advance, or matching tree with wrong lineage is not success.
 
-### Bound waiting
+## Retry Eligibility and Hooks
 
-Use three total attempts and fixed 200 ms delays. Cancellation is checked before sleeping and before retry. Conflux never unlinks a lock because ownership cannot be inferred safely.
+Eligibility requires a structured finalization command, non-exit-1 terminal status, exact fatal existing-`index.lock` stderr, and lock identity resolving to the current managed worktree. Exit code 1 stays `RepositoryRejected`.
+
+Final commits always run hooks. Automatic retry is permitted only for the top-level Git lock-acquisition failure before hooks execute. Temporary-repository tests install a counting pre-commit hook and hold a real lock; failed eligible attempts must leave the counter at zero and eventual success must make it exactly one. If platform behavior cannot prove this invariant, commit-command lock failure is terminal on that platform rather than retried.
+
+## Bounded Waiting
+
+Use three total attempts and fixed 200 millisecond delays through an injected sleeper. Check cancellation before sleeping and before retry. Never unlink a lock.
 
 ## Constitution Alignment
 
-Recovery uses only current process state and repository evidence. It adds no durable external workflow state, and final Apply completion is recognized only from verified Git evidence.
-
-## Split Rationale
-
-This proposal is independent of `wait-for-apply-process-group-before-git-finalization`. Process cleanup removes a known internal contender; this retry handles transient contention that can still originate outside the owned process group. Neither implementation consumes repository output from the other, so no hard dependency is declared.
+The plan and retry state are process-local. Success and drift decisions use workspace and Git evidence. External mutation is surfaced rather than silently committed.

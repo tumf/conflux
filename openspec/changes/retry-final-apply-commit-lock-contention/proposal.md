@@ -1,24 +1,26 @@
 ---
 change_type: hybrid
 priority: high
-dependencies: []
+dependencies:
+  - wait-for-apply-process-group-before-git-finalization
 references:
   - openspec/CONSTITUTION.md
   - openspec/specs/cli/spec.md
   - openspec/specs/apply-commit-recovery/spec.md
   - openspec/changes/archive/2026-07-31-fix-transient-wip-commit-lock-retry
+  - openspec/changes/wait-for-apply-process-group-before-git-finalization
   - src/execution/apply.rs
   - src/execution/wip_lock_retry.rs
   - src/vcs/git/commands/commit.rs
 verifications:
   - id: final-apply-lock-retry-tests
-    requirement: Final Apply commit recovers only from narrowly classified transient managed-worktree index-lock contention
+    requirement: Final Apply commit recovers only from narrowly classified transient managed-worktree index-lock contention without accepting repository drift or rerunning hooks after an eligible failed attempt
     phase: pre-integration
     owner: conflux-acceptance
     trigger: pull-request-validation
     automation: Makefile
-    evidence: Rust test output covering add-and-commit and amend recovery, bounded exhaustion, ambiguous success, cancellation, and non-retryable errors
-    rerun: cargo test --lib final_apply_commit_lock
+    evidence: Deterministic and temporary-repository Rust tests covering quiescence gating, frozen add/amend plans, drift rejection, mode-specific ambiguous success, bounded exhaustion, cancellation, hook counts, and non-retryable errors
+    rerun: cargo test --lib final_apply_commit_lock && cargo test --lib apply_commit_recovery
     prerequisites: []
     execution_class: repository-local
     completion_role: change-blocking
@@ -30,42 +32,44 @@ verifications:
 
 ## Problem / Context
 
-Conflux already retries narrowly classified managed-worktree `index.lock` contention around WIP snapshots. The hook-enabled final Apply commit does not use that policy. A transient lock during either `git add -A` or `git commit --amend --allow-empty` therefore terminates Apply even when the lock clears immediately and the workspace remains valid.
+Conflux retries narrowly classified managed-worktree `index.lock` contention around WIP snapshots, but the hook-enabled final Apply commit does not. Transient contention can therefore terminate Apply even when repository state has not changed.
 
-The process-group cleanup proposal fixes the observed internal lifecycle race, but external tools and repository hooks can still create brief legitimate contention. Final commit handling needs its own bounded recovery policy rather than relying on sleeps, lock deletion, or Apply-agent retries.
+Retry is safe only after the Apply process group is confirmed quiescent and only while the original finalization target remains unchanged. Re-deriving dirty/clean mode on every attempt could amend an external commit or stage changes created by another actor. This proposal therefore consumes the typed quiescence gate from `wait-for-apply-process-group-before-git-finalization` and fails closed on repository drift.
 
 ## Proposed Solution
 
-Add a final-Apply-specific retry boundary around the complete verified finalization sequence. Classify contention only when a structured Git command failure comes from the final Apply `git add -A`, add-and-commit, or amend command; stderr reports failure to create an existing `index.lock`; and the reported path resolves to the current managed worktree Git directory.
+After confirmed process-group quiescence, build one immutable finalization plan before the first mutating attempt. Read status with `git --no-optional-locks status --porcelain`, capture baseline HEAD, choose `AddAndCommit` or `Amend` once, and capture the exact intended tree. For a dirty worktree, derive the intended tree through an isolated temporary Git index so expected content includes tracked, staged, unstaged, deleted, and untracked files without mutating the real index. For amend, the intended tree is the clean baseline HEAD tree.
 
-Use at most three total attempts separated by a fixed 200 ms delay with no backoff. Capture repository state before each attempt and prove ambiguous success from HEAD, parent, subject, and expected tree state before retrying, so a commit that succeeded despite a lost process result is not duplicated. Re-run normal hook-enabled commit behavior on each required attempt; never add `--no-verify`.
+Before every retry, first recognize mode-specific ambiguous success. Otherwise require HEAD to remain at baseline and recompute the full intended tree through the isolated index; any HEAD, mode, index, or workspace-tree drift is terminal concurrent-mutation failure. Never switch modes. Stage the real index only after this check and verify `git write-tree` equals the frozen expected tree before committing.
 
-Repository hook rejection remains routed through the existing Apply repair feedback. Exhausted lock contention and all unrelated VCS errors remain terminal. Conflux never removes the lock.
+Retry only exact top-level Git failures that occur while acquiring the current managed worktree's `index.lock` for final `git add -A` or verified commit. Use three total attempts with fixed 200 millisecond delay. Eligible failed commit attempts must not run repository hooks; a hook counter integration test enforces zero hook invocations on lock-failed attempts and exactly one on eventual success. Exit-code-1 hook rejection remains in existing Apply repair and never consumes lock retries.
 
 ## Acceptance Criteria
 
-1. Transient managed-worktree `index.lock` contention during final Apply add, add-and-commit, or amend is retried and succeeds when it clears within three attempts.
-2. Attempts use a fixed 200 ms delay, no backoff, and honor Apply cancellation before sleeping and before another attempt.
-3. The final commit remains hook-enabled on every attempt; commit-hook rejection is not classified as lock contention and still enters the existing bounded Apply repair flow.
-4. Ambiguous command completion creates at most one final `Apply: <change-id>` commit.
-5. Persistent contention fails after three attempts with the original structured command, workspace, lock path, stderr, and attempt diagnostics while preserving workspace contents.
-6. Another worktree's lock, malformed lock text, permission/configuration errors, merge conflicts, hook failures, and arbitrary Git failures are not retried.
-7. Conflux never deletes or bypasses `index.lock`.
+1. Final lock retry cannot begin unless the dependency's typed cleanup result confirms Apply process-group quiescence.
+2. Baseline HEAD, finalization mode, and expected tree are frozen once; retries never reclassify dirty add-and-commit as amend or vice versa.
+3. `git --no-optional-locks status --porcelain` performs initial mode detection without requesting optional index locks.
+4. Before each retry, exact final success is recognized or HEAD and the isolated-index full-tree snapshot must still match the frozen plan; drift fails terminally before staging or commit.
+5. Dirty add-and-commit retries cannot stage newly arrived external content; clean amend retries cannot amend a newly arrived external commit.
+6. Transient eligible contention recovers within three attempts, fixed 200 millisecond delays, and cancellation checks before delay/retry.
+7. Lock-failed commit attempts execute zero hooks; eventual success executes hooks exactly once. Hook rejection remains existing bounded Apply repair.
+8. Persistent contention preserves workspace state and structured diagnostics. Other worktree locks, near-match stderr, permission/configuration/conflict errors, hook failures, and arbitrary Git failures are not retried.
+9. Conflux never deletes the lock or uses `--no-verify` for final Apply commits.
 
 ## Explicit Completion Conditions
 
-- Final commit lock classification is typed and command-scoped; it does not parse a rendered top-level error or become a generic Git retry.
-- The retry boundary repeats the complete finalization preparation needed for the selected add-and-commit or amend path and revalidates repository state on each attempt.
-- Ambiguous success validation proves exact expected HEAD lineage, subject, and committed tree before returning success.
-- Unit tests use injected timing for deterministic three-attempt, fixed-delay, cancellation, classification, and ambiguous-success coverage.
-- Temporary-repository tests hold and release real managed-worktree locks for both add-and-commit and amend paths and prove exactly one hook-enabled final commit.
+- The implementation consumes confirmed quiescence from `wait-for-apply-process-group-before-git-finalization`; this is a hard dependency because retry safety requires that repository-local typed outcome and Apply gate.
+- A typed immutable plan contains baseline HEAD, fixed mode, expected tree OID, expected final subject, and the mode-specific expected parent set.
+- Isolated-index snapshot generation is ephemeral, cleans up its temporary index, and includes all tracked/untracked/deleted workspace content without changing the real index.
+- Retry preflight recognizes exact success first; otherwise any baseline or full-tree drift returns a dedicated terminal concurrent-mutation diagnostic.
+- Add-and-commit success requires one new commit whose sole parent is baseline HEAD, subject is exact, and tree equals expected. Amend success requires replacement of baseline HEAD with a commit whose parent set equals baseline HEAD's parent set, subject is exact, and tree equals expected.
+- Eligible commit lock failure is proven by structured command, non-hook-rejection status, exact existing-lock stderr, current worktree lock identity, and integration evidence that hooks did not run.
+- Tests cover add/amend recovery, drift at every retry boundary, staged/unstaged/untracked arrivals, external HEAD advance, mode immutability, hook counts, ambiguous success, cancellation, and exhaustion.
 - `cargo test --lib final_apply_commit_lock`, `cargo test --lib apply_commit_recovery`, and `cargo clippy -- -D warnings` pass.
 
 ## Out of Scope
 
-- Retrying arbitrary Git or VCS failures.
-- Deleting `index.lock` files.
-- Adding `--no-verify` to final Apply commits.
+- Retrying before process-group quiescence.
+- Retrying arbitrary Git/VCS failures or any failure after repository hooks ran.
+- Deleting `index.lock`, bypassing hooks, or reconciling external repository drift.
 - Retrying merge, archive, push, or publication operations.
-- Treating lock contention as an Apply-agent-repairable hook failure.
-- Depending on the process-group cleanup proposal; either change can be implemented and verified independently.

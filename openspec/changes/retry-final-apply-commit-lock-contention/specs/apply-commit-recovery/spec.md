@@ -2,43 +2,53 @@
 
 ### Requirement: Final Apply commit retries narrowly classified index-lock contention
 
-When final Apply finalization fails because a structured finalization Git command cannot create the current managed worktree's existing `index.lock`, Conflux MUST retry the complete finalization sequence at most three total attempts with a fixed 200 millisecond delay and no backoff. Conflux MUST preserve repository verification hooks, MUST NOT delete or bypass the lock, and MUST NOT apply this policy to hook rejection or unrelated VCS failures. Completion MUST be proven from repository state so ambiguous command reporting cannot create duplicate final commits.
+After Apply process-group quiescence is confirmed, Conflux MAY retry final Apply lock-acquisition contention under an immutable finalization plan. The plan MUST freeze baseline HEAD, add-and-commit or amend mode, exact subject, expected tree, and expected lineage before mutation. Each retry MUST recognize exact success or fail closed unless HEAD and the complete isolated-index workspace tree still match the plan. Conflux MUST NOT switch mode, absorb external drift, rerun after hooks executed, delete the lock, or bypass verification hooks.
 
-#### Scenario: transient amend lock clears
+#### Scenario: finalization requires confirmed quiescence
 
-- **GIVEN** a WIP snapshot leaves the Apply worktree clean
-- **AND** final `git commit --amend --allow-empty` reports the current managed worktree's existing `index.lock`
-- **WHEN** the lock clears within the bounded retry budget
-- **THEN** Conflux retries normal hook-enabled finalization
-- **AND** exactly one final `Apply: <change-id>` commit exists
-- **AND** Acceptance may start only after repository state proves that commit succeeded
+- **GIVEN** Apply completion was observed
+- **AND** process-group cleanup is unconfirmed
+- **WHEN** final Apply lock retry would otherwise start
+- **THEN** Conflux performs no retry or final commit attempt
+- **AND** Apply fails through the cleanup barrier
 
-#### Scenario: transient add-and-commit lock clears
+#### Scenario: transient add-and-commit lock clears without drift
 
-- **GIVEN** final Apply finalization must stage dirty workspace content
-- **AND** finalization `git add -A` or the subsequent verified commit reports the current managed worktree's existing `index.lock`
-- **WHEN** the lock clears within three total attempts
-- **THEN** Conflux repeats complete finalization preparation from current repository state
-- **AND** the final hook-enabled commit contains the expected workspace tree exactly once
+- **GIVEN** confirmed process-group quiescence
+- **AND** an immutable dirty-worktree plan freezes baseline HEAD, `AddAndCommit`, and the isolated-index expected tree
+- **AND** eligible managed-worktree lock contention occurs before hooks execute
+- **WHEN** HEAD and the complete workspace tree remain unchanged and the lock clears within three attempts
+- **THEN** Conflux stages only the frozen expected tree and creates one hook-enabled commit
+- **AND** that commit has baseline HEAD as its sole parent, exact subject, and expected tree
 
-#### Scenario: persistent lock exhausts bounded retries
+#### Scenario: transient amend lock clears without drift
 
-- **GIVEN** eligible managed-worktree `index.lock` contention persists for all three attempts
-- **WHEN** the retry budget is exhausted
-- **THEN** final Apply fails with structured command, workspace, lock, stderr, and attempt diagnostics
-- **AND** Conflux does not delete the lock
-- **AND** workspace contents remain available for explicit recovery
+- **GIVEN** confirmed process-group quiescence
+- **AND** an immutable clean-worktree plan freezes baseline HEAD, `Amend`, baseline parents, and expected tree
+- **AND** eligible managed-worktree lock contention occurs before hooks execute
+- **WHEN** repository state remains unchanged and the lock clears within three attempts
+- **THEN** Conflux creates one replacement commit with the baseline ordered parent set, exact subject, and expected tree
+- **AND** it does not amend any later external commit
 
-#### Scenario: repository hook rejection is not lock contention
+#### Scenario: repository drift fails closed
 
-- **GIVEN** a hook-enabled final Apply commit runs
-- **WHEN** a repository hook rejects that commit
-- **THEN** Conflux does not consume the index-lock retry budget
-- **AND** it routes the rejection through the existing bounded Apply commit-repair behavior
+- **GIVEN** a finalization plan exists
+- **AND** a retry boundary observes external HEAD advance, mode change, index drift, or staged, unstaged, deleted, or untracked content differing from the expected tree
+- **WHEN** Conflux performs retry preflight
+- **THEN** it returns a terminal concurrent-mutation diagnostic before another stage or commit
+- **AND** it does not reset, absorb, amend, or commit the external change
 
-#### Scenario: unrelated VCS failures remain terminal
+#### Scenario: lock-failed attempts do not rerun hooks
 
-- **GIVEN** finalization fails for another worktree's lock, malformed lock output, permission or configuration failure, conflict, non-Git backend, or another Git command
+- **GIVEN** a counting repository hook and eligible top-level Git lock-acquisition failures
+- **WHEN** Conflux retries and eventually succeeds
+- **THEN** lock-failed attempts have executed the hook zero times
+- **AND** the successful verified commit executes it exactly once
+- **AND** a hook rejection uses existing Apply repair rather than lock retry
+
+#### Scenario: persistent or unrelated failures remain terminal
+
+- **GIVEN** contention persists for three attempts, hook execution cannot be excluded, or failure concerns another lock, malformed stderr, permission, configuration, conflict, backend, or command
 - **WHEN** Conflux classifies the failure
-- **THEN** it does not retry under the final Apply index-lock policy
-- **AND** it returns the original terminal failure context
+- **THEN** it returns structured terminal diagnostics and preserves workspace state
+- **AND** it does not delete the lock or consume another retry
