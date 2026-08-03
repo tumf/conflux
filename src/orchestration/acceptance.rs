@@ -275,13 +275,32 @@ impl AcceptanceCommandDiagnostic {
         if let Some(code) = self.exit_code {
             parts.push(format!("exit_code: {}", code));
         }
+        // Both streams are reported, each bounded on its own. A command that
+        // writes its diagnosis to stdout and an unrelated warning to stderr
+        // would otherwise lose the diagnosis entirely.
+        if let Some(stdout) = self.stdout_tail.as_deref().filter(|t| !t.trim().is_empty()) {
+            parts.push(format!("stdout: {}", condense(stdout)));
+        }
         if let Some(stderr) = self.stderr_tail.as_deref().filter(|t| !t.trim().is_empty()) {
             parts.push(format!("stderr: {}", condense(stderr)));
-        } else if let Some(stdout) = self.stdout_tail.as_deref().filter(|t| !t.trim().is_empty()) {
-            parts.push(format!("stdout: {}", condense(stdout)));
         }
         parts.join(" | ")
     }
+}
+
+/// Classify a permission/tool-policy denial from one failed Acceptance
+/// invocation's bounded transport evidence.
+///
+/// Shared by the serial acceptance runner and its retry loop so both decide
+/// "is this a policy denial?" from exactly the same bytes and the same
+/// classifier parallel acceptance uses.
+pub fn classify_acceptance_command_denial(
+    diagnostic: &AcceptanceCommandDiagnostic,
+) -> Option<crate::permission::PermissionDenial> {
+    crate::permission::classify_permission_denial(&[
+        diagnostic.stdout_tail.as_deref(),
+        diagnostic.stderr_tail.as_deref(),
+    ])
 }
 
 /// Routing decision for one Acceptance command that failed to complete.
@@ -1513,6 +1532,12 @@ impl AcceptanceResult {
 ///
 /// `protocol_retry` is `Some` only when this invocation continues a previous
 /// attempt that exited without a canonical verdict.
+///
+/// `previous_denial` carries the permission/tool-policy denial classified from
+/// the immediately preceding invocation, if any. The same signature observed
+/// again against an unchanged revision is a repeated unresolved denial, which
+/// enters the existing non-terminal hold instead of consuming corrective command
+/// retries — the same rule parallel acceptance already applies.
 #[allow(clippy::too_many_arguments)]
 pub async fn acceptance_test_streaming<O, F>(
     change: &Change,
@@ -1522,6 +1547,7 @@ pub async fn acceptance_test_streaming<O, F>(
     output: &O,
     cancel_check: F,
     protocol_retry: Option<AcceptanceProtocolRetry>,
+    previous_denial: Option<&crate::permission::PermissionDenial>,
 ) -> Result<(AcceptanceResult, u32, String)>
 where
     O: OutputHandler,
@@ -1697,36 +1723,66 @@ where
             "Acceptance command failed with exit code: {:?}",
             status.code()
         );
-        // Cloned before the attempt record consumes the tails; the recovery
-        // diagnostic is stored separately from canonical acceptance history.
-        let stdout_tail_for_diagnostic = stdout_tail.clone();
-        let stderr_tail_for_diagnostic = stderr_tail.clone();
-        let attempt_number = agent.next_acceptance_attempt_number(&change.id);
-        let attempt = AcceptanceAttempt {
-            attempt: attempt_number,
-            passed: false,
-            duration: start_time.elapsed(),
-            findings: Some(crate::acceptance::legacy_findings(tail_findings.clone())),
-            exit_code: status.code(),
-            stdout_tail,
-            stderr_tail,
-            commit_hash: commit_hash.clone(),
-        };
-        agent.record_acceptance_attempt(&change.id, attempt);
         output.on_error(&error_msg);
+
+        // A command that never completed produced no verdict, so it produces no
+        // canonical `AcceptanceAttempt`: transport evidence must not enter
+        // Acceptance history, where it would be replayed as previous findings
+        // and would consume attempt numbering. The bounded diagnosis below is
+        // the only place this output is carried, and the shared command-recovery
+        // policy renders it as untrusted latest-only context.
         let diagnostic = AcceptanceCommandDiagnostic {
             error: error_msg.clone(),
             exit_code: status.code(),
-            stdout_tail: stdout_tail_for_diagnostic,
-            stderr_tail: stderr_tail_for_diagnostic,
+            stdout_tail,
+            stderr_tail,
         };
+
+        // Permission/tool-policy denial is classified before generic command
+        // recovery, exactly as parallel acceptance does: a repeated unresolved
+        // denial against an unchanged revision is not a transient crash, so it
+        // enters the existing non-terminal hold instead of spending corrective
+        // command retries.
+        if let Some(denial) = classify_acceptance_command_denial(&diagnostic) {
+            let end_commit_hash = crate::vcs::git::commands::get_current_commit(".")
+                .await
+                .ok();
+            // "Unchanged" means no evidence that the workspace moved: two
+            // unresolvable revisions (a non-Git checkout) compare equal, while a
+            // revision that resolved on only one side is treated as movement.
+            let revision_unchanged = commit_hash == end_commit_hash;
+            let repeated_unresolved = previous_denial
+                .is_some_and(|previous| previous.signature() == denial.signature())
+                && revision_unchanged;
+            if repeated_unresolved {
+                warn!(
+                    change_id = %change.id,
+                    category = denial.category.as_str(),
+                    denied_target = %denial.denied_target,
+                    "Repeated unresolved permission/tool policy denial during acceptance; entering non-terminal hold without a corrective command retry"
+                );
+                return Ok((
+                    AcceptanceResult::PermissionStalled {
+                        blocker: crate::events::StalledBlocker::permission_denial(
+                            "acceptance",
+                            &denial,
+                        ),
+                    },
+                    0,
+                    command,
+                ));
+            }
+        }
+
         return Ok((
             AcceptanceResult::CommandFailed {
                 error: error_msg,
                 findings: tail_findings,
                 diagnostic,
             },
-            attempt_number,
+            // No canonical attempt was recorded, so no attempt number is
+            // reported — the same contract cancellation already uses.
+            0,
             command,
         ));
     }
@@ -1950,6 +2006,55 @@ mod tests {
                 !error.contains("stderr a"),
                 "only the latest evidence is reported: {error}"
             );
+        }
+
+        #[test]
+        fn the_terminal_error_reports_exit_code_and_both_distinct_bounded_tails() {
+            // Streams that disagree: the actionable diagnosis is on stdout while
+            // stderr carries only an unrelated warning. Reporting one stream
+            // would drop the diagnosis entirely.
+            let diagnostic = AcceptanceCommandDiagnostic {
+                error: "Acceptance command failed with exit code: Some(42)".to_string(),
+                exit_code: Some(42),
+                stdout_tail: Some(format!("the-actual-diagnosis {}", "s".repeat(10_000))),
+                stderr_tail: Some(format!("unrelated-warning {}", "e".repeat(10_000))),
+            };
+
+            let error =
+                acceptance_command_exhausted_error(3, MAX_ACCEPTANCE_COMMAND_RETRIES, &diagnostic);
+
+            assert!(error.contains("exit_code: 42"), "{error}");
+            assert!(
+                error.contains("stdout: ") && error.contains("the-actual-diagnosis"),
+                "the stdout tail must survive a present stderr: {error}"
+            );
+            assert!(
+                error.contains("stderr: ") && error.contains("unrelated-warning"),
+                "the stderr tail must be reported alongside stdout: {error}"
+            );
+            // Each stream is bounded on its own, so a flood on one cannot crowd
+            // the other out of the terminal diagnostic.
+            assert!(
+                error.len() < 1_200,
+                "both tails must stay bounded, got {} chars",
+                error.len()
+            );
+        }
+
+        #[test]
+        fn retry_progress_also_reports_both_streams() {
+            let diagnostic = AcceptanceCommandDiagnostic {
+                error: "Acceptance command failed with exit code: Some(7)".to_string(),
+                exit_code: Some(7),
+                stdout_tail: Some("stdout-evidence".to_string()),
+                stderr_tail: Some("stderr-evidence".to_string()),
+            };
+
+            let progress =
+                acceptance_command_retry_progress(1, MAX_ACCEPTANCE_COMMAND_RETRIES, &diagnostic);
+
+            assert!(progress.contains("stdout-evidence"), "{progress}");
+            assert!(progress.contains("stderr-evidence"), "{progress}");
         }
 
         #[test]

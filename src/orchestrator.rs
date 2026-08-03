@@ -1453,6 +1453,41 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Run `on_finish` exactly once for a parallel run.
+    ///
+    /// A change stopped by the shared Apply-dispatch ceiling was recorded by its
+    /// workspace task as a typed observation, so the hook receives
+    /// `iteration_limit` together with that change's exact cumulative dispatch
+    /// count — the same contract serial reports through `LoopControl::Break` —
+    /// instead of a status the hook would have to infer from log text.
+    async fn run_parallel_finish_hook(&self) -> Result<()> {
+        let state = self.shared_state.read().await;
+        let iteration_limit = state.apply_iteration_limits().first().cloned();
+        let processed = state.changes_processed();
+        let total = state.total_changes();
+        drop(state);
+
+        let (finish_status, finish_apply_count) = match &iteration_limit {
+            Some(record) => {
+                info!(
+                    change_id = %record.change_id,
+                    attempts = record.attempts,
+                    max = record.max,
+                    "Parallel run stopped on the Apply-dispatch ceiling"
+                );
+                ("iteration_limit", record.attempts)
+            }
+            None => ("completed", 0),
+        };
+
+        let finish_context = HookContext::new(processed, total, 0, false)
+            .with_status(finish_status)
+            .with_apply_count(finish_apply_count);
+        self.hooks
+            .run_hook(HookType::OnFinish, &finish_context)
+            .await
+    }
+
     /// Run parallel execution mode
     async fn run_parallel(
         &mut self,
@@ -1731,6 +1766,8 @@ impl Orchestrator {
 
         result?;
 
+        self.run_parallel_finish_hook().await?;
+
         // Report clearly when all requested changes were rejected before any work started.
         let n_rejected = rejected_count.load(std::sync::atomic::Ordering::SeqCst);
         if n_rejected >= total_requested && total_requested > 0 {
@@ -1762,6 +1799,101 @@ mod tests {
             last_modified: "1m ago".to_string(),
             dependencies: Vec::new(),
             metadata: ProposalMetadata::default(),
+        }
+    }
+
+    /// Parallel runs have no `LoopControl` return path, so the finish hook is
+    /// driven from the typed observation the workspace task recorded.
+    mod parallel_finish_hook {
+        use super::*;
+        use crate::hooks::{HookConfig, HookConfigValue, HooksConfig};
+        use tempfile::TempDir;
+
+        fn orchestrator_with_on_finish(log: &std::path::Path) -> Orchestrator {
+            let config = OrchestratorConfig {
+                hooks: Some(HooksConfig {
+                    on_finish: Some(HookConfigValue::Full(HookConfig {
+                        command: format!(
+                            "sh -c 'echo \"$OPENSPEC_STATUS $OPENSPEC_APPLY_COUNT\" >> {}'",
+                            log.display()
+                        ),
+                        continue_on_failure: false,
+                        timeout: 30,
+                        git_commit_no_verify: false,
+                        max_retries: 0,
+                        retry_delay_secs: 0,
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            Orchestrator::with_config(None, config).expect("test orchestrator")
+        }
+
+        fn lines(log: &std::path::Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_recorded_iteration_limit_reports_status_and_exact_count_once() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let orchestrator = orchestrator_with_on_finish(&log);
+
+            {
+                let mut state = orchestrator.shared_state.write().await;
+                *state = OrchestratorState::with_mode(
+                    vec!["change-a".to_string()],
+                    7,
+                    crate::orchestration::state::ExecutionMode::Parallel,
+                );
+                // The workspace task's typed observation: the ceiling refused
+                // dispatch 8 after 7 cumulative dispatches.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+                // A repeated observation for the same change must not duplicate.
+                state.record_apply_iteration_limit("change-a", 7, 7);
+            }
+
+            orchestrator
+                .run_parallel_finish_hook()
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(
+                lines(&log),
+                vec!["iteration_limit 7".to_string()],
+                "on_finish runs exactly once with the typed status and the exact count"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_run_without_an_iteration_limit_reports_completed() {
+            let temp_dir = TempDir::new().unwrap();
+            let log = temp_dir.path().join("on-finish.log");
+            let orchestrator = orchestrator_with_on_finish(&log);
+
+            {
+                let mut state = orchestrator.shared_state.write().await;
+                *state = OrchestratorState::with_mode(
+                    vec!["change-a".to_string()],
+                    7,
+                    crate::orchestration::state::ExecutionMode::Parallel,
+                );
+            }
+
+            orchestrator
+                .run_parallel_finish_hook()
+                .await
+                .expect("the finish hook must run");
+
+            assert_eq!(lines(&log), vec!["completed 0".to_string()]);
         }
     }
 

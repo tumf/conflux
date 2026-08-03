@@ -676,6 +676,27 @@ pub struct OrchestratorState {
     /// Execution mode: Serial or Parallel.
     /// Determines how `ChangeArchived` events are handled.
     execution_mode: ExecutionMode,
+
+    /// Changes stopped by the per-change Apply-dispatch ceiling, in observation
+    /// order.
+    ///
+    /// Parallel execution has no return channel for a typed Apply outcome, so
+    /// the budget owner's refusal is recorded here with its exact cumulative
+    /// count. That keeps `iteration_limit` a typed run-level outcome instead of
+    /// something a caller would have to re-derive by parsing an error string.
+    /// Active-run memory like the rest of this reducer.
+    apply_iteration_limits: Vec<ApplyIterationLimit>,
+}
+
+/// One change stopped by the configured Apply-dispatch ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyIterationLimit {
+    /// The change whose Apply budget was spent.
+    pub change_id: String,
+    /// Exact cumulative configured Apply dispatches reserved for that change.
+    pub attempts: u32,
+    /// The configured ceiling that refused the next dispatch.
+    pub max: u32,
 }
 
 #[allow(dead_code)] // Public API for future use by TUI/Web states
@@ -719,6 +740,7 @@ impl OrchestratorState {
             resolve_wait_queue: Vec::new(),
             reject_wait_queue: Vec::new(),
             execution_mode,
+            apply_iteration_limits: Vec::new(),
         }
     }
 
@@ -778,6 +800,31 @@ impl OrchestratorState {
     /// Mark a change as stalled.
     pub fn mark_stalled(&mut self, change_id: String) {
         self.stalled_change_ids.insert(change_id);
+    }
+
+    /// Record that the Apply-dispatch ceiling refused another dispatch.
+    ///
+    /// Repeated observations for the same change keep the first record: the
+    /// exact count that first hit the ceiling is the one the finish hook
+    /// reports.
+    pub fn record_apply_iteration_limit(&mut self, change_id: &str, attempts: u32, max: u32) {
+        if self
+            .apply_iteration_limits
+            .iter()
+            .any(|record| record.change_id == change_id)
+        {
+            return;
+        }
+        self.apply_iteration_limits.push(ApplyIterationLimit {
+            change_id: change_id.to_string(),
+            attempts,
+            max,
+        });
+    }
+
+    /// Changes stopped by the Apply-dispatch ceiling, in observation order.
+    pub fn apply_iteration_limits(&self) -> &[ApplyIterationLimit] {
+        &self.apply_iteration_limits
     }
 
     /// Mark a change as skipped.

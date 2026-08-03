@@ -303,18 +303,30 @@ fn format_cleanup_review_diagnostic(diagnostic: &CleanupReviewDiagnostic) -> Str
     {
         parts.push(format!("status: {}", condense(status)));
     }
+    // Reported independently of the primary kind: a command or marker failure
+    // that also lost status evidence must say so in the terminal diagnostic.
+    if let Some(status_error) = diagnostic
+        .status_error
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
+        parts.push(format!("status_error: {}", condense(status_error)));
+    }
+    // stdout and stderr are bounded separately, so both are reported: an exit
+    // code with only one stream is an incomplete picture of the failure.
+    if let Some(stdout) = diagnostic
+        .stdout_tail
+        .as_deref()
+        .filter(|tail| !tail.trim().is_empty())
+    {
+        parts.push(format!("stdout: {}", condense(stdout)));
+    }
     if let Some(stderr) = diagnostic
         .stderr_tail
         .as_deref()
         .filter(|tail| !tail.trim().is_empty())
     {
         parts.push(format!("stderr: {}", condense(stderr)));
-    } else if let Some(stdout) = diagnostic
-        .stdout_tail
-        .as_deref()
-        .filter(|tail| !tail.trim().is_empty())
-    {
-        parts.push(format!("stdout: {}", condense(stdout)));
     }
     parts.join(" | ")
 }
@@ -359,10 +371,11 @@ async fn run_cleanup_review_attempt(
         )
         .await?;
 
-    // Bounded tails for diagnostics; `stdout` keeps the full text only so the
-    // standalone marker can be counted across the whole attempt.
+    // Bounded tails for diagnostics; the marker contract is evaluated with a
+    // fixed-size streaming scanner so an attempt that floods stdout cannot grow
+    // this frame's memory with retained output.
     let mut output_collector = crate::history::OutputCollector::new();
-    let mut stdout = String::new();
+    let mut marker_scanner = crate::agent::CleanupMarkerScanner::new();
     loop {
         let line = if let Some(token) = cancel_token {
             tokio::select! {
@@ -394,8 +407,7 @@ async fn run_cleanup_review_attempt(
         match line {
             crate::ai_command_runner::OutputLine::Stdout(s) => {
                 output_collector.add_stdout(&s);
-                stdout.push_str(&s);
-                stdout.push('\n');
+                marker_scanner.observe(&s);
             }
             crate::ai_command_runner::OutputLine::Stderr(s) => {
                 output_collector.add_stderr(&s);
@@ -415,7 +427,7 @@ async fn run_cleanup_review_attempt(
 
     let stdout_tail = output_collector.stdout_tail();
     let stderr_tail = output_collector.stderr_tail();
-    let marker_count = crate::agent::count_cleanup_review_markers(&stdout);
+    let marker_count = marker_scanner.count();
 
     // Step 1 — command ownership. A classified permission/tool-policy denial is
     // distinguished before generic command failure so it can enter the existing
@@ -428,20 +440,24 @@ async fn run_cleanup_review_attempt(
     }
 
     if !status.success() {
-        let status_tail = current_porcelain_status(workspace_path).await;
+        // A status query that failed at the same time is kept as its own field:
+        // dropping it would make "no status evidence" indistinguishable from a
+        // clean worktree in the corrective prompt.
+        let (status_tail, status_error) = split_status_inspection(workspace_path).await;
         return Ok(CleanupReviewAttempt::Failure(CleanupReviewDiagnostic {
             kind: CleanupReviewFailureKind::CommandFailed,
             exit_code: status.code(),
             stdout_tail,
             stderr_tail,
             marker_count,
-            status_tail: status_tail.ok(),
+            status_tail,
+            status_error,
         }));
     }
 
     // Step 2 — protocol marker. Missing and duplicate markers both fail.
     if marker_count != 1 {
-        let status_tail = current_porcelain_status(workspace_path).await;
+        let (status_tail, status_error) = split_status_inspection(workspace_path).await;
         let kind = if marker_count == 0 {
             CleanupReviewFailureKind::MarkerMissing
         } else {
@@ -453,7 +469,8 @@ async fn run_cleanup_review_attempt(
             stdout_tail,
             stderr_tail,
             marker_count,
-            status_tail: status_tail.ok(),
+            status_tail,
+            status_error,
         }));
     }
 
@@ -468,6 +485,7 @@ async fn run_cleanup_review_attempt(
             stderr_tail,
             marker_count,
             status_tail: Some(dirty_status),
+            status_error: None,
         })),
         Err(e) => Ok(CleanupReviewAttempt::Failure(CleanupReviewDiagnostic {
             kind: CleanupReviewFailureKind::StatusInspectionFailed,
@@ -475,8 +493,22 @@ async fn run_cleanup_review_attempt(
             stdout_tail,
             stderr_tail,
             marker_count,
-            status_tail: Some(format!("status inspection failed: {}", e)),
+            status_tail: None,
+            status_error: Some(format!("status inspection failed: {}", e)),
         })),
+    }
+}
+
+/// Fresh porcelain evidence for a corrective prompt, split into the observed
+/// status and the inspection error.
+///
+/// Exactly one side is `Some`: a failed query is reported as an error rather
+/// than silently omitted, so the next attempt can tell "unproven" apart from
+/// "nothing reported".
+async fn split_status_inspection(workspace_path: &Path) -> (Option<String>, Option<String>) {
+    match current_porcelain_status(workspace_path).await {
+        Ok(status) => (Some(status), None),
+        Err(e) => (None, Some(e.to_string())),
     }
 }
 
@@ -1982,27 +2014,19 @@ pub async fn execute_acceptance_in_workspace(
             "Acceptance command failed with exit code: {:?}",
             status.code()
         );
-        let attempt_number = agent.next_acceptance_attempt_number(change_id);
-        let attempt = crate::history::AcceptanceAttempt {
-            attempt: attempt_number,
-            passed: false,
-            duration: start_time.elapsed(),
-            findings: Some(crate::acceptance::legacy_findings(tail_findings.clone())),
-            exit_code: status.code(),
-            stdout_tail: stdout_tail.clone(),
-            stderr_tail: stderr_tail.clone(),
-            commit_hash: revision_to_history_commit_hash(&end_revision),
-        };
-        agent.record_acceptance_attempt(change_id, attempt.clone());
-        acceptance_history.lock().await.record(change_id, attempt);
 
+        // A command that never completed produced no verdict, so it records no
+        // canonical `AcceptanceAttempt` in either the agent-local or the shared
+        // Acceptance history: transport evidence must not be replayed as
+        // previous findings, and it must not consume attempt numbering. The
+        // dedicated latest-only command-recovery context below is the only place
+        // this output travels.
         if let Some(ref tx) = event_tx {
             let _ = tx
                 .send(ParallelEvent::Log(
                     crate::events::LogEntry::error(&error_msg)
                         .with_change_id(change_id)
-                        .with_operation("acceptance")
-                        .with_iteration(attempt_number),
+                        .with_operation("acceptance"),
                 ))
                 .await;
             let _ = tx
@@ -2023,7 +2047,9 @@ pub async fn execute_acceptance_in_workspace(
                 error: error_msg,
                 findings: tail_findings,
             },
-            attempt_number,
+            // No canonical attempt was recorded, so no attempt number is
+            // reported.
+            0,
         ));
     }
 
@@ -3203,6 +3229,181 @@ mod tests {
                 !prompt(second_state.path(), 1).contains("<cleanup_review_correction>"),
                 "no prior-run diagnosis may be restored from outside the workspace"
             );
+        }
+
+        // === Simultaneous status-inspection failure ===
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_command_failure_that_also_breaks_status_reports_both() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // The command fails *and* leaves the repository unreadable, so the
+            // fresh status query cannot answer either. An absent status must not
+            // read as "nothing reported".
+            let command = fixture(
+                state.path(),
+                "rm -rf .git; echo 'cleanup crashed' >&2; exit 5",
+            );
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a broken repository is never a handoff-ready worktree");
+
+            let message = error.to_string();
+            assert!(
+                message.contains("failure_kind: command_failed"),
+                "the primary failure kind is preserved: {message}"
+            );
+            assert!(message.contains("exit_code: 5"), "{message}");
+            assert!(
+                message.contains("status_error: "),
+                "the simultaneous status-inspection failure must be reported: {message}"
+            );
+            assert!(message.contains("status inspection failed"), "{message}");
+            assert!(
+                !message.contains("| status: "),
+                "an unanswerable query must not present itself as observed status: {message}"
+            );
+
+            // The corrective prompt distinguishes unavailable evidence from an
+            // empty status.
+            let second = prompt(state.path(), 2);
+            assert!(
+                second.contains("\"failure_kind\":\"command_failed\""),
+                "{second}"
+            );
+            assert!(
+                second.contains("\"status_inspection_error\""),
+                "the corrective prompt must say cleanliness is unproven: {second}"
+            );
+            assert!(
+                !second.contains("\"current_porcelain_status\""),
+                "no status may be claimed when the query failed: {second}"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_marker_failure_that_also_breaks_status_reports_both() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Exits successfully with no marker, and breaks the repository.
+            let command = fixture(state.path(), "rm -rf .git; echo 'reviewed'; exit 0");
+
+            let error = run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a missing marker with unprovable cleanliness is terminal");
+
+            let message = error.to_string();
+            assert!(
+                message.contains("failure_kind: marker_missing"),
+                "the marker contract still owns the primary kind: {message}"
+            );
+            assert!(
+                message.contains("standalone_clean_marker_count: 0"),
+                "{message}"
+            );
+            assert!(
+                message.contains("status_error: "),
+                "the simultaneous status-inspection failure must be reported: {message}"
+            );
+
+            let second = prompt(state.path(), 2);
+            assert!(
+                second.contains("\"failure_kind\":\"marker_missing\""),
+                "{second}"
+            );
+            assert!(second.contains("\"status_inspection_error\""), "{second}");
+        }
+
+        // === Bounded marker accounting ===
+
+        #[test]
+        fn the_marker_scanner_state_is_fixed_size_regardless_of_stream_length() {
+            use crate::agent::CleanupMarkerScanner;
+
+            let mut scanner = CleanupMarkerScanner::new();
+            // Far more output than any bounded tail would keep.
+            for i in 0..200_000 {
+                scanner.observe(&format!("noise line {i} with some padding text"));
+            }
+            scanner.observe("CLEANUP_REVIEW: CLEAN");
+            for i in 0..200_000 {
+                scanner.observe(&format!("trailing noise {i}"));
+            }
+
+            assert_eq!(scanner.count(), 1, "the marker contract still holds");
+            // The scanner is a plain Copy value: it cannot retain the stream.
+            assert!(
+                std::mem::size_of::<CleanupMarkerScanner>() <= 2 * std::mem::size_of::<usize>(),
+                "marker state must stay bounded, got {} bytes",
+                std::mem::size_of::<CleanupMarkerScanner>()
+            );
+        }
+
+        #[test]
+        fn the_marker_scanner_ignores_fenced_markers_across_chunk_boundaries() {
+            use crate::agent::CleanupMarkerScanner;
+
+            let mut scanner = CleanupMarkerScanner::new();
+            for chunk in [
+                "```",
+                "CLEANUP_REVIEW: CLEAN",
+                "```",
+                "  CLEANUP_REVIEW: CLEAN  ",
+                "prefix CLEANUP_REVIEW: CLEAN",
+            ] {
+                scanner.observe(chunk);
+            }
+
+            assert_eq!(
+                scanner.count(),
+                1,
+                "only the standalone unfenced marker counts, even when the fence spans chunks"
+            );
+        }
+
+        #[cfg_attr(windows, ignore)]
+        #[tokio::test]
+        async fn a_large_stream_still_validates_the_marker_exactly_once() {
+            let repo_dir = dirty_worktree();
+            let state = TempDir::new().unwrap();
+            // Emits a fenced decoy, a large body, then the one real marker.
+            let command = fixture(
+                state.path(),
+                "echo '```'; echo 'CLEANUP_REVIEW: CLEAN'; echo '```'; \
+             i=0; while [ $i -lt 4000 ]; do echo \"filler line $i\"; i=$((i+1)); done; \
+             git add leftover.txt && git commit -q -m cleanup && echo 'CLEANUP_REVIEW: CLEAN'",
+            );
+
+            run_post_apply_cleanup_review(
+                "change-a",
+                repo_dir.path(),
+                &config(command),
+                &ai_runner(),
+                None,
+                None,
+            )
+            .await
+            .expect("one standalone marker outside fences plus a clean worktree is success");
+
+            assert_eq!(attempts(state.path()), 1, "no correction was needed");
+            assert!(!is_dirty(repo_dir.path()).await);
         }
     }
 }

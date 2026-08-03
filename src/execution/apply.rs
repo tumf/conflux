@@ -303,8 +303,12 @@ impl ApplyBudget {
         let attempt = state.attempts;
 
         let warning = if max_iterations > 0 {
-            let threshold = (max_iterations as f32 * 0.8) as u32;
-            if !state.warned && threshold > 0 && attempt >= threshold {
+            // Integer ceiling: the warning belongs to the first dispatch that
+            // actually reaches 80% of the ceiling. Truncating multiplication
+            // warned early for small limits (3 warned at attempt 2 = 67%) and
+            // never warned at all for a limit of 1.
+            let threshold = Self::warning_threshold(max_iterations);
+            if !state.warned && attempt >= threshold {
                 state.warned = true;
                 Some(format!(
                     "Approaching max iterations: {}/{}",
@@ -318,6 +322,25 @@ impl ApplyBudget {
         };
 
         ApplyBudgetReservation::Reserved { attempt, warning }
+    }
+
+    /// First 1-based dispatch number that reaches at least 80% of a positive
+    /// `max_iterations`, using integer ceiling semantics.
+    pub fn warning_threshold(max_iterations: u32) -> u32 {
+        (u64::from(max_iterations) * 4).div_ceil(5) as u32
+    }
+
+    /// Whether the positive ceiling for `change_id` is already spent.
+    ///
+    /// Lets a caller refuse a dispatch *before* running pre-dispatch hooks or
+    /// launching a child, so a refused cycle neither runs `pre_apply` nor
+    /// advances the counter. Returns `(attempts_so_far, max_iterations)`.
+    pub fn exhaustion(&self, change_id: &str, max_iterations: u32) -> Option<(u32, u32)> {
+        if max_iterations == 0 {
+            return None;
+        }
+        let attempts = self.attempts(change_id);
+        (attempts >= max_iterations).then_some((attempts, max_iterations))
     }
 
     /// Cumulative configured Apply dispatches reserved for `change_id` so far.
@@ -1062,6 +1085,78 @@ fn detect_apply_rejected_handoff(
         .then_some(ApplyRejectedHandoff { rejected_path })
 }
 
+/// Build the typed `iteration_limit` error for a dispatch the budget owner
+/// refused, and run the existing `on_error` hook once for it.
+///
+/// Shared by the pre-hook refusal check and the reservation itself so both
+/// report the same diagnosis and fire `on_error` exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_dispatch_on_iteration_limit(
+    change_id: &str,
+    workspace_path: &Path,
+    attempts: u32,
+    max: u32,
+    pending_commit_repair: Option<&CommitRejection>,
+    latest_failure_diagnostic: Option<&str>,
+    hooks: Option<&HookRunner>,
+    hook_ctx: &ApplyLoopHookContext,
+    progress: &TaskProgress,
+) -> OrchestratorError {
+    // Commit-hook recovery shares this budget, so an exhausted budget must
+    // surface the last actionable diagnostics instead of a bare iteration count.
+    let diagnostic = match (pending_commit_repair, latest_failure_diagnostic) {
+        (Some(rejection), _) => format!(
+            "the final Apply commit in workspace '{}' is still rejected by repository verification ({})",
+            workspace_path.display(),
+            format_commit_rejection_for_error(rejection)
+        ),
+        (None, Some(failure)) => format!(
+            "latest Apply failure in workspace '{}': {}",
+            workspace_path.display(),
+            failure
+        ),
+        (None, None) => format!(
+            "no owned completion, hold, or stall outcome was reached in workspace '{}'",
+            workspace_path.display()
+        ),
+    };
+    let error = OrchestratorError::IterationLimit {
+        change_id: change_id.to_string(),
+        attempts,
+        max,
+        diagnostic,
+    };
+    let error_msg = error.to_string();
+
+    if let Some(hook_runner) = hooks {
+        let error_ctx = hook_ctx
+            .build_hook_context(change_id, progress.completed, progress.total, attempts)
+            .with_error(&error_msg);
+        if let Err(e) = hook_runner.run_hook(HookType::OnError, &error_ctx).await {
+            error!("on_error hook failed: {}", e);
+        }
+    }
+
+    error
+}
+
+/// Bounded fingerprint of repository state, used to decide whether an Apply
+/// attempt that exited non-zero still moved the repository forward.
+///
+/// Modes that take no WIP snapshot (serial apply) have no empty-commit signal,
+/// so this is the only Git evidence available to their stall accounting. A
+/// query that cannot be answered returns `None`, which is treated as "no
+/// evidence" rather than as progress.
+async fn repository_progress_fingerprint(workspace_path: &Path) -> Option<String> {
+    let head = crate::vcs::git::commands::get_current_commit(workspace_path)
+        .await
+        .ok()?;
+    let (_, status) = crate::vcs::git::commands::has_uncommitted_changes(workspace_path)
+        .await
+        .ok()?;
+    Some(format!("{}\n{}", head.trim(), status))
+}
+
 /// Execute apply iterations until tasks are complete or max iterations reached.
 ///
 /// This is the unified apply loop used by both serial and parallel modes.
@@ -1124,6 +1219,12 @@ where
 
     // Check if VCS is Git for WIP/stall features
     let is_git = matches!(vcs_backend, VcsBackend::Git);
+
+    // Serial apply runs against the repository itself and takes no WIP snapshot,
+    // so it has no empty-commit signal. Repository fingerprints around each
+    // dispatch supply the Git/file evidence its stall accounting would otherwise
+    // lack.
+    let serial_git_progress_accounting = is_git && workspace_manager.is_none();
 
     let apply_succeeded = loop {
         // Dispatches reserved for this change so far, across every Apply entry in
@@ -1229,11 +1330,61 @@ where
             );
         }
 
+        // Refuse the dispatch before anything is started when the sole per-change
+        // budget owner has no ceiling left. This runs ahead of `pre_apply` so a
+        // refused cycle neither fires a pre-dispatch hook nor advances the
+        // counter.
+        if let Some((attempts, max)) = budget.exhaustion(change_id, max_iterations) {
+            return Err(refuse_dispatch_on_iteration_limit(
+                change_id,
+                workspace_path,
+                attempts,
+                max,
+                pending_commit_repair.as_ref(),
+                latest_failure_diagnostic.as_deref(),
+                hooks,
+                hook_ctx,
+                &progress,
+            )
+            .await);
+        }
+
+        // Run pre_apply hook *before* any child is launched and before the
+        // budget is consumed: the hook decides whether this dispatch is
+        // authorized at all, so a failing hook must leave no running command and
+        // no spent attempt. The prospective attempt number is what the
+        // reservation below will hand out.
+        let prospective_attempt = attempts_so_far.saturating_add(1);
+        if let Some(hook_runner) = hooks {
+            let current_hook_ctx = hook_ctx.build_hook_context(
+                change_id,
+                progress.completed,
+                progress.total,
+                prospective_attempt,
+            );
+
+            event_handler.on_hook_started(change_id, "pre_apply");
+
+            match hook_runner
+                .run_hook(HookType::PreApply, &current_hook_ctx)
+                .await
+            {
+                Ok(()) => {
+                    event_handler.on_hook_completed(change_id, "pre_apply");
+                }
+                Err(e) => {
+                    error!("pre_apply hook failed for {}: {}", change_id, e);
+                    event_handler.on_hook_failed(change_id, "pre_apply", &e.to_string());
+                    return Err(e);
+                }
+            }
+        }
+
         // Reserve the configured Apply-agent dispatch from the sole per-change
-        // budget owner. Everything above this point is workspace inspection and
-        // routing, so a cycle that completes or hands off without dispatching an
-        // agent never consumes budget. Command-queue transport retries happen
-        // inside this one reservation.
+        // budget owner. Everything above this point is workspace inspection,
+        // routing, and pre-dispatch authorization, so a cycle that completes,
+        // hands off, or is refused never consumes budget. Command-queue transport
+        // retries happen inside this one reservation.
         iteration = match budget.reserve(change_id, max_iterations) {
             ApplyBudgetReservation::Reserved { attempt, warning } => {
                 if let Some(warning) = warning {
@@ -1243,44 +1394,18 @@ where
                 attempt
             }
             ApplyBudgetReservation::Exhausted { attempts, max } => {
-                // Commit-hook recovery shares this budget, so an exhausted budget
-                // must surface the last actionable diagnostics instead of a bare
-                // iteration count.
-                let diagnostic = match (&pending_commit_repair, &latest_failure_diagnostic) {
-                    (Some(rejection), _) => format!(
-                        "the final Apply commit in workspace '{}' is still rejected by repository verification ({})",
-                        workspace_path.display(),
-                        format_commit_rejection_for_error(rejection)
-                    ),
-                    (None, Some(failure)) => format!(
-                        "latest Apply failure in workspace '{}': {}",
-                        workspace_path.display(),
-                        failure
-                    ),
-                    (None, None) => format!(
-                        "no owned completion, hold, or stall outcome was reached in workspace '{}'",
-                        workspace_path.display()
-                    ),
-                };
-                let error = OrchestratorError::IterationLimit {
-                    change_id: change_id.to_string(),
+                return Err(refuse_dispatch_on_iteration_limit(
+                    change_id,
+                    workspace_path,
                     attempts,
                     max,
-                    diagnostic,
-                };
-                let error_msg = error.to_string();
-
-                // Run on_error hook
-                if let Some(hook_runner) = hooks {
-                    let error_ctx = hook_ctx
-                        .build_hook_context(change_id, progress.completed, progress.total, attempts)
-                        .with_error(&error_msg);
-                    if let Err(e) = hook_runner.run_hook(HookType::OnError, &error_ctx).await {
-                        error!("on_error hook failed: {}", e);
-                    }
-                }
-
-                return Err(error);
+                    pending_commit_repair.as_ref(),
+                    latest_failure_diagnostic.as_deref(),
+                    hooks,
+                    hook_ctx,
+                    &progress,
+                )
+                .await);
             }
         };
 
@@ -1299,6 +1424,15 @@ where
             current_empty_wip_count,
             apply_escalation_uses_for_current_stall
         );
+
+        // Repository fingerprint taken immediately before the dispatch. Modes
+        // without a WIP snapshot compare it against a fresh one after a failed
+        // attempt so real Git/file work still counts as progress.
+        let pre_dispatch_fingerprint = if serial_git_progress_accounting {
+            repository_progress_fingerprint(workspace_path).await
+        } else {
+            None
+        };
 
         // Execute apply command with history context via AiCommandRunner
         let (mut child, mut rx, start_time, command) = if escalation_eligible {
@@ -1327,32 +1461,6 @@ where
         if first_apply {
             first_apply = false;
             event_handler.on_apply_started(change_id, &command);
-        }
-
-        // Run pre_apply hook
-        if let Some(hook_runner) = hooks {
-            let current_hook_ctx = hook_ctx.build_hook_context(
-                change_id,
-                progress.completed,
-                progress.total,
-                iteration,
-            );
-
-            event_handler.on_hook_started(change_id, "pre_apply");
-
-            match hook_runner
-                .run_hook(HookType::PreApply, &current_hook_ctx)
-                .await
-            {
-                Ok(()) => {
-                    event_handler.on_hook_completed(change_id, "pre_apply");
-                }
-                Err(e) => {
-                    error!("pre_apply hook failed for {}: {}", change_id, e);
-                    event_handler.on_hook_failed(change_id, "pre_apply", &e.to_string());
-                    return Err(e);
-                }
-            }
         }
 
         // Create output collector for history
@@ -1619,9 +1727,23 @@ where
             break false;
         }
 
-        // Even when the apply command exits naturally, REJECTED.md must hand off
-        // immediately to rejecting review before post_apply hooks, WIP snapshots,
-        // or stall detection can run.
+        // Even when the apply command exits naturally — including a non-zero
+        // ordinary failure — a handoff marker written by that attempt must be
+        // honoured immediately. Both markers are read from the fresh
+        // post-command inspection above, before permission accounting, post_apply
+        // hooks, WIP snapshots, or stall routing can turn the same cycle into a
+        // stall or authorize another dispatch.
+        if let Some(blocked_handoff) = detect_apply_blocked_handoff(workspace_path, change_id) {
+            info!(
+                change_id = change_id,
+                blocker_path = %blocked_handoff.blocker_path.display(),
+                completed = new_progress.completed,
+                total = new_progress.total,
+                "Apply loop exiting for blocked handoff after normal apply command exit"
+            );
+            break false;
+        }
+
         if detect_apply_rejected_handoff(workspace_path, change_id).is_some() {
             info!(
                 change_id = change_id,
@@ -1819,23 +1941,44 @@ where
         }
 
         // Modes without a WIP snapshot (serial apply, non-Git backends) never
-        // reach the block above, so an ordinary command failure that produced no
-        // task progress must still register with existing stall policy. Without
-        // this, `max_iterations = 0` could retry a permanently failing command
-        // forever instead of reaching the configured stall threshold.
-        if !wip_stall_accounting_ran
-            && ordinary_command_failure
-            && new_progress.completed <= progress.completed
-            && stall_detector.register_commit(change_id, StallPhase::Apply, true)
-        {
-            let count = stall_detector.current_count(change_id, StallPhase::Apply);
-            let threshold = stall_detector.config().threshold;
-            let message = format!(
-                "Stall detected for {} after {} apply command failures without task progress (apply)",
-                change_id, count
-            );
-            warn!("{} (threshold {})", message, threshold);
-            return Err(OrchestratorError::AgentCommand(message));
+        // reach the block above, so an ordinary command failure must still
+        // register with existing stall policy. Without this, `max_iterations = 0`
+        // could retry a permanently failing command forever instead of reaching
+        // the configured stall threshold.
+        //
+        // Checkbox progress alone is not enough evidence here: a failing attempt
+        // that still commits work or edits files in the repository is making
+        // progress even though no task line was ticked. On Git the repository
+        // fingerprint taken around this dispatch supplies that evidence, so only
+        // an attempt that moved neither tasks nor the repository counts as empty.
+        if !wip_stall_accounting_ran && ordinary_command_failure {
+            let task_progressed = new_progress.completed > progress.completed;
+            let repository_progressed = match &pre_dispatch_fingerprint {
+                Some(before) => repository_progress_fingerprint(workspace_path)
+                    .await
+                    .is_some_and(|after| after != *before),
+                None => false,
+            };
+            let is_empty = !task_progressed && !repository_progressed;
+
+            if repository_progressed {
+                info!(
+                    change_id = change_id,
+                    iteration = iteration,
+                    "Apply command failed but the repository advanced; not counting this attempt as an empty stall step"
+                );
+            }
+
+            if stall_detector.register_commit(change_id, StallPhase::Apply, is_empty) {
+                let count = stall_detector.current_count(change_id, StallPhase::Apply);
+                let threshold = stall_detector.config().threshold;
+                let message = format!(
+                    "Stall detected for {} after {} apply command failures without task or repository progress (apply)",
+                    change_id, count
+                );
+                warn!("{} (threshold {})", message, threshold);
+                return Err(OrchestratorError::AgentCommand(message));
+            }
         }
 
         // Check if complete. A completed checkbox set with an invalid active-section
@@ -4238,10 +4381,10 @@ mod apply_budget_recovery {
             diagnostic.contains("apply-boom"),
             "the diagnostic must carry bounded stream evidence: {diagnostic}"
         );
-        assert!(
-            recorder.warnings().is_empty(),
-            "a ceiling of 1 has no positive 80% threshold to cross: {:?}",
-            recorder.warnings()
+        assert_eq!(
+            recorder.warnings(),
+            vec!["Approaching max iterations: 1/1".to_string()],
+            "a ceiling of 1 is crossed by its only dispatch, so exactly one warning is due"
         );
     }
 
@@ -4449,5 +4592,314 @@ mod apply_budget_recovery {
             transport_attempts > 1,
             "the fixture must exercise real transport retries, saw {transport_attempts}"
         );
+    }
+}
+
+/// Dispatch authorization: what must be true *before* an Apply child starts, and
+/// what a completed attempt's own artifacts decide before stall routing runs.
+#[cfg(test)]
+mod apply_dispatch_authorization {
+    use super::tests::{init_git_repo, make_test_ai_runner};
+    use super::*;
+    use crate::hooks::{HookConfig, HookConfigValue, HookRunner, HooksConfig};
+    use tempfile::TempDir;
+
+    const PENDING_TASKS: &str = "## Implementation Tasks\n- [ ] implement\n";
+
+    fn write_tasks(workspace: &Path, change_id: &str, content: &str) {
+        let change_dir = workspace.join("openspec").join("changes").join(change_id);
+        std::fs::create_dir_all(&change_dir).unwrap();
+        std::fs::write(change_dir.join("tasks.md"), content).unwrap();
+    }
+
+    fn hook(command: String) -> HookConfigValue {
+        HookConfigValue::Full(HookConfig {
+            command,
+            continue_on_failure: false,
+            timeout: 30,
+            git_commit_no_verify: false,
+            max_retries: 0,
+            retry_delay_secs: 0,
+        })
+    }
+
+    async fn run_loop_with_hooks(
+        workspace: &Path,
+        change_id: &str,
+        config: &OrchestratorConfig,
+        budget: &ApplyBudget,
+        hooks: Option<&HookRunner>,
+    ) -> Result<ApplyLoopResult> {
+        let mut agent = AgentRunner::new(config.clone());
+        let ai_runner = make_test_ai_runner();
+        execute_apply_loop(
+            change_id,
+            workspace,
+            config,
+            &mut agent,
+            VcsBackend::Git,
+            None,
+            hooks,
+            &ApplyLoopHookContext::serial(0, 1, 1),
+            &NoOpEventHandler,
+            None,
+            &ai_runner,
+            budget,
+            |_line| async move {},
+        )
+        .await
+    }
+
+    // === 80% warning threshold (unit) ===
+
+    #[test]
+    fn the_warning_threshold_is_the_integer_ceiling_of_eighty_percent() {
+        // ceil(max * 0.8): the first dispatch that actually reaches 80%.
+        for (max, expected) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 4), (100, 80)] {
+            assert_eq!(
+                ApplyBudget::warning_threshold(max),
+                expected,
+                "a ceiling of {max} is first reached at 80% on dispatch {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_positive_ceiling_warns_exactly_once_at_its_ceiling_threshold() {
+        for (max, expected_attempt) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 4), (100, 80)] {
+            let budget = ApplyBudget::new();
+            let mut warned_at = Vec::new();
+
+            for attempt in 1..=max {
+                match budget.reserve("change-a", max) {
+                    ApplyBudgetReservation::Reserved {
+                        warning: Some(warning),
+                        ..
+                    } => {
+                        assert_eq!(
+                            warning,
+                            format!("Approaching max iterations: {attempt}/{max}")
+                        );
+                        warned_at.push(attempt);
+                    }
+                    ApplyBudgetReservation::Reserved { warning: None, .. } => {}
+                    other => panic!("a dispatch inside the ceiling must be reserved: {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                warned_at,
+                vec![expected_attempt],
+                "a ceiling of {max} must warn exactly once, on dispatch {expected_attempt}"
+            );
+        }
+    }
+
+    // === pre_apply authorizes the dispatch (integration) ===
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_failing_pre_apply_starts_no_command_and_spends_no_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        // The apply command records that it ran. A refused dispatch must leave
+        // this marker absent: no child may be launched before the hook decides.
+        let apply_marker = temp_dir.path().join("apply-ran.txt");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo ran >> {}'", apply_marker.display())),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let hooks = HookRunner::new(
+            HooksConfig {
+                pre_apply: Some(hook("sh -c 'exit 7'".to_string())),
+                ..Default::default()
+            },
+            workspace,
+        );
+        let budget = ApplyBudget::new();
+
+        let error = run_loop_with_hooks(workspace, "change-a", &config, &budget, Some(&hooks))
+            .await
+            .expect_err("a failing pre_apply hook must stop the loop");
+
+        assert!(
+            !matches!(error, OrchestratorError::IterationLimit { .. }),
+            "the hook failure — not the ceiling — owns this stop: {error}"
+        );
+        assert!(
+            !apply_marker.exists(),
+            "no Apply child may start before pre_apply succeeds"
+        );
+        assert_eq!(
+            budget.attempts("change-a"),
+            0,
+            "an unauthorized dispatch must not consume the per-change budget"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_succeeding_pre_apply_still_authorizes_the_dispatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let apply_marker = temp_dir.path().join("apply-ran.txt");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!("sh -c 'echo ran >> {}'", apply_marker.display())),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let hooks = HookRunner::new(
+            HooksConfig {
+                pre_apply: Some(hook("true".to_string())),
+                ..Default::default()
+            },
+            workspace,
+        );
+        let budget = ApplyBudget::new();
+
+        let _ = run_loop_with_hooks(workspace, "change-a", &config, &budget, Some(&hooks)).await;
+
+        assert!(
+            apply_marker.exists(),
+            "an authorized dispatch must still launch the Apply child"
+        );
+        assert_eq!(budget.attempts("change-a"), 1);
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_refused_dispatch_never_reaches_pre_apply() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let hook_marker = temp_dir.path().join("pre-apply.log");
+        let config = OrchestratorConfig {
+            apply_command: Some("true".to_string()),
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let hooks = HookRunner::new(
+            HooksConfig {
+                pre_apply: Some(hook(format!(
+                    "sh -c 'echo pre >> {}'",
+                    hook_marker.display()
+                ))),
+                ..Default::default()
+            },
+            workspace,
+        );
+        let budget = ApplyBudget::new();
+        // The ceiling is already spent, so the re-entry below is refused.
+        budget.reserve("change-a", 1);
+
+        let error = run_loop_with_hooks(workspace, "change-a", &config, &budget, Some(&hooks))
+            .await
+            .expect_err("a spent budget must refuse the re-entry");
+
+        assert!(matches!(
+            error,
+            OrchestratorError::IterationLimit {
+                attempts: 1,
+                max: 1,
+                ..
+            }
+        ));
+        assert!(
+            !hook_marker.exists(),
+            "a refused dispatch must not run the pre-dispatch hook"
+        );
+    }
+
+    // === Handoff markers outrank stall routing (integration) ===
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_non_zero_natural_exit_that_wrote_apply_blocked_hands_off_without_another_dispatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let blocker_dir = workspace
+            .join("openspec")
+            .join("changes")
+            .join("change-a")
+            .join("APPLY_BLOCKED");
+        let config = OrchestratorConfig {
+            // Writes the blocker marker, then exits non-zero — an ordinary
+            // command failure that nevertheless produced a handoff.
+            apply_command: Some(format!(
+                "sh -c 'mkdir -p {dir} && echo blocked > {dir}/marker.md; exit 4'",
+                dir = blocker_dir.display()
+            )),
+            // A threshold of one means stall routing would fire on this very
+            // attempt if it were allowed to run first.
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 1,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let budget = ApplyBudget::new();
+
+        let result = run_loop_with_hooks(workspace, "change-a", &config, &budget, None)
+            .await
+            .expect("the blocked handoff owns this outcome, not stall routing");
+
+        let handoff = result
+            .blocked_handoff
+            .expect("APPLY_BLOCKED written by the failed attempt must route to blocked handoff");
+        assert!(handoff.blocker_path.ends_with("APPLY_BLOCKED/marker.md"));
+        assert!(!result.completed);
+        assert_eq!(
+            budget.attempts("change-a"),
+            1,
+            "the handoff must be honoured without authorizing another dispatch"
+        );
+    }
+
+    #[cfg_attr(windows, ignore)]
+    #[tokio::test]
+    async fn a_non_zero_natural_exit_that_wrote_rejected_hands_off_without_another_dispatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        init_git_repo(workspace);
+        write_tasks(workspace, "change-a", PENDING_TASKS);
+
+        let change_dir = workspace.join("openspec").join("changes").join("change-a");
+        let config = OrchestratorConfig {
+            apply_command: Some(format!(
+                "sh -c 'echo rejected > {}/REJECTED.md; exit 4'",
+                change_dir.display()
+            )),
+            stall_detection: Some(crate::config::StallDetectionConfig {
+                enabled: true,
+                threshold: 1,
+                apply_escalation_after_empty_wip: None,
+                apply_escalation_max_uses_per_stall: None,
+            }),
+            max_iterations: Some(0),
+            ..Default::default()
+        };
+        let budget = ApplyBudget::new();
+
+        let result = run_loop_with_hooks(workspace, "change-a", &config, &budget, None)
+            .await
+            .expect("the rejecting handoff owns this outcome, not stall routing");
+
+        assert!(result.rejected_handoff.is_some());
+        assert_eq!(budget.attempts("change-a"), 1);
     }
 }

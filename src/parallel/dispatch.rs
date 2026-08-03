@@ -38,7 +38,7 @@ use super::cleanup::WorkspaceCleanupGuard;
 use super::events::send_event;
 use super::executor::{
     execute_acceptance_in_workspace, execute_apply_in_workspace,
-    execute_archive_finalization_in_workspace, execute_archive_in_workspace,
+    execute_archive_finalization_in_workspace, execute_archive_in_workspace, ParallelHookContext,
 };
 use super::types::WorkspaceResult;
 use super::workspace;
@@ -1384,6 +1384,10 @@ impl ParallelExecutor {
         // Handle to the run-wide Apply budget owner. Cloning shares the same
         // per-change accounting with every other in-flight workspace task.
         let apply_budget = self.apply_budget.clone();
+        // Configured hooks travel into the workspace task so parallel Apply runs
+        // the same `pre_apply`/`post_apply`/`on_error`/`on_change_complete`
+        // sequence serial does, instead of silently dropping them.
+        let hooks = self.hooks.clone();
         let workspace = workspace_val;
 
         // Spawn apply + acceptance + archive task
@@ -1999,6 +2003,13 @@ impl ParallelExecutor {
 
                 // Step 1: Execute apply with cumulative iteration count
                 // Use per-change cancel token that monitors both global and single-change stop
+                //
+                // Hook context carries this change's own worktree so hook
+                // scripts see the workspace they are actually running against.
+                let apply_hook_ctx = ParallelHookContext {
+                    workspace_path: workspace.path.to_string_lossy().to_string(),
+                    ..ParallelHookContext::default()
+                };
                 let apply_result = execute_apply_in_workspace(
                     &change_id,
                     &workspace.path,
@@ -2006,8 +2017,8 @@ impl ParallelExecutor {
                     &config,
                     event_tx.clone(),
                     vcs_backend,
-                    None, // hooks
-                    None, // parallel_ctx
+                    hooks.as_deref(),
+                    Some(&apply_hook_ctx),
                     Some(&per_change_cancel),
                     &ai_runner,
                     &repo_root,
@@ -2082,9 +2093,19 @@ impl ParallelExecutor {
                         // diagnosis with its exact cumulative attempt count
                         // instead of reclassifying it as an ordinary agent
                         // command crash, and stop this change without a
-                        // further cycle.
-                        if let OrchestratorError::IterationLimit { attempts, .. } = &e {
+                        // further cycle. The typed record crosses the parallel
+                        // boundary through the reducer, so run-level finish
+                        // routing reports `iteration_limit` from the observed
+                        // count rather than by parsing this message.
+                        if let OrchestratorError::IterationLimit { attempts, max, .. } = &e {
                             let attempts = *attempts;
+                            let max = *max;
+                            if let Some(shared) = &shared_orchestrator_state {
+                                shared
+                                    .write()
+                                    .await
+                                    .record_apply_iteration_limit(&change_id, attempts, max);
+                            }
                             let error = e.to_string();
                             if let Some(ref tx) = event_tx {
                                 let _ = tx

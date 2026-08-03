@@ -10649,14 +10649,9 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
     .await
     .or_fail("unexpected error");
 
-    assert!(
-        matches!(
-            result,
-            crate::orchestration::AcceptanceResult::CommandFailed { .. }
-        ),
-        "failing acceptance command should return CommandFailed, got {:?}",
-        result
-    );
+    let crate::orchestration::AcceptanceResult::CommandFailed { diagnostic, .. } = &result else {
+        panic!("failing acceptance command should return CommandFailed, got {result:?}");
+    };
     let report_path = repo_root.path().join("ACCEPTANCE_REPORT.json");
     assert!(
         !report_path.exists(),
@@ -10664,21 +10659,34 @@ async fn test_acceptance_command_failure_does_not_create_acceptance_report() {
         report_path.display()
     );
 
-    let history = acceptance_history.lock().await;
-    let attempts = history
-        .get("change-a")
-        .expect("command-failure acceptance must be recorded in history");
-    assert_eq!(attempts.len(), 1);
-    assert!(!attempts[0].passed);
-    assert_eq!(attempts[0].exit_code, Some(42));
+    // The transport evidence lives only in the bounded latest-only diagnosis.
+    assert_eq!(diagnostic.exit_code, Some(42));
     assert!(
-        attempts[0]
+        diagnostic
             .stdout_tail
             .as_deref()
             .unwrap_or_default()
             .contains("command-failed-before-verdict"),
-        "acceptance history should retain command-failure stdout tail, got {:?}",
-        attempts[0].stdout_tail
+        "the command-recovery diagnosis must carry the stdout tail, got {:?}",
+        diagnostic.stdout_tail
+    );
+
+    // A command that never completed produced no verdict, so canonical
+    // Acceptance history — shared and agent-local — stays untouched. Otherwise
+    // the failed output would be replayed to the next reviewer as previous
+    // findings and would consume attempt numbering.
+    assert!(
+        acceptance_history.lock().await.get("change-a").is_none(),
+        "command failures must not enter shared canonical Acceptance history"
+    );
+    assert!(
+        agent.get_last_acceptance_attempt("change-a").is_none(),
+        "command failures must not enter agent-local canonical Acceptance history"
+    );
+    assert_eq!(
+        agent.next_acceptance_attempt_number("change-a"),
+        1,
+        "a command failure must not consume canonical attempt numbering"
     );
 }
 
@@ -12265,5 +12273,249 @@ async fn serial_and_parallel_repeated_finding_stops_report_equivalent_diagnostic
             .get("stop_reason")
             .and_then(|value| value.as_str()),
         Some(crate::orchestration::acceptance::REPEATED_FINDING_REASON)
+    );
+}
+
+// === Parallel Apply hook wiring and typed iteration-limit propagation ===
+//
+// These drive `dispatch_change_to_workspace` end to end so the hook runner and
+// the reducer record are observed on the production path, not by calling
+// `execute_apply_in_workspace` with hand-built arguments.
+
+/// One dispatch driven with a scripted apply command and configured hooks.
+struct HookedDispatch {
+    result: WorkspaceResult,
+    /// Every hook invocation, in order, as `<hook> <apply_count>`.
+    hook_log: Vec<String>,
+    apply_invocations: u32,
+    shared_state: Arc<RwLock<OrchestratorState>>,
+}
+
+fn hook_entry(log: &Path, name: &str) -> crate::hooks::HookConfigValue {
+    crate::hooks::HookConfigValue::Full(crate::hooks::HookConfig {
+        command: format!(
+            "sh -c 'echo \"{name} $OPENSPEC_APPLY_COUNT\" >> {}'",
+            log.display()
+        ),
+        continue_on_failure: false,
+        timeout: 30,
+        git_commit_no_verify: false,
+        max_retries: 0,
+        retry_delay_secs: 0,
+    })
+}
+
+async fn dispatch_with_hooks(
+    change_id: &str,
+    apply_body: &str,
+    max_iterations: u32,
+    hook_log: &Path,
+) -> HookedDispatch {
+    let repo_dir = TempDir::new().or_fail("create temp repo");
+    let workspace_base = TempDir::new().or_fail("create temp workspace base");
+    init_missing_verdict_repo(repo_dir.path(), change_id).await;
+    let base_revision = get_current_commit(repo_dir.path())
+        .await
+        .or_fail("get base revision");
+
+    let config = create_test_config_with(OrchestratorConfig {
+        workspace_base_dir: Some(workspace_base.path().to_string_lossy().to_string()),
+        apply_command: Some(apply_body.to_string()),
+        acceptance_command: Some("sh -c 'echo ACCEPTANCE: PASS'".to_string()),
+        archive_command: Some(format!(
+            "sh -c 'mkdir -p openspec/changes/archive \
+             && mv openspec/changes/{change_id} openspec/changes/archive/{change_id}'"
+        )),
+        max_iterations: Some(max_iterations),
+        command_queue_stagger_delay_ms: Some(0),
+        command_queue_max_retries: Some(0),
+        command_queue_retry_delay_ms: Some(0),
+        command_queue_retry_if_duration_under_secs: Some(0),
+        ..Default::default()
+    });
+
+    let (tx, mut rx) = mpsc::channel(256);
+    let mut executor = ParallelExecutor::new(repo_dir.path().to_path_buf(), config, Some(tx));
+    executor.set_hooks(crate::hooks::HookRunner::new(
+        crate::hooks::HooksConfig {
+            pre_apply: Some(hook_entry(hook_log, "pre_apply")),
+            post_apply: Some(hook_entry(hook_log, "post_apply")),
+            on_error: Some(hook_entry(hook_log, "on_error")),
+            ..Default::default()
+        },
+        repo_dir.path(),
+    ));
+    let shared_state = Arc::new(RwLock::new(OrchestratorState::with_mode(
+        vec![change_id.to_string()],
+        max_iterations,
+        ExecutionMode::Parallel,
+    )));
+    executor.set_shared_orchestrator_state(shared_state.clone());
+
+    let semaphore = Arc::new(Semaphore::new(1));
+    let mut join_set: JoinSet<WorkspaceResult> = JoinSet::new();
+    let mut cleanup_guard = crate::parallel::cleanup::WorkspaceCleanupGuard::new(
+        VcsBackend::Git,
+        repo_dir.path().to_path_buf(),
+    );
+    let mut in_flight = HashSet::new();
+
+    executor
+        .dispatch_change_to_workspace(
+            change_id.to_string(),
+            base_revision,
+            semaphore,
+            &mut join_set,
+            &mut in_flight,
+            &mut cleanup_guard,
+        )
+        .await
+        .or_fail("dispatch hooked change");
+    let result = join_set
+        .join_next()
+        .await
+        .or_fail("workspace task should exist")
+        .or_fail("workspace task join should succeed");
+
+    let mut apply_invocations = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let ExecutionEvent::ApplyOutput {
+            change_id: id,
+            iteration: Some(iteration),
+            ..
+        } = &event
+        {
+            if id == change_id {
+                apply_invocations = apply_invocations.max(*iteration);
+            }
+        }
+    }
+
+    HookedDispatch {
+        result,
+        hook_log: std::fs::read_to_string(hook_log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+        apply_invocations,
+        shared_state,
+    }
+}
+
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn parallel_apply_runs_configured_hooks_across_command_failure_recovery() {
+    let change_id = "hooked-recovery";
+    let hook_dir = TempDir::new().or_fail("create hook log dir");
+    let hook_log = hook_dir.path().join("hooks.log");
+    let state_dir = TempDir::new().or_fail("create apply state dir");
+    let counter = state_dir.path().join("apply-attempts");
+
+    // Attempt 1 fails without touching tasks; attempt 2 completes them. The
+    // failure must reach `on_error` and must not reach `post_apply`.
+    let apply_body = format!(
+        "sh -c 'n=$(cat {counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {counter}; \
+         if [ $n = 1 ]; then echo apply-crash >&2; exit 3; fi; \
+         sed \"s/- \\[ \\]/- [x]/g\" openspec/changes/{change_id}/tasks.md > tasks.next \
+         && mv tasks.next openspec/changes/{change_id}/tasks.md'",
+        counter = counter.display(),
+        change_id = change_id,
+    );
+
+    let observed = dispatch_with_hooks(change_id, &apply_body, 5, &hook_log).await;
+
+    let count = |name: &str| {
+        observed
+            .hook_log
+            .iter()
+            .filter(|line| line.starts_with(name))
+            .count()
+    };
+
+    assert_eq!(
+        count("pre_apply"),
+        2,
+        "each authorized dispatch runs pre_apply: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        count("on_error"),
+        1,
+        "the failed attempt runs on_error exactly once: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        count("post_apply"),
+        1,
+        "only the attempt whose command completed is post_apply-eligible: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        observed.hook_log.first().map(String::as_str),
+        Some("pre_apply 1"),
+        "pre_apply must precede the first dispatch: {:?}",
+        observed.hook_log
+    );
+    assert_eq!(
+        observed.result.error, None,
+        "recovery must still complete the change"
+    );
+}
+
+#[cfg_attr(windows, ignore)]
+#[tokio::test]
+async fn parallel_iteration_limit_is_preserved_as_a_typed_record_without_another_dispatch() {
+    let change_id = "hooked-ceiling";
+    let hook_dir = TempDir::new().or_fail("create hook log dir");
+    let hook_log = hook_dir.path().join("hooks.log");
+
+    // Never completes and never progresses: the ceiling is the only stop.
+    let observed = dispatch_with_hooks(
+        change_id,
+        "sh -c 'echo still-working; exit 1'",
+        2,
+        &hook_log,
+    )
+    .await;
+
+    assert_eq!(
+        observed.apply_invocations, 2,
+        "the ceiling must refuse the third dispatch"
+    );
+    assert_eq!(
+        observed
+            .hook_log
+            .iter()
+            .filter(|line| line.starts_with("pre_apply"))
+            .count(),
+        2,
+        "a refused dispatch runs no pre-dispatch hook: {:?}",
+        observed.hook_log
+    );
+
+    let state = observed.shared_state.read().await;
+    assert_eq!(
+        state.apply_iteration_limits().len(),
+        1,
+        "exactly one typed iteration-limit record crosses the parallel boundary"
+    );
+    let record = &state.apply_iteration_limits()[0];
+    assert_eq!(record.change_id, change_id);
+    assert_eq!(
+        (record.attempts, record.max),
+        (2, 2),
+        "the exact cumulative dispatch count must survive the boundary"
+    );
+
+    let error = observed
+        .result
+        .error
+        .as_deref()
+        .or_fail("the ceiling stops the change with a diagnosis");
+    assert!(
+        error.contains("still-working") || error.contains("exit code"),
+        "the operator diagnosis must carry the latest actionable failure: {error}"
     );
 }

@@ -21,7 +21,7 @@ pub use prompt::{
     build_cleanup_review_prompt, build_cleanup_review_prompt_with_skill,
     build_last_acceptance_output_context, build_missing_verdict_continuation_context,
     build_task_format_repair_context, count_cleanup_review_markers, parse_cleanup_review_output,
-    CleanupReviewDiagnostic, CleanupReviewFailureKind,
+    CleanupMarkerScanner, CleanupReviewDiagnostic, CleanupReviewFailureKind,
 };
 pub use runner::AgentRunner;
 
