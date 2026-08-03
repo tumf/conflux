@@ -6,7 +6,17 @@ Parallel analysis MUST target only changes made eligible by explicit invocation 
 
 Repository-wide worktree discovery, active-change catalog refresh, `ChangesRefreshed`, and workspace observation MUST NOT create ordinary queue intent or append unrelated IDs to scheduler-local queued work or dependency analysis. For an already eligible ID that is absent from the active catalog, the scheduler MAY inspect that ID's preserved workspace and reconstruct an archived-dirty repair candidate. Repository evidence determines the resume phase but MUST NOT create execution intent.
 
-`RemoveFromQueue` and `DequeueChange` revoke ordinary eligibility. A preserved worktree or stale local/dynamic entry MUST NOT reacquire the change until accepted explicit requeue or retry restores reducer queued intent. Reducer-owned `ResolveWait` and `RejectWait` remain independently scheduler-consumable lane intent. Final terminal and terminal-error stop gates remain independently enforced after eligibility evaluation.
+`RemoveFromQueue` and `DequeueChange` revoke ordinary eligibility. A preserved worktree or stale local/dynamic entry MUST NOT reacquire the change until accepted explicit requeue or retry restores reducer queued intent. Presence on the scheduler-local candidate list MUST NOT by itself keep a change eligible: ordinary classification, dependency analysis, and dispatch selection MUST require current reducer-owned ordinary intent, and a revoked candidate MUST leave the scheduler-local candidate list. Reducer-owned `ResolveWait` and `RejectWait` remain independently scheduler-consumable lane intent. Final terminal and terminal-error stop gates remain independently enforced after eligibility evaluation.
+
+#### Scenario: Revocation stops an already admitted candidate
+
+**Given**: Changes `keeper` and `revoked` both carry accepted queue intent
+**And**: Both are already scheduler-local ordinary candidates
+**When**: `RemoveFromQueue` or `DequeueChange` revokes ordinary intent for `revoked`
+**Then**: `revoked` is not classified as dispatchable and is not selected for dispatch
+**And**: `revoked` leaves the scheduler-local candidate list and is not analyzed
+**And**: `keeper` remains dispatchable
+**And**: A later accepted `AddToQueue` restores `revoked` to dispatchable work
 
 #### Scenario: Catalog refresh does not admit unselected archived-dirty work
 
