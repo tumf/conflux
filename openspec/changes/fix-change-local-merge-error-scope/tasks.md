@@ -23,18 +23,21 @@
 ## Implementation Blocker #1
 
 - category: infrastructure
-- summary: macOS code-signature validation (`amfid`) is wedged on this host, so `rustc` cannot load any freshly built proc-macro dylib and no test binary can be compiled.
+- summary: this host's Gatekeeper malware-scan daemon (`syspolicyd`, `com.apple.security.syspolicy`) is hung in uninterruptible wait, so every `dlopen` of a non-system dylib fails and `rustc` cannot load any proc-macro crate. A reboot is required; the daemon cannot be restarted while SIP is engaged.
 - evidence:
-   - `dlopen("/tmp/cflx-iso/debug/deps/libzerofrom_derive-c949a57ee85cf33a.dylib")` returns `code signature in <38DCC633-0097-3345-9105-11096323EF7B> ... not valid for use in process: library load mig callout failed`
-   - `cargo test --lib parallel::tests::change_local_merge_error_scope` fails with `error[E0463]: can't find crate for 'zerofrom_derive'` / `'thiserror_impl'` / `'tokio_macros'` / `'rustversion'`, and with 579 such errors against the shared target dir (`error[E0463]: can't find crate for 'async_trait'`, `'tokio'`, `'serde'`, ...)
-   - 8 sequential retries and two independent target directories (shared `/Volumes/OWCUS4EXP1M2/mini-data/work-cache/rust-target/default` and a clean local `/tmp/cflx-iso`) all failed; a different proc-macro fails each run
-   - the same host-level symptom appears outside Rust: `eza --version` fails with `dyld[...]: Library not loaded: /opt/homebrew/opt/libgit2/lib/libgit2.1.9.dylib ... library load mig callout failed`
-   - not disk or volume related: `df -h` shows 49Gi free on `/` and 868Gi free on the external volume, and the dependency artifacts are present and readable
+   - kernel log names the responsible subsystem: `sudo log show --last 10m --predicate 'eventMessage CONTAINS "mig callout"'` yields `kernel (AppleSystemPolicy) ASP: malware_scan mig callout failed 0x1000000d for code /Volumes/OWCUS4EXP1M2/mini-data/work-cache/rust-target/default/debug/deps/conflux-...`
+   - `ps -o pid,stat,etime -p 222` reports `222 Us 02-19:14:37 /usr/libexec/syspolicyd` — STAT `U` is uninterruptible wait, so the process cannot be signalled or respawned, and `sudo sample 222 3` returns an empty call graph
+   - `sudo launchctl kickstart -k system/com.apple.security.syspolicy` fails with `150: Operation not permitted while System Integrity Protection is engaged`
+   - `amfid` is NOT the cause: it is a healthy 25-minute-old process (`/usr/libexec/amfid`, restarted after the previous attempt) and the failure persists unchanged, so `killall -9 amfid` does not clear this
+   - restarting the scan helper that ASP calls out to (`sudo launchctl kickstart -k system/com.apple.XprotectFramework.PluginService`, whose last exit status was `-9`) succeeds but does not clear the failure
+   - the scan-result cache is fully invalidated, not just for new artifacts: `dlopen` fails for `libasync_trait` (built 08-03), `libthiserror_impl` (08-02), `libtokio_macros` (07-31) and `librustversion` (07-26) alike, each returning `code signature ... not valid for use in process: library load mig callout failed`
+   - consequently `cargo test --lib --no-run` fails with `error[E0463]: can't find crate` and 579 downstream errors (e.g. `WorktreeEventSink ... is not dyn compatible` where `#[async_trait]` failed to expand)
+   - not specific to the external volume, to Rust, or to the Bash sandbox: `/opt/homebrew/bin/eza` fails identically on `/opt/homebrew/opt/libgit2/lib/libgit2.1.9.dylib`, and the same `dlopen` fails with the sandbox disabled
 - impact: no `cargo test`, `cargo clippy`, or compiled-binary verification can run, so the repository-local gate for this change cannot be executed. Implementation and tests are written; only their execution is blocked.
 - prerequisite_owner: host_operator
-- unblock_condition: `dlopen` of a freshly built unsigned dylib succeeds on this host — observable as `cargo test --lib parallel::tests::change_local_merge_error_scope` compiling without `error[E0463]: can't find crate`.
+- unblock_condition: `dlopen` of any non-system dylib succeeds on this host — observable as `cargo test --lib --no-run` compiling without `error[E0463]: can't find crate`.
 - unblock_actions:
-   - restart the wedged code-signature daemon on the host (`sudo killall -9 amfid`, which respawns automatically) or reboot the machine
+   - reboot the machine; `syspolicyd` is SIP-protected and stuck in uninterruptible wait, so no `killall`/`launchctl kickstart` recovery is available without disabling SIP
    - re-run `cargo test --lib parallel::tests:: && cargo test --lib tui:: && cargo test --lib lifecycle_integration && cargo test --features web-monitoring --lib web::remote_control_api::tests::operator_snapshot_tests && cargo fmt --check && cargo clippy -- -D warnings`
 - resumable: true
 - owner: host_operator
@@ -51,7 +54,7 @@
 
 Archive validation is the authoritative final OpenSpec gate. Expected archive gate: `cflx openspec validate fix-change-local-merge-error-scope --archive-gate`.
 
-Verification status while Implementation Blocker #1 stands: `cargo check --lib --tests` and `cargo check --lib --tests --features heavy-tests` both completed successfully before the host's code-signature daemon wedged, so every production and test source file in this change compiles. `cargo fmt` was applied. No `cargo test`, `cargo clippy`, or `cargo fmt --check` result exists yet, so no task whose completion depends on executing tests is marked complete.
+Verification status while Implementation Blocker #1 stands: `cargo check --lib --tests` and `cargo check --lib --tests --features heavy-tests` both completed successfully before the host's Gatekeeper scan daemon wedged, so every production and test source file in this change compiles. `cargo fmt` was applied. No `cargo test`, `cargo clippy`, or `cargo fmt --check` result exists yet, so no task whose completion depends on executing tests is marked complete.
 
 ## Future Work
 
