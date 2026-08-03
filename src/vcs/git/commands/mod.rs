@@ -24,14 +24,18 @@ pub use commit::{
     list_changes_with_uncommitted_files, squash_archive_wip_commits, validate_staged_snapshot,
 };
 pub use merge::{
-    check_merge_conflicts, first_parent_of, is_ancestor, is_merge_in_progress, merge, merge_branch,
-    merge_branch_preserving_conflict, merge_commit_hash_by_subject_since,
-    missing_merge_commits_since, presync_merge_subject_mismatches_since, PreservedMergeOutcome,
+    check_merge_conflicts, commit_diff_entries, commits_with_exact_subject, committed_tree_paths,
+    first_parent_lineage, index_conflict_entries, index_stage0_paths, is_ancestor,
+    is_clean_including_untracked, is_merge_in_progress, merge, merge_base, merge_branch,
+    merge_branch_preserving_conflict, merge_head, parents_of, rev_parse_commit, CommitDiffEntry,
+    PreservedMergeOutcome,
 };
 #[allow(unused_imports)]
 pub use worktree::{
-    count_commits_ahead, is_worktree, list_worktrees, run_worktree_setup, run_worktree_teardown,
-    validate_worktree_command_cwd, validate_worktree_command_cwd_facts, worktree_add,
-    worktree_remove, worktree_remove_with_options, RegisteredWorktreePath, WorktreeCommandCwdFacts,
-    WorktreeCommandCwdValidationError, WorktreeRemoveOptions,
+    classify_worktree_identity, count_commits_ahead, is_worktree, list_worktrees,
+    run_worktree_setup, run_worktree_teardown, validate_worktree_command_cwd,
+    validate_worktree_command_cwd_facts, validate_worktree_identity, worktree_add,
+    worktree_records, worktree_remove, worktree_remove_with_options, RegisteredWorktreePath,
+    WorktreeCommandCwdFacts, WorktreeCommandCwdValidationError, WorktreeIdentity, WorktreeRecord,
+    WorktreeRemoveOptions,
 };

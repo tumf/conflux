@@ -246,6 +246,59 @@ mod tests {
         }
     }
 
+    /// The embedded resolve skill must teach the identity-validated sequential
+    /// merge protocol the classifier actually enforces.
+    ///
+    /// Asserted against the embedded bytes, not the source file on disk, so a
+    /// skill edit that never reached the binary cannot pass.
+    #[test]
+    fn resolve_skill_defines_identity_validated_sequential_merge_protocol() {
+        let skills = get_cflx_embedded_skills().unwrap();
+        let resolve = skills
+            .iter()
+            .find(|skill| skill.name == "cflx-resolve")
+            .expect("cflx-resolve must be embedded");
+        let content = resolve.raw_content.as_str();
+
+        for required in [
+            "Repository-derived phase diagnosis",
+            "required_target_state",
+            "unsafe_evidence",
+            "presync_invalid",
+            "final_merge_missing",
+            "target_merge_unfinished",
+            "resurrection_cleanup_required",
+            "requires_live_removal",
+            "Pre-sync base into <change_id>",
+            "Merge change: <change_id>",
+            "Cleanup resurrected change: <change_id>",
+            "exactly one parent",
+            "openspec/changes/archive/YYYY-MM-DD-<change_id>/proposal.md",
+        ] {
+            assert!(
+                content.contains(required),
+                "cflx-resolve must document `{required}`"
+            );
+        }
+
+        assert!(
+            content.contains("Do NOT use `git commit --amend`"),
+            "cflx-resolve must forbid amend-based cleanup"
+        );
+        assert!(
+            content.contains("Staged-only, unstaged, mixed, or unrelated cleanup is not cleanup"),
+            "cflx-resolve must state that only a committed forward cleanup counts"
+        );
+        assert!(
+            content.contains("Never create a combined `Merge changes: ...` commit"),
+            "cflx-resolve must forbid combined sequential merge commits"
+        );
+        assert!(
+            !content.contains("git commit --amend -m \"Pre-sync base into"),
+            "the amend-the-pre-sync-subject instruction must be gone"
+        );
+    }
+
     /// Both acceptance skills must teach the structured blocker contract that
     /// the parser actually enforces, and must not ask the reviewer to create a
     /// change-directory marker.

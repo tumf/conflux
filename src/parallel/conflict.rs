@@ -3,15 +3,15 @@
 use crate::config::OrchestratorConfig;
 use crate::error::{OrchestratorError, Result};
 use crate::history::{ResolveAttempt, ResolveContext};
-use crate::vcs::git::commands as git_commands;
 use crate::vcs::{VcsBackend, WorkspaceManager};
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::events::{send_event, ParallelEvent};
+use super::resolve_state::{
+    self, BatchState, GitResolveEvidence, ResolveEvidence, SequentialMergeItem,
+};
 
 /// RAII guard that decrements auto_resolve_count on drop.
 /// This ensures the counter is decremented on all exit paths (success, error, early return).
@@ -31,6 +31,34 @@ impl Drop for AutoResolveGuard {
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Emit resolve failure events for the batch and return the terminal error.
+async fn fail_resolve(
+    event_tx: &Option<mpsc::Sender<ParallelEvent>>,
+    change_ids: &[String],
+    error_msg: String,
+) -> Result<()> {
+    send_event(
+        event_tx,
+        ParallelEvent::ConflictResolutionFailed {
+            error: error_msg.clone(),
+        },
+    )
+    .await;
+
+    for change_id in change_ids {
+        send_event(
+            event_tx,
+            ParallelEvent::ResolveFailed {
+                change_id: change_id.to_string(),
+                error: error_msg.clone(),
+            },
+        )
+        .await;
+    }
+
+    Err(OrchestratorError::GitConflict(error_msg))
 }
 
 /// Detect conflicted files using the workspace manager.
@@ -295,8 +323,9 @@ pub struct ResolveMergesWithRetryArgs<'a> {
     pub workspace_manager: &'a dyn WorkspaceManager,
     pub config: &'a OrchestratorConfig,
     pub event_tx: &'a Option<mpsc::Sender<ParallelEvent>>,
-    pub revisions: &'a [String],
-    pub change_ids: &'a [String],
+    /// Ordered batch admitted for sequential integration, including each
+    /// change's archive worktree path.
+    pub items: &'a [SequentialMergeItem],
     pub target_branch: &'a str,
     pub base_revision: &'a str,
     pub max_retries: u32,
@@ -335,14 +364,53 @@ async fn send_resolve_completed(
     }
 }
 
+/// Render the worktree location block from validated Git identity.
+///
+/// Every admitted item is listed. A supplied path that cannot be validated is
+/// reported with its concrete unsafe reason rather than collapsed to
+/// `(unknown)`, so the agent never sees an anonymous location and the operator
+/// can tell a stale path from a skipped one.
+pub(crate) async fn render_worktree_locations(
+    evidence: &dyn ResolveEvidence,
+    items: &[SequentialMergeItem],
+) -> String {
+    let mut lines = Vec::with_capacity(items.len());
+    for item in items {
+        let identity = evidence
+            .validate_worktree(&item.archive_path, &item.revision)
+            .await;
+        let location = match identity.resolved() {
+            Some((path, tip)) => format!(
+                "- {} => {} (change_id: {}, tip: {})",
+                item.revision,
+                path.display(),
+                item.change_id,
+                tip
+            ),
+            None => format!(
+                "- {} => {} (change_id: {}, unvalidated: {})",
+                item.revision,
+                item.archive_path.display(),
+                item.change_id,
+                match &identity {
+                    crate::vcs::git::commands::WorktreeIdentity::Unsafe { reason } =>
+                        reason.as_str(),
+                    _ => "unknown",
+                }
+            ),
+        };
+        lines.push(location);
+    }
+    lines.join("\n")
+}
+
 /// Attempt to resolve merges with retries using the configured resolve command.
 pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> Result<()> {
     let ResolveMergesWithRetryArgs {
         workspace_manager,
         config,
         event_tx,
-        revisions,
-        change_ids,
+        items,
         target_branch,
         base_revision,
         max_retries,
@@ -356,67 +424,53 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     send_event(event_tx, ParallelEvent::ConflictResolutionStarted).await;
 
-    let conflict_files = detect_conflicts(workspace_manager).await?;
+    let revisions = SequentialMergeItem::revisions(items);
+    let revisions = revisions.as_slice();
+    let change_ids = SequentialMergeItem::change_ids(items);
+    let change_ids = change_ids.as_slice();
 
-    if conflict_files.is_empty()
-        && matches!(
-            workspace_manager.backend_type(),
-            VcsBackend::Git | VcsBackend::Auto
-        )
-    {
-        let merge_in_progress = git_commands::is_merge_in_progress(workspace_manager.repo_root())
-            .await
-            .map_err(OrchestratorError::from)?;
+    let is_git = matches!(
+        workspace_manager.backend_type(),
+        VcsBackend::Git | VcsBackend::Auto
+    );
+    let evidence = GitResolveEvidence::new(workspace_manager.repo_root());
 
-        if merge_in_progress {
-            let merge_subject = if change_ids.len() == 1 {
-                format!("Merge change: {}", change_ids[0])
-            } else {
-                format!("Merge changes: {}", change_ids.join(", "))
-            };
-            info!(
-                "No unresolved conflicts and merge is in-progress (MERGE_HEAD exists); committing conflictless merge-ready state with subject '{}' and skipping AI resolve path for revisions: {}",
-                merge_subject,
-                revisions.join(", ")
-            );
-            git_commands::run_git(
-                &["commit", "-m", merge_subject.as_str()],
-                workspace_manager.repo_root(),
-            )
-            .await
-            .map_err(OrchestratorError::from)?;
-            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-            send_resolve_completed(event_tx, change_ids, publication_owns_completion).await;
-            return Ok(());
-        }
+    // Repository evidence decides entry, not process memory. A conflict-free
+    // `MERGE_HEAD` no longer short-circuits into a blind commit: it enters the
+    // classifier like every other state and reaches the agent as identity-proven
+    // continuation guidance.
+    let mut batch_state = if is_git {
+        Some(resolve_state::classify_batch(&evidence, items, base_revision).await)
+    } else {
+        None
+    };
 
-        let mut not_integrated_revisions: Vec<String> = Vec::new();
-        for revision in revisions {
-            let integrated =
-                git_commands::is_ancestor(workspace_manager.repo_root(), revision, "HEAD")
-                    .await
-                    .map_err(OrchestratorError::from)?;
-            if !integrated {
-                not_integrated_revisions.push(revision.clone());
-            }
-        }
-
-        if not_integrated_revisions.is_empty() {
-            info!(
-                "No unresolved conflicts, no merge in progress, and all revisions are already integrated into HEAD; skipping AI resolve path for revisions: {}",
-                revisions.join(", ")
-            );
-            send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
-            send_resolve_completed(event_tx, change_ids, publication_owns_completion).await;
-            return Ok(());
-        }
-
+    if batch_state.as_ref().is_some_and(BatchState::is_complete) {
         info!(
-            "No unresolved conflicts and no merge in progress, but revisions are not integrated into HEAD yet ({}); continuing resolve path",
-            not_integrated_revisions.join(", ")
+            "Sequential merge batch is already complete for revisions: {}",
+            revisions.join(", ")
         );
+        send_event(event_tx, ParallelEvent::ConflictResolutionCompleted).await;
+        send_resolve_completed(event_tx, change_ids, publication_owns_completion).await;
+        return Ok(());
     }
 
+    // Classification that withholds agent action is terminal, not retryable:
+    // identity is unproven, so invoking the agent would invite exactly the blind
+    // mutation this classifier exists to prevent.
+    if let Some(state) = batch_state
+        .as_ref()
+        .filter(|state| !state.allows_agent_action())
+    {
+        let reason = state.diagnosis();
+        warn!(
+            "Sequential merge batch state withholds agent action: {}",
+            reason.replace('\n', " | ")
+        );
+        return fail_resolve(event_tx, change_ids, reason).await;
+    }
+
+    let conflict_files = detect_conflicts(workspace_manager).await?;
     let conflict_files_str = conflict_files.join(", ");
 
     let vcs_status = get_vcs_status(workspace_manager).await.unwrap_or_default();
@@ -426,37 +480,33 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
     let vcs_prompt_prefix = workspace_manager.conflict_resolution_prompt();
 
-    let merge_plan = revisions
+    let merge_plan = items
         .iter()
-        .zip(change_ids.iter())
-        .map(|(rev, change_id)| format!("- {} => {}", rev, change_id))
+        .map(|item| format!("- {} => {}", item.revision, item.change_id))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let workspaces = workspace_manager.workspaces();
+    let worktree_locations = if is_git {
+        render_worktree_locations(&evidence, items).await
+    } else {
+        items
+            .iter()
+            .map(|item| {
+                format!(
+                    "- {} => {} (change_id: {})",
+                    item.revision,
+                    item.archive_path.display(),
+                    item.change_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
-    let workspace_paths: HashMap<String, PathBuf> = workspaces
-        .iter()
-        .map(|workspace| (workspace.name.clone(), workspace.path.clone()))
-        .collect();
-
-    let workspace_base_revisions: HashMap<String, String> = workspaces
-        .into_iter()
-        .map(|workspace| (workspace.name, workspace.base_revision))
-        .collect();
-
-    let worktree_locations = revisions
-        .iter()
-        .zip(change_ids.iter())
-        .map(|(rev, change_id)| {
-            let path = workspace_paths
-                .get(rev)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| "(unknown)".to_string());
-            format!("- {} => {} (change_id: {})", rev, path, change_id)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let phase_diagnosis = batch_state
+        .as_ref()
+        .map(BatchState::diagnosis)
+        .unwrap_or_default();
 
     // Create resolve context for tracking attempts
     let mut resolve_context = ResolveContext::new(max_retries);
@@ -480,6 +530,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             &vcs_status,
             &vcs_log,
             &conflict_files_str,
+            &phase_diagnosis,
         ),
         config.get_resolve_append_prompt(),
     );
@@ -511,6 +562,13 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             revisions.join(", ")
         );
 
+        // The newest classification is the authoritative continuation guidance
+        // for this attempt.
+        let phase_diagnosis = batch_state
+            .as_ref()
+            .map(BatchState::diagnosis)
+            .unwrap_or_default();
+
         let mut resolve_prompt = build_sequential_merge_resolve_prompt(
             config.get_resolve_skill(),
             vcs_prompt_prefix,
@@ -521,6 +579,7 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
             &vcs_status,
             &vcs_log,
             &conflict_files_str,
+            &phase_diagnosis,
         );
 
         // Add context from previous attempts if any
@@ -584,293 +643,34 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
 
         let remaining_conflicts = detect_conflicts(workspace_manager).await?;
         if remaining_conflicts.is_empty() {
-            if matches!(
-                workspace_manager.backend_type(),
-                VcsBackend::Git | VcsBackend::Auto
-            ) {
-                let repo_root = workspace_manager.repo_root();
-                let merge_in_progress = git_commands::is_merge_in_progress(repo_root)
-                    .await
-                    .map_err(OrchestratorError::from)?;
+            if is_git {
+                // Repository evidence, not the agent's exit status or prose,
+                // decides whether the batch progressed. Every unfinished state
+                // returns as one structured phase diagnosis instead of the old
+                // generic "missing merge commits" fallback.
+                let state = resolve_state::classify_batch(&evidence, items, base_revision).await;
+                let complete = state.is_complete();
+                let retryable = state.allows_agent_action();
+                let reason = state.diagnosis();
+                batch_state = Some(state);
 
-                if merge_in_progress {
-                    let reason =
-                        "Merge still in progress (MERGE_HEAD exists); retrying resolve".to_string();
+                if !complete && !retryable {
                     warn!(
-                        "Merge still in progress after resolve attempt {}/{}",
-                        attempt, max_retries
+                        "Sequential merge batch state withholds agent action after resolve attempt {}/{}: {}",
+                        attempt,
+                        max_retries,
+                        reason.replace('\n', " | ")
                     );
-                    send_event(
-                        event_tx,
-                        ParallelEvent::ResolveOutput {
-                            change_id: combined_change_id.clone(),
-                            output: reason.clone(),
-                            iteration: Some(attempt),
-                        },
-                    )
-                    .await;
-                    resolve_context.record(ResolveAttempt {
-                        attempt,
-                        command_success: status_success,
-                        verification_success: false,
-                        duration,
-                        continuation_reason: Some(reason),
-                        exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
-                    });
-                    continue;
+                    return fail_resolve(event_tx, change_ids, reason).await;
                 }
 
-                // Ensure there is no unfinished pre-sync merge left in any worktree.
-                let mut retry_reason: Option<String> = None;
-                for revision in revisions {
-                    if let Some(worktree_path) = workspace_paths.get(revision) {
-                        let worktree_merge_in_progress =
-                            git_commands::is_merge_in_progress(worktree_path)
-                                .await
-                                .map_err(OrchestratorError::from)?;
-                        if worktree_merge_in_progress {
-                            retry_reason = Some(format!(
-                                "Worktree merge still in progress for '{}' (MERGE_HEAD exists); retrying resolve",
-                                revision
-                            ));
-                            break;
-                        }
-
-                        let worktree_conflicts = git_commands::get_conflict_files(worktree_path)
-                            .await
-                            .map_err(OrchestratorError::from)?;
-                        if !worktree_conflicts.is_empty() {
-                            retry_reason = Some(format!(
-                                "Worktree conflicts still present for '{}' ({}); retrying resolve",
-                                revision,
-                                worktree_conflicts.join(", ")
-                            ));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(reason) = retry_reason {
-                    warn!("{}", reason);
-                    send_event(
-                        event_tx,
-                        ParallelEvent::ResolveOutput {
-                            change_id: combined_change_id.clone(),
-                            output: reason.clone(),
-                            iteration: Some(attempt),
-                        },
-                    )
-                    .await;
-                    resolve_context.record(ResolveAttempt {
-                        attempt,
-                        command_success: status_success,
-                        verification_success: false,
-                        duration,
-                        continuation_reason: Some(reason),
-                        exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
-                    });
-                    continue;
-                }
-
-                // Validate pre-sync merge commit subject convention inside each worktree.
-                // (If no pre-sync merge commit was created, this check is a no-op.)
-                let mut presync_retry_reason: Option<String> = None;
-                for (revision, change_id) in revisions.iter().zip(change_ids.iter()) {
-                    let Some(worktree_path) = workspace_paths.get(revision) else {
-                        continue;
-                    };
-
-                    let mismatches = git_commands::presync_merge_subject_mismatches_since(
-                        worktree_path,
-                        base_revision,
-                        change_id,
-                    )
-                    .await
-                    .map_err(OrchestratorError::from)?;
-
-                    if !mismatches.is_empty() {
-                        presync_retry_reason = Some(format!(
-                            "Invalid pre-sync merge commit subject in worktree '{}' (expected: 'Pre-sync base into {}', got: {}); retrying resolve",
-                            revision,
-                            change_id,
-                            mismatches.join("; ")
-                        ));
-                        break;
-                    }
-                }
-
-                if let Some(reason) = presync_retry_reason {
-                    warn!("{}", reason);
-                    send_event(
-                        event_tx,
-                        ParallelEvent::ResolveOutput {
-                            change_id: combined_change_id.clone(),
-                            output: reason.clone(),
-                            iteration: Some(attempt),
-                        },
-                    )
-                    .await;
-                    resolve_context.record(ResolveAttempt {
-                        attempt,
-                        command_success: status_success,
-                        verification_success: false,
-                        duration,
-                        continuation_reason: Some(reason),
-                        exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
-                    });
-                    continue;
-                }
-
-                let missing_commits =
-                    git_commands::missing_merge_commits_since(repo_root, base_revision, change_ids)
-                        .await
-                        .map_err(OrchestratorError::from)?;
-
-                // Filter out changes that were integrated via fast-forward.
-                // A fast-forward merge does not create a merge commit, so
-                // missing_merge_commits_since will report it as missing.
-                // Check if the worktree branch tip is an ancestor of HEAD
-                // (i.e. the branch content is already in the target branch).
-                let mut truly_missing: Vec<String> = Vec::new();
-                for missing_id in &missing_commits {
-                    // Find the revision (branch name) for this change_id
-                    let revision = revisions
-                        .iter()
-                        .zip(change_ids.iter())
-                        .find(|(_, cid)| *cid == missing_id)
-                        .map(|(rev, _)| rev.as_str());
-
-                    if let Some(rev) = revision {
-                        let is_integrated = git_commands::is_ancestor(repo_root, rev, "HEAD")
-                            .await
-                            .unwrap_or(false);
-                        if is_integrated {
-                            info!(
-                                "Change '{}' (branch '{}') integrated via fast-forward; skipping merge commit check",
-                                missing_id, rev
-                            );
-                        } else {
-                            truly_missing.push(missing_id.clone());
-                        }
-                    } else {
-                        truly_missing.push(missing_id.clone());
-                    }
-                }
-
-                if !truly_missing.is_empty() {
-                    let reason = format!(
-                        "Missing merge commits for change_ids ({}); retrying resolve",
-                        truly_missing.join(", ")
-                    );
+                if !complete {
                     warn!(
-                        "Missing merge commits after resolve attempt {}/{}: {:?}",
-                        attempt, max_retries, truly_missing
-                    );
-                    send_event(
-                        event_tx,
-                        ParallelEvent::ResolveOutput {
-                            change_id: combined_change_id.clone(),
-                            output: reason.clone(),
-                            iteration: Some(attempt),
-                        },
-                    )
-                    .await;
-                    resolve_context.record(ResolveAttempt {
+                        "Sequential merge batch incomplete after resolve attempt {}/{}: {}",
                         attempt,
-                        command_success: status_success,
-                        verification_success: false,
-                        duration,
-                        continuation_reason: Some(reason),
-                        exit_code: status.code(),
-                        stdout_tail: output_collector.stdout_tail(),
-                        stderr_tail: output_collector.stderr_tail(),
-                    });
-                    continue;
-                }
-
-                // Enforce that each worktree branch was pre-synced with the target branch state
-                // that existed immediately before its final merge commit.
-                let mut presync_missing_reason: Option<String> = None;
-                for (revision, change_id) in revisions.iter().zip(change_ids.iter()) {
-                    let expected_subject = format!("Merge change: {}", change_id);
-                    let merge_commit = git_commands::merge_commit_hash_by_subject_since(
-                        repo_root,
-                        base_revision,
-                        expected_subject.as_str(),
-                    )
-                    .await
-                    .map_err(OrchestratorError::from)?;
-
-                    let Some(merge_commit) = merge_commit else {
-                        continue;
-                    };
-
-                    let pre_merge_base =
-                        git_commands::first_parent_of(repo_root, merge_commit.trim())
-                            .await
-                            .map_err(OrchestratorError::from)?;
-                    let pre_merge_base = pre_merge_base.trim();
-
-                    let includes_presync_base =
-                        git_commands::is_ancestor(repo_root, pre_merge_base, revision)
-                            .await
-                            .map_err(OrchestratorError::from)?;
-
-                    if !includes_presync_base {
-                        let already_merged = git_commands::is_ancestor(repo_root, revision, "HEAD")
-                            .await
-                            .map_err(OrchestratorError::from)?;
-                        if !already_merged {
-                            let short = &pre_merge_base[..8.min(pre_merge_base.len())];
-                            presync_missing_reason = Some(format!(
-                                "Worktree branch '{}' does not include pre-merge base '{}' for change_id '{}' (pre-sync may have been skipped); retrying resolve",
-                                revision, short, change_id
-                            ));
-                            break;
-                        }
-                        info!(
-                            "Skipping pre-sync base ancestry retry for '{}' because branch is already integrated into HEAD",
-                            revision
-                        );
-                    }
-
-                    let (Some(worktree_path), Some(worktree_base_revision)) = (
-                        workspace_paths.get(revision),
-                        workspace_base_revisions.get(revision),
-                    ) else {
-                        continue;
-                    };
-
-                    // If the worktree was created from an older base revision, require that a
-                    // pre-sync merge commit exists with the standard subject.
-                    if worktree_base_revision.trim() != pre_merge_base {
-                        let expected_presync_subject = format!("Pre-sync base into {}", change_id);
-                        let presync_commit = git_commands::merge_commit_hash_by_subject_since(
-                            worktree_path,
-                            worktree_base_revision.trim(),
-                            expected_presync_subject.as_str(),
-                        )
-                        .await
-                        .map_err(OrchestratorError::from)?;
-
-                        if presync_commit.is_none() {
-                            presync_missing_reason = Some(format!(
-                                "Missing pre-sync merge commit in worktree '{}' (expected subject: 'Pre-sync base into {}'); retrying resolve",
-                                revision, change_id
-                            ));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(reason) = presync_missing_reason {
-                    warn!("{}", reason);
+                        max_retries,
+                        reason.replace('\n', " | ")
+                    );
                     send_event(
                         event_tx,
                         ParallelEvent::ResolveOutput {
@@ -954,31 +754,9 @@ pub async fn resolve_merges_with_retry(args: ResolveMergesWithRetryArgs<'_>) -> 
     }
 
     let error_msg = format!("Failed to resolve merges after {} attempts", max_retries);
-    send_event(
-        event_tx,
-        ParallelEvent::ConflictResolutionFailed {
-            error: error_msg.clone(),
-        },
-    )
-    .await;
-
-    // Send ResolveFailed for each change_id to update TUI status
-    for change_id in change_ids {
-        send_event(
-            event_tx,
-            ParallelEvent::ResolveFailed {
-                change_id: change_id.to_string(),
-                error: error_msg.clone(),
-            },
-        )
-        .await;
-    }
 
     // Guard will decrement auto resolve counter on drop
-
-    match workspace_manager.backend_type() {
-        VcsBackend::Git | VcsBackend::Auto => Err(OrchestratorError::GitConflict(error_msg)),
-    }
+    fail_resolve(event_tx, change_ids, error_msg).await
 }
 
 /// Build prompt for conflict resolution (variable context only; fixed guidance lives in cflx-resolve).
@@ -1024,7 +802,16 @@ fn build_sequential_merge_resolve_prompt(
     vcs_status: &str,
     vcs_log: &str,
     conflict_files_str: &str,
+    phase_diagnosis: &str,
 ) -> String {
+    let diagnosis_block = if phase_diagnosis.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRepository-derived phase diagnosis:\n{}",
+            phase_diagnosis
+        )
+    };
     format!(
         "{}\n\n\
          {}\n\n\
@@ -1035,7 +822,7 @@ fn build_sequential_merge_resolve_prompt(
          Worktree directories (branch => path):\n{}\n\n\
          Current VCS status:\n{}\n\n\
          VCS log for branches:\n{}\n\n\
-         Conflicting files (repo root, if any): {}",
+         Conflicting files (repo root, if any): {}{}",
         crate::agent::prompt::skill_prelude(resolve_skill),
         vcs_prompt_prefix,
         target_branch,
@@ -1044,7 +831,8 @@ fn build_sequential_merge_resolve_prompt(
         worktree_locations,
         vcs_status,
         vcs_log,
-        conflict_files_str
+        conflict_files_str,
+        diagnosis_block
     )
 }
 
@@ -1146,6 +934,7 @@ mod tests {
             "clean",
             "log entries",
             "(none)",
+            "phase: final_merge_missing",
         );
         assert!(prompt.contains("$cflx-resolve"));
         assert!(prompt.contains("load skills: cflx-resolve"));
@@ -1168,6 +957,7 @@ mod tests {
             "status",
             "log",
             "files",
+            "",
         );
         assert!(prompt.contains("$team-resolve"));
         assert!(prompt.contains("load skills: team-resolve"));
@@ -1186,6 +976,7 @@ mod tests {
             "status",
             "log",
             "files",
+            "",
         );
         // Fixed guidance must NOT appear (owned by cflx-resolve skill)
         assert!(

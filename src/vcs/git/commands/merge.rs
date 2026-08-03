@@ -391,79 +391,6 @@ pub async fn is_merge_in_progress<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
     Ok(output.status.success())
 }
 
-/// Return any change_ids missing merge commits since base_revision.
-///
-/// A merge commit is recognized by the subject exactly matching `Merge change: <change_id>`.
-pub async fn missing_merge_commits_since<P: AsRef<Path>>(
-    cwd: P,
-    base_revision: &str,
-    change_ids: &[String],
-) -> VcsResult<Vec<String>> {
-    if change_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let output = run_git(
-        &[
-            "log",
-            "--merges",
-            "--format=%s",
-            &format!("{}..HEAD", base_revision),
-        ],
-        cwd,
-    )
-    .await?;
-
-    let merge_messages: Vec<&str> = output.lines().collect();
-    let mut missing = Vec::new();
-    for change_id in change_ids {
-        let expected = format!("Merge change: {}", change_id);
-        if !merge_messages.iter().any(|line| line.trim() == expected) {
-            missing.push(change_id.clone());
-        }
-    }
-
-    Ok(missing)
-}
-
-/// Find the most recent merge commit hash whose subject matches exactly.
-///
-/// Returns `Ok(None)` when no such merge commit exists in the given range.
-pub async fn merge_commit_hash_by_subject_since<P: AsRef<Path>>(
-    cwd: P,
-    base_revision: &str,
-    expected_subject: &str,
-) -> VcsResult<Option<String>> {
-    let output = run_git(
-        &[
-            "log",
-            "--merges",
-            "--format=%H\t%s",
-            &format!("{}..HEAD", base_revision),
-        ],
-        cwd,
-    )
-    .await?;
-
-    for line in output.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        let mut parts = line.splitn(2, '\t');
-        let Some(hash) = parts.next() else {
-            continue;
-        };
-        let subject = parts.next().unwrap_or("");
-        if subject == expected_subject {
-            return Ok(Some(hash.to_string()));
-        }
-    }
-
-    Ok(None)
-}
-
-/// Return the first parent of a commit (e.g. the target branch state before a merge commit).
-pub async fn first_parent_of<P: AsRef<Path>>(cwd: P, commit: &str) -> VcsResult<String> {
-    run_git(&["rev-parse", &format!("{}^1", commit)], cwd).await
-}
-
 /// Check whether `ancestor` is an ancestor of `descendant`.
 ///
 /// Returns `Ok(false)` when not an ancestor.
@@ -483,36 +410,228 @@ pub async fn is_ancestor<P: AsRef<Path>>(
     Ok(output.status.success())
 }
 
-/// Return merge commit subjects that start with "Pre-sync base into" but do not match the
-/// expected subject for this change.
-///
-/// This is used to validate pre-sync merge commit message conventions inside worktrees.
-pub async fn presync_merge_subject_mismatches_since<P: AsRef<Path>>(
-    cwd: P,
-    base_revision: &str,
-    change_id: &str,
-) -> VcsResult<Vec<String>> {
-    let expected = format!("Pre-sync base into {}", change_id);
+/// Return the commit currently recorded in `MERGE_HEAD`, if a merge is in progress.
+pub async fn merge_head<P: AsRef<Path>>(cwd: P) -> VcsResult<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", "MERGE_HEAD"])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to read MERGE_HEAD: {}", e)))?;
 
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!head.is_empty()).then_some(head))
+}
+
+/// Resolve a revision to a full commit id, returning `Ok(None)` when it does not exist.
+pub async fn rev_parse_commit<P: AsRef<Path>>(cwd: P, revision: &str) -> VcsResult<Option<String>> {
+    let spec = format!("{}^{{commit}}", revision);
+    let output = Command::new("git")
+        .args(["rev-parse", "-q", "--verify", spec.as_str()])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to resolve '{}': {}", revision, e)))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!commit.is_empty()).then_some(commit))
+}
+
+/// Return the complete ordered parent list of a commit.
+///
+/// The order is Git's own: index 0 is the first parent. An empty result means a
+/// root commit.
+pub async fn parents_of<P: AsRef<Path>>(cwd: P, commit: &str) -> VcsResult<Vec<String>> {
+    let output = run_git(&["rev-list", "-1", "--parents", commit], cwd).await?;
+    let line = output.lines().next().unwrap_or("").trim();
+    Ok(line
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect())
+}
+
+/// Return the first-parent lineage of `tip`, newest first.
+pub async fn first_parent_lineage<P: AsRef<Path>>(cwd: P, tip: &str) -> VcsResult<Vec<String>> {
+    let output = run_git(&["rev-list", "--first-parent", tip], cwd).await?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Return the merge base of two revisions, or `Ok(None)` when they are unrelated.
+pub async fn merge_base<P: AsRef<Path>>(cwd: P, a: &str, b: &str) -> VcsResult<Option<String>> {
+    let output = Command::new("git")
+        .args(["merge-base", a, b])
+        .current_dir(cwd.as_ref())
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| VcsError::git_command(format!("Failed to execute git merge-base: {}", e)))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let base = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!base.is_empty()).then_some(base))
+}
+
+/// Enumerate every commit in `from..to` (or reachable from `to` when `from` is
+/// `None`) whose complete subject equals `subject`.
+///
+/// Unlike [`merge_commit_hash_by_subject_since`] this does not pre-filter on
+/// merge commits and does not collapse duplicates: the caller decides whether
+/// zero, one, or many candidates are acceptable, so an ambiguous history can
+/// fail closed instead of silently selecting the newest match.
+pub async fn commits_with_exact_subject<P: AsRef<Path>>(
+    cwd: P,
+    from: Option<&str>,
+    to: &str,
+    subject: &str,
+) -> VcsResult<Vec<String>> {
+    let range = match from {
+        Some(from) => format!("{}..{}", from, to),
+        None => to.to_string(),
+    };
+    let output = run_git(&["log", "--format=%H%x09%s", range.as_str()], cwd).await?;
+
+    let mut matches = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let hash = hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        if parts.next().unwrap_or("") == subject {
+            matches.push(hash.to_string());
+        }
+    }
+
+    Ok(matches)
+}
+
+/// An unmerged index entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexConflictEntry {
+    /// Conflict stage (1 = base, 2 = ours, 3 = theirs).
+    pub stage: u8,
+    /// Repository-relative path.
+    pub path: String,
+}
+
+/// Return every unmerged (stage 1/2/3) index entry.
+pub async fn index_conflict_entries<P: AsRef<Path>>(cwd: P) -> VcsResult<Vec<IndexConflictEntry>> {
+    let output = run_git(&["ls-files", "--unmerged"], cwd).await?;
+    Ok(output.lines().filter_map(parse_index_entry).collect())
+}
+
+/// Return the stage-0 (fully merged) index paths under `prefix`.
+pub async fn index_stage0_paths<P: AsRef<Path>>(cwd: P, prefix: &str) -> VcsResult<Vec<String>> {
+    let output = run_git(&["ls-files", "--stage", "--", prefix], cwd).await?;
+    Ok(output
+        .lines()
+        .filter_map(parse_index_entry)
+        .filter(|entry| entry.stage == 0)
+        .map(|entry| entry.path)
+        .collect())
+}
+
+fn parse_index_entry(line: &str) -> Option<IndexConflictEntry> {
+    let line = line.trim_end_matches('\n');
+    let (meta, path) = line.split_once('\t')?;
+    let stage = meta.split_whitespace().nth(2)?.parse::<u8>().ok()?;
+    Some(IndexConflictEntry {
+        stage,
+        path: path.to_string(),
+    })
+}
+
+/// Return the committed tree paths under `prefix` for `revision`.
+pub async fn committed_tree_paths<P: AsRef<Path>>(
+    cwd: P,
+    revision: &str,
+    prefix: &str,
+) -> VcsResult<Vec<String>> {
+    let output = run_git(
+        &["ls-tree", "-r", "--name-only", revision, "--", prefix],
+        cwd,
+    )
+    .await?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// A single `name-status` entry of a commit's own tree diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDiffEntry {
+    /// Git status letter (`A`, `M`, `D`, ...).
+    pub status: char,
+    /// Repository-relative path.
+    pub path: String,
+}
+
+/// Return the complete tree diff of `commit` against its first parent.
+pub async fn commit_diff_entries<P: AsRef<Path>>(
+    cwd: P,
+    commit: &str,
+) -> VcsResult<Vec<CommitDiffEntry>> {
     let output = run_git(
         &[
-            "log",
-            "--merges",
-            "--format=%s",
-            &format!("{}..HEAD", base_revision),
+            "diff-tree",
+            "-r",
+            "--no-commit-id",
+            "--name-status",
+            "--root",
+            commit,
         ],
         cwd,
     )
     .await?;
 
-    let mut mismatches = Vec::new();
-    for subject in output.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        if subject.starts_with("Pre-sync base into") && subject != expected {
-            mismatches.push(subject.to_string());
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let Some((status, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(status) = status.trim().chars().next() else {
+            continue;
+        };
+        // Rename/copy entries carry two paths; the destination is the last one.
+        let path = path.rsplit('\t').next().unwrap_or(path).trim();
+        if path.is_empty() {
+            continue;
         }
+        entries.push(CommitDiffEntry {
+            status,
+            path: path.to_string(),
+        });
     }
+    Ok(entries)
+}
 
-    Ok(mismatches)
+/// Check whether the index and working tree exactly match `HEAD`, untracked
+/// files included.
+pub async fn is_clean_including_untracked<P: AsRef<Path>>(cwd: P) -> VcsResult<bool> {
+    let output = run_git(&["status", "--porcelain", "--untracked-files=normal"], cwd).await?;
+    Ok(output.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -520,406 +639,267 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_presync_merge_subject_mismatches_since() {
-        let temp_dir = TempDir::new().unwrap();
-
-        // Initialize git repo
-        let init = Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(temp_dir.path())
+    async fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
             .output()
-            .await;
-        if init.is_err() {
-            // Skip if git not available
-            return;
-        }
-
-        let _ = Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-
-        std::fs::write(temp_dir.path().join("README.md"), "base\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Base"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-
-        let base_revision = run_git(&["rev-parse", "HEAD"], temp_dir.path())
             .await
-            .unwrap();
-
-        // Create worktree-like branch
-        let _ = Command::new("git")
-            .args(["checkout", "-b", "ws-change-a"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-
-        // Advance main
-        let _ = Command::new("git")
-            .args(["checkout", "main"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-        std::fs::write(temp_dir.path().join("main.txt"), "main\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Main advance"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-
-        // Pre-sync merge on ws-change-a, but with wrong message
-        let _ = Command::new("git")
-            .args(["checkout", "ws-change-a"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["merge", "--no-ff", "-m", "Pre-sync base into WRONG", "main"])
-            .current_dir(temp_dir.path())
-            .output()
-            .await;
-
-        let mismatches = presync_merge_subject_mismatches_since(
-            temp_dir.path(),
-            base_revision.trim(),
-            "change-a",
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            mismatches.iter().any(|s| s == "Pre-sync base into WRONG"),
-            "Expected mismatch to include wrong pre-sync subject"
-        );
+            .unwrap_or_else(|e| panic!("git {:?}: {}", args, e));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    /// Helper: initialize a git repo with config and an initial commit.
     async fn init_test_repo(dir: &Path) {
-        let _ = Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-        let _ = Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .await;
+        git(dir, &["init", "-b", "main"]).await;
+        git(dir, &["config", "user.email", "test@example.com"]).await;
+        git(dir, &["config", "user.name", "Test User"]).await;
+        git(dir, &["config", "commit.gpgsign", "false"]).await;
         std::fs::write(dir.join("README.md"), "initial\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
-            .current_dir(dir)
-            .output()
-            .await;
+        git(dir, &["add", "-A"]).await;
+        git(dir, &["commit", "-m", "Initial commit"]).await;
+    }
+
+    async fn commit_file(dir: &Path, name: &str, contents: &str, subject: &str) -> String {
+        std::fs::write(dir.join(name), contents).unwrap();
+        git(dir, &["add", "-A"]).await;
+        git(dir, &["commit", "-m", subject]).await;
+        git(dir, &["rev-parse", "HEAD"]).await
     }
 
     #[tokio::test]
-    async fn test_missing_merge_commits_reports_missing_for_fast_forward() {
-        // Verifies that missing_merge_commits_since reports a change as missing
-        // when it was integrated via fast-forward (no merge commit exists).
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
+    async fn exact_subject_enumeration_reports_zero_one_and_multiple_candidates() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
         init_test_repo(dir).await;
+        let base = git(dir, &["rev-parse", "HEAD"]).await;
 
-        let base_rev = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
-
-        // Create a feature branch and add a commit
-        let _ = Command::new("git")
-            .args(["checkout", "-b", "ws-change-a"])
-            .current_dir(dir)
-            .output()
-            .await;
-        std::fs::write(dir.join("feature.txt"), "feature\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Feature commit"])
-            .current_dir(dir)
-            .output()
-            .await;
-
-        // Fast-forward merge back to main
-        let _ = Command::new("git")
-            .args(["checkout", "main"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["merge", "ws-change-a"]) // default: fast-forward
-            .current_dir(dir)
-            .output()
-            .await;
-
-        // missing_merge_commits_since looks for "Merge change: change-a"
-        // Since fast-forward created no merge commit, the change is reported as missing.
-        let missing = missing_merge_commits_since(dir, base_rev.trim(), &["change-a".to_string()])
-            .await
-            .unwrap();
-
-        assert_eq!(
-            missing,
-            vec!["change-a".to_string()],
-            "Fast-forward merged change should appear as missing (no merge commit)"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_is_ancestor_detects_fast_forward_integration() {
-        // Verifies that is_ancestor can detect that a fast-forward-merged branch
-        // is an ancestor of HEAD, which is the mechanism to identify fast-forward
-        // integration in the resolve verification path.
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
-        init_test_repo(dir).await;
-
-        // Create a feature branch and add a commit
-        let _ = Command::new("git")
-            .args(["checkout", "-b", "ws-change-a"])
-            .current_dir(dir)
-            .output()
-            .await;
-        std::fs::write(dir.join("feature.txt"), "feature\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Feature commit"])
-            .current_dir(dir)
-            .output()
-            .await;
-
-        // Fast-forward merge back to main
-        let _ = Command::new("git")
-            .args(["checkout", "main"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["merge", "ws-change-a"])
-            .current_dir(dir)
-            .output()
-            .await;
-
-        // ws-change-a should be an ancestor of HEAD after fast-forward
-        let integrated = is_ancestor(dir, "ws-change-a", "HEAD").await.unwrap();
-        assert!(integrated, "Fast-forward branch should be ancestor of HEAD");
-
-        // A non-existent or unmerged branch should NOT be an ancestor
-        let _ = Command::new("git")
-            .args(["checkout", "-b", "ws-unmerged"])
-            .current_dir(dir)
-            .output()
-            .await;
-        std::fs::write(dir.join("unmerged.txt"), "unmerged\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Unmerged commit"])
-            .current_dir(dir)
-            .output()
-            .await;
-
-        let _ = Command::new("git")
-            .args(["checkout", "main"])
-            .current_dir(dir)
-            .output()
-            .await;
-
-        let not_integrated = is_ancestor(dir, "ws-unmerged", "HEAD").await.unwrap();
+        let subject = "Merge change: change-a";
         assert!(
-            !not_integrated,
-            "Unmerged branch should NOT be ancestor of HEAD"
+            commits_with_exact_subject(dir, Some(&base), "HEAD", subject)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no candidate must be reported before any matching commit exists"
+        );
+
+        commit_file(dir, "a.txt", "a\n", subject).await;
+        assert_eq!(
+            commits_with_exact_subject(dir, Some(&base), "HEAD", subject)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A near-miss subject must not be collected.
+        commit_file(dir, "b.txt", "b\n", "Merge change: change-a-extra").await;
+        assert_eq!(
+            commits_with_exact_subject(dir, Some(&base), "HEAD", subject)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "suffix-similar subjects must not count as exact candidates"
+        );
+
+        commit_file(dir, "c.txt", "c\n", subject).await;
+        assert_eq!(
+            commits_with_exact_subject(dir, Some(&base), "HEAD", subject)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "duplicate exact subjects must both be reported so callers can fail closed"
         );
     }
 
-    /// Regression test: parallel merge fast-forward verification.
-    ///
-    /// After archive, a fast-forward merge produces no merge commit.
-    /// `missing_merge_commits_since` reports it as missing, but `is_ancestor`
-    /// confirms the branch content is on HEAD. The combination should treat
-    /// the change as successfully integrated (no error).
     #[tokio::test]
-    async fn test_fast_forward_merge_passes_verification_with_ancestor_check() {
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
+    async fn parents_and_first_parent_lineage_distinguish_merge_sides() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
         init_test_repo(dir).await;
+        let base = git(dir, &["rev-parse", "HEAD"]).await;
 
-        let base_rev = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
+        git(dir, &["checkout", "-b", "ws-change-a"]).await;
+        let side = commit_file(dir, "side.txt", "side\n", "Side commit").await;
 
-        // Create workspace branch with a commit (simulates archived change)
-        let _ = Command::new("git")
-            .args(["checkout", "-b", "ws-change-ff"])
-            .current_dir(dir)
-            .output()
-            .await;
-        std::fs::write(dir.join("feature-ff.txt"), "fast-forward content\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Archive: change-ff"])
-            .current_dir(dir)
-            .output()
-            .await;
+        git(dir, &["checkout", "main"]).await;
+        let main_tip = commit_file(dir, "main.txt", "main\n", "Main commit").await;
+        git(
+            dir,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "Merge change: change-a",
+                "ws-change-a",
+            ],
+        )
+        .await;
+        let merge_commit = git(dir, &["rev-parse", "HEAD"]).await;
 
-        // Fast-forward merge back to main (no merge commit created)
-        let _ = Command::new("git")
-            .args(["checkout", "main"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["merge", "ws-change-ff"]) // default: fast-forward
-            .current_dir(dir)
-            .output()
-            .await;
+        let parents = parents_of(dir, &merge_commit).await.unwrap();
+        assert_eq!(parents, vec![main_tip.clone(), side.clone()]);
 
-        let change_ids = vec!["change-ff".to_string()];
-        let revisions = ["ws-change-ff".to_string()];
-
-        // missing_merge_commits_since reports the change as missing
-        let missing = missing_merge_commits_since(dir, base_rev.trim(), &change_ids)
-            .await
-            .unwrap();
-        assert_eq!(
-            missing,
-            vec!["change-ff".to_string()],
-            "Fast-forward merge should be reported as missing by merge commit check"
-        );
-
-        // Apply the same filtering logic used in verify_merge_commits:
-        // filter out changes whose branch is an ancestor of HEAD
-        let mut truly_missing: Vec<String> = Vec::new();
-        for missing_id in &missing {
-            let revision = revisions
-                .iter()
-                .zip(change_ids.iter())
-                .find(|(_, cid)| *cid == missing_id)
-                .map(|(rev, _)| rev.as_str());
-
-            if let Some(rev) = revision {
-                let is_integrated = is_ancestor(dir, rev, "HEAD").await.unwrap_or(false);
-                if !is_integrated {
-                    truly_missing.push(missing_id.clone());
-                }
-            } else {
-                truly_missing.push(missing_id.clone());
-            }
-        }
-
+        let lineage = first_parent_lineage(dir, &merge_commit).await.unwrap();
         assert!(
-            truly_missing.is_empty(),
-            "Fast-forward integrated change should NOT appear as truly missing, \
-             but got: {:?}",
-            truly_missing
+            lineage.contains(&main_tip),
+            "the merged-into tip stays on the first-parent lineage"
+        );
+        assert!(
+            !lineage.contains(&side),
+            "a side-branch commit must not appear on the first-parent lineage even though it is an ancestor"
+        );
+        assert!(
+            is_ancestor(dir, &side, &merge_commit).await.unwrap(),
+            "plain ancestry cannot tell the two sides apart, which is why lineage is checked separately"
+        );
+
+        assert_eq!(merge_base(dir, &main_tip, &side).await.unwrap(), Some(base));
+        assert_eq!(
+            parents_of(dir, &side).await.unwrap().len(),
+            1,
+            "an ordinary commit has exactly one parent"
         );
     }
 
-    /// Verify that a genuinely unintegrated change is still reported as missing
-    /// even when fast-forward filtering is applied.
     #[tokio::test]
-    async fn test_unintegrated_change_still_reported_missing_after_ff_filter() {
-        let temp_dir = TempDir::new().unwrap();
-        let dir = temp_dir.path();
+    async fn index_views_separate_stage_zero_from_conflict_stages() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
         init_test_repo(dir).await;
+        std::fs::create_dir_all(dir.join("openspec/changes/change-a")).unwrap();
+        commit_file(
+            dir,
+            "openspec/changes/change-a/proposal.md",
+            "base\n",
+            "Add change-a",
+        )
+        .await;
 
-        let base_rev = run_git(&["rev-parse", "HEAD"], dir).await.unwrap();
+        let stage0 = index_stage0_paths(dir, "openspec/changes").await.unwrap();
+        assert_eq!(stage0, vec!["openspec/changes/change-a/proposal.md"]);
+        assert!(index_conflict_entries(dir).await.unwrap().is_empty());
+        assert!(is_clean_including_untracked(dir).await.unwrap());
 
-        // Create a branch but do NOT merge it
-        let _ = Command::new("git")
-            .args(["checkout", "-b", "ws-change-unmerged"])
-            .current_dir(dir)
-            .output()
-            .await;
-        std::fs::write(dir.join("unmerged.txt"), "unmerged\n").unwrap();
-        let _ = Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .await;
-        let _ = Command::new("git")
-            .args(["commit", "-m", "Unmerged change"])
-            .current_dir(dir)
-            .output()
-            .await;
+        // Build a real content conflict on the same path.
+        git(dir, &["checkout", "-b", "ws-change-a"]).await;
+        commit_file(
+            dir,
+            "openspec/changes/change-a/proposal.md",
+            "branch\n",
+            "Branch edit",
+        )
+        .await;
+        git(dir, &["checkout", "main"]).await;
+        commit_file(
+            dir,
+            "openspec/changes/change-a/proposal.md",
+            "trunk\n",
+            "Trunk edit",
+        )
+        .await;
+        git(dir, &["merge", "--no-ff", "--no-commit", "ws-change-a"]).await;
 
-        let _ = Command::new("git")
-            .args(["checkout", "main"])
-            .current_dir(dir)
-            .output()
-            .await;
+        let conflicts = index_conflict_entries(dir).await.unwrap();
+        assert!(
+            conflicts.iter().any(
+                |entry| entry.path == "openspec/changes/change-a/proposal.md"
+                    && (1..=3).contains(&entry.stage)
+            ),
+            "unmerged entries must be reported with their conflict stage, got {:?}",
+            conflicts
+        );
+        assert!(
+            !index_stage0_paths(dir, "openspec/changes")
+                .await
+                .unwrap()
+                .contains(&"openspec/changes/change-a/proposal.md".to_string()),
+            "a conflicted path must not appear as merged stage-0 evidence"
+        );
+        assert_eq!(
+            merge_head(dir).await.unwrap(),
+            Some(git(dir, &["rev-parse", "ws-change-a"]).await)
+        );
+    }
 
-        let change_ids = vec!["change-unmerged".to_string()];
-        let revisions = ["ws-change-unmerged".to_string()];
+    #[tokio::test]
+    async fn cleanliness_detects_head_index_worktree_disagreement_and_untracked_dirt() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        init_test_repo(dir).await;
+        assert!(is_clean_including_untracked(dir).await.unwrap());
 
-        let missing = missing_merge_commits_since(dir, base_rev.trim(), &change_ids)
-            .await
-            .unwrap();
+        // Staged deletion: index disagrees with HEAD.
+        git(dir, &["rm", "--cached", "README.md"]).await;
+        assert!(
+            !is_clean_including_untracked(dir).await.unwrap(),
+            "a staged-only change must not read as clean"
+        );
+        git(dir, &["reset", "--", "README.md"]).await;
+        assert!(is_clean_including_untracked(dir).await.unwrap());
 
-        // Apply fast-forward filter
-        let mut truly_missing: Vec<String> = Vec::new();
-        for missing_id in &missing {
-            let revision = revisions
-                .iter()
-                .zip(change_ids.iter())
-                .find(|(_, cid)| *cid == missing_id)
-                .map(|(rev, _)| rev.as_str());
+        // Unstaged edit: worktree disagrees with index.
+        std::fs::write(dir.join("README.md"), "dirty\n").unwrap();
+        assert!(!is_clean_including_untracked(dir).await.unwrap());
+        std::fs::write(dir.join("README.md"), "initial\n").unwrap();
+        assert!(is_clean_including_untracked(dir).await.unwrap());
 
-            if let Some(rev) = revision {
-                let is_integrated = is_ancestor(dir, rev, "HEAD").await.unwrap_or(false);
-                if !is_integrated {
-                    truly_missing.push(missing_id.clone());
-                }
-            } else {
-                truly_missing.push(missing_id.clone());
-            }
-        }
+        // Untracked dirt.
+        std::fs::write(dir.join("stray.txt"), "stray\n").unwrap();
+        assert!(
+            !is_clean_including_untracked(dir).await.unwrap(),
+            "untracked files must count against terminal cleanliness"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_tree_and_diff_views_report_paths_and_deletions() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        init_test_repo(dir).await;
+        std::fs::create_dir_all(dir.join("openspec/changes/change-a")).unwrap();
+        commit_file(
+            dir,
+            "openspec/changes/change-a/proposal.md",
+            "live\n",
+            "Add change-a",
+        )
+        .await;
+        let with_live = git(dir, &["rev-parse", "HEAD"]).await;
 
         assert_eq!(
-            truly_missing,
-            vec!["change-unmerged".to_string()],
-            "Unintegrated change must still be reported as truly missing"
+            committed_tree_paths(dir, &with_live, "openspec/changes")
+                .await
+                .unwrap(),
+            vec!["openspec/changes/change-a/proposal.md"]
         );
+
+        git(dir, &["rm", "-r", "-f", "openspec/changes/change-a"]).await;
+        git(
+            dir,
+            &["commit", "-m", "Cleanup resurrected change: change-a"],
+        )
+        .await;
+        let cleanup = git(dir, &["rev-parse", "HEAD"]).await;
+
+        let entries = commit_diff_entries(dir, &cleanup).await.unwrap();
+        assert_eq!(
+            entries,
+            vec![CommitDiffEntry {
+                status: 'D',
+                path: "openspec/changes/change-a/proposal.md".to_string(),
+            }]
+        );
+        assert!(committed_tree_paths(dir, &cleanup, "openspec/changes")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            rev_parse_commit(dir, "HEAD").await.unwrap(),
+            Some(cleanup.clone())
+        );
+        assert_eq!(rev_parse_commit(dir, "does-not-exist").await.unwrap(), None);
+        assert_eq!(merge_head(dir).await.unwrap(), None);
     }
 }

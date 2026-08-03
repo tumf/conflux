@@ -27,6 +27,7 @@ mod merge;
 mod orchestration;
 mod output_bridge;
 pub(super) mod queue_state;
+pub(crate) mod resolve_state;
 mod target_plan;
 mod types;
 pub(crate) mod upstream_bridge;

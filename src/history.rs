@@ -807,12 +807,65 @@ pub struct ResolveAttempt {
     pub stderr_tail: Option<String>,
 }
 
+/// Byte cap for one recorded resolve stdout/stderr tail.
+pub const RESOLVE_STREAM_TAIL_MAX_BYTES: usize = 2 * 1024;
+
+/// Byte cap for the complete wrapper-inclusive `<resolve_context>` block.
+pub const RESOLVE_CONTEXT_MAX_BYTES: usize = 8 * 1024;
+
+/// Byte cap for one recorded structured phase diagnosis.
+///
+/// Bounded well below [`RESOLVE_CONTEXT_MAX_BYTES`] so the fixed wrapper plus
+/// the newest diagnosis alone always satisfies the context invariant, even when
+/// every stream tail has already been trimmed away.
+pub const RESOLVE_DIAGNOSIS_MAX_BYTES: usize = 3 * 1024;
+
+/// Keep at most `max_bytes` trailing bytes, cutting on a UTF-8 boundary.
+pub fn bounded_tail(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut start = value.len() - max_bytes;
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value[start..].to_string()
+}
+
+/// Keep at most `max_bytes` leading bytes, cutting on a UTF-8 boundary.
+///
+/// Used for the structured phase diagnosis, whose leading fields carry the
+/// identifying `phase`/`change_id` information.
+pub fn bounded_head(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+/// How much stream detail one rendered attempt keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamDetail {
+    /// Keep the recorded tail as-is.
+    Full,
+    /// Keep at most this many trailing bytes of each stream.
+    Bounded(usize),
+    /// Drop stream tails entirely.
+    Omitted,
+}
+
 /// Tracks resolve attempts within a single retry session
 pub struct ResolveContext {
     /// Attempts in the current session
     attempts: Vec<ResolveAttempt>,
     /// Maximum number of retries
     max_retries: u32,
+    /// Total attempts recorded, including any trimmed from `attempts`.
+    recorded: u32,
 }
 
 impl ResolveContext {
@@ -821,26 +874,108 @@ impl ResolveContext {
         Self {
             attempts: Vec::new(),
             max_retries,
+            recorded: 0,
         }
     }
 
-    /// Record a new attempt
+    /// Record a new attempt.
+    ///
+    /// Stream tails and the structured phase diagnosis are bounded here rather
+    /// than at render time so a single oversized attempt can never make the
+    /// retained history unbounded.
     pub fn record(&mut self, attempt: ResolveAttempt) {
+        let attempt = ResolveAttempt {
+            continuation_reason: attempt
+                .continuation_reason
+                .as_deref()
+                .map(|reason| bounded_head(reason, RESOLVE_DIAGNOSIS_MAX_BYTES)),
+            stdout_tail: attempt
+                .stdout_tail
+                .as_deref()
+                .map(|tail| bounded_tail(tail, RESOLVE_STREAM_TAIL_MAX_BYTES)),
+            stderr_tail: attempt
+                .stderr_tail
+                .as_deref()
+                .map(|tail| bounded_tail(tail, RESOLVE_STREAM_TAIL_MAX_BYTES)),
+            ..attempt
+        };
         self.attempts.push(attempt);
+        self.recorded = self.recorded.saturating_add(1);
+
+        let retained = self.max_retries.max(1) as usize;
+        if self.attempts.len() > retained {
+            let excess = self.attempts.len() - retained;
+            self.attempts.drain(0..excess);
+        }
     }
 
     /// Get the current attempt number (1-based)
     pub fn current_attempt(&self) -> u32 {
-        (self.attempts.len() as u32) + 1
+        self.recorded + 1
     }
 
     /// Format continuation context for prompt injection.
     /// Returns an empty string if there are no previous attempts.
+    ///
+    /// The complete wrapper-inclusive result is bounded by
+    /// [`RESOLVE_CONTEXT_MAX_BYTES`]. Reduction is deterministic: oldest
+    /// attempts are dropped first, then older attempts' stream tails, then the
+    /// newest attempt's stream detail. The newest attempt's metadata and
+    /// structured phase diagnosis are never dropped.
     pub fn format_continuation_context(&self) -> String {
         if self.attempts.is_empty() {
             return String::new();
         }
 
+        // 1. Remove oldest attempts entirely, retaining the newest two.
+        let total = self.attempts.len();
+        for keep in (2.min(total)..=total).rev() {
+            let rendered = self.render(&self.attempts[total - keep..], StreamDetail::Full);
+            if rendered.len() <= RESOLVE_CONTEXT_MAX_BYTES {
+                return rendered;
+            }
+        }
+
+        // 2. Remove the remaining older attempts' stream tails.
+        if total >= 2 {
+            let rendered = self.render_split(
+                &self.attempts[total - 2..],
+                StreamDetail::Omitted,
+                StreamDetail::Full,
+            );
+            if rendered.len() <= RESOLVE_CONTEXT_MAX_BYTES {
+                return rendered;
+            }
+        }
+
+        // 3. Trim the newest attempt's stream detail.
+        let newest = &self.attempts[total - 1..];
+        for limit in [RESOLVE_STREAM_TAIL_MAX_BYTES, 1024, 512, 256, 0] {
+            let detail = if limit == 0 {
+                StreamDetail::Omitted
+            } else {
+                StreamDetail::Bounded(limit)
+            };
+            let rendered = self.render(newest, detail);
+            if rendered.len() <= RESOLVE_CONTEXT_MAX_BYTES {
+                return rendered;
+            }
+        }
+
+        // 4. Newest attempt metadata plus its structured phase diagnosis.
+        self.render(newest, StreamDetail::Omitted)
+    }
+
+    fn render(&self, attempts: &[ResolveAttempt], detail: StreamDetail) -> String {
+        self.render_split(attempts, detail, detail)
+    }
+
+    fn render_split(
+        &self,
+        attempts: &[ResolveAttempt],
+        older_detail: StreamDetail,
+        newest_detail: StreamDetail,
+    ) -> String {
         let mut lines = vec![
             format!(
                 "This is attempt {} of {} for conflict resolution.",
@@ -850,7 +985,13 @@ impl ResolveContext {
             String::new(),
         ];
 
-        for attempt in &self.attempts {
+        let last_index = attempts.len().saturating_sub(1);
+        for (index, attempt) in attempts.iter().enumerate() {
+            let detail = if index == last_index {
+                newest_detail
+            } else {
+                older_detail
+            };
             let command_exit = if attempt.command_success {
                 format!("success (code: {})", attempt.exit_code.unwrap_or(0))
             } else {
@@ -870,22 +1011,12 @@ impl ResolveContext {
                 lines.push(format!("- Reason: {}", reason));
             }
             lines.push(format!("- Duration: {}s", duration_secs));
-            if let Some(stdout) = &attempt.stdout_tail {
-                if !stdout.is_empty() {
-                    lines.push("- Stdout tail:".to_string());
-                    lines.push(format!("  {}", stdout.replace('\n', "\n  ")));
-                }
-            }
-            if let Some(stderr) = &attempt.stderr_tail {
-                if !stderr.is_empty() {
-                    lines.push("- Stderr tail:".to_string());
-                    lines.push(format!("  {}", stderr.replace('\n', "\n  ")));
-                }
-            }
+            push_stream(&mut lines, "Stdout", attempt.stdout_tail.as_deref(), detail);
+            push_stream(&mut lines, "Stderr", attempt.stderr_tail.as_deref(), detail);
             lines.push(String::new());
         }
 
-        if let Some(last) = self.attempts.last() {
+        if let Some(last) = attempts.last() {
             if let Some(reason) = &last.continuation_reason {
                 lines.push(format!("Continue resolving the conflicts. {}", reason));
             } else {
@@ -898,6 +1029,25 @@ impl ResolveContext {
             lines.join("\n")
         )
     }
+}
+
+fn push_stream(lines: &mut Vec<String>, label: &str, value: Option<&str>, detail: StreamDetail) {
+    let Some(value) = value else {
+        return;
+    };
+    if value.is_empty() {
+        return;
+    }
+    let value = match detail {
+        StreamDetail::Full => value.to_string(),
+        StreamDetail::Bounded(limit) => bounded_tail(value, limit),
+        StreamDetail::Omitted => return,
+    };
+    if value.is_empty() {
+        return;
+    }
+    lines.push(format!("- {} tail:", label));
+    lines.push(format!("  {}", value.replace('\n', "\n  ")));
 }
 
 #[cfg(test)]
@@ -1791,5 +1941,172 @@ mod tests {
         assert!(history.last_follow_up_findings("change-a").is_none());
         assert!(history.retry_identities("change-a").is_none());
         assert!(history.semantic_fingerprint("change-a").is_none());
+    }
+
+    // --- Resolve continuation byte bounds ---
+
+    fn resolve_attempt(attempt: u32, reason: &str, stdout: &str, stderr: &str) -> ResolveAttempt {
+        ResolveAttempt {
+            attempt,
+            command_success: true,
+            verification_success: false,
+            duration: Duration::from_secs(1),
+            continuation_reason: Some(reason.to_string()),
+            exit_code: Some(0),
+            stdout_tail: Some(stdout.to_string()),
+            stderr_tail: Some(stderr.to_string()),
+        }
+    }
+
+    #[test]
+    fn bounded_helpers_cut_on_utf8_boundaries() {
+        let multibyte = "日本語テキスト".repeat(200);
+        assert!(multibyte.len() > RESOLVE_STREAM_TAIL_MAX_BYTES);
+
+        let tail = bounded_tail(&multibyte, RESOLVE_STREAM_TAIL_MAX_BYTES);
+        assert!(tail.len() <= RESOLVE_STREAM_TAIL_MAX_BYTES);
+        assert!(multibyte.ends_with(&tail), "the newest bytes must be kept");
+
+        let head = bounded_head(&multibyte, RESOLVE_STREAM_TAIL_MAX_BYTES);
+        assert!(head.len() <= RESOLVE_STREAM_TAIL_MAX_BYTES);
+        assert!(multibyte.starts_with(&head));
+
+        // Short values pass through untouched.
+        assert_eq!(bounded_tail("abc", 64), "abc");
+        assert_eq!(bounded_head("abc", 64), "abc");
+    }
+
+    #[test]
+    fn recorded_stream_tails_are_bounded_to_two_kib() {
+        let mut context = ResolveContext::new(3);
+        context.record(resolve_attempt(
+            1,
+            "phase: final_merge_missing",
+            &"a".repeat(50_000),
+            &"日本語".repeat(20_000),
+        ));
+
+        let formatted = context.format_continuation_context();
+        assert!(formatted.len() <= RESOLVE_CONTEXT_MAX_BYTES);
+        assert!(
+            std::str::from_utf8(formatted.as_bytes()).is_ok(),
+            "trimming must preserve valid UTF-8"
+        );
+        assert!(formatted.contains("phase: final_merge_missing"));
+    }
+
+    #[test]
+    fn repeated_oversized_attempts_stay_within_the_context_budget() {
+        let mut context = ResolveContext::new(3);
+        for attempt in 1..=3 {
+            context.record(resolve_attempt(
+                attempt,
+                &format!("phase: presync_invalid\nchange_id: change-{}", attempt),
+                // Simulates an agent echoing the whole prompt back.
+                &"prompt echo ".repeat(4_000),
+                &"stderr noise ".repeat(4_000),
+            ));
+        }
+
+        let formatted = context.format_continuation_context();
+        assert!(
+            formatted.len() <= RESOLVE_CONTEXT_MAX_BYTES,
+            "wrapper-inclusive context was {} bytes",
+            formatted.len()
+        );
+        assert!(formatted.starts_with("<resolve_context>"));
+        assert!(formatted.ends_with("</resolve_context>"));
+        assert!(
+            formatted.contains("change_id: change-3"),
+            "the newest structured phase diagnosis must always be retained: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn only_max_retries_attempts_are_retained() {
+        let mut context = ResolveContext::new(2);
+        for attempt in 1..=5 {
+            context.record(resolve_attempt(
+                attempt,
+                &format!("phase: presync_invalid ({})", attempt),
+                "",
+                "",
+            ));
+        }
+
+        let formatted = context.format_continuation_context();
+        assert_eq!(
+            context.current_attempt(),
+            6,
+            "the attempt counter must keep counting past the retention window"
+        );
+        assert!(!formatted.contains("Previous attempt (1):"));
+        assert!(!formatted.contains("Previous attempt (3):"));
+        assert!(formatted.contains("Previous attempt (4):"));
+        assert!(formatted.contains("Previous attempt (5):"));
+    }
+
+    #[test]
+    fn trim_order_drops_oldest_attempts_before_the_newest_stream_detail() {
+        let fill = |c: char| c.to_string().repeat(2_000);
+        let mut context = ResolveContext::new(3);
+        context.record(resolve_attempt(
+            1,
+            "phase: presync_invalid",
+            &fill('o'),
+            &fill('O'),
+        ));
+        context.record(resolve_attempt(
+            2,
+            "phase: presync_invalid",
+            &fill('m'),
+            &fill('M'),
+        ));
+        context.record(resolve_attempt(
+            3,
+            "phase: target_merge_unfinished",
+            &fill('n'),
+            &fill('N'),
+        ));
+
+        let formatted = context.format_continuation_context();
+        assert!(formatted.len() <= RESOLVE_CONTEXT_MAX_BYTES);
+        assert!(
+            !formatted.contains("Previous attempt (1):"),
+            "the oldest attempt is dropped first"
+        );
+        assert!(
+            formatted.contains("Previous attempt (2):"),
+            "the immediately preceding attempt's metadata is retained"
+        );
+        assert!(
+            !formatted.contains("mmmm"),
+            "older attempts lose their stream tails before the newest attempt does"
+        );
+        assert!(
+            formatted.contains("nnnn"),
+            "the newest attempt keeps stream detail as long as the budget allows"
+        );
+        assert!(formatted.contains("phase: target_merge_unfinished"));
+    }
+
+    #[test]
+    fn oversized_diagnosis_alone_still_satisfies_the_context_limit() {
+        let mut context = ResolveContext::new(1);
+        context.record(resolve_attempt(
+            1,
+            &format!("phase: unsafe_evidence\ndetail: {}", "x".repeat(200_000)),
+            &"s".repeat(200_000),
+            &"e".repeat(200_000),
+        ));
+
+        let formatted = context.format_continuation_context();
+        assert!(
+            formatted.len() <= RESOLVE_CONTEXT_MAX_BYTES,
+            "wrapper-inclusive context was {} bytes",
+            formatted.len()
+        );
+        assert!(formatted.contains("phase: unsafe_evidence"));
     }
 }
